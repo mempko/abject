@@ -25,6 +25,20 @@ Application shell and bootstrap.
 - **Surface model**: each surface is an `OffscreenCanvas` with its own 2D
   context, painted by the draw-command vocabulary, uploaded as a slab texture
   only when dirty
+- **Canvas layers are scene nodes**: a `kind: 'canvas'` node is a 2D drawing
+  layer living in the scene graph — a rectangle at its transform (or
+  `params.rect` for window-absolute placement; `backdrop: true` pins it
+  behind all meshes like the window's own content plane). Painted through
+  the unified draw channel (draw commands carrying `nodeId`): commands
+  accumulate incrementally on the layer's pixels and `clear` restarts them
+  (the layer erases to transparent). `params.commands` on the node also
+  works and replaces wholesale. The window's own content is the backmost 2D
+  layer of its subtree; non-backdrop canvas layers slice the subtree's
+  meshes by camera depth (meshes behind draw under, meshes in front draw
+  over), so 2D and 3D stack in any order: 2D → 3D → 2D → 3D → …
+  CanvasWidget is itself a layout-managed backdrop layer piped through this
+  channel — one drawing contract everywhere (local coordinates, transparent
+  clear, incremental batches, retained-and-replayed)
 - **The scene**: perspective camera whose z=0 plane maps ~1:1 to CSS px;
   desktop scroll = camera truck. Slabs get rounded corners (SDF), soft
   shadows, an accent rim + bloom and a z-lift when focused, a drag tilt that

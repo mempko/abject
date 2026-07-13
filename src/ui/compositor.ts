@@ -67,6 +67,12 @@ export interface DrawCommand {
   type: DrawCommandType;
   surfaceId: string;
   params: unknown;
+  /**
+   * Target a canvas-layer scene node (kind:'canvas') on the surface instead
+   * of the surface's own texture. Layer painting is incremental: commands
+   * accumulate on the layer's pixels; 'clear' restarts it.
+   */
+  nodeId?: string;
 }
 
 export interface RectParams {
@@ -479,6 +485,9 @@ export class Compositor {
       // GPU state is gone; OffscreenCanvases retain content, so re-upload all.
       for (const state of this.surfaceGl.values()) state.texture = undefined;
       for (const surface of this.surfaces.values()) surface.dirty = true;
+      // Canvas-layer node textures are also gone; force re-upload from the
+      // retained OffscreenCanvases.
+      for (const entry of this.canvasLayers.values()) entry.texture = undefined;
       // Custom-mesh GPU handles are now invalid; drop them so they rebuild
       // from the retained scene store on the next frame (no deleteDynamicMesh
       // — the underlying GL objects no longer exist).
@@ -590,6 +599,10 @@ export class Compositor {
     for (const glState of this.surfaceGl.values()) {
       if (glState.texture) this.renderer.deleteTexture(glState.texture);
     }
+    for (const entry of this.canvasLayers.values()) {
+      if (entry.texture) this.renderer.deleteTexture(entry.texture);
+    }
+    this.canvasLayers.clear();
     this.surfaceGl.clear();
     this.sceneStore.clear();
     this.worldKeys.clear();
@@ -1027,6 +1040,10 @@ export class Compositor {
    * Execute a draw command on a surface.
    */
   draw(command: DrawCommand): void {
+    if (command.nodeId) {
+      this.drawToLayer(command.surfaceId, command.nodeId, command);
+      return;
+    }
     const surface = this.surfaces.get(command.surfaceId);
     if (!surface) {
       return;
@@ -1079,6 +1096,26 @@ export class Compositor {
         this.resetSurfaceState(surface);
         break;
 
+      default:
+        this.execShapeCommand(ctx, command.surfaceId, command);
+        break;
+    }
+
+    surface.dirty = true;
+    surface.drawn = true;
+    this.needsRender = true;
+  }
+
+  /**
+   * Execute one shape/state draw command against a 2D context. Shared by
+   * window surfaces (draw) and canvas-layer scene nodes (execLayerCommand) —
+   * everything in the vocabulary except the surface-only commands (clear /
+   * reset / videoFrame), which the callers handle with their own semantics.
+   * `key` identifies the target for the async image caches (a surfaceId or a
+   * canvas layer's full key).
+   */
+  private execShapeCommand(ctx: OffscreenCanvasRenderingContext2D, key: string, command: DrawCommand): void {
+    switch (command.type) {
       case 'rect': {
         const p = command.params as RectParams;
         if (!p.fill && !p.stroke && !p.radius) {
@@ -1161,7 +1198,7 @@ export class Compositor {
           url: p.url as string,
           data: (p.data ?? p.image) as ImageParams['data'],
         };
-        this.draw({
+        this.execShapeCommand(ctx, key, {
           type: params.url !== undefined ? 'imageUrl' : 'image',
           surfaceId: command.surfaceId,
           params,
@@ -1171,7 +1208,7 @@ export class Compositor {
 
       case 'imageUrl': {
         const p = command.params as ImageUrlParams;
-        const sid = command.surfaceId;
+        const sid = key;
 
         if (p.url.startsWith('data:')) {
           // Fast path: stable data URIs (e.g. chat messages) hit the cache
@@ -1203,14 +1240,7 @@ export class Compositor {
             }
             this.imageCache.set(p.url, { img, loaded: true });
 
-            const surf = this.surfaces.get(sid);
-            if (surf) {
-              surf.ctx.save();
-              surf.ctx.setTransform(savedTransform);
-              blitImage(surf.ctx, img, p);
-              surf.ctx.restore();
-              surf.dirty = true;
-            }
+            this.lateBlit(sid, savedTransform, img, p);
             this.needsRender = true;
           };
           // On error, keep showing the old image (don't update liveDataImages)
@@ -1242,17 +1272,10 @@ export class Compositor {
               const drawToSurface = (image: HTMLImageElement) => {
                 entry.img = image;
                 entry.loaded = true;
-                // Remember this as the surface's live frame so the next swap can
+                // Remember this as the target's live frame so the next swap can
                 // fall back to it instead of the background.
                 this.liveDataImages.set(sid, { img: image, width: image.naturalWidth, height: image.naturalHeight });
-                const surf = this.surfaces.get(sid);
-                if (surf) {
-                  surf.ctx.save();
-                  surf.ctx.setTransform(savedTransform);
-                  blitImage(surf.ctx, image, p);
-                  surf.ctx.restore();
-                  surf.dirty = true;
-                }
+                this.lateBlit(sid, savedTransform, image, p);
                 this.needsRender = true;
               };
               // Load with CORS so the decoded pixels can be uploaded to WebGL.
@@ -1568,10 +1591,31 @@ export class Compositor {
         this.applyContextCommand(ctx, command.type, command.params as Record<string, unknown> | undefined);
         break;
     }
+  }
 
-    surface.dirty = true;
-    surface.drawn = true;
-    this.needsRender = true;
+  /**
+   * Late async image writes (decode finished after the draw batch) land on
+   * whichever target issued the command — a window surface or a canvas-layer
+   * scene node.
+   */
+  private lateBlit(key: string, transform: DOMMatrix, image: CanvasImageSource, p: ImageUrlParams): void {
+    const surf = this.surfaces.get(key);
+    if (surf) {
+      surf.ctx.save();
+      surf.ctx.setTransform(transform);
+      blitImage(surf.ctx, image, p);
+      surf.ctx.restore();
+      surf.dirty = true;
+      return;
+    }
+    const layer = this.canvasLayers.get(key);
+    if (layer) {
+      layer.ctx.save();
+      layer.ctx.setTransform(transform);
+      blitImage(layer.ctx, image, p);
+      layer.ctx.restore();
+      layer.needsUpload = true;
+    }
   }
 
   /**
@@ -1582,7 +1626,11 @@ export class Compositor {
    * the full surface.
    */
   private resetSurfaceState(surface: Surface): void {
-    const ctx = surface.ctx;
+    this.resetCtxState(surface.ctx, surface.rect.width, surface.rect.height);
+  }
+
+  /** Reset one 2D context's state and wipe its bitmap to transparent. */
+  private resetCtxState(ctx: OffscreenCanvasRenderingContext2D, width: number, height: number): void {
     if (typeof (ctx as unknown as { reset?: () => void }).reset === 'function') {
       (ctx as unknown as { reset: () => void }).reset();
     } else {
@@ -1593,7 +1641,7 @@ export class Compositor {
     ctx.shadowBlur = 0;
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
-    ctx.clearRect(0, 0, surface.rect.width, surface.rect.height);
+    ctx.clearRect(0, 0, width, height);
   }
 
   /**
@@ -1808,6 +1856,7 @@ export class Compositor {
     if (this.bloomConfig) this.renderer.applyBloom(this.bloomConfig.threshold, this.bloomConfig.intensity);
     this.overlay.draw();
     this.pruneCustomMeshes();
+    this.pruneCanvasLayers();
   }
 
   /**
@@ -1937,9 +1986,12 @@ export class Compositor {
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         1, 1, 1,
       );
-      // Occluded children (default): clipped to the window's content rect, so
-      // they stay inside the frame and below the title bar. Overlay children
-      // (occlude:false): unclipped, drawn on top — pop-out 3D / decorations.
+      // The window's own content (chrome + widgets + default canvas) is the
+      // BACKMOST 2D layer of its subtree. Scene nodes draw above it; canvas
+      // nodes (kind:'canvas') interleave with meshes by camera depth, so
+      // 2D and 3D layers stack freely: base 2D → 3D → 2D → 3D → …
+      // Occluded children clip to the content rect; occlude:false children
+      // draw last, unclipped (pop-out 3D / decorations over the chrome).
       this.drawVocabNodes(surface, frame, 'occluded');
       this.drawVocabNodes(surface, frame, 'overlay');
     }
@@ -1989,28 +2041,234 @@ export class Compositor {
   }
 
   /**
-   * Draw a window's scene-vocabulary nodes in one of two passes:
-   * - 'occluded' (default for window children): clipped to the window's screen
-   *   rect and drawn BEFORE the slab, so the window's chrome/content occludes
-   *   them and they cannot spill across the desktop.
-   * - 'overlay': nodes whose resolved params set `occlude: false`, drawn AFTER
-   *   the slab with no clip, so they sit on top and may extend past the window
-   *   (pop-out 3D, decorations meant to be visible over the chrome).
+   * Draw a window's scene-vocabulary nodes in one of two passes. The window's
+   * own content (chrome + widgets + default canvas) is the BACKMOST 2D layer
+   * of its subtree; scene nodes draw above it. Within a pass, canvas nodes
+   * (kind:'canvas' — 2D layers as rectangles in 3D space) interleave with
+   * meshes by camera depth, so 2D and 3D stack freely.
+   * - 'occluded' (default for window children): drawn after the base slab,
+   *   clipped to the window's content rect, so nodes sit above the window's
+   *   base 2D content but cannot paint over the title bar or spill across
+   *   the desktop.
+   * - 'overlay': nodes whose resolved params set `occlude: false`, drawn last
+   *   with no clip, so they sit on top of everything and may extend past the
+   *   window (pop-out 3D, decorations meant to be visible over the chrome).
    */
   private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay'): void {
-    // Clip occluded children to the window's CONTENT rect (in screen px): inset
-    // the title bar + a thin border on chromed windows so 3D can never paint
-    // over the title bar or escape the frame. Transparent windows have no
-    // chrome, so they clip to the full rect.
+    this.drawNodeTree(surface.id, surfaceModel, undefined, this.contentClip(surface), pass);
+  }
+
+  /**
+   * The window's CONTENT rect in screen px: inset the title bar + a thin
+   * border on chromed windows so occluded 3D and the overlay 2D layer can
+   * never paint over the title bar or escape the frame. Transparent windows
+   * have no chrome, so they clip to the full rect.
+   */
+  private contentClip(surface: Surface): { x: number; y: number; width: number; height: number } {
     const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
     const border = surface.transparent ? 0 : 2;
-    const clip = {
+    return {
       x: surface.rect.x - this.scrollX + border,
       y: surface.rect.y - this.scrollY + titleBar,
       width: Math.max(0, surface.rect.width - border * 2),
       height: Math.max(0, surface.rect.height - titleBar - border),
     };
-    this.drawNodeTree(surface.id, surfaceModel, undefined, clip, pass);
+  }
+
+  // ── Canvas-layer nodes (kind:'canvas') ────────────────────────────────
+  //
+  // A canvas node is a 2D drawing layer living IN the scene graph: a
+  // width×height px rectangle at its node transform, painted by the standard
+  // draw-command vocabulary (params.commands, retained and replaced whole on
+  // update), rendered as an unlit alpha-blended quad. Canvas layers
+  // interleave with meshes by camera depth (see drawNodeTree), which is what
+  // lets 2D and 3D stack arbitrarily: 2D → 3D → 2D → 3D → …
+
+  /**
+   * Per canvas-node retained pixels + GPU texture. Entries live exactly as
+   * long as their node lives in the SceneStore (NOT as long as they are
+   * drawn): incrementally-painted pixels have no client-side command log to
+   * rebuild from, so a layer on a hidden workspace must keep its pixels.
+   */
+  private canvasLayers = new Map<string, {
+    surfaceKey: string;
+    nodeId: string;
+    canvas: OffscreenCanvas;
+    ctx: OffscreenCanvasRenderingContext2D;
+    texture?: WebGLTexture;
+    rev: number;
+    w: number;
+    h: number;
+    tainted: boolean;
+    needsUpload: boolean;
+  }>();
+
+  /**
+   * Get (repainting when the node's command revision or size changed) the
+   * retained layer entry for a canvas node.
+   */
+  private canvasLayerEntry(key: string, node: VocabNode) {
+    const fullKey = `${key}/${node.id}`;
+    const { w, h } = Compositor.canvasNodeSize(node);
+    let entry = this.canvasLayers.get(fullKey);
+    if (!entry || entry.w !== w || entry.h !== h) {
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return undefined;
+      // Preserve pixels across resizes (same policy as window surfaces) so
+      // incrementally-drawn content survives a layout change; only a
+      // commands revision wipes and repaints.
+      if (entry) ctx.drawImage(entry.canvas, 0, 0);
+      entry = {
+        surfaceKey: key,
+        nodeId: node.id,
+        canvas, ctx,
+        texture: entry?.texture,
+        rev: entry?.rev ?? -1,
+        w, h,
+        tainted: entry?.tainted ?? false,
+        needsUpload: true,
+      };
+      this.canvasLayers.set(fullKey, entry);
+    }
+    if (entry.rev !== node.canvasRev) {
+      // Full repaint. A layer starts transparent each revision — everything
+      // left unpainted shows the scene behind it; a 'clear' with a color (or
+      // any painted background) opts into opacity.
+      this.resetCtxState(entry.ctx, w, h);
+      const commands = node.params.commands;
+      if (Array.isArray(commands)) {
+        for (const raw of commands) {
+          const cmd = raw as DrawCommand;
+          if (!cmd || typeof cmd !== 'object' || typeof cmd.type !== 'string') continue;
+          this.resolveCommandColors(cmd);
+          if (cmd.type === 'clear') {
+            this.resetCtxState(entry.ctx, w, h);
+            const p = cmd.params as { color?: string };
+            if (p?.color) {
+              entry.ctx.fillStyle = p.color;
+              entry.ctx.fillRect(0, 0, w, h);
+            }
+          } else if (cmd.type === 'reset') {
+            this.resetCtxState(entry.ctx, w, h);
+          } else if (cmd.type !== 'videoFrame') { // videoFrame is surface-only
+            this.execShapeCommand(entry.ctx, fullKey, cmd);
+          }
+        }
+      }
+      entry.rev = node.canvasRev;
+      entry.needsUpload = true;
+    }
+    return entry;
+  }
+
+  /** A canvas node's pixel size: params.rect wins, else width/height. */
+  private static canvasNodeSize(node: VocabNode): { w: number; h: number } {
+    const rect = node.params.rect as { width?: number; height?: number } | undefined;
+    const w = rect?.width ?? (node.params.width as number) ?? 0;
+    const h = rect?.height ?? (node.params.height as number) ?? 0;
+    return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+  }
+
+  /**
+   * The quad model matrix for a canvas node. Two placement modes:
+   * - params.rect { x, y, width, height }: surface-absolute px from the
+   *   window's top-left (how widgets are placed) — used by layout-managed
+   *   backdrop layers. transform.position[2] still supplies z.
+   * - transform (default): the node's world matrix, centered like a mesh;
+   *   the quad is width×height px and transform.scale multiplies.
+   */
+  private canvasNodeModel(key: string, node: VocabNode, surfaceModel: Mat4): Mat4 | undefined {
+    const { w, h } = Compositor.canvasNodeSize(node);
+    const rect = node.params.rect as { x: number; y: number; width: number; height: number } | undefined;
+    if (rect) {
+      const surface = this.surfaces.get(key);
+      if (!surface) return undefined; // rect placement needs a window surface
+      const ox = rect.x + rect.width / 2 - surface.rect.width / 2;
+      const oy = rect.y + rect.height / 2 - surface.rect.height / 2;
+      const z = node.transform.position?.[2] ?? 0;
+      return mat4Multiply(surfaceModel, mat4TRS(ox, oy, z, 0, 0, 0, w, h, 1));
+    }
+    const world = this.sceneStore.worldMatrix(node, surfaceModel);
+    return mat4Multiply(world, mat4TRS(0, 0, 0, 0, 0, 0, w, h, 1));
+  }
+
+  /**
+   * Incrementally paint one draw command onto a canvas-layer node
+   * (draw-channel commands carrying nodeId). Same vocabulary as surface
+   * draws; 'clear'/'reset' wipe to transparent ('clear' then fills when a
+   * color is given) — a layer composites over whatever is behind it, so
+   * transparent erases are meaningful.
+   */
+  private drawToLayer(surfaceId: string, nodeId: string, command: DrawCommand): void {
+    const node = this.sceneStore.getNode(surfaceId, nodeId);
+    if (!node || node.kind !== 'canvas') return;
+    const entry = this.canvasLayerEntry(surfaceId, node);
+    if (!entry) return;
+    this.resolveCommandColors(command);
+    if (command.type === 'clear') {
+      this.resetCtxState(entry.ctx, entry.w, entry.h);
+      const p = command.params as { color?: string };
+      if (p?.color) {
+        entry.ctx.fillStyle = p.color;
+        entry.ctx.fillRect(0, 0, entry.w, entry.h);
+      }
+    } else if (command.type === 'reset') {
+      this.resetCtxState(entry.ctx, entry.w, entry.h);
+    } else if (command.type !== 'videoFrame') { // videoFrame is surface-only
+      this.execShapeCommand(entry.ctx, `${surfaceId}/${nodeId}`, command);
+    }
+    entry.needsUpload = true;
+    if (this.isSurfaceKeyRenderable(surfaceId)) this.needsRender = true;
+  }
+
+  /**
+   * Draw a canvas node as an unlit alpha-blended quad (see canvasNodeModel
+   * for placement). Clipping rides the pass-wide scissor set by drawNodeTree
+   * (passing a per-draw scissor to drawSurface would disable that global
+   * scissor).
+   */
+  private drawCanvasLayerNode(
+    key: string,
+    node: VocabNode,
+    rp: Record<string, unknown>,
+    surfaceModel: Mat4,
+  ): void {
+    const entry = this.canvasLayerEntry(key, node);
+    if (!entry) return;
+    if (!entry.texture) {
+      entry.texture = this.renderer.createTexture();
+      entry.needsUpload = true;
+    }
+    if (entry.needsUpload && !entry.tainted) {
+      const ok = this.renderer.uploadTexture(entry.texture, entry.canvas);
+      entry.needsUpload = false;
+      if (!ok) {
+        entry.tainted = true;
+        console.warn(`[Compositor] canvas layer ${key}/${node.id} tainted by a cross-origin image; freezing its texture`);
+      }
+    }
+    const model = this.canvasNodeModel(key, node, surfaceModel);
+    if (!model) return;
+    this.renderer.drawSurface({
+      model,
+      viewProj: this.viewProj,
+      texture: entry.texture,
+      width: entry.w,
+      height: entry.h,
+      radius: (rp.radius as number) ?? 0,
+      dim: 1,
+      opacity: (rp.opacity as number) ?? 1,
+    });
+  }
+
+  /** Free pixels + GPU textures of canvas layers whose node no longer exists. */
+  private pruneCanvasLayers(): void {
+    for (const [fullKey, entry] of this.canvasLayers) {
+      if (this.sceneStore.getNode(entry.surfaceKey, entry.nodeId)) continue;
+      if (entry.texture) this.renderer.deleteTexture(entry.texture);
+      this.canvasLayers.delete(fullKey);
+    }
   }
 
   /**
@@ -2059,7 +2317,18 @@ export class Compositor {
     if (pass) {
       entries = entries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
     }
-    if (entries.length === 0) return;
+
+    // Canvas-layer nodes (2D layers living in the scene graph) follow the
+    // same layer/pass filters as meshes.
+    let canvasEntries = nodes
+      .filter((n) => n.kind === 'canvas')
+      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
+      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
+    if (pass) {
+      canvasEntries = canvasEntries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
+    }
+
+    if (entries.length === 0 && canvasEntries.length === 0) return;
 
     // Transparent meshes draw last, back-to-front, so they composite correctly.
     const opaque = entries.filter(({ rp }) => ((rp.opacity as number) ?? 1) >= 1 && !rp.texture);
@@ -2069,14 +2338,62 @@ export class Compositor {
     // Opt-in directional shadows: render a depth map from the light's POV,
     // auto-fitting the ortho frustum to the casters' world AABB. Casters are
     // this pass's meshes; skip on the overlay pass (overlay nodes pop out).
-    const shadow = shadowLightIndex >= 0 && shadowDir && pass !== 'overlay'
+    const shadow = shadowLightIndex >= 0 && shadowDir && pass !== 'overlay' && entries.length > 0
       ? this.renderShadowPass(key, entries.map((e) => e.node), surfaceModel, shadowDir, shadowLightIndex)
       : undefined;
 
     const scissored = clip !== undefined && pass === 'occluded';
     if (scissored) this.renderer.setScissor(clip);
 
-    for (const { node, rp } of [...opaque, ...transparent]) {
+    // Backdrop layers (params.backdrop:true — layout-managed widget canvases
+    // and window-glued backgrounds) pin behind ALL meshes regardless of z,
+    // like the window's own content plane. Everything else z-slices.
+    const backdrops = canvasEntries.filter(({ rp }) => rp.backdrop === true);
+    canvasEntries = canvasEntries.filter(({ rp }) => rp.backdrop !== true);
+    for (const b of backdrops) this.drawCanvasLayerNode(key, b.node, b.rp, surfaceModel);
+
+    const meshOrder = [...opaque, ...transparent];
+    if (canvasEntries.length === 0) {
+      for (const e of meshOrder) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+    } else {
+      // Canvas layers are compositing planes: they slice the pass's meshes by
+      // camera depth, so 2D and 3D stack freely (2D → 3D → 2D → 3D → …).
+      // Back-to-front over the layers; each mesh draws in the slice its
+      // origin depth falls in (ties go behind the layer, so a HUD at a
+      // mesh's exact z still reads over it). Depth testing still resolves
+      // mesh-vs-mesh occlusion across slices.
+      canvasEntries.sort((a, b) => this.nodeCameraDepth(a.node, surfaceModel) - this.nodeCameraDepth(b.node, surfaceModel));
+      const depths = new Map<VocabNode, number>();
+      for (const e of meshOrder) depths.set(e.node, this.nodeCameraDepth(e.node, surfaceModel));
+      const drawn = new Set<VocabNode>();
+      for (const layerEntry of canvasEntries) {
+        const layerDepth = this.nodeCameraDepth(layerEntry.node, surfaceModel);
+        for (const e of meshOrder) {
+          if (drawn.has(e.node) || depths.get(e.node)! > layerDepth) continue;
+          this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+          drawn.add(e.node);
+        }
+        this.drawCanvasLayerNode(key, layerEntry.node, layerEntry.rp, surfaceModel);
+      }
+      for (const e of meshOrder) {
+        if (!drawn.has(e.node)) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+      }
+    }
+
+    if (scissored) this.renderer.clearScissor();
+  }
+
+  /** Draw one resolved mesh entry (shared by the plain and sliced paths). */
+  private drawMeshEntry(
+    key: string,
+    entry: { node: VocabNode; rp: Record<string, unknown> },
+    surfaceModel: Mat4,
+    lights: MeshLight[],
+    env: { ambient?: [number, number, number]; fog?: FogOpts },
+    shadow: ShadowOpts | undefined,
+  ): void {
+    {
+      const { node, rp } = entry;
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
       const color = parseCssColor(resolveSceneColor((rp.color as string) ?? '#ffffff', this.sceneTheme));
       const emissiveStr = rp.emissive as string | undefined;
@@ -2111,8 +2428,6 @@ export class Compositor {
         });
       }
     }
-
-    if (scissored) this.renderer.clearScissor();
   }
 
   /**
@@ -3118,16 +3433,22 @@ export class Compositor {
     let bestId: string | undefined;
     let bestT = Infinity;
     for (const node of nodes) {
-      if (node.kind !== 'mesh') continue;
-      // Meshes are decorative by default: only those that explicitly opt in with
+      if (node.kind !== 'mesh' && node.kind !== 'canvas') continue;
+      // Nodes are decorative by default: only those that explicitly opt in with
       // `params.interactive === true` are click/drag/keyboard targets. Without
       // this, a full-window decorative mesh (e.g. a water surface) would ray-
       // intercept every click and starve the window's widgets / input canvas.
       if (node.params.interactive !== true) continue;
       if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
-      const model = this.sceneStore.worldMatrix(node, frame);
+      let model = this.sceneStore.worldMatrix(node, frame);
       let t: number | null;
-      if (hasCustomGeometry(node.params)) {
+      if (node.kind === 'canvas') {
+        // A canvas layer picks as the same quad drawCanvasLayerNode renders.
+        const quadModel = this.canvasNodeModel(key, node, frame);
+        if (!quadModel) continue;
+        model = quadModel;
+        t = rayMeshHit(ray, model, 'plane');
+      } else if (hasCustomGeometry(node.params)) {
         const g = node.params.geometry as CustomGeometryParam;
         t = rayCustomMeshHit(ray, model, g.positions, g.indices);
       } else {

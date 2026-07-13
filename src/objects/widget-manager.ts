@@ -1453,7 +1453,13 @@ Window:   this.call(this.dep('WidgetManager'), 'createWindowAbject', { title, re
 Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins, spacing })
 Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
 Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
+          A layout-managed 2D layer. It is a BACKDROP layer of the window's scene (beneath any 3D
+          scene nodes); for 2D drawn OVER 3D, add your own kind:'canvas' SCENE NODE in front of the
+          meshes (see LAYERS under the 3D scene section) — same drawing contract either way.
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
+          Painting is INCREMENTAL everywhere: batches accumulate on the layer's pixels. Begin every
+          repaint with { type: 'clear', surfaceId: 'c', params: {} } (add color for an opaque
+          background; without it the cleared area is transparent). Coordinates are layer-local.
           Two dialects mix freely:
           High-level shapes: rect, text, line, circle, arc, ellipse, polygon, path, imageUrl, clear,
           shadow, linearGradient, radialGradient, conicGradient, bezierCurve, quadraticCurve.
@@ -1530,10 +1536,32 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           OCCLUSION (default): 3D nodes attached to a window are CLIPPED to the window's content area and sit
           BELOW its title bar — they cannot spill across the desktop or cover the chrome, so the window stays
           movable/closable. To let a node escape the frame (3D that pops OUT of the window, or a decoration
-          drawn over the chrome) set params.occlude:false. NOTE: occluded 3D draws on top of the window's own
-          2D background; for an immersive all-3D scene (fish tank, space view) create the window with the
-          tank/scene as 3D meshes and DON'T expect a separate giant backdrop plane — a full-window opaque mesh
-          just hides everything. A modest backdrop sized to the window (or none) is right.
+          drawn over the chrome) set params.occlude:false.
+          LAYERS — 2D layers are scene nodes; 2D and 3D stack in ANY order by z:
+          The window's own content (background, widgets, the createCanvas widget) is the BACKMOST 2D
+          layer of its subtree; scene nodes draw above it. A kind:'canvas' node is a 2D drawing layer
+          that lives IN the scene graph — a width×height px rectangle at its transform, painted with
+          the same 2D draw-command vocabulary:
+          this.call(windowId, 'scene', { ops: [{ op: 'add', id: 'hud', kind: 'canvas',
+            transform: { position: [0, 0, 150] },
+            params: { width: 800, height: 500, commands: [
+              { type: 'text', params: { x: 24, y: 24, text: 'Score: 12', fill: '$textPrimary', font: 'bold 24px sans-serif' } } ] } }] })
+          Paint it through the window's DRAW CHANNEL (preferred — incremental, and images are
+          content-addressed): this.call(windowId, 'draw', { nodeId: 'hud', commands: [...] }).
+          Commands ACCUMULATE on the layer's pixels; begin each repaint with { type: 'clear',
+          params: {} } (the layer erases to transparent — unpainted areas show the scene behind it;
+          a clear with a color opts into an opaque background). A scene update supplying
+          params.commands also works and REPLACES the batch wholesale.
+          ORDERING IS DEPTH: a canvas layer slices the meshes — meshes behind its z draw under it,
+          meshes in front draw over it. So background art (canvas at z -300) → meshes (z -200..100) →
+          HUD/text (canvas at z 150) → pop-out meshes (z 300) all compose in one window: 2D → 3D →
+          2D → 3D, as many layers as you like. Canvas layers scale/rotate/animate like any node
+          (transform + op:'animate'), and params.opacity/radius style the quad.
+          For 2D text/slide content/HUD that must stay readable over a 3D scene, a canvas node in
+          front of the meshes is THE way — the window's base canvas always renders beneath the 3D.
+          An immersive all-3D scene (fish tank, space view) needs no giant backdrop plane sized far
+          beyond the window — a modest backdrop sized to the window (or a canvas node behind the
+          meshes) is right.
           INHERITANCE: a child node inherits its parent group's material/behaviour params — color, emissive,
           opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
           sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms

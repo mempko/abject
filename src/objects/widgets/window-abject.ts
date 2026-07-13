@@ -152,8 +152,18 @@ export class WindowAbject extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'draw',
+                description: 'Paint this window\'s surface or one of its canvas-layer scene nodes with 2D draw commands. Painting is INCREMENTAL: commands accumulate on the target\'s pixels; a { type: "clear" } restarts it (and compacts the retained replay log — clear at repaint boundaries). Pass nodeId to target a kind:"canvas" scene node (2D layer among the 3D); omit it to paint the window surface itself. mode:"replace" prepends a clear when the batch lacks one. Commands use the standard 2D vocabulary ({ type, params } — rect, text, line, circle, path, imageUrl, markdown-free primitives, plus the Canvas 2D API dialect).',
+                parameters: [
+                  { name: 'commands', type: { kind: 'array', elementType: { kind: 'reference', reference: 'DrawCommand' } }, description: 'Draw commands ({ type, params }); surfaceId/nodeId are stamped by the window' },
+                  { name: 'nodeId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target canvas-layer scene node id (kind:"canvas"). Omit to paint the window surface.', optional: true },
+                  { name: 'mode', type: { kind: 'primitive', primitive: 'string' }, description: '"append" (default, incremental) or "replace" (prepends a clear when missing)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) }. Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) }. Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). LAYERS: the window\'s own content is the BACKMOST 2D layer; a kind:"canvas" node is a 2D drawing layer in the scene — params { width, height, commands (standard 2D draw commands; an update replaces the batch and repaints; the layer starts transparent), opacity?, radius? }. Canvas layers slice meshes by z: meshes behind draw under, meshes in front draw over — 2D and 3D stack in any order (put HUD/text on a canvas node in front of the meshes). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
                 parameters: [
                   { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
                 ],
@@ -306,6 +316,35 @@ export class WindowAbject extends Abject {
         request(this.id, this.uiServerId, 'scene', {
           surfaceId: this.surfaceId, ops, contributorId: msg.routing.from,
         })
+      );
+    });
+
+    // ── Draw channel: paint this window's surface or one of its canvas-layer
+    // scene nodes (kind:'canvas'). Painting is incremental — commands
+    // accumulate; a 'clear' restarts the target. mode:'replace' is sugar
+    // that prepends a clear when the batch lacks one.
+    this.on('draw', async (msg: AbjectMessage) => {
+      const { nodeId, commands, mode } = msg.payload as {
+        nodeId?: string;
+        commands: unknown[];
+        mode?: 'append' | 'replace';
+      };
+      contractRequire(this.surfaceId !== undefined, 'draw: window has no surface yet');
+      contractRequire(Array.isArray(commands), 'draw needs a commands array');
+      let out: Array<Record<string, unknown>> = commands.map((c) => ({
+        ...(c as Record<string, unknown>),
+        surfaceId: this.surfaceId!,
+        ...(nodeId ? { nodeId } : {}),
+      }));
+      if (mode === 'replace'
+        && !out.some((c) => c.type === 'clear' || c.type === 'reset')) {
+        out = [
+          { type: 'clear', surfaceId: this.surfaceId!, ...(nodeId ? { nodeId } : {}), params: {} },
+          ...out,
+        ];
+      }
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'draw', { commands: out })
       );
     });
 
@@ -569,6 +608,41 @@ COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, the same
 direction as input y — mouse deltas map onto positions with no sign flips.
 Nodes persist until { op: 'remove', id }. Tilt/float the window itself:
 \`call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 })\`.
+LAYERS — 2D layers are scene nodes, so 2D and 3D stack in ANY order by z.
+The window's own content (background, widgets, canvas widget) is the
+BACKMOST 2D layer of this subtree; scene nodes draw above it. A
+kind:'canvas' node is a 2D drawing layer IN the scene graph — a
+width×height px rectangle at its transform painted with the standard 2D
+draw-command vocabulary:
+
+  await this.call(windowId, 'scene', { ops: [
+    { op: 'add', id: 'hud', kind: 'canvas',
+      transform: { position: [0, 0, 150] },
+      params: { width: 800, height: 500, commands: [
+        { type: 'text', params: { x: 24, y: 24, text: 'Score: 12',
+          fill: '$textPrimary', font: 'bold 24px sans-serif' } },
+      ] } },
+  ] });
+
+Paint it through my DRAW CHANNEL (preferred — incremental):
+
+  await this.call(windowId, 'draw', { nodeId: 'hud', commands: [
+    { type: 'clear', params: {} },
+    { type: 'text', params: { x: 24, y: 24, text: 'Score: 13',
+      fill: '$textPrimary', font: 'bold 24px sans-serif' } },
+  ] });
+
+Commands ACCUMULATE on the layer's pixels; begin each repaint with a bare
+clear (the layer erases to transparent, so unpainted areas show the scene
+behind it; clear with a color opts into an opaque background). Omitting
+nodeId paints the window surface itself. mode:'replace' prepends a clear
+when the batch lacks one. A scene update supplying params.commands also
+works and replaces the batch wholesale.
+ORDERING IS DEPTH: meshes behind the layer's z draw under it, meshes in
+front draw over it — background canvas (z -300) → meshes → HUD canvas
+(z 150) → pop-out meshes compose freely. 2D text/HUD that must read over
+the 3D goes on a canvas node in front of the meshes; the window's base
+canvas always renders beneath them.
 Meshes are DECORATIVE BY DEFAULT and pass clicks through to the widgets/
 canvas beneath them. Add interactive:true to a mesh's params to make it an
 input target; then the window's owner receives 'nodeInput'

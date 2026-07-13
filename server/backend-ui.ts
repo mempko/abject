@@ -64,7 +64,14 @@ export interface SurfaceState {
   inputMonitor: boolean;
   transparent: boolean;
   closable: boolean;
-  lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
+  /**
+   * Retained draw-command logs per layer, for reconnect replay. Key '' is
+   * the surface's own texture; other keys are canvas-node ids (kind:'canvas'
+   * scene nodes painted through the draw channel). Logs are incremental —
+   * batches append — and compact at 'clear'/'reset' boundaries: everything
+   * before the last clear is dead paint and is dropped.
+   */
+  drawLogs: Map<string, DrawCmd[]>;
   /**
    * Retained scene-vocabulary nodes riding this surface's slab, compacted
    * to their latest definition (add + merged updates) for reconnect replay.
@@ -193,6 +200,18 @@ function mergeSceneUpdateOps(
 /** URL scheme for content-addressed images in draw commands. */
 const ABX_IMAGE_PREFIX = 'abx:sha256:';
 
+/** A draw command on the wire; nodeId targets a canvas-layer scene node. */
+type DrawCmd = { type: string; surfaceId: string; nodeId?: string; params: unknown };
+
+/**
+ * Ceiling on a single layer's retained draw log. A well-behaved app clears
+ * at frame/repaint boundaries, which compacts the log; one that only appends
+ * (endless strokes with no clear) would otherwise grow replay unboundedly.
+ * Past the cap the oldest commands are dropped — replay of such a layer is
+ * best-effort from that point, and a warning is logged once per layer.
+ */
+const MAX_DRAW_LOG = 20_000;
+
 /** Optional metadata supplied when registering a transport with addTransport. */
 export interface ClientMeta {
   kind?: 'websocket' | 'webrtc';
@@ -315,7 +334,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'draw',
-                description: 'Execute draw commands on a surface. Each command has exactly 3 fields: { type, surfaceId, params }. ' +
+                description: 'Execute draw commands on a surface. Each command has fields { type, surfaceId, params } plus optional nodeId to paint a canvas-layer scene node (kind:"canvas") instead of the surface texture. Painting is INCREMENTAL on every target: commands accumulate on the pixels and a "clear" restarts them (the retained replay log compacts at clear boundaries — clear at repaint boundaries). ' +
                   'Valid types: "clear" (params: {}), "rect" (params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }), ' +
                   '"text" (params: { x, y, text, font?, fill?, align?, baseline? }), "line" (params: { x1, y1, x2, y2, stroke?, lineWidth? }), ' +
                   '"path" (params: { path (SVG path string), fill?, stroke?, lineWidth? }), ' +
@@ -409,7 +428,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](one geometry drawn many times in a single call — particles/fields) } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — casters shadow each other) }. Environment params: { ambient?, fog?:{ color?, near, far }, bloom?:true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](one geometry drawn many times in a single call — particles/fields) } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — casters shadow each other) }. Environment params: { ambient?, fog?:{ color?, near, far }, bloom?:true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -826,9 +845,7 @@ export class BackendUI extends Abject {
     });
 
     this.on('draw', async (msg: AbjectMessage) => {
-      const { commands } = msg.payload as {
-        commands: Array<{ type: string; surfaceId: string; params: unknown }>;
-      };
+      const { commands } = msg.payload as { commands: DrawCmd[] };
       return this.handleDraw(msg.routing.from, commands);
     });
 
@@ -1555,9 +1572,24 @@ transient client state — re-issue them after a reconnect if you want them back
 OCCLUSION (window scope): a window's 3D children are clipped to the window's
 content area and sit below the title bar by default — they can't spill across
 the desktop or cover the chrome. Set params.occlude:false to let a node draw on
-top / extend past the window (pop-out 3D, decorations over the chrome). Occluded
-3D draws on top of the window's own 2D background, so an immersive all-3D window
-should BE its 3D content, not hide it behind a full-window opaque backdrop mesh.
+top / extend past the window (pop-out 3D, decorations over the chrome).
+LAYERS — 2D layers are scene nodes; 2D and 3D stack in ANY order by depth. The
+window's own content (background, widgets, canvas widget) is the BACKMOST 2D
+layer of its subtree; scene nodes draw above it. A kind:'canvas' node is a 2D
+drawing layer IN the scene graph — a width×height px rectangle at its
+transform (or params.rect { x, y, width, height } for window-absolute
+placement; params.backdrop:true pins it behind ALL meshes like the window's
+content plane). Paint it through the draw channel — 'draw' with { nodeId } —
+where commands ACCUMULATE and a bare 'clear' erases to transparent (so
+unpainted areas show the scene behind it; clear with a color opts into an
+opaque background). A scene update supplying params.commands also works and
+replaces the batch wholesale; opacity and radius style the quad. Canvas
+layers slice meshes by z: meshes behind the layer draw under it, meshes in
+front draw over it — background canvas (z -300) → meshes → HUD/text canvas
+(z 150) → pop-out meshes compose freely in one window. 2D text/HUD that must
+read over the 3D goes on a canvas node in front of the meshes. An immersive
+all-3D window should BE its 3D content, not hide it behind a full-window
+opaque backdrop mesh.
 
 INHERITANCE: a child inherits its parent group's material/behaviour params —
 color, emissive, opacity, metalness, roughness, texture, drawMode, pointSize,
@@ -1843,10 +1875,15 @@ IMPORTANT:
    * the ack handler resumes flushing).
    *
    * Coalescing rules — all order-preserving, applied only to messages that
-   * fully supersede an older queued one:
-   *   - a single-surface 'draw' (a full repaint of that surface) replaces the
-   *     previously queued single-surface draw for the same surface, provided
-   *     no later queued message touches that surface;
+   * fully supersede (or safely merge into) an older queued one:
+   *   - a single-layer 'draw' (one surface + one canvas-node target) whose
+   *     batch contains a 'clear'/'reset' is a full repaint: it replaces the
+   *     previously queued draw for the same layer, provided no later queued
+   *     message touches that surface (scene ops that might create the node
+   *     the draw targets must stay ordered before it);
+   *   - a single-layer 'draw' WITHOUT a clear is incremental: it merges by
+   *     concatenation into the queued draw for the same layer instead —
+   *     dropping it would lose paint;
    *   - 'setCursor' replaces a previously queued setCursor.
    * Everything else appends. This keeps a slow client's queue bounded by
    * state size rather than by frame rate.
@@ -1855,25 +1892,41 @@ IMPORTANT:
     const queue = client.sendQueue;
 
     if (msg.type === 'draw') {
-      const surfaces = new Set(msg.commands.map((c) => c.surfaceId));
-      if (surfaces.size === 1) {
-        const sid: string = msg.commands[0].surfaceId;
-        const drawIdx = client.queuedDrawIndex.get(sid);
+      const cmds = msg.commands as DrawCmd[];
+      const surfaces = new Set(cmds.map((c) => c.surfaceId));
+      const layerKeys = new Set(cmds.map((c) => `${c.surfaceId} ${c.nodeId ?? ''}`));
+      if (surfaces.size === 1 && layerKeys.size === 1) {
+        const sid: string = cmds[0].surfaceId;
+        const layerKey = [...layerKeys][0];
+        const drawIdx = client.queuedDrawIndex.get(layerKey);
         if (drawIdx !== undefined && client.lastSurfaceTouch.get(sid) === drawIdx) {
-          queue[drawIdx] = msg;
-          client.coalescedDrops++;
-          this.maybeScheduleFlush(client);
-          return;
+          const fullRepaint = cmds.some((c) => c.type === 'clear' || c.type === 'reset');
+          const prev = queue[drawIdx] as { commands: DrawCmd[] };
+          if (fullRepaint) {
+            queue[drawIdx] = msg;
+            client.coalescedDrops++;
+            this.maybeScheduleFlush(client);
+            return;
+          }
+          // Merge incremental paint by concatenation — but bounded: an
+          // endless clearless painter against a stalled client would
+          // otherwise grow one message without limit (each merge re-copies
+          // the array, freezing the worker). Past the cap, append as a
+          // separate message and let the queue-length backstop rule.
+          if (prev.commands.length + cmds.length <= 8_000) {
+            queue[drawIdx] = { ...msg, commands: prev.commands.concat(cmds) } as BackendToFrontendMsg;
+            client.coalescedDrops++;
+            this.maybeScheduleFlush(client);
+            return;
+          }
         }
         queue.push(msg);
-        client.queuedDrawIndex.set(sid, queue.length - 1);
+        client.queuedDrawIndex.set(layerKey, queue.length - 1);
         client.lastSurfaceTouch.set(sid, queue.length - 1);
       } else {
         queue.push(msg);
-        for (const sid of surfaces) {
-          client.queuedDrawIndex.delete(sid);
-          client.lastSurfaceTouch.set(sid, queue.length - 1);
-        }
+        for (const key of layerKeys) client.queuedDrawIndex.delete(key);
+        for (const sid of surfaces) client.lastSurfaceTouch.set(sid, queue.length - 1);
       }
     } else if (msg.type === 'setCursor') {
       if (client.queuedCursorIndex !== undefined) {
@@ -2007,7 +2060,7 @@ IMPORTANT:
       inputMonitor: inputMonitor ?? false,
       transparent: transparent ?? false,
       closable: closable ?? true,
-      lastDrawCommands: [],
+      drawLogs: new Map(),
       sceneNodes: new Map(),
       sceneContributors: new Map(),
     });
@@ -2034,7 +2087,7 @@ IMPORTANT:
     }
 
     if (this.focusedNode?.surfaceId === surfaceId) this.focusedNode = undefined;
-    this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
+    for (const log of state.drawLogs.values()) this.releaseBlobs(this.blobHashesIn(log));
     this.surfaces.delete(surfaceId);
 
     this.sendToFrontend({
@@ -2053,7 +2106,7 @@ IMPORTANT:
     let count = 0;
     for (const [surfaceId, state] of this.surfaces.entries()) {
       if (state.objectId === objectId) {
-        this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
+        for (const log of state.drawLogs.values()) this.releaseBlobs(this.blobHashesIn(log));
         this.surfaces.delete(surfaceId);
         this.sendToFrontend({ type: 'destroySurface', surfaceId });
         if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
@@ -2065,33 +2118,48 @@ IMPORTANT:
 
   private handleDraw(
     objectId: AbjectId,
-    commands: Array<{ type: string; surfaceId: string; params: unknown }>
+    commands: DrawCmd[]
   ): boolean {
-    // Filter commands to only include surfaces owned by the caller, then
-    // intern inline data: URI images into the content-addressed blob store
-    // so repaints and replays reference bytes the client already holds.
+    // Filter to surfaces the caller may paint: its own surfaces, plus
+    // canvas-layer nodes it CONTRIBUTED to another window (a widget painting
+    // its backdrop layer, a decorator painting its HUD node). Then intern
+    // inline data: URI images into the content-addressed blob store so
+    // repaints and replays reference bytes the client already holds.
     const validCommands = commands
-      .filter((cmd) => this.surfaces.get(cmd.surfaceId)?.objectId === objectId)
-      .map((cmd) => this.internImageCommand(cmd));
+      .filter((cmd) => {
+        const st = this.surfaces.get(cmd.surfaceId);
+        if (!st) return false;
+        if (st.objectId === objectId) return true;
+        return cmd.nodeId !== undefined && st.sceneContributors.get(cmd.nodeId) === objectId;
+      })
+      .map((cmd) => this.internImageCommand(cmd) as DrawCmd);
 
-    // Retain the new batch's blobs BEFORE releasing the replaced batch's —
-    // a repaint reusing the same image must not let its refcount touch zero.
+    // Retain the incoming batch's blobs up-front so log bookkeeping below
+    // can never let a still-referenced image's refcount touch zero.
     const hashes = this.blobHashesIn(validCommands);
     this.retainBlobs(hashes);
 
-    // Snapshot the latest draw batch per surface so reconnecting clients can
-    // be replayed (handleClientReady reuses state.lastDrawCommands).
-    const touched = new Set<string>();
+    // Append each command to its layer's retained log (key '' = the surface
+    // texture, otherwise a canvas-node id), compacting at clear boundaries,
+    // so reconnecting clients replay exactly the live pixels' history.
+    const grouped = new Map<string, { state: SurfaceState; nodeId: string; cmds: DrawCmd[] }>();
     for (const cmd of validCommands) {
       const state = this.surfaces.get(cmd.surfaceId);
       if (!state) continue;
-      if (!touched.has(cmd.surfaceId)) {
-        this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
-        state.lastDrawCommands = [];
-        touched.add(cmd.surfaceId);
+      const groupKey = `${cmd.surfaceId} ${cmd.nodeId ?? ''}`;
+      let group = grouped.get(groupKey);
+      if (!group) {
+        group = { state, nodeId: cmd.nodeId ?? '', cmds: [] };
+        grouped.set(groupKey, group);
       }
-      state.lastDrawCommands.push(cmd);
+      group.cmds.push(cmd);
     }
+    for (const { state, nodeId, cmds } of grouped.values()) {
+      this.appendToDrawLog(state, nodeId, cmds);
+    }
+    // The batch's blobs are now accounted for by the logs; drop the up-front
+    // retention (retain-before-release ordering keeps counts positive).
+    this.releaseBlobs(hashes);
 
     if (validCommands.length > 0) {
       if (hashes.length > 0) {
@@ -2110,6 +2178,33 @@ IMPORTANT:
 
     this.log('debug', 'draw', { objectId, commandCount: commands.length });
     return true;
+  }
+
+  /**
+   * Append a batch to one layer's retained log. A 'clear'/'reset' anywhere
+   * in the batch is a compaction point: everything before the LAST one is
+   * dead paint, so the log restarts there. Blob refcounts follow the log
+   * (retain the new log before releasing the old — counts never dip to zero
+   * for a still-referenced image).
+   */
+  private appendToDrawLog(state: SurfaceState, nodeId: string, batch: DrawCmd[]): void {
+    let lastClear = -1;
+    for (let i = batch.length - 1; i >= 0; i--) {
+      const t = batch[i].type;
+      if (t === 'clear' || t === 'reset') { lastClear = i; break; }
+    }
+    const prev = state.drawLogs.get(nodeId) ?? [];
+    let next = lastClear >= 0 ? batch.slice(lastClear) : prev.concat(batch);
+    this.retainBlobs(this.blobHashesIn(next));
+    this.releaseBlobs(this.blobHashesIn(prev));
+    if (next.length > MAX_DRAW_LOG) {
+      const dropped = next.slice(0, next.length - MAX_DRAW_LOG);
+      next = next.slice(-MAX_DRAW_LOG);
+      this.releaseBlobs(this.blobHashesIn(dropped));
+      this.log('warn', 'drawLogCapped', { surfaceId: state.surfaceId, nodeId, dropped: dropped.length });
+      log.warn(`Draw log for ${state.surfaceId}/${nodeId || '(surface)'} exceeded ${MAX_DRAW_LOG} commands; dropping oldest ${dropped.length} — send a 'clear' at repaint boundaries to compact`);
+    }
+    state.drawLogs.set(nodeId, next);
   }
 
   // ── Content-addressed image blobs ────────────────────────────────────
@@ -2220,6 +2315,7 @@ IMPORTANT:
       if (op.op === 'remove') {
         state!.sceneNodes.delete(op.id);
         state!.sceneContributors.delete(op.id);
+        this.dropNodeDrawLog(state!, op.id);
         continue;
       }
       if (op.op === 'add') {
@@ -2358,6 +2454,7 @@ IMPORTANT:
       for (const nodeId of dead) {
         state.sceneNodes.delete(nodeId);
         state.sceneContributors.delete(nodeId);
+        this.dropNodeDrawLog(state, nodeId);
         if (this.focusedNode?.surfaceId === state.surfaceId && this.focusedNode.nodeId === nodeId) {
           this.focusedNode = undefined;
         }
@@ -2368,6 +2465,14 @@ IMPORTANT:
         ops: dead.map((id) => ({ op: 'remove', id })),
       });
     }
+  }
+
+  /** Drop a removed canvas node's retained draw log (releasing its blobs). */
+  private dropNodeDrawLog(state: SurfaceState, nodeId: string): void {
+    const log_ = state.drawLogs.get(nodeId);
+    if (!log_) return;
+    this.releaseBlobs(this.blobHashesIn(log_));
+    state.drawLogs.delete(nodeId);
   }
 
   /** Tear down an owner's world nodes (owner unregistered/died). */
@@ -3157,17 +3262,19 @@ IMPORTANT:
       }, clientId);
     }
 
-    // 2. Replay last draw commands for each surface (image bytes first —
-    // a reconnecting client starts with an empty blob cache)
+    // 2. Replay each surface's own draw log (image bytes first — a
+    // reconnecting client starts with an empty blob cache). Canvas-node
+    // layer logs replay later, AFTER scene nodes exist client-side.
     const replayClient = this.clients.get(clientId);
     for (const state of this.surfaces.values()) {
-      if (state.lastDrawCommands.length > 0) {
+      const rootLog = state.drawLogs.get('');
+      if (rootLog && rootLog.length > 0) {
         if (replayClient) {
-          this.queueBlobsForClient(replayClient, this.blobHashesIn(state.lastDrawCommands));
+          this.queueBlobsForClient(replayClient, this.blobHashesIn(rootLog));
         }
         this.sendToClient({
           type: 'draw',
-          commands: state.lastDrawCommands,
+          commands: rootLog,
         }, clientId);
       }
     }
@@ -3236,9 +3343,21 @@ IMPORTANT:
       }, clientId);
     }
 
+    // 7. Replay canvas-node layer logs — after the scene ops above, so the
+    // nodes the commands target exist client-side before the paint arrives.
+    for (const state of this.surfaces.values()) {
+      for (const [nodeId, cmds] of state.drawLogs) {
+        if (nodeId === '' || cmds.length === 0) continue;
+        if (replayClient) {
+          this.queueBlobsForClient(replayClient, this.blobHashesIn(cmds));
+        }
+        this.sendToClient({ type: 'draw', commands: cmds }, clientId);
+      }
+    }
+
     let totalDrawCmds = 0;
     for (const state of this.surfaces.values()) {
-      totalDrawCmds += state.lastDrawCommands.length;
+      for (const cmds of state.drawLogs.values()) totalDrawCmds += cmds.length;
     }
     log.info(`Replayed ${this.surfaces.size} surfaces (${totalDrawCmds} draw commands) to ${clientId}`);
   }

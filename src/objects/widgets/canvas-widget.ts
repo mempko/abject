@@ -1,18 +1,20 @@
 /**
- * CanvasWidget — a widget that stores draw commands from a ScriptableAbject
- * and renders them into the parent window's surface.
+ * CanvasWidget — a layout-managed 2D drawing layer.
  *
- * Instead of creating a separate UIServer surface, the canvas widget draws
- * directly into the window's surface at its layout-assigned position.
- * This ensures the drawing area moves with the window and integrates
- * naturally with the widget layout system.
+ * The widget owns a kind:'canvas' scene node on its window (a backdrop
+ * layer pinned behind the window's 3D meshes, positioned at the widget's
+ * layout rect) and pipes validated draw batches to it through the window's
+ * draw channel. Painting is incremental: batches accumulate on the layer's
+ * pixels and a 'clear' restarts them. Coordinates are layer-local and
+ * clear/clearRect are real transparent erases — one drawing contract shared
+ * with every other canvas layer in the scene.
  */
 
 import {
   AbjectId,
   AbjectMessage,
 } from '../../core/types.js';
-import { event } from '../../core/message.js';
+import { event, request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText } from './rich-text-layout.js';
@@ -152,15 +154,40 @@ export interface CanvasWidgetConfig extends WidgetConfig {
 }
 
 /**
- * CanvasWidget — renders user-supplied draw commands into the parent window's surface.
+ * CanvasWidget — a layout-managed backdrop canvas layer painted by
+ * user-supplied draw commands.
  */
 export class CanvasWidget extends WidgetAbject {
-  private storedCommands: unknown[] = [];
   /** Cache of expanded markdown layouts, keyed by text+geometry, so re-renders
    *  don't re-run the (async, round-tripping) layout for unchanged blocks.
    *  Cleared when an image finishes resolving so resolved dims take effect. */
   private mdCache = new Map<string, unknown[]>();
   private inputTargetId: AbjectId;
+
+  // ── Backdrop-layer plumbing ─────────────────────────────────────────
+  // The widget owns a kind:'canvas' scene node on its window (a backdrop
+  // layer pinned behind all meshes, placed at the widget's layout rect) and
+  // pipes draw batches straight to UIServer. The widget itself contributes
+  // nothing to the shared window texture.
+  //
+  // The pipe is COALESCED with a single forward in flight: `draw` replies
+  // immediately after validation (a 60fps caller must never be gated on the
+  // cross-worker round trip), and while one forward is in transit further
+  // batches merge into ONE pending batch — a batch containing 'clear' is a
+  // full repaint and replaces the pending one; a clearless batch appends.
+  // Whatever the caller's frame rate, at most one request chain is in
+  // flight, matching the old store-and-render-later throughput.
+  private layerReady = false;
+  private layerRect?: Rect;
+  private surfaceIdCache?: string;
+  private pendingForward?: unknown[];
+  private forwardInFlight = false;
+  /** Last submitted batch — re-queued when a markdown image resolves. */
+  private lastBatch?: unknown[];
+
+  private get layerNodeId(): string {
+    return `canvas-widget-${this.id}`;
+  }
 
   constructor(config: CanvasWidgetConfig) {
     super(config);
@@ -170,7 +197,7 @@ export class CanvasWidget extends WidgetAbject {
     // Override manifest to include the canvas interface
     (this as unknown as { manifest: unknown }).manifest = {
       name: 'CanvasWidget',
-      description: 'Canvas drawing widget — stores draw commands and renders into parent window surface. Forwards mouse/keyboard input from the compositor to the configured inputTargetId via the `input` event.',
+      description: 'Canvas drawing widget — a layout-managed 2D layer painted by draw commands (incremental: batches accumulate; begin each repaint with clear). Forwards mouse/keyboard input from the compositor to the configured inputTargetId via the `input` event.',
       version: '1.0.0',
       interface: {
           id: CANVAS_INTERFACE,
@@ -179,7 +206,7 @@ export class CanvasWidget extends WidgetAbject {
           methods: [
             {
               name: 'draw',
-              description: 'Submit draw commands to render on the canvas',
+              description: 'Submit draw commands to paint on the canvas. Incremental: batches accumulate on the pixels; begin each repaint with { type: "clear", surfaceId: "c", params: {} } (add color for an opaque background).',
               parameters: [
                 { name: 'commands', type: { kind: 'array', elementType: { kind: 'reference', reference: 'DrawCommand' } }, description: 'Draw commands' },
               ],
@@ -229,6 +256,10 @@ export class CanvasWidget extends WidgetAbject {
 
 I render the \`draw\` commands you send me. Each command is an object \`{ type, surfaceId: 'c', params }\` (surfaceId is rewritten internally; any string works). Commands execute in order against a stateful 2D context, and two dialects mix freely: high-level self-contained shapes, and the standard HTML5 Canvas 2D API (every context method is a command type with params named after the MDN argument names; every settable context property is a command with params \`{ value }\`). I REJECT the whole batch with an error if any command has an unknown type or is missing required params — nothing is drawn until every command is valid.
 
+PAINTING IS INCREMENTAL: I am my own layer (a rectangle of pixels), and draw batches ACCUMULATE on it — a new batch paints over what is already there. Begin every repaint with \`{ type: 'clear', surfaceId: 'c', params: {} }\` (add \`color\` for an opaque background; without it the erased area is transparent and shows the window background). Coordinates are LOCAL to me (0,0 = my top-left), including \`setTransform\`, and \`clear\`/\`clearRect\` are real transparent erases.
+
+\`draw\` replies as soon as the batch validates; the pixels land asynchronously. Rapid batches coalesce (a batch starting with \`clear\` supersedes an unpainted one), so an animation loop can await \`draw\` at 60fps without ever being gated on rendering.
+
 ### High-level shapes (all take optional \`fill\`, \`stroke\`, \`lineWidth\` in params)
 - \`rect\` — { x, y, width, height, fill?, stroke?, lineWidth?, radius? }   (radius = rounded corners)
 - \`circle\` — { cx, cy, radius, fill?, stroke? }
@@ -245,7 +276,7 @@ Text and images:
 - \`imageUrl\` — { x, y, width?, height?, url }
 
 State and effects:
-- \`clear\` — { color? } (fills the whole canvas; use as the first command each frame)
+- \`clear\` — { color? } (erases the whole canvas to transparent, then fills when color is given; use as the first command of every repaint — it also compacts my retained replay log)
 - \`shadow\` — { color, blur, offsetX?, offsetY? }
 - \`linearGradient\` — { x0, y0, x1, y1, stops: [{offset, color},...] } (becomes the fill for subsequent shapes until changed)
 - \`radialGradient\` — { cx0, cy0, r0, cx1, cy1, r1, stops: [...] }, \`conicGradient\` — { startAngle, cx, cy, stops: [...] }
@@ -290,9 +321,10 @@ async _render() {
 
 Notes:
 - Shorthand param names \`r\`, \`rx\`, \`ry\`, \`w\`, \`h\` are accepted and treated as \`radius\`, \`radiusX\`, \`radiusY\`, \`width\`, \`height\`; \`color\` on shapes is rejected (use \`fill\` or \`stroke\`).
-- I draw into the parent window's surface, so \`clear\`, \`reset\`, and \`clearRect\` become opaque background fills (default '#000') rather than transparent erases, and \`setTransform\` coordinates are window-absolute — prefer \`save\`/\`translate\`/\`restore\` or \`transform\`.
+- I am a BACKDROP layer of the window's scene subtree: I render above the window background but BENEATH any 3D scene nodes attached to the window (like the window's own content plane). I am implemented as a \`kind: 'canvas'\` scene node the window manages for me.
 - Value-returning context APIs (measureText, getImageData, isPointInPath, getTransform, createPattern) have no command form — a draw batch cannot return data.
 - For real 3D content (meshes, lights) attach retained scene nodes to your WINDOW instead: \`call(windowId, 'scene', { ops: [...] })\` — ask the window for its scene vocabulary. This canvas stays the way to draw 2D.
+- For 2D content that must draw OVER the window's 3D scene (HUD, slide text, scores), create your own \`kind: 'canvas'\` SCENE NODE in front of the meshes — same drawing contract as me, positioned by its transform — and paint it with \`call(windowId, 'draw', { nodeId, commands })\`. Canvas layers interleave with meshes by z, so 2D and 3D stack in any order.
 
 ## CanvasWidget — Input Forwarding
 
@@ -347,8 +379,8 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
         );
       }
 
-      this.storedCommands = commands;
-      await this.requestRedraw();
+      this.lastBatch = commands;
+      this.queueForward(commands);
       return true;
     });
 
@@ -375,69 +407,122 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
 
   // ---- WidgetAbject implementation ----
 
+  /**
+   * The widget paints nothing onto the shared window texture. Rendering is
+   * the moment layout geometry is known, so it maintains the backdrop layer
+   * node here (create on first layout, update rect on move/resize) and
+   * flushes any draw batches that arrived before the layer existed.
+   *
+   * Known limitation: inside a scrolling container the layer does not follow
+   * the scroll viewport clip (canvas widgets in scrollables are not a
+   * supported layout today).
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
-    const commands: unknown[] = [];
-    const w = this.rect.width;
-    const h = this.rect.height;
-
-    // Wrap user commands: save → translate → clip → [user commands] → restore
-    commands.push({ type: 'save', surfaceId, params: {} });
-    commands.push({ type: 'translate', surfaceId, params: { x: ox, y: oy } });
-    commands.push({ type: 'clip', surfaceId, params: { x: 0, y: 0, width: w, height: h } });
-
-    // Process each user command
-    for (const cmd of this.storedCommands) {
-      const c = cmd as { type: string; surfaceId?: string; params?: Record<string, unknown> };
-
-      if (c.type === 'clear' || c.type === 'reset') {
-        // Replace with a filled rect (clear/reset would wipe the entire
-        // window surface and its context state, including this wrapper's
-        // translate/clip)
-        const color = (c.params as { color?: string })?.color;
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: { x: 0, y: 0, width: w, height: h, fill: color ?? '#000' },
-        });
-      } else if (c.type === 'clearRect') {
-        // clearRect would punch a transparent hole in the shared window
-        // surface; paint the background color instead
-        const p = (c.params ?? {}) as { x?: number; y?: number; width?: number; height?: number };
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: { x: p.x ?? 0, y: p.y ?? 0, width: p.width ?? w, height: p.height ?? h, fill: '#000' },
-        });
-      } else if (c.type === 'putImageData') {
-        // putImageData ignores the canvas transform, so the wrapper's
-        // translate does not apply — bake the widget offset into dx/dy
-        const p = (c.params ?? {}) as { dx?: number; dy?: number };
-        commands.push({
-          ...c,
-          surfaceId,
-          params: { ...(c.params ?? {}), dx: (p.dx ?? 0) + ox, dy: (p.dy ?? 0) + oy },
-        });
-      } else if (c.type === 'markdown') {
-        // Expand a markdown block into primitive text/imageUrl/rect/line
-        // commands using the same engine the label widget uses. Coordinates
-        // are canvas-local (the wrapper's translate already applied).
-        const expanded = await this.expandMarkdown(surfaceId, (c.params ?? {}) as Record<string, unknown>);
-        for (const e of expanded) commands.push(e);
-      } else {
-        // Replace surfaceId with the window's surfaceId
-        commands.push({ ...c, surfaceId });
-      }
+    this.surfaceIdCache = surfaceId;
+    const w = this._renderRect.width;
+    const h = this._renderRect.height;
+    if (w > 0 && h > 0) {
+      await this.syncLayer({ x: ox, y: oy, width: w, height: h });
     }
-
-    commands.push({ type: 'restore', surfaceId, params: {} });
-
-    return commands;
+    void this.flushForwards();
+    return [];
   }
 
-  /** Invalidate the markdown layout cache when an image resolves so the next
-   *  render picks up the now-known image dimensions. */
+  /** Create or reposition the widget's backdrop layer node on the window. */
+  private async syncLayer(rect: Rect): Promise<void> {
+    const same = this.layerRect
+      && this.layerRect.x === rect.x && this.layerRect.y === rect.y
+      && this.layerRect.width === rect.width && this.layerRect.height === rect.height;
+    if (this.layerReady && same) return;
+    const op = this.layerReady
+      ? { op: 'update', id: this.layerNodeId, params: { rect } }
+      : { op: 'add', id: this.layerNodeId, kind: 'canvas', params: { rect, backdrop: true } };
+    try {
+      await this.request(request(this.id, this.ownerId, 'scene', { ops: [op] }));
+    } catch {
+      return; // window not ready yet — retried on the next render
+    }
+    this.layerRect = { ...rect };
+    if (!this.layerReady) {
+      this.layerReady = true;
+      void this.flushForwards();
+    }
+  }
+
+  /**
+   * Merge a validated batch into the pending forward and kick the flusher.
+   * A batch containing a 'clear'/'reset' fully repaints the layer, so it
+   * REPLACES anything pending; a clearless batch is incremental paint and
+   * appends. This also buffers batches that arrive before the layer node
+   * exists (pre-first-layout).
+   */
+  private queueForward(commands: unknown[]): void {
+    if (!this.pendingForward) {
+      this.pendingForward = commands;
+    } else {
+      const fullRepaint = commands.some((c) => {
+        const t = (c as { type?: string }).type;
+        return t === 'clear' || t === 'reset';
+      });
+      this.pendingForward = fullRepaint ? commands : this.pendingForward.concat(commands);
+    }
+    void this.flushForwards();
+  }
+
+  /** Drain pending batches, one forward in flight at a time. */
+  private async flushForwards(): Promise<void> {
+    if (this.forwardInFlight) return;
+    this.forwardInFlight = true;
+    try {
+      while (this.pendingForward && this.layerReady && this.surfaceIdCache) {
+        const batch = this.pendingForward;
+        this.pendingForward = undefined;
+        await this.forwardBatch(batch);
+      }
+    } finally {
+      this.forwardInFlight = false;
+    }
+  }
+
+  /**
+   * Pipe one validated batch to the widget's layer, straight to UIServer
+   * (the backend allows node-layer draws from the node's scene contributor).
+   * Only markdown commands need pre-processing (expansion into primitives);
+   * everything else passes through untouched — coordinates are layer-local,
+   * and clear/clearRect are REAL transparent erases (the layer composites
+   * over the window background, so an uncolored clear shows it).
+   */
+  private async forwardBatch(commands: unknown[]): Promise<void> {
+    const surfaceId = this.surfaceIdCache!;
+    const out: Array<Record<string, unknown>> = [];
+    for (const cmd of commands) {
+      const c = cmd as { type: string; params?: Record<string, unknown> };
+      if (c.type === 'markdown') {
+        const expanded = await this.expandMarkdown(surfaceId, (c.params ?? {}) as Record<string, unknown>);
+        for (const e of expanded) out.push(e as Record<string, unknown>);
+      } else {
+        out.push(cmd as Record<string, unknown>);
+      }
+    }
+    const stamped = out.map((c) => ({ ...c, surfaceId, nodeId: this.layerNodeId }));
+    try {
+      await this.request(
+        request(this.id, this.uiServerId, 'draw', { commands: stamped })
+      );
+    } catch {
+      // Surface tearing down mid-draw — nothing to paint on.
+    }
+  }
+
+  /** Invalidate the markdown layout cache when an image resolves, and
+   *  re-queue the last batch so the layer repaints with real image dims.
+   *  (Layers are incremental; the re-forward over-paints the same geometry —
+   *  a batch that begins with 'clear' repaints exactly.) */
   protected override onImageResolved(): void {
     this.mdCache.clear();
+    if (this.lastBatch) {
+      this.queueForward(this.lastBatch);
+    }
   }
 
   /**
@@ -546,6 +631,15 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
           // Target may be gone
         }
       }
+    }
+    // Hiding the widget must hide its layer too — the layer lives in the
+    // scene graph, not in the widget render pass that visibility gates.
+    if (updates.visible !== undefined && this.layerReady) {
+      void this.request(
+        request(this.id, this.ownerId, 'scene', { ops: [
+          { op: 'update', id: this.layerNodeId, params: { opacity: this.visible ? 1 : 0 } },
+        ] })
+      ).catch(() => { /* window may be gone */ });
     }
   }
 }

@@ -12,7 +12,7 @@
  * its window.
  */
 
-export const SCENE_NODE_KINDS = ['group', 'mesh', 'light', 'environment'] as const;
+export const SCENE_NODE_KINDS = ['group', 'mesh', 'light', 'environment', 'canvas'] as const;
 export type SceneNodeKind = typeof SCENE_NODE_KINDS[number];
 
 export const MESH_PRIMITIVES = ['plane', 'box', 'sphere', 'cylinder', 'cone', 'torus', 'icosphere'] as const;
@@ -75,6 +75,22 @@ export interface SceneOp {
    * - light: { lightType: 'point'|'directional'|'spot', color?, intensity?,
    *           direction? [x,y,z], range?, angle?, penumbra? }
    * - environment: { ambient?, fog?: { color?, near, far } } — scene-wide mood.
+   * - canvas: { width, height, rect?, backdrop?, commands?, opacity?,
+   *          radius?, occlude?, interactive? } — a 2D drawing layer living in
+   *          the scene graph: a rectangle painted by the standard 2D
+   *          draw-command vocabulary. Placement: width/height px at the
+   *          node's transform (scale multiplies), OR rect { x, y, width,
+   *          height } window-absolute px from the top-left. Painting:
+   *          params.commands (an update supplying commands replaces the
+   *          batch and repaints) or, preferred for incremental apps, the
+   *          draw channel — window 'draw' with { nodeId } — where commands
+   *          accumulate and 'clear' restarts. The layer starts transparent —
+   *          unpainted areas show the scene behind it. Canvas layers slice
+   *          the subtree's meshes by depth: meshes behind the layer's z draw
+   *          under it, meshes in front draw over it, so 2D and 3D content
+   *          stack freely (2D → 3D → 2D → 3D → …). backdrop:true pins the
+   *          layer behind ALL meshes regardless of z (window backgrounds,
+   *          layout-managed widget canvases).
    * - group: {}
    *
    * For op:'animate', params is the animation spec:
@@ -390,6 +406,48 @@ export function validateSceneOps(ops: unknown[]): string[] {
             }
           }
         }
+      }
+    }
+    if (kind === 'canvas' || (o.op === 'update' && (params.commands !== undefined || params.rect !== undefined))) {
+      const rect = params.rect as Record<string, unknown> | undefined;
+      if (rect !== undefined) {
+        if (!rect || typeof rect !== 'object'
+          || typeof rect.x !== 'number' || typeof rect.y !== 'number'
+          || typeof rect.width !== 'number' || (rect.width as number) <= 0
+          || typeof rect.height !== 'number' || (rect.height as number) <= 0) {
+          problems.set(`${o.id}:rect`, `'${o.id}': canvas params.rect must be { x, y, width > 0, height > 0 } in window px from the top-left`);
+        }
+      } else if (o.op === 'add') {
+        for (const dim of ['width', 'height'] as const) {
+          if (typeof params[dim] !== 'number' || (params[dim] as number) <= 0) {
+            problems.set(`${o.id}:${dim}`, `'${o.id}': canvas needs numeric params.${dim} > 0 (the layer's pixel size; transform.scale multiplies it) — or params.rect { x, y, width, height } for window-absolute placement`);
+          }
+        }
+      }
+      if (params.backdrop !== undefined && typeof params.backdrop !== 'boolean') {
+        problems.set(`${o.id}:backdrop`, `'${o.id}': params.backdrop must be true|false (true pins the layer behind ALL meshes, like the window's own content plane)`);
+      }
+      if (params.commands !== undefined) {
+        if (!Array.isArray(params.commands)) {
+          problems.set(`${o.id}:commands`, `'${o.id}': params.commands must be an array of { type, params } 2D draw commands (same vocabulary as a canvas widget's draw)`);
+        } else {
+          for (let i = 0; i < params.commands.length; i++) {
+            const c = params.commands[i] as Record<string, unknown> | null;
+            if (!c || typeof c !== 'object' || typeof c.type !== 'string') {
+              problems.set(`${o.id}:commands`, `'${o.id}': params.commands[${i}] must be an object with a string 'type' (e.g. { type: 'text', params: { x, y, text, fill } })`);
+              break;
+            }
+          }
+        }
+      }
+      if (params.opacity !== undefined && typeof params.opacity !== 'number') {
+        problems.set(`${o.id}:opacity`, `'${o.id}': params.opacity must be a number 0..1`);
+      }
+      if (params.radius !== undefined && typeof params.radius !== 'number') {
+        problems.set(`${o.id}:radius`, `'${o.id}': params.radius must be a number (px corner rounding)`);
+      }
+      if (params.occlude !== undefined && typeof params.occlude !== 'boolean') {
+        problems.set(`${o.id}:occlude`, `'${o.id}': params.occlude must be true|false (false = draw on top, not clipped to the window)`);
       }
     }
     if (kind === 'light') {

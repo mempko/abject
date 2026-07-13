@@ -21,6 +21,12 @@ export interface VocabNode {
    * deforms a custom mesh and re-upload the GPU buffers only when needed.
    */
   geomRev: number;
+  /**
+   * Bumped each time an applied op supplies `params.commands` (canvas-layer
+   * nodes), so the renderer repaints the layer's pixels only when its draw
+   * commands actually changed — transform-only updates skip the repaint.
+   */
+  canvasRev: number;
 }
 
 export class SceneStore {
@@ -44,6 +50,7 @@ export class SceneStore {
           transform: op.transform ?? {},
           params: op.params ?? {},
           geomRev: op.params?.geometry !== undefined ? 1 : 0,
+          canvasRev: op.params?.commands !== undefined ? 1 : 0,
         };
         this.nodes.set(key, node);
         let set = this.bySurface.get(surfaceId);
@@ -73,6 +80,9 @@ export class SceneStore {
           }
           node.geomRev++;
         }
+        // Canvas-layer commands REPLACE whole (the spread above already did)
+        // — a repaint always starts from the full new batch.
+        if (op.params.commands !== undefined) node.canvasRev++;
       }
       if (op.parentId !== undefined) node.parentId = op.parentId;
     }
