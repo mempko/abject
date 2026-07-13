@@ -1518,7 +1518,12 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           (re-send instances in an 'update' op to move them).
           LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
           angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
-          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with
+          frustum auto-fit to the scene).
+          INTENSITY IS A LINEAR MULTIPLIER ON THE LIGHT'S COLOR (1 = that color at full strength), NOT watts,
+          lumens, or candela. Real scenes use key 0.8-1.6, fill 0.3-0.6; values above 10 are REJECTED because
+          they multiply every channel past white and every lit mesh renders PURE WHITE, erasing its own color.
+          To light a bigger scene, raise 'range' (how far the light reaches, in world px) — never intensity.
+          ENVIRONMENT: add a kind:'environment' node with
           { ambient?, fog?: { color, near, far }, bloom?: true|{ threshold, intensity } } for scene-wide
           mood, depth, and a glow post-effect on bright/emissive meshes (neon, highlights).
           ambient is a COLOR ('#hex' or $token — e.g. '#1e293b'), NOT a number: carry the ambient

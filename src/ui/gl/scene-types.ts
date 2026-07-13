@@ -20,6 +20,16 @@ export type MeshPrimitive = typeof MESH_PRIMITIVES[number];
 
 export const LIGHT_TYPES = ['point', 'directional', 'spot'] as const;
 
+/**
+ * Upper bound on a light's `intensity`. Intensity multiplies the light's
+ * color linearly (1 = the color at full strength), so anything much above a
+ * few blows every channel past white and erases every mesh's albedo. Real
+ * scenes here use 0.3-1.6; the cap leaves generous headroom while catching
+ * the photometric-units mistake (intensity: 1600) that renders an all-white
+ * scene. Reach is controlled by `range`, not intensity.
+ */
+export const MAX_LIGHT_INTENSITY = 10;
+
 export const DRAW_MODES = ['triangles', 'lines', 'points'] as const;
 
 /** Declarative animation channels and presets carried in an 'animate' op's params. */
@@ -464,6 +474,18 @@ export function validateSceneOps(ops: unknown[]): string[] {
         if (params[k] !== undefined && typeof params[k] !== 'number') {
           problems.set(`${o.id}:${k}`, `'${o.id}': light params.${k} must be a number`);
         }
+      }
+      // Intensity is a LINEAR MULTIPLIER on the light's color, not a
+      // photometric quantity. Generators reach for watts/lumens/candela
+      // (intensity: 1600) which multiplies every channel far past white, so
+      // every lit mesh clips to pure white regardless of its own color — the
+      // albedo is simply gone. Reject loudly rather than render a white scene.
+      if (typeof params.intensity === 'number'
+        && (params.intensity < 0 || params.intensity > MAX_LIGHT_INTENSITY)) {
+        problems.set(
+          `${o.id}:intensity`,
+          `'${o.id}': light params.intensity must be 0..${MAX_LIGHT_INTENSITY} — it is a LINEAR MULTIPLIER on params.color (1 = the color at full strength; typical keys 0.8-1.6, fills 0.3-0.6), NOT watts/lumens/candela. Got ${params.intensity}, which multiplies every channel past white and renders every lit mesh pure white. To light a LARGER scene use params.range (how far the light reaches, in world px) — never a bigger intensity.`,
+        );
       }
       if (params.castShadow !== undefined && typeof params.castShadow !== 'boolean') {
         problems.set(`${o.id}:castShadow`, `'${o.id}': light params.castShadow must be true|false (directional lights only)`);
