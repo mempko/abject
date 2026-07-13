@@ -32,6 +32,13 @@ export class WorkerBus implements MessageBusLike {
   private peerPorts: Map<number, MessagePort> = new Map();
   /** Maps remote object IDs to the peer worker index that hosts them. */
   private peerObjects: Map<AbjectId, number> = new Map();
+  /**
+   * Global liveness view pushed from the main thread (live:add/live:remove):
+   * every id registered anywhere in the system — main, dedicated workers,
+   * other pool workers. Lets worker-hosted registries and sweepers answer
+   * isRegistered() with the same truth the main bus has.
+   */
+  private globalObjects: Set<AbjectId> = new Set();
 
   constructor(postToMain?: PostToMainFn) {
     this.postToMain = postToMain ?? ((data: unknown) => self.postMessage(data));
@@ -46,6 +53,13 @@ export class WorkerBus implements MessageBusLike {
     }
     const mailbox = new Mailbox();
     this.mailboxes.set(objectId, mailbox);
+    // Announce to the main thread so the main bus routes messages for this
+    // id to our bridge. Factory-spawned objects are announced by the spawn
+    // protocol too (idempotent), but objects constructed LOCALLY by another
+    // worker object — e.g. every window/widget WidgetManager news up — are
+    // only visible through this announcement. Without it, anything outside
+    // this worker that replies or sends to them hits UNDELIVERABLE.
+    this.postToMain({ type: 'bus:registered', objectId });
     return mailbox;
   }
 
@@ -59,6 +73,7 @@ export class WorkerBus implements MessageBusLike {
     }
     this.mailboxes.delete(objectId);
     resetSequence(objectId);
+    this.postToMain({ type: 'bus:unregistered', objectId });
   }
 
   /**
@@ -85,6 +100,15 @@ export class WorkerBus implements MessageBusLike {
    */
   removePeerObject(objectId: AbjectId): void {
     this.peerObjects.delete(objectId);
+  }
+
+  /** Record a global-liveness fact pushed from the main thread. */
+  addGlobalObject(objectId: AbjectId): void {
+    this.globalObjects.add(objectId);
+  }
+
+  removeGlobalObject(objectId: AbjectId): void {
+    this.globalObjects.delete(objectId);
   }
 
   /**
@@ -122,7 +146,9 @@ export class WorkerBus implements MessageBusLike {
    * Check if an object is registered locally in this worker.
    */
   isRegistered(objectId: AbjectId): boolean {
-    return this.mailboxes.has(objectId);
+    return this.mailboxes.has(objectId)
+      || this.peerObjects.has(objectId)
+      || this.globalObjects.has(objectId);
   }
 
   /**

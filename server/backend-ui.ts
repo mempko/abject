@@ -135,6 +135,8 @@ interface ClientConnection {
   lastSurfaceTouch: Map<string, number>;
   /** Queue index of the last queued setCursor, for latest-wins replacement. */
   queuedCursorIndex?: number;
+  /** Queue index of the last queued update-only sceneOps batch, per scene key. */
+  queuedSceneUpdateIndex: Map<string, number>;
   /** Stale messages replaced in-queue since the last diagnostics line. */
   coalescedDrops: number;
   lastCoalesceLog: number;
@@ -149,6 +151,44 @@ interface ClientConnection {
  */
 const UNACKED_HIGH = 8;
 const UNACKED_LOW = 3;
+
+/**
+ * Hard ceiling on a client's send queue. Coalescing keeps well-behaved
+ * traffic bounded by state size, but any un-coalesced message type produced
+ * at frame rate against a stalled client (a backgrounded tab stops acking)
+ * would otherwise grow the queue without limit — a 30fps 3D animation once
+ * ate the UI worker's whole 8GB heap this way. Past the cap we drop the
+ * client; on reconnect it gets a full state replay, which is strictly
+ * cheaper than the backlog.
+ */
+const MAX_CLIENT_QUEUE = 5000;
+
+/**
+ * Per-node last-wins merge of two update-only sceneOps batches: the same
+ * shallow transform/params merge the retained state applies, so replacing
+ * the queued batch with the merge is indistinguishable (to the client) from
+ * having applied both.
+ */
+function mergeSceneUpdateOps(
+  prev: Array<Record<string, unknown>>,
+  next: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const op of prev) byId.set(String(op.id), op);
+  for (const op of next) {
+    const old = byId.get(String(op.id));
+    if (!old) { byId.set(String(op.id), op); continue; }
+    const merged: Record<string, unknown> = { ...old, ...op };
+    if (old.transform || op.transform) {
+      merged.transform = { ...(old.transform as object | undefined), ...(op.transform as object | undefined) };
+    }
+    if (old.params || op.params) {
+      merged.params = { ...(old.params as object | undefined), ...(op.params as object | undefined) };
+    }
+    byId.set(String(op.id), merged);
+  }
+  return [...byId.values()];
+}
 
 /** URL scheme for content-addressed images in draw commands. */
 const ABX_IMAGE_PREFIX = 'abx:sha256:';
@@ -1706,6 +1746,7 @@ IMPORTANT:
       framesAcked: 0,
       queuedDrawIndex: new Map(),
       lastSurfaceTouch: new Map(),
+      queuedSceneUpdateIndex: new Map(),
       coalescedDrops: 0,
       lastCoalesceLog: 0,
       sentBlobs: new Set(),
@@ -1843,14 +1884,52 @@ IMPORTANT:
       }
       queue.push(msg);
       client.queuedCursorIndex = queue.length - 1;
+    } else if (msg.type === 'sceneOps') {
+      // An update-only batch (pure transform/param animation frames) merges
+      // into the previously queued update-only batch for the same scene,
+      // per node id — the same last-wins merge the retained state applies.
+      // Structural batches (add/remove/animate) append and become a barrier.
+      // This is what keeps a 30-60fps scene animation bounded by node count
+      // instead of frame rate when a client is slow or backgrounded.
+      const sceneMsg = msg as { surfaceId: string; world?: boolean; ownerId?: string; ops: Array<Record<string, unknown>> };
+      const key = sceneMsg.world ? `#world:${sceneMsg.ownerId ?? ''}` : sceneMsg.surfaceId;
+      const updateOnly = sceneMsg.ops.every((o) => o.op === 'update');
+      if (updateOnly) {
+        const idx = client.queuedSceneUpdateIndex.get(key);
+        if (idx !== undefined && client.lastSurfaceTouch.get(key) === idx) {
+          const prev = queue[idx] as { ops: Array<Record<string, unknown>> };
+          queue[idx] = { ...sceneMsg, ops: mergeSceneUpdateOps(prev.ops, sceneMsg.ops) } as BackendToFrontendMsg;
+          client.coalescedDrops++;
+          this.maybeScheduleFlush(client);
+          return;
+        }
+        queue.push(msg);
+        client.queuedSceneUpdateIndex.set(key, queue.length - 1);
+        client.lastSurfaceTouch.set(key, queue.length - 1);
+      } else {
+        queue.push(msg);
+        client.queuedSceneUpdateIndex.delete(key);
+        client.lastSurfaceTouch.set(key, queue.length - 1);
+      }
     } else {
       queue.push(msg);
       const sid = (msg as { surfaceId?: string }).surfaceId;
       if (sid) client.lastSurfaceTouch.set(sid, queue.length - 1);
     }
 
+    // Backstop: a queue past the cap means the client stopped consuming and
+    // coalescing could not absorb the traffic. Drop the client; a reconnect
+    // replays full state and costs far less than an unbounded backlog.
+    if (queue.length > MAX_CLIENT_QUEUE) {
+      log.error(`Client ${client.id} send queue exceeded ${MAX_CLIENT_QUEUE} messages (stalled client?); disconnecting — reconnect will replay state`);
+      try { client.transport.close(1013, 'send queue overflow'); } catch { /* already gone */ }
+      return;
+    }
+
     this.maybeScheduleFlush(client);
   }
+
+
 
   private maybeScheduleFlush(client: ClientConnection): void {
     if (client.flushScheduled) return;
@@ -1895,6 +1974,7 @@ IMPORTANT:
     client.sendQueue = [];
     client.queuedDrawIndex.clear();
     client.lastSurfaceTouch.clear();
+    client.queuedSceneUpdateIndex.clear();
     client.queuedCursorIndex = undefined;
 
     if (client.coalescedDrops > 0 && Date.now() - client.lastCoalesceLog > 5_000) {

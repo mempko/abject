@@ -58,6 +58,18 @@ export class WorkerPool {
     for (let i = 0; i < this.config.workerCount; i++) {
       const worker = this.config.workerFactory();
       const bridge = new WorkerBridge(worker, this.bus);
+      // Objects constructed locally inside the worker (e.g. widgets newed up
+      // by a worker-hosted WidgetManager) announce themselves via
+      // bus:registered — keep the routing map current so the whole system
+      // can reach them.
+      bridge.onLocalRegistered = (objectId) => {
+        this.objectToBridge.set(objectId, bridge);
+      };
+      bridge.onLocalUnregistered = (objectId) => {
+        if (this.objectToBridge.get(objectId) === bridge) {
+          this.objectToBridge.delete(objectId);
+        }
+      };
       this.bridges.push(bridge);
     }
 
@@ -83,6 +95,13 @@ export class WorkerPool {
    */
   getBridgeForObject(objectId: AbjectId): WorkerBridge | undefined {
     return this.objectToBridge.get(objectId);
+  }
+
+  /** Push one liveness fact to every pool worker. */
+  broadcastLiveness(objectId: AbjectId, alive: boolean): void {
+    for (const bridge of this.bridges) {
+      bridge.sendLiveness(objectId, alive);
+    }
   }
 
   /**

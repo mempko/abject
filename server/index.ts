@@ -187,6 +187,15 @@ async function main(): Promise<void> {
     const uiWorkerScript = new URL('../workers/ui-worker-node.ts', import.meta.url);
     const uiWorker = new NodeWorkerAdapter(uiWorkerScript);
     uiBridge = new DedicatedWorkerBridge(uiWorker, bus);
+    uiBridge.onDead = (code) => {
+      log.error('==================================================================');
+      log.error(`UI WORKER DIED (exit code ${code}): the desktop UI is gone.`);
+      log.error('Window, widget, and scene requests now fail fast with WORKER_DEAD');
+      log.error('until the server restarts. If the cause was "JS heap out of');
+      log.error('memory", raise ABJECTS_WORKER_MAX_OLD_SPACE_MB or check for a');
+      log.error('client send-queue backlog in the lines above.');
+      log.error('==================================================================');
+    };
 
     // Register BackendUI ID on the main bus before worker init
     // so replies can be routed back to BackendUI during its init
@@ -600,6 +609,22 @@ async function main(): Promise<void> {
       'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
       'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
+      'WebBrowserViewer',
+      // UI shell + workspace infrastructure — the main thread is reserved for
+      // the message bus, transports, and PeerRouter (a synchronous bus
+      // interceptor). WidgetManager moves its entire widget tree with it:
+      // windows/widgets/layouts init onto their creator's bus, so they all
+      // live in WidgetManager's worker.
+      'WidgetManager', 'WindowManager', 'Sidebar', 'GlobalToolbar', 'WorkspaceSwitcher',
+      'WorkspaceManager', 'WorkspaceRegistry', 'WorkspaceShareRegistry',
+      'WebBrowser', 'WebParser', 'FileTransfer', 'MCPBridge',
+      // Deliberately NOT worker-eligible:
+      // - PeerRouter: synchronous MessageInterceptor installed on the bus.
+      // - Supervisor: must not depend on the workers it restarts.
+      // - MediaStream: holds live RTCPeerConnection/MediaStreamTrack handles;
+      //   needs its track ops turned into P2P-worker RPCs before it can move.
+      // - Identity/PeerRegistry/SignalingRelay/PeerDiscovery/RemoteRegistry:
+      //   already co-located in the dedicated P2P worker.
     ];
     for (const name of workerEligible) {
       runtime.objectFactory.markWorkerEligible(name);

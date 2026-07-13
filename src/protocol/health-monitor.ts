@@ -343,12 +343,10 @@ export class HealthMonitor extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    // Discover Negotiator (for connection renegotiation)
-    try {
-      this.negotiatorId = await this.requireDep('Negotiator');
-    } catch {
-      // Negotiator may not be spawned yet — that's OK
-    }
+    // Discover Negotiator (for connection renegotiation). Optional: absence
+    // just disables renegotiation, so use the single-shot lookup rather than
+    // requireDep's bounded wait.
+    this.negotiatorId = await this.discoverDep('Negotiator') ?? undefined;
 
     // Discover Supervisor (for liveness failure escalation)
     try {

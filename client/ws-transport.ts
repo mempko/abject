@@ -21,8 +21,35 @@ export class WebSocketClientTransport implements ClientTransport {
   // then back off to 1s. ECONNREFUSED returns instantly on localhost.
   private static readonly RECONNECT_DELAYS = [100, 100, 200, 200, 200, 200, 200, 200, 200, 200, 500, 1000];
 
+  /** Pending auto-reconnect timer, so a visibility change can preempt it. */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+
   constructor(url: string) {
     this.url = url;
+    // Background tabs get their timers throttled (Chrome wakes them as
+    // rarely as once a minute), so a 1s reconnect delay can silently become
+    // 30-60s while the tab is hidden. Reconnect IMMEDIATELY when the tab
+    // becomes visible/focused or the network returns, instead of waiting
+    // out a throttled timer.
+    const kick = () => this.kickReconnect();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') kick();
+      });
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', kick);
+      window.addEventListener('online', kick);
+    }
+  }
+
+  /** If a reconnect is pending on a timer, run it now. */
+  private kickReconnect(): void {
+    if (this.closed || this.ws || this.reconnectTimer === undefined) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    console.log(`[Frontend] Reconnecting now (tab visible/network back, attempt ${this.reconnectAttempt})...`);
+    this.openWebSocket();
   }
 
   async connect(): Promise<void> {
@@ -102,7 +129,8 @@ export class WebSocketClientTransport implements ClientTransport {
       const delays = WebSocketClientTransport.RECONNECT_DELAYS;
       const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
       this.reconnectAttempt++;
-      setTimeout(() => {
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = undefined;
         if (this.closed) return;
         console.log(`[Frontend] Reconnecting (attempt ${this.reconnectAttempt}, delay ${delay}ms)...`);
         this.openWebSocket();

@@ -64,6 +64,7 @@ export class MessageBus implements MessageBusLike {
 
     const mailbox = new Mailbox();
     this.mailboxes.set(objectId, mailbox);
+    this._workerPool?.broadcastLiveness(objectId, true);
 
     this.checkInvariants();
     return mailbox;
@@ -88,6 +89,7 @@ export class MessageBus implements MessageBusLike {
     );
 
     resetSequence(objectId);
+    this._workerPool?.broadcastLiveness(objectId, false);
 
     this.checkInvariants();
   }
@@ -277,6 +279,11 @@ export class MessageBus implements MessageBusLike {
    */
   setWorkerPool(pool: WorkerPool): void {
     this._workerPool = pool;
+    // Snapshot-sync: anything registered before the pool attached (Registry,
+    // Factory, early core objects) becomes visible to worker-side
+    // isRegistered checks immediately.
+    for (const id of this.mailboxes.keys()) pool.broadcastLiveness(id, true);
+    for (const id of this.workerObjects) pool.broadcastLiveness(id, true);
   }
 
   /**
@@ -284,6 +291,7 @@ export class MessageBus implements MessageBusLike {
    */
   registerWorkerObject(objectId: AbjectId): void {
     this.workerObjects.add(objectId);
+    this._workerPool?.broadcastLiveness(objectId, true);
   }
 
   /**
@@ -291,6 +299,7 @@ export class MessageBus implements MessageBusLike {
    */
   unregisterWorkerObject(objectId: AbjectId): void {
     this.workerObjects.delete(objectId);
+    this._workerPool?.broadcastLiveness(objectId, false);
   }
 
   /**
@@ -307,6 +316,7 @@ export class MessageBus implements MessageBusLike {
   registerDedicatedBridge(objectId: AbjectId, bridge: WorkerBridge): void {
     this.dedicatedBridges.set(objectId, bridge);
     this.workerObjects.add(objectId);
+    this._workerPool?.broadcastLiveness(objectId, true);
   }
 
   /**
@@ -315,6 +325,7 @@ export class MessageBus implements MessageBusLike {
   unregisterDedicatedBridge(objectId: AbjectId): void {
     this.dedicatedBridges.delete(objectId);
     this.workerObjects.delete(objectId);
+    this._workerPool?.broadcastLiveness(objectId, false);
   }
 
   /**

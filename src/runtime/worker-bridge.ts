@@ -7,6 +7,7 @@
  */
 
 import { AbjectMessage, AbjectId } from '../core/types.js';
+import { error as errorMessage } from '../core/message.js';
 import type { MessageBus } from './message-bus.js';
 import { Log } from '../core/timed-log.js';
 
@@ -29,7 +30,8 @@ export interface WorkerLike {
 /** Message types sent from main thread to worker. */
 export interface WorkerInboundMessage {
   type: 'init' | 'spawn' | 'kill' | 'bus:deliver'
-      | 'peer:port' | 'peer:place' | 'peer:remove';
+      | 'peer:port' | 'peer:place' | 'peer:remove'
+      | 'live:add' | 'live:remove';
   objectId?: AbjectId;
   constructorName?: string;
   constructorArgs?: unknown;
@@ -42,7 +44,8 @@ export interface WorkerInboundMessage {
 
 /** Message types sent from worker to main thread. */
 export interface WorkerOutboundMessage {
-  type: 'ready' | 'spawned' | 'stopped' | 'bus:send' | 'error';
+  type: 'ready' | 'spawned' | 'stopped' | 'bus:send' | 'error'
+      | 'bus:registered' | 'bus:unregistered';
   objectId?: AbjectId;
   message?: AbjectMessage;
   error?: string;
@@ -66,6 +69,22 @@ export class WorkerBridge {
   private _dead = false;
 
   get isDead(): boolean { return this._dead; }
+
+  /**
+   * Invoked when an object registers/unregisters on this worker's bus
+   * OUTSIDE the spawn protocol (constructed locally by another worker
+   * object). The pool hooks these to keep its objectToBridge map current.
+   */
+  onLocalRegistered?: (objectId: AbjectId) => void;
+  onLocalUnregistered?: (objectId: AbjectId) => void;
+
+  /**
+   * Invoked once when the worker exits. Dedicated workers (UI, P2P) hook
+   * this to announce the loss loudly — their objects are registered via
+   * registerDedicatedBridge rather than hostedObjects, so the generic
+   * "lost N objects" line under-reports what actually died.
+   */
+  onDead?: (code: number) => void;
 
   constructor(worker: WorkerLike, bus: MessageBus) {
     this.worker = worker;
@@ -101,6 +120,7 @@ export class WorkerBridge {
         pending.reject(new Error(`Worker exited with code ${e.code}`));
       }
       this.pendingKills.clear();
+      try { this.onDead?.(e.code); } catch { /* observer error must not mask the exit */ }
     };
   }
 
@@ -117,6 +137,18 @@ export class WorkerBridge {
   deliverMessage(message: AbjectMessage): void {
     if (this._dead) {
       log.warn(`DEAD WORKER: dropping ${message.header.type} ${message.routing.method ?? '?'} to=${message.routing.to.slice(0, 8)}`);
+      // Fail requests FAST: without an error reply every caller sits out its
+      // full request timeout (30s default), and a per-frame animation loop
+      // against a dead worker turns that into a timeout storm.
+      if (message.header.type === 'request') {
+        try {
+          this.bus.send(errorMessage(
+            message,
+            'WORKER_DEAD',
+            `Worker hosting ${message.routing.to} has exited; the object is gone until a restart`,
+          ));
+        } catch { /* sender already gone */ }
+      }
       return;
     }
     const msg: WorkerInboundMessage = {
@@ -175,6 +207,20 @@ export class WorkerBridge {
       { type: 'peer:port', workerIndex, port } as WorkerInboundMessage,
       [port as unknown as Transferable],
     );
+  }
+
+  /**
+   * Push a global-liveness fact to this worker: `objectId` exists (or no
+   * longer exists) SOMEWHERE in the system — main thread, a dedicated
+   * worker, or any pool worker. WorkerBus.isRegistered folds these in so
+   * worker-hosted registries/sweepers see the same liveness the main bus
+   * sees, instead of declaring everything non-local dead.
+   */
+  sendLiveness(objectId: AbjectId, alive: boolean): void {
+    if (this._dead) return;
+    try {
+      this.worker.postMessage({ type: alive ? 'live:add' : 'live:remove', objectId } as WorkerInboundMessage);
+    } catch { /* worker going down */ }
   }
 
   /**
@@ -251,6 +297,25 @@ export class WorkerBridge {
           this.pendingKills.delete(objectId);
           pending.resolve();
         }
+        break;
+      }
+
+      case 'bus:registered': {
+        // A worker-local object came onto the worker's bus (e.g. a widget
+        // constructed by WidgetManager). Route its id to this bridge so
+        // replies and sends from anywhere reach it.
+        const objectId = data.objectId!;
+        this.hostedObjects.add(objectId);
+        this.bus.registerWorkerObject(objectId);
+        this.onLocalRegistered?.(objectId);
+        break;
+      }
+
+      case 'bus:unregistered': {
+        const objectId = data.objectId!;
+        this.hostedObjects.delete(objectId);
+        this.bus.unregisterWorkerObject(objectId);
+        this.onLocalUnregistered?.(objectId);
         break;
       }
 

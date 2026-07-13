@@ -231,8 +231,13 @@ export class SkillRegistry extends Abject {
     this.secretsVaultId = await this.discoverDep('SecretsVault') ?? undefined;
     await this.pushEnvToShell();
 
-    // Auto-start any MCP servers that were previously enabled
-    await this.startEnabledMCPBridges();
+    // Auto-start any MCP servers that were previously enabled — in the
+    // BACKGROUND. Each MCP server boots an external process (npm/npx startup
+    // routinely takes seconds), and awaiting them here holds the entire
+    // server boot hostage to third-party startup time. Bridges register in
+    // the Registry as they come up; anything that needs one discovers it then.
+    void this.startEnabledMCPBridges().catch((err) =>
+      log.warn(`Background MCP bridge startup failed: ${err instanceof Error ? err.message : String(err)}`));
 
     log.info(`Initialized with ${this.skills.size} skills in ${this.skillsDir}`);
   }
@@ -945,11 +950,18 @@ whenever the skill set changes.
   }
 
   private async startEnabledMCPBridges(): Promise<void> {
+    // Concurrent: each bridge boots an independent external process, and
+    // one slow (or wedged) server must not delay the others.
+    const pending: Array<Promise<void>> = [];
     for (const [name, entry] of this.skills) {
       if (entry.enabled && entry.parsed.mcpServer && !this.mcpBridges.has(name)) {
-        await this.spawnMCPBridge(name, entry);
+        pending.push(
+          this.spawnMCPBridge(name, entry).catch((err) =>
+            log.warn(`MCP bridge '${name}' failed to start: ${err instanceof Error ? err.message : String(err)}`)),
+        );
       }
     }
+    await Promise.allSettled(pending);
   }
 
   private async getEnabledMCPServerSummaries(): Promise<Array<{

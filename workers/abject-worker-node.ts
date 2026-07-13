@@ -87,6 +87,20 @@ import { WebAgent } from '../src/objects/web-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { Organism } from '../src/objects/organism.js';
 import type { OrganismSpec } from '../src/objects/organism.js';
+import { WidgetManager } from '../src/objects/widget-manager.js';
+import { WindowManager } from '../src/objects/window-manager.js';
+import { Sidebar } from '../src/objects/sidebar.js';
+import { GlobalToolbar } from '../src/objects/global-toolbar.js';
+import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
+import { WorkspaceManager } from '../src/objects/workspace-manager.js';
+import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
+import { WorkspaceShareRegistry } from '../src/objects/workspace-share-registry.js';
+import { WebParser } from '../src/objects/capabilities/web-parser.js';
+import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
+import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
+import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
+import { MCPBridge } from '../src/objects/mcp-bridge.js';
+import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WasmAbject } from '../src/objects/wasm-abject.js';
 import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 
@@ -199,6 +213,23 @@ constructors.set('Organism', (args?: unknown) => {
   const spec = args as OrganismSpec;
   return new Organism(spec);
 });
+// Main-thread relief (July 2026): the UI shell, workspace infrastructure,
+// web capability, and MCP bridges all run in pool workers. WidgetManager
+// carries its whole widget tree with it (windows/widgets/layouts init onto
+// their creator's bus), which moves the largest mailbox population off main.
+constructors.set('WidgetManager', () => new WidgetManager());
+constructors.set('WindowManager', () => new WindowManager());
+constructors.set('Sidebar', () => new Sidebar());
+constructors.set('GlobalToolbar', () => new GlobalToolbar());
+constructors.set('WorkspaceSwitcher', () => new WorkspaceSwitcher());
+constructors.set('WorkspaceManager', () => new WorkspaceManager());
+constructors.set('WorkspaceRegistry', () => new WorkspaceRegistry());
+constructors.set('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
+constructors.set('WebParser', () => new WebParser());
+constructors.set('WebBrowser', () => new WebBrowser());
+constructors.set('WebBrowserViewer', () => new WebBrowserViewer());
+constructors.set('FileTransfer', () => new FileTransfer());
+constructors.set('MCPBridge', (args?: unknown) => new MCPBridge(args as MCPBridgeConfig));
 constructors.set('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
 // Global error handlers — report to main thread before the worker dies
@@ -312,6 +343,16 @@ port.on('message', async (data: WorkerInboundMessage) => {
       if (objectId && workerIndex !== undefined) {
         workerBus.addPeerObject(objectId, workerIndex);
       }
+      break;
+    }
+
+    case 'live:add': {
+      if (data.objectId) workerBus.addGlobalObject(data.objectId);
+      break;
+    }
+
+    case 'live:remove': {
+      if (data.objectId) workerBus.removeGlobalObject(data.objectId);
       break;
     }
 

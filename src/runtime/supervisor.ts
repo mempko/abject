@@ -170,12 +170,10 @@ export class Supervisor extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    // Discover Factory via Registry
-    try {
-      this.factoryId = await this.requireDep('Factory');
-    } catch {
-      log.warn('Could not discover Factory — restarts will fail');
-    }
+    // Discover Factory via Registry. Kept non-fatal (warn-and-continue), so
+    // use the single-shot lookup rather than requireDep's bounded wait.
+    this.factoryId = await this.discoverDep('Factory') ?? undefined;
+    if (!this.factoryId) log.warn('Could not discover Factory — restarts will fail');
 
     // Discover HealthMonitor (to re-mark objects ready after restart)
     try {

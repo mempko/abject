@@ -410,10 +410,29 @@ export abstract class Abject {
   /**
    * Discover a dependency by manifest name. Throws if not found.
    */
-  protected async requireDep(name: string): Promise<AbjectId> {
-    const id = await this.discoverDep(name);
-    if (!id) throw new Error(`Required dependency '${name}' not found in Registry`);
-    return id;
+  /**
+   * Resolve a dependency this object cannot function without. Unlike
+   * discoverDep (single-shot, "use it if present"), requireDep WAITS for the
+   * dependency to appear: registration order is not a contract — during boot,
+   * respawns, and workspace switches a hard dependency may register moments
+   * after its dependent — so a hard requirement retries with backoff for a
+   * bounded window before giving up. If a dependency is genuinely optional,
+   * use discoverDep instead of catching this error.
+   */
+  protected async requireDep(name: string, opts?: { timeoutMs?: number }): Promise<AbjectId> {
+    const timeoutMs = opts?.timeoutMs ?? 10_000;
+    const deadline = Date.now() + timeoutMs;
+    let delay = 100;
+    for (;;) {
+      const id = await this.discoverDep(name);
+      if (id) return id;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`Required dependency '${name}' not found in Registry after ${timeoutMs}ms`);
+      }
+      await new Promise((r) => setTimeout(r, Math.min(delay, remaining)));
+      delay = Math.min(delay * 2, 1000);
+    }
   }
 
   /**
