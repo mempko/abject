@@ -55,6 +55,22 @@ export class MessageBus implements MessageBusLike {
   // Dedicated worker bridges (UI, P2P) — registered separately from the pool
   private dedicatedBridges: Map<AbjectId, WorkerBridge> = new Map();
 
+  // ── Registration grace window ─────────────────────────────────────────
+  //
+  // Worker-to-worker replies and worker registration announcements travel on
+  // DIFFERENT channels (peer ports vs the worker's main-thread port), so a
+  // "createWidget" reply can reach a caller before the new widget's
+  // bus:registered reaches main. A message sent to the new id in that gap
+  // used to fail RECIPIENT_NOT_FOUND instantly. Park messages to NEVER-SEEN
+  // ids briefly and flush them when the registration lands; recently
+  // UNREGISTERED ids (tombstones) skip the grace so dead-recipient handling
+  // (error replies, recipientGone) stays prompt.
+  private static readonly UNKNOWN_GRACE_MS = 400;
+  private static readonly UNKNOWN_GRACE_MAX_MSGS = 200;
+  private static readonly TOMBSTONE_TTL_MS = 10_000;
+  private pendingUnknown: Map<AbjectId, { messages: AbjectMessage[]; timer: ReturnType<typeof setTimeout> }> = new Map();
+  private tombstones: Map<AbjectId, number> = new Map();
+
   /**
    * Register an object with the bus. Creates a mailbox for the object.
    */
@@ -67,7 +83,26 @@ export class MessageBus implements MessageBusLike {
     this._workerPool?.broadcastLiveness(objectId, true);
 
     this.checkInvariants();
+    this.flushPendingUnknown(objectId);
     return mailbox;
+  }
+
+  /** Re-send messages parked for an id whose registration just landed. */
+  private flushPendingUnknown(objectId: AbjectId): void {
+    const parked = this.pendingUnknown.get(objectId);
+    if (!parked) return;
+    this.pendingUnknown.delete(objectId);
+    clearTimeout(parked.timer);
+    this.tombstones.delete(objectId);
+    for (const msg of parked.messages) this.send(msg);
+  }
+
+  /** The grace window expired with no registration — messages are dead. */
+  private expirePendingUnknown(objectId: AbjectId): void {
+    const parked = this.pendingUnknown.get(objectId);
+    if (!parked) return;
+    this.pendingUnknown.delete(objectId);
+    for (const msg of parked.messages) this.handleUndeliverable(msg);
   }
 
   /**
@@ -90,6 +125,16 @@ export class MessageBus implements MessageBusLike {
 
     resetSequence(objectId);
     this._workerPool?.broadcastLiveness(objectId, false);
+
+    // Dead recipients skip the registration grace window (and prune stale
+    // tombstones while we're here — the map stays tiny).
+    const now = Date.now();
+    this.tombstones.set(objectId, now);
+    if (this.tombstones.size > 512) {
+      for (const [id, t] of this.tombstones) {
+        if (now - t > MessageBus.TOMBSTONE_TTL_MS) this.tombstones.delete(id);
+      }
+    }
 
     this.checkInvariants();
   }
@@ -141,34 +186,24 @@ export class MessageBus implements MessageBusLike {
 
     // Check if recipient exists locally
     if (!recipient || !this.mailboxes.has(recipient)) {
-      log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from?.slice(0,8) ?? '?'} to=${recipient?.slice(0,8) ?? 'undefined'} (not registered)`);
-
-      // For undeliverable requests, send an error reply to the sender's
-      // mailbox so request() rejects instantly instead of timing out.
-      if (message.header.type === 'request') {
-        const sender = message.routing.from;
-        const errorReply = createError(
-          message,
-          'RECIPIENT_NOT_FOUND',
-          `Recipient ${recipient} is not registered`,
-        );
-        this.deliverToSender(sender, errorReply);
+      // Never-seen id (no fresh tombstone): its registration may still be in
+      // flight from a worker — park briefly and retry when it lands.
+      if (recipient && !this.recentlyUnregistered(recipient)) {
+        let parked = this.pendingUnknown.get(recipient);
+        if (!parked) {
+          parked = {
+            messages: [],
+            timer: setTimeout(() => this.expirePendingUnknown(recipient), MessageBus.UNKNOWN_GRACE_MS),
+          };
+          this.pendingUnknown.set(recipient, parked);
+        }
+        if (parked.messages.length < MessageBus.UNKNOWN_GRACE_MAX_MSGS) {
+          parked.messages.push(message);
+          return;
+        }
+        // Parked queue full — a flood at a genuinely unknown id; fail fast.
       }
-
-      // For undeliverable events, tell the sender its recipient is gone so it
-      // can stop emitting (e.g. an animating widget whose window was destroyed
-      // would otherwise fire childDirty at frame rate forever). Guard against
-      // recursion: never notify about an undeliverable recipientGone itself.
-      if (message.header.type === 'event' && recipient && message.routing.method !== 'recipientGone') {
-        const sender = message.routing.from;
-        const notice = createEvent(recipient, sender, 'recipientGone', {
-          recipient,
-          method: message.routing.method,
-        });
-        this.deliverToSender(sender, notice);
-      }
-
-      this.notifyUndeliverable(message);
+      this.handleUndeliverable(message);
       return;
     }
 
@@ -176,6 +211,49 @@ export class MessageBus implements MessageBusLike {
     const mailbox = this.mailboxes.get(recipient)!;
     mailbox.send(message);
     this.messageCount++;
+  }
+
+  /** True when the id was unregistered within the tombstone TTL. */
+  private recentlyUnregistered(objectId: AbjectId): boolean {
+    const t = this.tombstones.get(objectId);
+    return t !== undefined && Date.now() - t <= MessageBus.TOMBSTONE_TTL_MS;
+  }
+
+  /**
+   * A message whose recipient does not exist (locally, in a worker, or after
+   * the registration grace window): log it, error-reply requests, notify
+   * event senders their recipient is gone, and run the undeliverable hook.
+   */
+  private handleUndeliverable(message: AbjectMessage): void {
+    const recipient = message.routing.to;
+    log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from?.slice(0,8) ?? '?'} to=${recipient?.slice(0,8) ?? 'undefined'} (not registered)`);
+
+    // For undeliverable requests, send an error reply to the sender's
+    // mailbox so request() rejects instantly instead of timing out.
+    if (message.header.type === 'request') {
+      const sender = message.routing.from;
+      const errorReply = createError(
+        message,
+        'RECIPIENT_NOT_FOUND',
+        `Recipient ${recipient} is not registered`,
+      );
+      this.deliverToSender(sender, errorReply);
+    }
+
+    // For undeliverable events, tell the sender its recipient is gone so it
+    // can stop emitting (e.g. an animating widget whose window was destroyed
+    // would otherwise fire childDirty at frame rate forever). Guard against
+    // recursion: never notify about an undeliverable recipientGone itself.
+    if (message.header.type === 'event' && recipient && message.routing.method !== 'recipientGone') {
+      const sender = message.routing.from;
+      const notice = createEvent(recipient, sender, 'recipientGone', {
+        recipient,
+        method: message.routing.method,
+      });
+      this.deliverToSender(sender, notice);
+    }
+
+    this.notifyUndeliverable(message);
   }
 
   /**
@@ -292,6 +370,7 @@ export class MessageBus implements MessageBusLike {
   registerWorkerObject(objectId: AbjectId): void {
     this.workerObjects.add(objectId);
     this._workerPool?.broadcastLiveness(objectId, true);
+    this.flushPendingUnknown(objectId);
   }
 
   /**
@@ -300,6 +379,7 @@ export class MessageBus implements MessageBusLike {
   unregisterWorkerObject(objectId: AbjectId): void {
     this.workerObjects.delete(objectId);
     this._workerPool?.broadcastLiveness(objectId, false);
+    this.tombstones.set(objectId, Date.now());
   }
 
   /**
@@ -317,6 +397,7 @@ export class MessageBus implements MessageBusLike {
     this.dedicatedBridges.set(objectId, bridge);
     this.workerObjects.add(objectId);
     this._workerPool?.broadcastLiveness(objectId, true);
+    this.flushPendingUnknown(objectId);
   }
 
   /**
