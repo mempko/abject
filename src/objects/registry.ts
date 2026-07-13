@@ -25,6 +25,44 @@ const log = new Log('Registry');
 
 const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
 
+/** The only keys a DiscoveryQuery may carry. */
+const DISCOVERY_QUERY_KEYS = ['name', 'interface', 'capability', 'tags'] as const;
+
+/**
+ * Reject a discover query that carries no recognized filter, so a caller
+ * never gets the WHOLE registry back by accident.
+ *
+ * discover matches EXACT structured filters. A generator that reaches for
+ * free text (`{ query: 'Canvas' }`, `{ search: '3D scene' }`) hits none of
+ * the filter branches, and the unfiltered fall-through used to return every
+ * registration with its full manifest — a silent context bomb that answers
+ * nothing, so the caller rephrases and dumps the registry again. Fail loudly
+ * and point at the two methods that DO take free text.
+ */
+function validateDiscoveryQuery(query: unknown): void {
+  const hint = `discover takes EXACT structured filters: { name?, interface?, capability?, tags?: string[] } — e.g. { name: 'WidgetManager' } or { tags: ['capability'] }. It does NOT take free text. To find an object by rough name or by what it DOES, use search({ query: '...' }) for a cheap ranked match, or ask({ question: '...' }) for a semantic answer.`;
+
+  if (query === null || typeof query !== 'object' || Array.isArray(query)) {
+    throw new Error(`Registry.discover: query must be an object. ${hint}`);
+  }
+  const keys = Object.keys(query as Record<string, unknown>);
+  const unknown = keys.filter((k) => !(DISCOVERY_QUERY_KEYS as readonly string[]).includes(k));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Registry.discover: unknown query field${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => `'${k}'`).join(', ')} (nothing was matched). ${hint}`,
+    );
+  }
+  const hasFilter = DISCOVERY_QUERY_KEYS.some((k) => {
+    const v = (query as Record<string, unknown>)[k];
+    return k === 'tags' ? Array.isArray(v) && v.length > 0 : typeof v === 'string' && v.length > 0;
+  });
+  if (!hasFilter) {
+    throw new Error(
+      `Registry.discover: the query has no filter, which would return EVERY registered object with its full manifest. ${hint} To enumerate the catalog deliberately, call listSummaries() instead.`,
+    );
+  }
+}
+
 export interface RegistryState {
   objects: Map<AbjectId, ObjectRegistration>;
   byInterface: Map<InterfaceId, Set<AbjectId>>;
@@ -107,12 +145,12 @@ export class Registry extends Abject {
               },
               {
                 name: 'discover',
-                description: 'Find Abjects matching a query',
+                description: 'Find Abjects by EXACT structured filters, returning their full registrations (manifests included — a big payload). The query is an object with these keys and NO others: { name?: exact registered/manifest name, interface?: exact interface id, capability?: exact capability id, tags?: string[] (must have ALL) }. It is NOT free text: `{ query: "canvas" }` or `{ name: "something 3D" }` will not fuzzy-match anything. To look something up by rough name or by what it DOES, use `search` (cheap ranked substring match) or `ask` (semantic question) instead — reach for discover only when you already know the exact name/interface/capability/tag and want the full registration.',
                 parameters: [
                   {
                     name: 'query',
                     type: { kind: 'reference', reference: 'DiscoveryQuery' },
-                    description: 'The discovery query',
+                    description: 'Structured filter: { name?, interface?, capability?, tags? }. Unknown keys are rejected. Example: { name: "WidgetManager" } or { tags: ["capability"] }.',
                   },
                 ],
                 returns: {
@@ -273,7 +311,7 @@ If a caller is asking you ("what is the AbjectId for X?", "which object can do Y
 1. \`ask({ question })\` — **preferred.** Ask me a question in natural language. I answer directly using the catalog.
 2. \`search({ query, limit? })\` — Compact text search over names, descriptions, tags, and method names (case-insensitive substring). Returns a small ranked list of \`{ id, name, typeId?, description, matchedOn }\`. The cheapest programmatic way to locate an object by rough name or capability.
 3. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
-4. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape.
+4. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape. EXACT match only: those four keys are the whole vocabulary, and free text (\`{ query: 'canvas' }\`, or a name like \`'something 3D'\`) matches nothing and is REJECTED with an error. Rough names and "what can do X" belong in \`search\` or \`ask\`.
 5. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
 6. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\`, \`search\`, or \`listSummaries\` instead.
 
@@ -346,6 +384,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     this.on('discover', async (msg: AbjectMessage) => {
       this.reconcileDeadEntries();
       const query = msg.payload as DiscoveryQuery;
+      validateDiscoveryQuery(query);
       const results = await this.handleDiscover(query);
       return this.filterForCaller(results, msg.routing.from);
     });
