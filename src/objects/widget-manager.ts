@@ -20,6 +20,14 @@ import {
   AbjectMessage,
   InterfaceId,
 } from '../core/types.js';
+import {
+  CAMERA_FOV_Y, cameraDistance, apparentScale, nearPlaneZ, farPlaneZ,
+} from '../ui/gl/camera.js';
+import {
+  SCENE_NODE_KINDS, MESH_PRIMITIVES, LIGHT_TYPES, DRAW_MODES,
+  ANIM_PRESETS, ANIM_CHANNELS, SCENE_THEME_TOKENS, MAX_LIGHT_INTENSITY,
+} from '../ui/gl/scene-types.js';
+import { MAX_MESH_LIGHTS } from '../ui/gl/shaders.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
@@ -197,6 +205,12 @@ export class WidgetManager extends Abject {
                 description: 'List every live window: [{ windowId, ownerId, title, rect }]. Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+              },
+              {
+                name: 'getSceneParams',
+                description: 'The LIVE 3D scene parameters, read from the renderer itself: camera (perspective FOV, distance for the current viewport, near/far planes), depth (how apparent size scales with z, and the z-range needed for a scene to actually read as 3D), light limits, the full scene-op vocabulary (kinds, primitives, light types, animation presets/channels, theme tokens), and the validation rules. CALL THIS BEFORE LAYING OUT ANY 3D SCENE — choosing a z-range without knowing the camera distance is the difference between a 3D scene and a flat one, and these values change with the display and with the renderer.',
+                parameters: [],
+                returns: { kind: 'object', properties: {} },
               },
               {
                 name: 'createVBox',
@@ -554,6 +568,9 @@ export class WidgetManager extends Abject {
     });
 
     // Discovery: every live window with its owner, title, and rect — lets
+    // Live camera/limits/vocabulary for scene authors — see sceneParams().
+    this.on('getSceneParams', async () => this.sceneParams());
+
     // any abject find an existing window (e.g. to decorate it with scene
     // nodes) instead of rebuilding the app behind it.
     this.on('listWindows', async () => {
@@ -1169,6 +1186,76 @@ export class WidgetManager extends Abject {
     });
   }
 
+  /**
+   * Live 3D scene parameters, derived from the code that actually renders —
+   * never from numbers typed into a prompt.
+   *
+   * The camera's perspective strength depends on the viewport height, and the
+   * scene vocabulary (kinds, primitives, light types, animation presets) lives
+   * in the validator. An author that guesses at either writes code that renders
+   * wrong: a scene laid out across a z-range too small for the projection looks
+   * FLAT, and the natural "fix" — scaling the far object up until it is visible
+   * — inverts the only depth cue there is. So expose the real values and let
+   * objects ask. Changing the camera or the vocabulary updates this answer with
+   * no prompt anywhere to keep in sync.
+   */
+  private async sceneParams(): Promise<Record<string, unknown>> {
+    let viewport = { width: 1280, height: 720 };
+    if (this.uiServerId) {
+      try {
+        const info = await this.request<{ width: number; height: number }>(
+          request(this.id, this.uiServerId, 'getDisplayInfo', {}), 5000,
+        );
+        if (info && info.width > 0 && info.height > 0) viewport = { width: info.width, height: info.height };
+      } catch { /* fall back to the default viewport */ }
+    }
+
+    const D = cameraDistance(viewport.height);
+    const round = (n: number) => Math.round(n);
+    const sizeAtZ = [-2000, -1000, -500, -200, 0, 200, 500].map(z => ({
+      z,
+      apparentScale: Number(apparentScale(z, D).toFixed(2)),
+    }));
+
+    return {
+      camera: {
+        kind: 'perspective',
+        fovDegrees: Math.round((CAMERA_FOV_Y * 180) / Math.PI),
+        viewport,
+        distancePx: round(D),
+        note: 'The eye sits over the viewport centre, looking down -z. The z=0 plane maps 1:1 to CSS px, which is why 2D window content and 3D nodes share one coordinate space. +z is toward the viewer.',
+      },
+      depth: {
+        apparentScaleFormula: 'apparentScale(z) = D / (D - z), where D = camera.distancePx',
+        sizeAtZ,
+        nearPlaneZ: round(nearPlaneZ(D)),
+        farPlaneZ: round(farPlaneZ(D)),
+        clippingNote: `Nothing between z=${round(farPlaneZ(D))} and z=${round(nearPlaneZ(D))} is clipped. A mesh that fails to appear within a few hundred px of z=0 was NOT clipped — look for a rejected op batch, a light whose range does not reach it, fog, or occlusion.`,
+        flatSceneWarning: `Perspective is the ONLY thing that makes a scene read as 3D. With D=${round(D)}, a z-range of +/-120px gives about a ${Math.round((1 - apparentScale(-120, D) / apparentScale(120, D)) * 100)}% near-to-far size difference — that looks FLAT. Spread depth over hundreds of px (a corridor or court wants a z span on the order of D).`,
+        neverScaleUpFarObjects: 'A distant mesh MUST render smaller than a near one. If a far object is hard to see, extend a light\'s range, give it emissive, or move it nearer in z — never enlarge its mesh, which cancels the foreshortening and makes the scene read as broken.',
+      },
+      limits: {
+        maxLightIntensity: MAX_LIGHT_INTENSITY,
+        maxLightsPerWindow: MAX_MESH_LIGHTS,
+        intensityNote: 'Intensity is a linear multiplier on the light colour (1 = full strength), not watts or lumens. To light a bigger scene raise a light\'s `range`, never its intensity.',
+      },
+      vocabulary: {
+        kinds: [...SCENE_NODE_KINDS],
+        primitives: [...MESH_PRIMITIVES],
+        lightTypes: [...LIGHT_TYPES],
+        drawModes: [...DRAW_MODES],
+        animatePresets: [...ANIM_PRESETS],
+        animateChannels: [...ANIM_CHANNELS],
+        themeTokens: [...SCENE_THEME_TOKENS],
+      },
+      validation: {
+        idRequired: true,
+        atomic: true,
+        note: 'Every op needs a non-empty string `id`, and validation is ATOMIC: one malformed op rejects the WHOLE batch and nothing renders. A single id-less op therefore makes the entire scene vanish, which looks exactly like a clipping or rendering bug.',
+      },
+    };
+  }
+
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
@@ -1424,8 +1511,13 @@ A working app and a beautiful app differ in craft, not effort. Aim for "looks de
    \`'$accentSecondary'\`, \`'$accentTertiary'\`, \`'$windowBg'\`, \`'$canvasBg'\`, \`'$windowBorder'\`,
    \`'$textPrimary'\`, \`'$textSecondary'\`, \`'$shadowColor'\` — they resolve to the user's theme and
    keep your app cohesive with the desktop. For a fuller palette or computed shades, fetch it once:
-   \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\` and read
-   \`theme.tokens\`. **Chrome always uses theme tokens** — text, buttons, panels, on-screen keys,
+   \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\`. The COLORS are
+   TOP-LEVEL fields on that object — \`theme.accent\`, \`theme.accentSecondary\`, \`theme.textPrimary\`,
+   \`theme.windowBg\`, \`theme.statusError\`, … — NOT under \`theme.tokens\`, which holds only the
+   non-color scales (\`space\`, \`type\`, \`radius\`, \`motion\`, \`easing\`, \`elevation\`, \`glow\`, \`surface\`).
+   Reading \`theme.tokens.accent\` yields \`undefined\`, and an \`undefined\` fill is SILENTLY IGNORED by
+   the canvas — every shape then paints in whatever color was last set (usually black) with no error
+   anywhere. **Chrome always uses theme tokens** — text, buttons, panels, on-screen keys,
    borders, backgrounds: these should be \`$accent\`/\`$textPrimary\`/\`$windowBg\` etc. so the app sits
    in the user's desktop, not a foreign color scheme. Reach for hand-picked hex ONLY for genuine
    *illustration/content* the theme can't express (a game's character art, a chart's data series, a
@@ -1455,7 +1547,8 @@ Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windo
 Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
           A layout-managed 2D layer. It is a BACKDROP layer of the window's scene (beneath any 3D
           scene nodes); for 2D drawn OVER 3D, add your own kind:'canvas' SCENE NODE in front of the
-          meshes (see LAYERS under the 3D scene section) — same drawing contract either way.
+          meshes (see LAYERS under the 3D scene section) — same drawing contract either way, EXCEPT that the
+          \`markdown\` command exists only on the canvas WIDGET, and only the widget validates its commands.
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
           Painting is INCREMENTAL everywhere: batches accumulate on the layer's pixels. Begin every
           repaint with { type: 'clear', surfaceId: 'c', params: {} } (add color for an opaque
@@ -1480,7 +1573,15 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           the canvas at (x,y), wrapping to maxWidth. Same rich renderer as markdown labels, so you get rich
           text + images inside a pannable/zoomable canvas without hand-rolling a parser. Use this instead of
           the plain text command whenever node/cell content may contain markdown or images.
-          Invalid batches (unknown type, missing required params) are rejected with an error naming the problem.
+          IMPORTANT — \`markdown\` works ONLY on a CANVAS WIDGET (the one from createCanvas), which expands it
+          into primitives before drawing. It is NOT part of the scene's drawing vocabulary: sending it to a
+          kind:'canvas' SCENE NODE (via the window 'draw' channel or params.commands) is a SILENT NO-OP —
+          it draws nothing and reports no error, so a HUD built that way comes back blank. On a scene-node
+          canvas layer, use the \`text\` command (and lay the lines out yourself), or put the rich text in a
+          markdown \`label\`/\`contentBlock\` widget instead.
+          Invalid batches (unknown type, missing required params) are rejected with an error naming the problem
+          — but ONLY on a canvas widget: the scene-node canvas path does not validate draw commands, so an
+          unsupported command there fails silently.
           Ask the canvas widget itself for the full per-command param reference before writing a renderer.
 3D scene: THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is built in.
           Every window is a slab in the scene, and real 3D content (meshes with lighting, rotation,
@@ -1494,8 +1595,35 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
             params: { primitive: 'box', color: '$accent' } }] })
           Animate from a Timer tick by updating the transform:
           this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'cube', transform: { rotation: [rx, ry, 0] } }] })
-          Kinds: mesh, light, group, environment (full param details below).
+          Kinds: mesh, light, group, environment, canvas (a 2D drawing layer that lives in the scene — see
+          LAYERS below). Full param details below, and getSceneParams returns the live list.
           transform: { position: [x,y,z] px from window center (+z toward viewer), rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+          EVERY op needs a non-empty string 'id', and validation is ATOMIC: if ANY op in the batch is
+          malformed, the WHOLE batch is rejected and NOTHING renders. One id-less op therefore makes
+          your entire scene disappear — which looks exactly like "the meshes vanished" or "clipping is
+          broken". If your scene renders nothing, suspect a rejected batch FIRST (the reply tells you).
+
+          CAMERA & DEPTH — CALL getSceneParams BEFORE YOU PLACE ANYTHING IN z.
+          this.call(await this.dep('WidgetManager'), 'getSceneParams', {}) returns the LIVE projection
+          read from the renderer: the camera distance D for the current display, how apparent size scales
+          with z, where the near/far planes actually sit, the light limits, and the whole scene-op
+          vocabulary. Those numbers depend on the viewport and on the renderer, so ask — do not assume,
+          and do not trust remembered values.
+          What the answer will tell you, and why it decides whether your scene looks 3D at all:
+          - The camera is perspective. Apparent size scales as D / (D - z), so a mesh only looks farther
+            away because it renders SMALLER. That foreshortening is the entire depth illusion.
+          - D is large (on the order of twice the viewport height). A scene laid out across a SMALL z range
+            therefore has almost no near-to-far size difference and READS AS FLAT, however 3D its geometry
+            is. Depth has to be spread over hundreds of px in z — check the size-vs-z table in the answer
+            and pick a z span that produces a size difference you can actually see.
+          - NEVER "fix" a far object that looks too small or too faint by SCALING ITS MESH UP. That cancels
+            the foreshortening and the scene reads as broken — a far paddle drawn bigger than the near one
+            is a bug, not a visible paddle. If a distant mesh is hard to see, light it properly (see LIGHTS
+            below — 'range' only extends POINT and SPOT lights; a directional light already reaches
+            everywhere), give it 'emissive', or move it nearer in z.
+          - CLIPPING IS ALMOST NEVER YOUR PROBLEM: the planes sit far outside any sane layout (the answer
+            gives the exact z values). A mesh that fails to appear near z=0 was rejected, unlit, fogged, or
+            occluded — not clipped.
           ARBITRARY/DEFORMABLE MESHES: when no built-in primitive fits (a wave surface, terrain, a
           generated or morphing shape), a mesh node can carry its own polygons instead of a primitive:
           params: { geometry: { positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
@@ -1516,13 +1644,18 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           INSTANCING: params.instances = [{ position:[x,y,z], scale?, rotation?, color? }, ...] draws ONE geometry
           many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
           (re-send instances in an 'update' op to move them).
-          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
-          angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
-          frustum auto-fit to the scene).
+          LIGHTS: lightType 'point'|'directional'|'spot' with color and intensity; 'range' (falloff px) applies
+          to POINT and SPOT lights ONLY; spots also take angle + penumbra. A DIRECTIONAL light has no position
+          and no falloff — it already reaches the whole scene, so setting 'range' on one does nothing.
+          castShadow:true belongs on the LIGHT NODE ITSELF and only on a directional light (meshes then cast
+          shadows on each other, frustum auto-fit to the scene). It is NOT inherited usefully from a parent
+          group, and it is meaningless on a mesh: every non-instanced mesh casts already, and INSTANCED meshes
+          never cast shadows (they also ignore drawMode/pointSize and always draw as triangles).
           INTENSITY IS A LINEAR MULTIPLIER ON THE LIGHT'S COLOR (1 = that color at full strength), NOT watts,
           lumens, or candela. Real scenes use key 0.8-1.6, fill 0.3-0.6; values above 10 are REJECTED because
           they multiply every channel past white and every lit mesh renders PURE WHITE, erasing its own color.
-          To light a bigger scene, raise 'range' (how far the light reaches, in world px) — never intensity.
+          To reach a bigger scene, raise a POINT/SPOT light's 'range' (how far it reaches, in world px), add a
+          directional light, or lift 'ambient' on the environment node — never intensity.
           ENVIRONMENT: add a kind:'environment' node with
           { ambient?, fog?: { color, near, far }, bloom?: true|{ threshold, intensity } } for scene-wide
           mood, depth, and a glow post-effect on bright/emissive meshes (neon, highlights).
@@ -1546,7 +1679,9 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           The window's own content (background, widgets, the createCanvas widget) is the BACKMOST 2D
           layer of its subtree; scene nodes draw above it. A kind:'canvas' node is a 2D drawing layer
           that lives IN the scene graph — a width×height px rectangle at its transform, painted with
-          the same 2D draw-command vocabulary:
+          the same 2D draw-command vocabulary (minus \`markdown\`, which is a canvas-WIDGET command and
+          silently draws nothing here — use \`text\`). It also accepts params.rect { x, y, width, height }
+          to place it in window-absolute coords, and params.backdrop:true to sit behind the window content:
           this.call(windowId, 'scene', { ops: [{ op: 'add', id: 'hud', kind: 'canvas',
             transform: { position: [0, 0, 150] },
             params: { width: 800, height: 500, commands: [
@@ -1568,9 +1703,11 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           beyond the window — a modest backdrop sized to the window (or a canvas node behind the
           meshes) is right.
           INHERITANCE: a child node inherits its parent group's material/behaviour params — color, emissive,
-          opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
-          sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms
-          already compose down the parent chain; only primitive/geometry/instances are per-node (never inherited).
+          opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude — unless it sets its own.
+          Set color/occlude once on a group and the whole subtree follows. Transforms already compose down the
+          parent chain; only primitive/geometry/instances are per-node (never inherited). castShadow is the
+          exception: it is read from the LIGHT NODE itself (a directional light), so setting it on a group or
+          on a mesh does nothing — put it on the light.
           FOG is SCENE-RELATIVE: fog.near/far are depth in px measured BEHIND the content plane (the
           camera-to-content baseline is added for you), so use SMALL values — e.g. near 0, far 400 for a tank
           ~300px deep. Do NOT pass camera-distance values like far 2000+; that puts fog so far back it never
@@ -1640,7 +1777,11 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           outruns the mesh — drag by applying input deltas directly (y-down on both sides, so
           position = [startX + dx, startY + dy, z], no sign flips). Window-subtree hits arrive
           at the window's owner; world hits arrive at the node's owner directly. Picking is real 3D ray
-          casting, so rotated/animated meshes hit correctly.
+          casting, so rotated/animated meshes hit correctly — but only 'plane' and 'sphere' are tested
+          EXACTLY; 'box' and every other primitive ('cylinder', 'cone', 'torus', 'icosphere') are picked
+          against their bounding BOX, so a torus registers hits in its hole and a cone in its corners.
+          Custom geometry IS picked exactly (per-triangle). Where a precise hit region matters on a
+          curvy primitive, pick against a sphere/plane proxy or supply the shape as custom geometry.
           The 2D canvas above is for 2D content (charts, sprites, text); the scene is for 3D.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
@@ -1996,7 +2137,15 @@ const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 // translate: { x, y }  |  rotate: { angle }  |  scale: { x, y }
 // globalAlpha: { alpha }  |  shadow: { color, blur, offsetX?, offsetY? }
 // setLineDash: { segments: [dashLength, gapLength] }
-// linearGradient: { x0, y0, x1, y1, stops: [{offset, color}, ...] } — becomes the fill for subsequent shapes until changed
+// linearGradient: { x0, y0, x1, y1, stops: [{offset, color}, ...] } — sets the current fillStyle/strokeStyle
+//   to the gradient. IMPORTANT: it does NOT gradient-fill the high-level shapes (rect/circle/ellipse/polygon),
+//   because each of those paints with its OWN fill/stroke param and that param overwrites the gradient —
+//   while a shape with NO fill/stroke only adds to the path and paints nothing at all. So
+//   [linearGradient, {rect, fill:'#333'}] ignores the gradient, and [linearGradient, {rect}] draws NOTHING.
+//   To actually paint a gradient, use the canvas-API dialect and let the gradient BE the current style:
+//     [{ type:'linearGradient', params:{ x0:0, y0:0, x1:0, y1:H, stops:[...] } },
+//      { type:'fillRect',       params:{ x:0, y:0, width:W, height:H } }]
+//   (or beginPath -> rect/arc with no fill param -> { type:'fill' }). Same for radialGradient/conicGradient.
 // radialGradient: { cx0, cy0, r0, cx1, cy1, r1, stops: [...] }  |  conicGradient: { startAngle, cx, cy, stops: [...] }
 // bezierCurve: { x0, y0, cp1x, cp1y, cp2x, cp2y, x1, y1, fill?, stroke? }
 // quadraticCurve: { x0, y0, cpx, cpy, x1, y1, fill?, stroke? }

@@ -288,6 +288,12 @@ uniform bool  uShadowEnabled;
 uniform int   uShadowLight;   // index of the shadow-casting light
 uniform sampler2D uShadowMap;
 uniform mat4  uLightVP;
+
+/** Brightness at which highlights start rolling off toward 1.0 instead of
+ *  clipping. Below this the tone curve is exactly the identity, so normally-lit
+ *  scenes are untouched; above it, colour is preserved as brightness saturates. */
+const float TONE_KNEE = 0.85;
+
 out vec4 outColor;
 
 const float PI = 3.14159265359;
@@ -358,6 +364,25 @@ void main() {
     Lo += (kd * albedo + spec) * radiance * NdL * sf;
   }
   vec3 color = uAmbient * albedo + Lo + uEmissive;
+
+  // Highlight rolloff.
+  // Ambient + every light + the emissive term are summed with nothing to catch
+  // the overflow, and a scene with a couple of lights and a glowing material
+  // routinely lands past 1.0. Written straight out, that HARD-CLIPS: each
+  // channel saturates independently, so an over-lit mesh goes PURE WHITE and
+  // loses its hue entirely - a blue paddle and a pink one render identically.
+  //
+  // Compress the PEAK CHANNEL through a soft knee and scale rgb uniformly. The
+  // scale is the same for all three channels, so hue and saturation survive
+  // exactly; only brightness saturates, and it approaches 1.0 asymptotically
+  // instead of slamming into it. Below the knee this is the identity, so any
+  // scene that was already lit sanely renders exactly as before.
+  float peak = max(color.r, max(color.g, color.b));
+  if (peak > TONE_KNEE) {
+    float rolled = TONE_KNEE + (1.0 - TONE_KNEE) *
+                   (1.0 - exp(-(peak - TONE_KNEE) / (1.0 - TONE_KNEE)));
+    color *= rolled / peak;
+  }
 
   if (uFogEnabled) {
     float d = length(uCameraPos - vWorldPos);

@@ -349,6 +349,12 @@ export class GlRenderer {
 
   drawSurface(o: SurfaceDrawOpts): void {
     const gl = this.gl;
+    // A surface quad is a 2D COMPOSITING PLANE (a window slab or a canvas
+    // layer): it paints in painter's order and must never write depth, or it
+    // would cull the 3D nodes behind it. Assert that here rather than trusting
+    // ambient GL state — a leaked DEPTH_TEST from another pass is invisible
+    // until an entire scene mysteriously renders only its front half.
+    gl.disable(gl.DEPTH_TEST);
     const p = this.getProgram('surface', QUAD_VS, SURFACE_FS, [
       'uModel', 'uViewProj', 'uTex', 'uSize', 'uRadius', 'uDim', 'uOpacity',
       'uBorderColor', 'uRimColor', 'uRimWidth',
@@ -738,11 +744,21 @@ export class GlRenderer {
     gl.drawElements(gl.TRIANGLES, mesh.count, mesh.indexType, 0);
   }
 
-  /** End the shadow pass: restore the backbuffer and standard blend. */
+  /** End the shadow pass: restore the backbuffer, blend, AND the depth state.
+   *
+   *  DEPTH_TEST is OFF by default in this renderer and is enabled only for the
+   *  duration of a mesh draw — that invariant is what lets 2D compositing planes
+   *  (window slabs, canvas layers) paint in painter's order without writing depth.
+   *  beginShadowPass enables it, so failing to disable it here leaked a depth-
+   *  writing state into the very next drawSurface: the window's backdrop canvas
+   *  layer then stamped depth across the whole window at z=0, and EVERY mesh
+   *  behind the window plane was silently culled (a 3D scene would render only
+   *  the half of itself in front of the camera-facing window plane). */
   endShadowPass(): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.disable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }

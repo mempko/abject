@@ -16,6 +16,19 @@ import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES, TITLE_BAR_HEIGHT } from '../objects/widgets/widget-types.js';
 import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode, ShadowOpts } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
+import { CAMERA_FOV_Y, cameraDistance, NEAR_PLANE_FACTOR, FAR_PLANE_FACTOR } from './gl/camera.js';
+
+/**
+ * A camera the scene is drawn (and picked) through. The desktop has one; each
+ * window's own 3D subtree gets another, whose eye sits over that window so its
+ * depth converges into the window instead of toward the middle of the screen.
+ * See Compositor.windowCamera.
+ */
+interface SceneCamera {
+  viewProj: Mat4;
+  invViewProj: Mat4;
+  cameraPos: [number, number, number];
+}
 import { Overlay2D } from './gl/overlay-2d.js';
 import { SceneStore, VocabNode } from './gl/scene.js';
 import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneColor, hasCustomGeometry } from './gl/scene-types.js';
@@ -420,7 +433,9 @@ export class Compositor {
   /** Per-surface full-redraw counter, bumped by each bare `clear` command. */
   private surfaceVideoStamps: Map<string, number> = new Map();
   /** Camera field of view; distance derives so the z=0 plane is ~1:1 px. */
-  private static readonly CAMERA_FOV = (30 * Math.PI) / 180;
+  /** Defined in ./gl/camera.js so WidgetManager can report the same projection
+   *  to scene authors (getSceneParams) instead of a prompt guessing at it. */
+  private static readonly CAMERA_FOV = CAMERA_FOV_Y;
   /** Focus lift in px toward the camera — subtle enough that server-side
    * rect math (resize edges) stays within a few px of the projection. */
   private static readonly FOCUS_LIFT = 14;
@@ -1867,11 +1882,14 @@ export class Compositor {
   private updateCamera(scrollX: number, scrollY: number): void {
     const w = Math.max(1, this.width);
     const h = Math.max(1, this.height);
-    const dist = (h / 2) / Math.tan(Compositor.CAMERA_FOV / 2);
+    const dist = cameraDistance(h);
     const eyeX = w / 2 + scrollX;
     const eyeY = h / 2 + scrollY;
     this.cameraPos = [eyeX, eyeY, dist];
-    const proj = mat4PerspectiveYDown(Compositor.CAMERA_FOV, w / h, dist / 10, dist * 4);
+    const proj = mat4PerspectiveYDown(
+      Compositor.CAMERA_FOV, w / h,
+      dist * NEAR_PLANE_FACTOR, dist * FAR_PLANE_FACTOR,
+    );
     const view = mat4Translation(-eyeX, -eyeY, -dist);
     this.viewProj = mat4Multiply(proj, view);
     this.invViewProj = mat4Invert(this.viewProj);
@@ -1986,14 +2004,20 @@ export class Compositor {
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         1, 1, 1,
       );
+      // The window's subtree is drawn through ITS OWN camera, so its depth
+      // converges into the window rather than toward the middle of the screen
+      // (see windowCamera). Without this, a deep scene in an off-centre window
+      // slides sideways as it recedes and is scissored away by its own clip rect.
+      const cam = this.windowCamera(cx, cy, z);
+
       // The window's own content (chrome + widgets + default canvas) is the
       // BACKMOST 2D layer of its subtree. Scene nodes draw above it; canvas
       // nodes (kind:'canvas') interleave with meshes by camera depth, so
       // 2D and 3D layers stack freely: base 2D → 3D → 2D → 3D → …
       // Occluded children clip to the content rect; occlude:false children
       // draw last, unclipped (pop-out 3D / decorations over the chrome).
-      this.drawVocabNodes(surface, frame, 'occluded');
-      this.drawVocabNodes(surface, frame, 'overlay');
+      this.drawVocabNodes(surface, frame, 'occluded', cam);
+      this.drawVocabNodes(surface, frame, 'overlay', cam);
     }
 
     // World-scope nodes above the windows (params.layer: 'front').
@@ -2054,8 +2078,64 @@ export class Compositor {
    *   with no clip, so they sit on top of everything and may extend past the
    *   window (pop-out 3D, decorations meant to be visible over the chrome).
    */
-  private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay'): void {
-    this.drawNodeTree(surface.id, surfaceModel, undefined, this.contentClip(surface), pass);
+  private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay', cam: SceneCamera): void {
+    this.drawNodeTree(surface.id, surfaceModel, cam, undefined, this.contentClip(surface), pass);
+  }
+
+  /** The desktop camera: eye over the viewport centre. World-scope nodes use this. */
+  private globalCamera(): SceneCamera {
+    return { viewProj: this.viewProj, invViewProj: this.invViewProj, cameraPos: this.cameraPos };
+  }
+
+  /**
+   * The camera for ONE window's 3D subtree.
+   *
+   * The desktop camera's eye sits over the VIEWPORT centre, so its vanishing
+   * point is the middle of the screen. That is right for the slabs themselves
+   * (they live at z≈0, where the projection is 1:1 and the eye's position does
+   * not matter) and it is what gives lifted/tilted windows their parallax.
+   *
+   * It is wrong for a window's own 3D content. A scene attached to a window is
+   * clipped to that window's content rect, but under the desktop camera its
+   * depth converges toward the SCREEN centre — so in any window that is not
+   * centred, geometry slides sideways as it recedes and walks out from under
+   * its own clip rect. The deeper the scene, the further it walks: at z = -900
+   * it is displaced by 31% of the window's offset from the screen centre, which
+   * is enough to push a far wall (or a whole AI paddle) outside the window and
+   * make it vanish.
+   *
+   * So a window's subtree gets its own camera: the eye moves over the WINDOW's
+   * centre, making the window's own axis the view axis — depth now converges
+   * toward the middle of the window, where it belongs. To keep that content
+   * glued to the slab the desktop camera drew, the projection is OFF-AXIS: the
+   * principal point is shifted (proj[8]/proj[9], a constant NDC offset) so the
+   * window's centre still lands exactly where the slab's centre was rendered.
+   * Depth, scale, and the 1:1 plane are untouched, so window 2D and window 3D
+   * stay in lockstep and depth values remain comparable with every other window.
+   */
+  private windowCamera(cx: number, cy: number, z: number): SceneCamera {
+    const W = Math.max(1, this.width);
+    const H = Math.max(1, this.height);
+    const D = cameraDistance(H);
+
+    // Where the desktop camera puts this window's centre on screen (its slab is
+    // drawn there, so the subtree must converge on the same point).
+    const s = D / Math.max(1e-3, D - z);
+    const ax = W / 2 + ((cx - this.scrollX) - W / 2) * s;
+    const ay = H / 2 + ((cy - this.scrollY) - H / 2) * s;
+
+    const proj = mat4PerspectiveYDown(
+      Compositor.CAMERA_FOV, W / H,
+      D * NEAR_PLANE_FACTOR, D * FAR_PLANE_FACTOR,
+    );
+    // Off-axis shift: NDC_x = m0*x/w - proj[8], NDC_y = m5*y/w - proj[9].
+    // Solve for the view axis (x_view = y_view = 0) landing on (ax, ay).
+    proj[8] = 1 - (2 * ax) / W;
+    proj[9] = (2 * ay) / H - 1;
+
+    const view = mat4Translation(-cx, -cy, -D);
+    const viewProj = mat4Multiply(proj, view);
+    return { viewProj, invViewProj: mat4Invert(viewProj), cameraPos: [cx, cy, D] };
   }
 
   /**
@@ -2233,6 +2313,7 @@ export class Compositor {
     node: VocabNode,
     rp: Record<string, unknown>,
     surfaceModel: Mat4,
+    cam: SceneCamera,
   ): void {
     const entry = this.canvasLayerEntry(key, node);
     if (!entry) return;
@@ -2280,6 +2361,7 @@ export class Compositor {
    */
   private drawNodeTree(
     key: string, surfaceModel: Mat4,
+    cam: SceneCamera,
     layer?: 'back' | 'front',
     clip?: { x: number; y: number; width: number; height: number },
     pass?: 'occluded' | 'overlay',
@@ -2331,9 +2413,13 @@ export class Compositor {
     if (entries.length === 0 && canvasEntries.length === 0) return;
 
     // Transparent meshes draw last, back-to-front, so they composite correctly.
+    // nodeCameraDepth is -(distance^2) — LARGER means NEARER — so back-to-front
+    // is ASCENDING. Sorting the other way drew them nearest-first, which both
+    // blends in the wrong order and (since meshes write depth) makes the FARTHER
+    // transparent surface fail the depth test and vanish instead of showing through.
     const opaque = entries.filter(({ rp }) => ((rp.opacity as number) ?? 1) >= 1 && !rp.texture);
     const transparent = entries.filter((e) => !opaque.includes(e));
-    transparent.sort((a, b) => this.nodeCameraDepth(b.node, surfaceModel) - this.nodeCameraDepth(a.node, surfaceModel));
+    transparent.sort((a, b) => this.nodeCameraDepth(a.node, surfaceModel, cam) - this.nodeCameraDepth(b.node, surfaceModel, cam));
 
     // Opt-in directional shadows: render a depth map from the light's POV,
     // auto-fitting the ortho frustum to the casters' world AABB. Casters are
@@ -2350,11 +2436,11 @@ export class Compositor {
     // like the window's own content plane. Everything else z-slices.
     const backdrops = canvasEntries.filter(({ rp }) => rp.backdrop === true);
     canvasEntries = canvasEntries.filter(({ rp }) => rp.backdrop !== true);
-    for (const b of backdrops) this.drawCanvasLayerNode(key, b.node, b.rp, surfaceModel);
+    for (const b of backdrops) this.drawCanvasLayerNode(key, b.node, b.rp, surfaceModel, cam);
 
     const meshOrder = [...opaque, ...transparent];
     if (canvasEntries.length === 0) {
-      for (const e of meshOrder) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+      for (const e of meshOrder) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow, cam);
     } else {
       // Canvas layers are compositing planes: they slice the pass's meshes by
       // camera depth, so 2D and 3D stack freely (2D → 3D → 2D → 3D → …).
@@ -2362,21 +2448,21 @@ export class Compositor {
       // origin depth falls in (ties go behind the layer, so a HUD at a
       // mesh's exact z still reads over it). Depth testing still resolves
       // mesh-vs-mesh occlusion across slices.
-      canvasEntries.sort((a, b) => this.nodeCameraDepth(a.node, surfaceModel) - this.nodeCameraDepth(b.node, surfaceModel));
+      canvasEntries.sort((a, b) => this.nodeCameraDepth(a.node, surfaceModel, cam) - this.nodeCameraDepth(b.node, surfaceModel, cam));
       const depths = new Map<VocabNode, number>();
-      for (const e of meshOrder) depths.set(e.node, this.nodeCameraDepth(e.node, surfaceModel));
+      for (const e of meshOrder) depths.set(e.node, this.nodeCameraDepth(e.node, surfaceModel, cam));
       const drawn = new Set<VocabNode>();
       for (const layerEntry of canvasEntries) {
-        const layerDepth = this.nodeCameraDepth(layerEntry.node, surfaceModel);
+        const layerDepth = this.nodeCameraDepth(layerEntry.node, surfaceModel, cam);
         for (const e of meshOrder) {
           if (drawn.has(e.node) || depths.get(e.node)! > layerDepth) continue;
-          this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+          this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow, cam);
           drawn.add(e.node);
         }
-        this.drawCanvasLayerNode(key, layerEntry.node, layerEntry.rp, surfaceModel);
+        this.drawCanvasLayerNode(key, layerEntry.node, layerEntry.rp, surfaceModel, cam);
       }
       for (const e of meshOrder) {
-        if (!drawn.has(e.node)) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow);
+        if (!drawn.has(e.node)) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow, cam);
       }
     }
 
@@ -2391,6 +2477,7 @@ export class Compositor {
     lights: MeshLight[],
     env: { ambient?: [number, number, number]; fog?: FogOpts },
     shadow: ShadowOpts | undefined,
+    cam: SceneCamera,
   ): void {
     {
       const { node, rp } = entry;
@@ -2399,8 +2486,8 @@ export class Compositor {
       const emissiveStr = rp.emissive as string | undefined;
       const billboard = rp.billboard === true;
       const material = {
-        model: billboard ? this.billboardMatrix(world) : world,
-        viewProj: this.viewProj,
+        model: billboard ? this.billboardMatrix(world, cam.cameraPos) : world,
+        viewProj: cam.viewProj,
         color,
         emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
         opacity: (rp.opacity as number) ?? 1,
@@ -2413,7 +2500,7 @@ export class Compositor {
         ambient: env.ambient,
         fog: env.fog,
         shadow,
-        cameraPos: this.cameraPos,
+        cameraPos: cam.cameraPos,
       };
       if (Array.isArray(rp.instances) && (rp.instances as unknown[]).length > 0) {
         const handle = this.instancedHandle(key, node);
@@ -2604,9 +2691,9 @@ export class Compositor {
   }
 
   /** Camera-space depth (for transparency sorting): larger = nearer. */
-  private nodeCameraDepth(node: VocabNode, surfaceModel: Mat4): number {
+  private nodeCameraDepth(node: VocabNode, surfaceModel: Mat4, cam: SceneCamera): number {
     const m = this.sceneStore.worldMatrix(node, surfaceModel);
-    const dx = m[12] - this.cameraPos[0], dy = m[13] - this.cameraPos[1], dz = m[14] - this.cameraPos[2];
+    const dx = m[12] - cam.cameraPos[0], dy = m[13] - cam.cameraPos[1], dz = m[14] - cam.cameraPos[2];
     return -(dx * dx + dy * dy + dz * dz);
   }
 
@@ -2615,12 +2702,12 @@ export class Compositor {
    * world position and scale (extracted from the basis-vector lengths).
    * Billboards keep sprites/labels readable from any camera angle.
    */
-  private billboardMatrix(world: Mat4): Mat4 {
+  private billboardMatrix(world: Mat4, cameraPos: [number, number, number]): Mat4 {
     const px = world[12], py = world[13], pz = world[14];
     const sx = Math.hypot(world[0], world[1], world[2]) || 1;
     const sy = Math.hypot(world[4], world[5], world[6]) || 1;
     const sz = Math.hypot(world[8], world[9], world[10]) || 1;
-    let fx = this.cameraPos[0] - px, fy = this.cameraPos[1] - py, fz = this.cameraPos[2] - pz;
+    let fx = cameraPos[0] - px, fy = cameraPos[1] - py, fz = cameraPos[2] - pz;
     const fl = Math.hypot(fx, fy, fz) || 1; fx /= fl; fy /= fl; fz /= fl;       // forward (toward camera)
     // right = up × forward, with world up (0,1,0)
     let rx = 1 * fz - 0 * fy, ry = 0 * fx - 0 * fz, rz = 0 * fy - 1 * fx;
@@ -2892,7 +2979,7 @@ export class Compositor {
         this.worldKeys.delete(key);
         continue;
       }
-      this.drawNodeTree(key, identity, layer);
+      this.drawNodeTree(key, identity, this.globalCamera(), layer);
     }
   }
 
@@ -3376,14 +3463,18 @@ export class Compositor {
       const cy = rect.y + rect.height / 2;
       const slabModel = state?.model ?? mat4TRS(cx, cy, 0, 0, 0, 0, rect.width, rect.height, 1);
 
+      const nodeZ = (state?.lift ?? 0) + (state?.userZ ?? 0);
       const frame = mat4TRS(
-        cx, cy, (state?.lift ?? 0) + (state?.userZ ?? 0),
+        cx, cy, nodeZ,
         (state?.tiltX ?? 0) + (state?.userRotation?.[0] ?? 0),
         (state?.tiltY ?? 0) + (state?.userRotation?.[1] ?? 0),
         state?.userRotation?.[2] ?? 0,
         1, 1, 1,
       );
-      const nodeId = this.hitNodeTree(ray, surface.id, frame);
+      // Pick through the SAME camera the subtree was drawn with, or the ray
+      // misses everything the off-axis projection moved.
+      const nodeRay = rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, nodeZ).invViewProj);
+      const nodeId = this.hitNodeTree(nodeRay, surface.id, frame);
       if (nodeId) return { scope: 'window', surfaceId: surface.id, nodeId };
 
       if (surface.inputPassthrough) continue;
