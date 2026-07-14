@@ -258,6 +258,34 @@ interface LoopState {
     semantics?: SemanticReviewResult;
     compile?: string;
   };
+  /**
+   * True when the last staging op deliberately skipped its check because the
+   * edit set is still open — either more actions from the same LLM response
+   * were queued behind it, or the agent passed `more: true`. A half-written
+   * object legitimately does not parse, so checking mid-set would report a
+   * failure the agent was about to fix anyway. The observation says "check
+   * deferred" instead of showing a stale verdict.
+   */
+  checkDeferred?: boolean;
+  /**
+   * Exact source text last rendered into an observation. The source is only
+   * re-emitted when it CHANGED; otherwise the observation shows a compact
+   * outline and points at the copy already in the conversation. Re-sending an
+   * unchanged file every turn is what used to blow the conversation budget.
+   */
+  renderedSource?: string;
+  /** Deps whose usage guide has already been rendered in full (once is enough). */
+  renderedGuides: Set<string>;
+  /** The existing object's source, as last rendered in full. Shown once — it is the one thing the agent has not seen. */
+  renderedTargetSource?: string;
+  /**
+   * Call issues already present in the object before this loop touched it (keyed
+   * by kind|dep|method). They are not this task's to fix, so they never block its
+   * deploy. Computed lazily from targetSource, cached because the walk is O(source).
+   */
+  baselineCallKeys?: Set<string>;
+  /** Source the semantic reviewer has already seen — never review the same draft twice. */
+  semanticReviewedSource?: string;
 
   terminal?: { kind: 'done' | 'fail'; result?: unknown; error?: string };
   spawnedObjectId?: AbjectId;
@@ -626,12 +654,201 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Valid action verbs this loop dispatches, for unknown-action recovery. */
   private static readonly VALID_ACTIONS = [
-    'call', 'draft_manifest', 'draft_source', 'draft_diff', 'read_draft',
+    'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft',
     'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
     'compose_organism', 'extract_organelle',
     'reply', 'ask_user', 'done', 'fail',
   ];
+
+  // ── Staging, and when each check runs ─────────────────────────────────
+  //
+  // Every op that writes `state.draftSource` ends in `finishEdit`. Two checks
+  // exist and they have very different natures, so they run at different times:
+  //
+  //   SYNTAX — runs on EVERY edit, and is load-bearing. Members are addressed by
+  //   name through the parsed object literal, so an unparseable draft cannot be
+  //   edited by name AT ALL: one malformed body would poison every later edit.
+  //   Hence the invariant: *an edit may not take a parseable draft to an
+  //   unparseable one.* Such an edit is refused and the draft is left untouched
+  //   and healthy. This costs no step (the verdict rides on the same action) and
+  //   it cannot fire spuriously mid-change: a member body is self-contained, so
+  //   swapping four methods keeps the file parseable by construction. Only a
+  //   genuinely malformed body trips it — which the agent must know at once.
+  //   (A draft that is ALREADY broken — a whole-object draft_source with a typo —
+  //   accepts any edit, since draft_diff/draft_source are how it gets repaired.)
+  //
+  //   CALL VALIDATION — whole-object, and meaningless on half-written code, so it
+  //   WAITS for the edit set to close: while more edits are coming (more actions
+  //   of the same LLM response are queued, or the agent passed `more: true`) it
+  //   does not run. It runs once, on the closing edit.
+  //
+  // A staging op never fails merely because the object is incomplete. That
+  // matters mechanically: AgentAbject discards the rest of a batched response
+  // when one action fails, so a spurious failure would throw away the very edits
+  // that finish the object.
+  //
+  // The hard guarantee lives at deploy: a draft that does not parse, or that
+  // calls methods a dependency does not have, never reaches the live object.
+
+  /** Cap on how large a source may be before observations show an outline instead of the text. */
+  private static readonly MAX_INLINE_SOURCE_CHARS = 30000;
+
+  /**
+   * Close out a staging op.
+   *
+   * `revert` carries the pre-edit draft state when the invariant applies (a
+   * member-addressed edit whose base parsed cleanly). If the edit breaks the
+   * parse, the draft rolls back to exactly what it was — including back to NO
+   * draft at all, which matters on a modify loop's first edit: promoting
+   * targetSource into draftSource there would fake an undeployed change and
+   * send the loop chasing a no-op deploy. Whole-source ops (draft_source,
+   * draft_via_llm) pass undefined: throwing away a whole generation over one
+   * brace is worse than keeping it and repairing it with a diff.
+   */
+  private finishEdit(
+    state: LoopState,
+    action: AgentAction,
+    batchRemaining: number,
+    summary: string,
+    revert?: { draft: string | undefined },
+  ): { ok: boolean; summary: string; error?: string; data?: unknown } {
+    const source = state.draftSource ?? '';
+    const syntaxError = ScriptableAbject.tryCompile(source);
+    state.lastValidation = { ...(state.lastValidation ?? {}), compile: syntaxError ?? '' };
+
+    if (syntaxError && revert !== undefined) {
+      // Refuse the edit rather than leave a draft that can no longer be edited
+      // by member name. The draft is untouched, so the next attempt starts clean.
+      state.draftSource = revert.draft;
+      // The staged draft is back to a state whose checks no longer describe an
+      // edit in progress: drop the stale verdicts rather than leave the loop
+      // asserting a deferred check that will never fire on its own.
+      state.checkDeferred = false;
+      state.lastValidation = { ...(state.lastValidation ?? {}), compile: '', calls: undefined };
+      return {
+        ok: false,
+        summary: `${summary} — REFUSED: the member text you supplied is malformed, nothing was staged`,
+        error: `Your edit was NOT staged; the draft is unchanged and still parses. The text you supplied does not form a valid member.\n${this.augmentCompileError(source, syntaxError)}\n\n` +
+          `Re-send the edit with a well-formed body — the FULL member including its signature and balanced braces, e.g. "openMap(msg) { … }". (An incomplete OBJECT is fine and expected mid-change; an incomplete MEMBER is not, because members are addressed by name through the parsed literal.)`,
+      };
+    }
+
+    if (syntaxError) {
+      // Whole-source op that does not parse: keep it (there is nothing better to
+      // fall back to) but say plainly that name-addressed edits are unavailable
+      // until it parses again.
+      state.checkDeferred = false;
+      return {
+        ok: false,
+        summary: `${summary} — does not parse`,
+        error: `The source is staged but does not parse:\n${this.augmentCompileError(source, syntaxError)}\n\n` +
+          `Until it parses, edits addressed by member NAME cannot locate anything. Repair it with draft_diff (SEARCH/REPLACE works on any text) at the line above, or re-draft the whole object.`,
+      };
+    }
+
+    const more = this.actionField(action, ['more', 'moreEdits', 'pending']) === true;
+    if (more || batchRemaining > 0) {
+      state.checkDeferred = true;
+      const why = more
+        ? 'you said more edits are pending'
+        : `${batchRemaining} more action${batchRemaining === 1 ? '' : 's'} from this response still to apply`;
+      return {
+        ok: true,
+        summary: `${summary} — parses OK; call check deferred (${why})`,
+        data: `Staged and parses. The whole-object call check is deferred because ${why} — it runs on your closing edit, so keep writing until the object is complete.`,
+      };
+    }
+
+    state.checkDeferred = false;
+    const callErrors = this.walkCalls(state, source);
+    state.lastValidation = { ...(state.lastValidation ?? {}), calls: callErrors };
+
+    if (callErrors.length === 0) {
+      return { ok: true, summary: `${summary} — parses OK, 0 call issues`, data: 'Checks passed. Deploy when the object is complete.' };
+    }
+    const blocking = callErrors.filter(e => e.kind !== 'unknown-dep').length;
+    return {
+      ok: true,
+      summary: `${summary} — parses OK, ${callErrors.length} call issue${callErrors.length === 1 ? '' : 's'}${blocking > 0 ? ` (${blocking} block deploy)` : ' (advisory)'}`,
+      data: this.formatCallErrors(callErrors),
+    };
+  }
+
+  // ── Pure member edits (no state) — shared by the single-edit verbs and edit_source ──
+
+  private memberReplace(source: string, name: string, body: string): { source?: string; error?: string } {
+    const parsed = this.parseHandlerMembers(source);
+    if (!parsed) return { error: 'Could not locate the handler-map object literal (the source may not parse). Use draft_source to rewrite it whole.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}. To add a new one use op "add".` };
+    return { source: source.slice(0, m.start) + body.trim() + source.slice(m.end) };
+  }
+
+  private memberAdd(source: string, name: string, body: string): { source?: string; error?: string } {
+    const parsed = this.parseHandlerMembers(source);
+    if (!parsed) return { error: 'Could not locate the handler-map object literal (the source may not parse). Use draft_source to rewrite it whole.' };
+    if (parsed.members.some(x => x.name === name)) {
+      return { error: `A member named "${name}" already exists — use op "replace" to change it.` };
+    }
+    let j = parsed.objEnd - 1;
+    while (j > parsed.objStart && /\s/.test(source[j])) j--;
+    const needsComma = source[j] !== ',' && source[j] !== '{';
+    const insertion = (needsComma ? ',' : '') + '\n\n  ' + body.trim() + '\n';
+    return { source: source.slice(0, parsed.objEnd) + insertion + source.slice(parsed.objEnd) };
+  }
+
+  private memberRemove(source: string, name: string): { source?: string; error?: string } {
+    const parsed = this.parseHandlerMembers(source);
+    if (!parsed) return { error: 'Could not locate the handler-map object literal (the source may not parse). Use draft_source to rewrite it whole.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}.` };
+    let s = m.start;
+    let e = m.end;
+    // Absorb one trailing comma, or (for the last member) the preceding comma.
+    let k = e;
+    while (k < parsed.objEnd && /\s/.test(source[k])) k++;
+    if (source[k] === ',') {
+      e = k + 1;
+    } else {
+      let p = s - 1;
+      while (p > parsed.objStart && /\s/.test(source[p])) p--;
+      if (source[p] === ',') s = p;
+    }
+    return { source: source.slice(0, s) + source.slice(e) };
+  }
+
+  /** Apply SEARCH/REPLACE blocks. Returns the failure prose (with nearest-text hints) on any miss.
+   *  `parseErrors` carries blocks the parser could not read — they were NOT applied,
+   *  and callers must say so rather than report a clean success. */
+  private memberDiff(source: string, rawBlocks: unknown): { source?: string; error?: string; applied?: number; parseErrors?: string[] } {
+    const blocksText = this.normalizeDiffBlocks(rawBlocks);
+    if (typeof blocksText !== 'string' || blocksText.length === 0) {
+      return { error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks (or [{search, replace}] objects).' };
+    }
+    const parsed = parseSearchReplaceBlocks(blocksText);
+    if (parsed.blocks.length === 0) {
+      const detail = parsed.parseErrors.length > 0 ? parsed.parseErrors.join('; ') : 'no blocks recognized';
+      return { error: `Could not parse any SEARCH/REPLACE blocks. ${detail}. Format: each block is\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE` };
+    }
+    const result = applyDiff(source, parsed.blocks);
+    if (!result.ok) {
+      const errorLines = result.errors.map((e) => {
+        let line = `  - ${e.message}`;
+        if (e.nearest) {
+          line += `\n    Closest text in source (around line ${e.nearest.line}) — copy this EXACTLY into your SEARCH:\n` +
+            e.nearest.text.split('\n').map((l) => `    | ${l}`).join('\n');
+        }
+        return line;
+      }).join('\n');
+      const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
+      return {
+        error: `${result.applied}/${parsed.blocks.length} blocks applied, ${result.errors.length} failed:\n${errorLines}${parseNote}\n\n` +
+          `Nothing was staged. For a whole method, the robust move is a "replace" edit addressed by NAME — no SEARCH text to match.`,
+      };
+    }
+    return { source: result.source!, applied: parsed.blocks.length, parseErrors: parsed.parseErrors };
+  }
 
   /**
    * Build a recovery message for an unrecognized action. The most common cause
@@ -666,17 +883,155 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       `If "${got}" is a method on another object (for example writeGoalData/readGoalData on GoalManager), call it via {"action":"call","target":"<object>","method":"${got}","payload":{ ... }}.`;
   }
 
-  private async opDraftSource(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
+  private async opDraftSource(state: LoopState, action: AgentAction, batchRemaining: number): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     const source = this.actionField(action, ['source', 'code', 'draftSource', 'src']) as string | undefined;
     if (typeof source !== 'string' || source.length === 0) {
       const editingExisting = !!state.targetSource;
       const steer = editingExisting
-        ? ' You are modifying an existing object, so a whole-object draft_source is rarely needed — and a large source often gets truncated out of the action (the model runs out of output length). Prefer a TARGETED edit: replace_handler({name, body}) to swap one method (name-addressed, no SEARCH matching), or draft_diff for a small span. Only fall back to draft_source for a genuine full rewrite.'
+        ? ' You are modifying an existing object, so a whole-object draft_source is rarely needed — and a large source often gets truncated out of the action (the model runs out of output length). Prefer a TARGETED edit: edit_source({edits:[…]}) applies every method change in one action, name-addressed, with no SEARCH matching. Only fall back to draft_source for a genuine full rewrite.'
         : ' If the source is large and keeps getting dropped, draft it out-of-band with draft_via_llm({kind:"source"}) instead of inlining it in the action.';
       return { ok: false, summary: 'draft_source: missing source', error: `source must be a non-empty string (pass it as the \`source\` field).${steer}` };
     }
     state.draftSource = source;
-    return { ok: true, summary: `draft_source: ${source.split('\n').length} lines staged` };
+    return this.finishEdit(state, action, batchRemaining, `draft_source: ${source.split('\n').length} lines staged`);
+  }
+
+  /**
+   * The batched editor: apply every member change of a change-set in ONE action,
+   * then check once. This is the normal way to modify an object — N methods
+   * become one action, one syntax check, one call validation, one LLM turn.
+   *
+   * All-or-nothing: if any edit fails to locate its target, NOTHING is staged and
+   * every failure is reported together, so the draft can never end up half-applied.
+   */
+  private async opEditSource(state: LoopState, action: AgentAction, batchRemaining: number): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) {
+      return {
+        ok: false,
+        summary: 'edit_source: no base source',
+        error: 'edit_source edits an existing source. For a modify loop the target source loads automatically; if the goal turned out to be about an existing object, call load_target({objectId|targetName}) first. For a brand-new object use draft_source.',
+      };
+    }
+
+    const raw = this.actionField(action, ['edits', 'changes', 'ops', 'operations']);
+    const edits = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : []);
+    if (edits.length === 0) {
+      return {
+        ok: false,
+        summary: 'edit_source: missing edits',
+        error: 'Pass `edits`: an array of { op: "replace" | "add" | "remove", name, body } entries (body is the FULL member text including its signature, e.g. "openMap(msg) { … }"), and/or { op: "diff", blocks: "<<<<<<< SEARCH …" } for a change inside a member. They apply in order.',
+      };
+    }
+
+    let work = base;
+    const applied: string[] = [];
+    const failures: string[] = [];
+
+    for (let i = 0; i < edits.length; i++) {
+      const e = edits[i];
+      if (!e || typeof e !== 'object') {
+        failures.push(`edit[${i}]: not an object`);
+        continue;
+      }
+      const o = e as Record<string, unknown>;
+      const name = typeof o.name === 'string' ? o.name.trim()
+        : typeof o.handler === 'string' ? o.handler.trim()
+          : typeof o.method === 'string' ? o.method.trim() : '';
+      // Body aliases must stay in sync with opMemberEdit's list. A body arriving
+      // under a key we do not read looks exactly like "no body was given", and
+      // deleting a member on that basis would destroy code the model meant to
+      // rewrite — so an unrecognized body key must fail loudly, never silently.
+      const BODY_KEYS = ['body', 'source', 'member', 'text', 'code', 'content', 'newBody', 'implementation'];
+      let body: string | undefined;
+      for (const k of BODY_KEYS) {
+        if (typeof o[k] === 'string') { body = o[k] as string; break; }
+      }
+      const blocks = o.blocks ?? o.diff ?? o.patch ?? o.search_replace;
+
+      // Infer the op when the model left it off. Deletion is NEVER inferred: it
+      // is destructive and unrecoverable, so it must be asked for explicitly.
+      let op = typeof o.op === 'string' ? o.op.toLowerCase() : '';
+      if (op.startsWith('replace_') || op === 'update' || op === 'modify') op = 'replace';
+      if (op.startsWith('add_') || op === 'insert' || op === 'create') op = 'add';
+      if (op.startsWith('remove_') || op === 'delete') op = 'remove';
+      if (op === 'patch' || op === 'draft_diff') op = 'diff';
+      if (!op) {
+        if (blocks !== undefined) op = 'diff';
+        else if (name && body !== undefined) {
+          const parsed = this.parseHandlerMembers(work);
+          op = parsed?.members.some(m => m.name === name) ? 'replace' : 'add';
+        } else if (name) {
+          failures.push(
+            `edit[${i}] "${name}": no op and no body. If you meant to rewrite it, pass the member text as \`body\` ` +
+            `(a non-empty string containing the FULL member, e.g. "${name}(msg) { … }"). If you really meant to DELETE it, say so explicitly with { op: "remove", name: "${name}" } — deletion is never assumed.`,
+          );
+          continue;
+        }
+      }
+
+      // A blank body would splice emptiness over the member — a silent deletion
+      // wearing a rewrite's name. Reject it the same way replace_handler does.
+      if ((op === 'replace' || op === 'add') && typeof body === 'string' && !body.trim()) {
+        failures.push(`edit[${i}] ${op} "${name}": body is empty. Send the FULL member text including its signature; an empty body would erase the member.`);
+        continue;
+      }
+
+      let r: { source?: string; error?: string };
+      switch (op) {
+        case 'replace':
+          if (!name || body === undefined) { failures.push(`edit[${i}] replace: needs {name, body}`); continue; }
+          r = this.memberReplace(work, name, body);
+          break;
+        case 'add':
+          if (!name || body === undefined) { failures.push(`edit[${i}] add: needs {name, body}`); continue; }
+          r = this.memberAdd(work, name, body);
+          break;
+        case 'remove':
+          if (!name) { failures.push(`edit[${i}] remove: needs {name}`); continue; }
+          r = this.memberRemove(work, name);
+          break;
+        case 'diff':
+          r = this.memberDiff(work, blocks);
+          break;
+        default:
+          failures.push(`edit[${i}]: unknown op "${op}" — use replace, add, remove, or diff`);
+          continue;
+      }
+
+      if (r.error !== undefined || r.source === undefined) {
+        failures.push(`edit[${i}] ${op}${name ? ` "${name}"` : ''}: ${r.error ?? 'failed'}`);
+        continue;
+      }
+      work = r.source;
+      applied.push(`${op}${name ? ` ${name}` : ''}`);
+    }
+
+    if (failures.length > 0) {
+      return {
+        ok: false,
+        summary: `edit_source: ${failures.length}/${edits.length} edit${edits.length === 1 ? '' : 's'} failed — nothing staged`,
+        error: `No edits were applied (the set is all-or-nothing, so the draft is never left half-changed):\n${failures.map(f => `  - ${f}`).join('\n')}\n\n` +
+          `Re-emit the whole set with the failures corrected. read_draft() with no args lists every member name and its line range.`,
+      };
+    }
+
+    const prevDraft = state.draftSource;
+    state.draftSource = work;
+    return this.finishEdit(
+      state,
+      action,
+      batchRemaining,
+      `edit_source: ${applied.length} edit${applied.length === 1 ? '' : 's'} applied (${applied.join(', ')}), source now ${work.split('\n').length} lines`,
+      // A change-set applied to a healthy object must leave it healthy: roll back
+      // if it doesn't, so the draft never stops being editable by name.
+      this.parses(base) ? { draft: prevDraft } : undefined,
+    );
+  }
+
+  /** True when a source parses — i.e. its members can still be addressed by name. */
+  private parses(source: string): boolean {
+    return ScriptableAbject.tryCompile(source) === undefined;
   }
 
   /**
@@ -722,58 +1077,51 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return '';
   }
 
-  private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const rawBlocks = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']);
-    const blocksText = this.normalizeDiffBlocks(rawBlocks);
-    if (typeof blocksText !== 'string' || blocksText.length === 0) {
-      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For editing one method, prefer replace_handler({name, body}) — name-addressed, no SEARCH text to match. To rewrite the whole object use draft_source.' };
-    }
+  private async opDraftDiff(state: LoopState, action: AgentAction, batchRemaining: number): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     const base = state.draftSource ?? state.targetSource;
     if (!base) {
       return {
         ok: false,
         summary: 'draft_diff: no base source',
-        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically. If you discovered the goal is about an existing object, call load_target({objectId|targetName}) to adopt it and load its source, then draft_diff. For a brand-new object, use draft_source instead.',
+        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically. If you discovered the goal is about an existing object, call load_target({objectId|targetName}) to adopt it and load its source, then edit. For a brand-new object, use draft_source instead.',
       };
     }
 
-    const parsed = parseSearchReplaceBlocks(blocksText);
-    if (parsed.blocks.length === 0) {
-      const detail = parsed.parseErrors.length > 0 ? parsed.parseErrors.join('; ') : 'no blocks recognized';
+    const rawBlocks = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']);
+    const r = this.memberDiff(base, rawBlocks);
+    if (r.error !== undefined || r.source === undefined) {
       return {
         ok: false,
-        summary: `draft_diff: parse failed (${detail.slice(0, 80)})`,
-        error: `Could not parse any SEARCH/REPLACE blocks. ${detail}. Format: each block is\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE`,
+        summary: `draft_diff: not applied`,
+        error: `${r.error}\n\nFor a whole method, edit_source({edits:[{op:"replace", name, body}]}) addresses it by NAME — no SEARCH text to match, and every method of the change-set applies in one action.`,
       };
     }
 
-    const result = applyDiff(base, parsed.blocks);
-    if (!result.ok) {
-      const errorLines = result.errors.map((e) => {
-        let line = `  - ${e.message}`;
-        // Show the closest region actually in the source so the next attempt can
-        // copy it verbatim instead of guessing at whitespace again.
-        if (e.nearest) {
-          line += `\n    Closest text in source (around line ${e.nearest.line}) — copy this EXACTLY into your SEARCH:\n` +
-            e.nearest.text.split('\n').map((l) => `    | ${l}`).join('\n');
-        }
-        return line;
-      }).join('\n');
-      const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
-      return {
-        ok: false,
-        summary: `draft_diff: ${result.applied}/${parsed.blocks.length} applied, ${result.errors.length} failed`,
-        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again. If the edit is one method, the robust path is read_draft({handler:"<name>"}) to see its exact current text, then replace_handler({name:"<name>", body:"<full method>"}) — no SEARCH matching. For a whole-object rewrite use draft_source.`,
-      };
+    const prevDraft = state.draftSource;
+    state.draftSource = r.source;
+    const stackedNote = base !== state.targetSource ? ' (stacked on prior draft)' : '';
+    // A block the parser could not recognize is a block that did NOT get applied.
+    // Saying "2 blocks applied" without saying "1 was unreadable" reads as total
+    // success, and the missing edit only surfaces as a bug report from the user.
+    const dropped = r.parseErrors ?? [];
+    const droppedNote = dropped.length > 0
+      ? `⚠️ ${dropped.length} block${dropped.length === 1 ? '' : 's'} could NOT be parsed and ${dropped.length === 1 ? 'was' : 'were'} NOT applied: ${dropped.join('; ')}. That edit is MISSING from the draft — re-send ${dropped.length === 1 ? 'it' : 'them'} in valid SEARCH/REPLACE form.`
+      : '';
+    const res = this.finishEdit(
+      state,
+      action,
+      batchRemaining,
+      `draft_diff: ${r.applied} block${r.applied === 1 ? '' : 's'} applied${stackedNote}, source now ${r.source.split('\n').length} lines${dropped.length > 0 ? ` — ⚠️ ${dropped.length} block(s) dropped` : ''}`,
+      // A diff that BREAKS a healthy draft is a mistake and rolls back. A diff on
+      // an already-broken draft is how it gets repaired, so it is always kept.
+      this.parses(base) ? { draft: prevDraft } : undefined,
+    );
+    // The verdict alone would read as total success. The agent sees `data` as its
+    // action result, so the dropped blocks have to land there, not just in the log.
+    if (droppedNote) {
+      res.data = `${droppedNote}\n\n${typeof res.data === 'string' ? res.data : ''}`.trim();
     }
-
-    state.draftSource = result.source;
-    const stackedNote = state.draftSource && base !== state.targetSource ? ' (stacked on prior draft)' : '';
-    const parseNote = parsed.parseErrors.length > 0 ? ` [parse warnings: ${parsed.parseErrors.length}]` : '';
-    return {
-      ok: true,
-      summary: `draft_diff: ${parsed.blocks.length} block${parsed.blocks.length === 1 ? '' : 's'} applied${stackedNote}, source now ${result.source!.split('\n').length} lines${parseNote}`,
-    };
+    return res;
   }
 
   // ── Structure-aware editing of the staged handler-map object literal ──────
@@ -830,6 +1178,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
     // acorn's node.end is one past the last char; the closing `}` sits at end-1.
     return { objStart: obj.start, objEnd: obj.end - 1, members };
+  }
+
+  /** Member names + line ranges — what the observation shows instead of re-pasting the file. */
+  private sourceOutline(source: string): string {
+    const parsed = this.parseHandlerMembers(source);
+    if (!parsed || parsed.members.length === 0) {
+      return '  (the object literal could not be parsed — the draft may not compile right now)';
+    }
+    return parsed.members.map(m => {
+      const sl = source.slice(0, m.start).split('\n').length;
+      const el = source.slice(0, m.end).split('\n').length;
+      return `  ${m.name.padEnd(24)} lines ${sl}-${el} (${el - sl + 1})`;
+    }).join('\n');
   }
 
   private opReadDraft(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string; data?: unknown } {
@@ -899,79 +1260,57 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (!parsed || parsed.members.length === 0) {
       return { ok: true, summary: `read_draft: ${total} lines`, data: numbered(base) };
     }
-    const outline = parsed.members.map(m => {
-      const sl = base.slice(0, m.start).split('\n').length;
-      const el = base.slice(0, m.end).split('\n').length;
-      return `  ${m.name}  (lines ${sl}-${el}, ${el - sl + 1} ln)`;
-    }).join('\n');
     return {
       ok: true,
       summary: `read_draft: outline (${parsed.members.length} members, ${total} lines)`,
-      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${outline}`,
+      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${this.sourceOutline(base)}`,
     };
   }
 
-  private opReplaceHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+  /**
+   * Single-member sugar over edit_source. Kept because a one-method change reads
+   * cleanly as one verb; anything larger should go through edit_source so the
+   * whole change-set applies (and checks) in a single action.
+   */
+  private opMemberEdit(
+    state: LoopState,
+    action: AgentAction,
+    batchRemaining: number,
+    verb: 'replace' | 'add' | 'remove',
+  ): { ok: boolean; summary: string; error?: string; data?: unknown } {
+    const label = `${verb}_handler`;
     const base = state.draftSource ?? state.targetSource;
-    if (!base) return { ok: false, summary: 'replace_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
-    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
-    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
-    if (!name) return { ok: false, summary: 'replace_handler: missing name', error: 'replace_handler requires {name} — the existing member to replace.' };
-    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'replace_handler: missing body', error: 'replace_handler requires {body} — the FULL member text including its signature, e.g. "openMap(msg) { ... }".' };
-    const parsed = this.parseHandlerMembers(base);
-    if (!parsed) return { ok: false, summary: 'replace_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
-    const m = parsed.members.find(x => x.name === name);
-    if (!m) return { ok: false, summary: `replace_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}. To add a new member use add_handler.` };
-    const next = base.slice(0, m.start) + body.trim() + base.slice(m.end);
-    state.draftSource = next;
-    return { ok: true, summary: `replace_handler: "${name}" replaced, source now ${next.split('\n').length} lines. Run compile next.` };
-  }
+    if (!base) return { ok: false, summary: `${label}: no source`, error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
 
-  private opAddHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
-    const base = state.draftSource ?? state.targetSource;
-    if (!base) return { ok: false, summary: 'add_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
     const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
-    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
-    if (!name) return { ok: false, summary: 'add_handler: missing name', error: 'add_handler requires {name}.' };
-    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'add_handler: missing body', error: 'add_handler requires {body} — the full member text, e.g. "myMethod(msg) { ... }".' };
-    const parsed = this.parseHandlerMembers(base);
-    if (!parsed) return { ok: false, summary: 'add_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
-    if (parsed.members.some(x => x.name === name)) {
-      return { ok: false, summary: `add_handler: "${name}" exists`, error: `A member named "${name}" already exists — use replace_handler to change it.` };
-    }
-    let j = parsed.objEnd - 1;
-    while (j > parsed.objStart && /\s/.test(base[j])) j--;
-    const needsComma = base[j] !== ',' && base[j] !== '{';
-    const insertion = (needsComma ? ',' : '') + '\n\n  ' + body.trim() + '\n';
-    const next = base.slice(0, parsed.objEnd) + insertion + base.slice(parsed.objEnd);
-    state.draftSource = next;
-    return { ok: true, summary: `add_handler: "${name}" added, source now ${next.split('\n').length} lines. Run compile next.` };
-  }
+    if (!name) return { ok: false, summary: `${label}: missing name`, error: `${label} requires {name}.` };
 
-  private opRemoveHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
-    const base = state.draftSource ?? state.targetSource;
-    if (!base) return { ok: false, summary: 'remove_handler: no source', error: 'Nothing staged. Use draft_source or load_target first.' };
-    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
-    if (!name) return { ok: false, summary: 'remove_handler: missing name', error: 'remove_handler requires {name}.' };
-    const parsed = this.parseHandlerMembers(base);
-    if (!parsed) return { ok: false, summary: 'remove_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
-    const m = parsed.members.find(x => x.name === name);
-    if (!m) return { ok: false, summary: `remove_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}.` };
-    let s = m.start;
-    let e = m.end;
-    // Absorb one trailing comma, or (for the last member) the preceding comma.
-    let k = e;
-    while (k < parsed.objEnd && /\s/.test(base[k])) k++;
-    if (base[k] === ',') {
-      e = k + 1;
-    } else {
-      let p = s - 1;
-      while (p > parsed.objStart && /\s/.test(base[p])) p--;
-      if (base[p] === ',') s = p;
+    let body: string | undefined;
+    if (verb !== 'remove') {
+      body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
+      if (typeof body !== 'string' || !body.trim()) {
+        return { ok: false, summary: `${label}: missing body`, error: `${label} requires {body} — the FULL member text including its signature, e.g. "openMap(msg) { ... }".` };
+      }
     }
-    const next = base.slice(0, s) + base.slice(e);
-    state.draftSource = next;
-    return { ok: true, summary: `remove_handler: "${name}" removed, source now ${next.split('\n').length} lines. Run compile next.` };
+
+    const r = verb === 'replace' ? this.memberReplace(base, name, body!)
+      : verb === 'add' ? this.memberAdd(base, name, body!)
+        : this.memberRemove(base, name);
+
+    if (r.error !== undefined || r.source === undefined) {
+      return { ok: false, summary: `${label}: "${name}" not applied`, error: r.error };
+    }
+
+    const prevDraft = state.draftSource;
+    state.draftSource = r.source;
+    const past = verb === 'replace' ? 'replaced' : verb === 'add' ? 'added' : 'removed';
+    return this.finishEdit(
+      state,
+      action,
+      batchRemaining,
+      `${label}: "${name}" ${past}, source now ${r.source.split('\n').length} lines`,
+      this.parses(base) ? { draft: prevDraft } : undefined,
+    );
   }
 
   /**
@@ -1007,7 +1346,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     state.targetObjectId = resolvedId;
     state.targetName = nameOrId.includes('-') && nameOrId.length > 20 ? undefined : nameOrId;
-    if (source !== undefined) state.targetSource = source;
+    if (source !== undefined) {
+      state.targetSource = source;
+      // A different object's pre-existing call issues are not this one's baseline.
+      state.baselineCallKeys = undefined;
+    }
     // Pivot the loop: from here this is a modification of an existing object.
     if (state.kind === 'create') state.kind = 'modify';
 
@@ -1020,7 +1363,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
     return {
       ok: true,
-      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with draft_diff, deploy with deploy_update)`,
+      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with edit_source, deploy with deploy_update)`,
     };
   }
 
@@ -1030,7 +1373,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * specific guidance (e.g. "make it idempotent", "preserve the existing
    * messageAdded handler").
    */
-  private async opDraftViaLlm(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
+  private async opDraftViaLlm(state: LoopState, action: AgentAction, batchRemaining = 0): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.llmId) return { ok: false, summary: 'draft_via_llm: LLM unavailable', error: 'LLM not resolved' };
     const kind = this.actionField(action, ['kind', 'type']) as 'manifest' | 'source' | undefined;
     const instructions = (this.actionField(action, ['instructions', 'prompt', 'guidance']) as string | undefined) ?? '';
@@ -1082,14 +1425,20 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const code = codeMatch ? codeMatch[1].trim() : raw.trim();
     if (!code) return { ok: false, summary: 'draft_via_llm source: empty', error: 'no code block in LLM response' };
     state.draftSource = code;
-    return { ok: true, summary: `draft_via_llm source: ${code.split('\n').length} lines` };
+    return this.finishEdit(state, action, batchRemaining, `draft_via_llm source: ${code.split('\n').length} lines`);
   }
 
-  /** Run ScriptableAbject.tryCompile against the staged source. */
+  /**
+   * Explicit syntax check. Rarely needed now: every staging op checks the draft
+   * as it closes the edit set, and deploy refuses a draft that does not parse.
+   * Kept for the case where the agent wants to re-check a deferred edit set
+   * without making another edit.
+   */
   private opCompile(state: LoopState): { ok: boolean; summary: string; error?: string } {
     if (!state.draftSource) {
-      return { ok: false, summary: 'compile: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
+      return { ok: false, summary: 'compile: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm first' };
     }
+    state.checkDeferred = false;
     const err = ScriptableAbject.tryCompile(state.draftSource);
     state.lastValidation = { ...(state.lastValidation ?? {}), compile: err ?? '' };
     if (err) {
@@ -1121,7 +1470,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         detail = `\n\nSyntax error near line ${loc.line}:${loc.column}:\n${ctx}`;
       }
     }
-    detail += `\n\nSource is ${lines.length} lines. The failing line and its surrounding context are shown above; you already have the exact location, so do NOT use read_draft to find it again. Fix it in place: replace_handler to rewrite the single member that contains it, or draft_diff for a one-line change; or regenerate the whole object with draft_source. A syntax error at or near the last line is almost always an unbalanced brace/paren/bracket, so check the object literal's closing.`;
+    detail += `\n\nSource is ${lines.length} lines. The failing line and its surrounding context are shown above; you already have the exact location, so do NOT use read_draft to find it again. Fix it in place: edit_source with one { op: "replace", name, body } for the member that contains it, or regenerate the whole object with draft_source. A syntax error at or near the last line is almost always an unbalanced brace/paren/bracket, so check the object literal's closing.`;
     return `${err}${detail}`;
   }
 
@@ -1136,11 +1485,31 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private opValidateCalls(state: LoopState): { ok: boolean; summary: string; error?: string; issues?: CallValidationError[] } {
     if (!state.draftSource) {
-      return { ok: false, summary: 'validate_calls: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
+      return { ok: false, summary: 'validate_calls: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm first' };
     }
 
+    // The agent asked for the check explicitly, so the edit set is closed as far
+    // as calls go — leaving checkDeferred set would make the observation report
+    // "deferred" and hide the very issues this step just computed.
+    state.checkDeferred = false;
+    const errors = this.walkCalls(state, state.draftSource);
+    state.lastValidation = { ...(state.lastValidation ?? {}), calls: errors };
+
+    if (errors.length === 0) {
+      return { ok: true, summary: 'validate_calls: 0 issues' };
+    }
+
+    const summary = `validate_calls: ${errors.length} issue${errors.length === 1 ? '' : 's'} — ` +
+      errors.slice(0, 3).map(e => e.kind === 'hardcoded-id'
+        ? `hardcoded id ${(e.depName ?? '').slice(0, 8)}…`
+        : `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
+      (errors.length > 3 ? ', …' : '');
+    return { ok: false, summary, issues: errors, error: this.formatCallErrors(errors) };
+  }
+
+  /** The static walk itself, over an arbitrary source. Pure; writes no state. */
+  private walkCalls(state: LoopState, source: string): CallValidationError[] {
     const errors: CallValidationError[] = [];
-    const source = state.draftSource;
 
     // Per-source var-flow scan. The handler-map syntax in our system is one
     // top-level object literal, so a single global pass is good enough; per-
@@ -1245,18 +1614,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       errors.push({ kind: 'hardcoded-id', callSite: { line, snippet }, depName: id });
     }
 
-    state.lastValidation = { ...(state.lastValidation ?? {}), calls: errors };
-
-    if (errors.length === 0) {
-      return { ok: true, summary: 'validate_calls: 0 issues' };
-    }
-
-    const summary = `validate_calls: ${errors.length} issue${errors.length === 1 ? '' : 's'} — ` +
-      errors.slice(0, 3).map(e => e.kind === 'hardcoded-id'
-        ? `hardcoded id ${(e.depName ?? '').slice(0, 8)}…`
-        : `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
-      (errors.length > 3 ? ', …' : '');
-    return { ok: false, summary, issues: errors, error: this.formatCallErrors(errors) };
+    return errors;
   }
 
   /**
@@ -1266,12 +1624,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private async opReviewSemantics(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: string; result?: SemanticReviewResult }> {
     if (!state.draftSource) {
-      return { ok: false, summary: 'review_semantics: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
+      return { ok: false, summary: 'review_semantics: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm first' };
     }
     if (!this.llmId) return { ok: false, summary: 'review_semantics: LLM unavailable', error: 'LLM not resolved' };
 
     const sys = this.semanticReviewerSystemPrompt();
     const user = this.buildReviewerUserPrompt(state);
+    const reviewing = state.draftSource;
 
     let raw: string;
     try {
@@ -1283,8 +1642,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       );
       raw = (resp.content ?? '').trim();
     } catch (err) {
+      // Do NOT mark the draft reviewed: a reviewer that never ran must not
+      // suppress the advisory review at deploy, or the draft ships with the
+      // loop believing semantics were covered when nothing looked at them.
       return { ok: false, summary: 'review_semantics: LLM call failed', error: err instanceof Error ? err.message : String(err) };
     }
+    state.semanticReviewedSource = reviewing;
 
     let result: SemanticReviewResult;
     if (/^VERIFIED\b/.test(raw)) {
@@ -1320,6 +1683,99 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return { ok: result.verified, summary, result, data: advisory, error: result.verified ? undefined : this.formatSemanticIssues(result) };
   }
 
+  // ── The deploy gate ───────────────────────────────────────────────────
+  //
+  // Deploy is the ONLY place a check refuses to proceed, and it refuses on
+  // mechanical grounds only: a draft that does not parse, or that calls a method
+  // a dependency's live manifest does not have, must never reach the live object.
+  // LLM judgments (the semantic reviewer) advise but never block — a deployed
+  // object answering real calls teaches more per step than another blind pass.
+
+  /** Refuse the deploy when the staged draft is mechanically broken. Returns the refusal, or undefined to proceed. */
+  private gateDeploy(state: LoopState, verb: string): { ok: false; summary: string; error: string } | undefined {
+    const source = state.draftSource!;
+
+    const syntaxError = ScriptableAbject.tryCompile(source);
+    state.lastValidation = { ...(state.lastValidation ?? {}), compile: syntaxError ?? '' };
+    if (syntaxError) {
+      state.checkDeferred = false;
+      return {
+        ok: false,
+        summary: `${verb}: refused — staged source does not parse`,
+        error: `Nothing was deployed: the live object is untouched and still runs its old code.\n${this.augmentCompileError(source, syntaxError)}`,
+      };
+    }
+
+    const callErrors = this.walkCalls(state, source);
+    state.lastValidation = { ...(state.lastValidation ?? {}), calls: callErrors };
+    state.checkDeferred = false;
+
+    // What may block a deploy is narrow, and deliberately so.
+    //
+    // Kind: only a recipient addressed by a bare name (delivered nowhere, always
+    // times out) and a method absent from the target's live manifest are certain
+    // runtime failures. `unknown-dep` merely means the agent never introspected
+    // that object, and `hardcoded-id` is a regex over every UUID-shaped literal —
+    // both are heuristics, and a heuristic must not be able to make an object
+    // permanently unshippable. They advise.
+    //
+    // Provenance: only issues THIS loop introduced. The walker reads the whole
+    // file, so an existing object carrying a UUID in its data, or calling a method
+    // its dependency's (LLM-authored) manifest forgot to declare, would otherwise
+    // refuse every future deploy of code the agent never touched — turning an
+    // unrelated one-line fix into an unfixable task.
+    const CERTAIN = new Set(['name-string-recipient', 'unknown-method']);
+    const preExisting = this.baselineCallErrorKeys(state);
+    const blocking = callErrors.filter(e => CERTAIN.has(e.kind) && !preExisting.has(this.callErrorKey(e)));
+
+    if (blocking.length > 0) {
+      return {
+        ok: false,
+        summary: `${verb}: refused — ${blocking.length} call${blocking.length === 1 ? '' : 's'} you wrote would fail at runtime`,
+        error: `Nothing was deployed: the live object is untouched.\n${this.formatCallErrors(blocking)}\n\n` +
+          `Fix these with edit_source, then deploy again. If you believe a method DOES exist and the manifest is simply out of date, ask the object itself (call("<Name>", "ask", {question: "..."})) and use the name it gives you.`,
+      };
+    }
+    return undefined;
+  }
+
+  /** Identity of a call issue, independent of line number (lines shift as the draft is edited). */
+  private callErrorKey(e: CallValidationError): string {
+    return `${e.kind}|${e.depName ?? ''}|${e.methodName ?? ''}`;
+  }
+
+  /**
+   * Call issues that were ALREADY in the object before this loop touched it.
+   * They are not this task's to fix, and must never block shipping its change.
+   */
+  private baselineCallErrorKeys(state: LoopState): Set<string> {
+    if (!state.baselineCallKeys) {
+      state.baselineCallKeys = new Set(
+        state.targetSource ? this.walkCalls(state, state.targetSource).map(e => this.callErrorKey(e)) : [],
+      );
+    }
+    return state.baselineCallKeys;
+  }
+
+  /**
+   * Run the semantic reviewer inline, once per distinct draft, and render its
+   * findings as advisory prose to ride back on the deploy result. Costs no extra
+   * agent turn (it used to cost one, plus a full observation). Never blocks:
+   * failures and timeouts here are swallowed.
+   */
+  private async adviseSemantics(state: LoopState): Promise<string | undefined> {
+    if (!this.llmId || !state.draftSource) return undefined;
+    if (state.semanticReviewedSource === state.draftSource) return undefined;
+    try {
+      const res = await this.opReviewSemantics(state);
+      const issues = res.result?.issues ?? [];
+      if (issues.length === 0) return undefined;
+      return `Semantic review of the deployed draft (advisory — the object IS live; fix what is real, then deploy again):\n${this.formatSemanticIssues(res.result!)}`;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Deploy a CREATE: read the staged manifest + source from the loop state
    * and send Factory.spawn server-side. Still pure message passing — this
@@ -1330,7 +1786,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private async opDeploySpawn(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.factoryId) return { ok: false, summary: 'deploy_spawn: Factory unavailable', error: 'Factory not resolved' };
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
-    if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm({kind: "source"}) first' };
+    if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
+
+    const refusal = this.gateDeploy(state, 'deploy_spawn');
+    if (refusal) return refusal;
 
     const spawnReq: SpawnRequest = {
       manifest: state.draftManifest,
@@ -1392,10 +1851,17 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       ? ` — WARNING: another live object already holds the name "${state.draftManifest.name}" (${state.nameCollisionId}). Name-based calls resolve to THAT older object; your own calls to "${state.draftManifest.name}" are auto-routed to the new instance. Decide what to do about the duplicate: usually the older object should have been modified instead of spawning a twin, or it should be destroyed.`
       : '';
 
+    const advisory = await this.adviseSemantics(state);
+
     return {
       ok: true,
       summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${collisionNote}`,
-      data: { objectId: result.objectId, manifest: state.draftManifest },
+      data: {
+        objectId: result.objectId,
+        manifest: state.draftManifest,
+        ...(advisory ? { semanticReview: advisory } : {}),
+        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI.',
+      },
     };
   }
 
@@ -1417,7 +1883,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private async opDeployUpdate(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.registryId) return { ok: false, summary: 'deploy_update: Registry unavailable', error: 'Registry not resolved' };
-    if (!state.draftSource) return { ok: false, summary: 'deploy_update: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm({kind: "source"}) first' };
+    if (!state.draftSource) return { ok: false, summary: 'deploy_update: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
+
+    const refusal = this.gateDeploy(state, 'deploy_update');
+    if (refusal) return refusal;
 
     // Resolve target: explicit objectId / targetName from action wins, else
     // fall back to the kind:modify state target.
@@ -1530,10 +1999,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
     if (targetLabel && !state.targetName) state.targetName = targetLabel;
 
+    const advisory = await this.adviseSemantics(state);
+
     return {
       ok: true,
       summary: `deploy_update: ${targetLabel ?? targetId} updated (${state.draftSource.split('\n').length} lines)`,
-      data: { objectId: targetId },
+      data: {
+        objectId: targetId,
+        ...(advisory ? { semanticReview: advisory } : {}),
+        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI. If the edit touched show()/createCanvas/widget wiring, hide() then show() the target first.',
+      },
     };
   }
 
@@ -1630,7 +2105,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return {
         ok: false,
         summary: `compose_organism: membrane source does not compile: ${compileErr.slice(0, 100)}`,
-        error: `Fix the staged source (replace_handler / draft_diff / draft_source), run compile, then rerun compose_organism. Error: ${compileErr}`,
+        error: `Fix the staged source (edit_source / draft_source), then rerun compose_organism. Error: ${compileErr}`,
       };
     }
 
@@ -2306,8 +2781,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      return this.handleAct(taskId, action, msg.routing.from);
+      const { taskId, action, batchRemaining } = msg.payload as {
+        taskId: string; step: number; action: AgentAction; batchRemaining?: number;
+      };
+      return this.handleAct(taskId, action, msg.routing.from, batchRemaining ?? 0);
     });
 
     this.on('agentPhaseChanged', async () => { /* no-op */ });
@@ -2436,6 +2913,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       usedObjects: [],
       turn: 0,
       turnLog: [],
+      renderedGuides: new Set(),
     };
 
     // Resume authored work from a prior task in this goal, if any: a
@@ -2623,6 +3101,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       ? new Set(['call', 'read_draft', 'getState', 'ask', 'discover'])
       : new Set(['compile', 'validate_calls', 'deploy_spawn', 'deploy_update']);
     if (!MECHANICAL.has(last.action)) return reasoningTier;
+    // A deploy now carries the semantic reviewer's findings back with it. If it
+    // found something, the next think may well WRITE CODE to address it — that
+    // is an authoring step, not a mechanical one.
+    if (last.action.startsWith('deploy_') && (state.lastValidation?.semantics?.issues.length ?? 0) > 0) {
+      return reasoningTier;
+    }
     // A "successful" mechanical step can still surface a runtime problem —
     // that needs reasoning even though the action itself succeeded.
     if (/\b(error|exception|fail|threw|cannot read|undefined|not found|not registered)\b/i.test(last.summary)) {
@@ -2631,7 +3115,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return 'balanced';
   }
 
-  private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  /**
+   * `batchRemaining` is how many further actions from the SAME LLM response are
+   * still queued behind this one (AgentAbject drains them with no LLM call in
+   * between). Staging ops use it to keep the edit set OPEN: the syntax and call
+   * checks run once, on the last edit of the response, instead of after each one.
+   */
+  private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId, batchRemaining = 0): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.tasks.get(taskId);
     if (!extra) {
       return { success: false, error: 'No active task' };
@@ -2650,28 +3140,31 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           res = await this.opDraftManifest(state, action);
           break;
         case 'draft_source':
-          res = await this.opDraftSource(state, action);
+          res = await this.opDraftSource(state, action, batchRemaining);
+          break;
+        case 'edit_source':
+          res = await this.opEditSource(state, action, batchRemaining);
           break;
         case 'draft_diff':
-          res = await this.opDraftDiff(state, action);
+          res = await this.opDraftDiff(state, action, batchRemaining);
           break;
         case 'read_draft':
           res = this.opReadDraft(state, action);
           break;
         case 'replace_handler':
-          res = this.opReplaceHandler(state, action);
+          res = this.opMemberEdit(state, action, batchRemaining, 'replace');
           break;
         case 'add_handler':
-          res = this.opAddHandler(state, action);
+          res = this.opMemberEdit(state, action, batchRemaining, 'add');
           break;
         case 'remove_handler':
-          res = this.opRemoveHandler(state, action);
+          res = this.opMemberEdit(state, action, batchRemaining, 'remove');
           break;
         case 'load_target':
           res = await this.opLoadTarget(state, action);
           break;
         case 'draft_via_llm':
-          res = await this.opDraftViaLlm(state, action);
+          res = await this.opDraftViaLlm(state, action, batchRemaining);
           break;
         case 'compile':
           res = this.opCompile(state);
@@ -2767,19 +3260,69 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         if (dep.events.size > 0) {
           lines.push(`  Events: ${[...dep.events].join(', ')}`);
         }
+        // The guide is prose the `ask` action already put in the conversation.
+        // Render it once, in full; after that a pointer. Re-pasting an excerpt
+        // every turn is what used to push this loop into the context budget.
         if (dep.usageGuide) {
-          const excerpt = dep.usageGuide.slice(0, 600).replace(/\n+/g, ' ');
-          lines.push(`  Usage guide excerpt: ${excerpt}${dep.usageGuide.length > 600 ? '…' : ''}`);
+          if (state.renderedGuides.has(dep.depName)) {
+            lines.push('  Usage guide: shown earlier in this conversation — scroll back to it rather than re-asking.');
+          } else {
+            state.renderedGuides.add(dep.depName);
+            lines.push('  Usage guide:');
+            lines.push(dep.usageGuide.slice(0, 1600).split('\n').map(l => `    ${l}`).join('\n'));
+          }
         }
       }
     }
     lines.push('');
 
-    if (state.targetSource) {
-      lines.push(`TARGET SOURCE (${state.targetSource.split('\n').length} lines — current code of ${state.targetName ?? state.targetObjectId?.slice(0, 8) ?? 'target'}; use draft_diff to edit)`);
-      lines.push('```javascript');
-      lines.push(state.targetSource);
-      lines.push('```');
+    // ── Source ──
+    // Two separate things, and conflating them once let a from-scratch draft be
+    // hot-swapped over a live object whose code the agent had never been shown.
+    //
+    // EXISTING SOURCE — the code running right now. The agent did not write it,
+    // so it is emitted IN FULL, exactly once, whenever it appears (including
+    // mid-loop, when load_target adopts an object the loop did not start with).
+    //
+    // STAGED DRAFT — the agent's own work, already in its transcript. Re-pasting
+    // it every turn is what used to blow the conversation budget, so it renders
+    // as a structural outline; read_draft({handler}) pulls any member's exact text.
+    const targetLabel = state.targetName ?? state.targetObjectId?.slice(0, 8) ?? 'target';
+    if (state.targetSource && state.renderedTargetSource !== state.targetSource) {
+      const n = state.targetSource.split('\n').length;
+      if (state.targetSource.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) {
+        lines.push(`EXISTING SOURCE of ${targetLabel} (${n} lines — this is the code running LIVE right now)`);
+        lines.push('```javascript');
+        lines.push(state.targetSource);
+        lines.push('```');
+        lines.push('Shown in full once. Change it by member name with edit_source; re-read any member with read_draft({handler:"name"}).');
+      } else {
+        lines.push(`EXISTING SOURCE of ${targetLabel} (${n} lines — LIVE code, too large to inline)`);
+        lines.push(this.sourceOutline(state.targetSource));
+        lines.push('Read any member with read_draft({handler:"name"}) before you change it.');
+      }
+      state.renderedTargetSource = state.targetSource;
+      lines.push('');
+    }
+
+    const current = state.draftSource ?? state.targetSource;
+    if (current) {
+      const nLines = current.split('\n').length;
+      const origin = state.draftSource ? 'staged draft' : `live code of ${targetLabel}`;
+      const firstLook = state.renderedSource === undefined && !state.targetSource;
+      if (firstLook && current.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) {
+        lines.push(`SOURCE (${nLines} lines — ${origin})`);
+        lines.push('```javascript');
+        lines.push(current);
+        lines.push('```');
+        lines.push('This is the last time the full text is shown; from here you get the outline. read_draft({handler:"name"}) shows any member exactly as it stands.');
+      } else {
+        const changed = current !== state.renderedSource;
+        lines.push(`SOURCE OUTLINE (${nLines} lines — ${origin}${state.renderedSource === undefined ? '' : changed ? ', changed since last shown' : ', unchanged'})`);
+        lines.push(this.sourceOutline(current));
+        lines.push('Full text is not re-pasted each turn. read_draft({handler:"name"}) shows a member exactly as it stands now; read_draft({grep:"..."}) searches it.');
+      }
+      state.renderedSource = current;
       lines.push('');
     }
 
@@ -2810,20 +3353,32 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       lines.push('');
     }
 
-    if (state.lastValidation) {
-      lines.push('LAST VALIDATION');
+    lines.push('CHECKS (run automatically on your edits — you do not spend a step on them)');
+    if (state.checkDeferred) {
+      lines.push('  syntax:   parses OK');
+      lines.push('  calls:    deferred — your edit set is still open. The call check runs on your closing edit (the one without "more": true). Keep writing until the object is complete.');
+    } else if (!state.lastValidation) {
+      lines.push('  (nothing checked yet)');
+    } else {
       const v = state.lastValidation;
-      if (v.compile !== undefined) lines.push(`  compile:          ${v.compile === '' ? 'OK' : v.compile.slice(0, 120)}`);
-      if (v.calls) lines.push(`  validate_calls:   ${v.calls.length} issue${v.calls.length === 1 ? '' : 's'}`);
+      if (v.compile !== undefined) lines.push(`  syntax:   ${v.compile === '' ? 'parses OK' : `ERROR — ${v.compile.slice(0, 120)}`}`);
+      if (v.calls) {
+        const preExisting = this.baselineCallErrorKeys(state);
+        const blocking = v.calls.filter(e =>
+          (e.kind === 'name-string-recipient' || e.kind === 'unknown-method') && !preExisting.has(this.callErrorKey(e))).length;
+        lines.push(`  calls:    ${v.calls.length === 0 ? 'no issues' : `${v.calls.length} issue${v.calls.length === 1 ? '' : 's'}${blocking > 0 ? ` (${blocking} block deploy)` : ' (advisory — none block deploy)'}`}`);
+      } else {
+        lines.push('  calls:    not checked yet — runs automatically on your closing edit');
+      }
       if (v.semantics) {
         const errs = v.semantics.issues.filter(i => i.severity === 'error').length;
         const warns = v.semantics.issues.filter(i => i.severity === 'warning').length;
-        lines.push(`  review_semantics: ${v.semantics.verified
-          ? `VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'} — deployable)` : ''}`
-          : `${errs} error${errs === 1 ? '' : 's'}`}`);
+        lines.push(`  semantics: ${v.semantics.verified
+          ? `VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
+          : `${errs} finding${errs === 1 ? '' : 's'} (advisory — never blocks a deploy)`}`);
       }
-      lines.push('');
     }
+    lines.push('');
 
     // Stop-reading steer: read_draft is read-only and makes no progress.
     // Count how many read_drafts run back-to-back with no productive action
@@ -2838,9 +3393,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const compileErr = typeof state.lastValidation?.compile === 'string' && state.lastValidation.compile !== '';
       lines.push(`⚠️ You have called read_draft ${consecutiveReads}× in a row without changing anything. read_draft is read-only, so it makes no progress.`);
       if (compileErr) {
-        lines.push('   The compile error above already names the exact failing line and shows its context, so you HAVE the location. Do NOT read_draft again to find it. Fix it now: replace_handler to rewrite the one member that contains it, or draft_diff for a small change, or draft_source to regenerate the whole object.');
+        lines.push('   The syntax error above already names the exact failing line and shows its context, so you HAVE the location. Do NOT read_draft again to find it. Fix it now with edit_source — one { op: "replace", name, body } for the member that contains it.');
       } else {
-        lines.push('   Act now instead of reading again: compile to validate the draft, then deploy_update — or make a targeted replace_handler / draft_diff edit. One more read will not move the build forward.');
+        lines.push('   Act now instead of reading again: make the edit with edit_source (it checks the result for you), then deploy. One more read will not move the build forward.');
       }
       lines.push('');
     }
@@ -2945,10 +3500,17 @@ When several actions are fully independent of each other — e.g. several discov
 
 Local-operation fields sit at the TOP LEVEL of the action, beside \`"action"\` — only \`call\` has a \`payload\` wrapper. So \`draft_manifest\` is \`{"action":"draft_manifest","manifest":{...}}\`, \`draft_source\` is \`{"action":"draft_source","source":"..."}\`, and so on.
 
-- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
+- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, make the whole change with \`edit_source\`, then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
-- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, prefer \`replace_handler\`/\`draft_diff\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
-- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. Good for small edits that span or sit inside members; for replacing a whole method prefer \`replace_handler\` (no SEARCH matching). Either way you edit without re-emitting the whole file. Each block:
+- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, use \`edit_source\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
+- \`edit_source({edits, more?})\` — **the way to change an existing object.** Apply a whole change-set in ONE action: \`edits\` is an array applied in order, where each entry is
+  - \`{ op: "replace", name, body }\` — swap the entire top-level member \`name\` for \`body\` (the FULL member text including its signature, e.g. \`"openMap(msg) { … }"\`). Addressed by name through the object literal's structure: no SEARCH text to match, whitespace-proof, unaffected by file size.
+  - \`{ op: "add", name, body }\` — insert a new member.
+  - \`{ op: "remove", name }\` — delete a member.
+  - \`{ op: "diff", blocks }\` — a SEARCH/REPLACE edit *inside* a member, for a change too small to justify rewriting the whole method.
+
+  Rewriting four methods is ONE \`edit_source\` with four edits, not four actions. The set is all-or-nothing: if any edit fails to find its target, nothing is staged and every failure is reported together, so the draft is never left half-changed.
+- \`draft_diff({blocks})\` — SEARCH/REPLACE blocks against the current source, when you want one surgical span and nothing else. Each block:
 
   \`\`\`
   <<<<<<< SEARCH
@@ -2958,15 +3520,11 @@ Local-operation fields sit at the TOP LEVEL of the action, beside \`"action"\` �
   >>>>>>> REPLACE
   \`\`\`
 
-  Multiple blocks may appear in one \`blocks\` payload and are applied in order. SEARCH must match a UNIQUE location in the current source — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. Whitespace is forgiven (line-trimmed match), but matching the indentation exactly is safer. Successive \`draft_diff\` calls stack on the prior result, so you can layer fixes. To insert new code, use a SEARCH that matches a nearby anchor and include both the anchor and your insertion in REPLACE.
-- \`read_draft({handler? , lineRange?, grep?})\` — read the CURRENT staged source so you edit against ground truth instead of memory. No args → a compact outline (each top-level member with its line range). \`{handler:"name"}\` → that member's exact current text (line-numbered). \`{lineRange:"a-b"}\` → those lines. \`{grep:"pattern"}\` → matching lines. Editing nothing, read-only. Use it to orient in an EXISTING large object BEFORE editing it (a modify flow): one read of the one member you're about to change. It is NOT for re-reviewing source you just generated: after \`draft_source\`/\`draft_via_llm\`, go straight to \`compile\` (it points to the one broken spot), and only \`read_draft\` the specific member/line a validation error names, once. read_draft is read-only, so repeating it makes no progress; never call it two turns in a row without an edit or a compile between them.
-- \`replace_handler({name, body})\` — replace the ENTIRE top-level member named \`name\` (a method or property of the \`({ … })\` literal) with \`body\` (the full member text, including its signature, e.g. \`"openMap(msg) { … }"\`). Located by name via the object literal's structure — no SEARCH text, whitespace-proof, unaffected by file size. **This is the preferred way to modify one method**; reach for it before \`draft_diff\`. Run \`compile\` after.
-- \`add_handler({name, body})\` — insert a NEW top-level member (full member text). Errors if \`name\` already exists (use replace_handler then). Run \`compile\` after.
-- \`remove_handler({name})\` — delete the top-level member named \`name\` (and its separating comma). Run \`compile\` after.
-- \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`draft_diff\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
-- \`compile()\` — run a syntax check on the staged source. Fails fast on parse errors.
-- \`validate_calls()\` — static check: every \`this.call(x, "method", …)\` site is checked against the live manifest of the target dep. Run AFTER compile.
-- \`review_semantics()\` — LLM reviewer reads the drafts plus all known dependency manifests + usage guides and flags semantic issues (wrong payload shape, enum-like values not in the guide, missing await, etc.). May emit follow-up \`questions\` for specific deps.
+  SEARCH must match a UNIQUE location — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. For a whole method, an \`edit_source\` \`replace\` is more robust (nothing to match).
+- \`replace_handler({name, body})\` / \`add_handler({name, body})\` / \`remove_handler({name})\` — single-member sugar for the corresponding \`edit_source\` op. Use them for a one-method change; use \`edit_source\` the moment there is more than one.
+- \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing and makes no progress on its own. Use it to look at a member you are about to rewrite, or one a check named. Never two turns in a row without an edit in between.
+- \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
+- \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
@@ -2978,6 +3536,23 @@ Local-operation fields sit at the TOP LEVEL of the action, beside \`"action"\` �
 
 - \`done({result})\` — terminal success. \`result\` is a string (becomes \`report\`), an object (merged into the result), or omitted.
 - \`fail({reason})\` — terminal failure. \`reason\` is a precise string describing what couldn't be done and why.
+
+# Checks run themselves — write the code, don't audit it
+
+**Do not spend steps compiling and validating.** The checks run on their own and their verdict comes back on the same action that made the edit. A step spent on a manual \`compile\` is a step not spent building or verifying.
+
+**Write the whole change, then let it be checked.** An INCOMPLETE OBJECT is fine and expected mid-change — a method that calls a helper you have not written yet is just work in progress, and nothing complains about it. Two ways to write a multi-part change:
+
+- Put the whole change-set in ONE \`edit_source\` when it fits. Every edit applies, then the checks run once. This is the normal case, and four methods is one action, not four.
+- When it does not fit in one response, split it across turns and mark every edit but the last with \`"more": true\`. That keeps the edit set OPEN, so the whole-object call check waits until you are done instead of judging a half-written object. Drop \`"more"\` on your final edit and it runs, once.
+
+\`\`\`json
+{ "action": "replace_handler", "name": "_draw", "body": "_draw(msg) { … }", "more": true }
+\`\`\`
+
+**One thing is checked immediately, every time: that what you supplied is a well-formed MEMBER.** Members are addressed by name through the parsed object literal, so a body with unbalanced braces would make every later edit unable to find anything. Such an edit is refused outright — the draft is left untouched and still healthy — and you get the failing line back. Send the FULL member, signature and all, with balanced braces, and this never fires.
+
+**Deploy is the gate.** A draft that does not parse, or that calls a method a dependency does not have, is refused by \`deploy_spawn\` / \`deploy_update\`: the live object is not touched and you get the exact failing line. You cannot ship broken code, so never check defensively "just in case". The semantic reviewer also runs itself at deploy — its findings ride back on the deploy result as advice, and never block.
 
 # Recipes
 
@@ -2991,7 +3566,7 @@ Investigation:
 
 Deployment (use the local actions — they read your staged drafts and run the proper multi-message sequence):
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
-- Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
+- Update an existing object: \`{ "action": "deploy_update" }\` after \`edit_source\`. If the loop started as a modify, the target source is preloaded and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
 
 Organism composition:
@@ -3047,9 +3622,9 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
 
    **Let the goal's named requirements drive OPEN questions before you commit to an approach.** When the goal names a quality or capability — a presentation style ("3D", "animated"), an input modality (mouse, voice), sound, persistence, networking — your first question to the providing dependency is "what do you offer for <that requirement>?", asked before you settle on how to build it. A modify loop makes this easy to skip: the existing source suggests an approach, and questions shaped as "confirm the commands I already plan to use" get exactly the narrow answer they asked for, leaving a purpose-built capability undiscovered while you hand-roll an imitation on the surface the old code happened to use. One open capability question per named requirement is cheap; rework after shipping the imitation is not.
-3. **Validate before deploying; compile first, don't re-read.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: go straight to \`compile\` (it localizes the one broken spot far faster than re-reading), then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. When compile reports a syntax error it already shows the failing line and context, so fix it with \`replace_handler\`/\`draft_diff\` at that line or regenerate with \`draft_source\`; do NOT \`read_draft\` to relocate it. Reading the draft repeatedly with no edit between reads is a stall that burns your step budget and leaves nothing to verify.
+3. **Write the whole change, then ship it.** Author the complete change-set — one \`edit_source\` when it fits, \`"more": true\` across turns when it does not — and let the automatic checks tell you where you stand. A syntax error the checks report is a location, not a verdict: fix that member with one \`edit_source\` replace. Do NOT \`read_draft\` to relocate an error the check already pinpointed, and never read twice in a row without editing in between; that is a stall that burns your budget and leaves nothing to verify.
 
-   **Once compile is clean and validate_calls reports zero issues, review_semantics is ADVISORY — ship and verify live instead of polishing blind.** Fix its findings when they name a real wrong-payload/wrong-method bug, but cap yourself at TWO review_semantics rounds: a deployed object answering real calls teaches you more per step than a third blind review pass, and behavioral verification catches what matters. Budget the endgame explicitly — deploy + behavioral checks + a screenshot need ~5 steps, so start deploying while you still have them. A task that dies polishing an undeployed draft delivered nothing.
+   **Ship and verify live instead of polishing blind.** The semantic reviewer's findings are advice, not a gate: fix the ones that name a real wrong-payload or wrong-method bug, and let the rest ride into your report. A deployed object answering real calls teaches you more per step than another blind review pass. Budget the endgame explicitly — deploy plus behavioral checks plus a screenshot need ~5 steps, so start deploying while you still have them. A task that dies polishing an undeployed draft delivered nothing.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
    For each behavior the user mentioned, send a \`call\` that drives it and check the result via \`getState\` or the response. Examples:
@@ -3068,9 +3643,13 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 
    **State your own draft sets is a claim, not evidence.** A mode/style/flag field your source writes (e.g. \`presentation: '3d'\`) merely restates the code's intent — checking it verifies nothing. Verify each requirement against what the user literally asked for, using evidence the draft cannot fabricate: exercised behavior, or the rendered image for visual requirements.
 
+   **Do not satisfy a check by changing the thing it checks.** If a criterion reads "the X is visible" and you cannot see X, the fix is to find out WHY it is not visible — not to enlarge, brighten, or recolor X until it is unmissable. Making the artifact louder until it trips your own check moves the goalposts: the criterion passes, the object is still wrong, and you will report success on something the user immediately sees is broken. This is the single most seductive failure in a visual loop, because the resulting screenshot genuinely does show what the criterion asked for. Ask yourself before every visual claim: *did I make this correct, or did I make it conspicuous?* If your change was "make it bigger/brighter so I can see it in the screenshot", you have not fixed the bug — you have hidden it.
+
+   In a perspective 3D scene this has a concrete, checkable form: **distant objects MUST render smaller than near ones.** If a far object needs a larger mesh than its near counterpart before you can spot it, that is proof of a real defect (too little depth in the scene's z-range, a light that does not reach the far end, or a rejected op batch) — and scaling it up destroys the very depth cue that makes the scene read as 3D. Judge the whole rendered image against the goal ("does this look like what the user asked for?"), not against a checklist item you have the power to satisfy by hand.
+
    ${this.visionCapable === false
     ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
-    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It is a screen crop, so raise the window first if another window overlaps it. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
+    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It is a screen crop, so raise the window first if another window overlaps it. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. For a 3D scene, judge the DEPTH: near objects must look bigger than far ones, and a scene where everything is the same apparent size is flat, not 3D, however "3D" the geometry is. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
 
    **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
 
@@ -3098,10 +3677,10 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 # What's in your observation
 
 The TASK section gives the kind, target (if any), and goal.
-The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim.
-The TARGET SOURCE section (modify loops only) shows the current code of the object being edited, preloaded from the Registry. Author SEARCH/REPLACE blocks against the exact text shown here.
+The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim. Each usage guide is printed once, the turn it is learned; after that the observation points back to it rather than re-pasting it.
+The SOURCE section shows the code in full ONCE — the first time there is code to show (for a modify, the existing object's code). After that you get a SOURCE OUTLINE: every member with its line range. The full text is not re-pasted every turn, because it is already in this conversation and your own edits are your own. When you need a member's exact current text, \`read_draft({handler:"name"})\` gives it to you.
 The DRAFTS section shows what manifest / source you have staged, and whether that source is deployed (live) or has undeployed edits.
-The LAST VALIDATION section shows the most recent compile / validate_calls / review_semantics result.
+The CHECKS section shows the automatic syntax / call / semantic verdicts on the staged source, or says they are deferred because your edit set is still open.
 The RECENT TURNS section is your action log so you remember what you have already done.
 
 Begin.

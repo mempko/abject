@@ -1376,6 +1376,12 @@ The registered object must implement these handlers to participate in the agent 
   /**
    * Send agentAct request to the registered agent.
    * Used by directExecution mode; job mode calls the agent directly.
+   *
+   * `batchRemaining` is how many further actions from the SAME LLM response are
+   * still queued behind this one. They drain without an LLM call between them,
+   * so an agent can use it to defer work that only makes sense once the whole
+   * response has been applied (e.g. ObjectCreator validates a staged source once
+   * the last edit of a multi-edit response lands, not after each edit).
    */
   private async actStep(entry: TaskEntry): Promise<AgentActionResult> {
     return this.request<AgentActionResult>(
@@ -1383,6 +1389,7 @@ The registered object must implement these handlers to participate in the agent 
         taskId: entry.state.id,
         step: entry.state.step,
         action: entry.state.action,
+        batchRemaining: entry.pendingActions?.length ?? 0,
       }),
       entry.config.timeout,
     );
@@ -2050,7 +2057,7 @@ The registered object must implement these handlers to participate in the agent 
             const actResult = await this.executeStep(
               entry,
               `[${agentName}] ${desc} (step ${task.step + 1})`,
-              `return await call('${entry.agentId}', 'agentAct', { taskId: '${task.id}', step: ${task.step}, action: ${actionJson} })`,
+              `return await call('${entry.agentId}', 'agentAct', { taskId: '${task.id}', step: ${task.step}, action: ${actionJson}, batchRemaining: ${entry.pendingActions?.length ?? 0} })`,
               async () => this.actStep(entry),
             );
             task.lastResult = {
