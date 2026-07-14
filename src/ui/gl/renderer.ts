@@ -660,6 +660,12 @@ export class GlRenderer {
     const gl = this.gl;
     const p = this.useMeshMaterial(o, true);
     gl.uniform1i(p.uniforms.uUseVertexColor, 1); // instance color drives albedo
+    // ...and because it does, uColor must be WHITE. The shader multiplies them
+    // (albedo = uColor * vColor), and the compositor already defaults an
+    // instance with no colour of its own to the NODE's colour — so leaving
+    // uColor set to that same node colour rendered every instance at colour
+    // SQUARED (a #808080 starfield came out at 0.25 grey, not 0.5).
+    gl.uniform3f(p.uniforms.uColor, 1, 1, 1);
     gl.bindVertexArray(mesh.vao);
     gl.enable(gl.DEPTH_TEST);
     gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, mesh.indexType, 0, mesh.instanceCount);

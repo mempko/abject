@@ -1223,7 +1223,7 @@ export class WidgetManager extends Abject {
         fovDegrees: Math.round((CAMERA_FOV_Y * 180) / Math.PI),
         viewport,
         distancePx: round(D),
-        note: 'The eye sits over the viewport centre, looking down -z. The z=0 plane maps 1:1 to CSS px, which is why 2D window content and 3D nodes share one coordinate space. +z is toward the viewer.',
+        note: 'A window\'s 3D subtree renders through ITS OWN camera: the eye sits over THAT WINDOW\'s centre, looking down -z, so depth converges into the middle of your window (a node on the window\'s axis never drifts sideways as z changes). The z=0 plane maps 1:1 to CSS px, which is why 2D window content and 3D nodes share one coordinate space. +z is toward the viewer. (World-scope nodes, which are not attached to a window, use a desktop camera centred on the viewport instead.)',
       },
       depth: {
         apparentScaleFormula: 'apparentScale(z) = D / (D - z), where D = camera.distancePx',
@@ -1237,8 +1237,9 @@ export class WidgetManager extends Abject {
       limits: {
         maxLightIntensity: MAX_LIGHT_INTENSITY,
         maxLightsPerWindow: MAX_MESH_LIGHTS,
-        intensityNote: 'Intensity is a linear multiplier on the light colour (1 = full strength), not watts or lumens. To light a bigger scene raise a light\'s `range`, never its intensity.',
+        intensityNote: 'Intensity is a linear multiplier on the light colour (1 = full strength), not watts or lumens. To BRIGHTEN a scene raise intensity (2-6 is fine), lift ambient, add emissive, or add a light — the renderer rolls highlights off through a soft knee, so over-lighting saturates toward white without erasing a mesh\'s hue. `range` is a falloff DISTANCE that only ever dims: with no range a point/spot light already reaches infinitely far, so adding one makes the scene darker, never brighter, and it does nothing at all on a directional light.',
       },
+      validationNote: 'Unknown PARAMS are silently ignored (only the op\'s own fields are validated), so a successful batch does not mean every param was understood. Invented params like `emissiveIntensity` do nothing. `emissive` is a colour, not a strength.',
       vocabulary: {
         kinds: [...SCENE_NODE_KINDS],
         primitives: [...MESH_PRIMITIVES],
@@ -1602,6 +1603,12 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           malformed, the WHOLE batch is rejected and NOTHING renders. One id-less op therefore makes
           your entire scene disappear — which looks exactly like "the meshes vanished" or "clipping is
           broken". If your scene renders nothing, suspect a rejected batch FIRST (the reply tells you).
+          BUT that check covers the op's OWN fields, not the contents of params: an unrecognized PARAM is
+          accepted, ignored, and never reported. Only the params documented here exist — inventing one (a
+          plausible-sounding emissiveIntensity, shininess, wireframe, side) silently does nothing, so a batch
+          applying successfully does NOT mean every param in it was understood. emissive in particular is a
+          COLOUR, not a strength: its brightness is the colour's own lightness, and there is no separate
+          intensity for it.
 
           CAMERA & DEPTH — CALL getSceneParams BEFORE YOU PLACE ANYTHING IN z.
           this.call(await this.dep('WidgetManager'), 'getSceneParams', {}) returns the LIVE projection
@@ -1651,17 +1658,25 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           shadows on each other, frustum auto-fit to the scene). It is NOT inherited usefully from a parent
           group, and it is meaningless on a mesh: every non-instanced mesh casts already, and INSTANCED meshes
           never cast shadows (they also ignore drawMode/pointSize and always draw as triangles).
+          'range' ONLY DIMS — it never brightens. It is a falloff distance: with no range (the default) a
+          point/spot light reaches infinitely far at full strength, and setting one makes the light FADE OUT
+          past that distance. So adding 'range' to a dim scene makes it darker, never brighter.
           INTENSITY IS A LINEAR MULTIPLIER ON THE LIGHT'S COLOR (1 = that color at full strength), NOT watts,
-          lumens, or candela. Real scenes use key 0.8-1.6, fill 0.3-0.6; values above 10 are REJECTED because
-          they multiply every channel past white and every lit mesh renders PURE WHITE, erasing its own color.
-          To reach a bigger scene, raise a POINT/SPOT light's 'range' (how far it reaches, in world px), add a
-          directional light, or lift 'ambient' on the environment node — never intensity.
+          lumens, or candela. Real scenes use key 0.8-1.6, fill 0.3-0.6; values above 10 are REJECTED.
+          TO BRIGHTEN A SCENE, RAISE INTENSITY (2-6 is fine), lift 'ambient' on the environment node, give the
+          mesh an 'emissive' colour, or add another light. Over-lighting no longer washes colour out: the
+          renderer rolls highlights off through a soft knee and scales rgb uniformly, so a blue mesh under a
+          strong light stays blue and merely saturates toward white instead of clipping to it.
           ENVIRONMENT: add a kind:'environment' node with
           { ambient?, fog?: { color, near, far }, bloom?: true|{ threshold, intensity } } for scene-wide
           mood, depth, and a glow post-effect on bright/emissive meshes (neon, highlights).
           ambient is a COLOR ('#hex' or $token — e.g. '#1e293b'), NOT a number: carry the ambient
           light's brightness in the color's lightness. A numeric ambient fails validation and the
           WHOLE ops batch is rejected (scene ops validate atomically — one bad node and nothing renders).
+          BLOOM threshold is the brightness a pixel must EXCEED to glow, and the highlight rolloff keeps lit
+          colour just under 1.0 — so a threshold at or near 1.0 never fires and you get no bloom and no error.
+          Around 0.6 is the working default; go lower for more glow. Bloom is also a DESKTOP-WIDE post pass,
+          not a per-window effect: an environment node's bloom settings apply to every window on screen.
           ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
           tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
           params: { preset: 'spin', duration: 4000 } }] }). Presets (extras ride in params beside preset):
@@ -1681,7 +1696,11 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           that lives IN the scene graph — a width×height px rectangle at its transform, painted with
           the same 2D draw-command vocabulary (minus \`markdown\`, which is a canvas-WIDGET command and
           silently draws nothing here — use \`text\`). It also accepts params.rect { x, y, width, height }
-          to place it in window-absolute coords, and params.backdrop:true to sit behind the window content:
+          to place it in window-absolute coords, and params.backdrop:true to pin it behind ALL MESHES
+          regardless of z (that is what 'backdrop' means — it does NOT put it behind the window's own 2D
+          content). The window's surface — its background and every widget — is unconditionally the backmost
+          thing in the subtree, so a backdrop layer paints OVER your widgets. There is no way to place a scene
+          node behind the window's 2D content; to put art behind widgets, draw it on the window surface itself.
           this.call(windowId, 'scene', { ops: [{ op: 'add', id: 'hud', kind: 'canvas',
             transform: { position: [0, 0, 150] },
             params: { width: 800, height: 500, commands: [
@@ -1723,7 +1742,8 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, matching input coordinates —
           mouse dx/dy map directly onto position dx/dy with the SAME sign, no axis flips.
           The camera is a long lens (desktop UI stays undistorted), so small objects read near-isometric.
-          For visible perspective/foreshortening, go BIG: scale 200+ and vary z (e.g. position z 100-300) —
+          For visible perspective/foreshortening, go BIG: scale 200+ and spread z over HUNDREDS of px (see
+          CAMERA & DEPTH above and getSceneParams — a z span of ~200px is the FLAT case, not the 3D one) —
           depth must be a meaningful fraction of the scene to show.
           Colors take '#hex' or theme tokens ('$accent', '$statusError', ...) that re-resolve on theme change.
           Nodes persist until removed ({ op: 'remove', id }). Tilt/float the whole window with
@@ -1777,11 +1797,11 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           outruns the mesh — drag by applying input deltas directly (y-down on both sides, so
           position = [startX + dx, startY + dy, z], no sign flips). Window-subtree hits arrive
           at the window's owner; world hits arrive at the node's owner directly. Picking is real 3D ray
-          casting, so rotated/animated meshes hit correctly — but only 'plane' and 'sphere' are tested
-          EXACTLY; 'box' and every other primitive ('cylinder', 'cone', 'torus', 'icosphere') are picked
-          against their bounding BOX, so a torus registers hits in its hole and a cone in its corners.
-          Custom geometry IS picked exactly (per-triangle). Where a precise hit region matters on a
-          curvy primitive, pick against a sphere/plane proxy or supply the shape as custom geometry.
+          casting, so rotated/animated meshes hit correctly. 'plane', 'sphere' and 'box' are tested EXACTLY
+          (the ray is transformed into the mesh's own space, so a rotated/scaled box is an exact fit), and
+          custom geometry is picked per-triangle. The curvy primitives — 'cylinder', 'cone', 'torus',
+          'icosphere' — fall back to a bounding-box test, so a torus registers hits in its hole and a cone in
+          its corners; where a precise hit region matters on one of those, supply the shape as custom geometry.
           The 2D canvas above is for 2D content (charts, sprites, text); the scene is for 3D.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.

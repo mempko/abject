@@ -911,12 +911,19 @@ export class Compositor {
 
   private applyOps(surfaceKey: string, ops: SceneOp[]): void {
     const rest: SceneOp[] = [];
+    // `animate` resolves against a node that must ALREADY be in the store, so it
+    // has to run after the adds in its own batch — otherwise the most natural
+    // thing to write, [{op:'add', id:'cube'}, {op:'animate', id:'cube'}], looks
+    // up a node that does not exist yet, drops the animation, and still replies
+    // success. Collect them and start them once the batch has been applied.
+    const anims: SceneOp[] = [];
     for (const op of ops) {
-      if (op.op === 'animate') { this.startOrStopAnim(surfaceKey, op); continue; }
+      if (op.op === 'animate') { anims.push(op); continue; }
       if (op.op === 'remove') this.nodeAnims.delete(`${surfaceKey}/${op.id}`);
       rest.push(op);
     }
     if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
+    for (const op of anims) this.startOrStopAnim(surfaceKey, op);
     // Pick up bloom config from any 'environment' node (global post-effect).
     for (const op of rest) this.syncBloomFrom(surfaceKey, op);
     // Only wake the render loop for changes that can reach pixels. A 30-60fps
@@ -2333,7 +2340,12 @@ export class Compositor {
     if (!model) return;
     this.renderer.drawSurface({
       model,
-      viewProj: this.viewProj,
+      // The window camera, same as the meshes this layer slices. Drawing the
+      // layer through the DESKTOP camera made the two converge on different
+      // vanishing points, so a canvas layer at z != 0 drifted away from the
+      // meshes it is supposed to interleave with (and from its own hit region)
+      // in every window that is not centred on screen.
+      viewProj: cam.viewProj,
       texture: entry.texture,
       width: entry.w,
       height: entry.h,
