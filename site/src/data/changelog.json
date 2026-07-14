@@ -1,5 +1,26 @@
 [
   {
+    "version": "0.8.16",
+    "date": "2026-07-14",
+    "title": "Scenes that render whole, writes that stay calm",
+    "summary": "This release fixes 3D scenes that were rendering only their front half, unifies 2D canvas and 3D scene drawing into one z-sliced compositor, and stops runaway saves from stalling a workspace. Objects that draw, persist, or get discovered should all behave more predictably.",
+    "highlights": [
+      "Canvas layers are now scene nodes: 2D and 3D content interleave by depth through a single unified draw channel, so a canvas widget can sit behind or in front of 3D geometry",
+      "3D scenes render fully again: a leaked DEPTH_TEST state was culling everything behind the window, so scenes only showed their front half",
+      "Persistence no longer floods the bus: saveData calls are coalesced, with a flush on shutdown so nothing is lost on the way out",
+      "Registry.discover rejects free-text queries rather than quietly dumping the whole catalog back at the caller",
+      "Light intensities in photometric units (lux, lumens) are rejected up front instead of washing every mesh to pure white",
+      "Newly spawned objects get a registration grace window: messages addressed to an id still in flight are parked rather than dropped",
+      "ObjectCreator spends fewer LLM turns on validation the machine can do for free, so object creation is faster and cheaper",
+      "The changelog keeps every release instead of collapsing entries that share a minor version"
+    ],
+    "fixes": [
+      "Instanced scene colours were being squared, making them render darker than specified",
+      "The scene 'animate' property was silently dropped",
+      "Canvas layers were attached to the wrong camera"
+    ]
+  },
+  {
     "version": "0.8.15",
     "date": "2026-07-13",
     "title": "Smoother under the hood",
