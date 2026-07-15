@@ -3486,7 +3486,18 @@ export class Compositor {
       // Pick through the SAME camera the subtree was drawn with, or the ray
       // misses everything the off-axis projection moved.
       const nodeRay = rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, nodeZ).invViewProj);
-      const nodeId = this.hitNodeTree(nodeRay, surface.id, frame);
+      // Interaction must be CLIPPED to the window like rendering is. Occluded
+      // nodes (the default) are scissored to the content rect when drawn, so a
+      // click outside that rect must not hit them either — otherwise a mesh
+      // grown large enough to project past its window ray-intercepts clicks
+      // ANYWHERE on screen, and since this loop runs top-down it steals every
+      // click from every window beneath it (invisible, since the mesh is
+      // scissored out of view — the exact "one window eats the whole workspace"
+      // bug). Only explicit pop-out nodes (occlude:false) draw outside the rect,
+      // so only they may be picked outside it.
+      const clip = this.contentClip(surface);
+      const insideClip = x >= clip.x && x <= clip.x + clip.width && y >= clip.y && y <= clip.y + clip.height;
+      const nodeId = this.hitNodeTree(nodeRay, surface.id, frame, undefined, undefined, insideClip);
       if (nodeId) return { scope: 'window', surfaceId: surface.id, nodeId };
 
       if (surface.inputPassthrough) continue;
@@ -3530,6 +3541,11 @@ export class Compositor {
     frame: Mat4,
     layer?: 'back' | 'front',
     collect?: (t: number, nodeId: string) => void,
+    /** When false, the click is OUTSIDE the window's content rect, so occluded
+     *  nodes (which are scissored to that rect on render) are not eligible —
+     *  only pop-out (occlude:false) nodes may be hit. World-scope picks and
+     *  clicks inside the rect pass true. */
+    insideClip = true,
   ): string | undefined {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return undefined;
@@ -3543,6 +3559,9 @@ export class Compositor {
       // intercept every click and starve the window's widgets / input canvas.
       if (node.params.interactive !== true) continue;
       if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
+      // Outside the window rect, only pop-out nodes are reachable (see the
+      // caller): match the render scissor, which clips everything but occlude:false.
+      if (!insideClip && this.sceneStore.resolveParams(node).occlude !== false) continue;
       let model = this.sceneStore.worldMatrix(node, frame);
       let t: number | null;
       if (node.kind === 'canvas') {
