@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.8.17",
+    "date": "2026-07-16",
+    "title": "Windows Stay In Their Frames",
+    "summary": "A single fix for 3D windows: mouse clicks now stop at the edge of the window they belong to, so one window no longer swallows input meant for the rest of the workspace.",
+    "highlights": [
+      "Mesh picking in 3D scenes is clipped to its window's bounds, so clicking outside a window reaches whatever is actually there"
+    ],
+    "fixes": [
+      "One window's 3D content captured picking across the entire workspace, leaving other windows and the desktop unclickable"
+    ]
+  },
+  {
     "version": "0.8.16",
     "date": "2026-07-14",
     "title": "Scenes that render whole, writes that stay calm",
