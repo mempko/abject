@@ -460,6 +460,8 @@ export class ObjectCreator extends Abject {
           description:
             'Creates new objects and modifies existing objects via an LLM-driven agent loop. ' +
             'Handles creation, modification, investigation, fixing, redesigning, and integration tasks — any work involving building, changing, or explaining an Abject\'s behavior. ' +
+            'Its deploy actions carry the owner, registry, and persistence context that direct Factory/Registry calls bypass, ' +
+            'and it can clone an existing object server-side (no source size limit). ' +
             'Uses the universal ask protocol to discover and learn about objects dynamically.',
           canExecute: true,
           config: {
@@ -655,7 +657,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   /** Valid action verbs this loop dispatches, for unknown-action recovery. */
   private static readonly VALID_ACTIONS = [
     'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft',
-    'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'draft_via_llm',
+    'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'clone_object', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
     'compose_organism', 'extract_organelle',
     'reply', 'ask_user', 'done', 'fail',
@@ -1364,6 +1366,115 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return {
       ok: true,
       summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with edit_source, deploy with deploy_update)`,
+    };
+  }
+
+  /**
+   * Clone-and-rename an existing source-backed object ENTIRELY server-side.
+   * draft_source + deploy_spawn push the whole source through the LLM context,
+   * which big objects (a 50KB deck) do not survive; this op reads the
+   * original's manifest + source straight from the Registry, spawns through
+   * the same guarded path deploy_spawn uses (this loop as owner/parent, the
+   * workspace registry as home, AbjectStore persistence), and adopts the
+   * clone as the loop's modify target. The LLM never round-trips a byte of
+   * source. Lineage is stamped the way Factory.clone stamps it.
+   */
+  private async opCloneObject(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!this.factoryId) return { ok: false, summary: 'clone_object: Factory unavailable', error: 'Factory not resolved' };
+    if (!this.registryId) return { ok: false, summary: 'clone_object: Registry unavailable', error: 'Registry not resolved' };
+
+    const nameOrId = this.actionField(action, ['objectId', 'target', 'targetName', 'objectName', 'from', 'sourceObject']) as string | undefined;
+    if (typeof nameOrId !== 'string' || nameOrId.length === 0) {
+      return { ok: false, summary: 'clone_object: missing original', error: 'pass {objectId} or {targetName} naming the existing object to clone' };
+    }
+    const newNameRaw = this.actionField(action, ['newName', 'name', 'cloneName']) as string | undefined;
+    if (typeof newNameRaw !== 'string' || newNameRaw.trim().length === 0) {
+      return { ok: false, summary: 'clone_object: missing newName', error: 'pass {newName} — the clone gets its own registered name' };
+    }
+    const newName = newNameRaw.trim();
+    const description = this.actionField(action, ['description']) as string | undefined;
+    const withData = this.actionField(action, ['withData', 'copyData']) === true;
+
+    const originalId = await this.resolveTarget(nameOrId);
+    if (!originalId) {
+      return { ok: false, summary: `clone_object: not found: ${nameOrId}`, error: `Could not resolve "${nameOrId}". Discover it first (call("Registry", "discover"/"ask", …)).` };
+    }
+
+    // Read manifest + source server-side, trying the workspace registry first
+    // and the system registry after (getSource chains, but lookup does not —
+    // so walk both for the full registration).
+    let registration: ObjectRegistration | null = null;
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      try {
+        registration = await this.sendRequest<ObjectRegistration | null>(registryId, 'lookup', { objectId: originalId }, 10000);
+        if (registration) break;
+      } catch { /* try next */ }
+    }
+    const source = registration?.source
+      ?? await this.sendRequest<string | null>(this.registryId, 'getSource', { objectId: originalId }, 10000).catch(() => null);
+    if (!registration?.manifest || typeof source !== 'string' || source.length === 0) {
+      return { ok: false, summary: `clone_object: no source on file for ${nameOrId}`, error: 'Only source-backed objects can be cloned; this one exposes no source through the Registry.' };
+    }
+
+    const manifest: AbjectManifest = {
+      ...registration.manifest,
+      name: newName,
+      ...(description ? { description } : {}),
+      lineage: {
+        clonedFrom: (registration.typeId as string | undefined) ?? (originalId as string),
+        generation: (registration.manifest.lineage?.generation ?? 0) + 1,
+      },
+    };
+
+    const spawnReq: SpawnRequest = {
+      manifest,
+      source,
+      owner: this.id,
+      parentId: this.id,
+      registryHint: this.registryId,
+    };
+    if (withData && registration.data !== undefined) {
+      // Deep-copy via JSON so the clone's data is independent of the original's.
+      try { spawnReq.data = JSON.parse(JSON.stringify(registration.data)); } catch { spawnReq.data = {}; }
+    }
+
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `clone_object: spawn failed: ${msg.slice(0, 120)}`, error: msg };
+    }
+    if (!result?.objectId) {
+      return { ok: false, summary: 'clone_object: Factory returned no objectId', error: 'unexpected Factory response' };
+    }
+
+    // Persist so the clone survives a restart (same as deploy_spawn).
+    if (this.abjectStoreId) {
+      this.sendRequest<unknown>(
+        this.abjectStoreId,
+        'save',
+        { objectId: result.objectId, manifest, source, owner: this.id },
+        15000,
+      ).catch(err => log.warn('clone_object: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+    }
+
+    // Adopt the clone as this loop's modify target: the follow-up is
+    // read_draft / edit_source / deploy_update against source already staged.
+    state.targetObjectId = result.objectId;
+    state.targetName = newName;
+    state.targetSource = source;
+    state.baselineCallKeys = undefined;
+    if (state.kind === 'create') state.kind = 'modify';
+
+    return {
+      ok: true,
+      summary:
+        `clone_object: ${newName} spawned from ${registration.name ?? nameOrId} ` +
+        `(${result.objectId.slice(0, 8)}, ${source.split('\n').length} lines, owner=you, persisted) — ` +
+        `adopted as modify target (edit with edit_source, ship with deploy_update)`,
+      data: { objectId: result.objectId, name: newName },
     };
   }
 
@@ -3163,6 +3274,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'load_target':
           res = await this.opLoadTarget(state, action);
           break;
+        case 'clone_object':
+          res = await this.opCloneObject(state, action);
+          break;
         case 'draft_via_llm':
           res = await this.opDraftViaLlm(state, action, batchRemaining);
           break;
@@ -3500,7 +3614,10 @@ When several actions are fully independent of each other — e.g. several discov
 
 Local-operation fields sit at the TOP LEVEL of the action, beside \`"action"\` — only \`call\` has a \`payload\` wrapper. So \`draft_manifest\` is \`{"action":"draft_manifest","manifest":{...}}\`, \`draft_source\` is \`{"action":"draft_source","source":"..."}\`, and so on.
 
+Your local actions are the supported way to create and modify Abjects: they carry the owner, registry, and persistence context that keeps an object editable and durable. Raw \`Factory.spawn\` / \`Registry.updateSource\` / \`AbjectStore.save\` calls through \`call\`/jobs bypass that context — objects made that way land ownerless in the wrong registry and vanish on restart — so create and modify through the local actions below, every time.
+
 - \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, make the whole change with \`edit_source\`, then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
+- \`clone_object({objectId?, targetName?, newName, description?, withData?})\` — clone an EXISTING source-backed object into a NEW one ENTIRELY server-side: resolves the original, copies its manifest + source renamed to \`newName\`, spawns it with you as owner in this workspace's registry, persists it, and adopts the clone as this loop's modify target. No source passes through your context, so this is THE way to build "a new object based on that one" (a shorter variant of an existing deck, a themed copy of an app) even when the original is far too large to draft. Then inspect with \`read_draft\`, change with \`edit_source\`, ship with \`deploy_update\`. \`withData: true\` also deep-copies the original's data (default: the clone starts with fresh data). For authoring from scratch, use \`draft_source\` + \`deploy_spawn\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, use \`edit_source\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
 - \`edit_source({edits, more?})\` — **the way to change an existing object.** Apply a whole change-set in ONE action: \`edits\` is an array applied in order, where each entry is
