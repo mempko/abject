@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.8.19",
+    "date": "2026-07-18",
+    "title": "Cloning, clearer errors, and sturdier plumbing",
+    "summary": "This release lets agents clone existing objects as a starting point for new ones, and makes the platform more honest when things go wrong: clearer error messages, streaming that recovers from stalled LLM providers, and routing failures that surface immediately instead of silently misbehaving.",
+    "highlights": [
+      "Agents can now clone an existing object to create a new one, preserving the authoring invariant so cloned objects remain editable and self-consistent",
+      "The two error messages agents run into most often now explain what went wrong and what to do about it, so agents can self-correct instead of retrying blindly",
+      "Streaming from OpenAI-compatible providers now detects empty and hung completions and fails cleanly instead of leaving conversations stuck"
+    ],
+    "fixes": [
+      "Fixed a desync in worker-thread routing that could send messages to the wrong worker; the system now fails fast if routing state ever diverges again",
+      "Reading and updating an object's source or manifest now falls back to the secondary registry, so these operations work for objects that only the fallback knows about"
+    ]
+  },
+  {
     "version": "0.8.18",
     "date": "2026-07-17",
     "title": "v0.8.18",
