@@ -8,11 +8,24 @@
  * headers.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('OPENROUTER');
+
+/**
+ * Per-model reasoning override, matched against the resolved model id.
+ * OpenRouter normalizes the unified `reasoning` knob, but individual models
+ * respond to effort differently (or pathologically) — this lets a deployment
+ * force or disable reasoning for a model family without code changes.
+ */
+export interface OpenRouterReasoningOverride {
+  /** Matched against the resolved model id (e.g. /^moonshotai\//). */
+  match: RegExp;
+  /** Effort forced for matching models; 'none' omits the reasoning field entirely. */
+  effort: EffortLevel;
+}
 
 export interface OpenRouterConfig {
   apiKey: string;
@@ -21,6 +34,14 @@ export interface OpenRouterConfig {
   fetchFn?: FetchDelegate;
   siteUrl?: string;
   appTitle?: string;
+  /**
+   * Routing preferences sent as the request's `provider` field — OpenRouter's
+   * order / allow_fallbacks / ignore / sort / require_parameters object.
+   * Lets a deployment steer around a flaky upstream.
+   */
+  providerPreferences?: Record<string, unknown>;
+  /** Per-model reasoning overrides, first match wins. */
+  reasoningOverrides?: OpenRouterReasoningOverride[];
 }
 
 const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
@@ -35,6 +56,9 @@ interface OpenRouterModelsResponse {
 }
 
 export class OpenRouterProvider extends OpenAIProvider {
+  private readonly providerPreferences?: Record<string, unknown>;
+  private readonly reasoningOverrides: OpenRouterReasoningOverride[];
+
   constructor(config: OpenRouterConfig) {
     super({
       apiKey: config.apiKey,
@@ -48,6 +72,8 @@ export class OpenRouterProvider extends OpenAIProvider {
       },
     });
     this.name = 'openrouter';
+    this.providerPreferences = config.providerPreferences;
+    this.reasoningOverrides = config.reasoningOverrides ?? [];
   }
 
   // OpenRouter normalizes ONE unified `reasoning: { effort }` across every
@@ -58,13 +84,23 @@ export class OpenRouterProvider extends OpenAIProvider {
     return { supportsEffort: false, reasons: true, maxOutput: 64000 };
   }
 
-  protected override applyReasoning(request: OpenAIRequest, _model: string, options: LLMCompletionOptions): { reasoningActive: boolean } {
-    const effort = this.resolveEffort(options);
+  protected override applyReasoning(request: OpenAIRequest, model: string, options: LLMCompletionOptions): { reasoningActive: boolean } {
+    // A configured per-model override beats the tier/explicit effort.
+    const override = this.reasoningOverrides.find(o => o.match.test(model));
+    const effort = override?.effort ?? this.resolveEffort(options);
     if (effort && effort !== 'none') {
       request.reasoning = { effort };
       return { reasoningActive: true };
     }
     return { reasoningActive: false };
+  }
+
+  protected override applyRequestExtras(request: OpenAIRequest, _model: string, _options: LLMCompletionOptions, stream: boolean): void {
+    // Ask for token accounting (incl. the reasoning-token breakdown) — with
+    // `include` the final SSE chunk carries `usage`. Non-streaming responses
+    // always carry usage, so only ask on streams.
+    if (stream) request.usage = { include: true };
+    if (this.providerPreferences) request.provider = this.providerPreferences;
   }
 
   override async listModels(): Promise<ModelInfo[]> {
@@ -108,5 +144,16 @@ export function createOpenRouterProvider(): OpenRouterProvider | undefined {
     log.warn('No API key found');
     return undefined;
   }
-  return new OpenRouterProvider({ apiKey });
+  // Optional routing preferences as a JSON string, e.g.
+  // OPENROUTER_PROVIDER_PREFERENCES='{"allow_fallbacks":true,"sort":"latency"}'
+  let providerPreferences: Record<string, unknown> | undefined;
+  const prefsJson = (globalThis as Record<string, unknown>).OPENROUTER_PROVIDER_PREFERENCES as string | undefined;
+  if (prefsJson) {
+    try {
+      providerPreferences = JSON.parse(prefsJson) as Record<string, unknown>;
+    } catch {
+      log.warn('OPENROUTER_PROVIDER_PREFERENCES is not valid JSON — ignoring');
+    }
+  }
+  return new OpenRouterProvider({ apiKey, providerPreferences });
 }

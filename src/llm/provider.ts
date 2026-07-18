@@ -125,6 +125,8 @@ export interface LLMCompletionResult {
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** Tokens the model spent on hidden reasoning (when the provider reports them). */
+    reasoningTokens?: number;
   };
 }
 
@@ -146,6 +148,8 @@ export interface LLMStreamChunk {
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** Tokens the model spent on hidden reasoning (when the provider reports them). */
+    reasoningTokens?: number;
   };
 }
 
@@ -220,6 +224,25 @@ export function defaultIsRetryable(err: unknown): boolean {
   if (/\b408\b/.test(msg)) return true;
   if (/\b4\d\d\b/.test(msg) && !/\b(408|429)\b/.test(msg)) return false;
   return !PERMANENT_PATTERNS.some(re => re.test(msg));
+}
+
+/**
+ * The provider finished a request cleanly (HTTP 200, terminal finish_reason)
+ * but produced zero visible text — a transient model/gateway behavior
+ * (reasoning-only response, upstream hiccup), not a usable answer. Always
+ * retryable. Stream implementations throw this so the retry loop re-issues
+ * the request immediately; after retries exhaust the empty result is
+ * restored for callers that have their own empty-response handling.
+ */
+export class EmptyCompletionError extends Error {
+  constructor(
+    message: string,
+    /** Provider stop reason seen on the empty stream (e.g. 'stop'). */
+    readonly stopReason?: string,
+  ) {
+    super(message);
+    this.name = 'EmptyCompletionError';
+  }
 }
 
 /**
@@ -414,6 +437,8 @@ export abstract class BaseLLMProvider implements LLMProvider {
   /**
    * Make an HTTP request to the API.
    * Returns FetchResult. Uses fetchFn delegate when available, falls back to native fetch.
+   * The native branch enforces `fetchOptions.timeout` itself (the delegate is
+   * expected to honor it); a timed-out request throws a retryable error.
    */
   protected async fetch(
     url: string,
@@ -428,7 +453,23 @@ export abstract class BaseLLMProvider implements LLMProvider {
       return result;
     }
 
-    const response = await fetch(url, options);
+    let response: Response;
+    if (fetchOptions?.timeout && !options.signal) {
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), fetchOptions.timeout);
+      try {
+        response = await fetch(url, { ...options, signal: abort.signal });
+      } catch (err) {
+        if (abort.signal.aborted) {
+          throw new Error(`LLM API request timed out after ${fetchOptions.timeout}ms`);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    } else {
+      response = await fetch(url, options);
+    }
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'Unknown error');

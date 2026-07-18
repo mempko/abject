@@ -14,6 +14,7 @@ import {
   ModelInfo,
   ContentPart,
   EffortLevel,
+  EmptyCompletionError,
   defaultIsRetryable,
 } from './provider.js';
 import { require } from '../core/contracts.js';
@@ -65,8 +66,37 @@ export interface OpenAIRequest {
   reasoning_effort?: string;
   /** Output-length style hint (GPT-5.x). */
   verbosity?: string;
+  /** Usage accounting request (OpenRouter: `{ include: true }` appends a usage chunk to streams). */
+  usage?: { include: boolean };
+  /** Provider routing preferences (OpenRouter: order/allow_fallbacks/ignore/sort). */
+  provider?: Record<string, unknown>;
   /** Provider-specific extras (e.g. reasoning, reasoning_split) set by subclass hooks. */
   [key: string]: unknown;
+}
+
+/** One Server-Sent-Events data frame from the chat-completions stream. */
+interface OpenAIStreamEvent {
+  choices?: Array<{
+    delta?: {
+      content?: string;
+      /** Hidden reasoning, per-provider naming: OpenRouter sends `reasoning`
+       * and/or `reasoning_details`, Moonshot/DeepSeek `reasoning_content`. */
+      reasoning?: string;
+      reasoning_content?: string;
+      reasoning_details?: unknown;
+    };
+    finish_reason?: string | null;
+  }>;
+  /** Token accounting, present on the final chunk when usage was requested. */
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
+  /** Mid-stream upstream error frame (OpenRouter): the gateway reports a
+   * failed upstream as data instead of an HTTP status. */
+  error?: { message?: string; code?: string | number; status?: string | number } | string;
 }
 
 /** Per-model reasoning capability + output ceiling, provided by each provider. */
@@ -100,6 +130,9 @@ interface OpenAIResponse {
     total_tokens: number;
     prompt_tokens_details?: {
       cached_tokens?: number;
+    };
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
     };
   };
 }
@@ -218,8 +251,15 @@ export class OpenAIProvider extends BaseLLMProvider {
     if (options.cacheKey) request.prompt_cache_key = options.cacheKey;
     const { reasoningActive } = this.applyReasoning(request, model, options);
     request.max_completion_tokens = this.resolveMaxTokens(model, options, reasoningActive);
+    this.applyRequestExtras(request, model, options, stream);
     return { request, reasoningActive };
   }
+
+  /**
+   * Subclass hook for provider-specific request fields (OpenRouter attaches
+   * usage accounting + provider routing preferences). Base sends nothing extra.
+   */
+  protected applyRequestExtras(_request: OpenAIRequest, _model: string, _options: LLMCompletionOptions, _stream: boolean): void {}
 
   async listModels(): Promise<ModelInfo[]> {
     if (!this.apiKey) {
@@ -428,6 +468,7 @@ export class OpenAIProvider extends BaseLLMProvider {
           inputTokens: data.usage.prompt_tokens,
           outputTokens: data.usage.completion_tokens,
           cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
+          reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
         },
       };
     }, { label: `${this.name}.complete` });
@@ -473,8 +514,21 @@ export class OpenAIProvider extends BaseLLMProvider {
       } catch (err) {
         lastErr = err;
         if (yielded) throw err;
-        if (attempt >= maxAttempts) throw err;
-        if (!defaultIsRetryable(err)) throw err;
+        if (attempt >= maxAttempts) {
+          // Preserve the historical empty-completion contract: with retries
+          // exhausted, report the empty stream as a normal (empty) completion
+          // so callers with their own empty-response handling (the agent
+          // loop) behave exactly as before this layer learned to retry.
+          if (err instanceof EmptyCompletionError) {
+            yield { content: '', done: true, stopReason: err.stopReason };
+            return;
+          }
+          throw err;
+        }
+        // Empty completions are always worth another attempt (a fresh try may
+        // land on a different gateway upstream); everything else defers to
+        // the standard classifier.
+        if (!(err instanceof EmptyCompletionError) && !defaultIsRetryable(err)) throw err;
         const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
         const msg = err instanceof Error ? err.message : String(err);
         // eslint-disable-next-line no-console
@@ -485,69 +539,174 @@ export class OpenAIProvider extends BaseLLMProvider {
     throw lastErr;
   }
 
+  /**
+   * One streaming attempt. Bounded by an overall wall-clock cap (streams that
+   * keep delivering bytes legitimately run for minutes on big generations)
+   * and a much tighter idle limit (no bytes at all means a dead connection —
+   * gateway keepalive comments otherwise flow continuously).
+   */
+  private static readonly STREAM_OVERALL_TIMEOUT_MS = 600_000;
+  private static readonly STREAM_IDLE_TIMEOUT_MS = 60_000;
+
   private async *streamOnce(request: OpenAIRequest): AsyncIterable<LLMStreamChunk> {
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(request),
-    });
+    const abort = new AbortController();
+    let abortReason: 'idle' | 'overall' | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const armIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { abortReason = 'idle'; abort.abort(); }, OpenAIProvider.STREAM_IDLE_TIMEOUT_MS);
+    };
+    const overallTimer = setTimeout(() => { abortReason = 'overall'; abort.abort(); }, OpenAIProvider.STREAM_OVERALL_TIMEOUT_MS);
+    armIdleTimer();
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${body}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body');
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = '';
+    // Diagnostics accumulated across the stream so a zero-text completion can
+    // be reported with enough context to explain WHY (reasoning-only answer,
+    // upstream error, immediate stop).
+    let dataEvents = 0;
+    let reasoningEvents = 0;
+    let emittedNonWhitespace = false;
     let stopReason: string | undefined;
+    let usage: LLMStreamChunk['usage'];
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    // A timeout abort can surface two ways depending on where the generator
+    // is parked: read() rejects with AbortError (caught below) OR the body
+    // just ends cleanly (loop exit). Both must report the timeout, never a
+    // fake clean stop.
+    const timeoutError = () => new Error(
+      abortReason === 'idle'
+        ? `${this.name} stream idle timeout: no data for ${OpenAIProvider.STREAM_IDLE_TIMEOUT_MS / 1000}s`
+        : `${this.name} stream exceeded overall ${OpenAIProvider.STREAM_OVERALL_TIMEOUT_MS / 1000}s cap`,
+    );
 
-      buffer += decoder.decode(value, { stream: true });
+    try {
+      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(request),
+        signal: abort.signal,
+      });
 
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`OpenAI API error: ${response.status} - ${body}`);
+      }
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('No response body');
+      }
 
-        const data = line.slice(6);
-        if (data === '[DONE]') {
-          yield { content: '', done: true, stopReason };
-          return;
-        }
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-        try {
-          const event = JSON.parse(data);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Any bytes — data frames, comment keepalives — prove the connection lives.
+        armIdleTimer();
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+
+          const data = line.slice(6);
+          if (data === '[DONE]') {
+            if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents);
+            yield { content: '', done: true, stopReason, usage };
+            return;
+          }
+
+          let event: OpenAIStreamEvent;
+          try {
+            event = JSON.parse(data) as OpenAIStreamEvent;
+          } catch {
+            continue; // Ignore parse errors (partial frames etc.)
+          }
+          dataEvents++;
+
+          // OpenAI-compatible gateways (OpenRouter especially) report a failed
+          // upstream mid-stream as a data frame carrying `error` instead of
+          // `choices`. Left undetected, the stream just ends and the caller
+          // mistakes a dead upstream for a clean (often empty) stop.
+          const streamError = event.error;
+          if (streamError) {
+            const code = typeof streamError === 'object' ? (streamError.code ?? streamError.status ?? 'unknown') : 'unknown';
+            const message = typeof streamError === 'object' ? (streamError.message ?? JSON.stringify(streamError)) : streamError;
+            throw new Error(`${this.name} stream error: ${code} - ${String(message).slice(0, 300)}`);
+          }
+
+          const delta = event.choices?.[0]?.delta;
           // Reasoning models put the answer in delta.content; the hidden
-          // reasoning goes to a separate field (reasoning_content /
-          // reasoning_details), which we intentionally do not surface.
-          const delta = event.choices?.[0]?.delta?.content;
+          // reasoning goes to a separate field (reasoning / reasoning_content /
+          // reasoning_details), which we intentionally do not surface — but we
+          // count it so an answerless stream is diagnosable.
+          if (delta?.reasoning || delta?.reasoning_content || delta?.reasoning_details) reasoningEvents++;
 
-          if (delta) {
-            yield { content: delta, done: false };
+          const text = delta?.content;
+          if (text) {
+            if (/\S/.test(text)) emittedNonWhitespace = true;
+            yield { content: text, done: false };
+          }
+
+          if (event.usage) {
+            usage = {
+              inputTokens: event.usage.prompt_tokens ?? 0,
+              outputTokens: event.usage.completion_tokens ?? 0,
+              cacheReadTokens: event.usage.prompt_tokens_details?.cached_tokens,
+              reasoningTokens: event.usage.completion_tokens_details?.reasoning_tokens,
+            };
           }
 
           const fr = event.choices?.[0]?.finish_reason;
           if (fr) {
+            // Don't return yet: with usage accounting requested, the usage
+            // chunk arrives AFTER the finish_reason chunk. Record the stop
+            // reason and let the stream run to [DONE] / EOF, where the
+            // terminal chunk is yielded with usage attached.
             stopReason = String(fr);
-            yield { content: '', done: true, stopReason };
-            return;
           }
-        } catch {
-          // Ignore parse errors
         }
       }
-    }
 
-    yield { content: '', done: true, stopReason };
+      // The body ending after a timeout abort reads as a clean EOF — report
+      // the timeout instead of yielding a truncated "completion".
+      if (abortReason) throw timeoutError();
+      if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents);
+      yield { content: '', done: true, stopReason, usage };
+    } catch (err) {
+      // A timeout abort surfaces as an AbortError from fetch/read — rethrow as
+      // a descriptive (and retryable) timeout instead.
+      if (abortReason) throw timeoutError();
+      throw err;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+      clearTimeout(overallTimer);
+    }
+  }
+
+  /**
+   * Zero-text completion: log the full diagnostic, then throw so the retry
+   * loop treats it as the transient failure it is instead of a clean stop.
+   */
+  private throwEmptyStream(
+    stopReason: string | undefined,
+    usage: LLMStreamChunk['usage'],
+    dataEvents: number,
+    reasoningEvents: number,
+  ): never {
+    const usageSummary = usage
+      ? `${usage.inputTokens}in/${usage.outputTokens}out/reasoning=${usage.reasoningTokens ?? '?'}`
+      : 'n/a';
+    const detail =
+      `stop_reason=${stopReason ?? 'unknown'} ` +
+      `events=${dataEvents} reasoning_deltas=${reasoningEvents} usage=${usageSummary}`;
+    // eslint-disable-next-line no-console
+    console.warn(`[${this.name}.stream] stream produced 0 text chars. ${detail}`);
+    throw new EmptyCompletionError(`LLM returned an empty completion (${detail})`, stopReason);
   }
 
   /**

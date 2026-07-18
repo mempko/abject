@@ -17,6 +17,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  LLMStreamChunk,
   ModelTier,
   ModelInfo,
   getTextContent,
@@ -585,6 +586,7 @@ export class LLMObject extends Abject {
 
       let fullContent = '';
       let stopReason: string | undefined;
+      let usage: LLMStreamChunk['usage'];
       try {
         for await (const chunk of provider.stream(messages, effectiveOptions)) {
           if (activeReq.killed) {
@@ -594,6 +596,7 @@ export class LLMObject extends Abject {
           lastChunkAt = Date.now();
           fullContent += chunk.content;
           if (chunk.stopReason) stopReason = chunk.stopReason;
+          if (chunk.usage) usage = chunk.usage;
           activeReq.outputChars = fullContent.length;
           // Send each chunk as an event back to the requester
           this.send(event(this.id, callerId, 'llmChunk', {
@@ -613,9 +616,12 @@ export class LLMObject extends Abject {
       }
 
       const elapsed = Date.now() - start;
-      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${stopReason ?? 'unknown'}`);
-      this.trackRequestEnd(correlationId, fullContent);
-      return { content: fullContent, stopReason };
+      const tokenSummary = usage
+        ? ` | tokens=${usage.inputTokens}in/${usage.outputTokens}out${usage.reasoningTokens ? `/reasoning=${usage.reasoningTokens}` : ''}`
+        : '';
+      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${stopReason ?? 'unknown'}${tokenSummary}`);
+      this.trackRequestEnd(correlationId, fullContent, usage);
+      return { content: fullContent, stopReason, usage };
     });
 
     this.on('listProviders', async () => {
