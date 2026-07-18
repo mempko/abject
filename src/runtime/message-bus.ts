@@ -179,8 +179,13 @@ export class MessageBus implements MessageBusLike {
         this.messageCount++;
         return;
       }
-      log.warn(`UNDELIVERABLE (no worker bridge): ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)}`);
-      this.notifyUndeliverable(message);
+      // Routing desync: the id is marked worker-hosted but no bridge claims
+      // it. Fail like any other undeliverable — an error reply now, never a
+      // silent 30s timeout.
+      this.handleUndeliverable(message, {
+        code: 'NO_WORKER_BRIDGE',
+        reason: `Recipient ${recipient} is marked worker-hosted but no bridge claims it (routing desync)`,
+      });
       return;
     }
 
@@ -223,10 +228,15 @@ export class MessageBus implements MessageBusLike {
    * A message whose recipient does not exist (locally, in a worker, or after
    * the registration grace window): log it, error-reply requests, notify
    * event senders their recipient is gone, and run the undeliverable hook.
+   * `detail` overrides the error code/reason for desync-flavored failures
+   * (e.g. NO_WORKER_BRIDGE) so callers can tell them apart from a genuinely
+   * unknown recipient.
    */
-  private handleUndeliverable(message: AbjectMessage): void {
+  private handleUndeliverable(message: AbjectMessage, detail?: { code: string; reason: string }): void {
     const recipient = message.routing.to;
-    log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from?.slice(0,8) ?? '?'} to=${recipient?.slice(0,8) ?? 'undefined'} (not registered)`);
+    const code = detail?.code ?? 'RECIPIENT_NOT_FOUND';
+    const reason = detail?.reason ?? `Recipient ${recipient} is not registered`;
+    log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from?.slice(0,8) ?? '?'} to=${recipient?.slice(0,8) ?? 'undefined'} (${reason})`);
 
     // For undeliverable requests, send an error reply to the sender's
     // mailbox so request() rejects instantly instead of timing out.
@@ -234,8 +244,8 @@ export class MessageBus implements MessageBusLike {
       const sender = message.routing.from;
       const errorReply = createError(
         message,
-        'RECIPIENT_NOT_FOUND',
-        `Recipient ${recipient} is not registered`,
+        code,
+        reason,
       );
       this.deliverToSender(sender, errorReply);
     }

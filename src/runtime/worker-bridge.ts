@@ -306,16 +306,23 @@ export class WorkerBridge {
         // replies and sends from anywhere reach it.
         const objectId = data.objectId!;
         this.hostedObjects.add(objectId);
-        this.bus.registerWorkerObject(objectId);
+        // Set the route BEFORE marking the id worker-hosted on the main bus:
+        // registerWorkerObject flushes messages parked for this id, and a
+        // flush landing before the route exists takes the no-worker-bridge
+        // path and drops the message.
         this.onLocalRegistered?.(objectId);
+        this.bus.registerWorkerObject(objectId);
         break;
       }
 
       case 'bus:unregistered': {
         const objectId = data.objectId!;
         this.hostedObjects.delete(objectId);
-        this.bus.unregisterWorkerObject(objectId);
+        // Drop the route before the worker-hosted flag so an in-flight
+        // message fails fast against a known-gone route instead of racing a
+        // half-torn-down registration.
         this.onLocalUnregistered?.(objectId);
+        this.bus.unregisterWorkerObject(objectId);
         break;
       }
 

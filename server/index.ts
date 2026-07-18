@@ -187,6 +187,13 @@ async function main(): Promise<void> {
     const uiWorkerScript = new URL('../workers/ui-worker-node.ts', import.meta.url);
     const uiWorker = new NodeWorkerAdapter(uiWorkerScript);
     uiBridge = new DedicatedWorkerBridge(uiWorker, bus);
+    const bridge = uiBridge;
+    // Objects constructed locally inside the UI worker announce themselves
+    // via bus:registered — hook those so they get a bridge mapping, the same
+    // coverage pool workers get. Without it the id is marked worker-hosted
+    // with no route, and requests to it die on the no-worker-bridge path.
+    bridge.onLocalRegistered = (id) => bus.registerDedicatedBridge(id, bridge);
+    bridge.onLocalUnregistered = (id) => bus.unregisterDedicatedBridge(id);
     uiBridge.onDead = (code) => {
       log.error('==================================================================');
       log.error(`UI WORKER DIED (exit code ${code}): the desktop UI is gone.`);
@@ -743,6 +750,12 @@ async function main(): Promise<void> {
     const p2pWorkerScript = new URL('../workers/p2p-worker-node.ts', import.meta.url);
     const p2pWorker = new NodeWorkerAdapter(p2pWorkerScript);
     p2pBridge = new DedicatedWorkerBridge(p2pWorker, bus);
+    const bridge = p2pBridge;
+    // Same local-registration coverage as the UI worker: anything the P2P
+    // worker constructs outside the pre-assigned ids gets a bridge mapping
+    // instead of becoming a worker-hosted id with no route.
+    bridge.onLocalRegistered = (id) => bus.registerDedicatedBridge(id, bridge);
+    bridge.onLocalUnregistered = (id) => bus.unregisterDedicatedBridge(id);
 
     // Register all P2P object IDs on the main bus before worker init
     const p2pObjectIds = [identityId, peerRegistryId, remoteRegistryId, signalingRelayId, peerDiscoveryId, remoteUIAccessId];
