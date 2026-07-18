@@ -3177,11 +3177,27 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
     const hallucinationPatterns = ['<function_calls>', '<tool_call>', '<invoke name='];
     const hallucinatedTools = hallucinationPatterns.some(p => content.includes(p));
+    // Pure narration carries no brace at all; a response with braces that
+    // still didn't parse is malformed JSON. The two failures need different
+    // corrections: the narrator must convert its own plan, the malformed one
+    // must fix its syntax.
+    const pureProse = !content.includes('{');
 
     if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {
-      const correction = hallucinatedTools
-        ? '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Respond with a valid JSON action, for example:\n```json\n{"action": "done", "result": "..."}\n```'
-        : '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+      let correction: string;
+      if (hallucinatedTools) {
+        correction = '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Respond with a valid JSON action, for example:\n```json\n{"action": "done", "result": "..."}\n```';
+      } else if (pureProse) {
+        // Echo the narration back so the model turns ITS OWN stated plan into
+        // the action envelope — a generic "that was invalid" message leaves
+        // chatty models re-narrating the same plan until the retry budget dies.
+        const prose = content.trim().replace(/\s+/g, ' ').slice(0, 300);
+        correction =
+          `[Error] Your previous response was prose with no action block. You wrote: "${prose}${content.trim().length > 300 ? '…' : ''}"\n` +
+          'Convert that plan into a single action NOW. Respond with ONLY a ```json code block, for example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+      } else {
+        correction = '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+      }
       entry.state.llmMessages.push({ role: 'user', content: correction });
       return { action: '_reparse', reasoning: `Retrying after unparseable response (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
     }

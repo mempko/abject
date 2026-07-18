@@ -395,7 +395,14 @@ export class ScriptableAbject extends Abject {
           log.warn(
             `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
           );
-          return { success: false, error: 'Only the owner can update source' };
+          return {
+            success: false,
+            error:
+              `Only the owner can update source (owner: ${this._owner || 'none — this object was spawned without one'}; sender: ${msg.routing.from}). ` +
+              'ObjectCreator and AbjectEditor are also accepted and take over ownership. ' +
+              'Agents: route the edit through ObjectCreator — its edit_source / deploy_update local actions carry owner context, ' +
+              'while a direct updateSource call from a job never will.',
+          };
         }
         // Adopt sender as owner
         this._owner = msg.routing.from;
