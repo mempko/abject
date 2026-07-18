@@ -486,33 +486,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
 
     this.on('updateManifest', async (msg: AbjectMessage) => {
       const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
-      const reg = this.objects.get(objectId);
-      if (!reg) return false;
-
-      const old = reg.manifest;
-
-      // Remove old indices
-      this.byInterface.get(old.interface.id)?.delete(objectId);
-      for (const cap of old.providedCapabilities ?? []) {
-        this.byCapability.get(cap)?.delete(objectId);
-      }
-      this.byName.get(reg.name)?.delete(objectId);
-
-      // Update
-      reg.manifest = manifest;
-
-      // Re-index
-      const newIfaceId = manifest.interface.id;
-      if (!this.byInterface.has(newIfaceId)) this.byInterface.set(newIfaceId, new Set());
-      this.byInterface.get(newIfaceId)!.add(objectId);
-      for (const cap of manifest.providedCapabilities ?? []) {
-        if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
-        this.byCapability.get(cap)!.add(objectId);
-      }
-      if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
-      this.byName.get(reg.name)!.add(objectId);
-
-      return true;
+      return this.updateManifestRegistration(objectId, manifest);
     });
 
     this.on('resolveType', async (msg: AbjectMessage) => {
@@ -828,11 +802,47 @@ Each line shows one registered object: id, name, description, and non-meta metho
   }
 
   /**
+   * Replace a registered object's cached manifest and re-index it. Returns
+   * false when the object isn't registered here. Extracted from the
+   * updateManifest handler so subclasses that chain to a fallback registry
+   * (WorkspaceRegistry) reuse the same re-indexing for local hits.
+   */
+  protected updateManifestRegistration(objectId: AbjectId, manifest: AbjectManifest): boolean {
+    const reg = this.objects.get(objectId);
+    if (!reg) return false;
+
+    const old = reg.manifest;
+
+    // Remove old indices
+    this.byInterface.get(old.interface.id)?.delete(objectId);
+    for (const cap of old.providedCapabilities ?? []) {
+      this.byCapability.get(cap)?.delete(objectId);
+    }
+    this.byName.get(reg.name)?.delete(objectId);
+
+    // Update
+    reg.manifest = manifest;
+
+    // Re-index
+    const newIfaceId = manifest.interface.id;
+    if (!this.byInterface.has(newIfaceId)) this.byInterface.set(newIfaceId, new Set());
+    this.byInterface.get(newIfaceId)!.add(objectId);
+    for (const cap of manifest.providedCapabilities ?? []) {
+      if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
+      this.byCapability.get(cap)!.add(objectId);
+    }
+    if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
+    this.byName.get(reg.name)!.add(objectId);
+
+    return true;
+  }
+
+  /**
    * Resolve a reference (live AbjectId, durable TypeId, or registered name)
    * to its current registration. Tries id first (fast path), then the durable
    * TypeId index, then the name index (first live entry wins).
    */
-  private resolveRegistration(ref: string): ObjectRegistration | undefined {
+  protected resolveRegistration(ref: string): ObjectRegistration | undefined {
     const direct = this.objects.get(ref as AbjectId);
     if (direct) return direct;
 

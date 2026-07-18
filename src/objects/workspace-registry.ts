@@ -5,14 +5,17 @@
  * fallback chain.
  *
  * Two chaining strategies are mixed:
- *   - `discover` chains "fallback only on miss" because lookups want one
- *     answer (a name resolves to one Abject).
+ *   - `discover` / `getSource` / `updateSource` / `updateManifest` chain
+ *     "fallback only on miss" because lookups want one answer (a name or id
+ *     resolves to one Abject — its source is part of that identity, so an
+ *     object spawned without a registryHint into the global registry must be
+ *     just as readable and editable through the workspace registry).
  *   - `list` / `listSummaries` always merge local + fallback because callers
  *     (CommandPalette, ProcessExplorer, AppExplorer-style UIs) need the
  *     complete picture: workspace-local Abjects *and* system services.
  */
 
-import { AbjectId, AbjectMessage, DiscoveryQuery, InterfaceId, ObjectRegistration } from '../core/types.js';
+import { AbjectId, AbjectManifest, AbjectMessage, DiscoveryQuery, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Registry } from './registry.js';
 import { request } from '../core/message.js';
 
@@ -44,6 +47,64 @@ export class WorkspaceRegistry extends Registry {
       this.fallbackRegistryId = registryId;
       await this.refreshGlobalCatalog();
       return true;
+    });
+
+    // Override getSource / updateSource / updateManifest to chain on local
+    // miss. Resolution is by identity, not by which registry holds the entry:
+    // an object spawned without a registryHint lands in the fallback (global)
+    // registry, and its source must still be readable (load_target's fetch)
+    // and its cached source/manifest writable (deploy_update's cache sync)
+    // through the workspace registry. Forward the original payload verbatim —
+    // getSource/updateSource accept objectId | typeId | name | ref, and the
+    // fallback resolves by the same rules.
+    this.on('getSource', async (msg: AbjectMessage) => {
+      const { objectId, typeId, name, ref } = msg.payload as {
+        objectId?: string; typeId?: string; name?: string; ref?: string;
+      };
+      const local = this.getObjectSource(ref ?? objectId ?? typeId ?? name ?? '');
+      if (local !== null) return local;
+      if (!this.fallbackRegistryId) return null;
+      try {
+        return await this.request<string | null>(
+          request(this.id, this.fallbackRegistryId, 'getSource', msg.payload as Record<string, unknown>),
+        );
+      } catch {
+        return null;
+      }
+    });
+
+    this.on('updateSource', async (msg: AbjectMessage) => {
+      const { objectId, typeId, name, ref, source } = msg.payload as {
+        objectId?: string; typeId?: string; name?: string; ref?: string; source: string;
+      };
+      const reg = this.resolveRegistration(ref ?? objectId ?? typeId ?? name ?? '');
+      if (reg) {
+        reg.source = source;
+        return true;
+      }
+      if (!this.fallbackRegistryId) return false;
+      try {
+        return await this.request<boolean>(
+          request(this.id, this.fallbackRegistryId, 'updateSource', msg.payload as Record<string, unknown>),
+        );
+      } catch {
+        return false;
+      }
+    });
+
+    this.on('updateManifest', async (msg: AbjectMessage) => {
+      const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
+      if (this.lookupObject(objectId)) {
+        return this.updateManifestRegistration(objectId, manifest);
+      }
+      if (!this.fallbackRegistryId) return false;
+      try {
+        return await this.request<boolean>(
+          request(this.id, this.fallbackRegistryId, 'updateManifest', msg.payload as Record<string, unknown>),
+        );
+      } catch {
+        return false;
+      }
     });
 
     // Override list / listSummaries to union local + global.
