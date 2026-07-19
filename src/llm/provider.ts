@@ -66,6 +66,31 @@ export interface ModelInfo {
 }
 
 /**
+ * A provider's prompt-cache economics — the parameters that drive the
+ * client-side keepalive policy in LLMObject. In the keepalive-economics
+ * framing: `readRatio` is r (cached-read price relative to input price),
+ * `writeRatio` is w (what a re-prefill costs after eviction, above 1.0 when
+ * the provider charges a cache-write premium), and `ttlSeconds` is T (the
+ * documented idle TTL, after which the entry is evicted). From these the
+ * warmer derives the economical ping interval τ* = T − margin and the
+ * break-even idle horizon I_max = τ*(w/r − 1), past which keeping the
+ * prefix warm costs more than the re-prefill it prevents.
+ */
+export interface CacheProfile {
+  /** Documented idle TTL of a cache entry, in seconds. */
+  ttlSeconds: number;
+  /** Cached-read price as a ratio of the input price (r). */
+  readRatio: number;
+  /**
+   * Cost ratio of re-prefilling after eviction (w) — 1.0 where re-caching
+   * is automatic and free, higher where writes carry a premium.
+   */
+  writeRatio: number;
+  /** Smallest prefix the provider will cache, in tokens. */
+  minPrefixTokens: number;
+}
+
+/**
  * How a provider authenticates: HTTP API key, base URL (Ollama), an
  * external CLI binary that manages its own auth (claude/codex), or
  * nothing at all. Drives the GlobalSettings AI tab — `apiKey` and
@@ -358,6 +383,14 @@ export interface LLMProvider {
   supportedEfforts?(modelId: string): EffortLevel[];
 
   /**
+   * The prompt-cache economics of a model through this provider, or
+   * undefined when the provider has no usable prompt cache (local models,
+   * CLI transports, unverified gateways). Undefined disables client-side
+   * cache keepalive for requests routed here.
+   */
+  cacheProfile?(modelId: string): CacheProfile | undefined;
+
+  /**
    * Self-describing UI metadata: credential mode, default tier models,
    * static model list seed, etc. GlobalSettings consumes this to build
    * the AI tab without per-provider hardcoding.
@@ -434,6 +467,11 @@ export abstract class BaseLLMProvider implements LLMProvider {
   /** Providers with an effort knob override; the default has none. */
   supportedEfforts(_modelId: string): EffortLevel[] {
     return [];
+  }
+
+  /** Providers with a priceable prompt cache override; the default has none. */
+  cacheProfile(_modelId: string): CacheProfile | undefined {
+    return undefined;
   }
 
   /**

@@ -4,7 +4,7 @@
 
 import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { require } from '../core/contracts.js';
+import { require, invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import { Capabilities } from '../core/capability.js';
 import * as msg from '../core/message.js';
@@ -21,6 +21,7 @@ import {
   ModelTier,
   ModelInfo,
   EffortLevel,
+  CacheProfile,
   getTextContent,
   truncateText,
   messageTextChars,
@@ -166,6 +167,53 @@ export interface LLMStats {
 }
 
 /**
+ * Keepalive policy derived from a provider's CacheProfile: the economical
+ * ping interval τ* (TTL minus a safety margin), the break-even idle horizon
+ * I_max = τ*(w/r − 1) past which warmth costs more than the re-prefill it
+ * prevents, and the per-arm ping budget that bounds total spend at roughly
+ * one re-prefill even if every clock in the process lies.
+ */
+interface WarmPolicy {
+  ttlMs: number;
+  tauMs: number;
+  iMaxMs: number;
+  maxPings: number;
+  minPrefixTokens: number;
+}
+
+/**
+ * One tracked prompt-cache entry, mirroring (as well as the client can) a
+ * prefix the provider currently holds warm. Identity is CONTENT — the
+ * serialized (provider, model, message-prefix) — never the caller's
+ * cacheKey, which is retained only for ping routing affinity and as the
+ * release handle.
+ *
+ * Two clocks, deliberately distinct: `lastUsedAt` moves only on real
+ * (paying) requests and decides whether warmth is still worth buying;
+ * `lastWarmAt` moves on any successful refresh (real request or ping) and
+ * tracks the provider's TTL. Pings never touch `lastUsedAt` — a keepalive
+ * that could justify itself would never stop.
+ */
+interface WarmEntry {
+  /** Short content hash for logs; identity is `serialized`. */
+  id: string;
+  providerName: string;
+  model: string;
+  messages: LLMMessage[];
+  serialized: string;
+  /** Last-seen routing key: replayed on pings, matched by releaseCache. */
+  cacheKey?: string;
+  prefixTokens: number;
+  lastUsedAt: number;
+  lastWarmAt: number;
+  pingsRemaining: number;
+  consecutiveFailures: number;
+  pingInFlight: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  policy: WarmPolicy;
+}
+
+/**
  * The LLM object provides language model capabilities to the system.
  */
 export class LLMObject extends Abject {
@@ -191,6 +239,36 @@ export class LLMObject extends Abject {
   private _history: LLMHistoryEntry[] = [];
   private readonly _MAX_HISTORY = 50;
   private readonly _MAX_CONTENT_CHARS = 10_000;
+
+  // ── Prompt-cache keepalive (the "cache warmer") ───────────────────────
+  // Distinct from the progress-heartbeat keepaliveTimer in complete/stream:
+  // this one re-reads large prompt prefixes on a timer during agent pauses
+  // so the provider's prompt cache stays warm (cached reads at ~0.1× input
+  // price instead of a full re-prefill after eviction). Default OFF — every
+  // ping spends real money on the user's key.
+  private cacheKeepaliveEnabled = false;
+  /** Latched by the circuit breaker; only an explicit reconfigure resets it. */
+  private cacheKeepaliveTripped = false;
+  /** Content-addressed registry, small enough that identity is by string compare. */
+  private warmEntries: WarmEntry[] = [];
+  private _warmStats = { pings: 0, pingFailures: 0, pingInputTokens: 0, pingOutputTokens: 0, entriesDropped: 0 };
+  /** Rolling window of ping send-times backing the runaway circuit breaker. */
+  private _warmPingTimes: number[] = [];
+
+  /** Max concurrently tracked prefixes; each retains a potentially large prompt. */
+  private static readonly WARM_MAX_ENTRIES = 8;
+  /** Safety margin under the provider TTL covering ping latency, jitter, and TTL-enforcement slack. */
+  private static readonly WARM_TTL_MARGIN_S = 60;
+  /** Consecutive ping failures before the entry is dropped (a failing ping means the cache is probably cold; retrying is paying to find out). */
+  private static readonly WARM_MAX_PING_FAILURES = 2;
+  /** Ping generation cap: a cache read, not an answer. */
+  private static readonly WARM_PING_MAX_TOKENS = 8;
+  /**
+   * Circuit breaker: 3× the theoretical fleet maximum (8 entries pinging
+   * every 240s ≈ 120/hour). Exceeding this means a bug category we didn't
+   * foresee — disable the feature entirely rather than keep spending.
+   */
+  private static readonly WARM_MAX_PINGS_PER_HOUR = 360;
 
   constructor() {
     super({
@@ -363,6 +441,14 @@ export class LLMObject extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'releaseCache',
+                description: 'Stop keeping the prompt cache warm for a cache key. Send this (fire-and-forget) when the task or conversation that was passing options.cacheKey reaches a terminal state, so the keepalive never keeps a dead session warm. Returns the number of tracked prefixes released.',
+                parameters: [
+                  { name: 'cacheKey', type: { kind: 'primitive', primitive: 'string' }, description: 'The cacheKey the requests were sent with' },
+                ],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
                 name: 'pause',
                 description: 'Pause the LLM object, rejecting new requests',
                 parameters: [],
@@ -515,7 +601,9 @@ export class LLMObject extends Abject {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
-      return this.complete(messages, options, provider, m.routing.from, m.header.messageId);
+      const result = await this.complete(messages, options, provider, m.routing.from, m.header.messageId);
+      this.trackCacheWarmth(provider, options, messages, result.usage);
+      return result;
     });
 
     this.on('generateCode', async (m: AbjectMessage) => {
@@ -636,6 +724,7 @@ export class LLMObject extends Abject {
         : (stopReason ?? 'unknown');
       log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${reasonNote}${tokenSummary}`);
       this.trackRequestEnd(correlationId, fullContent, usage);
+      this.trackCacheWarmth(providerName, options, messages, usage);
       return { content: fullContent, stopReason, usage };
     });
 
@@ -657,6 +746,7 @@ export class LLMObject extends Abject {
         credentials?: Record<string, string>;
         tierRouting?: TierRouting;
         visionFallback?: TierConfig | null;
+        cacheKeepalive?: { enabled: boolean };
       };
       await this.configure(config);
       return true;
@@ -733,6 +823,21 @@ export class LLMObject extends Abject {
         activeRequests: Array.from(this._activeRequests.values()),
         history: this._history,
         paused: this._paused,
+        keepalive: {
+          enabled: this.cacheKeepaliveEnabled,
+          tripped: this.cacheKeepaliveTripped,
+          ...this._warmStats,
+          entries: this.warmEntries.map(e => ({
+            id: e.id,
+            provider: e.providerName,
+            model: e.model,
+            prefixTokens: e.prefixTokens,
+            cacheKey: e.cacheKey,
+            lastUsedAt: e.lastUsedAt,
+            lastWarmAt: e.lastWarmAt,
+            pingsRemaining: e.pingsRemaining,
+          })),
+        },
       };
     });
 
@@ -770,8 +875,19 @@ export class LLMObject extends Abject {
       return true;
     });
 
+    this.on('releaseCache', async (m: AbjectMessage) => {
+      const { cacheKey } = m.payload as { cacheKey?: string };
+      require(typeof cacheKey === 'string' && cacheKey.length > 0, 'releaseCache needs the cacheKey the requests were sent with');
+      const matches = this.warmEntries.filter(e => e.cacheKey === cacheKey);
+      for (const entry of matches) this.dropWarmEntry(entry, 'released by caller');
+      return matches.length;
+    });
+
     this.on('pause', async () => {
       this._paused = true;
+      // Pause stops spending too; entries are not resurrected on unpause —
+      // only the next real request re-arms.
+      this.dropAllWarmEntries('paused');
       log.info('LLM paused');
       this.changed('paused', true);
       return true;
@@ -850,6 +966,7 @@ export class LLMObject extends Abject {
     credentials?: Record<string, string>;
     tierRouting?: TierRouting;
     visionFallback?: TierConfig | null;
+    cacheKeepalive?: { enabled: boolean };
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
     const credentials = config.credentials ?? {};
@@ -900,6 +1017,15 @@ export class LLMObject extends Abject {
     if (config.visionFallback !== undefined) {
       this.visionFallback = config.visionFallback ?? undefined;
       log.info(`Vision fallback configured: ${JSON.stringify(this.visionFallback ?? null)}`);
+    }
+
+    // Cache keepalive: undefined leaves it untouched. An explicit reconfigure
+    // is the one thing that resets a tripped circuit breaker.
+    if (config.cacheKeepalive !== undefined) {
+      this.cacheKeepaliveEnabled = !!config.cacheKeepalive.enabled;
+      this.cacheKeepaliveTripped = false;
+      if (!this.cacheKeepaliveEnabled) this.dropAllWarmEntries('keepalive disabled');
+      log.info(`Cache keepalive ${this.cacheKeepaliveEnabled ? 'enabled' : 'disabled'}`);
     }
   }
 
@@ -1700,6 +1826,306 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(effortOverride && !options?.effort ? { effort: effortOverride } : {}),
     };
+  }
+
+  // ── Prompt-cache keepalive ────────────────────────────────────────────
+  // The client-side defense against agentic cache eviction: an agent's loop
+  // is think → act → wait, and the wait routinely outlives the provider's
+  // cache TTL, so the follow-up pays full prefill price again. During the
+  // pause we re-read the exact prefix on a timer (τ* under the TTL), each
+  // read refreshing the entry at ~0.1× input price. The policy is bounded on
+  // every axis: ping only while economically alive (idle < I_max), never
+  // past the ping budget, never after the entry went cold, and a circuit
+  // breaker latches the whole feature off if ping volume ever exceeds what
+  // the registry could legitimately produce.
+
+  /**
+   * Concatenative identity serialization: provider + model + each message.
+   * Built so that a conversation extended by new turns serializes to a
+   * string that startsWith() its previous serialization — that property is
+   * what detects "this request grew out of that tracked prefix". Image and
+   * document parts contribute a length+head fingerprint instead of their
+   * full base64 payload.
+   */
+  private serializeForCacheIdentity(providerName: string, model: string, messages: LLMMessage[]): string {
+    let out = providerName + '\u0000' + model + '\u0000';
+    for (const m of messages) {
+      out += m.role + '\u0001';
+      if (typeof m.content === 'string') {
+        out += m.content;
+      } else {
+        for (const part of m.content) {
+          if (part.type === 'text') out += 't:' + part.text;
+          else out += part.type[0] + ':' + part.data.length + ':' + part.data.slice(0, 64);
+        }
+      }
+      out += '\u0002';
+    }
+    return out;
+  }
+
+  /** FNV-1a hash of the identity string — a log label, not the identity. */
+  private static contentHash(s: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  /**
+   * Derive the runtime policy from a provider's cache economics, or
+   * undefined when the numbers make keepalive meaningless (TTL inside the
+   * safety margin, or re-prefill no dearer than a cached read).
+   */
+  private static warmPolicyFrom(profile: CacheProfile): WarmPolicy | undefined {
+    if (!(profile.ttlSeconds > LLMObject.WARM_TTL_MARGIN_S)) return undefined;
+    if (!(profile.readRatio > 0) || !(profile.writeRatio > 0)) return undefined;
+    const costRatio = profile.writeRatio / profile.readRatio - 1;
+    if (!(costRatio > 0)) return undefined;
+    const tauMs = (profile.ttlSeconds - LLMObject.WARM_TTL_MARGIN_S) * 1000;
+    return {
+      ttlMs: profile.ttlSeconds * 1000,
+      tauMs,
+      iMaxMs: tauMs * costRatio,
+      maxPings: Math.ceil(costRatio),
+      minPrefixTokens: Math.max(1, profile.minPrefixTokens),
+    };
+  }
+
+  /**
+   * Record a completed real request in the warm registry. Exact match →
+   * refresh; a tracked prefix this request extends → superseded (keeping the
+   * longer prefix warm refreshes the shorter one's blocks anyway); otherwise
+   * a new entry, LRU-bounded. Never throws — warmth is an optimization and
+   * must not break the request path.
+   */
+  private trackCacheWarmth(
+    providerName: string | undefined,
+    options: LLMCompletionOptions | undefined,
+    messages: LLMMessage[],
+    usage: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined,
+  ): void {
+    if (!this.cacheKeepaliveEnabled || this.cacheKeepaliveTripped || this._paused) return;
+    try {
+      const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
+      const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
+      const model = this.modelFor(provider, effectiveOptions);
+      const profile = provider.cacheProfile?.(model);
+      if (!profile) return;
+      const policy = LLMObject.warmPolicyFrom(profile);
+      if (!policy) return;
+
+      // Prefix size = the whole prompt, cached portions included. Without
+      // usage we can't verify the caching floor, so we don't arm.
+      const prefixTokens = usage
+        ? usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+        : 0;
+      if (prefixTokens < policy.minPrefixTokens) return;
+
+      const now = Date.now();
+      const serialized = this.serializeForCacheIdentity(provider.name, model, messages);
+      let entry = this.warmEntries.find(e => e.serialized === serialized);
+      if (!entry) {
+        const grewFrom = this.warmEntries.find(e => serialized.startsWith(e.serialized));
+        if (grewFrom) this.dropWarmEntry(grewFrom, 'superseded by longer prefix', true);
+        entry = {
+          id: LLMObject.contentHash(serialized),
+          providerName: provider.name,
+          model,
+          messages,
+          serialized,
+          cacheKey: options?.cacheKey,
+          prefixTokens,
+          lastUsedAt: now,
+          lastWarmAt: now,
+          pingsRemaining: policy.maxPings,
+          consecutiveFailures: 0,
+          pingInFlight: false,
+          policy,
+        };
+        this.warmEntries.push(entry);
+        while (this.warmEntries.length > LLMObject.WARM_MAX_ENTRIES) {
+          const oldest = this.warmEntries.reduce((a, b) => (a.lastUsedAt <= b.lastUsedAt ? a : b));
+          this.dropWarmEntry(oldest, 'evicted (registry full)');
+        }
+        log.info(`cache-warm: tracking ${entry.id} (${provider.name}/${model}, ${prefixTokens} tok, ping every ${Math.round(policy.tauMs / 1000)}s, horizon ${Math.round(policy.iMaxMs / 60000)}min)`);
+      } else {
+        // A real request restarts the economics: fresh use clock, fresh
+        // ping budget. (Pings never take this path.)
+        entry.lastUsedAt = now;
+        entry.lastWarmAt = now;
+        entry.pingsRemaining = policy.maxPings;
+        entry.consecutiveFailures = 0;
+        entry.prefixTokens = prefixTokens;
+        if (options?.cacheKey) entry.cacheKey = options.cacheKey;
+      }
+      this.scheduleWarmPing(entry);
+      this.checkInvariants();
+    } catch (err) {
+      log.warn(`cache-warm: tracking failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * (Re)schedule an entry's single pending timer for lastWarmAt + τ*. There
+   * is deliberately no setInterval anywhere in this machinery: one timer per
+   * entry, and the next is set only after the previous ping settles, so a
+   * hung ping cannot pile up successors.
+   */
+  private scheduleWarmPing(entry: WarmEntry): void {
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    const delay = Math.max(entry.lastWarmAt + entry.policy.tauMs - Date.now(), 1000);
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      void this.warmPingTick(entry);
+    }, delay);
+    // Node returns a Timeout (unref keeps us from holding the process open);
+    // browser returns a number, where the optional call is a no-op.
+    (entry.timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * One timer firing for one entry: decide drop / skip / ping. Every path
+   * out of here either drops the entry or leaves exactly one timer pending.
+   */
+  private async warmPingTick(entry: WarmEntry): Promise<void> {
+    if (!this.warmEntries.includes(entry)) return;
+    if (!this.cacheKeepaliveEnabled || this.cacheKeepaliveTripped || this._paused) {
+      this.dropWarmEntry(entry, 'keepalive off');
+      return;
+    }
+
+    const now = Date.now();
+    const sinceWarm = now - entry.lastWarmAt;
+    const sinceUse = now - entry.lastUsedAt;
+    // Clock anomalies drop the entry rather than pinging "to be safe" — the
+    // failure mode of dropping is a re-prefill, the failure mode of trusting
+    // a broken clock is unbounded spend.
+    if (!Number.isFinite(sinceWarm) || !Number.isFinite(sinceUse) || sinceWarm < 0 || sinceUse < 0) {
+      this.dropWarmEntry(entry, 'clock anomaly');
+      return;
+    }
+    // Past the TTL the provider has evicted the entry; a "keepalive" now
+    // would be a full-price speculative re-prefill. Never ping a cold entry.
+    if (sinceWarm >= entry.policy.ttlMs) {
+      this.dropWarmEntry(entry, 'went cold (TTL elapsed since last refresh)');
+      return;
+    }
+    // Past break-even, warmth costs more than the re-prefill it prevents.
+    if (sinceUse >= entry.policy.iMaxMs) {
+      this.dropWarmEntry(entry, 'past break-even horizon');
+      return;
+    }
+    if (entry.pingsRemaining <= 0) {
+      this.dropWarmEntry(entry, 'ping budget exhausted');
+      return;
+    }
+    // Real traffic refreshed the entry after this timer was set — the cache
+    // is being kept warm for free. Just reschedule.
+    if (sinceWarm < entry.policy.tauMs) {
+      this.scheduleWarmPing(entry);
+      return;
+    }
+    const provider = this.providers.get(entry.providerName);
+    if (!provider) {
+      this.dropWarmEntry(entry, 'provider no longer registered');
+      return;
+    }
+    if (!this.recordWarmPingForBreaker()) return;
+
+    entry.pingInFlight = true;
+    entry.pingsRemaining--;
+    this._warmStats.pings++;
+    const pingNo = entry.policy.maxPings - entry.pingsRemaining;
+    log.info(`cache-warm: ping ${entry.id} (${entry.providerName}/${entry.model}, ${entry.prefixTokens} tok, ping ${pingNo}/${entry.policy.maxPings}, ${Math.round((entry.policy.iMaxMs - sinceUse) / 60000)}min to break-even)`);
+    let failed = false;
+    try {
+      const result = await provider.complete(entry.messages, {
+        model: entry.model,
+        maxTokens: LLMObject.WARM_PING_MAX_TOKENS,
+        effort: 'none',
+        ...(entry.cacheKey ? { cacheKey: entry.cacheKey } : {}),
+      });
+      // Success refreshes the TTL clock ONLY — lastUsedAt is real traffic's.
+      entry.lastWarmAt = Date.now();
+      entry.consecutiveFailures = 0;
+      if (result.usage) {
+        this._warmStats.pingInputTokens += result.usage.inputTokens + (result.usage.cacheReadTokens ?? 0) + (result.usage.cacheWriteTokens ?? 0);
+        this._warmStats.pingOutputTokens += result.usage.outputTokens;
+      }
+    } catch (err) {
+      failed = true;
+      entry.consecutiveFailures++;
+      this._warmStats.pingFailures++;
+      log.warn(`cache-warm: ping ${entry.id} failed (${entry.consecutiveFailures}/${LLMObject.WARM_MAX_PING_FAILURES}): ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      entry.pingInFlight = false;
+    }
+    if (failed && entry.consecutiveFailures >= LLMObject.WARM_MAX_PING_FAILURES) {
+      this.dropWarmEntry(entry, 'consecutive ping failures');
+      return;
+    }
+    // A real request may have superseded/released the entry mid-ping.
+    if (this.warmEntries.includes(entry)) {
+      this.scheduleWarmPing(entry);
+      this.checkInvariants();
+    }
+  }
+
+  private dropWarmEntry(entry: WarmEntry, reason: string, quiet = false): void {
+    if (entry.timer !== undefined) {
+      clearTimeout(entry.timer);
+      entry.timer = undefined;
+    }
+    const idx = this.warmEntries.indexOf(entry);
+    if (idx >= 0) {
+      this.warmEntries.splice(idx, 1);
+      this._warmStats.entriesDropped++;
+      if (!quiet) log.info(`cache-warm: dropped ${entry.id} (${reason}; ${this.warmEntries.length} still tracked)`);
+    }
+  }
+
+  private dropAllWarmEntries(reason: string): void {
+    for (const entry of [...this.warmEntries]) this.dropWarmEntry(entry, reason, true);
+    if (this._warmStats.pings > 0 || this._warmStats.entriesDropped > 0) {
+      log.info(`cache-warm: cleared all entries (${reason})`);
+    }
+  }
+
+  /**
+   * Rolling-hour ping counter. Exceeding the ceiling means a bug this design
+   * didn't foresee — latch the feature off and drop everything. Only an
+   * explicit configure() resets the latch.
+   */
+  private recordWarmPingForBreaker(): boolean {
+    const now = Date.now();
+    this._warmPingTimes.push(now);
+    const cutoff = now - 3_600_000;
+    while (this._warmPingTimes.length > 0 && this._warmPingTimes[0] < cutoff) this._warmPingTimes.shift();
+    if (this._warmPingTimes.length > LLMObject.WARM_MAX_PINGS_PER_HOUR) {
+      this.cacheKeepaliveTripped = true;
+      log.error(`cache-warm: CIRCUIT BREAKER TRIPPED — ${this._warmPingTimes.length} pings in the last hour (ceiling ${LLMObject.WARM_MAX_PINGS_PER_HOUR}). Keepalive disabled until reconfigured.`);
+      this.dropAllWarmEntries('circuit breaker tripped');
+      return false;
+    }
+    return true;
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(this.warmEntries.length <= LLMObject.WARM_MAX_ENTRIES, `warm registry bounded (${this.warmEntries.length})`);
+    for (const e of this.warmEntries) {
+      invariant(e.pingsRemaining >= 0, 'warm entry ping budget never negative');
+      invariant(e.timer !== undefined || e.pingInFlight, 'warm entry always has a pending timer or a ping in flight');
+      invariant(e.policy.tauMs > 0 && e.policy.ttlMs > e.policy.tauMs, 'warm policy: 0 < τ* < TTL');
+    }
+  }
+
+  protected override async onStop(): Promise<void> {
+    this.dropAllWarmEntries('stopping');
+    await super.onStop();
   }
 
   /**

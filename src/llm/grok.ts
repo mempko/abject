@@ -5,7 +5,7 @@
  * we subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -48,6 +48,12 @@ export class GrokProvider extends OpenAIProvider {
       tierModels: DEFAULT_TIER_MODELS,
     });
     this.name = 'grok';
+  }
+
+
+  /** Cache economics through this vendor are unverified — no keepalive. */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return undefined;
   }
 
   protected override reasoningProfile(model: string): OpenAIReasoningProfile {

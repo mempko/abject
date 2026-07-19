@@ -19,6 +19,7 @@ import {
   ModelInfo,
   ContentPart,
   EffortLevel,
+  CacheProfile,
   defaultIsRetryable,
   getTextContent,
 } from './provider.js';
@@ -208,6 +209,15 @@ export class GeminiProvider extends BaseLLMProvider {
   /** All current Gemini models take thinkingLevel minimal→high. */
   override supportedEfforts(_modelId: string): EffortLevel[] {
     return ['minimal', 'low', 'medium', 'high'];
+  }
+
+  /**
+   * Implicit caching above ~2048 tokens. Reads at 0.25× (not 0.1×) shrink
+   * the break-even horizon to roughly a quarter of the other providers';
+   * the TTL is documented only as "minutes", so the conservative 5 applies.
+   */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return { ttlSeconds: 300, readRatio: 0.25, writeRatio: 1.0, minPrefixTokens: 2048 };
   }
 
   override describe(): LLMProviderDescription {

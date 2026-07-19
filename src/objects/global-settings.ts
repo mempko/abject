@@ -62,6 +62,8 @@ const STORAGE_KEY_TIER_CODE_EFFORT = 'global-settings:tierCodeEffort';
 // Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
 const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
 const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
+// Prompt-cache keepalive toggle (default off — pings spend real money)
+const STORAGE_KEY_CACHE_KEEPALIVE = 'global-settings:cacheKeepalive';
 
 /**
  * Provider list, labels, default tier models, credential metadata, and
@@ -184,6 +186,12 @@ export class GlobalSettings extends Abject {
   private visionDesiredModelId: string | null = null;
   /** Provider-dropdown label meaning "no vision fallback configured". */
   private static readonly VISION_NONE_LABEL = 'None';
+
+  // Prompt-cache keepalive: LLMObject pings large prompt prefixes between
+  // agent steps so provider caches stay warm. Off by default (it spends
+  // cached-read pings to avoid full re-prefills).
+  private cacheKeepaliveEnabled = false;
+  private cacheKeepaliveCheckboxId?: AbjectId;
 
   // Tier presets: a named bundle of tier routing + vision fallback. Built-in
   // presets are derived from each provider's defaultTierModels; user-saved
@@ -431,6 +439,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       visionFallback.model = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
       );
+      this.cacheKeepaliveEnabled = (await this.request<boolean | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CACHE_KEEPALIVE })
+      )) === true;
 
       // Apply each provider's optional `modelMigrations` map to saved
       // tier-routing model ids. Used when an upstream API drops a model
@@ -599,6 +610,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         : (visionFallback.provider && visionFallback.model
           ? { provider: visionFallback.provider, model: visionFallback.model }
           : null),
+      cacheKeepalive: { enabled: this.cacheKeepaliveEnabled },
     }));
   }
 
@@ -731,6 +743,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           await this.onTierEffortChanged(tier);
           return;
         }
+      }
+
+      // Cache keepalive checkbox toggled (persisted + applied on Save)
+      if (fromId === this.cacheKeepaliveCheckboxId && aspect === 'change') {
+        this.cacheKeepaliveEnabled = value as boolean;
+        return;
       }
 
       // Vision-fallback row dropdowns
@@ -1678,6 +1696,27 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
     }
 
+    // ── Cache keepalive row ──
+    // Opt-in: LLMObject re-reads large prompt prefixes on a timer between
+    // agent steps so provider prompt caches stay warm (cached reads instead
+    // of full re-prefills after the pause). Spends money, hence off by default.
+    {
+      const { widgetIds: [keepaliveCheckboxId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'checkbox', windowId: this.windowId,
+            checked: this.cacheKeepaliveEnabled,
+            text: 'Keep prompt caches warm between agent steps (pings spend cached-read tokens to avoid re-prefills)' },
+        ]})
+      );
+      this.cacheKeepaliveCheckboxId = keepaliveCheckboxId;
+      await this.request(request(this.id, keepaliveCheckboxId, 'addDependent', {}));
+      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
+        widgetId: keepaliveCheckboxId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 28 },
+      }));
+    }
+
     // Save button row (HBox: spacer + button)
     const saveRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -1919,6 +1958,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.visionProviderSelectId = undefined;
     this.visionModelSelectId = undefined;
     this.visionCapLabelId = undefined;
+    this.cacheKeepaliveCheckboxId = undefined;
     this.presetSelectId = undefined;
     this.presetNameInputId = undefined;
     this.presetApplyBtnId = undefined;
@@ -3860,6 +3900,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           await this.request(request(this.id, this.storageId, 'delete', { key: STORAGE_KEY_VISION_MODEL }));
         } catch { /* nothing saved yet */ }
       }
+
+      // Persist the cache-keepalive opt-in
+      await this.request(request(this.id, this.storageId, 'set', {
+        key: STORAGE_KEY_CACHE_KEEPALIVE, value: this.cacheKeepaliveEnabled,
+      }));
     }
 
     // Configure all providers, tier routing, and the vision fallback

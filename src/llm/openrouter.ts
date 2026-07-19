@@ -8,7 +8,7 @@
  * headers.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -112,6 +112,17 @@ export class OpenRouterProvider extends OpenAIProvider {
    */
   override supportedEfforts(_modelId: string): EffortLevel[] {
     return ['none', 'minimal', 'low', 'medium', 'high'];
+  }
+
+  /**
+   * OpenRouter passes prompt caching through to the underlying backend, so
+   * the real economics vary per route; this is the conservative envelope
+   * (0.1× reads, free re-cache, 5-minute TTL). An endpoint pin is not a
+   * machine pin, so keepalive pings may occasionally miss — the keepalive's
+   * failure handling tolerates a lossy cache.
+   */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return { ttlSeconds: 300, readRatio: 0.10, writeRatio: 1.0, minPrefixTokens: 1024 };
   }
 
   override async listModels(): Promise<ModelInfo[]> {

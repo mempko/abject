@@ -14,6 +14,7 @@ import {
   ModelInfo,
   ContentPart,
   EffortLevel,
+  CacheProfile,
   EmptyCompletionError,
   defaultIsRetryable,
 } from './provider.js';
@@ -222,6 +223,17 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   /**
+   * Automatic prefix caching above ~1024 tokens: reads at 0.1×, re-caching
+   * is free (w=1.0), entries clear after "5–10 minutes of inactivity" — the
+   * fuzzy end of that range belongs in the keepalive margin, so the TTL here
+   * is the conservative 5 minutes. Subclasses with different (or unverified)
+   * cache economics override.
+   */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return { ttlSeconds: 300, readRatio: 0.10, writeRatio: 1.0, minPrefixTokens: 1024 };
+  }
+
+  /**
    * Effort for this call: explicit override, else per-tier default. Untiered
    * calls get none (legacy behavior).
    */
@@ -247,6 +259,14 @@ export class OpenAIProvider extends BaseLLMProvider {
    * reasoning minimum), clamped to the model's output ceiling. */
   protected resolveMaxTokens(model: string, options: LLMCompletionOptions, reasoningActive: boolean): number {
     const profile = this.reasoningProfile(model);
+    // effort 'none' with an explicit tiny cap is the keepalive-ping contract:
+    // the caller wants a cache read, not an answer. Honor the cap as-is — the
+    // reasoning floor exists to keep answers from starving, and a ping has no
+    // answer to protect (this is what bounds ping spend on models that reason
+    // without a knob, e.g. the DeepSeek reasoner).
+    if (options.effort === 'none' && options.maxTokens !== undefined) {
+      return Math.min(options.maxTokens, profile.maxOutput);
+    }
     const tier = options.tier;
     let cap = tier ? OpenAIProvider.TIER_MAX_TOKENS[tier] : (options.maxTokens ?? 4096);
     cap = Math.max(cap, options.maxTokens ?? 0);

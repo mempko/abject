@@ -9,7 +9,7 @@
  * model until Meta ships variants.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, CacheProfile } from './provider.js';
 import { OpenAIProvider, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -52,6 +52,12 @@ export class MetaProvider extends OpenAIProvider {
 
   // Muse Spark reasons and takes reasoning_effort exactly like the OpenAI
   // base; only the output ceiling differs.
+
+  /** Cache economics through this vendor are unverified — no keepalive. */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return undefined;
+  }
+
   protected override reasoningProfile(_model: string): OpenAIReasoningProfile {
     return { supportsEffort: true, reasons: true, maxOutput: MUSE_SPARK_MAX_OUTPUT };
   }

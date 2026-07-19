@@ -14,6 +14,7 @@ import {
   ModelInfo,
   ContentPart,
   EffortLevel,
+  CacheProfile,
   defaultIsRetryable,
   getTextContent,
 } from './provider.js';
@@ -198,6 +199,15 @@ export class AnthropicProvider extends BaseLLMProvider {
   }
 
   /**
+   * 5-minute ephemeral cache on explicit breakpoints: reads at 0.1× input,
+   * writes at a 1.25× premium. 4096 is the largest per-model caching floor
+   * across the current lineup, so the conservative bound for all of them.
+   */
+  override cacheProfile(_modelId: string): CacheProfile {
+    return { ttlSeconds: 300, readRatio: 0.10, writeRatio: 1.25, minPrefixTokens: 4096 };
+  }
+
+  /**
    * Resolve max_tokens + effort + thinking for a call from the model profile
    * and the requested tier. Callers may override effort (`options.effort`) and
    * raise max_tokens (`options.maxTokens` acts as a floor, capped at the model
@@ -206,6 +216,19 @@ export class AnthropicProvider extends BaseLLMProvider {
   private resolveGenerationConfig(model: string, options: LLMCompletionOptions): GenerationConfig {
     const profile = AnthropicProvider.profileForModel(model);
     const tier = options.tier;
+
+    // effort 'none' is the utility/keepalive-ping contract: answer directly
+    // with zero thinking, honoring a tiny max_tokens instead of raising it to
+    // thinking headroom. Models that think by default get an explicit
+    // thinking-off; the effort field itself is not sent ('none' is not on the
+    // API's effort ladder).
+    if (options.effort === 'none') {
+      return {
+        maxTokens: Math.min(profile.maxOutput, options.maxTokens ?? 4096),
+        thinking: profile.mode === 'adaptive-default' ? { type: 'disabled' } : undefined,
+        thinkingEnabled: false,
+      };
+    }
 
     // base max_tokens: tier default as a floor, honoring a larger caller
     // request, capped at the model's output ceiling. No tier → legacy default.

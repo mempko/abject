@@ -5,7 +5,7 @@
  * subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -67,6 +67,15 @@ export class DeepSeekProvider extends OpenAIProvider {
   // The reasoner takes exactly two levels; chat/flash models have no knob.
   override supportedEfforts(modelId: string): EffortLevel[] {
     return deepseekReasons(modelId) ? ['high', 'max'] : [];
+  }
+
+  /**
+   * Automatic disk-backed context caching: reads at 0.1×, re-caching free,
+   * documented retention up to 10 minutes idle (lossy below that — the
+   * cache is best-effort, which the keepalive tolerates).
+   */
+  override cacheProfile(_modelId: string): CacheProfile | undefined {
+    return { ttlSeconds: 600, readRatio: 0.10, writeRatio: 1.0, minPrefixTokens: 1024 };
   }
 
   // The DeepSeek chat API is text-only across the catalog
