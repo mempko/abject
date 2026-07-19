@@ -22,6 +22,16 @@ const ABJECT_STORE_INTERFACE = 'abjects:abject-store' as InterfaceId;
 
 const STORAGE_KEY = 'abject-store:snapshots';
 
+/**
+ * One prior source of an object. Only the source is versioned — manifests
+ * rarely change and the current one still parses old sources; `data` is
+ * live state, not code, and belongs to exactly one point in time.
+ */
+export interface AbjectVersion {
+  source: string;
+  savedAt: number;
+}
+
 export interface AbjectSnapshot {
   typeId: string;
   objectId: string;
@@ -30,6 +40,13 @@ export interface AbjectSnapshot {
   owner: string;
   savedAt: number;
   data?: Record<string, unknown>;
+  /**
+   * Prior sources, newest first, pushed only when a save actually CHANGES
+   * the source (data-only persistence never creates a version). Bounded at
+   * MAX_VERSIONS — old enough history ages out. This is the undo path for
+   * "an agent rewrote my object and ruined it".
+   */
+  versions?: AbjectVersion[];
 }
 
 export interface RestoreResult {
@@ -70,6 +87,9 @@ export class AbjectStore extends Abject {
   private workspaceId?: string;
   private peerId?: string;
   private snapshots: Map<string, AbjectSnapshot> = new Map();
+
+  /** Prior sources kept per object; older history ages out. */
+  private static readonly MAX_VERSIONS = 10;
 
   // Debounced Storage write state (see schedulePersist).
   private static readonly PERSIST_DEBOUNCE_MS = 500;
@@ -148,6 +168,41 @@ export class AbjectStore extends Abject {
                 parameters: [],
                 returns: { kind: 'reference', reference: 'RestoreResult' },
               },
+              {
+                name: 'listVersions',
+                description: 'List an object\'s saved source versions (newest first). Every source-changing save keeps the prior source, bounded at 10. Returns { name, typeId, objectId, current: { savedAt, sizeChars }, versions: [{ index, savedAt, sizeChars }] }, or null when the object has no snapshot. Accepts a live objectId, durable typeId, or object name.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Live objectId, typeId, or object name' },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'getVersion',
+                description: 'Fetch one prior version\'s full source. Returns { source, savedAt }.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Live objectId, typeId, or object name' },
+                  { name: 'index', type: { kind: 'primitive', primitive: 'number' }, description: 'Version index from listVersions (0 = most recent prior version)' },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'restoreVersion',
+                description: 'Make a prior version the live source: applies it to the running object (updateSource), updates the snapshot and registry, and pushes the replaced source onto the version ring so the restore is itself undoable. Returns { success, error? }.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Live objectId, typeId, or object name' },
+                  { name: 'index', type: { kind: 'primitive', primitive: 'number' }, description: 'Version index from listVersions' },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'deleteVersion',
+                description: 'Permanently remove one prior version from an object\'s history (frees its ring slot; the live source is untouched). Returns { success, error? }.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Live objectId, typeId, or object name' },
+                  { name: 'index', type: { kind: 'primitive', primitive: 'number' }, description: 'Version index from listVersions' },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -183,6 +238,121 @@ export class AbjectStore extends Abject {
     this.on('restoreAll', async () => {
       return this.restoreAll();
     });
+
+    this.on('listVersions', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: string };
+      const snap = this.findSnapshot(objectId);
+      if (!snap) return null;
+      return {
+        name: snap.manifest.name,
+        typeId: snap.typeId,
+        objectId: snap.objectId,
+        current: { savedAt: snap.savedAt, sizeChars: snap.source.length },
+        versions: (snap.versions ?? []).map((v, index) => ({
+          index,
+          savedAt: v.savedAt,
+          sizeChars: v.source.length,
+        })),
+      };
+    });
+
+    this.on('getVersion', async (msg: AbjectMessage) => {
+      const { objectId, index } = msg.payload as { objectId: string; index: number };
+      const snap = this.findSnapshot(objectId);
+      precondition(snap !== undefined, `No snapshot found for '${objectId}'`);
+      const versions = snap!.versions ?? [];
+      precondition(
+        Number.isInteger(index) && index >= 0 && index < versions.length,
+        `Version index ${index} out of range (object has ${versions.length} prior versions)`,
+      );
+      const v = versions[index];
+      return { source: v.source, savedAt: v.savedAt };
+    });
+
+    this.on('restoreVersion', async (msg: AbjectMessage) => {
+      const { objectId, index } = msg.payload as { objectId: string; index: number };
+      return this.restoreVersion(objectId, index);
+    });
+
+    this.on('deleteVersion', async (msg: AbjectMessage) => {
+      const { objectId, index } = msg.payload as { objectId: string; index: number };
+      const snap = this.findSnapshot(objectId);
+      if (!snap) return { success: false, error: `No snapshot found for '${objectId}'` };
+      const versions = snap.versions ?? [];
+      if (!Number.isInteger(index) || index < 0 || index >= versions.length) {
+        return { success: false, error: `Version index ${index} out of range (object has ${versions.length} prior versions)` };
+      }
+      const removed = versions.splice(index, 1)[0];
+      if (versions.length === 0) delete snap.versions;
+      this.schedulePersist();
+      log.info(`Deleted version of '${snap.manifest.name}' from ${new Date(removed.savedAt).toISOString()} (${removed.source.length} chars, ${versions.length} remain)`);
+      this.changed('versionDeleted', { typeId: snap.typeId, objectId: snap.objectId, deletedSavedAt: removed.savedAt });
+      return { success: true };
+    });
+  }
+
+  /**
+   * Resolve a snapshot by typeId key, live objectId, or manifest name —
+   * callers usually hold the live objectId, which changes across restarts,
+   * while the snapshot map is keyed by durable typeId.
+   */
+  private findSnapshot(ref: string): AbjectSnapshot | undefined {
+    const direct = this.snapshots.get(ref);
+    if (direct) return direct;
+    for (const snap of this.snapshots.values()) {
+      if (snap.objectId === ref || snap.manifest.name === ref) return snap;
+    }
+    return undefined;
+  }
+
+  /**
+   * Make a prior version the live source: the current source is pushed onto
+   * the ring first (a restore is itself undoable), the snapshot updates, the
+   * running object gets `updateSource`, and the registry syncs. The version
+   * ring keeps its restored entry — restoring is a copy, not a move.
+   */
+  private async restoreVersion(ref: string, index: number): Promise<{ success: boolean; error?: string }> {
+    const snap = this.findSnapshot(ref);
+    if (!snap) return { success: false, error: `No snapshot found for '${ref}'` };
+    const versions = snap.versions ?? [];
+    if (!Number.isInteger(index) || index < 0 || index >= versions.length) {
+      return { success: false, error: `Version index ${index} out of range (object has ${versions.length} prior versions)` };
+    }
+    const chosen = versions[index];
+
+    // Apply to the live object first — if the old source no longer compiles
+    // against today's runtime, fail without touching the snapshot.
+    try {
+      const result = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, snap.objectId as AbjectId, 'updateSource', { source: chosen.source })
+      );
+      if (result && result.success === false) {
+        return { success: false, error: result.error ?? 'updateSource failed' };
+      }
+    } catch (err) {
+      return { success: false, error: `Live object rejected the version: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    const newVersions = [
+      { source: snap.source, savedAt: snap.savedAt },
+      ...versions,
+    ].slice(0, AbjectStore.MAX_VERSIONS);
+    snap.source = chosen.source;
+    snap.savedAt = Date.now();
+    snap.versions = newVersions;
+    this.schedulePersist();
+
+    if (this.registryId) {
+      try {
+        await this.request(request(this.id, this.registryId, 'updateSource', {
+          objectId: snap.objectId, source: chosen.source,
+        }));
+      } catch { /* registry sync is best effort */ }
+    }
+
+    log.info(`Restored '${snap.manifest.name}' to version from ${new Date(chosen.savedAt).toISOString()} (${chosen.source.length} chars)`);
+    this.changed('versionRestored', { typeId: snap.typeId, objectId: snap.objectId, restoredSavedAt: chosen.savedAt });
+    return { success: true };
   }
 
   protected override async onInit(): Promise<void> {
@@ -341,12 +511,40 @@ export class AbjectStore extends Abject {
       } catch { /* Identity may not be available */ }
     }
 
+    // Resolve the workspace BEFORE computing the snapshot key. Saves that
+    // arrive before WorkspaceManager tags us used to fall back to the bare
+    // objectId key, and the next save (workspace now known) would start a
+    // fresh typeId-keyed entry — a stale duplicate that shadowed the real
+    // snapshot in lookups and orphaned its version history.
+    const wsId = await this.ensureWorkspaceId();
     const typeId = this.computeTypeId(manifest.name) ?? objectId;
 
     // Preserve existing data if the caller didn't supply one (e.g. an
     // ObjectCreator-driven save after a source edit shouldn't wipe data).
-    const existing = this.snapshots.get(typeId);
+    let existing = this.snapshots.get(typeId);
+    if (!existing && typeId !== objectId) {
+      // Adopt a legacy entry saved under the bare objectId before the
+      // workspace was known, so its data and history carry forward.
+      const legacy = this.snapshots.get(objectId);
+      if (legacy) {
+        existing = legacy;
+        this.snapshots.delete(objectId);
+      }
+    }
     const finalData = data !== undefined ? data : existing?.data;
+
+    // Version history: a save that CHANGES the source pushes the outgoing
+    // source onto the ring first, so it stays restorable. Identical-source
+    // saves (data persistence, re-registration) carry history through
+    // untouched.
+    let versions = existing?.versions;
+    if (existing && existing.source !== source) {
+      versions = [
+        { source: existing.source, savedAt: existing.savedAt },
+        ...(existing.versions ?? []),
+      ].slice(0, AbjectStore.MAX_VERSIONS);
+      log.info(`Source changed for '${manifest.name}' — kept prior version (${existing.source.length} chars, ${versions.length}/${AbjectStore.MAX_VERSIONS} kept)`);
+    }
 
     const snapshot: AbjectSnapshot = {
       typeId,
@@ -356,6 +554,7 @@ export class AbjectStore extends Abject {
       owner,
       savedAt: Date.now(),
       ...(finalData !== undefined ? { data: finalData } : {}),
+      ...(versions && versions.length > 0 ? { versions } : {}),
     };
 
     // Key by typeId for durable identity (survives restart with new objectId)
@@ -374,7 +573,6 @@ export class AbjectStore extends Abject {
     }
 
     // Tag the newly-created object with our workspace
-    const wsId = await this.ensureWorkspaceId();
     if (this.widgetManagerId && wsId) {
       try {
         await this.request(
@@ -567,6 +765,17 @@ export class AbjectStore extends Abject {
   const restored = await call(await dep('AbjectStore'), 'restoreAll', {});
   // restored: [{ originalId, newId, name }]
   // Note: restored objects get NEW IDs — the original IDs are not reused.
+
+### Version history (undo a bad source edit)
+
+  const info = await call(await dep('AbjectStore'), 'listVersions', { objectId });
+  // info: { name, current: {savedAt, sizeChars}, versions: [{index, savedAt, sizeChars}] }
+  const old = await call(await dep('AbjectStore'), 'getVersion', { objectId, index: 0 });
+  const result = await call(await dep('AbjectStore'), 'restoreVersion', { objectId, index: 0 });
+  // Applies the prior source to the LIVE object and persists it. The replaced
+  // source is kept in the ring, so a restore can itself be undone.
+  await call(await dep('AbjectStore'), 'deleteVersion', { objectId, index: 0 });
+  // Permanently removes one prior version (live source untouched).
 
 ### IMPORTANT
 - The interface ID is 'abjects:abject-store'.

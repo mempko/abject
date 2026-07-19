@@ -648,6 +648,8 @@ export class AppExplorer extends Abject {
         if (editorId) {
           specs.push({ type: 'button', windowId, rect: r0,
             text: 'Edit Source', style: { fontSize: 12 }, action: 'editSource' });
+          specs.push({ type: 'button', windowId, rect: r0,
+            text: 'History', style: { fontSize: 12 }, action: 'history' });
         }
       }
       if (!this.selectedKindIsSystem) {
@@ -802,6 +804,10 @@ export class AppExplorer extends Abject {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.editSource(this.instanceEntries[this.selectedInstanceIndex].id);
         }
+      } else if (action === 'history') {
+        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
+          await this.showHistory(this.instanceEntries[this.selectedInstanceIndex].id);
+        }
       } else if (action === 'cloneTo') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.cloneToWorkspace(this.instanceEntries[this.selectedInstanceIndex]);
@@ -885,6 +891,15 @@ export class AppExplorer extends Abject {
     if (!editorId) return;
     try {
       await this.request(request(this.id, editorId, 'show', { objectId }));
+    } catch { /* editor may not be available */ }
+  }
+
+  /** Open the editor straight into version history (view + restore prior sources). */
+  private async showHistory(objectId: AbjectId): Promise<void> {
+    const editorId = await this.findAbjectEditor();
+    if (!editorId) return;
+    try {
+      await this.request(request(this.id, editorId, 'show', { objectId, showHistory: true }));
     } catch { /* editor may not be available */ }
   }
 

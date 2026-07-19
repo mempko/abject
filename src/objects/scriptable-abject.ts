@@ -388,10 +388,13 @@ export class ScriptableAbject extends Abject {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
         // Ownership may be stale after restart (ObjectCreator gets new ID each session).
-        // Resolve the current ObjectCreator and AbjectEditor via registry and accept if the sender matches either.
+        // Resolve the current ObjectCreator, AbjectEditor, and AbjectStore via
+        // registry and accept if the sender matches any (the store applies
+        // version restores).
         const creatorId = await this.discoverDep('ObjectCreator');
         const editorId = await this.discoverDep('AbjectEditor');
-        if (msg.routing.from !== creatorId && msg.routing.from !== editorId) {
+        const storeId = await this.discoverDep('AbjectStore');
+        if (msg.routing.from !== creatorId && msg.routing.from !== editorId && msg.routing.from !== storeId) {
           log.warn(
             `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
           );
@@ -399,13 +402,16 @@ export class ScriptableAbject extends Abject {
             success: false,
             error:
               `Only the owner can update source (owner: ${this._owner || 'none — this object was spawned without one'}; sender: ${msg.routing.from}). ` +
-              'ObjectCreator and AbjectEditor are also accepted and take over ownership. ' +
+              'ObjectCreator, AbjectEditor, and AbjectStore are also accepted and take over ownership. ' +
               'Agents: route the edit through ObjectCreator — its edit_source / deploy_update local actions carry owner context, ' +
               'while a direct updateSource call from a job never will.',
           };
         }
-        // Adopt sender as owner
-        this._owner = msg.routing.from;
+        // Adopt sender as owner — except the store, whose version restores
+        // are maintenance, not a claim on the object.
+        if (msg.routing.from !== storeId) {
+          this._owner = msg.routing.from;
+        }
       }
 
       // Hot-reload: tear down current UI via old hide() handler

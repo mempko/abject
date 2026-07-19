@@ -54,6 +54,11 @@ export class AbjectEditor extends Abject {
   private addInputId?: AbjectId;
   private addConfirmBtnId?: AbjectId;
   private addRowId?: AbjectId;
+  private historyBtnId?: AbjectId;
+  private historyRowId?: AbjectId;
+  private historySelectId?: AbjectId;
+  private historyRestoreBtnId?: AbjectId;
+  private historyDeleteBtnId?: AbjectId;
 
   // State
   private editingObjectId?: AbjectId;
@@ -61,6 +66,13 @@ export class AbjectEditor extends Abject {
   private entries: HandlerEntry[] = [];
   private selectedIndex = -1;
   private addMode = false;
+  /** Version metadata from AbjectStore.listVersions while the history row is open. */
+  private historyVersions: Array<{ index: number; savedAt: number; sizeChars: number }> = [];
+  /** The exact option labels shown in the history select (index 0 = current). */
+  private historyOptions: string[] = [];
+  /** Select index currently shown: 0 = current source, n>0 = historyVersions[n-1]. */
+  private historySelectedIndex = 0;
+  private historyVisible = false;
 
   constructor() {
     super({
@@ -114,8 +126,8 @@ export class AbjectEditor extends Abject {
 
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: string };
-      return this.showEditor(objectId as AbjectId);
+      const { objectId, showHistory } = msg.payload as { objectId: string; showHistory?: boolean };
+      return this.showEditor(objectId as AbjectId, showHistory === true);
     });
 
     this.on('hide', async () => {
@@ -148,9 +160,18 @@ export class AbjectEditor extends Abject {
     this.addInputId = undefined;
     this.addConfirmBtnId = undefined;
     this.addRowId = undefined;
+    this.historyBtnId = undefined;
+    this.historyRowId = undefined;
+    this.historySelectId = undefined;
+    this.historyRestoreBtnId = undefined;
+    this.historyDeleteBtnId = undefined;
     this.entries = [];
     this.selectedIndex = -1;
     this.addMode = false;
+    this.historyVersions = [];
+    this.historyOptions = [];
+    this.historySelectedIndex = 0;
+    this.historyVisible = false;
   }
 
   async hide(): Promise<boolean> {
@@ -168,7 +189,7 @@ export class AbjectEditor extends Abject {
 
   // ── Show Editor ──────────────────────────────────────────────────────
 
-  private async showEditor(objectId: AbjectId): Promise<boolean> {
+  private async showEditor(objectId: AbjectId, showHistory = false): Promise<boolean> {
     if (!objectId) return false;
 
     // Fetch source
@@ -264,13 +285,24 @@ export class AbjectEditor extends Abject {
           // 9: add confirm button (hidden initially)
           { type: 'button', windowId: this.windowId, text: 'OK',
             style: { visible: false, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          // 10: history toggle button
+          { type: 'button', windowId: this.windowId, text: 'History' },
+          // 11: history version select (hidden row initially)
+          { type: 'select', windowId: this.windowId, options: ['(no versions)'], selectedIndex: 0,
+            style: { visible: false } },
+          // 12: restore-version button (hidden row initially)
+          { type: 'button', windowId: this.windowId, text: 'Restore',
+            style: { visible: false, background: this.theme.statusWarning, color: this.theme.actionText, borderColor: this.theme.statusWarning } },
+          // 13: delete-version button (hidden row initially)
+          { type: 'button', windowId: this.windowId, text: 'Delete',
+            style: { visible: false, background: this.theme.statusError, color: this.theme.actionText, borderColor: this.theme.statusError } },
         ],
       })
     );
 
     const [splitPaneId, handlerListId, sourceEditorId,
       testBtnId, saveBtnId, cancelBtnId, addBtnId, editStatusId,
-      addInputId, addConfirmBtnId] = widgetIds;
+      addInputId, addConfirmBtnId, historyBtnId, historySelectId, historyRestoreBtnId, historyDeleteBtnId] = widgetIds;
 
     this.splitPaneId = splitPaneId;
     this.handlerListId = handlerListId;
@@ -282,6 +314,10 @@ export class AbjectEditor extends Abject {
     this.editStatusId = editStatusId;
     this.addInputId = addInputId;
     this.addConfirmBtnId = addConfirmBtnId;
+    this.historyBtnId = historyBtnId;
+    this.historySelectId = historySelectId;
+    this.historyRestoreBtnId = historyRestoreBtnId;
+    this.historyDeleteBtnId = historyDeleteBtnId;
 
     // Set up split pane children
     await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.handlerListId }));
@@ -314,6 +350,27 @@ export class AbjectEditor extends Abject {
       ],
     }));
 
+    // History row (hidden initially, same collapse pattern as the add row)
+    this.historyRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: this.historyRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 0 }, // hidden
+    }));
+    await this.request(request(this.id, this.historyRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.historySelectId, sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 28 } },
+        { widgetId: this.historyRestoreBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 70, height: 28 } },
+        { widgetId: this.historyDeleteBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 65, height: 28 } },
+      ],
+    }));
+
     // Button row
     const btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -334,6 +391,7 @@ export class AbjectEditor extends Abject {
         { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 60, height: 28 } },
         { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 28 } },
         { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 55, height: 28 } },
+        { widgetId: this.historyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
       ],
     }));
     await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
@@ -353,10 +411,18 @@ export class AbjectEditor extends Abject {
     await this.addDep(this.addBtnId);
     await this.addDep(this.addConfirmBtnId);
     await this.addDep(this.addInputId);
+    await this.addDep(this.historyBtnId);
+    await this.addDep(this.historySelectId);
+    await this.addDep(this.historyRestoreBtnId);
+    await this.addDep(this.historyDeleteBtnId);
 
     // Select first handler if any exist
     if (this.entries.length > 0) {
       await this.selectEntry(0);
+    }
+
+    if (showHistory) {
+      await this.openHistory();
     }
 
     return true;
@@ -485,6 +551,205 @@ export class AbjectEditor extends Abject {
       return;
     }
 
+    // History toggle
+    if (fromId === this.historyBtnId && aspect === 'click') {
+      if (this.historyVisible) await this.closeHistory();
+      else await this.openHistory();
+      return;
+    }
+
+    // History version selected — preview it in the editor
+    if (fromId === this.historySelectId && aspect === 'change') {
+      await this.previewHistorySelection();
+      return;
+    }
+
+    // Restore the previewed version
+    if (fromId === this.historyRestoreBtnId && aspect === 'click') {
+      await this.restoreHistorySelection();
+      return;
+    }
+
+    // Delete the previewed version
+    if (fromId === this.historyDeleteBtnId && aspect === 'click') {
+      await this.deleteHistorySelection();
+      return;
+    }
+  }
+
+  // ── Version History ──────────────────────────────────────────────────
+
+  private static formatVersionLabel(prefix: string, savedAt: number, sizeChars: number): string {
+    const when = new Date(savedAt).toLocaleString();
+    const kb = (sizeChars / 1000).toFixed(1);
+    return `${prefix} — ${when} (${kb}K)`;
+  }
+
+  /** Fetch version metadata and show the history row. */
+  private async openHistory(): Promise<void> {
+    if (!this.editingObjectId || !this.historyRowId || !this.historySelectId) return;
+    if (!this.abjectStoreId) {
+      await this.updateStatus('AbjectStore unavailable — no version history', this.theme.statusError);
+      return;
+    }
+    let info: {
+      current: { savedAt: number; sizeChars: number };
+      versions: Array<{ index: number; savedAt: number; sizeChars: number }>;
+    } | null = null;
+    try {
+      info = await this.request(request(this.id, this.abjectStoreId, 'listVersions', { objectId: this.editingObjectId }));
+    } catch { /* store unreachable */ }
+    if (!info) {
+      await this.updateStatus('No snapshot for this object — versions appear after the first persisted save', this.theme.statusNeutral);
+      return;
+    }
+    if (info.versions.length === 0) {
+      await this.updateStatus('No prior versions yet — a version is kept every time a save changes the source', this.theme.statusNeutral);
+      return;
+    }
+
+    this.historyVersions = info.versions;
+    this.historySelectedIndex = 0;
+    this.historyOptions = [
+      AbjectEditor.formatVersionLabel('Current', info.current.savedAt, info.current.sizeChars),
+      ...info.versions.map((v, i) => AbjectEditor.formatVersionLabel(`v-${i + 1}`, v.savedAt, v.sizeChars)),
+    ];
+    await this.request(request(this.id, this.historySelectId, 'update', {
+      options: this.historyOptions, selectedIndex: 0, style: { visible: true },
+    }));
+    for (const btnId of [this.historyRestoreBtnId, this.historyDeleteBtnId]) {
+      if (btnId) await this.request(request(this.id, btnId, 'update', { style: { visible: true, disabled: true } }));
+    }
+    await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+      widgetId: this.historyRowId,
+      preferredSize: { height: 32 },
+    }));
+    this.historyVisible = true;
+    await this.updateStatus(`${info.versions.length} prior version(s) — pick one to preview, then Restore to make it live`, this.theme.statusNeutral);
+  }
+
+  private async closeHistory(): Promise<void> {
+    if (!this.historyRowId) return;
+    this.historyVisible = false;
+    // Leave the editor showing whatever was previewed only if it is current;
+    // otherwise reload the live source so the editor never silently holds a
+    // stale version the user might Save by habit.
+    if (this.historySelectedIndex !== 0) {
+      await this.loadCurrentSource();
+    }
+    this.historyVersions = [];
+    this.historyOptions = [];
+    this.historySelectedIndex = 0;
+    if (this.historySelectId) {
+      await this.request(request(this.id, this.historySelectId, 'update', { style: { visible: false } }));
+    }
+    for (const btnId of [this.historyRestoreBtnId, this.historyDeleteBtnId]) {
+      if (btnId) await this.request(request(this.id, btnId, 'update', { style: { visible: false } }));
+    }
+    await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+      widgetId: this.historyRowId,
+      preferredSize: { height: 0 },
+    }));
+  }
+
+  /** Re-fetch the live source and load it into the handler list + editor. */
+  private async loadCurrentSource(): Promise<void> {
+    if (!this.editingObjectId) return;
+    try {
+      const source = await this.request<string>(request(this.id, this.editingObjectId, 'getSource', {}));
+      this.entries = parseHandlerMap(source);
+      this.selectedIndex = -1;
+      await this.refreshList();
+      if (this.entries.length > 0) await this.selectEntry(0);
+    } catch { /* object gone */ }
+  }
+
+  private async previewHistorySelection(): Promise<void> {
+    if (!this.historySelectId || !this.abjectStoreId || !this.editingObjectId) return;
+    // Selects report their value as the option LABEL; recover the index from
+    // the exact option list we rendered.
+    const label = await this.request<string>(request(this.id, this.historySelectId, 'getValue', {}));
+    this.historySelectedIndex = Math.max(0, this.historyOptions.indexOf(label));
+
+    if (this.historySelectedIndex === 0) {
+      await this.loadCurrentSource();
+      for (const btnId of [this.historyRestoreBtnId, this.historyDeleteBtnId]) {
+        if (btnId) await this.request(request(this.id, btnId, 'update', { style: { disabled: true } }));
+      }
+      await this.updateStatus('Viewing current source', this.theme.statusNeutral);
+      return;
+    }
+
+    const version = this.historyVersions[this.historySelectedIndex - 1];
+    try {
+      const { source, savedAt } = await this.request<{ source: string; savedAt: number }>(
+        request(this.id, this.abjectStoreId, 'getVersion', { objectId: this.editingObjectId, index: version.index })
+      );
+      this.entries = parseHandlerMap(source);
+      this.selectedIndex = -1;
+      await this.refreshList();
+      if (this.entries.length > 0) await this.selectEntry(0);
+      for (const btnId of [this.historyRestoreBtnId, this.historyDeleteBtnId]) {
+        if (btnId) await this.request(request(this.id, btnId, 'update', { style: { disabled: false } }));
+      }
+      await this.updateStatus(`**Previewing version from ${new Date(savedAt).toLocaleString()}** — press Restore to make it live, or Delete to drop it from history`, this.theme.statusWarning);
+    } catch (err) {
+      await this.updateStatus(`Could not load version: ${err instanceof Error ? err.message : String(err)}`, this.theme.statusError);
+    }
+  }
+
+  private async restoreHistorySelection(): Promise<void> {
+    if (!this.abjectStoreId || !this.editingObjectId || this.historySelectedIndex === 0) return;
+    const version = this.historyVersions[this.historySelectedIndex - 1];
+    await this.setControlsDisabled(true);
+    try {
+      const result = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, this.abjectStoreId, 'restoreVersion', { objectId: this.editingObjectId, index: version.index })
+      );
+      if (result.success) {
+        await this.loadCurrentSource();
+        await this.updateStatus(`Restored version from ${new Date(version.savedAt).toLocaleString()} — it is now live and persisted`, this.theme.statusSuccess);
+        await this.notify('Version restored', 'success');
+        // Refresh the history row: the replaced source is now the newest version.
+        await this.closeHistory();
+        await this.openHistory();
+      } else {
+        await this.updateStatus(`**Restore failed:** ${result.error ?? 'unknown'}`, this.theme.statusError);
+        await this.notify(`Restore failed: ${(result.error ?? 'unknown').slice(0, 80)}`, 'error');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.updateStatus(`**Restore failed:** ${msg}`, this.theme.statusError);
+    }
+    await this.setControlsDisabled(false);
+  }
+
+  private async deleteHistorySelection(): Promise<void> {
+    if (!this.abjectStoreId || !this.editingObjectId || this.historySelectedIndex === 0) return;
+    const version = this.historyVersions[this.historySelectedIndex - 1];
+    const confirmed = await this.confirm({
+      title: 'Delete Version',
+      message: `Permanently delete the version from ${new Date(version.savedAt).toLocaleString()}? The live source is untouched.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    try {
+      const result = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, this.abjectStoreId, 'deleteVersion', { objectId: this.editingObjectId, index: version.index })
+      );
+      if (result.success) {
+        await this.updateStatus(`Deleted version from ${new Date(version.savedAt).toLocaleString()}`, this.theme.statusNeutral);
+        await this.notify('Version deleted', 'success');
+        // Refresh: indices shifted, and the preview was showing deleted bytes.
+        await this.closeHistory();
+        await this.openHistory();
+      } else {
+        await this.updateStatus(`**Delete failed:** ${result.error ?? 'unknown'}`, this.theme.statusError);
+      }
+    } catch (err) {
+      await this.updateStatus(`**Delete failed:** ${err instanceof Error ? err.message : String(err)}`, this.theme.statusError);
+    }
   }
 
   // ── Apply / Save ──────────────────────────────────────────────────────
