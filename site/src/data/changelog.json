@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.8.20",
+    "date": "2026-07-19",
+    "title": "Version History, Self-Healing Scrums, Warmer Caches",
+    "summary": "This release makes long-running work safer to trust: scriptable abjects keep a source history you can restore from, goals can be paused or stopped mid-flight, and stalled scrums recover on their own. Under the hood, smarter LLM plumbing keeps prompt caches warm and routes reasoning effort per model tier.",
+    "highlights": [
+      "Scriptable abjects now keep a version history of their source; open the editor's History panel to browse past versions and restore any of them",
+      "You can pause or stop a running goal at any time, and scrums self-heal when their work stalls instead of hanging forever",
+      "Prompt-cache keepalive: the LLM service keeps warm prompt caches alive with a content-addressed registry, reducing latency and token cost on repeated turns",
+      "Reasoning effort is now routed per model tier, so heavier thinking goes where it helps and cheap calls stay cheap",
+      "Clearer diagnostics when a model truncates its output or refuses a request, so failures explain themselves instead of failing silently"
+    ],
+    "fixes": [
+      "Scrums that lost an agent mid-run previously stalled indefinitely; they now detect the failure and recover automatically"
+    ]
+  },
+  {
     "version": "0.8.19",
     "date": "2026-07-18",
     "title": "Cloning, clearer errors, and sturdier plumbing",
