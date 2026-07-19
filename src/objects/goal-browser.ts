@@ -347,6 +347,8 @@ Click the arrow to expand/collapse a goal.
       goals: this.toGoalNodes(),
       isExpanded: (id) => this.expandedGoals.has(id as GoalId),
       getTasks: (id) => this.tasksByGoal.get(id as GoalId) ?? [],
+      // Per-goal pause/resume/stop controls on live goal rows.
+      withActions: true,
     });
   }
 
@@ -392,6 +394,38 @@ Click the arrow to expand/collapse a goal.
           this.tasksByGoal.set(goalId, tasks);
         }
       }
+      await this.rebuildTree();
+      return;
+    }
+
+    // Per-row goal controls (pause/resume/stop glyphs on live goal rows)
+    if (fromId === this.goalWidgetId && aspect === 'goalAction') {
+      const data = typeof value === 'string' ? JSON.parse(value) : value;
+      const { id: rawId, action } = data as { id: string; action: 'pause' | 'resume' | 'stop' };
+      const goalId = (rawId.startsWith('goal:') ? rawId.slice(5) : rawId) as GoalId;
+      if (!this.goalManagerId) return;
+
+      if (action === 'stop') {
+        const goal = this.goals.find(g => g.id === goalId);
+        const confirmed = await this.confirm({
+          title: 'Stop Goal',
+          message: `Stop "${(goal?.title ?? goalId).slice(0, 120)}" and cancel its tasks?`,
+          confirmLabel: 'Stop',
+          destructive: true,
+        });
+        if (!confirmed) return;
+        await this.request(request(this.id, this.goalManagerId, 'stopGoal', { goalId })).catch(() => undefined);
+      } else {
+        const method = action === 'pause' ? 'pauseGoal' : 'resumeGoal';
+        await this.request(request(this.id, this.goalManagerId, method, { goalId })).catch(() => undefined);
+      }
+
+      // Refresh the goal row so the controls reflect the new status.
+      try {
+        const goal = await this.request<Goal>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+        const idx = this.goals.findIndex(g => g.id === goalId);
+        if (idx >= 0 && goal) this.goals[idx] = goal;
+      } catch { /* goal may be gone */ }
       await this.rebuildTree();
       return;
     }
@@ -452,6 +486,8 @@ Click the arrow to expand/collapse a goal.
           break;
         }
         case 'goalUpdated':
+        case 'goalPaused':
+        case 'goalResumed':
         case 'goalCompleted':
         case 'goalFailed':
         case 'taskCompleted':

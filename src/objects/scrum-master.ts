@@ -93,6 +93,22 @@ export class ScrumMaster extends Abject {
   private scrummedRounds = new Set<string>();
 
   /**
+   * Self-healing: retry bookkeeping for in-flight scrum tasks, keyed by the
+   * OTA task id our enqueueTask call returned. A scrum task that dies
+   * without making a decision (LLM provider outage, step-limit error) used
+   * to deadlock the goal — the round's `goalReadyForCompletion` had already
+   * been emitted and the idempotency guards blocked any re-run, so nothing
+   * ever reviewed the round again. Now a failed scrum retries with backoff,
+   * and after MAX_SCRUM_ATTEMPTS the goal fails with an instructive error
+   * instead of hanging forever.
+   */
+  private scrumAttempts = new Map<string, { goalId: string; priorScrumNumber: number; attempt: number }>();
+  /** Pending retry timers so onStop can cancel them. */
+  private scrumRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private static readonly MAX_SCRUM_ATTEMPTS = 3;
+  private static readonly SCRUM_RETRY_BASE_MS = 15_000;
+
+  /**
    * Tasks waiting on upstream dependencies. As `taskCompleted` events arrive
    * for upstream taskIds, dependents whose blockers become empty are enqueued
    * on their assigned agent. `taskPermanentlyFailed` cascades the failure.
@@ -217,6 +233,12 @@ export class ScrumMaster extends Abject {
     log.info('Initialized; registered as Agent and subscribed to GoalManager events');
   }
 
+  protected override async onStop(): Promise<void> {
+    for (const timer of this.scrumRetryTimers) clearTimeout(timer);
+    this.scrumRetryTimers.clear();
+    await super.onStop();
+  }
+
   private setupHandlers(): void {
     // GoalManager event subscription. Two triggers enqueue a fresh scrum task;
     // taskCompleted/taskPermanentlyFailed drive dep tracking.
@@ -239,6 +261,9 @@ export class ScrumMaster extends Abject {
         const { goalId } = value as { goalId: string };
         for (const [pendingId, info] of this.pendingDeps) {
           if (info.goalId === goalId) this.pendingDeps.delete(pendingId);
+        }
+        for (const [taskId, info] of this.scrumAttempts) {
+          if (info.goalId === goalId) this.scrumAttempts.delete(taskId);
         }
       } else if (aspect === 'taskCompleted') {
         const { taskId } = value as { taskId: string };
@@ -314,6 +339,8 @@ export class ScrumMaster extends Abject {
     this.on('taskResult', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
         ticketId: string;
+        success?: boolean;
+        error?: string;
         lastAction?: { action: string; [k: string]: unknown };
       };
 
@@ -327,6 +354,18 @@ export class ScrumMaster extends Abject {
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) pending.resolve(payload);
       this.scrumInFlight.delete(payload.ticketId);
+
+      // Self-healing: a scrum task that died without a decision (provider
+      // outage, unhandled step error) gets retried with backoff. This fires
+      // exactly once per scrum-task death — the taskResult event — so a
+      // slow-but-alive scrum can never be double-run.
+      const attemptInfo = this.scrumAttempts.get(payload.ticketId);
+      if (attemptInfo) {
+        this.scrumAttempts.delete(payload.ticketId);
+        if (payload.success === false) {
+          this.scheduleScrumRetry(attemptInfo, payload.error);
+        }
+      }
     });
 
     // Forward progress events to reset our pending-ticket inactivity timers.
@@ -378,9 +417,11 @@ export class ScrumMaster extends Abject {
   }
 
   /**
-   * Enqueue a scrum task on ourselves. Idempotent per (goalId, scrumNumber).
+   * Enqueue a scrum task on ourselves. Idempotent per (goalId, scrumNumber);
+   * `attempt` > 1 marks a self-healing retry (the caller has already cleared
+   * the round guard).
    */
-  private async enqueueScrumTask(goalId: string, priorScrumNumber: number): Promise<void> {
+  private async enqueueScrumTask(goalId: string, priorScrumNumber: number, attempt = 1): Promise<void> {
     if (!this.agentAbjectId) return;
     const roundKey = `${goalId}#${priorScrumNumber}`;
     if (this.scrummedRounds.has(roundKey)) {
@@ -393,14 +434,75 @@ export class ScrumMaster extends Abject {
       ? `Run the first scrum for goal ${goalId.slice(0, 8)}. No prior round — review the goal description and team roster, plan the initial work.`
       : `Run a scrum for goal ${goalId.slice(0, 8)} after round ${priorScrumNumber}. Review the round's outcomes (completed tasks, scratchpad, failed tasks) and decide: complete_goal, plan more, or fail_goal.`;
 
-    log.info(`Enqueuing scrum task for goal ${goalId.slice(0, 8)} (after round ${priorScrumNumber})`);
+    log.info(`Enqueuing scrum task for goal ${goalId.slice(0, 8)} (after round ${priorScrumNumber}${attempt > 1 ? `, retry attempt ${attempt}` : ''})`);
 
-    await this.request(
+    const { taskId } = await this.request<{ taskId: string }>(
       request(this.id, this.agentAbjectId, 'enqueueTask', {
         agentId: this.id,
         task: taskDesc,
         goalId,
       }),
+    );
+    this.scrumAttempts.set(taskId, { goalId, priorScrumNumber, attempt });
+  }
+
+  /**
+   * Schedule a retry of a dead scrum with exponential backoff (15s, 30s,
+   * 60s). After MAX_SCRUM_ATTEMPTS the goal fails with an instructive
+   * error — a visible failure the user can act on beats a silent hang.
+   */
+  private scheduleScrumRetry(info: { goalId: string; priorScrumNumber: number; attempt: number }, error?: string): void {
+    const { goalId, priorScrumNumber, attempt } = info;
+    if (attempt >= ScrumMaster.MAX_SCRUM_ATTEMPTS) {
+      log.warn(`Scrum for goal ${goalId.slice(0, 8)} round ${priorScrumNumber} failed ${attempt} times — failing the goal`);
+      if (this.goalManagerId) {
+        this.send(event(this.id, this.goalManagerId, 'failGoal', {
+          goalId,
+          error: `Scrum review failed ${attempt} times in a row (last error: ${(error ?? 'unknown').slice(0, 200)}). ` +
+            `The goal cannot advance without a working scrum — this usually means the LLM provider is down or misconfigured. ` +
+            `Fix the provider (Settings → AI) and re-ask.`,
+        }));
+      }
+      return;
+    }
+    const delay = ScrumMaster.SCRUM_RETRY_BASE_MS * 2 ** (attempt - 1);
+    log.info(`Scrum for goal ${goalId.slice(0, 8)} round ${priorScrumNumber} died (attempt ${attempt}: ${(error ?? 'unknown').slice(0, 120)}) — retrying in ${Math.round(delay / 1000)}s`);
+    const timer = setTimeout(() => {
+      this.scrumRetryTimers.delete(timer);
+      void this.retryScrum(goalId, priorScrumNumber, attempt + 1);
+    }, delay);
+    this.scrumRetryTimers.add(timer);
+  }
+
+  /**
+   * Re-run a dead scrum if the goal still wants one: active → clear the
+   * round guard and enqueue; paused → check again later (user is
+   * interjecting; the retry must not burn attempts against a paused goal);
+   * terminal/gone → drop.
+   */
+  private async retryScrum(goalId: string, priorScrumNumber: number, attempt: number): Promise<void> {
+    if (!this.goalManagerId) return;
+    let status: string | undefined;
+    try {
+      const goal = await this.request<{ status?: string } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+      );
+      status = goal?.status;
+    } catch { /* GoalManager unreachable — fall through to reschedule */ }
+
+    if (status === 'paused' || status === undefined) {
+      const timer = setTimeout(() => {
+        this.scrumRetryTimers.delete(timer);
+        void this.retryScrum(goalId, priorScrumNumber, attempt);
+      }, 30_000);
+      this.scrumRetryTimers.add(timer);
+      return;
+    }
+    if (status !== 'active') return; // completed/failed/archived while we backed off
+
+    this.scrummedRounds.delete(`${goalId}#${priorScrumNumber}`);
+    await this.enqueueScrumTask(goalId, priorScrumNumber, attempt).catch(err =>
+      log.warn(`scrum retry enqueue for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),
     );
   }
 

@@ -3328,6 +3328,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     });
 
     if (res.terminal) {
+      // The build is over — release its prompt-cache warmth (draft_via_llm
+      // requests carried this goal-derived cacheKey) so the keepalive never
+      // keeps a dead session warm.
+      if (this.llmId) {
+        this.send(event(this.id, this.llmId, 'releaseCache', { cacheKey: state.goal.slice(0, 64) }));
+      }
       // Surface the terminal back to AgentAbject in the shape it expects
       // (terminalActions config maps `done` -> success and `fail` -> error).
       if (state.terminal?.kind === 'done') {

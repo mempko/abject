@@ -352,6 +352,14 @@ export class AgentAbject extends Abject {
     pending: QueuedTask[];
   }>();
 
+  /**
+   * Goals the user paused. In-flight OTA loops for these goals park at the
+   * next phase boundary (pause gate in runStateMachine); queued tasks are
+   * skipped by the queue runner until resume. Maintained by
+   * pauseTasksByGoal/resumeTasksByGoal (called from GoalManager).
+   */
+  private pausedGoals = new Set<string>();
+
   /** Lazy Ajv instance for response schema validation. */
   private _ajv?: Ajv;
   private get ajv(): Ajv {
@@ -1246,6 +1254,30 @@ The registered object must implement these handlers to participate in the agent 
       return { cancelled };
     });
 
+    /**
+     * Freeze / unfreeze every task of a goal. Pausing doesn't abort anything:
+     * in-flight OTA loops park at the next phase boundary (the pause gate in
+     * runStateMachine), and queued tasks of the goal are skipped by the queue
+     * runner until resume. GoalManager calls these from pauseGoal/resumeGoal.
+     */
+    this.on('pauseTasksByGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      this.pausedGoals.add(goalId);
+      log.info(`pauseTasksByGoal: goal ${goalId.slice(0, 8)} paused`);
+      return true;
+    });
+
+    this.on('resumeTasksByGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      this.pausedGoals.delete(goalId);
+      log.info(`resumeTasksByGoal: goal ${goalId.slice(0, 8)} resumed`);
+      // Queued tasks of this goal were being skipped — kick every idle queue.
+      for (const agentId of this.agentTaskQueues.keys()) {
+        this.processNextInQueue(agentId);
+      }
+      return true;
+    });
+
     // ── Internal step handler (called by job code) ──
     // Only _think needs to go through AgentAbject (it accesses conversation
     // state + LLM).  Observe and act job code call agents directly to avoid
@@ -1595,6 +1627,13 @@ The registered object must implement these handlers to participate in the agent 
     }));
 
     entry.finished = true;
+
+    // The task is over — release its prompt-cache warmth (requests carried
+    // cacheKey = task id) so the keepalive never keeps a dead session warm.
+    if (this.llmId) {
+      this.send(event(this.id, this.llmId, 'releaseCache', { cacheKey: entry.state.id }));
+    }
+
     this.changed('taskCompleted', {
       taskId: entry.state.id,
       agentId: entry.agentId,
@@ -1632,7 +1671,11 @@ The registered object must implement these handlers to participate in the agent 
   private processNextInQueue(agentId: AbjectId): void {
     const q = this.agentTaskQueues.get(agentId);
     if (!q || q.inFlight || q.pending.length === 0) return;
-    const next = q.pending.shift()!;
+    // Skip queued tasks whose goal is paused — they stay pending and the
+    // queue is re-kicked by resumeTasksByGoal.
+    const idx = q.pending.findIndex(t => !t.goalId || !this.pausedGoals.has(t.goalId));
+    if (idx === -1) return;
+    const next = q.pending.splice(idx, 1)[0];
     q.inFlight = { taskId: next.taskId, goalId: next.goalId };
     this.startQueuedTask(agentId, next).catch(err => {
       log.warn(`startQueuedTask for ${agentId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
@@ -1705,6 +1748,25 @@ The registered object must implement these handlers to participate in the agent 
 
     try {
       while (phase !== 'done' && phase !== 'error') {
+        // ── Goal pause gate ──
+        // A paused goal freezes its agents BETWEEN phases: park here until
+        // the user resumes, or until the task is cancelled out from under us
+        // (stop-while-paused sets state.phase='error' externally, same as
+        // cancelTasksByGoal).
+        const gateGoal = entry.goalId ?? entry.incomingGoalId;
+        if (gateGoal && this.pausedGoals.has(gateGoal)) {
+          log.info(`[${agentName}] Task ${task.id.slice(0, 8)} parked — goal ${gateGoal.slice(0, 8)} is paused`);
+          while (this.pausedGoals.has(gateGoal) && task.phase !== 'error') {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+          if (task.phase === 'error') {
+            phase = 'error';
+            task.error = task.error ?? 'Cancelled';
+            break;
+          }
+          log.info(`[${agentName}] Task ${task.id.slice(0, 8)} resumed — goal ${gateGoal.slice(0, 8)} is active again`);
+        }
+
         switch (phase) {
           case 'observing': {
             // Skip observation on step 0 if configured

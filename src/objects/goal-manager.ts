@@ -49,7 +49,12 @@ export interface Goal {
    * where possible — title is the label, description is the substance.
    */
   description: string;
-  status: 'active' | 'completed' | 'failed' | 'archived';
+  /**
+   * `paused` freezes the sprint: agents stop stepping, pending tasks are not
+   * claimable, scrums don't fire, and the staleness watchdog ignores it.
+   * Only the user (via Chat's pause control) moves a goal in and out of it.
+   */
+  status: 'active' | 'paused' | 'completed' | 'failed' | 'archived';
   createdBy: AbjectId;
   creatorName: string;
   progress: ProgressEntry[];
@@ -83,6 +88,55 @@ export class GoalManager extends Abject {
   /** Scrums for which `goalReadyForCompletion` has been emitted. Key is `${goalId}#${scrumNumber}` so each scrum
    *  gets one emission. Cleared per-key when a new task is added at that scrum number. */
   private readyForCompletionEmitted: Set<string> = new Set();
+
+  /**
+   * Cancel every task of a goal: release + remove its tuples, abort running
+   * agent tasks, clean the per-goal SharedState namespace. Shared by the
+   * `cancelTasksForGoal` handler and `stopGoal` (handlers are serialized, so
+   * stopGoal cannot self-request the other handler).
+   */
+  private async cancelTasksForGoalInternal(goalId: string): Promise<{ cancelled: number }> {
+    if (!this.tupleSpaceId) return { cancelled: 0 };
+
+    const ns = this.getTupleNamespace(goalId as GoalId);
+    const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+      request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId }, namespace: ns })
+    );
+
+    let cancelled = 0;
+    for (const task of tasks) {
+      try {
+        if (task.claimedBy) {
+          try {
+            await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
+          } catch { /* best effort */ }
+        }
+        await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
+        this.emittedTerminalTasks.delete(task.id);
+        cancelled++;
+      } catch { /* best effort -- tuple may already be gone */ }
+    }
+
+    // Cancel running agent tasks for this goal
+    if (this.agentAbjectId) {
+      try {
+        await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
+      } catch { /* best effort */ }
+    }
+
+    // Clean up per-goal SharedState namespace
+    if (this.sharedStateId) {
+      const stateNs = `goal-${goalId}`;
+      try {
+        await this.request(request(this.id, this.sharedStateId, 'delete', { name: stateNs, key: 'meta' }));
+      } catch { /* best effort */ }
+      try {
+        await this.request(request(this.id, this.sharedStateId, 'unsubscribe', { name: stateNs }));
+      } catch { /* best effort */ }
+    }
+
+    return { cancelled };
+  }
 
   /** Walk up the parent chain to find the top-level goal ID, which is the TupleSpace namespace. */
   private getTupleNamespace(goalId: GoalId): string {
@@ -153,6 +207,39 @@ export class GoalManager extends Abject {
                 { name: 'error', type: { kind: 'primitive', primitive: 'string' }, description: 'Error message', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'undefined' },
+            },
+            {
+              name: 'pauseGoal',
+              description: 'Freeze an active goal: agents stop stepping, pending tasks stop being claimable, scrums stop firing. The user can interject via appendGoalNote, then resumeGoal. Emits goalPaused.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'resumeGoal',
+              description: 'Resume a paused goal: agents continue stepping and the scrum cycle re-arms. Emits goalResumed.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'stopGoal',
+              description: 'Hard-stop a goal (active or paused): cancels every task including running agent loops, then fails the goal as "Stopped by user". Emits goalFailed.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'appendGoalNote',
+              description: 'Append a user note to the goal scratchpad (under user/notes/). Agents and the next scrum see it through the goal context, so notes steer the remaining work — the interjection channel for paused goals.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'note', type: { kind: 'primitive', primitive: 'string' }, description: 'The note text' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
             },
             {
               name: 'getGoal',
@@ -304,6 +391,8 @@ export class GoalManager extends Abject {
             { name: 'goalUpdated', description: 'A goal received a progress update', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalCompleted', description: 'A goal was completed', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalFailed', description: 'A goal failed', payload: { kind: 'reference', reference: 'Goal' } },
+            { name: 'goalPaused', description: 'A goal was paused by the user', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
+            { name: 'goalResumed', description: 'A paused goal was resumed', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'goalsCleared', description: 'Completed/failed goals were cleared', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'goalsSwept', description: 'Goals were archived or deleted by lifecycle sweep', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'taskCompleted', description: 'A task was completed', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, result: { kind: 'primitive', primitive: 'string' } } } },
@@ -850,8 +939,9 @@ reviews results and either plans another round or completes/fails the goal.
 
     this.on('failGoal', async (msg: AbjectMessage) => {
       const { goalId, error } = msg.payload as { goalId: GoalId; error?: string };
+      // A paused goal can still be failed (e.g. the user stops it mid-pause).
       const goal = this.goals.get(goalId);
-      if (!goal || goal.status !== 'active') return;
+      if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return;
 
       goal.status = 'failed';
       goal.error = error;
@@ -860,6 +950,98 @@ reviews results and either plans another round or completes/fails the goal.
       log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
       this.changed('goalFailed', { goalId, error });
       this.syncGoalToSharedState(goal);
+    });
+
+    /**
+     * Freeze a goal: agents stop stepping (AgentAbject gates its OTA loops),
+     * pending tasks stop being claimable, and no scrum fires (the ready
+     * check requires status 'active'). The user interjects via
+     * `appendGoalNote`, then `resumeGoal` continues the sprint.
+     */
+    this.on('pauseGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'active') return false;
+
+      goal.status = 'paused';
+      goal.updatedAt = Date.now();
+
+      if (this.agentAbjectId) {
+        try {
+          await this.request(request(this.id, this.agentAbjectId, 'pauseTasksByGoal', { goalId }));
+        } catch { /* best effort — the claimTask/scrum gates still hold */ }
+      }
+
+      log.info(`Goal paused: "${goal.title}" (${goalId})`);
+      this.changed('goalPaused', { goalId });
+      this.syncGoalToSharedState(goal);
+      return true;
+    });
+
+    this.on('resumeGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'paused') return false;
+
+      goal.status = 'active';
+      goal.updatedAt = Date.now();
+
+      if (this.agentAbjectId) {
+        try {
+          await this.request(request(this.id, this.agentAbjectId, 'resumeTasksByGoal', { goalId }));
+        } catch { /* best effort */ }
+      }
+
+      log.info(`Goal resumed: "${goal.title}" (${goalId})`);
+      this.changed('goalResumed', { goalId });
+      this.syncGoalToSharedState(goal);
+      // The round may have reached all-terminal right as the user paused —
+      // re-check so the next scrum isn't lost.
+      this.maybeEmitGoalReadyForCompletion(goalId).catch(() => { /* best effort */ });
+      return true;
+    });
+
+    /**
+     * Hard stop: cancel every task (tuples + running agent loops) and fail
+     * the goal as 'Stopped by user'. Works from active or paused.
+     */
+    this.on('stopGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      const goal = this.goals.get(goalId);
+      if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
+
+      const { cancelled } = await this.cancelTasksForGoalInternal(goalId).catch(() => ({ cancelled: 0 }));
+
+      goal.status = 'failed';
+      goal.error = 'Stopped by user';
+      goal.updatedAt = Date.now();
+
+      log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
+      this.changed('goalFailed', { goalId, error: 'Stopped by user' });
+      this.syncGoalToSharedState(goal);
+      return true;
+    });
+
+    /**
+     * Append a user note to the goal's scratchpad (under `user/notes/...`).
+     * This is how a paused goal receives the user's interjection: agents and
+     * the next scrum read the scratchpad through the goal context, so the
+     * note steers the remaining work.
+     */
+    this.on('appendGoalNote', async (msg: AbjectMessage) => {
+      const { goalId, note } = msg.payload as { goalId: GoalId; note: string };
+      requireNonEmpty(note, 'note');
+      const goal = this.goals.get(goalId);
+      if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
+
+      if (!goal.scratchpad) goal.scratchpad = {};
+      goal.scratchpad[`user/notes/${Date.now()}`] = note;
+      goal.updatedAt = Date.now();
+
+      log.info(`Goal note appended to "${goal.title}" (${goalId}): ${note.slice(0, 80)}`);
+      this.changed('goalUpdated', { goalId, parentId: goal.parentId, message: `User note: ${note.slice(0, 120)}` });
+      this.syncGoalToSharedState(goal);
+      return true;
     });
 
     this.on('getGoal', async (msg: AbjectMessage) => {
@@ -933,16 +1115,17 @@ reviews results and either plans another round or completes/fails the goal.
 
     this.on('getStats', async () => {
       await this.sweepGoals();
-      let active = 0, completed = 0, failed = 0, archived = 0;
+      let active = 0, paused = 0, completed = 0, failed = 0, archived = 0;
       for (const [, goal] of this.goals) {
         switch (goal.status) {
           case 'active': active++; break;
+          case 'paused': paused++; break;
           case 'completed': completed++; break;
           case 'failed': failed++; break;
           case 'archived': archived++; break;
         }
       }
-      return { active, completed, failed, archived, total: this.goals.size };
+      return { active, paused, completed, failed, archived, total: this.goals.size };
     });
 
     // ── Task convenience methods (delegate to TupleSpace) ──
@@ -1015,6 +1198,12 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('claimTask', async (msg: AbjectMessage) => {
       const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
       if (!this.tupleSpaceId) { log.info(`claimTask — no TupleSpace`); return null; }
+
+      // A paused goal's tasks are frozen, not claimable.
+      if (goalId && this.goals.get(goalId as GoalId)?.status === 'paused') {
+        log.info(`claimTask — goal ${goalId.slice(0, 8)} is paused, nothing claimable`);
+        return null;
+      }
 
       const pattern: Record<string, unknown> = { status: 'pending' };
       if (goalId) pattern.goalId = goalId;
@@ -1288,53 +1477,7 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('cancelTasksForGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       requireNonEmpty(goalId, 'goalId');
-      if (!this.tupleSpaceId) return { cancelled: 0 };
-
-      const ns = this.getTupleNamespace(goalId as GoalId);
-
-      // Find all tasks for this goal
-      const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
-        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId }, namespace: ns })
-      );
-
-      let cancelled = 0;
-      for (const task of tasks) {
-        try {
-          // Release claim if held
-          if (task.claimedBy) {
-            try {
-              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
-            } catch { /* best effort */ }
-          }
-          // Remove tuple from TupleSpace entirely
-          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
-          this.emittedTerminalTasks.delete(task.id);
-          cancelled++;
-        } catch { /* best effort -- tuple may already be gone */ }
-      }
-
-      // Cancel running agent tasks for this goal
-      if (this.agentAbjectId) {
-        try {
-          await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
-        } catch { /* best effort */ }
-      }
-
-      // Clean up per-goal SharedState namespace
-      if (this.sharedStateId) {
-        const ns = `goal-${goalId}`;
-        try {
-          await this.request(request(this.id, this.sharedStateId, 'delete', {
-            name: ns,
-            key: 'meta',
-          }));
-        } catch { /* best effort */ }
-        try {
-          await this.request(request(this.id, this.sharedStateId, 'unsubscribe', { name: ns }));
-        } catch { /* best effort */ }
-      }
-
-      return { cancelled };
+      return this.cancelTasksForGoalInternal(goalId);
     });
 
     this.on('updateTaskAttempts', async (msg: AbjectMessage) => {

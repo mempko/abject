@@ -33,8 +33,16 @@ const GROUP_WINDOW_MS = 3 * 60_000;
 // ── Composer ───────────────────────────────────────────────────────────
 const SEND_GLYPH = '\u27A4';       // ➤
 const ATTACH_GLYPH = '📎'; // 📎
+// Two ASCII pipes, not U+2016 DOUBLE VERTICAL LINE — the canvas font renders
+// that glyph as a single stroke, which reads as anything but "pause".
+const PAUSE_GLYPH = '||';          // pause the running goal
+const RESUME_GLYPH = '\u25B6';     // ▶ resume the paused goal
+const STOP_GLYPH = '\u25A0';       // ■ stop the goal entirely
 const SEND_BTN_SIZE = 44;
 const INPUT_MIN_HEIGHT = 44;
+const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
+const COMPOSER_HINT_GOAL = `${PAUSE_GLYPH}  Pause the goal   \u00B7   ${STOP_GLYPH}  Stop it`;
+const COMPOSER_HINT_PAUSED = `\u21B5  Send note   \u00B7   ${RESUME_GLYPH}  Resume   \u00B7   ${STOP_GLYPH}  Stop`;
 
 // ── Attachments ────────────────────────────────────────────────────────
 /** Image MIME types the LLM vision content part accepts. */
@@ -143,6 +151,12 @@ export class Chat extends Abject {
   private inputRowId?: AbjectId;
   private textInputId?: AbjectId;
   private sendBtnId?: AbjectId;
+  /** Stop button shown next to Send while a goal is in progress. */
+  private stopBtnId?: AbjectId;
+  /** True while the composer shows goal controls (Pause/Resume + Stop). */
+  private goalControlsActive = false;
+  /** True while the current goal is paused (input unlocked for interjections). */
+  private goalPaused = false;
   private uploadBtnId?: AbjectId;
   private fileSystemId?: AbjectId;
 
@@ -251,7 +265,7 @@ export class Chat extends Abject {
 
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
-  private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
+  private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
 
   constructor(args?: ChatConstructorArgs) {
     super({
@@ -595,7 +609,17 @@ export class Chat extends Abject {
       const fromId = msg.routing.from;
 
       if (fromId === this.sendBtnId && aspect === 'click') {
+        // While a goal runs, the send button is the Pause/Resume control.
+        if (this.goalControlsActive) {
+          await this.handlePauseResumeClick();
+          return;
+        }
         await this.handleSendClick();
+        return;
+      }
+
+      if (fromId === this.stopBtnId && aspect === 'click') {
+        await this.handleStopClick();
         return;
       }
 
@@ -1120,6 +1144,7 @@ export class Chat extends Abject {
       }, entry.timeoutMs);
     }
     for (const [goalId, entry] of this.pendingGoalCompletions) {
+      if (entry.paused) continue; // suspended while its goal is paused
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingGoalCompletions.delete(goalId);
@@ -1228,6 +1253,10 @@ export class Chat extends Abject {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
 
+      // Swap the composer into goal mode: send button becomes Pause, a Stop
+      // button appears. Fire-and-forget — UI must not gate goal startup.
+      void this.enterGoalControls();
+
       // Suspend this chat task's own timeout while we wait on the goal: the
       // goal's wait (below) is authoritative, so the chat can't time out before
       // the goal does. Re-armed in the finally so the post-goal reply synthesis
@@ -1282,6 +1311,7 @@ export class Chat extends Abject {
         };
       } finally {
         this.resumeTicketTimeout(this._currentTicketId);
+        await this.exitGoalControls();
       }
     }
 
@@ -1786,6 +1816,9 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.composerHintLabelId = undefined;
     this.textInputId = undefined;
     this.sendBtnId = undefined;
+    this.stopBtnId = undefined;
+    this.goalControlsActive = false;
+    this.goalPaused = false;
     this.messageLabelIds = [];
     this.messageMetadata.clear();
     this.bubbleSenderLabels.clear();
@@ -1955,7 +1988,10 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   private async handleSendClick(): Promise<void> {
-    if (this.uiPhase !== 'idle' || !this.textInputId) return;
+    // While the goal is paused the composer is the interjection channel:
+    // Enter sends a note into the goal instead of starting a new chat task.
+    const interjecting = this.goalControlsActive && this.goalPaused;
+    if ((this.uiPhase !== 'idle' && !interjecting) || !this.textInputId) return;
 
     const text = await this.request<string>(
       request(this.id, this.textInputId, 'getValue', {})
@@ -1965,6 +2001,12 @@ A single successful creation goal is a complete turn. End it with **done**.
     // attachments; the remaining typed text is the message. With no text and
     // no pasted images there is nothing to send.
     const cleanText = this.stripImageRefs(text ?? '').trim();
+    if (interjecting) {
+      if (!cleanText) return;
+      await this.request(request(this.id, this.textInputId, 'update', { text: '' }));
+      await this.sendInterjection(cleanText);
+      return;
+    }
     if (!cleanText && this.pendingImages.length === 0) return;
 
     // Clear input
@@ -2188,11 +2230,161 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private async setInputDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    if (this.sendBtnId) {
+    // While goal controls are up, the send button is Pause/Resume and must
+    // stay clickable regardless of the text input's lock state.
+    if (this.sendBtnId && !this.goalControlsActive) {
       try { await this.request(request(this.id, this.sendBtnId, 'update', { style })); } catch { /* widget gone */ }
     }
     if (this.textInputId) {
       try { await this.request(request(this.id, this.textInputId, 'update', { style })); } catch { /* widget gone */ }
+    }
+  }
+
+  // ── Goal controls (Pause/Resume + Stop) ─────────────────────────────
+
+  private async setComposerHint(text: string): Promise<void> {
+    if (!this.composerHintLabelId) return;
+    try { await this.request(request(this.id, this.composerHintLabelId, 'update', { text })); } catch { /* widget gone */ }
+  }
+
+  /**
+   * A goal just started: the send button becomes Pause and a Stop button
+   * joins the composer row. Torn down by exitGoalControls when the goal
+   * reaches a terminal state (or the wait times out).
+   */
+  private async enterGoalControls(): Promise<void> {
+    if (this.goalControlsActive || !this.windowId || !this.sendBtnId || !this.composerRowId) return;
+    this.goalControlsActive = true;
+    this.goalPaused = false;
+    try {
+      await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH, style: { disabled: false } }));
+      const { widgetIds: [stopBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'button', windowId: this.windowId, text: STOP_GLYPH,
+            style: {
+              background: this.theme.windowBg,
+              color: this.theme.statusError,
+              borderColor: this.theme.statusError,
+              radius: SEND_BTN_SIZE / 2,
+              fontSize: 16,
+            } },
+        ]})
+      );
+      this.stopBtnId = stopBtnId;
+      await this.request(request(this.id, stopBtnId, 'addDependent', {}));
+      await this.request(request(this.id, this.composerRowId, 'addLayoutChild', {
+        widgetId: stopBtnId,
+        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+        preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE },
+        alignment: 'right' as const,
+      }));
+      await this.setComposerHint(COMPOSER_HINT_GOAL);
+    } catch { /* widget gone — controls degrade to plain busy state */ }
+  }
+
+  /** Tear the goal controls down and restore the plain composer. */
+  private async exitGoalControls(): Promise<void> {
+    if (!this.goalControlsActive) return;
+    this.goalControlsActive = false;
+    this.goalPaused = false;
+    if (this.sendBtnId) {
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: SEND_GLYPH })); } catch { /* widget gone */ }
+    }
+    if (this.stopBtnId) {
+      const stopBtnId = this.stopBtnId;
+      this.stopBtnId = undefined;
+      if (this.composerRowId) {
+        try { await this.request(request(this.id, this.composerRowId, 'removeLayoutChild', { widgetId: stopBtnId })); } catch { /* widget gone */ }
+      }
+      try { await this.request(request(this.id, stopBtnId, 'destroy', {})); } catch { /* widget gone */ }
+    }
+    await this.setComposerHint(COMPOSER_HINT_DEFAULT);
+  }
+
+  /**
+   * Pause: freeze the goal (GoalManager stops agents, claims, and scrums),
+   * unlock the composer so the user can interject, and suspend the goal-wait
+   * timeout so a long pause can't time the chat out. Resume reverses it all.
+   */
+  private async handlePauseResumeClick(): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId || !this.sendBtnId) return;
+
+    if (!this.goalPaused) {
+      const ok = await this.request<boolean>(
+        request(this.id, this.goalManagerId, 'pauseGoal', { goalId })
+      ).catch(() => false);
+      if (!ok) return;
+      this.goalPaused = true;
+      this.setGoalWaitPaused(goalId, true);
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
+      if (this.textInputId) {
+        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: false } })); } catch { /* widget gone */ }
+      }
+      await this.setComposerHint(COMPOSER_HINT_PAUSED);
+      await this.appendBubble('assistant', 'Agent', 'Paused — work has stopped. Type a note to steer the goal, then press ' + RESUME_GLYPH + ' to continue or ' + STOP_GLYPH + ' to stop.', false);
+    } else {
+      const ok = await this.request<boolean>(
+        request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
+      ).catch(() => false);
+      if (!ok) return;
+      this.goalPaused = false;
+      this.setGoalWaitPaused(goalId, false);
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
+      if (this.textInputId) {
+        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: true } })); } catch { /* widget gone */ }
+      }
+      await this.setComposerHint(COMPOSER_HINT_GOAL);
+    }
+  }
+
+  /**
+   * Stop: hard-stop the goal. GoalManager cancels every task and fails the
+   * goal as "Stopped by user", which resolves the goal wait — the normal
+   * cleanup path then tears the controls down.
+   */
+  private async handleStopClick(): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId) return;
+    // Re-arm the wait timer first so a stop from the paused state can't
+    // leave the goal wait suspended if the failure event races us.
+    this.setGoalWaitPaused(goalId, false);
+    await this.request(
+      request(this.id, this.goalManagerId, 'stopGoal', { goalId })
+    ).catch(() => undefined);
+  }
+
+  /**
+   * Interjection while paused: show the note as a user bubble, keep it in
+   * the conversation history, and write it into the goal's scratchpad where
+   * agents and the next scrum read it.
+   */
+  private async sendInterjection(note: string): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId) return;
+    await this.appendBubble('user', 'You', note, false);
+    this.conversationHistory.push({ role: 'user', content: `[Note to the running goal] ${note}` });
+    this.schedulePersist();
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'appendGoalNote', { goalId, note })
+    ).catch(() => false);
+    if (!ok) {
+      await this.appendBubble('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
+    }
+  }
+
+  /** Suspend/re-arm the goal-wait timeout while its goal is paused. */
+  private setGoalWaitPaused(goalId: string, paused: boolean): void {
+    const entry = this.pendingGoalCompletions.get(goalId);
+    if (!entry || entry.paused === paused) return;
+    entry.paused = paused;
+    clearTimeout(entry.timer);
+    if (!paused) {
+      entry.timer = setTimeout(() => {
+        this.pendingGoalCompletions.delete(goalId);
+        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
+        entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
     }
   }
 

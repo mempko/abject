@@ -42,7 +42,16 @@ export interface GoalRow {
   expanded?: boolean;
   /** goal rows only. */
   hasChildren?: boolean;
+  /**
+   * goal rows only — per-goal controls the widget renders right-aligned and
+   * hit-tests (fires `goalAction` with { id, action }). Populated only when
+   * the caller opts in via `withActions` (GoalBrowser; Chat's activity
+   * bubble keeps its controls in the composer instead).
+   */
+  actions?: GoalRowAction[];
 }
+
+export type GoalRowAction = 'pause' | 'resume' | 'stop';
 
 /** Normalised goal shape both callers map into (a full Goal or a Chat live-goal). */
 export interface GoalNode {
@@ -50,7 +59,7 @@ export interface GoalNode {
   parentId?: string;
   title: string;
   description: string;
-  status: 'active' | 'completed' | 'failed' | 'archived';
+  status: 'active' | 'paused' | 'completed' | 'failed' | 'archived';
   /** Latest progress message, if any. */
   latestMessage?: string;
   /** Agent that emitted the latest progress message, if known. */
@@ -72,6 +81,7 @@ export interface TaskNode {
 
 const GOAL_STATUS_ICON_NAMES: Record<string, IconName> = {
   active:    'chevronRight',
+  paused:    'dot',
   completed: 'check',
   failed:    'close',
 };
@@ -107,8 +117,10 @@ export function buildGoalRows(input: {
   isExpanded: (goalId: string) => boolean;
   getTasks: (goalId: string) => TaskNode[];
   rootId?: string;
+  /** Render per-goal pause/resume/stop controls on live goal rows. */
+  withActions?: boolean;
 }): GoalRow[] {
-  const { goals, isExpanded, getTasks, rootId } = input;
+  const { goals, isExpanded, getTasks, rootId, withActions } = input;
   const rows: GoalRow[] = [];
 
   // parent -> children map for nesting
@@ -142,6 +154,11 @@ export function buildGoalRows(input: {
       || (goal.status === 'failed' && !!goal.error)
       || (!!goal.description && goal.description.trim() !== goal.title.trim());
 
+    const actions: GoalRowAction[] | undefined = !withActions ? undefined
+      : goal.status === 'active' ? ['pause', 'stop']
+      : goal.status === 'paused' ? ['resume', 'stop']
+      : undefined;
+
     rows.push({
       id: `goal:${goal.id}`,
       kind: 'goal',
@@ -152,6 +169,7 @@ export function buildGoalRows(input: {
       textColorRole: 'primary',
       expanded,
       hasChildren,
+      ...(actions ? { actions } : {}),
     });
 
     if (!expanded) return;
