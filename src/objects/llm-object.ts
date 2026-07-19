@@ -20,6 +20,7 @@ import {
   LLMStreamChunk,
   ModelTier,
   ModelInfo,
+  EffortLevel,
   getTextContent,
   truncateText,
   messageTextChars,
@@ -32,6 +33,12 @@ import {
 export interface TierConfig {
   provider: string;
   model: string;
+  /**
+   * Reasoning-effort override for this tier. When set, requests routed
+   * through the tier run at this effort unless the caller passed an explicit
+   * `options.effort`. Omitted → the provider's per-tier default applies.
+   */
+  effort?: EffortLevel;
 }
 
 export interface CompressOptions {
@@ -64,6 +71,10 @@ export interface TierCapability {
   provider: string;
   model: string | null;
   vision: boolean | null;
+  /** The tier's configured reasoning-effort override, when one is set. */
+  effort?: EffortLevel;
+  /** Effort levels the model supports ([] = no selectable effort). */
+  supportedEfforts?: EffortLevel[];
 }
 
 export interface TierCapabilities {
@@ -382,9 +393,9 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'setTierRouting',
-                description: 'Set per-tier provider and model routing',
+                description: 'Set per-tier provider, model, and optional reasoning-effort routing',
                 parameters: [
-                  { name: 'tierRouting', type: { kind: 'reference', reference: 'TierRouting' }, description: 'Mapping from tier to provider+model' },
+                  { name: 'tierRouting', type: { kind: 'reference', reference: 'TierRouting' }, description: 'Mapping from tier to { provider, model, effort? } — effort (none/minimal/low/medium/high/xhigh/max) overrides the provider default for requests routed through that tier' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -396,7 +407,7 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'describeTiers',
-                description: 'Describe the effective model behind each tier (smart/balanced/fast/code) including capabilities. Returns { smart, balanced, fast, code, visionFallback } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. visionFallback is the optional substitute model for image-bearing steps when a tier is text-only (null when not configured); to use it, pass its provider in the request payload and its model in options.model. Consult this before sending image content: pick a tier whose vision is not false, use the fallback, or omit the image.',
+                description: 'Describe the effective model behind each tier (smart/balanced/fast/code) including capabilities. Returns { smart, balanced, fast, code, visionFallback } where each entry is { provider, model, vision, effort?, supportedEfforts } — vision is true when the model accepts image input, false when it is text-only, and null when unknown; effort is the tier\'s configured reasoning-effort override when one is set; supportedEfforts lists the effort levels the model accepts ([] = no selectable effort). visionFallback is the optional substitute model for image-bearing steps when a tier is text-only (null when not configured); to use it, pass its provider in the request payload and its model in options.model. Consult this before sending image content: pick a tier whose vision is not false, use the fallback, or omit the image.',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'TierCapabilities' },
               },
@@ -532,10 +543,8 @@ export class LLMObject extends Abject {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider: providerName } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
-      const { provider, modelOverride } = this.resolveProviderAndModel(providerName, options?.tier);
-      const effectiveOptions = modelOverride
-        ? { ...options, model: modelOverride }
-        : options;
+      const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
+      const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
 
       const callerId = m.routing.from;
       const correlationId = m.header.messageId;
@@ -619,7 +628,13 @@ export class LLMObject extends Abject {
       const tokenSummary = usage
         ? ` | tokens=${usage.inputTokens}in/${usage.outputTokens}out${usage.reasoningTokens ? `/reasoning=${usage.reasoningTokens}` : ''}`
         : '';
-      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${stopReason ?? 'unknown'}${tokenSummary}`);
+      // A stream that ends without a finish frame is suspect: the generation
+      // may have been cut off upstream. Name it so truncation hunts don't
+      // have to infer it from a bare 'unknown'.
+      const reasonNote = stopReason === undefined && fullContent.length > 0
+        ? 'unknown (no finish frame — possible truncation)'
+        : (stopReason ?? 'unknown');
+      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${reasonNote}${tokenSummary}`);
       this.trackRequestEnd(correlationId, fullContent, usage);
       return { content: fullContent, stopReason, usage };
     });
@@ -898,13 +913,11 @@ export class LLMObject extends Abject {
     callerId?: AbjectId,
     requestId?: string,
   ): Promise<LLMCompletionResult> {
-    const { provider, modelOverride } = this.resolveProviderAndModel(providerName, options?.tier);
-    const effectiveOptions = modelOverride
-      ? { ...options, model: modelOverride }
-      : options;
+    const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
+    const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
 
     const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
-    log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${effectiveOptions?.model ?? 'provider-default'} maxTokens=${options?.maxTokens ?? 'default'}`);
+    log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${effectiveOptions?.model ?? 'provider-default'}${effectiveOptions?.effort ? ` effort=${effectiveOptions.effort}` : ''} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 
     // Track active request
@@ -1598,12 +1611,14 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     for (const tier of ['smart', 'balanced', 'fast', 'code'] as ModelTier[]) {
       let providerName: string | undefined;
       let model: string | undefined;
+      let effort: EffortLevel | undefined;
 
       // Mirror resolveProviderAndModel: an unrouted code tier rides smart.
       const config = this.tierRouting[tier] ?? (tier === 'code' ? this.tierRouting.smart : undefined);
       if (config && this.providers.get(config.provider)) {
         providerName = config.provider;
         model = config.model;
+        effort = config.effort;
       } else {
         const provider = this.getProvider();
         if (provider) {
@@ -1616,10 +1631,13 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         out[tier] = null;
         continue;
       }
+      const tierProvider = this.providers.get(providerName);
       out[tier] = {
         provider: providerName,
         model: model ?? null,
         vision: model ? await this.lookupVision(providerName, model) : null,
+        ...(effort ? { effort } : {}),
+        supportedEfforts: model && tierProvider?.supportedEfforts ? tierProvider.supportedEfforts(model) : [],
       };
     }
     return out;
@@ -1639,7 +1657,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   private resolveProviderAndModel(
     providerName?: string,
     tier?: ModelTier,
-  ): { provider: LLMProvider; modelOverride?: string } {
+  ): { provider: LLMProvider; modelOverride?: string; effortOverride?: EffortLevel } {
     // Explicit provider name takes priority (backward compat)
     if (providerName) {
       const provider = this.providers.get(providerName);
@@ -1647,15 +1665,15 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       return { provider: provider! };
     }
 
-    // Tier routing: look up per-tier provider+model. The code tier falls
-    // back to the smart tier's routing when unconfigured — code generation
-    // wants the strongest model, and smart is where users put it.
+    // Tier routing: look up per-tier provider+model(+effort). The code tier
+    // falls back to the smart tier's routing when unconfigured — code
+    // generation wants the strongest model, and smart is where users put it.
     const effectiveTier = tier === 'code' && !this.tierRouting.code ? 'smart' : tier;
     if (effectiveTier && this.tierRouting[effectiveTier]) {
       const config = this.tierRouting[effectiveTier]!;
       const provider = this.providers.get(config.provider);
       if (provider) {
-        return { provider, modelOverride: config.model };
+        return { provider, modelOverride: config.model, effortOverride: config.effort };
       }
       log.warn(`Tier '${effectiveTier}' routes to provider '${config.provider}' which is not registered, falling back to default`);
     }
@@ -1664,6 +1682,24 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     const provider = this.getProvider();
     require(provider !== undefined, 'No LLM provider available');
     return { provider: provider! };
+  }
+
+  /**
+   * Merge tier-routing overrides into a request's options: the configured
+   * model always applies; the configured effort applies unless the caller
+   * passed an explicit effort of its own.
+   */
+  private applyRouting(
+    options: LLMCompletionOptions | undefined,
+    modelOverride?: string,
+    effortOverride?: EffortLevel,
+  ): LLMCompletionOptions | undefined {
+    if (!modelOverride && !effortOverride) return options;
+    return {
+      ...options,
+      ...(modelOverride ? { model: modelOverride } : {}),
+      ...(effortOverride && !options?.effort ? { effort: effortOverride } : {}),
+    };
   }
 
   /**

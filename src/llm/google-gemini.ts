@@ -18,6 +18,7 @@ import {
   ModelTier,
   ModelInfo,
   ContentPart,
+  EffortLevel,
   defaultIsRetryable,
   getTextContent,
 } from './provider.js';
@@ -101,6 +102,11 @@ export class GeminiProvider extends BaseLLMProvider {
   };
   private static readonly TIER_THINKING_LEVEL: Record<ModelTier, string> = {
     smart: 'high', balanced: 'medium', fast: 'minimal', code: 'high',
+  };
+  /** Effort → Gemini thinkingLevel. The API takes minimal/low/medium/high. */
+  private static readonly EFFORT_TO_THINKING: Record<EffortLevel, string> = {
+    none: 'minimal', minimal: 'minimal', low: 'low', medium: 'medium',
+    high: 'high', xhigh: 'high', max: 'high',
   };
   private static readonly MODEL_MAX_OUTPUT = 65536;
 
@@ -187,15 +193,21 @@ export class GeminiProvider extends BaseLLMProvider {
           name: m.displayName ?? m.name,
           // Every current Gemini generateContent model is multimodal
           vision: true,
+          efforts: this.supportedEfforts(m.name),
         }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', vision: true },
-        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true },
-        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', vision: true, efforts: this.supportedEfforts('gemini-3.1-pro-preview') },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true, efforts: this.supportedEfforts('gemini-3.5-flash') },
+        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true, efforts: this.supportedEfforts('gemini-3.1-flash-lite') },
       ];
     }
+  }
+
+  /** All current Gemini models take thinkingLevel minimal→high. */
+  override supportedEfforts(_modelId: string): EffortLevel[] {
+    return ['minimal', 'low', 'medium', 'high'];
   }
 
   override describe(): LLMProviderDescription {
@@ -375,14 +387,20 @@ export class GeminiProvider extends BaseLLMProvider {
     if (options.temperature !== undefined) gc.temperature = options.temperature;
     if (options.stopSequences) gc.stopSequences = options.stopSequences;
     const tier = options.tier;
+    // Effort maps onto Gemini's thinkingLevel; an explicit effort wins over
+    // the tier default. ('none'/'minimal' → minimal; xhigh/max → high.)
+    const effortLevel = options.effort ? GeminiProvider.EFFORT_TO_THINKING[options.effort] : undefined;
     if (tier) {
       gc.maxOutputTokens = Math.min(
         GeminiProvider.MODEL_MAX_OUTPUT,
         Math.max(GeminiProvider.TIER_MAX_OUTPUT[tier], options.maxTokens ?? 0),
       );
-      gc.thinkingConfig = { thinkingLevel: GeminiProvider.TIER_THINKING_LEVEL[tier] };
+      gc.thinkingConfig = { thinkingLevel: effortLevel ?? GeminiProvider.TIER_THINKING_LEVEL[tier] };
     } else if (options.maxTokens !== undefined) {
       gc.maxOutputTokens = options.maxTokens;
+      if (effortLevel) gc.thinkingConfig = { thinkingLevel: effortLevel };
+    } else if (effortLevel) {
+      gc.thinkingConfig = { thinkingLevel: effortLevel };
     }
     if (Object.keys(gc).length > 0) request.generationConfig = gc;
 

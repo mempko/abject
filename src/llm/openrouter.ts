@@ -51,6 +51,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   code: 'anthropic/claude-opus-4.8',
 };
 
+
 interface OpenRouterModelsResponse {
   data: Array<{ id: string; name?: string; architecture?: { input_modalities?: string[] } }>;
 }
@@ -103,6 +104,16 @@ export class OpenRouterProvider extends OpenAIProvider {
     if (this.providerPreferences) request.provider = this.providerPreferences;
   }
 
+  /**
+   * OpenRouter normalizes ONE unified `reasoning: { effort }` across every
+   * underlying model family and silently ignores it for models without a
+   * level knob, so the standard ladder is offered for all models. ('none'
+   * omits the reasoning field, letting the model's default behavior apply.)
+   */
+  override supportedEfforts(_modelId: string): EffortLevel[] {
+    return ['none', 'minimal', 'low', 'medium', 'high'];
+  }
+
   override async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await this.fetch(`${this.baseUrl}/v1/models`, {
@@ -117,6 +128,7 @@ export class OpenRouterProvider extends OpenAIProvider {
         vision: m.architecture?.input_modalities
           ? m.architecture.input_modalities.includes('image')
           : undefined,
+        efforts: this.supportedEfforts(m.id),
       }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);

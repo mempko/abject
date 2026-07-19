@@ -84,6 +84,9 @@ interface OpenAIStreamEvent {
       reasoning?: string;
       reasoning_content?: string;
       reasoning_details?: unknown;
+      /** Model-generated refusal text (OpenAI-compatible moderation refusals
+       * stream here, NOT in `content`). */
+      refusal?: string;
     };
     finish_reason?: string | null;
   }>;
@@ -206,6 +209,19 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   /**
+   * Selectable efforts follow the reasoning profile: an effort-capable model
+   * takes the standard ladder, one that reasons without a knob (or doesn't
+   * reason) offers nothing to select. Shared by the OpenAI-compatible
+   * subclasses through their reasoningProfile overrides; providers with
+   * non-standard ladders (DeepSeek's high/max) override this directly.
+   */
+  override supportedEfforts(modelId: string): EffortLevel[] {
+    const profile = this.reasoningProfile(modelId);
+    if (!profile.supportsEffort) return [];
+    return ['none', 'minimal', 'low', 'medium', 'high'];
+  }
+
+  /**
    * Effort for this call: explicit override, else per-tier default. Untiered
    * calls get none (legacy behavior).
    */
@@ -282,7 +298,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         .filter(id => !excluded.test(id))
         .sort();
       const models = (filtered.length > 0 ? filtered : rows.map(r => r.id))
-        .map(id => ({ id, name: id, vision: this.modelVision(id) }));
+        .map(id => ({ id, name: id, vision: this.modelVision(id), efforts: this.supportedEfforts(id) }));
       return models;
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
@@ -561,9 +577,10 @@ export class OpenAIProvider extends BaseLLMProvider {
 
     // Diagnostics accumulated across the stream so a zero-text completion can
     // be reported with enough context to explain WHY (reasoning-only answer,
-    // upstream error, immediate stop).
+    // refusal, upstream error, immediate stop).
     let dataEvents = 0;
     let reasoningEvents = 0;
+    let refusalText = '';
     let emittedNonWhitespace = false;
     let stopReason: string | undefined;
     let usage: LLMStreamChunk['usage'];
@@ -615,7 +632,7 @@ export class OpenAIProvider extends BaseLLMProvider {
 
           const data = line.slice(6);
           if (data === '[DONE]') {
-            if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents);
+            if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents, refusalText);
             yield { content: '', done: true, stopReason, usage };
             return;
           }
@@ -645,6 +662,10 @@ export class OpenAIProvider extends BaseLLMProvider {
           // reasoning_details), which we intentionally do not surface — but we
           // count it so an answerless stream is diagnosable.
           if (delta?.reasoning || delta?.reasoning_content || delta?.reasoning_details) reasoningEvents++;
+          // Moderation refusals stream in delta.refusal, not delta.content —
+          // collect the text so an empty stream caused by a refusal says so
+          // instead of masquerading as a model that silently stopped.
+          if (delta?.refusal) refusalText += delta.refusal;
 
           const text = delta?.content;
           if (text) {
@@ -675,7 +696,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       // The body ending after a timeout abort reads as a clean EOF — report
       // the timeout instead of yielding a truncated "completion".
       if (abortReason) throw timeoutError();
-      if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents);
+      if (!emittedNonWhitespace) this.throwEmptyStream(stopReason, usage, dataEvents, reasoningEvents, refusalText);
       yield { content: '', done: true, stopReason, usage };
     } catch (err) {
       // A timeout abort surfaces as an AbortError from fetch/read — rethrow as
@@ -691,19 +712,25 @@ export class OpenAIProvider extends BaseLLMProvider {
   /**
    * Zero-text completion: log the full diagnostic, then throw so the retry
    * loop treats it as the transient failure it is instead of a clean stop.
+   * A collected refusal is named in the diagnostic — a moderation refusal is
+   * a different failure than a model that reasoned and silently stopped.
    */
   private throwEmptyStream(
     stopReason: string | undefined,
     usage: LLMStreamChunk['usage'],
     dataEvents: number,
     reasoningEvents: number,
+    refusalText: string,
   ): never {
     const usageSummary = usage
       ? `${usage.inputTokens}in/${usage.outputTokens}out/reasoning=${usage.reasoningTokens ?? '?'}`
       : 'n/a';
+    const refusalSummary = refusalText
+      ? ` refusal="${refusalText.replace(/\s+/g, ' ').slice(0, 200)}"`
+      : '';
     const detail =
       `stop_reason=${stopReason ?? 'unknown'} ` +
-      `events=${dataEvents} reasoning_deltas=${reasoningEvents} usage=${usageSummary}`;
+      `events=${dataEvents} reasoning_deltas=${reasoningEvents} usage=${usageSummary}${refusalSummary}`;
     // eslint-disable-next-line no-console
     console.warn(`[${this.name}.stream] stream produced 0 text chars. ${detail}`);
     throw new EmptyCompletionError(`LLM returned an empty completion (${detail})`, stopReason);

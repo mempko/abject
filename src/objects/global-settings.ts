@@ -49,12 +49,16 @@ const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
 // Per-tier routing storage keys
 const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
 const STORAGE_KEY_TIER_SMART_MODEL = 'global-settings:tierSmartModel';
+const STORAGE_KEY_TIER_SMART_EFFORT = 'global-settings:tierSmartEffort';
 const STORAGE_KEY_TIER_BALANCED_PROVIDER = 'global-settings:tierBalancedProvider';
 const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
+const STORAGE_KEY_TIER_BALANCED_EFFORT = 'global-settings:tierBalancedEffort';
 const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
 const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
+const STORAGE_KEY_TIER_FAST_EFFORT = 'global-settings:tierFastEffort';
 const STORAGE_KEY_TIER_CODE_PROVIDER = 'global-settings:tierCodeProvider';
 const STORAGE_KEY_TIER_CODE_MODEL = 'global-settings:tierCodeModel';
+const STORAGE_KEY_TIER_CODE_EFFORT = 'global-settings:tierCodeEffort';
 // Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
 const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
 const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
@@ -73,18 +77,29 @@ const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast', 'Code'];
 const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast', 'code'];
 
 /** Per-tier storage keys, so every load/persist path loops instead of hardcoding tiers. */
-const TIER_STORAGE_KEYS: Record<ModelTierName, { provider: string; model: string }> = {
-  smart:    { provider: STORAGE_KEY_TIER_SMART_PROVIDER,    model: STORAGE_KEY_TIER_SMART_MODEL },
-  balanced: { provider: STORAGE_KEY_TIER_BALANCED_PROVIDER, model: STORAGE_KEY_TIER_BALANCED_MODEL },
-  fast:     { provider: STORAGE_KEY_TIER_FAST_PROVIDER,     model: STORAGE_KEY_TIER_FAST_MODEL },
-  code:     { provider: STORAGE_KEY_TIER_CODE_PROVIDER,     model: STORAGE_KEY_TIER_CODE_MODEL },
+const TIER_STORAGE_KEYS: Record<ModelTierName, { provider: string; model: string; effort: string }> = {
+  smart:    { provider: STORAGE_KEY_TIER_SMART_PROVIDER,    model: STORAGE_KEY_TIER_SMART_MODEL,    effort: STORAGE_KEY_TIER_SMART_EFFORT },
+  balanced: { provider: STORAGE_KEY_TIER_BALANCED_PROVIDER, model: STORAGE_KEY_TIER_BALANCED_MODEL, effort: STORAGE_KEY_TIER_BALANCED_EFFORT },
+  fast:     { provider: STORAGE_KEY_TIER_FAST_PROVIDER,     model: STORAGE_KEY_TIER_FAST_MODEL,     effort: STORAGE_KEY_TIER_FAST_EFFORT },
+  code:     { provider: STORAGE_KEY_TIER_CODE_PROVIDER,     model: STORAGE_KEY_TIER_CODE_MODEL,     effort: STORAGE_KEY_TIER_CODE_EFFORT },
 };
+
+/** 'Default' = no override (provider's tier default applies). */
+const EFFORT_DEFAULT_LABEL = 'Default';
+
+/** One tier's saved routing row: provider + model + optional effort override. */
+interface TierRoutingRow {
+  provider: string | null;
+  model: string | null;
+  /** Reasoning-effort override; null/undefined = provider default. */
+  effort?: string | null;
+}
 
 /** Saved tier presets: name → full tier routing + optional vision fallback. */
 const STORAGE_KEY_TIER_PRESETS = 'global-settings:tierPresets';
 
 interface TierPreset {
-  routing: Partial<Record<ModelTierName, { provider: string; model: string }>>;
+  routing: Partial<Record<ModelTierName, { provider: string; model: string; effort?: string }>>;
   vision: { provider: string; model: string } | null;
 }
 
@@ -97,7 +112,7 @@ const LEGACY_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
 const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
 const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 
-interface ModelInfo { id: string; name: string; vision?: boolean; }
+interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: string[]; }
 
 /**
  * GlobalSettings object that provides a configuration UI for LLM API keys.
@@ -142,6 +157,14 @@ export class GlobalSettings extends Abject {
   private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
   /** Per-tier capability label ("vision" / "text-only") next to the model dropdown. */
   private tierCapLabelIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+  /**
+   * Per-tier reasoning-effort dropdown. Options come from the selected
+   * model's ModelInfo.efforts (plus a leading 'Default' = no override);
+   * hidden (never created / options ['—']) for models with no effort knob.
+   */
+  private tierEffortSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+  /** The effort each tier is meant to show (null = Default/no override). */
+  private tierDesiredEfforts: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null, code: null };
   /**
    * The model id each tier is meant to show: the saved routing at build time,
    * then the user's latest dropdown pick. Dropdowns render by display name,
@@ -364,11 +387,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.loadProviderDescriptions();
 
     const credentials: Partial<Record<LLMProviderName, string>> = {};
-    const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
-      smart: { provider: null, model: null },
-      balanced: { provider: null, model: null },
-      fast: { provider: null, model: null },
-      code: { provider: null, model: null },
+    const tierRouting: Record<ModelTierName, TierRoutingRow> = {
+      smart: { provider: null, model: null, effort: null },
+      balanced: { provider: null, model: null, effort: null },
+      fast: { provider: null, model: null, effort: null },
+      code: { provider: null, model: null, effort: null },
     };
     const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
 
@@ -397,6 +420,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         );
         tierRouting[tier].model = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
+        );
+        tierRouting[tier].effort = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
         );
       }
       visionFallback.provider = await this.request<string | null>(
@@ -516,7 +542,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   private async persistTierRouting(
-    tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
+    tierRouting: Record<ModelTierName, TierRoutingRow>,
   ): Promise<void> {
     if (!this.storageId) return;
     const keys: [string, string | null][] = TIER_NAMES.flatMap((tier): [string, string | null][] => [
@@ -528,21 +554,32 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         await this.request(request(this.id, this.storageId, 'set', { key, value }));
       }
     }
+    // Effort override: persisted when set, DELETED when cleared back to
+    // Default — unlike provider/model, absence is a meaningful state.
+    for (const tier of TIER_NAMES) {
+      const effort = tierRouting[tier].effort;
+      const key = TIER_STORAGE_KEYS[tier].effort;
+      if (effort) {
+        await this.request(request(this.id, this.storageId, 'set', { key, value: effort }));
+      } else {
+        await this.request(request(this.id, this.storageId, 'delete', { key })).catch(() => undefined);
+      }
+    }
   }
 
   private async configureProviders(
     credentials: Partial<Record<LLMProviderName, string>>,
-    tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
+    tierRouting: Record<ModelTierName, TierRoutingRow>,
     visionFallback?: { provider: string | null; model: string | null },
   ): Promise<void> {
     if (!this.llmId) return;
 
     // Build tier routing for LLMObject (only include tiers with both provider and model)
-    const routing: Record<string, { provider: string; model: string }> = {};
+    const routing: Record<string, { provider: string; model: string; effort?: string }> = {};
     for (const tier of TIER_NAMES) {
-      const { provider, model } = tierRouting[tier];
+      const { provider, model, effort } = tierRouting[tier];
       if (provider && model) {
-        routing[tier] = { provider, model };
+        routing[tier] = { provider, model, ...(effort ? { effort } : {}) };
       }
     }
 
@@ -684,6 +721,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       for (const tier of TIER_NAMES) {
         if (fromId === this.tierModelSelectIds[tier] && aspect === 'change') {
           await this.onTierModelChanged(tier);
+          return;
+        }
+      }
+
+      // Tier effort dropdown changed -- record the override pick
+      for (const tier of TIER_NAMES) {
+        if (fromId === this.tierEffortSelectIds[tier] && aspect === 'change') {
+          await this.onTierEffortChanged(tier);
           return;
         }
       }
@@ -1130,7 +1175,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const cId = this.aiContainerId!;
 
     // Load tier routing (credentials already loaded into this.credentialValues in onInit)
-    const savedTierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
+    const savedTierRouting: Record<ModelTierName, TierRoutingRow> = {
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
@@ -1144,6 +1189,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         );
         savedTierRouting[tier].model = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
+        );
+        savedTierRouting[tier].effort = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
         );
       }
       savedVisionFallback.provider = await this.request<string | null>(
@@ -1499,6 +1547,28 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         preferredSize: { height: 32 },
       }));
 
+      // Reasoning-effort dropdown: 'Default' + the selected model's supported
+      // levels. Disabled (single '—') when the model has no effort knob.
+      const savedEffort = savedTierRouting[tier].effort ?? null;
+      this.tierDesiredEfforts[tier] = savedEffort;
+      const effortOptions = this.effortOptionsFor(activeProvider, modelList[modelIdx]?.id ?? null);
+      const effortIdx = savedEffort ? Math.max(0, effortOptions.indexOf(savedEffort)) : 0;
+      const { widgetIds: [effortSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'select', windowId: this.windowId,
+            options: effortOptions,
+            selectedIndex: effortIdx,
+            style: effortOptions.length <= 1 ? { disabled: true } : undefined },
+        ]})
+      );
+      this.tierEffortSelectIds[tier] = effortSelectId;
+      await this.request(request(this.id, effortSelectId, 'addDependent', {}));
+      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
+        widgetId: effortSelectId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 92, height: 32 },
+      }));
+
       // Capability label for the selected model (vision / text-only)
       const initialCap = this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '');
       const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -1845,6 +1915,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+    this.tierEffortSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.visionProviderSelectId = undefined;
     this.visionModelSelectId = undefined;
     this.visionCapLabelId = undefined;
@@ -2050,7 +2121,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (providerName && modelName && modelName !== '(no models)') {
         const modelList = this.providerModelCache.get(providerName) ?? [];
         const info = modelList.find(m => m.name === modelName);
-        routing[tier] = { provider: providerName, model: info ? info.id : modelName };
+        const effort = this.tierDesiredEfforts[tier];
+        routing[tier] = { provider: providerName, model: info ? info.id : modelName, ...(effort ? { effort } : {}) };
       }
     }
     let vision: TierPreset['vision'] = null;
@@ -2088,6 +2160,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         options: providerLabels, selectedIndex: pIdx,
       }));
       this.tierDesiredModelIds[tier] = entry.model;
+      this.tierDesiredEfforts[tier] = entry.effort ?? null;
       await this.refreshTierModelOptions(tier);
       void this.refreshProviderModels(entry.provider);
     }
@@ -2504,6 +2577,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, modelSelectId, 'update', { options, selectedIndex })
     );
     await this.updateTierCapabilityLabel(tier, providerName, options[selectedIndex] ?? '');
+    await this.refreshTierEffortOptions(tier, providerName, modelList[selectedIndex]?.id ?? null);
   }
 
   // ── Tier capability display ───────────────────────────────────────
@@ -2627,6 +2701,58 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
       this.tierDesiredModelIds[tier] = info?.id ?? null;
       await this.updateTierCapabilityLabel(tier, provider, modelName);
+      await this.refreshTierEffortOptions(tier, provider, info?.id ?? null);
+    } catch { /* widget gone */ }
+  }
+
+  /**
+   * Effort dropdown options for one provider model: 'Default' plus the
+   * model's supported levels (from ModelInfo.efforts). A model with no
+   * selectable effort gets the single placeholder '—'.
+   */
+  private effortOptionsFor(provider: LLMProviderName, modelId: string | null): string[] {
+    if (!modelId) return ['—'];
+    const info = (this.providerModelCache.get(provider) ?? []).find(m => m.id === modelId);
+    const efforts = info?.efforts ?? [];
+    if (efforts.length === 0) return ['—'];
+    return [EFFORT_DEFAULT_LABEL, ...efforts];
+  }
+
+  /**
+   * Repaint a tier's effort dropdown for a newly-selected model: new option
+   * list, previous pick kept when the new model supports it, disabled state
+   * when there is nothing to select. Clears the desired effort when the new
+   * model doesn't support the old level (so Save persists reality).
+   */
+  private async refreshTierEffortOptions(tier: ModelTierName, provider: LLMProviderName, modelId: string | null): Promise<void> {
+    const effortSelectId = this.tierEffortSelectIds[tier];
+    if (!effortSelectId) return;
+    const options = this.effortOptionsFor(provider, modelId);
+    const desired = this.tierDesiredEfforts[tier];
+    let selectedIndex = 0;
+    if (desired) {
+      const idx = options.indexOf(desired);
+      if (idx >= 0) selectedIndex = idx;
+      else this.tierDesiredEfforts[tier] = null;
+    }
+    try {
+      await this.request(request(this.id, effortSelectId, 'update', {
+        options,
+        selectedIndex,
+        style: { disabled: options.length <= 1 },
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  /** Record a tier's effort-dropdown pick ('Default'/'—' → no override). */
+  private async onTierEffortChanged(tier: ModelTierName): Promise<void> {
+    const effortSelectId = this.tierEffortSelectIds[tier];
+    if (!effortSelectId) return;
+    try {
+      const value = await this.request<string>(
+        request(this.id, effortSelectId, 'getValue', {})
+      );
+      this.tierDesiredEfforts[tier] = (value === EFFORT_DEFAULT_LABEL || value === '—') ? null : value;
     } catch { /* widget gone */ }
   }
 
@@ -3603,7 +3729,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
 
     // Read per-tier provider + model selections
-    const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
+    const tierRouting: Record<ModelTierName, TierRoutingRow> = {
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
@@ -3630,6 +3756,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         tierRouting[tier] = {
           provider: providerName,
           model: modelInfo ? modelInfo.id : modelName,
+          effort: this.tierDesiredEfforts[tier],
         };
         this.tierDesiredModelIds[tier] = tierRouting[tier].model;
       }

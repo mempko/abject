@@ -2238,8 +2238,11 @@ The registered object must implement these handlers to participate in the agent 
           ...(finalRoute.provider ? { provider: finalRoute.provider } : {}),
           options: {
             tier: finalRoute.tier,
+            // No maxTokens override: the provider's per-tier sizing already
+            // accounts for reasoning models (whose hidden thinking shares the
+            // output cap). A fixed 16K cap starved code-emitting responses —
+            // K3 spent ~19K tokens reasoning and the visible answer was cut.
             ...(finalRoute.model ? { model: finalRoute.model } : {}),
-            maxTokens: 16384,
             cacheKey: entry.state.id,
           },
         }),
@@ -2500,8 +2503,11 @@ The registered object must implement these handlers to participate in the agent 
           ...(route.provider ? { provider: route.provider } : {}),
           options: {
             tier: route.tier,
+            // No maxTokens override: the provider's per-tier sizing already
+            // accounts for reasoning models (whose hidden thinking shares the
+            // output cap). A fixed 16K cap starved code-emitting responses —
+            // K3 spent ~19K tokens reasoning and the visible answer was cut.
             ...(route.model ? { model: route.model } : {}),
-            maxTokens: 16384,
             cacheKey: entry.state.id,
           },
         }),
@@ -2544,7 +2550,19 @@ The registered object must implement these handlers to participate in the agent 
 
     // 'max_tokens'/'length' means the provider cut the response off
     // mid-generation, so even a parseable action carries incomplete content.
-    const streamTruncated = llmResult.stopReason === 'max_tokens' || llmResult.stopReason === 'length';
+    // A MISSING stop reason on a substantial response is the same failure in
+    // disguise: the stream died without a finish frame (upstream drop, cap
+    // hit without a length frame). Treating it as complete let truncated
+    // draft_source responses fall through to the unparseable path and burn
+    // parse retries instead of the truncation re-emit.
+    const noFinishFrame = llmResult.stopReason === undefined || llmResult.stopReason === 'unknown';
+    const streamTruncated =
+      llmResult.stopReason === 'max_tokens' ||
+      llmResult.stopReason === 'length' ||
+      (noFinishFrame && trimmedContent.length >= AgentAbject.TRUNCATION_SUSPECT_MIN_CHARS);
+    if (streamTruncated && noFinishFrame) {
+      log.warn(`[${agentName}] Step ${task.step + 1} — stream ended without a finish frame after ${trimmedContent.length} chars; treating as truncated`);
+    }
     const parsed = this.parseAction(entry, llmResult.content, streamTruncated);
     log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
@@ -3010,6 +3028,13 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
   /** Maximum re-emit attempts for a terminal action cut off mid-generation. */
   private static readonly MAX_TRUNCATION_RETRIES = 1;
+
+  /**
+   * A stream that ends with NO finish frame is only suspected truncated when
+   * it carried at least this much content — a short reply without a finish
+   * frame is more likely a provider quirk than a cut-off generation.
+   */
+  private static readonly TRUNCATION_SUSPECT_MIN_CHARS = 2000;
 
   /**
    * Handle a terminal action recovered from a truncated (cut-off) response.

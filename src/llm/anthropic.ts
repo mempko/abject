@@ -190,6 +190,13 @@ export class AnthropicProvider extends BaseLLMProvider {
     return { mode: 'none', supportsEffort: false, maxOutput: 8192 };
   }
 
+  /** Effort-capable Claude models take the API's effort ladder; others have no knob. */
+  override supportedEfforts(modelId: string): EffortLevel[] {
+    const profile = AnthropicProvider.profileForModel(modelId);
+    if (!profile.supportsEffort) return [];
+    return ['low', 'medium', 'high', 'xhigh', 'max'];
+  }
+
   /**
    * Resolve max_tokens + effort + thinking for a call from the model profile
    * and the requested tier. Callers may override effort (`options.effort`) and
@@ -309,7 +316,7 @@ export class AnthropicProvider extends BaseLLMProvider {
       }
       log.info(`listModels: fetched ${rows.length} live Anthropic models`);
       // Every current Claude chat model accepts image input
-      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id, vision: true }));
+      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id, vision: true, efforts: this.supportedEfforts(r.id) }));
     } catch (err) {
       log.warn(`listModels: fetch failed (${err instanceof Error ? err.message : String(err)}); falling back to the hardcoded catalog`);
       return this.fallbackModels();

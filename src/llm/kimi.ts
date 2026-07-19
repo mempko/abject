@@ -84,7 +84,7 @@ export class KimiProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as KimiModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id) }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id), efforts: this.supportedEfforts(m.id) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [

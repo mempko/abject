@@ -56,6 +56,13 @@ export interface ModelInfo {
    * "probably works" rather than blocking.
    */
   vision?: boolean;
+  /**
+   * Reasoning-effort levels this model accepts through this provider, in
+   * ascending order. Empty/undefined means the model has no selectable
+   * effort (either it doesn't reason, or its reasoning has no level knob) —
+   * UIs hide the effort selector for such models.
+   */
+  efforts?: EffortLevel[];
 }
 
 /**
@@ -343,6 +350,14 @@ export interface LLMProvider {
   listModels(): Promise<ModelInfo[]>;
 
   /**
+   * The reasoning-effort levels a model accepts through this provider, in
+   * ascending order — [] when the model has no selectable effort. Cheap and
+   * synchronous (derived from the provider's own model knowledge); drives
+   * the Settings effort dropdown and effort validation in tier routing.
+   */
+  supportedEfforts?(modelId: string): EffortLevel[];
+
+  /**
    * Self-describing UI metadata: credential mode, default tier models,
    * static model list seed, etc. GlobalSettings consumes this to build
    * the AI tab without per-provider hardcoding.
@@ -414,6 +429,11 @@ export abstract class BaseLLMProvider implements LLMProvider {
   /** Providers opt in by overriding; the default provider has no speech APIs. */
   supportsSpeech(): { transcribe: boolean; synthesize: boolean } {
     return { transcribe: false, synthesize: false };
+  }
+
+  /** Providers with an effort knob override; the default has none. */
+  supportedEfforts(_modelId: string): EffortLevel[] {
+    return [];
   }
 
   /**

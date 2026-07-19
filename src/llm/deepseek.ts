@@ -5,7 +5,7 @@
  * subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -64,6 +64,11 @@ export class DeepSeekProvider extends OpenAIProvider {
     return { reasoningActive: true };
   }
 
+  // The reasoner takes exactly two levels; chat/flash models have no knob.
+  override supportedEfforts(modelId: string): EffortLevel[] {
+    return deepseekReasons(modelId) ? ['high', 'max'] : [];
+  }
+
   // The DeepSeek chat API is text-only across the catalog
   protected override modelVision(_modelId: string): boolean | undefined {
     return false;
@@ -76,7 +81,7 @@ export class DeepSeekProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as DeepSeekModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id, vision: false }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: false, efforts: this.supportedEfforts(m.id) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
