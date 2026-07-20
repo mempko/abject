@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.8.21",
+    "date": "2026-07-20",
+    "title": "Windows That Hold Together",
+    "summary": "This release makes tilted windows behave like real solid objects on the desktop. Rotate a window and everything about it moves as one piece: the frame, its content, and where your clicks land.",
+    "highlights": [
+      "Tilted windows now render, clip, and respond to picking as a single rigid object; content stays inside the frame and clicks land exactly where they appear, at any angle"
+    ],
+    "fixes": [
+      "Content no longer bleeds outside the frame of a rotated window",
+      "Clicks on tilted windows no longer miss or hit the wrong spot because picking used the flat layout instead of the rendered angle"
+    ]
+  },
+  {
     "version": "0.8.20",
     "date": "2026-07-19",
     "title": "Version History, Self-Healing Scrums, Warmer Caches",
