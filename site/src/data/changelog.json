@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.8.22",
+    "date": "2026-07-20",
+    "title": "A Pattern Language Takes Root",
+    "summary": "Your KnowledgeBase can now grow a generative pattern language: reusable patterns that link to each other, expand through weave, and show up on a language map. Alongside that, resizing windows full of markdown is much faster.",
+    "highlights": [
+      "The KnowledgeBase gains a generative pattern language: agents can save and refine patterns, weave expands linked patterns into context (and flags dangling links), and a language map shows how your patterns connect."
+    ],
+    "fixes": [
+      "Resizing markdown-heavy windows (like long chats) is now fast; text layout no longer recomputes from scratch on every mouse movement."
+    ]
+  },
+  {
     "version": "0.8.21",
     "date": "2026-07-20",
     "title": "Windows That Hold Together",
