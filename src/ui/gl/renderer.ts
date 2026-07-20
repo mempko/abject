@@ -174,6 +174,9 @@ export class GlRenderer {
       antialias: true,
       premultipliedAlpha: true,
       preserveDrawingBuffer: false,
+      // Stencil clips a tilted window's content to its PROJECTED quad — the
+      // scissor rect can only express axis-aligned clipping.
+      stencil: true,
     });
     require(gl !== null, 'Failed to get WebGL2 context');
     this.gl = gl!;
@@ -269,8 +272,9 @@ export class GlRenderer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.disable(gl.SCISSOR_TEST);
     gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.STENCIL_TEST);
     gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
   }
 
   /**
@@ -292,6 +296,50 @@ export class GlRenderer {
 
   clearScissor(): void {
     this.gl.disable(this.gl.SCISSOR_TEST);
+  }
+
+  /**
+   * Begin a stencil clip: rasterize the projected unit quad (model ×
+   * viewProj) into the stencil buffer and restrict subsequent draws to it.
+   * The scissor (if set) bounds the stencil clear, so set the conservative
+   * screen bbox FIRST. Used for tilted windows, whose content region is a
+   * rotated quad on screen that the axis-aligned scissor cannot express.
+   * Pair with endStencilClip().
+   */
+  beginStencilClip(model: Mat4, viewProj: Mat4): void {
+    const gl = this.gl;
+    const p = this.getProgram('stencilQuad',
+      `#version 300 es
+layout(location = 0) in vec2 aPos;
+uniform mat4 uModel;
+uniform mat4 uViewProj;
+void main() { gl_Position = uViewProj * uModel * vec4(aPos, 0.0, 1.0); }`,
+      `#version 300 es
+precision mediump float;
+out vec4 fragColor;
+void main() { fragColor = vec4(1.0); }`,
+      ['uModel', 'uViewProj']);
+    gl.enable(gl.STENCIL_TEST);
+    gl.clearStencil(0);
+    gl.clear(gl.STENCIL_BUFFER_BIT);
+    gl.stencilFunc(gl.ALWAYS, 1, 0xff);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+    gl.colorMask(false, false, false, false);
+    gl.depthMask(false);
+    gl.useProgram(p.program);
+    gl.uniformMatrix4fv(p.uniforms.uModel, false, model);
+    gl.uniformMatrix4fv(p.uniforms.uViewProj, false, viewProj);
+    gl.bindVertexArray(this.quadVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(null);
+    gl.colorMask(true, true, true, true);
+    gl.depthMask(true);
+    gl.stencilFunc(gl.EQUAL, 1, 0xff);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+  }
+
+  endStencilClip(): void {
+    this.gl.disable(this.gl.STENCIL_TEST);
   }
 
   /** Clear just the depth buffer (scissor must be off). Gives a fresh depth

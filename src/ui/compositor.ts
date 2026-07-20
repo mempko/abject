@@ -1954,6 +1954,16 @@ export class Compositor {
       );
       state.model = model;
 
+      // The window's own camera — used for the slab AND its content subtree.
+      // For an unrotated slab the off-axis projection renders identically to
+      // the desktop camera by construction, but once the slab is rotated
+      // (setSlabTransform, drag tilt) the two cameras disagree: the desktop
+      // camera shows an oblique view of the frame while the window camera
+      // shows the content nearly head-on, so the frame visibly tilted away
+      // from its own content. Drawing both through ONE camera keeps a tilted
+      // window rigid.
+      const cam = this.windowCamera(cx, cy, z);
+
       const radius = surface.transparent ? 0 : Math.min(chrome.radius, rect.width / 2, rect.height / 2);
 
       if (!surface.transparent) {
@@ -1967,7 +1977,7 @@ export class Compositor {
           rect.width + pad * 2, rect.height + pad * 2, 1,
         );
         this.renderer.drawGlow({
-          model: shadowModel, viewProj: this.viewProj,
+          model: shadowModel, viewProj: cam.viewProj,
           quadWidth: rect.width + pad * 2, quadHeight: rect.height + pad * 2,
           halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
           radius,
@@ -1984,7 +1994,7 @@ export class Compositor {
             rect.width + pad2 * 2, rect.height + pad2 * 2, 1,
           );
           this.renderer.drawGlow({
-            model: glowModel, viewProj: this.viewProj,
+            model: glowModel, viewProj: cam.viewProj,
             quadWidth: rect.width + pad2 * 2, quadHeight: rect.height + pad2 * 2,
             halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
             radius,
@@ -2002,6 +2012,7 @@ export class Compositor {
         rim: focused && !surface.transparent
           ? { ...chrome.glow, a: chrome.glow.a * 0.9 }
           : undefined,
+        viewProj: cam.viewProj,
       });
 
       // Scene-vocabulary nodes ride the window's UNSCALED frame (the slab
@@ -2011,11 +2022,11 @@ export class Compositor {
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         1, 1, 1,
       );
-      // The window's subtree is drawn through ITS OWN camera, so its depth
-      // converges into the window rather than toward the middle of the screen
-      // (see windowCamera). Without this, a deep scene in an off-centre window
-      // slides sideways as it recedes and is scissored away by its own clip rect.
-      const cam = this.windowCamera(cx, cy, z);
+      // The window's subtree is drawn through the same window camera as the
+      // slab (see above), so its depth converges into the window rather than
+      // toward the middle of the screen (see windowCamera). Without this, a
+      // deep scene in an off-centre window slides sideways as it recedes and
+      // is scissored away by its own clip rect.
 
       // The window's own content (chrome + widgets + default canvas) is the
       // BACKMOST 2D layer of its subtree. Scene nodes draw above it; canvas
@@ -2039,7 +2050,7 @@ export class Compositor {
     surface: Surface,
     state: SurfaceGlState,
     model: Mat4,
-    opts: { radius: number; dim: number; opacity: number; rim?: RGBA; scissor?: { x: number; y: number; width: number; height: number } },
+    opts: { radius: number; dim: number; opacity: number; rim?: RGBA; scissor?: { x: number; y: number; width: number; height: number }; viewProj?: Mat4 },
   ): void {
     if (!state.texture) {
       state.texture = this.renderer.createTexture();
@@ -2058,7 +2069,7 @@ export class Compositor {
     }
     this.renderer.drawSurface({
       model,
-      viewProj: this.viewProj,
+      viewProj: opts.viewProj ?? this.viewProj,
       texture: state.texture,
       width: surface.rect.width,
       height: surface.rect.height,
@@ -2086,7 +2097,64 @@ export class Compositor {
    *   window (pop-out 3D, decorations meant to be visible over the chrome).
    */
   private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay', cam: SceneCamera): void {
-    this.drawNodeTree(surface.id, surfaceModel, cam, undefined, this.contentClip(surface), pass);
+    const state = this.glState(surface.id);
+    const rot = state.userRotation;
+    const tilted = !!(state.tiltX || state.tiltY || (rot && (rot[0] || rot[1] || rot[2])));
+    let clip = this.contentClip(surface);
+    let clipQuad: { model: Mat4; viewProj: Mat4 } | undefined;
+    if (tilted) {
+      // A tilted window's content region is a rotated quad on screen; the
+      // axis-aligned scissor would crop it with an upright rectangle. Build
+      // the content rect's model under the tilted frame for a stencil clip,
+      // and shrink the scissor to the quad's conservative screen bbox (it
+      // still bounds the stencil clear + draws cheaply).
+      const { model } = this.contentQuadModel(surface, surfaceModel);
+      clipQuad = { model, viewProj: cam.viewProj };
+      clip = this.projectedQuadBounds(model, cam.viewProj) ?? clip;
+    }
+    this.drawNodeTree(surface.id, surfaceModel, cam, undefined, clip, pass, clipQuad);
+  }
+
+  /**
+   * The window's CONTENT rect (title bar + border inset) as a unit-quad
+   * model under the window's frame matrix — the tilted-space twin of
+   * contentClip().
+   */
+  private contentQuadModel(surface: Surface, surfaceModel: Mat4): { model: Mat4; cw: number; ch: number } {
+    const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
+    const border = surface.transparent ? 0 : 2;
+    const cw = Math.max(1, surface.rect.width - border * 2);
+    const ch = Math.max(1, surface.rect.height - titleBar - border);
+    // Content center offset from the window center, in window-local px.
+    const oy = (titleBar - border) / 2;
+    return { model: mat4Multiply(surfaceModel, mat4TRS(0, oy, 0, 0, 0, 0, cw, ch, 1)), cw, ch };
+  }
+
+  /**
+   * Conservative screen-space bbox of a projected unit quad, clamped to the
+   * viewport; undefined when the quad is entirely behind the camera.
+   */
+  private projectedQuadBounds(model: Mat4, viewProj: Mat4): { x: number; y: number; width: number; height: number } | undefined {
+    const m = mat4Multiply(viewProj, model);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [qx, qy] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]] as const) {
+      const w = m[3] * qx + m[7] * qy + m[15];
+      if (w <= 1e-6) continue;
+      const x = (m[0] * qx + m[4] * qy + m[12]) / w;
+      const y = (m[1] * qx + m[5] * qy + m[13]) / w;
+      const sx = (x + 1) / 2 * this.width;
+      const sy = (1 - (y + 1) / 2) * this.height;
+      minX = Math.min(minX, sx); maxX = Math.max(maxX, sx);
+      minY = Math.min(minY, sy); maxY = Math.max(maxY, sy);
+    }
+    if (!Number.isFinite(minX)) return undefined;
+    const pad = 2;
+    const x0 = Math.max(0, minX - pad), y0 = Math.max(0, minY - pad);
+    return {
+      x: x0, y: y0,
+      width: Math.min(this.width, maxX + pad) - x0,
+      height: Math.min(this.height, maxY + pad) - y0,
+    };
   }
 
   /** The desktop camera: eye over the viewport centre. World-scope nodes use this. */
@@ -2377,6 +2445,7 @@ export class Compositor {
     layer?: 'back' | 'front',
     clip?: { x: number; y: number; width: number; height: number },
     pass?: 'occluded' | 'overlay',
+    clipQuad?: { model: Mat4; viewProj: Mat4 },
   ): void {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return;
@@ -2442,6 +2511,11 @@ export class Compositor {
 
     const scissored = clip !== undefined && pass === 'occluded';
     if (scissored) this.renderer.setScissor(clip);
+    // Tilted windows additionally stencil-clip to the PROJECTED content quad
+    // (the scissor above is only its conservative bbox, and also bounds the
+    // stencil clear).
+    const stencilled = scissored && clipQuad !== undefined;
+    if (stencilled) this.renderer.beginStencilClip(clipQuad!.model, clipQuad!.viewProj);
 
     // Backdrop layers (params.backdrop:true — layout-managed widget canvases
     // and window-glued backgrounds) pin behind ALL meshes regardless of z,
@@ -2478,6 +2552,7 @@ export class Compositor {
       }
     }
 
+    if (stencilled) this.renderer.endStencilClip();
     if (scissored) this.renderer.clearScissor();
   }
 
@@ -3447,6 +3522,21 @@ export class Compositor {
   }
 
   /**
+   * The picking ray for a surface's SLAB — through the same window camera
+   * the slab renders with (see the render loop). Identical to the desktop
+   * ray for an untransformed slab; diverges exactly when the slab is tilted,
+   * which is when picking through the wrong camera misses.
+   */
+  private slabRay(surface: Surface, x: number, y: number): Ray {
+    const state = this.surfaceGl.get(surface.id);
+    const { rect } = surface;
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const z = (state?.lift ?? 0) + (state?.userZ ?? 0);
+    return rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, z).invViewProj);
+  }
+
+  /**
    * Find the topmost scene-vocabulary MESH node at a viewport point — the
    * 3D analogue of widget hit-testing. Follows visual order: front-layer
    * world nodes, then each window's subtree meshes and slab top-down
@@ -3496,12 +3586,22 @@ export class Compositor {
       // bug). Only explicit pop-out nodes (occlude:false) draw outside the rect,
       // so only they may be picked outside it.
       const clip = this.contentClip(surface);
-      const insideClip = x >= clip.x && x <= clip.x + clip.width && y >= clip.y && y <= clip.y + clip.height;
+      const rotated = !!((state?.tiltX ?? 0) || (state?.tiltY ?? 0) || state?.userRotation?.some(v => v !== 0));
+      // Tilted windows clip content to the PROJECTED quad (see drawVocabNodes),
+      // so picking must use the same region or clicks near the skewed edges
+      // hit invisible geometry / miss visible geometry.
+      const insideClip = rotated
+        ? (() => {
+            const { model, cw, ch } = this.contentQuadModel(surface, frame);
+            return !!raySurfaceHit(nodeRay, model, cw, ch);
+          })()
+        : x >= clip.x && x <= clip.x + clip.width && y >= clip.y && y <= clip.y + clip.height;
       const nodeId = this.hitNodeTree(nodeRay, surface.id, frame, undefined, undefined, insideClip);
       if (nodeId) return { scope: 'window', surfaceId: surface.id, nodeId };
 
       if (surface.inputPassthrough) continue;
-      const hit = raySurfaceHit(ray, slabModel, rect.width, rect.height);
+      // The slab renders through the window camera — pick it the same way.
+      const hit = raySurfaceHit(this.slabRay(surface, x, y), slabModel, rect.width, rect.height);
       if (!hit) continue;
       try {
         const pixel = surface.ctx.getImageData(
@@ -3606,8 +3706,8 @@ export class Compositor {
       rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
       0, 0, 0, rect.width, rect.height, 1,
     );
-    const ray = rayFromScreen(x, y, this.width, this.height, this.invViewProj);
-    const hit = raySurfaceHit(ray, model, rect.width, rect.height);
+    // Pick through the slab's own camera (matches how it renders when tilted).
+    const hit = raySurfaceHit(this.slabRay(surface, x, y), model, rect.width, rect.height);
     if (!hit) return undefined;
     return { surface, x: hit.x, y: hit.y };
   }
@@ -3617,7 +3717,6 @@ export class Compositor {
     // even if no frame has rendered since the last scroll.
     this.clampScroll();
     this.updateCamera(this.scrollX, this.scrollY);
-    const ray = rayFromScreen(viewportX, viewportY, this.width, this.height, this.invViewProj);
 
     // Iterate in reverse z-order (top to bottom)
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
@@ -3634,7 +3733,8 @@ export class Compositor {
         rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
         0, 0, 0, rect.width, rect.height, 1,
       );
-      const hit = raySurfaceHit(ray, model, rect.width, rect.height);
+      // Pick through the slab's own camera (matches how it renders when tilted).
+      const hit = raySurfaceHit(this.slabRay(surface, viewportX, viewportY), model, rect.width, rect.height);
       if (!hit) continue;
 
       // Transparent pixels pass input through to surfaces below.
