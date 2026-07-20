@@ -810,8 +810,13 @@ export class LabelWidget extends WidgetAbject {
     return this.text;
   }
 
-  protected applyUpdate(_updates: Record<string, unknown>): void {
-    // Invalidate wrap caches when text or style changes
+  protected applyUpdate(updates: Record<string, unknown>): void {
+    // Geometry-only updates (rect moves/resizes) keep the caches: both are
+    // keyed on (text, width, fontSize), so an unchanged width reuses the
+    // layout as-is and a changed width recomputes on the next render.
+    // Invalidating here made every window resize re-flow every label,
+    // including vertical-only resizes where nothing changed.
+    if (updates.text === undefined && updates.style === undefined) return;
     this.cachedWrappedLines = null;
     this.cachedRichLayout = null;
     // Clear selection when text changes

@@ -79,6 +79,9 @@ export class WindowAbject extends Abject {
   private destroying = false;
   private rendering = false;
   private renderScheduled = false;
+  /** A size change awaits relayout (latest-wins; this.rect holds the newest size). */
+  private resizePending = false;
+  private resizeDraining = false;
   private frameTimer?: ReturnType<typeof setTimeout>;
 
   // Animation state — shimmerPos cycles 0 → 1 along the accent line while
@@ -524,11 +527,36 @@ export class WindowAbject extends Abject {
       }
 
       if (sizeChanged) {
-        await this.updateChildrenOnResize();
-        await this.renderWindow();
+        // Latest-wins coalescing: resize drags deliver un-throttled rects
+        // (120+/sec on fast mice), and a full child relayout + render per
+        // event queues far behind the pointer. this.rect already holds the
+        // newest size, so intermediate sizes are skipped and at most one
+        // relayout runs at a time.
+        this.resizePending = true;
+        void this.drainResize();
       }
       this.changed('windowRect', { x, y, width, height });
     });
+  }
+
+  /**
+   * Run relayout+render passes until no newer size is pending. Each pass
+   * lays out at whatever this.rect holds when it starts, so a burst of
+   * windowRect events costs at most one in-flight pass plus one final
+   * pass at the settled size.
+   */
+  private async drainResize(): Promise<void> {
+    if (this.resizeDraining) return;
+    this.resizeDraining = true;
+    try {
+      while (this.resizePending) {
+        this.resizePending = false;
+        await this.updateChildrenOnResize();
+        await this.renderWindow();
+      }
+    } finally {
+      this.resizeDraining = false;
+    }
   }
 
   // Window lifecycle/API (create, layout, close/reopen) agents build against.

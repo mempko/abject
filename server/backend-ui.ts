@@ -510,6 +510,12 @@ export class BackendUI extends Abject {
                 returns: { kind: 'primitive', primitive: 'number' },
               },
               {
+                name: 'getFontMetrics',
+                description: 'Fetch the per-character font-width table (populated from the connected client). Widgets cache it process-wide so text layout can measure locally instead of one bus round trip per word.',
+                parameters: [],
+                returns: { kind: 'object', properties: { fonts: { kind: 'object', properties: {} } } },
+              },
+              {
                 name: 'injectInput',
                 description: 'Inject a synthetic input event into a surface (click, keypress, etc.)',
                 parameters: [
@@ -925,6 +931,14 @@ export class BackendUI extends Abject {
         font?: string;
       };
       return this.handleMeasureText(surfaceId, text, font ?? WIDGET_FONT);
+    });
+
+    this.on('getFontMetrics', async () => {
+      const fonts: Record<string, Record<string, number>> = {};
+      for (const [font, chars] of this.fontMetrics) {
+        fonts[font] = Object.fromEntries(chars);
+      }
+      return { fonts };
     });
 
     this.on('setSurfaceTitle', async (msg: AbjectMessage) => {

@@ -35,6 +35,60 @@ import {
 } from './widget-types.js';
 import { Tween, pulse as motionPulse } from '../../ui/motion.js';
 
+/**
+ * Per-process font-metrics cache for local text measurement. One fetch from
+ * the UI server serves every widget in the process; per-word layout measures
+ * then run as local char-width sums instead of bus round trips — the
+ * dominant cost of markdown reflow during window resizes. The summation
+ * mirrors the server's own measureText (per-char widths, 'M' fallback), so
+ * local and remote answers agree.
+ */
+class LocalFontMetrics {
+  private fonts = new Map<string, Map<string, number>>();
+  private fetchPromise?: Promise<void>;
+  private lastFetchAt = 0;
+  /** Cap refetch attempts (unknown fonts, headless with no metrics). */
+  private static readonly REFETCH_INTERVAL_MS = 10_000;
+
+  /** Local width, or null when this font has no metrics yet. */
+  measure(text: string, font: string): number | null {
+    const chars = this.fonts.get(font);
+    if (!chars) return null;
+    const fallback = chars.get('M') ?? 7.5;
+    let width = 0;
+    for (let i = 0; i < text.length; i++) {
+      width += chars.get(text[i]) ?? fallback;
+    }
+    return width;
+  }
+
+  /** Fetch/refresh the table (throttled, single-flight); always resolves. */
+  refresh(
+    fetcher: () => Promise<{ fonts?: Record<string, Record<string, number>> } | null>,
+  ): Promise<void> {
+    if (this.fetchPromise) return this.fetchPromise;
+    const now = Date.now();
+    if (now - this.lastFetchAt < LocalFontMetrics.REFETCH_INTERVAL_MS) return Promise.resolve();
+    this.lastFetchAt = now;
+    this.fetchPromise = fetcher()
+      .then((result) => {
+        for (const [font, chars] of Object.entries(result?.fonts ?? {})) {
+          let map = this.fonts.get(font);
+          if (!map) {
+            map = new Map<string, number>();
+            this.fonts.set(font, map);
+          }
+          for (const [ch, w] of Object.entries(chars)) map.set(ch, w);
+        }
+      })
+      .catch(() => { /* keep whatever we have */ })
+      .finally(() => { this.fetchPromise = undefined; });
+    return this.fetchPromise;
+  }
+}
+
+const localFontMetrics = new LocalFontMetrics();
+
 
 
 // Theme color tokens that may be baked into a WidgetStyle. On a theme change we
@@ -484,15 +538,31 @@ export abstract class WidgetAbject extends Abject {
   }
 
   /**
-   * Measure text width via UIServer message.
+   * Measure text width. Answers locally from the process-wide font-metrics
+   * table whenever possible; a font with no metrics yet triggers one
+   * (throttled) table fetch and then falls back to a per-call UIServer
+   * request, which itself estimates when no client has reported metrics.
    */
   protected async measureText(surfaceId: string, text: string, font?: string): Promise<number> {
     if (!text) return 0;
+    const resolvedFont = font ?? WIDGET_FONT;
+
+    let width = localFontMetrics.measure(text, resolvedFont);
+    if (width !== null) return width;
+
+    await localFontMetrics.refresh(() =>
+      this.request<{ fonts?: Record<string, Record<string, number>> }>(
+        request(this.id, this.uiServerId, 'getFontMetrics', {})
+      ).catch(() => null)
+    );
+    width = localFontMetrics.measure(text, resolvedFont);
+    if (width !== null) return width;
+
     return this.request<number>(
       request(this.id, this.uiServerId, 'measureText', {
         surfaceId,
         text,
-        font: font ?? WIDGET_FONT,
+        font: resolvedFont,
       })
     );
   }
