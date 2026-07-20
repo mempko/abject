@@ -41,7 +41,7 @@ const STORAGE_KEY = 'knowledge-base:entries';
  */
 export const PROFILE_TAG = 'profile';
 
-export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference';
+export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference' | 'pattern';
 
 /**
  * Who authored an entry. Curation policy keys off this: 'user' entries are
@@ -79,6 +79,16 @@ export interface RecallResult extends KnowledgeEntry {
   score?: number;
 }
 
+/**
+ * A weave result: a pattern entry plus how it entered the selection.
+ * 'matched' for query hits, 'linked-from: NAME' for link expansions.
+ */
+export interface WovenPattern extends KnowledgeEntry {
+  snippet?: string;
+  score?: number;
+  via: string;
+}
+
 /** Compact preview shape returned when recall is called with previews: true. */
 export interface RecallPreview {
   id: string;
@@ -102,7 +112,7 @@ export class KnowledgeBase extends Abject {
       manifest: {
         name: 'KnowledgeBase',
         description:
-          'Persistent agent memory system. Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search), match (exact/regex lookup for identifiers), and get (fetch one full entry by id). Knowledge persists across restarts and syncs across peers.',
+          'Persistent agent memory system. Agents remember facts, insights, lessons learned, and patterns, then retrieve them four ways: recall (BM25 full-text search), match (exact/regex lookup for identifiers), get (fetch one full entry by id), and weave (select patterns whose contexts match a goal, plus their linked patterns). Knowledge persists across restarts and syncs across peers.',
         version: '2.0.0',
         interface: {
           id: KNOWLEDGE_BASE_INTERFACE,
@@ -115,7 +125,7 @@ export class KnowledgeBase extends Abject {
               parameters: [
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Short summary (max 200 chars)' },
                 { name: 'content', type: { kind: 'primitive', primitive: 'string' }, description: 'The knowledge content (markdown)' },
-                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: "Entry type: 'learned' | 'fact' | 'insight' | 'reference'" },
+                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: "Entry type: 'learned' | 'fact' | 'insight' | 'reference' | 'pattern'" },
                 { name: 'tags', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Tags for search/filtering', optional: true },
                 { name: 'origin', type: { kind: 'primitive', primitive: 'string' }, description: "Who authored this: 'user' | 'agent' | 'reviewer' | 'scrum' (default 'agent')", optional: true },
               ],
@@ -132,6 +142,19 @@ export class KnowledgeBase extends Abject {
                 { name: 'previews', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Return compact previews instead of full entries', optional: true },
               ],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'KnowledgeEntry' } },
+            },
+            {
+              name: 'weave',
+              description: "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their 'Links: -> NAME' references to pull in linked patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
+              parameters: [
+                { name: 'query', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal or task description to match pattern contexts against' },
+                { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max directly matched patterns (default 5)', optional: true },
+                { name: 'hops', type: { kind: 'primitive', primitive: 'number' }, description: 'Link-expansion depth (default 1, max 2)', optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                patterns: { kind: 'array', elementType: { kind: 'reference', reference: 'WovenPattern' } },
+                dangling: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              } },
             },
             {
               name: 'match',
@@ -600,7 +623,15 @@ Search, read the previews, and refine: when results are thin, reformulate with d
     tags: ['ui', 'preferences'],
   });
 
-Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources)
+Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries: Context / Forces / Therefore sections with 'Links: -> NAME' cross-references; usually authored by the post-goal reviewer)
+
+### Weave patterns for a goal
+
+  const woven = await call(await dep('KnowledgeBase'), 'weave', {
+    query: 'build a dashboard from live portfolio data', limit: 3,
+  });
+  // woven.patterns: matched patterns plus one hop of linked patterns
+  // woven.dangling: link names with no pattern written yet
 
 ### Update / forget / list
 
@@ -657,7 +688,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       requireNonEmpty(title, 'title');
       requireNonEmpty(content, 'content');
       precondition(
-        type === 'learned' || type === 'fact' || type === 'insight' || type === 'reference',
+        type === 'learned' || type === 'fact' || type === 'insight' || type === 'reference' || type === 'pattern',
         `Invalid knowledge type: ${type}`,
       );
       const entryOrigin: KnowledgeOrigin =
@@ -775,6 +806,69 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         }));
       }
       return results;
+    });
+
+    this.on('weave', async (msg: AbjectMessage) => {
+      const { query, limit, hops } = msg.payload as {
+        query: string; limit?: number; hops?: number;
+      };
+      requireNonEmpty(query, 'query');
+      const max = Math.min(limit ?? 5, 20);
+      const maxHops = Math.min(hops ?? 1, 2);
+
+      // Rank over a generous pool, keep only active patterns.
+      const ranked = await this.rankIds(query, 100);
+      const selected: WovenPattern[] = [];
+      const seen = new Set<string>();
+      for (const r of ranked) {
+        const entry = this.entries.get(r.id);
+        if (!entry || entry.archived || entry.type !== 'pattern') continue;
+        selected.push({ ...entry, snippet: r.snippet, score: r.score, via: 'matched' });
+        seen.add(entry.id);
+        if (selected.length >= max) break;
+      }
+
+      // Breadth-first link expansion: a matched pattern pulls in the
+      // patterns its 'Links:' line names, so the language's structure
+      // (not just keyword overlap) shapes the selection. Total output is
+      // capped so a densely linked language can't flood the prompt.
+      const totalCap = max * 3;
+      const dangling = new Set<string>();
+      let frontier = [...selected];
+      for (let hop = 0; hop < maxHops && frontier.length > 0 && selected.length < totalCap; hop++) {
+        const next: WovenPattern[] = [];
+        for (const pattern of frontier) {
+          for (const name of this.parsePatternLinks(pattern.content)) {
+            const linked = this.findPatternByName(name);
+            if (!linked) {
+              dangling.add(name);
+              continue;
+            }
+            if (seen.has(linked.id) || selected.length >= totalCap) continue;
+            const woven: WovenPattern = { ...linked, via: `linked-from: ${pattern.title}` };
+            selected.push(woven);
+            seen.add(linked.id);
+            next.push(woven);
+          }
+        }
+        frontier = next;
+      }
+
+      // Bump access counts so patterns participate in staleness signals.
+      const now = Date.now();
+      for (const pattern of selected) {
+        const live = this.entries.get(pattern.id);
+        if (live) {
+          live.accessCount++;
+          live.lastAccessedAt = now;
+          this.bumpAccessInDb(live);
+          pattern.accessCount = live.accessCount;
+          pattern.lastAccessedAt = now;
+        }
+      }
+
+      log.info(`Weave "${query.slice(0, 60)}" => ${selected.length} patterns (${dangling.size} dangling links)`);
+      return { patterns: selected, dangling: [...dangling] };
     });
 
     this.on('match', async (msg: AbjectMessage) => {
@@ -970,6 +1064,30 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     return undefined;
   }
 
+  /**
+   * Parse pattern link names from a pattern body's 'Links:' line, the
+   * '-> NAME, OTHER NAME' convention. Names resolve by normalized title.
+   */
+  private parsePatternLinks(content: string): string[] {
+    const line = content.match(/^\s*Links:\s*(.+)$/mi)?.[1];
+    if (!line) return [];
+    return line
+      .split(',')
+      .map(name => name.replace(/->/g, '').trim())
+      .filter(name => name.length > 0);
+  }
+
+  /** Resolve a link name to an active pattern entry by normalized title. */
+  private findPatternByName(name: string): KnowledgeEntry | undefined {
+    const norm = this.normalizeTitle(name);
+    for (const entry of this.entries.values()) {
+      if (entry.type === 'pattern' && !entry.archived && this.normalizeTitle(entry.title) === norm) {
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
   // ─── Distillation ──────────────────────────────────────────────
 
   private static readonly MAX_ENTRIES = 1000;
@@ -980,11 +1098,13 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
   /**
    * An entry the automated cleanup must never touch: user-authored entries
-   * (origin 'user'), user facts (tagged 'user'/'person'), and entries a
-   * reviewer has confirmed useful.
+   * (origin 'user'), user facts (tagged 'user'/'person'), patterns (they
+   * retire only through explicit curation, never by staleness), and entries
+   * a reviewer has confirmed useful.
    */
   private isProtected(entry: KnowledgeEntry): boolean {
     if (entry.origin === 'user') return true;
+    if (entry.type === 'pattern') return true;
     if (entry.type === 'fact' && entry.tags.some(t => t === 'user' || t === 'person')) return true;
     if (entry.usefulCount > 0) return true;
     return false;

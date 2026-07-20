@@ -699,7 +699,14 @@ export class ScrumMaster extends Abject {
     // This is what skips Registry rediscovery on repeat tasks: a previous
     // scrum saved a "this kind of goal routes to that Abject via that
     // method" lesson → the recall surfaces it → the planner uses it directly.
-    const relevantKnowledge = await this.recallKnowledge(goal.description);
+    // Alongside it, weave the pattern language: patterns whose contexts
+    // match this goal (plus their linked patterns) shape task decomposition
+    // and ordering. Pattern entries surface only through the weave.
+    const [recalled, applicablePatterns] = await Promise.all([
+      this.recallKnowledge(goal.description),
+      this.weavePatterns(goal.description),
+    ]);
+    const relevantKnowledge = recalled.filter(e => e.type !== 'pattern');
 
     // Loop backstop: many rounds with accumulating failures is the signature of
     // retrying the same fix. Surface it deterministically so the planner weighs
@@ -738,6 +745,7 @@ export class ScrumMaster extends Abject {
         scratchpad: scratchpadSummary,
         teamNames: eligibleTeamNames,
         relevantKnowledge,
+        ...(applicablePatterns.length > 0 ? { applicablePatterns } : {}),
       },
     };
   }
@@ -774,6 +782,35 @@ export class ScrumMaster extends Abject {
       return Array.isArray(entries) ? entries : [];
     } catch (err) {
       log.warn(`recallKnowledge failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Weave the pattern language against a query: patterns whose contexts
+   * match, plus the patterns their Links lines name. The planner reads
+   * these to shape task decomposition and ordering.
+   */
+  private async weavePatterns(
+    query: string,
+    limit = 3,
+  ): Promise<Array<{ id: string; title: string; content: string; via?: string }>> {
+    const kbId = await this.getKnowledgeBaseId();
+    if (!kbId) return [];
+    try {
+      const woven = await this.request<{ patterns?: Array<{ id: string; title: string; content: string; via?: string }> } | null>(
+        request(this.id, kbId, 'weave', { query, limit }),
+        5000,
+      );
+      if (!woven || !Array.isArray(woven.patterns)) return [];
+      return woven.patterns.map(p => ({
+        id: p.id,
+        title: p.title,
+        content: (p.content ?? '').slice(0, 3000),
+        via: p.via,
+      }));
+    } catch (err) {
+      log.warn(`weavePatterns failed: ${err instanceof Error ? err.message : String(err)}`);
       return [];
     }
   }
@@ -948,11 +985,11 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
   }
 
   /**
-   * Record the plan that actually worked on the goal's own scratchpad. This is
-   * the goal's record of how it was achieved; it lives and dies with the goal,
-   * so it never pollutes the shared KnowledgeBase. Reusable cross-goal lessons
-   * (goal-shape → agent/method mappings) are the LLM's deliberate job via the
-   * save_knowledge action; this auto-record is just the local plan.
+   * Record the raw execution record (what ran, who ran it, what failed) on
+   * the goal's own scratchpad. It lives and dies with the goal, so it never
+   * pollutes the shared KnowledgeBase. TaskReviewer reads it during the
+   * post-goal review and distills recurring shapes into pattern entries;
+   * ScrumMaster only records, the reviewer decides what it means.
    */
   private async recordCompletionPlan(goalId: string, synthesis: string): Promise<void> {
     if (!this.goalManagerId) return;
@@ -1014,7 +1051,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       .map(id => agentNames.get(id) ?? id.slice(0, 8)))];
 
     const plan = [
-      `Goal shape:\n${goal.description}`,
+      `Goal:\n${goal.description}`,
       participatingAgents.length > 0
         ? `Participating agents:\n${participatingAgents.join(', ')}`
         : 'Participating agents:\n(none)',
@@ -1147,7 +1184,7 @@ Rules:
     if (!kbId) return { success: false, error: 'KnowledgeBase not registered in this workspace' };
     const title = action.title as string | undefined;
     const content = action.content as string | undefined;
-    const type = (action.type as string | undefined) ?? 'learned';
+    const type = (action.type as string | undefined) ?? 'fact';
     const tags = (action.tags as string[] | undefined) ?? [];
     if (!title || !content) {
       return { success: false, error: 'save_knowledge requires title and content' };
@@ -1392,13 +1429,16 @@ No parameters. Returns:
   "failed": [{ "description", "error", "assignedAgentId" }, ...],
   "scratchpad": { "key": "value", ... },
   "teamNames": ["<AgentName>", "<AgentName>", ...],
-  "relevantKnowledge": [{ "id", "title", "type", "tags", "content" }, ...]
+  "relevantKnowledge": [{ "id", "title", "type", "tags", "content" }, ...],
+  "applicablePatterns": [{ "id", "title", "content", "via" }, ...]
 }
 \`\`\`
 
 \`teamNames\` is just a list of valid agent names you can pass to \`add_task\`'s \`assignedAgentName\` field — the names ALONE do not tell you what each agent can do. To learn capabilities, call \`poll_team\` (which uses the ask protocol — every agent's reply describes its current tools, skills, and MCP servers). Static manifest descriptions are not exposed here because they're stale for any agent whose capabilities are configurable at runtime.
 
 The \`relevantKnowledge\` array holds prior lessons retrieved from KnowledgeBase via full-text search against the goal description. **Read it carefully** — past sprints may have already discovered the right Abject, tool, or approach for this kind of goal. If a cached entry already names the right agent + method for what the user is asking, plan tasks that use that mapping directly instead of polling the team again. Each entry's \`id\` lets you call \`forget_knowledge\` if the entry turns out to be wrong.
+
+\`applicablePatterns\` (present when the workspace's pattern language has matches) holds Alexander/Coplien-style patterns whose Context sections fit this goal, plus patterns they link to (\`via\` says how each arrived). A pattern is a proven shape for how this kind of goal gets done, its Forces resolved by its Therefore: its Therefore/Contract sections often dictate task decomposition and ordering directly (for example "fetch tasks first, then compute tasks, then presentation tasks"). When a pattern's context genuinely holds, plan the scrum's tasks to follow it and say so in the task descriptions so executing agents apply it too.
 
 ### \`poll_team({ members?: string[], question?: string })\`
 Asks selected team members via the ask protocol. **This is how you learn what each agent can actually do** — the default question asks each agent to enumerate its current tools/skills/MCP capabilities AND propose a concrete task. Use whenever:
@@ -1456,25 +1496,25 @@ Declare the goal unreachable. Use when no team member can contribute and replann
 Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.
 
 ### \`save_knowledge({ title, content, type?, tags? })\`
-Persist a genuinely reusable insight to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact or lesson that holds on its own, not a log of this sprint.
+Persist a genuinely reusable FACT to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact that holds on its own, not a log of this sprint.
 
-Save ONLY when this sprint rediscovered something non-obvious that cost real effort and will recur on unrelated future goals. Good candidates:
+Save facts you discovered while planning that will recur on unrelated future goals:
 
 - A capability that was hard to locate: which kind of tool or method turned out to handle a class of work, when that was not obvious from a registry walk.
-- An approach that beat the obvious one, with the reason it won.
 - A constraint that mattered: a permission, dependency, or precondition that was not apparent up front.
 - A user-identity fact confirmed by a successful task: an address, account, or identifier.
 
-Most sprints save nothing. When the work was routine or the team found what it needed quickly, skip it. The plan that worked is already recorded on the goal's scratchpad, so this is reserved for lessons worth carrying to a different goal later.
+Most sprints save nothing. When the work was routine or the team found what it needed quickly, skip it. Lessons, recurring shapes, and patterns are the post-goal reviewer's job: it reads this goal's execution record after completion and distills what generalizes into the pattern language. Your job here is facts only — the execution record you leave behind is its raw material.
 
-Write the entry as the insight itself. The title states the takeaway (for example "Bulk inbox triage needs an agent that drives a real browser"), phrased so a reader who never saw this sprint understands it. Avoid titles that name this goal or begin with "Goal shape".
+Write the entry as the fact itself. The title states the takeaway (for example "Bulk inbox triage needs an agent that drives a real browser"), phrased so a reader who never saw this sprint understands it.
 
 Skip:
 - The synthesis the user already saw via \`complete_goal\`
 - The working plan and task-specific details (those live on the goal scratchpad)
 - One-off observations unlikely to recur
+- Lessons about how the goal was approached (the reviewer distills those)
 
-\`type\`: 'fact' (durable truth), 'learned' (lesson from outcome), 'insight' (analysis), 'reference' (pointer). Defaults to 'learned'.
+\`type\`: 'fact' (durable truth), 'insight' (analysis), 'reference' (pointer). Defaults to 'fact'.
 \`tags\`: short keywords describing the topic plus any capability involved.
 
 Returns \`{ id, title }\`.
@@ -1517,7 +1557,7 @@ Do NOT guess based on agent name alone. The relevant capability may or may not b
 For goals whose outcome the user will rely on directly — numbers or facts reported back, destructive or irreversible actions, artifacts published somewhere external — stage a follow-up cross-check task in the NEXT round after the producing task completes. Assign the cross-check to a DIFFERENT agent than the one that produced the result, give it \`consumes\` on the produced scratchpad keys, and describe the outcome as independent confirmation (re-fetch the source, recompute the figure, load the published artifact) with a clear pass/fail verdict written to its own \`produces\` key. A failed cross-check is grounds to replan the producing task, and \`complete_goal\` waits until the check passes. Routine goals (a UI built and visibly working, an exploratory question) complete on their own evidence; reserve the cross-check round for results that are costly to get wrong.
 
 **Knowledge as memory across sprints:**
-The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. When a sprint completes, ScrumMaster automatically saves a compact "Scrum plan" lesson with the tasks and agents that actually worked. Use manual \`save_knowledge\` only for extra durable facts the automatic plan lesson would not capture, such as user preferences, provider-specific constraints, or a corrected tool mapping. Every future scrum on a similar goal surfaces prior lessons in \`relevantKnowledge\` and lets the planner choose faster while still staying inside the goal system. When a cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
+The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. When a sprint completes, ScrumMaster automatically records the execution record (the tasks and agents that actually worked) on the goal's scratchpad; the post-goal reviewer reads it and grows the pattern language from shapes that recur, which future scrums receive as \`applicablePatterns\`. Use \`save_knowledge\` for durable facts that pipeline would not capture, such as user preferences, provider-specific constraints, or a corrected tool mapping. Every future scrum on a similar goal surfaces prior facts in \`relevantKnowledge\` and lets the planner choose faster while still staying inside the goal system. When a cached fact stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
 
 Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad conventions. Never save categorical claims that a capability does NOT exist ("there is no X API", "Y is not supported"): the platform evolves, those claims go stale silently, and a recalled negative will override live discovery on every future goal. If a capability seemed absent this sprint, that observation belongs in the synthesis for THIS goal only; the next sprint re-discovers. Likewise, treat recalled lessons containing such negatives as suspect — prefer the live guides.
 

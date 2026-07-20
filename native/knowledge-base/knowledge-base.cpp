@@ -3,8 +3,9 @@
 //
 // Same message surface and semantics: remember (dedup by normalized
 // title+type, optional origin provenance), recall (BM25 full-text,
-// title-boosted, snippets + scores, previews mode), match (exact lookup),
-// get/forget/update/list, markUseful/archive curation, the
+// title-boosted, snippets + scores, previews mode), weave (pattern
+// selection by context match plus 'Links: -> NAME' expansion), match
+// (exact lookup), get/forget/update/list, markUseful/archive curation, the
 // entryAdded/entryUpdated/entryRemoved events, cross-peer merge through
 // SharedState, and periodic distillation (stale entries are archived, not
 // deleted; only the archive itself is bounded by hard deletes).
@@ -30,6 +31,7 @@
 
 #include <algorithm>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "bm25.hpp"
@@ -81,7 +83,7 @@ struct Entry {
   std::string id;
   std::string title;
   std::string content;
-  std::string type;    // learned | fact | insight | reference
+  std::string type;    // learned | fact | insight | reference | pattern
   std::vector<std::string> tags;
   std::string origin = "agent";  // user | agent | reviewer | scrum
   std::string created_by;
@@ -140,7 +142,7 @@ struct Entry {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 static bool valid_type(const std::string& t) {
-  return t == "learned" || t == "fact" || t == "insight" || t == "reference";
+  return t == "learned" || t == "fact" || t == "insight" || t == "reference" || t == "pattern";
 }
 
 static std::string gen_id() {
@@ -191,6 +193,45 @@ static bool has_regex_meta(const std::string& p) {
   return false;
 }
 
+/// Parse pattern link names from a pattern body's 'Links:' line, the
+/// '-> NAME, OTHER NAME' convention. Names resolve by normalized title.
+static std::vector<std::string> parse_pattern_links(const std::string& content) {
+  size_t pos = 0;
+  while (pos <= content.size()) {
+    const size_t eol = content.find('\n', pos);
+    const std::string line =
+        content.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+    const size_t start = line.find_first_not_of(" \t");
+    if (start != std::string::npos &&
+        kb::to_lower_ascii(line.substr(start, 6)) == "links:") {
+      std::vector<std::string> names;
+      const std::string rest = line.substr(start + 6);
+      size_t piece_start = 0;
+      while (piece_start <= rest.size()) {
+        const size_t comma = rest.find(',', piece_start);
+        std::string piece = rest.substr(
+            piece_start, comma == std::string::npos ? std::string::npos : comma - piece_start);
+        std::string cleaned;
+        for (size_t i = 0; i < piece.size(); i++) {
+          if (piece[i] == '-' && i + 1 < piece.size() && piece[i + 1] == '>') { i++; continue; }
+          cleaned += piece[i];
+        }
+        const size_t b = cleaned.find_first_not_of(" \t\r");
+        if (b != std::string::npos) {
+          const size_t e = cleaned.find_last_not_of(" \t\r");
+          names.push_back(cleaned.substr(b, e - b + 1));
+        }
+        if (comma == std::string::npos) break;
+        piece_start = comma + 1;
+      }
+      return names;
+    }
+    if (eol == std::string::npos) break;
+    pos = eol + 1;
+  }
+  return {};
+}
+
 // ── The object ───────────────────────────────────────────────────────────
 
 class KnowledgeBase final : public Object {
@@ -199,25 +240,29 @@ class KnowledgeBase final : public Object {
     ManifestBuilder m(
         "KnowledgeBase",
         "Persistent agent memory system (native C++/WASM module). Agents "
-        "remember facts, insights, and lessons learned, then retrieve them "
-        "three ways: recall (BM25 full-text search, title-boosted, returns "
-        "snippets and scores; pass previews: true for compact results, then "
-        "fetch winners with get), match (exact lookup for identifiers and "
-        "precise strings, supports 'A|B' alternations), and get (fetch one "
-        "full entry by id). Remember durable knowledge only: user "
-        "preferences and personal facts (tag them 'profile'), workspace and "
-        "project structure, stable patterns, and references. Types: "
-        "'learned' (behavioral lessons), 'fact' (discovered facts), "
-        "'insight' (agent analysis), 'reference' (pointers to resources). "
-        "Knowledge persists across restarts and syncs across peers.",
-        "3.1.0", "abjects:knowledge-base");
+        "remember facts, insights, lessons learned, and patterns, then "
+        "retrieve them four ways: recall (BM25 full-text search, "
+        "title-boosted, returns snippets and scores; pass previews: true for "
+        "compact results, then fetch winners with get), match (exact lookup "
+        "for identifiers and precise strings, supports 'A|B' alternations), "
+        "get (fetch one full entry by id), and weave (select patterns whose "
+        "contexts match a goal, plus their linked patterns). Remember "
+        "durable knowledge only: user preferences and personal facts (tag "
+        "them 'profile'), workspace and project structure, stable patterns, "
+        "and references. Types: 'learned' (behavioral lessons), 'fact' "
+        "(discovered facts), 'insight' (agent analysis), 'reference' "
+        "(pointers to resources), 'pattern' (Alexander/Coplien-style "
+        "generative pattern-language entries with Context/Forces/Therefore "
+        "sections and 'Links: -> NAME' cross-references). Knowledge "
+        "persists across restarts and syncs across peers.",
+        "3.2.0", "abjects:knowledge-base");
 
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
              "(updates if exists).")
         .param("title", "string", "Short summary (max 200 chars)")
         .param("content", "string", "The knowledge content (markdown)")
-        .param("type", "string", "Entry type: 'learned' | 'fact' | 'insight' | 'reference'")
+        .param("type", "string", "Entry type: 'learned' | 'fact' | 'insight' | 'reference' | 'pattern'")
         .param("tags", "array", "Tags for search/filtering", true)
         .param("origin", "string",
                "Who authored this: 'user' | 'agent' | 'reviewer' | 'scrum' (default 'agent')", true)
@@ -233,6 +278,17 @@ class KnowledgeBase final : public Object {
         .param("limit", "number", "Max results (default 10)", true)
         .param("previews", "boolean", "Return compact previews instead of full entries", true)
         .returns("array");
+    m.method("weave",
+             "Select pattern entries (type 'pattern') whose contexts match "
+             "the query (BM25-ranked), then follow their 'Links: -> NAME' "
+             "references to pull in linked patterns. Returns { patterns, "
+             "dangling }: each pattern carries via ('matched' or "
+             "'linked-from: NAME'); dangling lists link names that resolve "
+             "to no pattern yet.")
+        .param("query", "string", "Goal or task description to match pattern contexts against")
+        .param("limit", "number", "Max directly matched patterns (default 5)", true)
+        .param("hops", "number", "Link-expansion depth (default 1, max 2)", true)
+        .returns("object");
     m.method("match",
              "Exact lookup over titles, content, and tags. Use for "
              "identifiers, names, and precise strings. Case-insensitive; "
@@ -370,6 +426,7 @@ class KnowledgeBase final : public Object {
   void register_handlers() {
     on("remember", [this](Request& req) { handle_remember(req); });
     on("recall", [this](Request& req) { handle_recall(req); });
+    on("weave", [this](Request& req) { handle_weave(req); });
     on("match", [this](Request& req) { handle_match(req); });
 
     on("get", [this](Request& req) {
@@ -648,6 +705,74 @@ class KnowledgeBase final : public Object {
     req.reply(std::move(out));
   }
 
+  void handle_weave(Request& req) {
+    const json& p = req.payload();
+    const std::string query = str_or(p, "query", "");
+    if (query.empty()) { req.error("CONTRACT_VIOLATION", "query must not be empty"); return; }
+    const size_t max = static_cast<size_t>(std::min<int64_t>(int_or(p, "limit", 5), 20));
+    const int64_t max_hops = std::min<int64_t>(int_or(p, "hops", 1), 2);
+
+    struct Woven { Entry* entry; std::string snippet; double score; bool scored; std::string via; };
+    std::vector<Woven> selected;
+    std::set<std::string> seen;
+
+    const std::vector<std::string> query_terms = kb::tokenize(query);
+    for (const auto& hit : index_.search(query, 100)) {
+      auto it = entries_.find(hit.id);
+      if (it == entries_.end()) continue;
+      Entry& e = it->second;
+      if (e.archived || e.type != "pattern") continue;
+      selected.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true, "matched"});
+      seen.insert(e.id);
+      if (selected.size() >= max) break;
+    }
+
+    // Breadth-first link expansion: a matched pattern pulls in the patterns
+    // its 'Links:' line names, so the language's structure (not just keyword
+    // overlap) shapes the selection. Total output is capped so a densely
+    // linked language can't flood the prompt.
+    const size_t total_cap = max * 3;
+    std::set<std::string> dangling;
+    size_t frontier_begin = 0;
+    for (int64_t hop = 0; hop < max_hops && frontier_begin < selected.size(); hop++) {
+      const size_t frontier_end = selected.size();
+      for (size_t i = frontier_begin; i < frontier_end; i++) {
+        for (const auto& name : parse_pattern_links(selected[i].entry->content)) {
+          Entry* linked = find_pattern_by_name(name);
+          if (!linked) { dangling.insert(name); continue; }
+          if (seen.count(linked->id) || selected.size() >= total_cap) continue;
+          seen.insert(linked->id);
+          selected.push_back({linked, "", 0, false, "linked-from: " + selected[i].entry->title});
+        }
+      }
+      frontier_begin = frontier_end;
+    }
+
+    // Bump access counts so patterns participate in staleness signals.
+    const int64_t now = static_cast<int64_t>(now_ms());
+    json patterns = json::array();
+    for (const auto& w : selected) {
+      w.entry->access_count++;
+      w.entry->last_accessed_at = now;
+      persist_entry(*w.entry);
+      json full = w.entry->to_json();
+      if (w.scored) {
+        full["snippet"] = w.snippet;
+        full["score"] = w.score;
+      }
+      full["via"] = w.via;
+      patterns.push_back(std::move(full));
+    }
+    flush_sync(now);
+
+    json dangling_out = json::array();
+    for (const auto& name : dangling) dangling_out.push_back(name);
+    log(LogLevel::Info, "Weave \"" + clip_utf8(query, 60) + "\" => " +
+                            std::to_string(patterns.size()) + " patterns (" +
+                            std::to_string(dangling_out.size()) + " dangling links)");
+    req.reply({{"patterns", std::move(patterns)}, {"dangling", std::move(dangling_out)}});
+  }
+
   void handle_match(Request& req) {
     const json& p = req.payload();
     const std::string pattern = p.value("pattern", std::string());
@@ -791,6 +916,15 @@ class KnowledgeBase final : public Object {
     return nullptr;
   }
 
+  /// Resolve a link name to an active pattern entry by normalized title.
+  Entry* find_pattern_by_name(const std::string& name) {
+    const std::string norm = normalize_title(name);
+    for (auto& [_, e] : entries_) {
+      if (e.type == "pattern" && !e.archived && normalize_title(e.title) == norm) return &e;
+    }
+    return nullptr;
+  }
+
   void touch(Entry& e) {
     e.access_count++;
     e.last_accessed_at = static_cast<int64_t>(now_ms());
@@ -848,10 +982,12 @@ class KnowledgeBase final : public Object {
   }
 
   /// An entry the automated cleanup must never touch: user-authored entries
-  /// (origin 'user'), user facts (tagged 'user'/'person'), and entries a
-  /// reviewer has confirmed useful.
+  /// (origin 'user'), user facts (tagged 'user'/'person'), patterns (they
+  /// retire only through explicit curation, never by staleness), and entries
+  /// a reviewer has confirmed useful.
   bool is_protected(const Entry& e) const {
     if (e.origin == "user") return true;
+    if (e.type == "pattern") return true;
     if (e.type == "fact") {
       for (const auto& t : e.tags) {
         if (t == "user" || t == "person") return true;

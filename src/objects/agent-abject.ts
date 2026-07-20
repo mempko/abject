@@ -324,6 +324,13 @@ export class AgentAbject extends Abject {
   private static readonly PROFILE_BLOCK_CHAR_BUDGET = 4000;
   private static readonly PROFILE_ENTRY_CHAR_CAP = 400;
 
+  /**
+   * Woven pattern entries get a larger per-entry slice than ordinary
+   * knowledge: a pattern's value is its full Context/Forces/Therefore body,
+   * which truncation at ordinary caps would gut.
+   */
+  private static readonly PATTERN_ENTRY_CHAR_CAP = 3000;
+
   /** submit_job pipelines may legitimately run many bus calls; give them room. */
   private static readonly SUBMIT_JOB_TIMEOUT_MS = 300000;
   /** Cap on a job result entering the conversation; jobs should aggregate. */
@@ -2763,19 +2770,23 @@ The registered object must implement these handlers to participate in the agent 
       prompt += await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId);
     }
 
-    // Inject relevant knowledge from KnowledgeBase in two passes:
+    // Inject relevant knowledge from KnowledgeBase in three passes:
     //   1. Durable user-profile facts (PROFILE_TAG), always included regardless
     //      of the task wording, so stable knowledge about the user (home
     //      location, name, preferences) is present even when the task shares no
     //      keywords with it — keyword recall alone would rank it out of the top
     //      results and the agent would re-ask for something it already knows.
     //   2. The top entries whose text matches this task.
-    // A profile fact that also matches the query is not repeated.
+    //   3. Woven patterns: pattern-language entries whose contexts match the
+    //      task, plus the patterns they link to.
+    // A profile fact that also matches the query is not repeated, and pattern
+    // entries surface only through the weave (never as plain knowledge lines,
+    // which would truncate their bodies).
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
         type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number };
-        const [profileAll, matched, tagList] = await Promise.all([
+        const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
             5000,
@@ -2786,6 +2797,10 @@ The registered object must implement these handlers to participate in the agent 
           ).catch(() => null),
           this.request<Array<{ tag: string; count: number }> | null>(
             request(this.id, knowledgeBaseId, 'listTags', { limit: 20 }),
+            5000,
+          ).catch(() => null),
+          this.request<{ patterns?: Array<KEntry & { via?: string }> } | null>(
+            request(this.id, knowledgeBaseId, 'weave', { query: entry.state.task, limit: 3 }),
             5000,
           ).catch(() => null),
         ]);
@@ -2828,8 +2843,12 @@ The registered object must implement these handlers to participate in the agent 
           prompt += block;
         }
 
+        const patterns = (woven?.patterns ?? []).filter(e => e.id);
+        const patternIds = new Set(patterns.map(e => e.id));
+
         const profileTitles = new Set((profile ?? []).map(e => e.title));
-        const relevant = (matched ?? []).filter(e => !profileTitles.has(e.title));
+        const relevant = (matched ?? [])
+          .filter(e => !profileTitles.has(e.title) && e.type !== 'pattern' && !patternIds.has(e.id));
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
@@ -2838,9 +2857,18 @@ The registered object must implement these handlers to participate in the agent 
           prompt += kb;
         }
 
+        if (patterns.length > 0) {
+          let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern. Apply the patterns whose context holds for this task.\n';
+          for (const e of patterns) {
+            const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
+            block += `\n### PATTERN: ${e.title}${via}\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
+          }
+          prompt += block;
+        }
+
         // Record what was injected so the post-task reviewer can judge which
         // entries actually helped (KnowledgeBase.markUseful).
-        entry.injectedKnowledge = [...(profile ?? []), ...relevant]
+        entry.injectedKnowledge = [...(profile ?? []), ...relevant, ...patterns]
           .filter(e => e.id)
           .map(e => ({ id: e.id, title: e.title }));
       }

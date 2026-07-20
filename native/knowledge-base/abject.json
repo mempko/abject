@@ -1,15 +1,15 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
   "replaces": "KnowledgeBase",
   "build": "bash ../../sdk/cpp/build.sh knowledge-base.cpp -o main.wasm",
   "manifest": {
-    "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), and get (fetch one full entry by id). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources). Knowledge persists across restarts and syncs across peers.",
+    "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, lessons learned, and patterns, then retrieve them four ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), get (fetch one full entry by id), and weave (select patterns whose contexts match a goal, plus their linked patterns). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries with Context/Forces/Therefore sections and 'Links: -> NAME' cross-references). Knowledge persists across restarts and syncs across peers.",
     "interface": {
-      "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), and get (fetch one full entry by id). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources). Knowledge persists across restarts and syncs across peers.",
+      "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, lessons learned, and patterns, then retrieve them four ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), get (fetch one full entry by id), and weave (select patterns whose contexts match a goal, plus their linked patterns). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries with Context/Forces/Therefore sections and 'Links: -> NAME' cross-references). Knowledge persists across restarts and syncs across peers.",
       "events": [
         {
           "description": "A knowledge entry was added",
@@ -59,7 +59,7 @@
               }
             },
             {
-              "description": "Entry type: 'learned' | 'fact' | 'insight' | 'reference'",
+              "description": "Entry type: 'learned' | 'fact' | 'insight' | 'reference' | 'pattern'",
               "name": "type",
               "type": {
                 "kind": "primitive",
@@ -140,6 +140,42 @@
           ],
           "returns": {
             "kind": "array"
+          }
+        },
+        {
+          "description": "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their 'Links: -> NAME' references to pull in linked patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
+          "name": "weave",
+          "parameters": [
+            {
+              "description": "Goal or task description to match pattern contexts against",
+              "name": "query",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Max directly matched patterns (default 5)",
+              "name": "limit",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            },
+            {
+              "description": "Link-expansion depth (default 1, max 2)",
+              "name": "hops",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
           }
         },
         {
@@ -355,6 +391,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.1.0"
+    "version": "3.2.0"
   }
 }
