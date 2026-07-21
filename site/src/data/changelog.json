@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.8.24",
+    "date": "2026-07-21",
+    "title": "Chat that stays grounded, and gets out of the way",
+    "summary": "Chat now moves faster on simple requests and is more honest about what it actually did. Single-step asks skip the planning overhead, and replies can no longer claim work that never happened.",
+    "highlights": [
+      "Fast path for single-step requests: simple asks skip full planning and dispatch directly, cutting most of the back-and-forth before anything happens",
+      "Chat replies are grounded in real work: a reply cannot claim an action was taken unless there is a goal behind it"
+    ],
+    "fixes": [
+      "Chat no longer reports work as done when no action was actually dispatched"
+    ]
+  },
+  {
     "version": "0.8.23",
     "date": "2026-07-21",
     "title": "Hidden Means Hidden",
