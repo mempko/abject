@@ -135,6 +135,22 @@ export class ScrumMaster extends Abject {
   }>();
 
   /**
+   * Fast path. A goal `quick_dispatch`ed straight to one agent — no planning
+   * scrum. Keyed by goalId → the single task's id + agent. When the task's
+   * `goalReadyForCompletion` arrives: success → complete the goal directly
+   * (zero LLM); failure → fall into a normal review scrum that sees the
+   * failure and replans. See commitQuickDispatch.
+   */
+  private oneShotGoals = new Map<string, { taskId: string; agentId: AbjectId }>();
+  /**
+   * Goals where `review_scrum` must NOT offer quick_dispatch again — set when
+   * a quick_dispatch could not be committed (agent vanished mid-scrum or a
+   * malformed action), so the fallback review plans normally instead of
+   * re-offering the same doomed shortcut.
+   */
+  private forceFullScrum = new Set<string>();
+
+  /**
    * Pending ticket promises. AgentAbject's queue runner sends `executeTask`
    * to bootstrap the OTA loop; we forward to `startTask` and await the
    * resulting `taskResult` event. This map joins the two — same pattern
@@ -253,7 +269,25 @@ export class ScrumMaster extends Abject {
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         ), 200);
       } else if (aspect === 'goalReadyForCompletion') {
-        const { goalId, scrumNumber } = value as { goalId: string; scrumNumber: number };
+        const { goalId, scrumNumber, doneTaskIds } = value as {
+          goalId: string; scrumNumber: number; doneTaskIds?: string[];
+        };
+        // Fast path: a quick_dispatched goal's single task just finished.
+        const oneShot = this.oneShotGoals.get(goalId);
+        if (oneShot) {
+          this.oneShotGoals.delete(goalId);
+          if ((doneTaskIds ?? []).includes(oneShot.taskId)) {
+            // Success → complete the goal directly, no review scrum.
+            await this.completeOneShotGoal(goalId, oneShot.taskId).catch(err =>
+              log.warn(`completeOneShotGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
+            );
+            return;
+          }
+          // Failure → let the normal review scrum below see the failed task
+          // (it re-reads task state) and plan a real recovery. Suppress a
+          // repeat quick_dispatch offer so it doesn't retry the same shortcut.
+          this.forceFullScrum.add(goalId);
+        }
         await this.enqueueScrumTask(goalId, scrumNumber).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         );
@@ -265,6 +299,8 @@ export class ScrumMaster extends Abject {
         for (const [taskId, info] of this.scrumAttempts) {
           if (info.goalId === goalId) this.scrumAttempts.delete(taskId);
         }
+        this.oneShotGoals.delete(goalId);
+        this.forceFullScrum.delete(goalId);
       } else if (aspect === 'taskCompleted') {
         const { taskId } = value as { taskId: string };
         this.unblockDependents(taskId).catch(err =>
@@ -312,6 +348,7 @@ export class ScrumMaster extends Abject {
                 complete_goal: { type: 'success' },
                 fail_goal: { type: 'error', resultFields: ['reason'] },
                 dispatch_scrum: { type: 'success' },
+                quick_dispatch: { type: 'success' },
               },
             },
           }),
@@ -511,16 +548,33 @@ export class ScrumMaster extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   /**
-   * Observation strings. AgentAbject auto-injects the goal context (title,
-   * description, scratchpad, task list) via `buildGoalProgressContext`, so
-   * we don't repeat that here — we just remind the LLM of its loop position.
-   * The system prompt mandates `review_scrum` as the first action regardless.
+   * Observation strings. The first observation (step 0) carries the full
+   * goal-state snapshot (buildReviewSnapshot) so the first think decides
+   * directly — collapsing the fast path to a single think and saving a think
+   * on every scrum's opening round. Later steps just note loop position;
+   * AgentAbject already injects goal context via `buildGoalProgressContext`.
    */
   private async handleObserve(msg: AbjectMessage): Promise<{ observation: string }> {
     const { taskId, step } = msg.payload as { taskId: string; step: number };
     if (step === 0) {
+      // Deliver the goal-state snapshot up front so the first think decides
+      // directly — no separate review_scrum round-trip. This collapses the
+      // fast path to a single think (quick_dispatch) and saves a think on
+      // every scrum's first round.
+      const goalId = await this.lookupGoalIdForOTATask(taskId);
+      const snap = goalId ? await this.buildReviewSnapshot(goalId) : { error: 'goal not resolved yet' };
+      if ('data' in snap) {
+        return {
+          observation:
+            `Scrum for this goal. Its full state is below — you already have it, so decide your action directly (no need to call review_scrum first):\n\n` +
+            `${JSON.stringify(snap.data, null, 2)}\n\n` +
+            `Choose ONE action now: if \`quickDispatchAvailable\` is set and the goal is a single obvious step one \`team\` agent covers, \`quick_dispatch\`; otherwise \`poll_team\` to learn capabilities, \`add_task\`(+\`dispatch_scrum\`) to plan, \`complete_goal\` if already satisfied, or \`fail_goal\` if unreachable.`,
+        };
+      }
+      // Snapshot unavailable (goal not resolvable yet) — fall back to the
+      // explicit review action rather than guessing.
       return {
-        observation: `Beginning scrum for OTA task ${taskId.slice(0, 8)}. Your first action MUST be review_scrum (look at goal context, completed/failed tasks, scratchpad). Then decide: complete_goal, plan via add_task+dispatch_scrum, or fail_goal.`,
+        observation: `Beginning scrum for OTA task ${taskId.slice(0, 8)}. Call review_scrum to load goal state, then decide: quick_dispatch, plan via add_task+dispatch_scrum, complete_goal, or fail_goal.`,
       };
     }
     return {
@@ -565,7 +619,7 @@ export class ScrumMaster extends Abject {
         // straight to `done` from the thinking phase). Their side effects
         // execute in the `taskResult` listener via executeTerminalAction.
         default:
-          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum.` };
+          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch.` };
       }
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -621,6 +675,9 @@ export class ScrumMaster extends Abject {
       case 'dispatch_scrum':
         await this.commitDispatchScrum(otaTaskId, goalId);
         return;
+      case 'quick_dispatch':
+        await this.commitQuickDispatch(goalId, normalized);
+        return;
       default:
         // Non-terminal lastAction — nothing to commit. Means the OTA hit
         // maxSteps or errored without a clean terminal. Log so we can see it.
@@ -651,16 +708,30 @@ export class ScrumMaster extends Abject {
   // ─── Action: review_scrum ─────────────────────────────────────────
 
   /**
-   * Returns a structured snapshot of the goal: title, description, completed
-   * tasks (with results), failed tasks (with errors), scratchpad keys+values,
-   * team roster. AgentAbject already injects much of this into the prompt,
-   * but having an explicit action result lets the LLM "look at state" as a
-   * deliberate first step before deciding.
+   * `review_scrum` action wrapper. The snapshot is now also delivered up
+   * front in the first observation (see handleObserve), so the LLM rarely
+   * needs to call this — it stays available as an explicit mid-scrum refresh.
    */
   private async actReviewScrum(
     goalId: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
-    if (!this.goalManagerId || !this.agentAbjectId) return { success: false, error: 'Dependencies unavailable' };
+    const snap = await this.buildReviewSnapshot(goalId);
+    if ('error' in snap) return { success: false, error: snap.error };
+    return { success: true, data: snap.data };
+  }
+
+  /**
+   * Build the goal-state snapshot the scrum LLM decides from: title,
+   * description, completed tasks, failed tasks (with errors), scratchpad,
+   * team roster with capability summaries, quickDispatchAvailable, and
+   * recalled knowledge + applicable patterns. Delivered in the opening
+   * observation so the first think can act directly (no separate review
+   * round-trip), and also returned by the review_scrum action for refreshes.
+   */
+  private async buildReviewSnapshot(
+    goalId: string,
+  ): Promise<{ data: Record<string, unknown> } | { error: string }> {
+    if (!this.goalManagerId || !this.agentAbjectId) return { error: 'Dependencies unavailable' };
 
     const goal = await this.request<{
       title: string; description: string; status: string; currentScrumNumber: number;
@@ -668,7 +739,7 @@ export class ScrumMaster extends Abject {
     } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     );
-    if (!goal) return { success: false, error: 'Goal not found' };
+    if (!goal) return { error: 'Goal not found' };
 
     const allTasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
       request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
@@ -676,17 +747,28 @@ export class ScrumMaster extends Abject {
     const completed = allTasks.filter(t => t.fields.status === 'done');
     const failed = allTasks.filter(t => t.fields.status === 'permanently_failed');
 
-    // Names only — capabilities are dynamic and live in each agent's askPrompt.
-    // Static manifest descriptions are stale for any agent whose capabilities
-    // are runtime-configurable (SkillAgent's installed skills, MCPBridge's
-    // tool list). The planner should call `poll_team` (which uses the ask
-    // protocol) when it needs to know what agents can actually do.
+    // Roster WITH descriptions. listAgents returns each agent's REGISTRATION
+    // description, which is live: SkillAgent rebuilds it from its enabled
+    // skills + connected MCP servers and re-registers on every change, so
+    // this snapshot reflects current capabilities (unlike the static manifest
+    // description). It is a coarse summary — enough to recognize an obvious
+    // single-agent match for the quick_dispatch fast path — while `poll_team`
+    // remains the deep, live capability probe for anything non-obvious.
     const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
-    const eligibleTeamNames = team
-      .filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster')
-      .map(a => a.name);
+    const eligible = team.filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster');
+    const teamRoster = eligible.map(a => ({ name: a.name, description: (a.description ?? '').slice(0, 300) }));
+
+    // Offer quick_dispatch only on the very first look at a fresh goal (no
+    // scrum round has planned or run anything yet) and only when this goal
+    // hasn't already fallen back to full planning. After any task runs, the
+    // goal is past the shortcut and plans normally.
+    const quickDispatchAvailable =
+      (goal.currentScrumNumber ?? 0) === 0
+      && completed.length === 0
+      && failed.length === 0
+      && !this.forceFullScrum.has(goalId);
 
     const scratchpad = goal.scratchpad ?? {};
     const scratchpadSummary: Record<string, string> = {};
@@ -723,7 +805,6 @@ export class ScrumMaster extends Abject {
     }
 
     return {
-      success: true,
       data: {
         goal: {
           title: goal.title,
@@ -743,7 +824,8 @@ export class ScrumMaster extends Abject {
           assignedAgentId: (t.fields.assignedAgentId as string ?? '').slice(0, 8),
         })),
         scratchpad: scratchpadSummary,
-        teamNames: eligibleTeamNames,
+        team: teamRoster,
+        ...(quickDispatchAvailable ? { quickDispatchAvailable: true } : {}),
         relevantKnowledge,
         ...(applicablePatterns.length > 0 ? { applicablePatterns } : {}),
       },
@@ -1266,6 +1348,117 @@ Rules:
    * we can't surface the error back to it, but the goal will eventually
    * stall and GoalObserver's staleness backstop handles it.
    */
+  // ─── Fast path: quick_dispatch (single task, no planning scrum) ────
+
+  /**
+   * Commit a `quick_dispatch`: send ONE task straight to one agent and skip
+   * the whole planning cycle (no poll_team / add_task / dispatch_scrum, and
+   * no second review). The goal is marked one-shot; its single task's
+   * `goalReadyForCompletion` completes the goal directly on success, or falls
+   * into a normal review scrum on failure (see the changed handler).
+   *
+   * Validation is defensive: the LLM picked `agentName` from the roster
+   * `review_scrum` just handed it, so a miss means the agent vanished in the
+   * intervening seconds — rare. On any miss we re-run a normal scrum with the
+   * quick_dispatch offer suppressed, so a bad shortcut degrades to planning
+   * rather than dead-ending.
+   */
+  private async commitQuickDispatch(goalId: string, action: Record<string, unknown>): Promise<void> {
+    if (!this.goalManagerId || !this.agentAbjectId) return;
+
+    const agentName = action.agentName as string | undefined;
+    const task = action.task as string | undefined;
+    const target = (action.target ?? action.objectName ?? action.objectId) as string | undefined;
+
+    if (!agentName || !task) {
+      log.warn(`quick_dispatch missing agentName/task for goal ${goalId.slice(0, 8)} — falling back to full scrum`);
+      await this.fallBackToFullScrum(goalId);
+      return;
+    }
+
+    const team = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
+      request(this.id, this.agentAbjectId, 'listAgents', {}),
+    );
+    const agent = team.find(a => a.name === agentName && a.canExecute !== false && a.name !== 'ScrumMaster' && a.name !== 'Chat');
+    if (!agent) {
+      log.warn(`quick_dispatch to unknown agent "${agentName}" for goal ${goalId.slice(0, 8)} — falling back to full scrum`);
+      await this.fallBackToFullScrum(goalId);
+      return;
+    }
+
+    const { scrumNumber } = await this.request<{ scrumNumber: number }>(
+      request(this.id, this.goalManagerId, 'startNextScrum', { goalId }),
+    );
+    const taskId = await this.dispatchSingleTask(goalId, agent.agentId, task, scrumNumber, target);
+    if (!taskId) {
+      await this.fallBackToFullScrum(goalId);
+      return;
+    }
+
+    this.oneShotGoals.set(goalId, { taskId, agentId: agent.agentId });
+    const targetNote = target ? ` →${target}` : '';
+    log.info(`quick_dispatch: goal ${goalId.slice(0, 8)} → single task to ${agentName}${targetNote} (no planning scrum)`);
+    this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: 1 });
+  }
+
+  /**
+   * addTask + enqueueTask for one directly-assigned task. The tuple carries
+   * `dispatchTupleId`, so on termination AgentAbject reports back through
+   * completeTask/failTask and the goal's `goalReadyForCompletion` fires — the
+   * same accounting the normal dispatch path relies on.
+   */
+  private async dispatchSingleTask(
+    goalId: string, agentId: AbjectId, description: string, scrumNumber: number, target?: string,
+  ): Promise<string | undefined> {
+    const addResult = await this.request<{ taskId?: string; error?: string }>(
+      request(this.id, this.goalManagerId!, 'addTask', {
+        goalId, description, assignedAgentId: agentId, scrumNumber,
+      }),
+    );
+    if (!addResult.taskId) {
+      log.warn(`dispatchSingleTask addTask failed for goal ${goalId.slice(0, 8)}: ${addResult.error ?? 'unknown'}`);
+      return undefined;
+    }
+    await this.request(
+      request(this.id, this.agentAbjectId!, 'enqueueTask', {
+        agentId,
+        task: description,
+        taskId: addResult.taskId,
+        goalId,
+        dispatchTupleId: addResult.taskId,
+        data: target ? { target } : undefined,
+      }),
+    );
+    return addResult.taskId;
+  }
+
+  /** Complete a one-shot goal directly with its single task's result — no LLM. */
+  private async completeOneShotGoal(goalId: string, taskId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+    ).catch(() => null);
+    // completeTask mirrors the agent's result to this scratchpad key; use it
+    // verbatim as the goal result (the creator composes the user-facing reply).
+    const result = goal?.scratchpad?.[`tasks/${taskId}/result`] ?? 'Done.';
+    await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result }));
+    log.info(`quick_dispatch complete: goal ${goalId.slice(0, 8)} finished in one task (no planning scrum)`);
+  }
+
+  /**
+   * Re-run a normal planning scrum for a goal whose quick_dispatch could not
+   * commit. Clears the round-0 idempotency guard (the first scrum already
+   * consumed it) and suppresses the quick_dispatch offer so the re-review
+   * plans normally instead of looping on the same shortcut.
+   */
+  private async fallBackToFullScrum(goalId: string): Promise<void> {
+    this.forceFullScrum.add(goalId);
+    this.scrummedRounds.delete(`${goalId}#0`);
+    await this.enqueueScrumTask(goalId, 0).catch(err =>
+      log.warn(`fallBackToFullScrum(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
+    );
+  }
+
   private async commitDispatchScrum(otaTaskId: string, goalId: string): Promise<void> {
     if (!this.goalManagerId || !this.agentAbjectId) return;
 
@@ -1414,27 +1607,30 @@ Rules:
 2. The sprint needs more work — call \`add_task\` (one or more times to stage), then \`dispatch_scrum\` to commit.
 3. The sprint is unreachable — call \`fail_goal({ reason })\`.
 
-## Mandatory first action
+## Your first action
 
-Your FIRST action every scrum is \`review_scrum\` (no parameters). It returns the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, and the team roster. **Do not skip this.** You must look at state before deciding.
+The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
 
 ## Action vocabulary
 
-### \`review_scrum\` — MANDATORY first action
-No parameters. Returns:
+### \`review_scrum\` — optional state refresh
+No parameters. Returns the same snapshot you were already given in the opening observation (goal, completed/failed tasks, scratchpad, team, quickDispatchAvailable, relevantKnowledge, applicablePatterns). You normally don't need it, since the snapshot is delivered up front; use it only to re-read state after taking an intermediate action. Shape:
 \`\`\`json
 {
   "goal": { "title", "description", "currentScrumNumber", "status" },
   "completed": [{ "description", "producesKeys", "assignedAgentId" }, ...],
   "failed": [{ "description", "error", "assignedAgentId" }, ...],
   "scratchpad": { "key": "value", ... },
-  "teamNames": ["<AgentName>", "<AgentName>", ...],
+  "team": [{ "name": "<AgentName>", "description": "<what it does>" }, ...],
+  "quickDispatchAvailable": true,
   "relevantKnowledge": [{ "id", "title", "type", "tags", "content" }, ...],
   "applicablePatterns": [{ "id", "title", "content", "via" }, ...]
 }
 \`\`\`
 
-\`teamNames\` is just a list of valid agent names you can pass to \`add_task\`'s \`assignedAgentName\` field — the names ALONE do not tell you what each agent can do. To learn capabilities, call \`poll_team\` (which uses the ask protocol — every agent's reply describes its current tools, skills, and MCP servers). Static manifest descriptions are not exposed here because they're stale for any agent whose capabilities are configurable at runtime.
+\`team\` lists each agent with its live capability summary (kept current as skills and MCP servers come and go). The summaries are enough to recognize when one agent obviously owns a request; they are a coarse summary, not a full tool signature, so when the right agent isn't obvious from the descriptions — or you need to confirm a specific tool/skill/MCP is installed RIGHT NOW — call \`poll_team\`, which asks agents directly and returns their detailed live replies. Pass an agent's \`name\` to \`add_task\`'s \`assignedAgentName\` or to \`quick_dispatch\`.
+
+\`quickDispatchAvailable\` appears only on the first look at a fresh goal. When it's present and the goal is a SINGLE concrete step that one agent's \`team\` description clearly covers, skip planning entirely and emit \`quick_dispatch\` (see below). When the goal needs multiple steps, coordination, verification, or the right agent isn't obvious, plan normally instead.
 
 The \`relevantKnowledge\` array holds prior lessons retrieved from KnowledgeBase via full-text search against the goal description. **Read it carefully** — past sprints may have already discovered the right Abject, tool, or approach for this kind of goal. If a cached entry already names the right agent + method for what the user is asking, plan tasks that use that mapping directly instead of polling the team again. Each entry's \`id\` lets you call \`forget_knowledge\` if the entry turns out to be wrong.
 
@@ -1446,7 +1642,7 @@ Asks selected team members via the ask protocol. **This is how you learn what ea
 - The goal needs work AND \`relevantKnowledge\` doesn't already tell you which agent has the right capability.
 - You're tempted to guess based on agent name alone — agent names alone do not tell you whether the relevant capability is currently installed and connected. Many agents have runtime-configurable capabilities (skills, connected services, registered Abjects they can call). Polling is the way to find out what each can actually do RIGHT NOW.
 
-Restrict via \`members\` when you can narrow the candidate set to a couple of plausible names from \`teamNames\`. Polling all agents in parallel is a few seconds slower than polling 2-3.
+Restrict via \`members\` when you can narrow the candidate set to a couple of plausible names from \`team\`. Polling all agents in parallel is a few seconds slower than polling 2-3.
 
 **When to skip the poll**:
 - The goal is satisfied — go straight to \`complete_goal\`.
@@ -1459,7 +1655,7 @@ Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the 
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong. **Carry the goal's key requirement phrases through VERBATIM** (quote them): a paraphrase softens the requirement into something weaker that an agent can satisfy with an imitation — "use 3D graphics" rewritten as "a 3D presentation" invites a flat perspective drawing; "delete the old entries" rewritten as "clean up" invites archiving. Outcome wording is yours; the requirement words stay the user's.
-- \`assignedAgentName\`: must match a name in the team roster (from \`review_scrum\`).
+- \`assignedAgentName\`: must match a \`name\` in the \`team\` roster (from the goal state in your opening observation).
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: array of indices into THIS scrum's prior add_task calls (0-indexed). Omit for default sequential (each task waits on the previous). Pass \`[]\` for parallel-eligible.
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
@@ -1490,7 +1686,16 @@ Calling \`complete_goal\` after \`add_task\` cleanly abandons the staged batch (
 ### \`fail_goal({ reason })\` — TERMINAL error
 Declare the goal unreachable. Use when no team member can contribute and replanning won't help.
 
-**Also fail here to break a loop.** When \`review_scrum\` carries a \`loopWarning\` (the goal has run several rounds with accumulating failures) and the recent rounds keep dispatching the same kind of task against the same target with the same failure, another retry will not help. Stop and \`fail_goal\` with a precise diagnosis: the recurring failure, what was already tried across rounds, and the concrete change that would unblock it (often a fix in platform code, or a capability the team genuinely lacks). A clear failure the user can act on beats an endless "final attempt" loop.
+**Also fail here to break a loop.** When the goal state carries a \`loopWarning\` (the goal has run several rounds with accumulating failures) and the recent rounds keep dispatching the same kind of task against the same target with the same failure, another retry will not help. Stop and \`fail_goal\` with a precise diagnosis: the recurring failure, what was already tried across rounds, and the concrete change that would unblock it (often a fix in platform code, or a capability the team genuinely lacks). A clear failure the user can act on beats an endless "final attempt" loop.
+
+### \`quick_dispatch({ agentName, task, target? })\` — TERMINAL success (fast path)
+Offered only when the goal state shows \`quickDispatchAvailable\`. Send ONE task straight to one agent and skip the entire planning cycle — no \`poll_team\`, no \`add_task\`, no \`dispatch_scrum\`, and no second review. On success the goal completes automatically with the agent's result; if the single task fails, a normal planning scrum picks it up with the failure in view, so a wrong guess costs only one attempt.
+
+Use it when the request is a single concrete step that one agent's \`team\` description clearly covers — e.g. calling an existing object's method, one lookup, one navigation. Reach for the normal \`add_task\` + \`dispatch_scrum\` flow instead when the goal spans multiple steps, needs coordination or a verification round, or the right agent isn't obvious from the descriptions (poll first).
+
+- \`agentName\`: a \`name\` from the \`team\` roster.
+- \`task\`: the full, self-contained task description, written the same way an \`add_task\` description is (state the outcome; carry the user's requirement phrases through verbatim).
+- \`target\`: OPTIONAL concrete object the task operates on (prefer a registered name over a UUID), same meaning as \`add_task\`'s \`target\`.
 
 ### \`dispatch_scrum\` — TERMINAL success
 Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.
@@ -1537,17 +1742,16 @@ Returns \`{ id, forgotten: true }\` on success.
 
 ## Decision flow
 
-**First scrum (currentScrumNumber=0):**
-1. \`review_scrum\` to read goal description, team names, and any relevant cached knowledge.
-2. Decide: do I already know which agent has the right capability?
+**First scrum (currentScrumNumber=0):** the goal state (description, \`team\` roster with capability summaries, cached knowledge) is already in your opening observation. Act directly:
+1. **Is this a single step one agent obviously owns?** If \`quickDispatchAvailable\` is set and one \`team\` description clearly covers the whole request in one action (call a method on an existing object, one lookup, one navigation) → \`quick_dispatch({ agentName, task })\` and you're done. This is the common case for small requests; don't spin up a full sprint for them.
+2. Otherwise decide: do I already know which agent has the right capability?
    - **YES** (cached lesson in \`relevantKnowledge\` names the agent + tool, or the goal is so generic any agent fits) → \`add_task\` directly, then \`dispatch_scrum\`.
    - **NO** → \`poll_team\` (often restricted via \`members\` to plausible candidates) to learn current capabilities. Read each contribution: which agent reported owning the relevant tool/skill/MCP? \`add_task\` to that agent, then \`dispatch_scrum\`. Save what you learned via \`save_knowledge\` before \`complete_goal\` later so the next sprint skips the poll.
 
 Do NOT guess based on agent name alone. The relevant capability may or may not be installed/connected/registered for any given agent at this moment — agents with runtime-configurable capabilities only own a capability if their ask reply confirms it. The poll resolves the ambiguity.
 
-**Subsequent scrum (currentScrumNumber>0):**
-1. \`review_scrum\` to see completed tasks, scratchpad, and \`relevantKnowledge\`.
-2. Decide based on what you see:
+**Subsequent scrum (currentScrumNumber>0):** the completed tasks, scratchpad, and \`relevantKnowledge\` are already in your opening observation.
+1. Decide based on what you see:
    - User's intent durably satisfied AND the outcome holds → if you learned something durable (tool/provider mapping, pattern, user fact), call \`save_knowledge\` first, THEN \`complete_goal\` with a self-contained synthesis built from scratchpad data. **No team poll needed for review-only scrums.** A task reporting \`done\` means that task's work finished — it is the agent's claim, not proof the goal is achieved. Before completing, confirm the goal's user-visible outcome actually holds (e.g. a \`windowVisible: true\` self-report or "should now work" is a claim; for "something is broken / not working" goals, look for evidence the symptom is genuinely gone).
    - A completed task describes its result as a temporary or runtime workaround, flags it as unverified, notes it would regress on restart, or recommends durable follow-up work → the goal is NOT yet done. Stage that durable follow-up: \`add_task\` to the agent whose capability can change the underlying object itself (its source/definition, so the fix survives a restart), then \`dispatch_scrum\`. Honor an executing agent's own recommendation for a durable fix rather than discarding it at completion — a transient runtime call changes state only until the next restart, while the durable fix changes the thing that was broken.
    - Failed tasks need correction → \`add_task\` with corrective work, possibly polling specific agents first if approach is unclear, then \`dispatch_scrum\`. If a cached \`relevantKnowledge\` entry led the prior round astray, \`forget_knowledge\` it before planning the corrective task.
@@ -1564,7 +1768,7 @@ Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad c
 ## Rules
 
 - Output ONE action per cycle as JSON in a \`\`\`json\`\`\` block. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the JSON's \`reasoning\` field.
-- Always start with \`review_scrum\`. Never poll the team or plan tasks before reviewing.
+- The goal state is delivered up front — read the opening observation, then act. \`review_scrum\` is only an optional mid-scrum refresh, not a required first step.
 - Don't poll the team if you can already decide from the scratchpad. Polling is expensive.
 - Multiple \`add_task\` calls = multiple OTA cycles. Each call stages one task; \`dispatch_scrum\` commits the batch.
 - Prefer 1-3 tasks per scrum unless work is naturally parallelizable.
