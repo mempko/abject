@@ -634,7 +634,11 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
     }
     // Hiding the widget must hide its layer too — the layer lives in the
     // scene graph, not in the widget render pass that visibility gates.
-    if (updates.visible !== undefined && this.layerReady) {
+    // Visibility arrives either top-level or as style.visible (the common
+    // widget shape); both must sync the layer or a style-hidden canvas
+    // keeps its stale pixels on screen.
+    const styleVisible = (updates.style as { visible?: boolean } | undefined)?.visible;
+    if ((updates.visible !== undefined || styleVisible !== undefined) && this.layerReady) {
       void this.request(
         request(this.id, this.ownerId, 'scene', { ops: [
           { op: 'update', id: this.layerNodeId, params: { opacity: this.visible ? 1 : 0 } },
