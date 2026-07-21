@@ -263,6 +263,15 @@ export class Chat extends Abject {
   /** Current goal ID for the active task. */
   private _currentGoalId?: string;
 
+  /**
+   * Whether a goal was created during the current turn. A `done` that reports
+   * an action or a verified outcome must be backed by a goal; if none ran this
+   * turn, the reply is ungrounded (the model confabulated it). Reset at the
+   * start of each turn, set true when the `goal` action creates one, and read
+   * after the task to decide whether to run the self-audit re-prompt.
+   */
+  private _goalCreatedThisTurn = false;
+
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
   private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
@@ -1249,6 +1258,7 @@ export class Chat extends Abject {
         );
         goalId = created.goalId;
         this._currentGoalId = goalId;
+        this._goalCreatedThisTurn = true;
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -1334,7 +1344,7 @@ export class Chat extends Abject {
 
 Work already done — check here BEFORE creating a goal, and build on these outcomes instead of repeating them:
 ${this.recentGoalOutcomes.map(g => `- [${g.status}] "${g.title}"${g.resultPreview ? ` — ${g.resultPreview}` : ''}`).join('\n')}`;
-    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents.
+    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents. You do not carry out actions yourself; you route them.
 
 Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.${recentGoalsBlock}
 
@@ -1351,6 +1361,16 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 \`\`\`json
 { "action": "done", "text": "Hello! How can I help you?" }
 \`\`\`
+
+## You route, you do not act (and you cannot see)
+
+You have no hands and no eyes in this system. You cannot navigate a slide, open or move a window, click anything, change anything, or look at the screen, any window, or any live state. Every real action and every real observation happens inside a **goal** you create: the goal runs on the agents, and the result it returns is your ONLY source of truth about what actually happened.
+
+So:
+- Report only what a goal returned this turn. If you created no goal, nothing has happened yet, so there is nothing to confirm.
+- Make claims about the real world only from a goal result. "Done", "you're now on slide 11", "it's open", "moved it", "verified on the live window" all assert that something really happened. State them only when a goal you created returned that outcome. Never invent a status, a screen reading, a nav-bar value, or a verification.
+- Treat a repeat-looking request as its own action. Earlier turns are history, not proof the new action occurred. "Now take me to slide 11" is a fresh navigation: create the goal, then report what it returns.
+- When you cannot ground a claim in a goal result, create the goal, or say plainly what you are doing or asking. Do not narrate an outcome you did not observe.
 
 ## Available Actions
 
@@ -1393,6 +1413,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
   \`{ "action": "reply", "text": "Working on it, I've created the goal..." }\`
 - **done**: Task complete, send final reply. The user can only see what you put in the done text.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
+  Everything you assert in done text about an action or an outcome must trace to a goal result from this conversation. With no goal run this turn, done text may greet, answer from known facts, or acknowledge and ask, but it may not claim an action happened or was verified. If the user asked you to DO something and you have no goal result yet, you are not done: create the goal instead.
   When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity; the result fits.
 
   **Self-contained text rule.** The done text is the user's ONLY view of the result. Do not reference internal artifacts the user can't see — no "see above", "see the prioritized list", "see scratchpad", "see goal X", "see the attached", "as shown earlier". The user has not seen anything earlier; they only see this reply. If the goal result or scratchpad contains a list, table, or detailed data the user asked for, INLINE it directly in the done text. Pull values out of the scratchpad and write them into your reply.
@@ -1461,7 +1482,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
 1. Always respond with valid JSON in a \`\`\`json block. ONE action per response. Never reply with bare prose — even your final answer must be wrapped in \`{ "action": "done", "text": "..." }\`.
 2. For simple greetings, use **done** directly. For questions about objects or the system, create a **goal** to investigate rather than guessing. You do not have knowledge of what objects exist or what they can do. Always use the system to find out.
-3. When the user asks you to do something, create a **goal** immediately with well-described tasks.
+3. When the user asks you to DO something (navigate, open, show, move, change, fetch, run, take me to), create a **goal** immediately with well-described tasks, even when the request looks like a repeat of an earlier turn. You cannot do it yourself, and you cannot see whether it happened; the goal is the only way it happens and the only way you learn the outcome. Report the outcome only from what that goal returns.
 4. **Trust the team to try.** Your toolset is dynamic — agents and MCP-backed skills come and go (email, calendar, contacts, finance, web, etc.). When the user asks for concrete data or an action, your first move is always a goal. Report capability limits only after a real goal has run and produced a real failure — then quote that failure and offer to create the missing agent.
 
    This applies to confident-sounding capability claims about the OUTSIDE world too. Predictions about how an external service will react ("site X blocks headless browsers", "Y rate-limits aggressively", "the API has restrictive scopes", "browser automation is fragile and ToS-adjacent", "no LinkedIn/Gmail/bank integration is possible") are training-data speculation, not evidence. Keep them out of your reply.
@@ -2078,6 +2099,66 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.runChatTask(text);
   }
 
+  /**
+   * Run one Chat OTA turn: start the task, wait for its terminal result, and
+   * report whether a goal was created during it. Resets the per-turn goal flag
+   * so the self-audit can tell a grounded reply (goal ran) from a confabulated
+   * one (no goal). `messages` is the full LLM-visible conversation for this
+   * turn; `task` stays the raw user text so the KB recall query is stable.
+   */
+  private async runTaskTurn(
+    userText: string,
+    messages: { role: string; content: string | ContentPart[] }[],
+  ): Promise<{ success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean }> {
+    this._goalCreatedThisTurn = false;
+    this._currentGoalId = undefined;
+    this._streamBuffer = '';
+    const { ticketId } = await this.request<{ ticketId: string }>(
+      request(this.id, this.agentAbjectId!, 'startTask', {
+        task: userText,
+        systemPrompt: this.buildSystemPrompt(),
+        initialMessages: messages,
+        goalId: undefined,
+        config: { queueName: `chat-${this.id}` },
+      }),
+      60000,
+    );
+    this._currentTicketId = ticketId;
+    const result = await this.waitForTaskResult(ticketId, 180000);
+    this._currentTicketId = undefined;
+    this._currentGoalId = undefined;
+    return {
+      success: result.success,
+      result: result.result,
+      error: result.error,
+      maxStepsReached: result.maxStepsReached,
+      goalCreated: this._goalCreatedThisTurn,
+    };
+  }
+
+  /**
+   * Cheap prefilter for the self-audit: does this reply assert that an action
+   * was performed, report live/UI state, or claim a verification — things Chat
+   * can only truthfully know from a goal it ran? Greetings, questions, and
+   * answers built from given facts won't match, so they skip the extra check.
+   * This only decides whether the one audit re-prompt is worth running; the
+   * model makes the real call there. It is a soft prefilter, not a hard block.
+   */
+  private mightBeUngroundedClaim(text: string): boolean {
+    return /\b(verified|you'?re now|it'?s now|now on the|nav ?bar reads|on the live (?:window|deck|screen)|i'?ve (?:now|just)?|i have (?:now|just)|navigated|opened it|moved it|switched to|toggled|scrolled to|set it to|changed it to|updated the|refreshed the)\b/i.test(text)
+      || /\bdone\s*[—-]/i.test(text);
+  }
+
+  /**
+   * The audit re-prompt. Hands the model its own drafted reply and asks it to
+   * either ground the claim by creating a real goal, or confirm the reply if
+   * it was only conversational. Leans on the model's ability to recognize its
+   * own ungrounded claim when asked point-blank.
+   */
+  private buildAuditPrompt(draft: string): string {
+    return `Before this reply reaches the user, audit it:\n\n"${draft}"\n\nYou created NO goal this turn, so you did not actually perform any action or observe any live state. Does this reply claim an action was done, report the state of a window/screen/deck, or say something was "verified"? If YES, you cannot know that without a goal — respond now with a \`goal\` action that actually performs what the user asked, and report the real outcome only after it runs. If the reply is only a greeting, a question, or an answer built from facts already in this conversation, it's fine — respond with the same \`done\` unchanged.`;
+  }
+
   private async runChatTask(userText: string): Promise<void> {
     if (this.uiPhase === 'closed') return;
     this.uiPhase = 'busy';
@@ -2137,27 +2218,27 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Goal is created on the first `goal` action — Chat creates it via
       // GoalManager.createGoal, ScrumMaster runs the scrum cycle (plan,
       // execute, plan again or declare done), and emits goalCompleted.
-      this._currentGoalId = undefined;
-      const goalId = undefined;
+      let turn = await this.runTaskTurn(userText, initialMessages);
 
-      // Submit task — returns ticketId immediately
-      this._streamBuffer = '';
-      const { ticketId } = await this.request<{ ticketId: string }>(
-        request(this.id, this.agentAbjectId!, 'startTask', {
-          task: userText,
-          systemPrompt: this.buildSystemPrompt(),
-          initialMessages,
-          goalId,
-          config: { queueName: `chat-${this.id}` },
-        }),
-        60000,
-      );
-      this._currentTicketId = ticketId;
+      // Self-audit: a `done` that reports an action or a verified outcome but
+      // ran NO goal this turn is ungrounded — the model can't have done or
+      // observed anything without a goal, so it confabulated. Re-prompt once,
+      // letting the model catch its own claim and route it as a real goal.
+      // Scoped to goal-less, claim-shaped replies so greetings/answers skip it.
+      if (turn.success && !turn.goalCreated) {
+        const draft = (turn.result as string) ?? '';
+        if (draft && this.mightBeUngroundedClaim(draft)) {
+          log.info('[Chat] self-audit: goal-less claim-shaped reply — re-prompting to ground or route');
+          const auditMessages = [
+            ...initialMessages,
+            { role: 'assistant', content: draft },
+            { role: 'user', content: this.buildAuditPrompt(draft) },
+          ];
+          turn = await this.runTaskTurn(userText, auditMessages);
+        }
+      }
 
-      // Wait for taskResult event
-      const result = await this.waitForTaskResult(ticketId, 180000);
-      this._currentTicketId = undefined;
-      this._currentGoalId = undefined;
+      const result = turn;
 
       // Post-task UI cleanup.
       await this.removeActivityBubble();

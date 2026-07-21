@@ -3314,6 +3314,12 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         correction = '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
       }
       entry.state.llmMessages.push({ role: 'user', content: correction });
+      // Log the actual unparseable content (preview) — otherwise a response
+      // that reparse-corrects on retry never surfaces WHAT the model emitted,
+      // making a recurring per-turn reparse (e.g. a reasoning model prefixing
+      // prose before its JSON) impossible to diagnose from the logs.
+      const failKind = hallucinatedTools ? 'xml-tool-calls' : pureProse ? 'pure-prose' : 'malformed-json';
+      log.warn(`[parse] unparseable LLM response (${failKind}, attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES}): "${content.trim().replace(/\s+/g, ' ').slice(0, 240)}${content.trim().length > 240 ? '…' : ''}"`);
       return { action: '_reparse', reasoning: `Retrying after unparseable response (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
     }
 
