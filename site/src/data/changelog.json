@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.8.23",
+    "date": "2026-07-21",
+    "title": "Hidden Means Hidden",
+    "summary": "A small maintenance release for the canvas compositor: hiding a layer now truly hides it. If a window or widget sets itself invisible, nothing from it lingers on screen.",
+    "highlights": [],
+    "fixes": [
+      "Canvas layers now honor style.visible when hiding, so content marked invisible no longer keeps rendering after its window is hidden"
+    ]
+  },
+  {
     "version": "0.8.22",
     "date": "2026-07-20",
     "title": "A Pattern Language Takes Root",
