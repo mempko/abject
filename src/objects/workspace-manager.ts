@@ -879,7 +879,7 @@ export class WorkspaceManager extends Abject {
         request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
       );
       if (results.length > 0) {
-        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode }));
+        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode, whitelist: ws.whitelist }));
       }
     } catch { /* SharedState not available yet */ }
 
@@ -927,6 +927,22 @@ export class WorkspaceManager extends Abject {
       workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
       exposedObjectIds: ws.exposedObjectIds,
     });
+
+    // Notify SharedState of the new whitelist so private-mode outbound sync
+    // targets stay in step with the whitelist (a change while already private
+    // would otherwise leave SharedState broadcasting to a stale peer set).
+    if (ws.accessMode === 'private') {
+      try {
+        const results = await this.request<Array<{ id: AbjectId }>>(
+          request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
+        );
+        if (results.length > 0) {
+          this.send(event(this.id, results[0].id, 'setAccessMode', {
+            accessMode: ws.accessMode, whitelist: ws.whitelist,
+          }));
+        }
+      } catch { /* SharedState not available yet */ }
+    }
 
     return true;
   }
@@ -1439,7 +1455,7 @@ export class WorkspaceManager extends Abject {
         request(this.id, info.registryId, 'discover', { name: 'SharedState' })
       );
       if (results.length > 0) {
-        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode }));
+        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode, whitelist }));
       }
     } catch { /* SharedState not spawned yet */ }
 

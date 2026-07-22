@@ -110,6 +110,13 @@ export class SharedState extends Abject {
   /** Workspace access mode. Local workspaces never sync over P2P. */
   private _accessMode: 'local' | 'private' | 'public' = 'local';
 
+  /**
+   * Peer IDs allowed to sync when the workspace is `private`. Kept in step with
+   * WorkspaceManager via setAccessMode/setWhitelist notifications. Ignored in
+   * `public` mode (all peers) and `local` mode (no peers).
+   */
+  private _whitelist: string[] = [];
+
   // Named state maps — each subscriber group gets its own CRDT map
   private stateMaps: Map<string, LWWMap> = new Map();
   // Track subscribers per state name
@@ -120,6 +127,13 @@ export class SharedState extends Abject {
   // Remote SharedState instances discovered via WSR + remote registries
   // Key: remote SharedState AbjectId string, Value: AbjectId
   private remotePeers: Map<string, AbjectId> = new Map();
+
+  // Owner peerId of each discovered remote SharedState (by AbjectId string).
+  // Populated during discovery, where the workspace's ownerPeerId is known.
+  // Peers added via inbound bidirectional links have no entry here — those
+  // senders already passed our inbound whitelist gate (PeerRouter), so they
+  // are safe to sync with in private mode.
+  private remotePeerOwners: Map<string, string> = new Map();
 
   // Discovery debounce
   private discoveryTimer?: ReturnType<typeof setTimeout>;
@@ -300,8 +314,9 @@ export class SharedState extends Abject {
       } else if (isNewName && this.remotePeers.size > 0) {
         // Discovery already ran — request sync from known remote peers for the new name.
         // This handles the case where Chat subscribes after discovery already completed.
-        log.info(`[${this.id.slice(0, 8)}] new name '${name}' after discovery — requesting sync from ${this.remotePeers.size} known peers`);
-        for (const remoteSSId of this.remotePeers.values()) {
+        const targets = this.syncTargets();
+        log.info(`[${this.id.slice(0, 8)}] new name '${name}' after discovery — requesting sync from ${targets.length} allowed peers`);
+        for (const remoteSSId of targets) {
           this.send(createEvent(this.id, remoteSSId, '_requestSync', {
             names: [name],
           }));
@@ -364,12 +379,12 @@ export class SharedState extends Abject {
 
       // Phase 4: Re-gossip if merge updated local state and hops remaining
       if (updated && propagationId && (hopsRemaining ?? 0) > 0) {
+        const allPeers = this.syncTargets().filter(id => id !== fromId);
         const fanout = Math.min(
           GOSSIP_FANOUT_BASE,
-          Math.max(1, Math.ceil(Math.log2(this.remotePeers.size + 1))),
-          this.remotePeers.size,
+          Math.max(1, Math.ceil(Math.log2(allPeers.length + 1))),
+          allPeers.length,
         );
-        const allPeers = Array.from(this.remotePeers.values()).filter(id => id !== fromId);
         const selected = this.selectRandom(allPeers, fanout);
         for (const remoteSSId of selected) {
           this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
@@ -450,18 +465,27 @@ export class SharedState extends Abject {
     });
 
     this.on('setAccessMode', async (msg: AbjectMessage) => {
-      const { accessMode } = msg.payload as { accessMode: 'local' | 'private' | 'public' };
+      const { accessMode, whitelist } = msg.payload as {
+        accessMode: 'local' | 'private' | 'public';
+        whitelist?: string[];
+      };
       const prev = this._accessMode;
       this._accessMode = accessMode;
-      log.info(`[${this.id.slice(0, 8)}] accessMode changed: ${prev} → ${accessMode}`);
+      if (whitelist !== undefined) this._whitelist = whitelist;
+      log.info(`[${this.id.slice(0, 8)}] accessMode changed: ${prev} → ${accessMode} (whitelist=${this._whitelist.length})`);
       if (accessMode === 'local' && prev !== 'local') {
         // Went local: clear all remote peers, stop syncing
         this.remotePeers.clear();
+        this.remotePeerOwners.clear();
         log.info(`[${this.id.slice(0, 8)}] cleared remote peers (workspace is now local)`);
       } else if (accessMode !== 'local' && prev === 'local') {
         // Went shared: trigger discovery
         this.scheduleDiscovery();
       }
+      // In private mode, drop any known-owner peers no longer on the whitelist
+      // (mode tightened public→private, or the whitelist shrank) so they stop
+      // receiving updates immediately, not just at the next send-time filter.
+      if (accessMode === 'private') this.prunePrivateNonWhitelisted();
     });
   }
 
@@ -608,6 +632,12 @@ export class SharedState extends Abject {
     for (const ws of discovered) {
       const registryId = ws.registryId as AbjectId;
       if (!registryId) continue;
+      // Private-mode outbound gate: never sync a private workspace's state to a
+      // peer that is not on its whitelist, even if we can see their workspace.
+      if (!this.peerAllowedForSync(ws.ownerPeerId)) {
+        log.info(`[${this.id.slice(0, 8)}] skipping non-whitelisted peer ${ws.ownerPeerId?.slice(0, 16)} (private mode)`);
+        continue;
+      }
 
       try {
         const queryResults = await this.request<Array<{ id: AbjectId }>>(
@@ -617,6 +647,7 @@ export class SharedState extends Abject {
           const remoteSSId = queryResults[0].id;
           if (remoteSSId !== this.id) {
             newRemotePeers.set(remoteSSId, remoteSSId);
+            this.remotePeerOwners.set(remoteSSId as string, ws.ownerPeerId);
           }
         }
       } catch {
@@ -637,6 +668,8 @@ export class SharedState extends Abject {
           const remoteSSId = queryResults[0].id;
           if (remoteSSId !== this.id) {
             newRemotePeers.set(remoteSSId, remoteSSId);
+            // Locally shared workspaces live on this same peer.
+            this.remotePeerOwners.set(remoteSSId as string, this.localPeerId);
           }
         }
       } catch {
@@ -656,6 +689,10 @@ export class SharedState extends Abject {
       // Disconnect event: replace remotePeers with fresh discovery results
       // to remove peers that are no longer reachable
       this.remotePeers = newRemotePeers;
+      // Drop owner entries for peers that are gone
+      for (const key of [...this.remotePeerOwners.keys()]) {
+        if (!this.remotePeers.has(key)) this.remotePeerOwners.delete(key);
+      }
       this.pruneOnNextDiscovery = false;
       log.info(`[${this.id.slice(0, 8)}] pruned stale peers — now ${this.remotePeers.size} remote instances`);
     } else {
@@ -692,6 +729,50 @@ export class SharedState extends Abject {
       }
     }
     return names;
+  }
+
+  // ==========================================================================
+  // Private-mode outbound gate — only sync with whitelisted peers
+  // ==========================================================================
+
+  /**
+   * Whether we may sync with a remote SharedState owned by `ownerPeerId`.
+   * Only enforced in `private` mode (public syncs with all; `local` never
+   * reaches sync). Same-peer (self) and unknown owners are allowed — an
+   * unknown-owner peer arrived via an inbound link that already passed our
+   * PeerRouter whitelist gate, so it is provably whitelisted or same-peer.
+   */
+  private peerAllowedForSync(ownerPeerId: string | undefined): boolean {
+    if (this._accessMode !== 'private') return true;
+    if (!ownerPeerId || ownerPeerId === this.localPeerId) return true;
+    return this._whitelist.includes(ownerPeerId);
+  }
+
+  /** Remote SharedState targets we may sync to under the current access mode. */
+  private syncTargets(): AbjectId[] {
+    const all = Array.from(this.remotePeers.values());
+    if (this._accessMode !== 'private') return all;
+    return all.filter(id => this.peerAllowedForSync(this.remotePeerOwners.get(id as string)));
+  }
+
+  /**
+   * Drop known-owner remote peers that private mode no longer allows (mode
+   * tightened public→private, or the whitelist shrank). Send-time filtering via
+   * syncTargets() already protects confidentiality; this just stops such peers
+   * being counted and picked as anti-entropy targets.
+   */
+  private prunePrivateNonWhitelisted(): void {
+    if (this._accessMode !== 'private') return;
+    let dropped = 0;
+    for (const [key] of [...this.remotePeers]) {
+      const owner = this.remotePeerOwners.get(key);
+      if (owner && owner !== this.localPeerId && !this._whitelist.includes(owner)) {
+        this.remotePeers.delete(key);
+        this.remotePeerOwners.delete(key);
+        dropped++;
+      }
+    }
+    if (dropped > 0) log.info(`[${this.id.slice(0, 8)}] pruned ${dropped} non-whitelisted remote peer(s) (private mode)`);
   }
 
   // ==========================================================================
@@ -784,7 +865,12 @@ export class SharedState extends Abject {
 
   private broadcastEntry(name: string, key: string, entry: LWWEntry): void {
     if (this._accessMode === 'local') return;
-    if (this.remotePeers.size === 0) return;
+
+    // Only broadcast to peers allowed under the current access mode. In private
+    // mode this excludes discovered-but-not-whitelisted peers — the outbound
+    // confidentiality gate that keeps private state from leaking to other peers.
+    const allPeers = this.syncTargets();
+    if (allPeers.length === 0) return;
 
     const propagationId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.seenPropagations.set(propagationId, Date.now() + PROPAGATION_EXPIRY);
@@ -792,14 +878,13 @@ export class SharedState extends Abject {
     // Gossip: pick ceil(log2(n)) random peers instead of all
     const fanout = Math.min(
       GOSSIP_FANOUT_BASE,
-      Math.max(1, Math.ceil(Math.log2(this.remotePeers.size + 1))),
-      this.remotePeers.size,
+      Math.max(1, Math.ceil(Math.log2(allPeers.length + 1))),
+      allPeers.length,
     );
 
-    const allPeers = Array.from(this.remotePeers.values());
     const selected = this.selectRandom(allPeers, fanout);
 
-    log.info(`[${this.id.slice(0, 8)}] gossipBroadcast name='${name}' key='${key}' to ${selected.length}/${this.remotePeers.size} peers`);
+    log.info(`[${this.id.slice(0, 8)}] gossipBroadcast name='${name}' key='${key}' to ${selected.length}/${allPeers.length} peers`);
     for (const remoteSSId of selected) {
       this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
         name, key, entry, propagationId, hopsRemaining: 3,
@@ -880,7 +965,10 @@ export class SharedState extends Abject {
 
   private async antiEntropyExchange(): Promise<void> {
     if (this._accessMode === 'local') return;
-    if (this.remotePeers.size === 0) return;
+
+    // Only exchange with peers allowed under the current access mode.
+    const allPeers = this.syncTargets();
+    if (allPeers.length === 0) return;
 
     // Clean up expired propagation IDs
     const now = Date.now();
@@ -889,7 +977,6 @@ export class SharedState extends Abject {
     }
 
     // Pick one random remote peer
-    const allPeers = Array.from(this.remotePeers.values());
     const targetPeer = allPeers[Math.floor(Math.random() * allPeers.length)];
 
     // Send digest of all our state maps
