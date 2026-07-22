@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.8.27",
+    "date": "2026-07-22",
+    "title": "Private workspaces stay private",
+    "summary": "Shared state in a private workspace now syncs only to peers you have explicitly whitelisted. If you use private workspaces with peers connected, this closes a path where state could reach peers you had not approved.",
+    "highlights": [
+      "Private-workspace SharedState sync is now gated to whitelisted peers: peers outside the whitelist no longer receive updates"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.8.26",
     "date": "2026-07-22",
     "title": "Storage That Keeps Up",
