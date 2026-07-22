@@ -38,6 +38,12 @@ export class ChatBrowser extends Abject {
   private newChatBtnId?: AbjectId;
 
   private refreshTimer?: ReturnType<typeof setTimeout>;
+  /** Single-flight guards: at most one refresh (fetch + rebuild) runs at a
+   *  time. A roster event during a refresh sets `refreshPending`, and the
+   *  loop re-runs once after — so a burst of events (e.g. during a goal) can
+   *  never spawn overlapping window rebuilds that flood the render queue. */
+  private refreshInFlight = false;
+  private refreshPending = false;
 
   constructor() {
     super({
@@ -177,16 +183,23 @@ export class ChatBrowser extends Abject {
     }
   }
 
-  private async fetchRoster(): Promise<PersistedConversation[]> {
-    if (!this.chatManagerId) return [];
+  /**
+   * Fetch the roster. Returns the rows on success (possibly an empty array
+   * for a genuinely empty roster), or `null` when the request failed or timed
+   * out — callers keep the current list on null rather than blanking it. The
+   * timeout is generous because ChatManager can be briefly busy under load,
+   * and a slow reply must not be read as "no conversations".
+   */
+  private async fetchRoster(): Promise<PersistedConversation[] | null> {
+    if (!this.chatManagerId) return null;
     try {
       const rows = await this.request<PersistedConversation[]>(
-        request(this.id, this.chatManagerId, 'listConversations', {}), 3000,
+        request(this.id, this.chatManagerId, 'listConversations', {}), 5000,
       );
       return rows ?? [];
     } catch (err) {
-      log.warn(`listConversations failed: ${String(err)}`);
-      return [];
+      log.warn(`listConversations failed (keeping current list): ${String(err)}`);
+      return null;
     }
   }
 
@@ -252,7 +265,7 @@ export class ChatBrowser extends Abject {
       })
     );
 
-    await this.populate();
+    await this.populate(await this.fetchRoster() ?? []);
     this.changed('visibility', true);
     return true;
   }
@@ -274,22 +287,44 @@ export class ChatBrowser extends Abject {
 
   private scheduleRefresh(): void {
     if (!this.windowId) return;
-    if (this.refreshTimer) return;
-    this.refreshTimer = setTimeout(async () => {
+    // Coalesce: mark that a refresh is wanted. If one is already running or a
+    // debounce timer is pending, that in-flight pass will pick it up — we must
+    // NOT start a second concurrent refresh (overlapping rebuilds flood the
+    // render queue and freeze the UI during a goal's roster-event burst).
+    this.refreshPending = true;
+    if (this.refreshInFlight || this.refreshTimer) return;
+    this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
-      if (!this.windowId || !this.rootLayoutId) return;
-      try {
-        await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
-      } catch { /* best effort */ }
-      this.listWidgetId = undefined;
-      this.newChatBtnId = undefined;
-      await this.populate();
+      void this.drainRefresh();
     }, 80);
+  }
+
+  /** Run refreshes single-file until none is pending. Fetches BEFORE clearing,
+   *  so a timed-out/failed fetch keeps the current list instead of blanking it. */
+  private async drainRefresh(): Promise<void> {
+    if (this.refreshInFlight) return;
+    this.refreshInFlight = true;
+    try {
+      while (this.refreshPending) {
+        this.refreshPending = false;
+        if (!this.windowId || !this.rootLayoutId) return;
+        const rows = await this.fetchRoster();
+        if (rows === null) continue; // keep current; re-loop if more arrived
+        try {
+          await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
+        } catch { /* best effort */ }
+        this.listWidgetId = undefined;
+        this.newChatBtnId = undefined;
+        await this.populate(rows);
+      }
+    } finally {
+      this.refreshInFlight = false;
+    }
   }
 
   // ─── Rendering ─────────────────────────────────────────────────────
 
-  private async populate(): Promise<void> {
+  private async populate(rows: PersistedConversation[]): Promise<void> {
     if (!this.rootLayoutId || !this.windowId) return;
 
     // Header row: title + "+ New chat"
@@ -335,8 +370,6 @@ export class ChatBrowser extends Abject {
       preferredSize: { height: HEADER_BTN_H },
     }));
     this.send(request(this.id, this.newChatBtnId, 'addDependent', {}));
-
-    const rows = await this.fetchRoster();
 
     if (rows.length === 0) {
       await this.renderEmptyState();

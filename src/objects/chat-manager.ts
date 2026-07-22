@@ -169,8 +169,13 @@ export class ChatManager extends Abject {
     await this.ensureWorkspaceId();
     await this.loadRoster();
 
-    // Rehydrate Chat instances — deferred so Factory drains its spawn queue.
-    queueMicrotask(() => void this.rehydrateConversations());
+    // Lazy rehydration: we do NOT spawn a Chat Abject for every saved
+    // conversation at boot. Each conversation's Chat is spawned on demand when
+    // the user opens it (openChatWindow spawns if absent). Eagerly spawning all
+    // of them made every conversation a live GoalManager subscriber, so a
+    // single running goal's progress events were delivered to dozens of idle
+    // chats at once — amplifying bus traffic and starving rendering. The roster
+    // metadata above is enough to list conversations; the Chat itself waits.
   }
 
   private setupHandlers(): void {
@@ -333,21 +338,6 @@ export class ChatManager extends Abject {
 
   // ─── Chat instance lifecycle ───────────────────────────────────────
 
-  private async rehydrateConversations(): Promise<void> {
-    if (!this.factoryId || !this.registryId) return;
-    if (this.conversations.size === 0) return;
-
-    await this.ensurePeerId();
-    await this.ensureWorkspaceId();
-
-    for (const c of this.conversations.values()) {
-      if (c.chatId) continue;
-      await this.spawnChatFor(c);
-    }
-    this.schedulePersist();
-    this.changed('rosterChanged', {});
-  }
-
   private async spawnChatFor(c: ConversationRuntime): Promise<AbjectId | undefined> {
     if (c.chatId) return c.chatId;
     if (!this.factoryId || !this.registryId) return undefined;
@@ -449,10 +439,13 @@ export class ChatManager extends Abject {
       }
     }
 
-    // Delete persisted history
+    // Delete persisted history and any reconnect marker
     if (this.storageId) {
       try {
         await this.request(request(this.id, this.storageId, 'delete', { key: `chats:history:${conversationId}` }));
+      } catch { /* best effort */ }
+      try {
+        await this.request(request(this.id, this.storageId, 'delete', { key: `chats:activegoal:${conversationId}` }));
       } catch { /* best effort */ }
     }
 

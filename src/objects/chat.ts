@@ -272,6 +272,16 @@ export class Chat extends Abject {
    */
   private _goalCreatedThisTurn = false;
 
+  /**
+   * Whether this conversation is currently subscribed to GoalManager's events.
+   * With lazy rehydration each conversation is its own Chat instance, so an
+   * idle chat must NOT subscribe: otherwise one running goal's progress events
+   * fan out to every open conversation and flood the bus. We subscribe only
+   * while a goal we created is active, and stay subscribed for the instance's
+   * life so a late outcome (after the task returned) still lands here.
+   */
+  private _goalSubscribed = false;
+
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
   private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
@@ -416,10 +426,12 @@ export class Chat extends Abject {
     this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
     this.fileSystemId = await this.discoverDep('FileSystem') ?? undefined;
 
-    // Subscribe to GoalManager for real-time goal updates
-    if (this.goalManagerId) {
-      this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
-    }
+    // Do NOT subscribe to GoalManager unconditionally. An idle conversation
+    // that watches every goal event is what floods the bus when many chats are
+    // open (see _goalSubscribed). We reconnect only if this conversation left a
+    // goal running before a restart; otherwise we stay quiet until we create a
+    // goal ourselves (which subscribes then).
+    await this.reconnectActiveGoal();
 
     // Load persisted conversation history (if any) for this conversation.
     if (this.conversationId && !this.historyLoaded) {
@@ -807,6 +819,8 @@ export class Chat extends Abject {
               this.recordGoalOutcome(data.goalId, entry.title, 'completed', data.result);
               this.scheduleActivityRefresh();
             }
+            // Top goal done — drop the reconnect marker.
+            if (data.goalId === this._currentGoalId) void this.persistActiveGoal(undefined);
             // Resolve any waitForGoalCompletion promise for this goal — Chat's
             // goal action waits on this to surface ScrumMaster's synthesized
             // result to the user.
@@ -836,6 +850,8 @@ export class Chat extends Abject {
               this.recordGoalOutcome(data.goalId, entry.title, 'failed', data.error);
               this.scheduleActivityRefresh();
             }
+            // Top goal done — drop the reconnect marker.
+            if (data.goalId === this._currentGoalId) void this.persistActiveGoal(undefined);
             const pending = this.pendingGoalCompletions.get(data.goalId);
             if (pending) {
               this.pendingGoalCompletions.delete(data.goalId);
@@ -917,7 +933,15 @@ export class Chat extends Abject {
       // a goal action "failed" from a transient wait timeout: the goal keeps
       // running (or completes) in the background, and without this the LLM
       // only ever sees the stale failure and re-creates duplicate goals.
-      return { observation: this.buildGoalStateObservation() };
+      //
+      // Chat's work is routing (create a goal vs answer) and composing the
+      // reply from a goal's result — balanced-tier work, and this is the
+      // interactive path the user waits on, so run it on balanced rather than
+      // the top tier. The self-audit re-prompt (runChatTask) is the net for
+      // the confabulation a lighter model could invite. If the configured
+      // balanced model proves too weak here (parse retries, worse routing),
+      // this is the one line to move back to 'smart'.
+      return { observation: this.buildGoalStateObservation(), tier: 'balanced' };
     });
 
     this.on('agentAct', (msg: AbjectMessage) => {
@@ -1009,6 +1033,60 @@ export class Chat extends Abject {
       };
       this.pendingTickets.set(ticketId, entry);
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Goal subscription (lazy, only while a goal is active)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Subscribe to GoalManager once (idempotent). We never auto-unsubscribe,
+   *  so a late outcome after the task returned still delivers; a single active
+   *  conversation subscribing is cheap — the flood came from ALL of them. */
+  private ensureGoalSubscription(): void {
+    if (this._goalSubscribed || !this.goalManagerId) return;
+    this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
+    this._goalSubscribed = true;
+  }
+
+  /** Persist (or clear) the goal this conversation is running, so a lazily
+   *  re-spawned Chat can reconnect to it after a restart. Best-effort. */
+  private async persistActiveGoal(goalId: string | undefined): Promise<void> {
+    if (!this.storageId || !this.conversationId) return;
+    const key = `chats:activegoal:${this.conversationId}`;
+    try {
+      if (goalId) {
+        await this.request(request(this.id, this.storageId, 'set', { key, value: goalId }));
+      } else {
+        await this.request(request(this.id, this.storageId, 'delete', { key }));
+      }
+    } catch { /* best effort */ }
+  }
+
+  /** On (lazy) spawn, re-attach to a goal left running by a prior session so
+   *  its outcome still surfaces in this conversation. A marker pointing at an
+   *  already-finished or missing goal is dropped. Idle conversations (no marker)
+   *  return immediately and stay unsubscribed. */
+  private async reconnectActiveGoal(): Promise<void> {
+    if (!this.goalManagerId || !this.conversationId || !this.storageId) return;
+    let activeGoalId: string | null = null;
+    try {
+      activeGoalId = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: `chats:activegoal:${this.conversationId}` }),
+      );
+    } catch { return; }
+    if (typeof activeGoalId !== 'string' || !activeGoalId) return;
+
+    const goal = await this.request<{ status?: string; title?: string } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId: activeGoalId }),
+    ).catch(() => null);
+    if (goal && (goal.status === 'active' || goal.status === 'paused')) {
+      this._currentGoalId = activeGoalId;
+      this.liveGoals.set(activeGoalId, { title: goal.title ?? '(in progress)', status: 'active' });
+      this.ensureGoalSubscription();
+      this.fetchGoalTasks(activeGoalId).then(() => this.scheduleActivityRefresh()).catch(() => { /* window may not exist yet */ });
+    } else {
+      await this.persistActiveGoal(undefined);
+    }
   }
 
   /**
@@ -1259,6 +1337,11 @@ export class Chat extends Abject {
         goalId = created.goalId;
         this._currentGoalId = goalId;
         this._goalCreatedThisTurn = true;
+        // We now have an active goal: subscribe to GoalManager (idempotent) so
+        // we see its progress and outcome, and persist it so a lazily
+        // re-spawned Chat reconnects after a restart.
+        this.ensureGoalSubscription();
+        void this.persistActiveGoal(goalId);
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -1348,9 +1431,7 @@ ${this.recentGoalOutcomes.map(g => `- [${g.status}] "${g.title}"${g.resultPrevie
 
 Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.${recentGoalsBlock}
 
-## System Architecture
-
-Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring methods and events), a mailbox, and message handlers. Objects communicate exclusively via messages. They discover each other via Registry and coordinate via the observer pattern (addDependent -> changed events).
+## The desktop is a 3D scene
 
 The desktop is a native 3D scene: every window is a slab in it, and objects can attach real 3D content (meshes, lights, transforms) through their window in addition to drawing 2D content on canvases. 3D objects can also live free-floating in the global scene with no window at all — the right shape when the user asks for a standalone object on the desktop (a pet, a draggable shape, ambient décor) rather than an app UI. Word goals to match: a standalone object should float on the desktop itself, not live in a window. Existing windows — including built-in apps' windows — can be DECORATED by a separate object that finds the window and attaches 3D content to it, so "add X to the Y window" goals should say to decorate the existing window, keeping the original app untouched (never to rebuild or clone the app). When a request involves visuals, describe the desired OUTCOME in the goal and let the builders discover the current rendering capabilities live (they ask the UI objects for up-to-date vocabularies) — do not prescribe rendering implementation details (like "use 2D canvas with projection math") from memory; such recalled how-tos may predate current capabilities.
 
