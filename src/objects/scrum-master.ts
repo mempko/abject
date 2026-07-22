@@ -554,7 +554,7 @@ export class ScrumMaster extends Abject {
    * on every scrum's opening round. Later steps just note loop position;
    * AgentAbject already injects goal context via `buildGoalProgressContext`.
    */
-  private async handleObserve(msg: AbjectMessage): Promise<{ observation: string }> {
+  private async handleObserve(msg: AbjectMessage): Promise<{ observation: string; tier?: string }> {
     const { taskId, step } = msg.payload as { taskId: string; step: number };
     if (step === 0) {
       // Deliver the goal-state snapshot up front so the first think decides
@@ -564,7 +564,14 @@ export class ScrumMaster extends Abject {
       const goalId = await this.lookupGoalIdForOTATask(taskId);
       const snap = goalId ? await this.buildReviewSnapshot(goalId) : { error: 'goal not resolved yet' };
       if ('data' in snap) {
+        // Tier the first decision by trouble: a goal with failed tasks or a
+        // loop warning needs the strongest reasoning to recover/replan; a
+        // clean goal (quick_dispatch, straightforward plan, or completion
+        // judgment) is well within balanced, and a misjudgment self-heals.
+        const inTrouble = ((snap.data.failed as unknown[] | undefined)?.length ?? 0) > 0
+          || snap.data.loopWarning !== undefined;
         return {
+          tier: inTrouble ? 'smart' : 'balanced',
           observation:
             `Scrum for this goal. Its full state is below — you already have it, so decide your action directly (no need to call review_scrum first):\n\n` +
             `${JSON.stringify(snap.data, null, 2)}\n\n` +
@@ -572,12 +579,18 @@ export class ScrumMaster extends Abject {
         };
       }
       // Snapshot unavailable (goal not resolvable yet) — fall back to the
-      // explicit review action rather than guessing.
+      // explicit review action rather than guessing. Keep smart: we can't see
+      // state to know it's safe to go lighter.
       return {
+        tier: 'smart',
         observation: `Beginning scrum for OTA task ${taskId.slice(0, 8)}. Call review_scrum to load goal state, then decide: quick_dispatch, plan via add_task+dispatch_scrum, complete_goal, or fail_goal.`,
       };
     }
+    // Step >= 1 within a scrum means the LLM is mid multi-step plan (e.g.
+    // poll_team then add_task then dispatch) — the genuinely complex path —
+    // so keep the strongest tier for the follow-through.
     return {
+      tier: 'smart',
       observation: `Step ${step}. Your prior action's result is in the conversation above. Decide your next action.`,
     };
   }

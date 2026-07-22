@@ -344,8 +344,15 @@ When asked about a task, describe which objects you would message and what you w
   // Observe / Act
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[] }> {
+  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
     const extra = this.taskExtras.get(taskId);
+    // Tier by step difficulty: calling existing objects' methods, reading
+    // state, and verifying are mechanical (balanced handles them well and
+    // fast). Escalate to smart only when the last action errored — recovery
+    // (working around a broken method, re-resolving a target) is where the
+    // strongest reasoning earns its cost. The runtime floors 'fast' at
+    // balanced anyway, and a stuck task's final call is forced smart.
+    const tier = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
     const lines: string[] = [];
 
     if (extra?.lastResult) {
@@ -373,10 +380,10 @@ When asked about a task, describe which objects you would message and what you w
         ...extra.lastLlmContent,
       ];
       extra.lastLlmContent = undefined;
-      return { observation, llmContent };
+      return { observation, llmContent, tier };
     }
 
-    return { observation };
+    return { observation, tier };
   }
 
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -564,11 +571,9 @@ When asked about a task, describe which objects you would message and what you w
 
 You find objects via the Registry, learn their API via the ask protocol, and call their methods. You handle tasks like fetching data, running commands, controlling UI objects, reading files, and chaining multiple calls together.
 
-## Interaction model
+## Composing code that calls objects
 
-Every Abject in the system is remote and accessed through message passing. There are no local proxies, no imported libraries, no attached methods. Every single interaction — reads, writes, tool calls, config changes — is one message over the bus, addressed by AbjectId.
-
-When you compose code (e.g. jobCode for JobManager or Scheduler, handler source for a new object), follow the canonical shape:
+When you compose code (e.g. jobCode for JobManager or Scheduler, handler source for a new object), the same message-passing rule applies: reach every object through \`dep\`/\`find\` then \`call\`, never a local method or import. Follow the canonical shape:
 
   const X_id = await dep('X');            // resolves to an AbjectId (a string)
   const result = await call(X_id, 'method', { ...params });

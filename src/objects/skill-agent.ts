@@ -373,9 +373,13 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   // Observe / Act
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleObserve(taskId: string): Promise<{ observation: string }> {
+  private async handleObserve(taskId: string): Promise<{ observation: string; tier?: string }> {
     const extra = this.taskExtras.get(taskId);
     const lastResult = extra?.lastResult ?? 'No previous action result.';
+    // Invoking skills/MCP tools and reading their results is mechanical work
+    // balanced does well and fast; escalate to smart only when the last
+    // action errored, where recovery reasoning is worth the cost.
+    const tier = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
 
     // Include current skill state so the LLM knows what's already done
     let skillState = '';
@@ -408,7 +412,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       } catch { /* best effort */ }
     }
 
-    return { observation: lastResult + skillState };
+    return { observation: lastResult + skillState, tier };
   }
 
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {

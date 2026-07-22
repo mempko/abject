@@ -2874,10 +2874,19 @@ The registered object must implement these handlers to participate in the agent 
       }
     } catch { /* best effort */ }
 
-    // Always-present guidance on how object identity works. Agents reference
-    // objects constantly (in goals, scratchpad, calls, and saved knowledge);
-    // they need to know which handle survives a restart and which does not.
-    prompt += `\n\n## Object identity
+    // Always-present primer on the system every agent operates in: the
+    // message-passing model, the ask protocol, and the observe-think-act loop
+    // that drives them. Injected once here so every agent shares one baseline
+    // instead of each prompt re-deriving (or omitting) it; per-agent prompts
+    // add only their own specifics on top.
+    prompt += `\n\n## How this system works
+Everything here is an Abject: an autonomous object with a manifest (its declared methods and events), a mailbox, and message handlers. Abjects never call each other directly; they communicate only by passing messages, find each other through the Registry, and coordinate by subscribing to each other's change events. Nothing is a local library or an imported function: every read, write, or action is a message to some Abject, addressed by its durable registered name (or its AbjectId). You act through the actions in your vocabulary below, and the system turns each one into the right messages for you, so you never hand-write raw envelopes; \`submit_job\` additionally hands you \`call\`/\`dep\`/\`find\` to message objects directly for mechanical multi-step work.
+
+An Abject's capabilities are live, not a fixed list: the way to know what an object can do right now is to ask it (the ask protocol), and it answers from its current, real capabilities, which shift as skills, tools, and connections come and go. Prefer asking over assuming from a name or a remembered fact. Other parts of the system may ask you the same way; answer from what you can genuinely do this moment, and decline plainly when a request falls outside your role.
+
+You run inside an observe-think-act loop: each turn you observe the current state, then think and emit exactly ONE action as JSON, and the system carries it out and returns the result to your next observation. You keep looping until you emit a terminal action that ends the task. The rest of this prompt tells you which actions you have and when to use each.
+
+## Object identity
 Every Abject has two kinds of handle:
 - Its **registered name** (e.g. "GraphViewer") and its **typeId** are DURABLE — they persist across restarts and always point at the live object.
 - Its **AbjectId** (a UUID like \`adac6cc1-...\`) is EPHEMERAL — objects are re-spawned with a fresh AbjectId every time they are restored on restart, so a UUID copied from an earlier goal, scratchpad, or saved memory is usually stale and resolves to nothing.
