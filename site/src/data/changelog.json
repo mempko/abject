@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.8.25",
+    "date": "2026-07-22",
+    "title": "Chats That Wake When You Need Them",
+    "summary": "Conversations now load only when you open them, so workspaces with a lot of chat history start faster and stay responsive under load. Agents also think at a level matched to what they are actually doing, which cuts unnecessary work on routine steps.",
+    "highlights": [
+      "Chats rehydrate lazily: a workspace no longer spawns every past conversation at boot, it loads a chat when you open it",
+      "The conversation list stays usable under heavy load instead of stalling while history catches up",
+      "Agents pick their reasoning tier based on the state they are in, so simple steps stay quick and harder ones get more thought",
+      "All agents now share one system primer, giving them consistent grounding about the system they run in"
+    ],
+    "fixes": [
+      "Fixed the goal-event flood from many simultaneously live chats that could freeze rendering in busy workspaces"
+    ]
+  },
+  {
     "version": "0.8.24",
     "date": "2026-07-21",
     "title": "Chat that stays grounded, and gets out of the way",
