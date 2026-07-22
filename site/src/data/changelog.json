@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.8.26",
+    "date": "2026-07-22",
+    "title": "Storage That Keeps Up",
+    "summary": "Saving data no longer rewrites your whole store on every change, so workspaces stay responsive as they grow. Existing data migrates automatically the first time you start this version.",
+    "highlights": [
+      "Storage now uses SQLite for per-key writes instead of rewriting the entire JSON file each time; this removes the multi-second stalls that showed up once a store got large",
+      "Your existing JSON store is migrated to SQLite once, on first boot; no action needed and the storage interface is unchanged"
+    ],
+    "fixes": [
+      "Fixed workspace freezes caused by frequent saves scaling with total store size rather than the amount of data actually changed"
+    ]
+  },
+  {
     "version": "0.8.25",
     "date": "2026-07-22",
     "title": "Chats That Wake When You Need Them",
