@@ -624,6 +624,9 @@ export class Compositor {
     this.surfaces.clear();
     this.sortedSurfaces = [];
     this.liveDataImages.clear();
+    // Drop client-side animations too: the backend replays retained ones after
+    // reconnect, so stale entries would otherwise double up on the re-added nodes.
+    this.nodeAnims.clear();
     this.needsRender = true;
   }
 

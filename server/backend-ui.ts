@@ -55,6 +55,65 @@ function mergeSceneParams(node: SceneOp, incoming: Record<string, unknown>): voi
   }
 }
 
+/**
+ * Fold a one-shot animation's TARGET into the retained node so a reconnect
+ * replay restores the settled pose instead of the pre-animation one.
+ *
+ * Animations run client-side and are never themselves retained (their
+ * channel/duration/easing are not node state). But a node that is added hidden
+ * (e.g. a group at scale ~0) and then animated INTO view would replay hidden
+ * after a reconnect, because the tween that revealed it is gone — the exact
+ * cause of a presentation's content vanishing on refresh while static nodes
+ * (nav, décor) survive. For an explicit channel tween that is not looping and
+ * not a stop, the resting state is its `to` value, so we bake that into the
+ * retained transform/params. Looping/preset/path animations oscillate around a
+ * base that is already the visible `add` state, so they are left untouched.
+ */
+/**
+ * Remove a node and its whole subtree from a retained node map, mirroring the
+ * client SceneStore.removeNode cascade. Removing a parent group MUST drop its
+ * descendants: a slide deck reuses a container id (remove 'slide', then re-add
+ * 'slide' with the next slide's children), so without the cascade every prior
+ * slide's children stay retained, re-parent onto the reused container, and
+ * stack up on reconnect (or, before the reveal animation is restored, collapse
+ * together at the container's initial scale). The client cascades on remove, so
+ * live is clean; only the backend's retained snapshot leaked.
+ */
+function removeSceneNodeCascade(nodes: Map<string, SceneOp>, id: string, onRemove?: (nodeId: string) => void): void {
+  const children: string[] = [];
+  for (const [childId, node] of nodes) {
+    if (node.parentId === id) children.push(childId);
+  }
+  nodes.delete(id);
+  onRemove?.(id);
+  for (const childId of children) removeSceneNodeCascade(nodes, childId, onRemove);
+}
+
+/**
+ * Retain an `animate` op for reconnect replay, or clear on `stop`. Animations
+ * are transient client state, but replaying the retained op after the node adds
+ * makes animated content re-animate on reconnect (a spin keeps spinning, an
+ * intro tween plays again) — reproducing exactly what a live client shows,
+ * instead of a static snapshot. Keyed by `${nodeId}|${channelKey}` so
+ * concurrent per-channel tweens coexist and same-channel ones replace, mirroring
+ * the client animation engine's merge. Presets have no explicit channel, so
+ * their name is the key. A `stop` (per node) clears every entry for that node.
+ */
+function retainAnimateOp(anims: Map<string, SceneOp>, op: SceneOp): void {
+  const ap = op.params as { channel?: string; preset?: string; stop?: boolean } | undefined;
+  if (ap?.stop) {
+    for (const k of [...anims.keys()]) if (k.startsWith(`${op.id}|`)) anims.delete(k);
+    return;
+  }
+  const channelKey = ap?.channel ?? ap?.preset ?? '_';
+  anims.set(`${op.id}|${channelKey}`, op);
+}
+
+/** Drop every retained animation belonging to a removed node. */
+function clearNodeAnims(anims: Map<string, SceneOp>, nodeId: string): void {
+  for (const k of [...anims.keys()]) if (k.startsWith(`${nodeId}|`)) anims.delete(k);
+}
+
 export interface SurfaceState {
   surfaceId: string;
   objectId: AbjectId;
@@ -77,6 +136,14 @@ export interface SurfaceState {
    * to their latest definition (add + merged updates) for reconnect replay.
    */
   sceneNodes: Map<string, SceneOp>;
+  /**
+   * Active animations on this surface's nodes, keyed `${nodeId}|${channelKey}`
+   * so concurrent per-channel tweens (e.g. spin + bob) coexist and same-channel
+   * ones replace. Replayed AFTER the node adds on reconnect so animated content
+   * re-animates (spins keep spinning, intros play again) rather than snapping to
+   * a static pose. A `stop` clears a node's entries; removing a node clears its.
+   */
+  sceneAnims: Map<string, SceneOp>;
   /**
    * Decorations: scene nodes contributed by abjects OTHER than the surface
    * owner (nodeId -> contributor). Their input routes to the contributor and
@@ -236,6 +303,8 @@ export class BackendUI extends Abject {
    * their owner dies. Compacted like per-surface nodes for reconnect replay.
    */
   private worldScenes: Map<AbjectId, Map<string, SceneOp>> = new Map();
+  /** Active animations on world nodes, per owner, keyed like SurfaceState.sceneAnims. */
+  private worldSceneAnims: Map<AbjectId, Map<string, SceneOp>> = new Map();
   /**
    * The selected 3D scene node: set on node mousedown, cleared when focus
    * moves elsewhere. While set, keyboard input routes to the node's owner
@@ -2081,6 +2150,7 @@ IMPORTANT:
       closable: closable ?? true,
       drawLogs: new Map(),
       sceneNodes: new Map(),
+      sceneAnims: new Map(),
       sceneContributors: new Map(),
     });
 
@@ -2330,11 +2400,16 @@ IMPORTANT:
     // not node params and would corrupt the snapshot + reconnect replay).
     const foreign = contributorId !== undefined && contributorId !== state!.objectId;
     for (const op of ops) {
-      if (op.op === 'animate') continue;
+      if (op.op === 'animate') {
+        retainAnimateOp(state!.sceneAnims, op);
+        continue;
+      }
       if (op.op === 'remove') {
-        state!.sceneNodes.delete(op.id);
-        state!.sceneContributors.delete(op.id);
-        this.dropNodeDrawLog(state!, op.id);
+        removeSceneNodeCascade(state!.sceneNodes, op.id, (nodeId) => {
+          state!.sceneContributors.delete(nodeId);
+          this.dropNodeDrawLog(state!, nodeId);
+          clearNodeAnims(state!.sceneAnims, nodeId);
+        });
         continue;
       }
       if (op.op === 'add') {
@@ -2381,10 +2456,18 @@ IMPORTANT:
       nodes = new Map();
       this.worldScenes.set(objectId, nodes);
     }
+    let anims = this.worldSceneAnims.get(objectId);
+    if (!anims) {
+      anims = new Map();
+      this.worldSceneAnims.set(objectId, anims);
+    }
     for (const op of ops) {
-      if (op.op === 'animate') continue;
+      if (op.op === 'animate') {
+        retainAnimateOp(anims, op);
+        continue;
+      }
       if (op.op === 'remove') {
-        nodes.delete(op.id);
+        removeSceneNodeCascade(nodes, op.id, (nodeId) => clearNodeAnims(anims!, nodeId));
         continue;
       }
       if (op.op === 'add') {
@@ -2398,6 +2481,7 @@ IMPORTANT:
       if (op.parentId !== undefined) existing.parentId = op.parentId;
     }
     if (nodes.size === 0) this.worldScenes.delete(objectId);
+    if (anims.size === 0) this.worldSceneAnims.delete(objectId);
 
     this.sendToFrontend({
       type: 'sceneOps',
@@ -2474,6 +2558,7 @@ IMPORTANT:
         state.sceneNodes.delete(nodeId);
         state.sceneContributors.delete(nodeId);
         this.dropNodeDrawLog(state, nodeId);
+        clearNodeAnims(state.sceneAnims, nodeId);
         if (this.focusedNode?.surfaceId === state.surfaceId && this.focusedNode.nodeId === nodeId) {
           this.focusedNode = undefined;
         }
@@ -2497,6 +2582,7 @@ IMPORTANT:
   /** Tear down an owner's world nodes (owner unregistered/died). */
   private destroyWorldSceneForObject(objectId: AbjectId): void {
     if (this.focusedNode?.ownerId === objectId) this.focusedNode = undefined;
+    this.worldSceneAnims.delete(objectId);
     const nodes = this.worldScenes.get(objectId);
     if (!nodes || nodes.size === 0) {
       this.worldScenes.delete(objectId);
@@ -3350,6 +3436,15 @@ IMPORTANT:
           ops: [...state.sceneNodes.values()] as unknown as Array<Record<string, unknown>>,
         }, clientId);
       }
+      // Restart retained animations AFTER the adds, so their target nodes exist
+      // client-side — spins resume, intro tweens replay.
+      if (state.sceneAnims.size > 0) {
+        this.sendToClient({
+          type: 'sceneOps',
+          surfaceId: state.surfaceId,
+          ops: [...state.sceneAnims.values()] as unknown as Array<Record<string, unknown>>,
+        }, clientId);
+      }
     }
     for (const [ownerId, nodes] of this.worldScenes) {
       if (nodes.size === 0) continue;
@@ -3359,6 +3454,16 @@ IMPORTANT:
         world: true,
         ownerId,
         ops: [...nodes.values()] as unknown as Array<Record<string, unknown>>,
+      }, clientId);
+    }
+    for (const [ownerId, anims] of this.worldSceneAnims) {
+      if (anims.size === 0) continue;
+      this.sendToClient({
+        type: 'sceneOps',
+        surfaceId: '',
+        world: true,
+        ownerId,
+        ops: [...anims.values()] as unknown as Array<Record<string, unknown>>,
       }, clientId);
     }
 
