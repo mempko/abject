@@ -1757,13 +1757,22 @@ export class Compositor {
    */
   private startRenderLoop(): void {
     const render = () => {
-      // Composite playing videos into their surfaces before the render check,
-      // so a fresh frame both updates the canvas and schedules the upload.
-      if (this.blitVideoFrames()) this.needsRender = true;
-      if (this.needsRender) {
-        // Clear BEFORE rendering so an animating frame can re-request.
-        this.needsRender = false;
-        this.render();
+      // A single throw inside render() must never permanently stop the loop:
+      // the rAF re-arm below has to run even when a frame fails, or one GL error
+      // (an oversized/incomplete framebuffer on mobile, a lazy shader compile
+      // failure) freezes the whole desktop with only a lone console error. Log
+      // once per failure and keep scheduling frames.
+      try {
+        // Composite playing videos into their surfaces before the render check,
+        // so a fresh frame both updates the canvas and schedules the upload.
+        if (this.blitVideoFrames()) this.needsRender = true;
+        if (this.needsRender) {
+          // Clear BEFORE rendering so an animating frame can re-request.
+          this.needsRender = false;
+          this.render();
+        }
+      } catch (err) {
+        console.error('[Compositor] render frame failed:', err);
       }
       this.animationFrameId = requestAnimationFrame(render);
     };

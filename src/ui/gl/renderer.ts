@@ -169,7 +169,13 @@ export class GlRenderer {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    const gl = canvas.getContext('webgl2', {
+    // Surface the driver's real reason if creation fails (blocklist, out of
+    // memory, unsupported flag combo) instead of a bare null — invaluable when
+    // debugging device-specific blank screens.
+    canvas.addEventListener('webglcontextcreationerror', (e) => {
+      console.error('[GlRenderer] WebGL2 context creation error:', (e as WebGLContextEvent).statusMessage);
+    }, { once: true });
+    const attrs: WebGLContextAttributes = {
       alpha: true,
       antialias: true,
       premultipliedAlpha: true,
@@ -177,7 +183,12 @@ export class GlRenderer {
       // Stencil clips a tilted window's content to its PROJECTED quad — the
       // scissor rect can only express axis-aligned clipping.
       stencil: true,
-    });
+    };
+    // Some Android GL drivers refuse a multisampled stencil default framebuffer
+    // (antialias + stencil together). Stencil is functionally required; MSAA is
+    // cosmetic, so retry without it rather than fail boot with a blank screen.
+    const gl = canvas.getContext('webgl2', attrs)
+      ?? canvas.getContext('webgl2', { ...attrs, antialias: false });
     require(gl !== null, 'Failed to get WebGL2 context');
     this.gl = gl!;
 
@@ -263,9 +274,32 @@ export class GlRenderer {
   // ── Frame lifecycle ──────────────────────────────────────────────────
 
   setSize(cssWidth: number, cssHeight: number, dpr: number): void {
-    this.canvas.width = Math.max(1, Math.round(cssWidth * dpr));
-    this.canvas.height = Math.max(1, Math.round(cssHeight * dpr));
+    // Clamp the backing buffer to what the GPU can actually allocate. High-DPR
+    // phones (Android Chrome commonly reports dpr 2.6-4) can otherwise push the
+    // drawing buffer AND the full-resolution bloom texture (copyTexImage2D of
+    // canvas.width x canvas.height) past MAX_TEXTURE_SIZE / MAX_RENDERBUFFER_SIZE,
+    // yielding an incomplete framebuffer or a lost context — a blank canvas that
+    // only reproduces on mobile. Shrink dpr uniformly so the larger dimension
+    // fits; correctness (something visible) beats pixel density.
+    const limit = this.maxBufferSize();
+    const maxDim = Math.max(cssWidth, cssHeight) * dpr;
+    if (maxDim > limit) dpr = dpr * (limit / maxDim);
+    this.canvas.width = Math.max(1, Math.min(limit, Math.round(cssWidth * dpr)));
+    this.canvas.height = Math.max(1, Math.min(limit, Math.round(cssHeight * dpr)));
   }
+
+  /** Largest square buffer this GPU accepts as both a texture and a renderbuffer. */
+  private maxBufferSize(): number {
+    if (this.cachedMaxBufferSize === 0) {
+      const gl = this.gl;
+      this.cachedMaxBufferSize = Math.max(1, Math.min(
+        gl.getParameter(gl.MAX_TEXTURE_SIZE) as number,
+        gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number,
+      ));
+    }
+    return this.cachedMaxBufferSize;
+  }
+  private cachedMaxBufferSize = 0;
 
   beginFrame(): void {
     const gl = this.gl;
@@ -835,6 +869,8 @@ void main() { fragColor = vec4(1.0); }`,
   private bloomTex: WebGLTexture[] = [];
   private bloomW = 0;
   private bloomH = 0;
+  /** Set once if the GPU can't complete the bloom FBOs; makes applyBloom a no-op. */
+  private bloomUnavailable = false;
 
   private ensureBloomTargets(): void {
     const gl = this.gl;
@@ -854,6 +890,11 @@ void main() { fragColor = vec4(1.0); }`,
       const fbo = gl.createFramebuffer()!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      // An incomplete FBO (e.g. an oversized allocation on a limited mobile GPU)
+      // must not throw mid-frame and kill the render loop — drop bloom instead.
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+        this.bloomUnavailable = true;
+      }
       this.bloomTex[i] = tex; this.bloomFbo[i] = fbo;
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -882,6 +923,7 @@ void main() { fragColor = vec4(1.0); }`,
     const gl = this.gl;
     if (this.contextLost) return;
     this.ensureBloomTargets();
+    if (this.bloomUnavailable) return;
     // 1. Snapshot the lit backbuffer.
     gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex!);
     gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, this.canvas.width, this.canvas.height, 0);
