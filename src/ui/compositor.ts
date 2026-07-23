@@ -2043,11 +2043,27 @@ export class Compositor {
       // 2D and 3D layers stack freely: base 2D → 3D → 2D → 3D → …
       // Occluded children clip to the content rect; occlude:false children
       // draw last, unclipped (pop-out 3D / decorations over the chrome).
+      //
+      // Isolate this window's 3D depth range. The depth buffer is shared and
+      // cleared only once per frame, but window compositing is painter's order
+      // (back-to-front) — a window's slab writes no depth. Without a reset, an
+      // earlier (further-back) window whose 3D content pops toward the camera
+      // leaves near-camera depth values that this window's later depth-tested
+      // draws lose against, so the back window's geometry (and its chrome edge)
+      // bleeds through the front window. Clearing here gives each window a fresh
+      // depth range; painter's order then guarantees a front window's content
+      // always composites over a back window's, whatever their world depths.
+      this.renderer.clearDepth();
       this.drawVocabNodes(surface, frame, 'occluded', cam);
+      // The overlay (pop-out) pass keeps sharing this window's depth range, so
+      // intra-window stacking between occluded and pop-out content is unchanged.
       this.drawVocabNodes(surface, frame, 'overlay', cam);
     }
 
-    // World-scope nodes above the windows (params.layer: 'front').
+    // World-scope nodes above the windows sit over every window's 3D content,
+    // so give them a fresh depth range rather than testing against the last
+    // window's leftover depth.
+    this.renderer.clearDepth();
     this.drawWorldNodes('front');
 
     this.renderScrollbarsOverlay();
