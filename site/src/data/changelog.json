@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.8.28",
+    "date": "2026-07-23",
+    "title": "Holding the Scene Together",
+    "summary": "A small stability release focused on the 3D desktop: reconnecting to a session now rebuilds the scene correctly, windows keep their depth to themselves, and the renderer survives mobile Chrome's quirks.",
+    "highlights": [
+      "More reliable 3D rendering on mobile Chrome: the WebGL2 renderer is hardened so the desktop no longer goes blank",
+      "Cleaner session reconnects: the 3D scene now rebuilds fully, with removed objects cleaned up in cascade and animations retained and replayed"
+    ],
+    "fixes": [
+      "Reconnecting no longer leaves stale objects or frozen animations in the 3D scene",
+      "Each window's 3D depth is now isolated, so a window behind another can no longer punch through it visually",
+      "Mobile Chrome no longer blanks the screen due to WebGL2 renderer failures"
+    ]
+  },
+  {
     "version": "0.8.27",
     "date": "2026-07-22",
     "title": "Private workspaces stay private",
