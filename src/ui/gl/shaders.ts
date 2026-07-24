@@ -205,6 +205,12 @@ void main() {}
  * ellipsoids) stays lit correctly.
  */
 export const MESH_VS = `#version 300 es
+// Explicit precision on BOTH stages so the linker never has to reconcile a
+// vertex out-varying against a fragment in-varying of differing (or default)
+// precision. Desktop linkers are lenient; strict mobile drivers (Adreno, Mali)
+// reject a mismatched interpolant pair, which reads as "3D silently absent".
+precision highp float;
+precision highp int;
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec3 aColor;
@@ -213,10 +219,10 @@ uniform mat4 uModel;
 uniform mat4 uViewProj;
 uniform mat3 uNormalMat;
 uniform float uPointSize;
-out vec3 vWorldPos;
-out vec3 vNormal;
-out vec3 vColor;
-out vec2 vUv;
+out highp vec3 vWorldPos;
+out highp vec3 vNormal;
+out highp vec3 vColor;
+out highp vec2 vUv;
 void main() {
   vec4 world = uModel * vec4(aPos, 1.0);
   vWorldPos = world.xyz;
@@ -234,6 +240,8 @@ void main() {
  * (vertex color path = instance color). uModel is the parent node transform.
  */
 export const MESH_INSTANCED_VS = `#version 300 es
+precision highp float;
+precision highp int;
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
 layout(location = 4) in vec4 iM0;
@@ -244,10 +252,10 @@ layout(location = 8) in vec3 iColor;
 uniform mat4 uModel;
 uniform mat4 uViewProj;
 uniform float uPointSize;
-out vec3 vWorldPos;
-out vec3 vNormal;
-out vec3 vColor;
-out vec2 vUv;
+out highp vec3 vWorldPos;
+out highp vec3 vNormal;
+out highp vec3 vColor;
+out highp vec2 vUv;
 void main() {
   mat4 m = uModel * mat4(iM0, iM1, iM2, iM3);
   vec4 world = m * vec4(aPos, 1.0);
@@ -262,10 +270,11 @@ void main() {
 
 export const MESH_FS = `#version 300 es
 precision highp float;
-in vec3 vWorldPos;
-in vec3 vNormal;
-in vec3 vColor;
-in vec2 vUv;
+precision highp int;
+in highp vec3 vWorldPos;
+in highp vec3 vNormal;
+in highp vec3 vColor;
+in highp vec2 vUv;
 uniform vec3  uColor;        // albedo
 uniform vec3  uEmissive;
 uniform float uOpacity;
@@ -273,18 +282,22 @@ uniform float uMetalness;
 uniform float uRoughness;
 uniform vec3  uAmbient;
 uniform vec3  uCameraPos;
-uniform bool  uUseVertexColor;
-uniform bool  uUseTexture;
+// Boolean flags carried as int (0/1), never a GLSL bool. Several mobile drivers
+// (notably Adreno) mishandle boolean uniform upload/packing, so an int flag
+// compared against 0 is the portable idiom. The host already sets these with
+// uniform1i, so the JS side is unchanged.
+uniform int   uUseVertexColor;
+uniform int   uUseTexture;
 uniform sampler2D uTex;
 uniform int   uLightCount;
 uniform vec4  uLightPos[${MAX_MESH_LIGHTS}];   // xyz + w (0=dir, 1=point, 2=spot)
 uniform vec3  uLightColor[${MAX_MESH_LIGHTS}]; // rgb * intensity
 uniform vec4  uLightDir[${MAX_MESH_LIGHTS}];   // xyz aim dir (dir/spot), w = range (0 = infinite)
 uniform vec4  uLightSpot[${MAX_MESH_LIGHTS}];  // x=cosInner, y=cosOuter, z=isSpot
-uniform bool  uFogEnabled;
+uniform int   uFogEnabled;
 uniform vec3  uFogColor;
 uniform vec2  uFogRange;      // near, far
-uniform bool  uShadowEnabled;
+uniform int   uShadowEnabled;
 uniform int   uShadowLight;   // index of the shadow-casting light
 uniform sampler2D uShadowMap;
 uniform mat4  uLightVP;
@@ -320,9 +333,9 @@ vec3 fresnel(float ct, vec3 f0) { return f0 + (1.0 - f0) * pow(clamp(1.0 - ct, 0
 
 void main() {
   vec3 albedo = uColor;
-  if (uUseVertexColor) albedo *= vColor;
+  if (uUseVertexColor != 0) albedo *= vColor;
   float alpha = uOpacity;
-  if (uUseTexture) { vec4 t = texture(uTex, vUv); albedo *= t.rgb; alpha *= t.a; }
+  if (uUseTexture != 0) { vec4 t = texture(uTex, vUv); albedo *= t.rgb; alpha *= t.a; }
 
   vec3 N = normalize(vNormal);
   vec3 V = normalize(uCameraPos - vWorldPos);
@@ -333,7 +346,12 @@ void main() {
   float a = rough * rough;
   vec3 Lo = vec3(0.0);
   for (int i = 0; i < ${MAX_MESH_LIGHTS}; i++) {
-    if (i >= uLightCount) break;
+    // continue, not break: the trip count stays a compile-time constant so the
+    // loop fully unrolls. A data-dependent break terminates the loop early and
+    // defeats unrolling on some mobile compilers, which then choke on the
+    // dynamically-indexed light arrays inside. Unused light slots are zero-filled
+    // by the host, so skipping them here is equivalent to the old early-out.
+    if (i >= uLightCount) continue;
     vec3 L; float atten = 1.0;
     if (uLightPos[i].w < 0.5) {
       L = normalize(-uLightDir[i].xyz);                 // directional
@@ -360,7 +378,7 @@ void main() {
     vec3  F = fresnel(VdH, F0);
     vec3 spec = (D * G) * F / max(4.0 * NdV * NdL, 1e-4);
     vec3 kd = (vec3(1.0) - F) * (1.0 - uMetalness);
-    float sf = (uShadowEnabled && i == uShadowLight) ? shadowFactor(N, L) : 1.0;
+    float sf = (uShadowEnabled != 0 && i == uShadowLight) ? shadowFactor(N, L) : 1.0;
     Lo += (kd * albedo + spec) * radiance * NdL * sf;
   }
   vec3 color = uAmbient * albedo + Lo + uEmissive;
@@ -384,7 +402,7 @@ void main() {
     color *= rolled / peak;
   }
 
-  if (uFogEnabled) {
+  if (uFogEnabled != 0) {
     float d = length(uCameraPos - vWorldPos);
     float f = clamp((uFogRange.y - d) / max(uFogRange.y - uFogRange.x, 1e-3), 0.0, 1.0);
     color = mix(uFogColor, color, f);

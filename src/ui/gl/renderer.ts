@@ -199,6 +199,7 @@ export class GlRenderer {
     canvas.addEventListener('webglcontextrestored', () => {
       this.contextLost = false;
       this.programs.clear();
+      this.programErrors.clear();   // recompile fresh against the restored context
       this.meshVaos = new WeakMap();
       this.disposeBloomTargets();   // GPU FBOs/textures are gone; reallocate lazily
       this.disposeShadow();
@@ -244,31 +245,48 @@ export class GlRenderer {
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
+  /** Program names whose compile/link failed once, mapped to the driver info log.
+   *  A shader that fails on this GPU fails identically every frame, so we record
+   *  it and stop re-running the compiler (and re-throwing) 60x/second. */
+  private programErrors = new Map<string, string>();
+
   private getProgram(name: string, vsSrc: string, fsSrc: string, uniformNames: string[]): ProgramInfo {
     let info = this.programs.get(name);
     if (info) return info;
+    const prior = this.programErrors.get(name);
+    if (prior !== undefined) throw new Error(prior);
     const gl = this.gl;
-    const compile = (type: number, src: string): WebGLShader => {
-      const sh = gl.createShader(type)!;
-      gl.shaderSource(sh, src);
-      gl.compileShader(sh);
-      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-        throw new Error(`Shader '${name}' compile error: ${gl.getShaderInfoLog(sh)}`);
+    try {
+      const compile = (type: number, src: string): WebGLShader => {
+        const sh = gl.createShader(type)!;
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+          throw new Error(`Shader '${name}' compile error: ${gl.getShaderInfoLog(sh)}`);
+        }
+        return sh;
+      };
+      const program = gl.createProgram()!;
+      gl.attachShader(program, compile(gl.VERTEX_SHADER, vsSrc));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fsSrc));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(`Program '${name}' link error: ${gl.getProgramInfoLog(program)}`);
       }
-      return sh;
-    };
-    const program = gl.createProgram()!;
-    gl.attachShader(program, compile(gl.VERTEX_SHADER, vsSrc));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fsSrc));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(`Program '${name}' link error: ${gl.getProgramInfoLog(program)}`);
+      const uniforms: Record<string, WebGLUniformLocation | null> = {};
+      for (const u of uniformNames) uniforms[u] = gl.getUniformLocation(program, u);
+      info = { program, uniforms };
+      this.programs.set(name, info);
+      return info;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.programErrors.set(name, msg);
+      // Log the real driver reason exactly once per program. On a device where a
+      // shader won't build (a driver miscompile the desktop never hits), this is
+      // the single line that names the cause; remote consoles pick it up.
+      console.error('[GlRenderer]', msg);
+      throw err;
     }
-    const uniforms: Record<string, WebGLUniformLocation | null> = {};
-    for (const u of uniformNames) uniforms[u] = gl.getUniformLocation(program, u);
-    info = { program, uniforms };
-    this.programs.set(name, info);
-    return info;
   }
 
   // ── Frame lifecycle ──────────────────────────────────────────────────
@@ -515,12 +533,22 @@ void main() { fragColor = vec4(1.0); }`,
     'uShadowEnabled', 'uShadowLight', 'uShadowMap', 'uLightVP',
   ];
 
-  /** Bind the mesh (or instanced-mesh) program and set every material uniform. */
-  private useMeshMaterial(o: MeshMaterialOpts, instanced = false): ProgramInfo {
+  /**
+   * Bind the mesh (or instanced-mesh) program and set every material uniform.
+   * Returns null if the mesh program cannot be built on this GPU — callers then
+   * skip the draw so a driver that rejects the mesh shader degrades to "no 3D"
+   * rather than throwing out of the frame and blanking the 2D desktop with it.
+   */
+  private useMeshMaterial(o: MeshMaterialOpts, instanced = false): ProgramInfo | null {
     const gl = this.gl;
-    const p = instanced
-      ? this.getProgram('meshInstanced', MESH_INSTANCED_VS, MESH_FS, GlRenderer.MESH_UNIFORMS)
-      : this.getProgram('mesh', MESH_VS, MESH_FS, GlRenderer.MESH_UNIFORMS);
+    let p: ProgramInfo;
+    try {
+      p = instanced
+        ? this.getProgram('meshInstanced', MESH_INSTANCED_VS, MESH_FS, GlRenderer.MESH_UNIFORMS)
+        : this.getProgram('mesh', MESH_VS, MESH_FS, GlRenderer.MESH_UNIFORMS);
+    } catch {
+      return null;   // reason already logged once by getProgram
+    }
     gl.useProgram(p.program);
     gl.uniformMatrix4fv(p.uniforms.uModel, false, o.model);
     gl.uniformMatrix4fv(p.uniforms.uViewProj, false, o.viewProj);
@@ -590,6 +618,7 @@ void main() { fragColor = vec4(1.0); }`,
   drawMesh(o: MeshDrawOpts): void {
     const gl = this.gl;
     const p = this.useMeshMaterial(o);
+    if (!p) return;
     const entry = this.getMeshVao(o.geometry);
     gl.uniform1i(p.uniforms.uUseVertexColor, entry.hasColor ? 1 : 0);
     gl.bindVertexArray(entry.vao);
@@ -664,6 +693,7 @@ void main() { fragColor = vec4(1.0); }`,
     if (mesh.count === 0) return;
     const gl = this.gl;
     const p = this.useMeshMaterial(o);
+    if (!p) return;
     gl.uniform1i(p.uniforms.uUseVertexColor, mesh.hasColor ? 1 : 0);
     gl.bindVertexArray(mesh.vao);
     gl.enable(gl.DEPTH_TEST);
@@ -741,6 +771,7 @@ void main() { fragColor = vec4(1.0); }`,
     if (mesh.instanceCount === 0) return;
     const gl = this.gl;
     const p = this.useMeshMaterial(o, true);
+    if (!p) return;
     gl.uniform1i(p.uniforms.uUseVertexColor, 1); // instance color drives albedo
     // ...and because it does, uColor must be WHITE. The shader multiplies them
     // (albedo = uColor * vColor), and the compositor already defaults an
