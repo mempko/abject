@@ -7,6 +7,7 @@
       <span class="logo-highlight">{'{'}abject{'}'}</span>.world
     </a>
     <div class="nav-links">
+      <a href="/theory">Theory</a>
       <a href="/ask-protocol">Ask Protocol</a>
       <a href="/#symbiogenesis">Why Abject?</a>
       <a href="/#architecture">How It Works</a>
@@ -120,9 +121,22 @@
     }
   }
 
-  @media (max-width: 940px) {
-    .nav-links a[href="/#architecture"],
+  /* The bar is at its width limit; shed the section anchors first,
+     since those destinations are reachable by scrolling the home page. */
+  @media (max-width: 1024px) {
     .nav-links a[href="/#capabilities"] {
+      display: none;
+    }
+  }
+
+  @media (max-width: 940px) {
+    .nav-links a[href="/#architecture"] {
+      display: none;
+    }
+  }
+
+  @media (max-width: 840px) {
+    .nav-links a[href="/#symbiogenesis"] {
       display: none;
     }
   }

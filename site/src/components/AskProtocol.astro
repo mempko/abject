@@ -37,7 +37,10 @@ const useCases = [
       ))}
     </div>
 
-    <p class="ask-cta"><a href="/ask-protocol" class="btn btn-outline">Read the Ask Protocol &rarr;</a></p>
+    <p class="ask-cta">
+      <a href="/ask-protocol" class="btn btn-outline">Read the Ask Protocol &rarr;</a>
+      <a href="/theory" class="btn btn-outline">Read the theory &rarr;</a>
+    </p>
   </div>
 </section>
 
@@ -95,7 +98,10 @@ const useCases = [
   }
 
   .ask-cta {
-    text-align: center;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.75rem;
     margin-top: 1rem;
   }
 </style>

@@ -1,0 +1,555 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+const askPrimitive = `ask(question: string) -> string`;
+---
+
+<Layout
+  title="The Theory - Abject"
+  description="The thinking behind Abject: Alan Kay's big idea was messaging, compression instead of abstraction, Naur's theory over artifact, pattern languages, and DCI."
+>
+  <Header />
+  <main class="spec">
+    <div class="spec-container">
+
+      <!-- Hero -->
+      <header class="spec-hero">
+        <p class="spec-eyebrow">// THEORY</p>
+        <h1>The Theory</h1>
+        <p class="spec-thesis">
+          Object orientation was misunderstood. The big idea was never classes, or inheritance,
+          or the taxonomy of nouns that a generation of textbooks made of it. The big idea was
+          messaging: independent things that hold their own state and talk across agreed
+          boundaries. That idea has been running the world the whole time, in TCP/IP and in your
+          cells, while the languages that claimed the name drifted somewhere else entirely.
+          Abject is an attempt to take the original idea seriously, with one addition that was
+          not available in 1972.
+        </p>
+      </header>
+
+      <div class="spec-callout">
+        <strong>This page is the condensed version.</strong> The longform argument lives in
+        <a href="https://blog.mempko.com/a-love-letter-to-object-orientation/" target="_blank" rel="noopener">A&nbsp;Love&nbsp;Letter&nbsp;to&nbsp;Object&nbsp;Orientation</a>.
+        For the mechanics rather than the reasoning, read <a href="/ask-protocol">the Ask Protocol specification</a>.
+      </div>
+
+      <!-- Table of Contents -->
+      <nav class="spec-toc">
+        <h2>Contents</h2>
+        <ol>
+          <li><a href="#messaging">The Big Idea Was Messaging</a></li>
+          <li><a href="#compression">Compression, Not Abstraction</a></li>
+          <li><a href="#metasystem">The Ultimate Metasystem</a></li>
+          <li><a href="#theory-artifact">Theory and Artifact</a></li>
+          <li><a href="#dci">Data, Context, and Interaction</a></li>
+          <li><a href="#love-letter">A Love Letter</a></li>
+        </ol>
+      </nav>
+
+      <!-- 1 -->
+      <section id="messaging">
+        <h2><span class="section-num">1</span> The Big Idea Was Messaging</h2>
+
+        <p>
+          Alan Kay coined the term "object oriented" and spent much of the rest of his career
+          regretting it. In a 1998 message to the Squeak mailing list he put it plainly:
+        </p>
+
+        <blockquote class="spec-quote">
+          <p>The big idea is "messaging".</p>
+          <p>
+            The key in making great and growable systems is much more to design how its modules
+            communicate rather than what their internal properties and behaviors should be.
+          </p>
+          <cite>Alan Kay, 1998</cite>
+        </blockquote>
+
+        <p>
+          The word he reached for was <em>ma</em>, the Japanese term for that which is in between.
+          Not the things, the space between the things. What matters about a system is not the
+          inventory of its parts but the character of the gaps between them: what crosses, in
+          what form, under whose terms.
+        </p>
+
+        <p>
+          The internet is the proof. It is not one giant class hierarchy. It is independent
+          systems sending messages across agreed boundaries, and it has survived fifty years of
+          continuous change precisely because nothing in it inherits from anything else. Biology
+          got there first. A white blood cell meeting a pathogen does not consult a specification;
+          it reads what is on the surface and responds.
+        </p>
+
+        <p>
+          Meanwhile the languages that took Kay's name built taxonomies. Classes, hierarchies,
+          the careful modeling of nouns. All of it about internal properties, almost none of it
+          about the space between. The industry kept the word and lost the idea.
+        </p>
+      </section>
+
+      <!-- 2 -->
+      <section id="compression">
+        <h2><span class="section-num">2</span> Compression, Not Abstraction</h2>
+
+        <p>
+          If messaging is the point, the hard problem is what the messages mean. Two systems
+          built by people who never met have no shared vocabulary, so historically a human wrote
+          the bridge. Every integration, every adapter, every SDK: a person reading one side's
+          documentation and hand-carrying meaning to the other. This is most of what software
+          work has been.
+        </p>
+
+        <p>Abject's addition is one method that every object implements:</p>
+
+        <pre><code>{askPrimitive}</code></pre>
+
+        <p>
+          Ask any object a question in plain English and it answers. That is the entire protocol.
+          What makes it more than a documentation string is where the answer comes from.
+        </p>
+
+        <h3>Abstraction freezes a judgment</h3>
+
+        <p>
+          An abstraction is a decision someone made at one moment about what mattered, preserved
+          after the reasons for it have moved on. An interface definition, a manifest, a schema:
+          each one throws the implementation away and keeps a summary of it. That summary was
+          someone's judgment, it was lossy when it was written, and it goes stale from the moment
+          it is committed. Anyone working from manifests alone is working from another person's
+          frozen, lossy judgment about a system that has since changed.
+        </p>
+
+        <h3>Compression re-derives it</h3>
+
+        <p>
+          An object answering through the ask protocol is not reading a description that someone
+          wrote in advance. It is deriving one, right now, from the real thing: its manifest, its
+          handlers, its actual source. The answer is a compression of the implementation rather
+          than an abstraction over it, and the difference is that a compression can be
+          regenerated. Change the object and the next answer changes with it. Nothing to keep in
+          sync, because nothing was ever stored.
+        </p>
+
+        <div class="spec-callout">
+          <strong>This is why the manifest is not enough.</strong> The manifest is the cheap
+          answer, and objects fall back to it when no model is available. The interesting answer
+          is the one derived from the code that is running at the moment you ask.
+        </div>
+      </section>
+
+      <!-- 3 -->
+      <section id="metasystem">
+        <h2><span class="section-num">3</span> The Ultimate Metasystem</h2>
+
+        <p>
+          Once objects can be interviewed, the bridges build themselves. An email object holding
+          a dinner invitation asks a calendar object it has never met how to save it. The calendar
+          answers with the message shape it accepts. Glue code is generated and the event lands.
+          No SDK, no integration sprint, no meeting between two teams.
+        </p>
+
+        <p>
+          The part that is easy to miss is that this is a conversation and not a lookup. The
+          object being asked can interrogate the caller's intent, push back when a request does
+          not fit, propose something adjacent, or redirect entirely. An ambiguous integration
+          becomes a negotiated one. That is a category the old model had no room for, because
+          documentation cannot ask you a clarifying question.
+        </p>
+
+        <p>
+          This is the composability ceiling lifting. Systems used to compose only as far as
+          someone had hand-built the connections, so the reachable set of combinations was
+          whatever humans had gotten around to writing. When objects can teach each other, the
+          reachable set is whatever the objects can explain, which is a much larger space and one
+          that grows on its own.
+        </p>
+
+        <p class="spec-aside">
+          The mechanics of all of this, message envelopes, the introspect interface, proxy
+          generation and self-healing, are specified in <a href="/ask-protocol">the Ask Protocol</a>.
+        </p>
+      </section>
+
+      <!-- 4 -->
+      <section id="theory-artifact">
+        <h2><span class="section-num">4</span> Theory and Artifact</h2>
+
+        <p>
+          In 1985 Peter Naur argued that a program is not really the product of programming.
+          The product is a <em>theory</em>: the working understanding, held in the heads of the
+          people who built it, of what the problem is and why the solution takes the shape it
+          does. Code is a secondary artifact, an imperfect projection of that theory. This is why
+          a codebase whose team has left is so much harder to change than its size suggests.
+          The artifact survived and the theory did not.
+        </p>
+
+        <p>
+          Abject takes this literally. Running objects are expendable. They get rewritten,
+          respawned, garbage collected when a better version exists. What accumulates instead is
+          a knowledge base: facts, lessons learned from things that went wrong, insights,
+          references, and patterns distilled from what actually happened rather than from what
+          someone intended to happen.
+        </p>
+
+        <h3>Patterns as a living vocabulary</h3>
+
+        <p>
+          This is Christopher Alexander's idea, applied where it was always going to fit best.
+          A pattern names a recurring tension and the structural resolution that answers it.
+          A pattern language is a vocabulary of those resolutions, built from use, revised when
+          the world changes, and worth more than any individual building made with it. Abject
+          grows one from its own execution history, and recalls the relevant entries into later
+          work.
+        </p>
+
+        <p class="thesis-conclusion">
+          You could throw away every object in the system and rebuild from the knowledge base and
+          the pattern language, and get something that works at least as well.
+        </p>
+
+        <p>
+          That is the actual claim. The objects are the artifacts the theory happens to have
+          produced so far.
+        </p>
+      </section>
+
+      <!-- 5 -->
+      <section id="dci">
+        <h2><span class="section-num">5</span> Data, Context, and Interaction</h2>
+
+        <p>
+          Trygve Reenskaug, who gave us MVC, later worked with James Coplien on an architecture
+          called DCI: Data, Context, Interaction. The observation behind it is that objects
+          modeled as stable domain data are easy to reason about, but real behavior does not live
+          in any one of them. It lives in a scenario that several objects participate in. So DCI
+          keeps the data in the objects, moves the scenario into a Context, and describes the
+          roles objects play while the scenario runs as the Interaction.
+        </p>
+
+        <p>
+          Abject extends this from a code structure into a runtime one. You ask for something and
+          a goal is created. The goal is decomposed, the objects that can play the necessary roles
+          are gathered, and work is assigned to them. Messages flow between them until the goal
+          resolves.
+        </p>
+
+        <div class="spec-grid">
+          <div class="spec-card">
+            <h4>Data</h4>
+            <p>Carried by the objects. Stable, durable, unaware of any particular scenario.</p>
+          </div>
+          <div class="spec-card">
+            <h4>Context</h4>
+            <p>The goal in motion. It exists for the duration of the work and then it is done.</p>
+          </div>
+          <div class="spec-card">
+            <h4>Interaction</h4>
+            <p>The messages. The roles objects play while a goal is being pursued.</p>
+          </div>
+        </div>
+
+        <p>
+          Nothing here requires a class hierarchy, and nothing requires an object to know in
+          advance which scenarios it will be useful in. That is the property that lets a system
+          keep absorbing new work without the parts having to be redesigned around it. You can
+          watch a goal go through this cycle in <a href="/#emergence">the scrum loop</a>.
+        </p>
+      </section>
+
+      <!-- 6 -->
+      <section id="love-letter">
+        <h2><span class="section-num">6</span> A Love Letter</h2>
+
+        <p>
+          Every object can explain itself. Every object can be discovered by conversation rather
+          than by prior arrangement. Workflows compose out of that instead of being hardcoded,
+          and the durable output is a theory rather than a pile of source.
+        </p>
+
+        <p>
+          None of this is new. Kay described the shape of it in the seventies, Alexander in the
+          seventies, Naur in the eighties, Reenskaug and Coplien in the two thousands. What was
+          missing was something that could sit in the gaps between objects and handle the
+          ambiguity that rigid interfaces never could. That part is recent. The architecture is
+          older than the model that finally made it work.
+        </p>
+
+        <p>
+          So Abject is a love letter to messages, and to the people who kept saying that the
+          space between things is where the design lives, for the several decades when the
+          industry was busy drawing hierarchies.
+        </p>
+
+        <p class="thesis-conclusion">
+          It is a simple idea but a powerful one. Hard to grasp its scope. Kind of like the
+          Schrödinger equation.
+        </p>
+
+        <p class="spec-aside">
+          Longform, in the author's own words:
+          <a href="https://blog.mempko.com/a-love-letter-to-object-orientation/" target="_blank" rel="noopener">A Love Letter to Object Orientation</a>,
+          <a href="https://blog.mempko.com/entering-the-architecture-age/" target="_blank" rel="noopener">Entering the Architecture Age</a>,
+          <a href="https://blog.mempko.com/an-abject-horror/" target="_blank" rel="noopener">An Abject Horror</a>.
+        </p>
+      </section>
+
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  /* ── Page layout ── */
+  .spec {
+    padding-top: 80px;
+  }
+
+  .spec-container {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 0 1.5rem 4rem;
+  }
+
+  /* ── Hero ── */
+  .spec-hero {
+    padding: 3rem 0 2rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 2.5rem;
+  }
+
+  .spec-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--eldritch);
+    letter-spacing: 0.15em;
+    margin-bottom: 0.75rem;
+  }
+
+  .spec-hero h1 {
+    font-size: clamp(2rem, 4vw, 3rem);
+    margin-bottom: 1.5rem;
+    color: var(--text-primary);
+  }
+
+  .spec-thesis {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.8;
+    max-width: 680px;
+  }
+
+  /* ── Table of Contents ── */
+  .spec-toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 3rem;
+  }
+
+  .spec-toc h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 1rem;
+  }
+
+  .spec-toc ol {
+    list-style: none;
+    counter-reset: toc;
+    padding: 0;
+  }
+
+  .spec-toc li {
+    counter-increment: toc;
+    padding: 0.3rem 0;
+  }
+
+  .spec-toc li::before {
+    content: counter(toc) ".";
+    font-family: var(--font-mono);
+    color: var(--eldritch);
+    margin-right: 0.75rem;
+    font-size: 0.9rem;
+  }
+
+  .spec-toc a {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    transition: color 0.2s;
+  }
+
+  .spec-toc a:hover {
+    color: var(--eldritch);
+  }
+
+  /* ── Sections ── */
+  section {
+    padding: 3rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  section:last-child {
+    border-bottom: none;
+  }
+
+  section h2 {
+    font-size: 1.6rem;
+    margin-bottom: 1.5rem;
+    color: var(--text-primary);
+    text-align: left;
+  }
+
+  section h2::after {
+    display: none;
+  }
+
+  .section-num {
+    font-family: var(--font-mono);
+    color: var(--eldritch);
+    margin-right: 0.5rem;
+    font-size: 0.9em;
+  }
+
+  section h3 {
+    font-size: 1.15rem;
+    color: var(--eldritch);
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+  }
+
+  section h4 {
+    font-size: 1rem;
+    color: var(--eldritch);
+    margin-bottom: 0.5rem;
+  }
+
+  section p {
+    color: var(--text-secondary);
+    line-height: 1.8;
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+  }
+
+  section p em {
+    color: var(--text-primary);
+    font-style: italic;
+  }
+
+  section pre {
+    margin-bottom: 1.5rem;
+  }
+
+  /* ── Links ── */
+  .spec-container a {
+    color: var(--eldritch-dim);
+    border-bottom: 1px solid rgba(63, 207, 138, 0.3);
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .spec-container a:hover {
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
+  }
+
+  .spec-toc a {
+    border-bottom: none;
+    color: var(--text-secondary);
+  }
+
+  /* ── Pull quote ── */
+  .spec-quote {
+    border-left: 2px solid var(--eldritch);
+    background: var(--eldritch-glow);
+    border-radius: 0 8px 8px 0;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+  }
+
+  .spec-quote p {
+    color: var(--text-primary);
+    font-size: 1.05rem;
+    line-height: 1.7;
+    margin-bottom: 0.75rem;
+  }
+
+  .spec-quote cite {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-style: normal;
+    color: var(--text-dim);
+    letter-spacing: 0.06em;
+  }
+
+  /* ── Cards ── */
+  .spec-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 1.75rem;
+    transition: border-color 0.3s;
+  }
+
+  .spec-card:hover {
+    border-color: var(--border-accent);
+  }
+
+  .spec-card h4 {
+    margin-top: 0;
+  }
+
+  .spec-card p:last-child {
+    margin-bottom: 0;
+  }
+
+  .spec-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1.25rem;
+    margin: 1.5rem 0;
+  }
+
+  /* ── Callout ── */
+  .spec-callout {
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+
+  .spec-callout strong {
+    color: var(--eldritch);
+  }
+
+  /* ── Aside ── */
+  .spec-aside {
+    color: var(--text-dim) !important;
+    font-size: 0.9rem !important;
+    font-style: italic;
+    margin-top: 2rem;
+  }
+
+  /* ── Conclusion ── */
+  .thesis-conclusion {
+    font-size: 1.15rem !important;
+    color: var(--eldritch) !important;
+    font-weight: 600;
+    margin: 2rem 0;
+    text-align: center;
+    line-height: 1.6 !important;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .spec-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
