@@ -1,0 +1,242 @@
+<!doctype html>
+<!--
+  Source for public/og-card.png, the site-wide Open Graph card.
+
+  To regenerate: open this file at a 1200x630 viewport and capture it at 2x,
+  which yields the committed 2400x1260 PNG. Headless, from the repo root:
+
+    node -e "const {chromium}=require('playwright');(async()=>{
+      const b=await chromium.launch();
+      const p=await b.newPage({viewport:{width:1200,height:630},deviceScaleFactor:2});
+      await p.goto('file://'+process.cwd()+'/site/tools/og-card.html',{waitUntil:'networkidle'});
+      await p.evaluate(()=>document.fonts.ready);
+      await p.screenshot({path:'site/public/og-card.png'});
+      await b.close();})()"
+
+  then `optipng -o2 site/public/og-card.png`. The background is a single seeded
+  still frame of src/scripts/abyss-bg.js, so the particle field is reproducible.
+  Verify the webfonts resolved before trusting the output; a network failure
+  silently falls back to Georgia and the card looks wrong.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Spectral:wght@400;500;600&family=Spline+Sans+Mono:wght@400;600&display=swap" rel="stylesheet" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg-deep: #05060a;
+    --eldritch: #5be5a0;
+    --void-purple: #8b7bff;
+    --text-primary: #e8e6dc;
+    --text-secondary: #c4c2b8;
+    --text-dim: #9a98a8;
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-body: 'Spectral', Georgia, serif;
+    --font-mono: 'Spline Sans Mono', monospace;
+  }
+
+  html, body { width: 1200px; height: 630px; }
+
+  body {
+    background: var(--bg-deep);
+    position: relative;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #abyss { position: absolute; inset: 0; }
+
+  /* Deep radial lift behind the text, so the copy never fights the particles. */
+  .veil {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(120% 90% at 12% 42%, rgba(5, 6, 10, 0.88) 0%, rgba(5, 6, 10, 0.55) 45%, rgba(5, 6, 10, 0) 75%),
+      radial-gradient(80% 70% at 88% 8%, rgba(91, 229, 160, 0.07) 0%, rgba(5, 6, 10, 0) 60%);
+  }
+
+  .card {
+    position: absolute;
+    inset: 0;
+    padding: 72px 80px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .logo {
+    font-family: var(--font-mono);
+    font-size: 34px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+  }
+
+  .logo .brace { color: var(--eldritch); }
+
+  .body-block { max-width: 900px; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: 68px;
+    font-weight: 600;
+    line-height: 1.08;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    margin-bottom: 26px;
+  }
+
+  h1 .accent { color: var(--eldritch); }
+
+  .sub {
+    font-family: var(--font-body);
+    font-size: 25px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    max-width: 900px;
+  }
+
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    font-family: var(--font-mono);
+    font-size: 19px;
+    color: var(--text-dim);
+    letter-spacing: 0.06em;
+  }
+
+  .foot .incant { color: var(--void-purple); }
+
+  /* Hairline accent along the bottom edge. Sloped-free gradient, no SVG filter. */
+  .rule {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--eldritch) 0%, rgba(139, 123, 255, 0.6) 45%, rgba(5, 6, 10, 0) 100%);
+  }
+</style>
+</head>
+<body>
+  <canvas id="abyss" width="1200" height="630"></canvas>
+  <div class="veil"></div>
+
+  <div class="card">
+    <div class="logo"><span class="brace">{</span>abject<span class="brace">}</span>.world</div>
+
+    <div class="body-block">
+      <h1>Objects that <span class="accent">explain themselves</span>.</h1>
+      <p class="sub">
+        A peer-to-peer desktop for local-first AI objects that find each other,
+        negotiate in plain English, and repair what breaks.
+      </p>
+    </div>
+
+    <div class="foot">
+      <span class="incant">conjure &middot; awaken &middot; scry</span>
+      <span>GPL-3.0-or-later</span>
+    </div>
+  </div>
+
+  <div class="rule"></div>
+
+<script>
+  // A single still frame of the site's own abyss background (src/scripts/abyss-bg.js),
+  // seeded so the card regenerates identically.
+  const ELDRITCH = { r: 91, g: 229, b: 160 };
+  const VOID_PURPLE = { r: 139, g: 123, b: 255 };
+  const ICHOR = { r: 255, g: 92, b: 119 };
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const rng = mulberry32(0xAB1EC7);
+  const rand = (min, max) => min + rng() * (max - min);
+
+  function pickColor() {
+    const r = rng();
+    if (r < 0.55) return ELDRITCH;
+    if (r < 0.9) return VOID_PURPLE;
+    return ICHOR;
+  }
+
+  const canvas = document.getElementById('abyss');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+
+  function drawTendril(t) {
+    if (t.points.length < 3) return;
+    const { r, g, b } = t.color;
+    ctx.strokeStyle = `rgba(${r},${g},${b},${t.alpha})`;
+    ctx.lineWidth = t.width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    const pts = t.points;
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length - 1; i++) {
+      ctx.quadraticCurveTo(pts[i].x, pts[i].y, (pts[i].x + pts[i + 1].x) / 2, (pts[i].y + pts[i + 1].y) / 2);
+    }
+    const last = pts[pts.length - 1];
+    ctx.lineTo(last.x, last.y);
+    ctx.stroke();
+  }
+
+  function drawParticle(p) {
+    const breathe = 0.5 + 0.5 * Math.sin(p.pulse);
+    const a = p.alpha * (0.4 + 0.6 * breathe);
+    const { r: cr, g: cg, b: cb } = p.color;
+    const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius * 6);
+    grad.addColorStop(0, `rgba(${cr},${cg},${cb},${a})`);
+    grad.addColorStop(0.3, `rgba(${cr},${cg},${cb},${a * 0.3})`);
+    grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius * 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = `rgba(${cr},${cg},${cb},${a * 1.5})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Tendrils first, then particles, exactly as the live renderer layers them.
+  for (let i = 0; i < 26; i++) {
+    const pointCount = Math.floor(rand(5, 9));
+    let x = rand(0, w);
+    let y = rand(h * 0.3, h);
+    const points = [];
+    for (let j = 0; j < pointCount; j++) {
+      points.push({ x, y });
+      x += rand(-80, 80);
+      y += rand(-120, -30);
+    }
+    drawTendril({ points, color: pickColor(), alpha: rand(0.03, 0.07), width: rand(0.5, 1.5) });
+  }
+
+  for (let i = 0; i < 220; i++) {
+    drawParticle({
+      x: rand(0, w),
+      y: rand(0, h),
+      radius: rand(0.5, 2.5),
+      color: pickColor(),
+      alpha: rand(0.08, 0.34),
+      pulse: rand(0, Math.PI * 2),
+    });
+  }
+
+  document.body.dataset.painted = 'true';
+</script>
+</body>
+</html>
