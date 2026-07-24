@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.8.29",
+    "date": "2026-07-24",
+    "title": "3D on Your Phone, For Real",
+    "summary": "This release makes the 3D desktop work reliably on mobile GPUs. Android devices (especially Adreno chips) that previously showed a blank screen now render the full workspace.",
+    "highlights": [
+      "Reworked the 3D mesh shaders to follow strict mobile GPU rules (matched precision, constant loop bounds), so windows and scenes render correctly on Android phones and tablets",
+      "If a device's GPU still can't compile the shaders, the renderer now degrades gracefully to a working 2D desktop instead of a blank page"
+    ],
+    "fixes": [
+      "Blank desktop on mobile Chrome caused by shader compilation failures on Adreno and similar mobile GPUs"
+    ]
+  },
+  {
     "version": "0.8.28",
     "date": "2026-07-23",
     "title": "Holding the Scene Together",
