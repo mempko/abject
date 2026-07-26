@@ -108,6 +108,8 @@ export class MCPBridge extends Abject {
                 status: { kind: 'primitive', primitive: 'string' },
                 serverName: { kind: 'primitive', primitive: 'string' },
                 toolCount: { kind: 'primitive', primitive: 'number' },
+                error: { kind: 'primitive', primitive: 'string' },
+                stderrTail: { kind: 'primitive', primitive: 'string' },
               }},
             },
           ],
@@ -137,6 +139,10 @@ export class MCPBridge extends Abject {
     prompt += `- Bridge state: ${this.bridgeStatus}\n`;
     if (this.bridgeStatusError) {
       prompt += `- Last error: ${this.bridgeStatusError}\n`;
+    }
+    const stderrTail = this.transport?.stderrTail;
+    if (stderrTail && !this.bridgeStatusError?.includes(stderrTail)) {
+      prompt += `- Subprocess stderr: ${stderrTail}\n`;
     }
     const envKeys = Object.keys(this.env).filter(k => this.env[k]);
     if (envKeys.length > 0) {
@@ -228,6 +234,7 @@ export class MCPBridge extends Abject {
         serverName: this.serverName,
         toolCount: this.cachedTools.length,
         error: this.bridgeStatusError,
+        stderrTail: this.transport?.stderrTail || undefined,
         configFile: this.configFile,
       };
     });
@@ -245,7 +252,7 @@ export class MCPBridge extends Abject {
       onStateChange: (state) => {
         if (state === 'error' || state === 'closed') {
           this.bridgeStatus = 'error';
-          this.bridgeStatusError = `Transport ${state}`;
+          this.bridgeStatusError = this.describeFailure(`Transport ${state}`);
           log.error(`[${this.serverName}] transport ${state}`);
         }
       },
@@ -310,10 +317,22 @@ export class MCPBridge extends Abject {
       });
     } catch (err) {
       this.bridgeStatus = 'error';
-      this.bridgeStatusError = err instanceof Error ? err.message : String(err);
+      this.bridgeStatusError = this.describeFailure(err instanceof Error ? err.message : String(err));
       log.error(`[${this.serverName}] initialization failed:`, this.bridgeStatusError);
       // Don't rethrow -- let the bridge exist in error state so it can be inspected
     }
+  }
+
+  /**
+   * Fold the subprocess's own stderr into a failure message. The server
+   * almost always prints the actual reason it refused to start (missing
+   * credential, malformed config, unknown flag); reporting only the exit
+   * code throws that away and leaves the caller guessing.
+   */
+  private describeFailure(message: string): string {
+    if (message.includes('Server stderr:')) return message;
+    const tail = this.transport?.stderrTail;
+    return tail ? `${message}\nServer stderr:\n${tail}` : message;
   }
 
   private async disconnectFromServer(): Promise<void> {

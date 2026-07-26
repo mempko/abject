@@ -330,9 +330,7 @@ export class ShellExecutor extends Abject {
   }
 
   private async validateSkillCommand(skillName: string, fullCommand: string): Promise<void> {
-    // Extract command name only (first word, basename) for skill matching
-    const firstWord = fullCommand.trim().split(/\s+/)[0] ?? fullCommand;
-    const cmdName = firstWord.split('/').pop() ?? firstWord;
+    const cmdName = extractCommandName(fullCommand);
 
     // Check skill-specific whitelist
     const skillWhitelist = this.skillAllowedCommands.get(skillName);
@@ -434,6 +432,46 @@ export class ShellExecutor extends Abject {
 
     return super.askPrompt(_question) + '\n\n' + lines.join('\n');
   }
+}
+
+/**
+ * Reduce a command line to the program being run, for permission matching.
+ *
+ * Naively taking the first whitespace-delimited word misreads two very common
+ * shapes. `TOKEN=abc curl ...` yields `TOKEN=abc` as the "command", which both
+ * renders the secret into the permission dialog and guarantees the entry can
+ * never match a whitelist (every distinct token value is a distinct "command").
+ * `env A=B cmd` has the same problem one level in. So: skip leading `VAR=value`
+ * assignments, step through an `env` prefix, and take the basename of what's
+ * left.
+ */
+export function extractCommandName(fullCommand: string): string {
+  // Multi-line scripts routinely open with comments or an assignment line, so
+  // the program being run is not on the first line. Take the first line that
+  // actually runs something.
+  const firstRealLine = fullCommand
+    .split('\n')
+    .map(l => l.trim())
+    .find(l => l && !l.startsWith('#') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(l))
+    ?? fullCommand;
+
+  const words = firstRealLine.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+
+  // Leading environment assignments, optionally introduced by `env`.
+  const isAssignment = (w: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w);
+  while (i < words.length) {
+    if (isAssignment(words[i])) { i++; continue; }
+    if (words[i] === 'env' || words[i] === '/usr/bin/env') {
+      i++;
+      while (i < words.length && isAssignment(words[i])) i++;
+      continue;
+    }
+    break;
+  }
+
+  const word = words[i] ?? words[0] ?? fullCommand;
+  return word.split('/').pop() || word;
 }
 
 export const SHELL_EXECUTOR_ID = 'abjects:shell-executor' as AbjectId;

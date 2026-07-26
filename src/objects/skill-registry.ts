@@ -44,7 +44,9 @@ export class SkillRegistry extends Abject {
   /** AbjectId of each running MCPBridge, keyed by skill name. */
   private mcpBridges = new Map<string, AbjectId>();
   /** Cached bridge health state, keyed by skill name. */
-  private mcpBridgeStates = new Map<string, { status: string; error?: string; toolCount: number }>();
+  private mcpBridgeStates = new Map<string, {
+    status: string; error?: string; toolCount: number; stderrTail?: string;
+  }>();
 
   constructor(skillsDir?: string) {
     super({
@@ -75,13 +77,21 @@ export class SkillRegistry extends Abject {
             },
             {
               name: 'enableSkill',
-              description: 'Enable a skill',
+              description:
+                'Enable a skill. For MCP skills this starts the bridge and waits for the handshake, so the ' +
+                'return value reports the real outcome: mcpStatus, toolCount, and on failure the error ' +
+                '(including the server subprocess stderr) plus any declared env vars still missing.',
               parameters: [
-                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name' },
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name (case-insensitive)' },
               ],
               returns: { kind: 'object', properties: {
                 success: { kind: 'primitive', primitive: 'boolean' },
                 warning: { kind: 'primitive', primitive: 'string' },
+                mcpStatus: { kind: 'primitive', primitive: 'string' },
+                toolCount: { kind: 'primitive', primitive: 'number' },
+                error: { kind: 'primitive', primitive: 'string' },
+                missingEnv: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                hint: { kind: 'primitive', primitive: 'string' },
               } },
             },
             {
@@ -143,12 +153,24 @@ export class SkillRegistry extends Abject {
             },
             {
               name: 'setSkillConfig',
-              description: 'Set configuration (env vars) for a skill and persist',
+              description:
+                'Set configuration (env vars) for a skill and persist it. This is the supported place for ' +
+                'skill credentials; values live in storage, not in the SKILL.md file. If the skill is an ' +
+                'enabled MCP server its bridge is restarted so the new environment takes effect, and the ' +
+                'restart outcome is reported back.',
               parameters: [
-                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name' },
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name (case-insensitive)' },
                 { name: 'env', type: { kind: 'object', properties: {} }, description: 'Key-value map of environment variables' },
+                { name: 'merge', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Merge into existing config instead of replacing it (default false)' },
               ],
-              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+                keys: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                restarted: { kind: 'primitive', primitive: 'boolean' },
+                mcpStatus: { kind: 'primitive', primitive: 'string' },
+                toolCount: { kind: 'primitive', primitive: 'number' },
+                error: { kind: 'primitive', primitive: 'string' },
+              } },
             },
             {
               name: 'getEnabledMCPServers',
@@ -213,14 +235,14 @@ export class SkillRegistry extends Abject {
     await this.loadStates();
     await this.loadConfigs();
 
-    // Seed config from SKILL.md default env values for skills with no config or empty env
+    // Fill config gaps from SKILL.md default env values. Stored values win —
+    // they came from the user or an agent through setSkillConfig — but any key
+    // the store has no value for is seeded from the file.
+    let seeded = false;
     for (const [name, entry] of this.skills) {
-      if (!entry.parsed.defaultEnv) continue;
-      const existing = this.skillConfigs.get(name);
-      if (!existing || !existing.env || Object.values(existing.env).every(v => !v)) {
-        this.skillConfigs.set(name, { env: { ...entry.parsed.defaultEnv } });
-      }
+      if (this.applyDefaultEnv(name, entry.parsed.defaultEnv, 'fill')) seeded = true;
     }
+    if (seeded) await this.persistConfigs();
 
     // Import MCP servers already configured on the host (mcporter / openclaw) as
     // disabled skills, so they can be bridged natively instead of shelled out to.
@@ -256,8 +278,18 @@ provides enabled skill summaries for agent prompt injection.
 
 ### Enable / disable a skill
 
-  await call(await dep('SkillRegistry'), 'enableSkill', { name: 'my-skill' });
+  const res = await call(await dep('SkillRegistry'), 'enableSkill', { name: 'my-skill' });
   await call(await dep('SkillRegistry'), 'disableSkill', { name: 'my-skill' });
+
+For an MCP skill, \`enableSkill\` waits for the server handshake and reports the
+real outcome, so the reply is the diagnosis:
+
+  { success: true, mcpStatus: 'running', toolCount: 12 }                  // working
+  { success: true, mcpStatus: 'error', toolCount: 0, error: '<subprocess stderr>',
+    missingEnv: ['SOME_TOKEN'], hint: 'Set them with setSkillConfig...' }  // not working
+
+\`error\` carries the server subprocess's own stderr, which is where MCP servers
+print why they refused to start. Read it before investigating anything else.
 
 ### Re-scan the skills directory
 
@@ -292,8 +324,21 @@ When an Abject bridges a specific MCP server (Telegram, Slack, GitHub, etc.), ca
 
 Env vars for a skill (including BOT_TOKEN / API_KEY values for its MCP server) live inside SkillRegistry and are injected into the MCP subprocess at spawn time. Read and write them through SkillRegistry:
 
-  await call(await dep('SkillRegistry'), 'setSkillConfig', { name: 'my-skill', env: { API_KEY: 'xxx' } });
+  await call(await dep('SkillRegistry'), 'setSkillConfig', { name: 'my-skill', env: { API_KEY: 'xxx' }, merge: true });
   const config = await call(await dep('SkillRegistry'), 'getSkillConfig', { name: 'my-skill' });
+
+Pass \`merge: true\` when setting a subset of the keys; without it the supplied
+env replaces the whole config and unrelated keys are lost. If the skill is an
+enabled MCP server, the bridge restarts on the new environment and the reply
+reports \`restarted\`, \`mcpStatus\`, and \`toolCount\`.
+
+This is the supported home for skill credentials. The \`env:\` block in a
+SKILL.md file supplies **defaults**, used to fill keys that have no stored
+value; stored config wins for keys that are already set. Declare the env var
+names there with empty values and keep live credentials out of the file: it
+sits in plaintext under the skills directory, it is copied around whenever a
+skill is shared or reinstalled, and a value written there is ignored once the
+stored config has one.
 
 ### Where users set these values
 
@@ -340,8 +385,10 @@ whenever the skill set changes.
     this.on('enableSkill', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
-      const entry = this.skills.get(name);
+      const match = this.findSkillEntry(name);
+      const entry = match?.entry;
       if (!entry) throw new Error(`Skill "${name}" not found`);
+      const key = match!.key;
       entry.enabled = true;
       await this.persistStates();
       await this.pushEnvToShell();
@@ -349,7 +396,45 @@ whenever the skill set changes.
       // If this is an MCP server, spawn a bridge
       let warning: string | undefined;
       if (entry.parsed.mcpServer) {
-        await this.spawnMCPBridge(name, entry);
+        await this.spawnMCPBridge(key, entry);
+
+        // Report what actually happened. `spawnMCPBridge` has already awaited
+        // the subprocess handshake, so the outcome is known here; returning a
+        // bare success made a dead server look like a working one and pushed
+        // the real diagnosis a full observe cycle downstream.
+        const state = this.mcpBridgeStates.get(key);
+        const missing = this.missingEnvKeys(key);
+        this.changed('skillsChanged', { reason: 'enabled' });
+
+        if (state?.status === 'error') {
+          const hint = missing.length > 0
+            ? `Declared env vars with no value: ${missing.join(', ')}. ` +
+              `Set them with setSkillConfig({ name: "${key}", env: { ... }, merge: true }).`
+            : undefined;
+          log.warn(`Enabled skill "${key}" but its MCP bridge failed: ${state.error ?? 'unknown error'}`);
+          return {
+            success: true,
+            mcpStatus: 'error',
+            toolCount: 0,
+            error: state.error,
+            missingEnv: missing.length > 0 ? missing : undefined,
+            hint,
+          };
+        }
+
+        // Connected. Zero tools is unusual but legal (a server may expose only
+        // resources), so report it as a warning rather than a failure.
+        const toolCount = state?.toolCount ?? 0;
+        log.info(`Enabled skill: ${key} (${toolCount} tools)`);
+        return {
+          success: true,
+          mcpStatus: 'running',
+          toolCount,
+          warning: toolCount === 0
+            ? `MCP server "${key}" connected but exposes no tools. If you expected tools, check its configuration; ` +
+              (missing.length > 0 ? `these declared env vars have no value: ${missing.join(', ')}.` : 'the server may expose resources only.')
+            : undefined,
+        };
       } else if (looksLikeMcpSkill(entry.parsed)) {
         // The skill declares an MCP launcher dependency (e.g. mcporter) but has no
         // mcp-command frontmatter, so no bridge will start. Surface this softly so
@@ -370,7 +455,8 @@ whenever the skill set changes.
     this.on('disableSkill', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
-      const entry = this.skills.get(name);
+      const match = this.findSkillEntry(name);
+      const entry = match?.entry;
       if (!entry) throw new Error(`Skill "${name}" not found`);
       entry.enabled = false;
       await this.persistStates();
@@ -378,7 +464,7 @@ whenever the skill set changes.
 
       // If this is an MCP server, stop its bridge
       if (entry.parsed.mcpServer) {
-        await this.stopMCPBridge(name);
+        await this.stopMCPBridge(match!.key);
       }
 
       this.changed('skillsChanged', { reason: 'disabled' });
@@ -442,6 +528,16 @@ whenever the skill set changes.
 
       // Re-scan to pick it up
       await this.doScan();
+      // An install is an explicit statement of intent, so values in the new
+      // file's env block take effect rather than being treated as defaults
+      // that an older stored config can shadow. Parse the content we just
+      // wrote so the right entry is found even when the frontmatter `name`
+      // differs from the directory name.
+      const installed = parseSkillMd(content, name);
+      if (this.applyDefaultEnv(installed.name, installed.defaultEnv, 'overwrite')) {
+        await this.persistConfigs();
+        await this.pushEnvToShell();
+      }
       this.changed('skillsChanged', { reason: 'installed' });
       log.info(`Installed skill: ${name}`);
       return { success: true };
@@ -451,12 +547,18 @@ whenever the skill set changes.
       const { name } = msg.payload as { name: string };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
 
-      const entry = this.skills.get(name);
+      const match = this.findSkillEntry(name);
+      const entry = match?.entry;
       if (!entry) throw new Error(`Skill "${name}" not found`);
+
+      // Stop the subprocess before the files go away. Uninstall used to leave
+      // a running MCP server orphaned: still connected, still holding the
+      // skill's credentials, with nothing left on disk to explain it.
+      await this.stopMCPBridge(match!.key);
 
       const skillDir = path.join(this.skillsDir, name);
       await fsPromises.rm(skillDir, { recursive: true, force: true });
-      this.skills.delete(name);
+      this.skills.delete(match!.key);
       await this.persistStates();
       this.changed('skillsChanged', { reason: 'uninstalled' });
       log.info(`Uninstalled skill: ${name}`);
@@ -474,14 +576,44 @@ whenever the skill set changes.
     });
 
     this.on('setSkillConfig', async (msg: AbjectMessage) => {
-      const { name, env } = msg.payload as { name: string; env: Record<string, string> };
+      const { name, env, merge } = msg.payload as {
+        name: string; env: Record<string, string>; merge?: boolean;
+      };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
-      this.skillConfigs.set(name, { env: env ?? {} });
+      // Resolve through the case-insensitive lookup so a caller that types
+      // "Slack-MCP-Server" configures the installed skill instead of creating
+      // an orphan config entry that nothing ever reads.
+      const key = this.findSkillEntry(name)?.key ?? name;
+      const next: Record<string, string> = merge
+        ? { ...(this.skillConfigs.get(key)?.env ?? {}), ...(env ?? {}) }
+        : { ...(env ?? {}) };
+      this.skillConfigs.set(key, { env: next });
       await this.persistConfigs();
       await this.pushEnvToShell();
       this.changed('skillsChanged', { reason: 'configured' });
-      log.info(`Saved config for skill: ${name}`);
-      return { success: true };
+      log.info(`Saved config for skill: ${key} (${Object.keys(env ?? {}).join(', ') || 'no keys'}${merge ? ', merged' : ''})`);
+      // Restart a running bridge so the new environment actually takes effect;
+      // otherwise the caller sets a credential, sees success, and keeps
+      // talking to a subprocess still holding the old (or empty) value.
+      let restarted = false;
+      const entry = this.skills.get(key);
+      if (entry?.enabled && entry.parsed.mcpServer && this.mcpBridges.has(key)) {
+        await this.stopMCPBridge(key);
+        await this.spawnMCPBridge(key, entry);
+        restarted = true;
+      }
+      const state = this.mcpBridgeStates.get(key);
+      return {
+        success: true,
+        keys: Object.keys(next),
+        restarted,
+        // Same vocabulary as enableSkill so callers can branch one way.
+        ...(restarted ? {
+          mcpStatus: state?.status === 'error' ? 'error' : 'running',
+          toolCount: state?.toolCount ?? 0,
+          error: state?.error,
+        } : {}),
+      };
     });
 
     this.on('getEnabledMCPServers', async () => {
@@ -524,6 +656,7 @@ whenever the skill set changes.
     status: 'connected' | 'connecting' | 'error' | 'disabled' | 'not_installed' | 'not_mcp';
     bridgeId?: string;
     error?: string;
+    stderrTail?: string;
     toolCount?: number;
     hint?: string;
   } {
@@ -561,13 +694,19 @@ whenever the skill set changes.
       };
     }
     if (state?.status === 'error') {
+      const missing = this.missingEnvKeys(key);
       return {
         found: false,
         status: 'error',
         bridgeId,
         error: state.error,
+        stderrTail: state.stderrTail,
         toolCount: state.toolCount,
-        hint: `MCPBridge spawned but is in error state: ${state.error ?? 'unknown'}. Check credentials (SkillRegistry.getSkillConfig/setSkillConfig) or the bridge's getStatus handler directly.`,
+        hint:
+          `MCPBridge spawned but is in error state: ${state.error ?? 'unknown'}.` +
+          (missing.length > 0
+            ? ` Declared env vars with no value: ${missing.join(', ')}. Set them with SkillRegistry.setSkillConfig({ name: "${key}", env: { ... }, merge: true }).`
+            : ` Check credentials (SkillRegistry.getSkillConfig/setSkillConfig) or the bridge's getStatus handler directly.`),
       };
     }
     return {
@@ -612,13 +751,8 @@ whenever the skill set changes.
           enabled: previousEnabled.get(parsed.name) ?? false,
         });
 
-        // Seed config from defaultEnv if no config exists or env is empty
-        if (parsed.defaultEnv) {
-          const existing = this.skillConfigs.get(parsed.name);
-          if (!existing || !existing.env || Object.values(existing.env).every(v => !v)) {
-            this.skillConfigs.set(parsed.name, { env: { ...parsed.defaultEnv } });
-          }
-        }
+        // Fill any unset env keys from the file's defaults.
+        this.applyDefaultEnv(parsed.name, parsed.defaultEnv, 'fill');
       } catch (err) {
         // If SKILL.md doesn't exist or can't be parsed, skip this directory
         if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -630,6 +764,17 @@ whenever the skill set changes.
           enabled: false,
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+    }
+
+    // Reap bridges whose skill is gone from disk. A skill directory can vanish
+    // without going through uninstallSkill (deleted by hand, moved, renamed),
+    // and the subprocess it spawned would otherwise keep running forever with
+    // no skill left to disable it.
+    for (const name of [...this.mcpBridges.keys()]) {
+      if (!this.skills.has(name)) {
+        log.info(`Stopping MCP bridge for removed skill "${name}"`);
+        await this.stopMCPBridge(name);
       }
     }
 
@@ -696,6 +841,73 @@ whenever the skill set changes.
 
     if (seededConfig) await this.persistConfigs();
     return imported;
+  }
+
+  /**
+   * Reconcile a skill's stored config with the `env:` block in its SKILL.md.
+   *
+   * Two modes, because the two callers mean different things:
+   *
+   * - `'fill'` (a passive scan): the file supplies defaults. Any key the store
+   *   has no non-empty value for is seeded from the file; existing values are
+   *   left alone, because they came from a user or an agent deliberately
+   *   setting them and outrank a file default.
+   * - `'overwrite'` (an explicit install/reinstall): the file is the newer
+   *   statement of intent, so its non-empty values win. Empty values in the
+   *   file never clobber a stored value — an empty env entry is a declaration
+   *   that the key exists, not an instruction to erase it.
+   *
+   * The old behaviour re-seeded only when the stored env was entirely empty,
+   * so one incidental non-secret value (a `"true"` feature flag) froze the
+   * config forever and every later credential written into the SKILL.md was
+   * silently discarded, leaving the server to start with no credentials at all.
+   *
+   * Returns true when anything changed.
+   */
+  private applyDefaultEnv(
+    name: string,
+    defaultEnv: Record<string, string> | undefined,
+    mode: 'fill' | 'overwrite',
+  ): boolean {
+    if (!defaultEnv || Object.keys(defaultEnv).length === 0) return false;
+
+    const existing = this.skillConfigs.get(name);
+    const env: Record<string, string> = { ...(existing?.env ?? {}) };
+    let changed = false;
+
+    for (const [key, value] of Object.entries(defaultEnv)) {
+      const current = env[key];
+      const wantsOverwrite = mode === 'overwrite' && !!value && value !== current;
+      const fillsGap = !current && value !== undefined && value !== current;
+      if (wantsOverwrite || fillsGap) {
+        env[key] = value;
+        changed = true;
+      } else if (!(key in env)) {
+        // Declared but with no value anywhere: keep the key so the UI and
+        // agents can see what still needs to be supplied.
+        env[key] = '';
+        changed = true;
+      }
+    }
+
+    if (changed) this.skillConfigs.set(name, { env });
+    return changed;
+  }
+
+  /**
+   * Env keys a skill declares (via `env:` or OpenClaw `requires.env`) that
+   * still have no value. Used to explain a failed enable before the
+   * subprocess even runs.
+   */
+  private missingEnvKeys(name: string): string[] {
+    const entry = this.skills.get(name);
+    if (!entry) return [];
+    const config = this.skillConfigs.get(name)?.env ?? {};
+    const declared = new Set([
+      ...(entry.parsed.requiredEnv ?? []),
+      ...Object.keys(entry.parsed.defaultEnv ?? {}),
+    ]);
+    return [...declared].filter(k => !config[k]);
   }
 
   // ─── State Persistence ──────────────────────────────────────────
@@ -898,8 +1110,22 @@ whenever the skill set changes.
       this.mcpBridges.set(name, result.objectId);
       log.info(`Spawned MCPBridge for "${name}": ${result.objectId}`);
 
-      // Query bridge health after a short delay (give it time to connect)
-      setTimeout(() => this.refreshBridgeState(name).catch(() => {}), 3000);
+      // Factory.spawn awaits the bridge's onInit, which awaits the MCP
+      // handshake, so the outcome is already decided. Read it now rather than
+      // leaving callers to guess for three seconds.
+      await this.refreshBridgeState(name).catch(() => {});
+      const state = this.mcpBridgeStates.get(name);
+      if (state?.status === 'error') {
+        entry.error = state.error ?? 'MCP bridge failed to start';
+      } else {
+        entry.error = undefined;
+      }
+
+      // A server can also connect and then discover tools slightly later
+      // (some publish tools/list_changed after init), so re-check shortly.
+      if ((state?.toolCount ?? 0) === 0) {
+        setTimeout(() => this.refreshBridgeState(name).catch(() => {}), 3000);
+      }
     } catch (err) {
       log.error(`Failed to spawn MCPBridge for "${name}":`, err instanceof Error ? err.message : String(err));
       entry.error = `MCP spawn failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -912,7 +1138,7 @@ whenever the skill set changes.
     const bridgeId = this.mcpBridges.get(name);
     if (!bridgeId) return;
     try {
-      const status = await this.request<{ status: string; toolCount: number; error?: string }>(
+      const status = await this.request<{ status: string; toolCount: number; error?: string; stderrTail?: string }>(
         request(this.id, bridgeId, 'getStatus', {}),
         5000,
       );
@@ -920,6 +1146,7 @@ whenever the skill set changes.
         status: status.status,
         error: status.error,
         toolCount: status.toolCount,
+        stderrTail: status.stderrTail,
       });
       if (status.status === 'error') {
         log.info(`MCPBridge "${name}" in error state: ${status.error}`);

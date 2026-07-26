@@ -605,8 +605,12 @@ pane shows details, configuration, and actions for the selected skill.
       } catch { /* skip */ }
     }
 
+    // Saving config restarts an enabled MCP skill's bridge so the new values
+    // take effect; that spawns a subprocess (npx can take seconds), so allow
+    // more than the default deadline before reporting failure to the user.
     await this.request(
       request(this.id, this.skillRegistryId, 'setSkillConfig', { name: skill.name, env }),
+      60000,
     );
   }
 }

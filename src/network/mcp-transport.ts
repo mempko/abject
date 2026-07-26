@@ -17,6 +17,17 @@ const log = new Log('MCPTransport');
 
 export type MCPTransportState = 'idle' | 'starting' | 'connected' | 'error' | 'closed';
 
+/** How much of the child's stderr to retain for diagnostics. */
+const STDERR_BUFFER_LIMIT = 8192;
+
+/**
+ * Lines that are pure launcher noise. Every `npx`-launched server emits a few
+ * of these; they crowd out the one line that actually says why the server
+ * died, so they are dropped from the diagnostic tail whenever there is any
+ * other output to show.
+ */
+const STDERR_NOISE = /^\s*npm (warn|notice)\b/i;
+
 export interface MCPTransportEvents {
   onStateChange?: (state: MCPTransportState) => void;
   onNotification?: (method: string, params: unknown) => void;
@@ -40,6 +51,15 @@ export class MCPTransport {
   private nextId = 1;
   private pending = new Map<string | number, PendingRequest>();
   private requestTimeout: number;
+  /**
+   * Rolling tail of the child's stderr. MCP servers report fatal
+   * misconfiguration (missing credentials, bad config file, unsupported
+   * flags) on stderr and then exit; without retaining it the only signal
+   * that survives is "exited: code=1", which tells a diagnosing agent
+   * nothing and sends it hunting through log files for what we already had.
+   */
+  private stderrChunks: string[] = [];
+  private stderrLength = 0;
 
   constructor(opts?: { requestTimeout?: number }) {
     this.requestTimeout = opts?.requestTimeout ?? 30_000;
@@ -47,6 +67,33 @@ export class MCPTransport {
 
   get currentState(): MCPTransportState { return this.state; }
   get isConnected(): boolean { return this.state === 'connected'; }
+
+  /**
+   * The most recent stderr output from the child, with launcher noise
+   * stripped when there is anything more informative to show. Empty string
+   * when the child never wrote to stderr.
+   */
+  get stderrTail(): string {
+    const raw = this.stderrChunks.join('');
+    if (!raw.trim()) return '';
+    const lines = raw.split('\n');
+    const signal = lines.filter(l => l.trim() && !STDERR_NOISE.test(l));
+    return (signal.length > 0 ? signal : lines.filter(l => l.trim())).join('\n').trim();
+  }
+
+  private recordStderr(text: string): void {
+    this.stderrChunks.push(text);
+    this.stderrLength += text.length;
+    while (this.stderrLength > STDERR_BUFFER_LIMIT && this.stderrChunks.length > 1) {
+      this.stderrLength -= this.stderrChunks.shift()!.length;
+    }
+  }
+
+  /** Append the stderr tail to an error message when there is one. */
+  private withStderr(message: string): string {
+    const tail = this.stderrTail;
+    return tail ? `${message}\nServer stderr:\n${tail}` : message;
+  }
 
   on(events: MCPTransportEvents): void {
     this.events = { ...this.events, ...events };
@@ -60,6 +107,9 @@ export class MCPTransport {
       'Transport must be idle/closed/error to start');
 
     this.setState('starting');
+
+    this.stderrChunks = [];
+    this.stderrLength = 0;
 
     const mergedEnv = { ...process.env, ...env };
 
@@ -82,24 +132,28 @@ export class MCPTransport {
       this.reader = createInterface({ input: child.stdout! });
       this.reader.on('line', (line) => this.handleLine(line));
 
-      // Log stderr for diagnostics
+      // Retain stderr for diagnostics as well as logging it. The retained
+      // tail is what callers get to see when the server dies during startup.
       child.stderr?.on('data', (data: Buffer) => {
-        log.info(`[stderr] ${data.toString().trimEnd()}`);
+        const text = data.toString();
+        this.recordStderr(text);
+        log.info(`[stderr] ${text.trimEnd()}`);
       });
 
       child.on('error', (err) => {
         log.error('Process error:', err.message);
         this.setState('error');
-        this.events.onError?.(err);
-        this.rejectAll(err);
-        reject(err);
+        const enriched = new Error(this.withStderr(err.message));
+        this.events.onError?.(enriched);
+        this.rejectAll(enriched);
+        reject(enriched);
       });
 
       child.on('close', (code, signal) => {
         log.info(`Process exited: code=${code} signal=${signal}`);
         if (this.state !== 'closed') {
           this.setState('closed');
-          this.rejectAll(new Error(`MCP server exited: code=${code} signal=${signal}`));
+          this.rejectAll(new Error(this.withStderr(`MCP server exited: code=${code} signal=${signal}`)));
         }
       });
 
@@ -116,7 +170,11 @@ export class MCPTransport {
    * Send a JSON-RPC request and wait for the response.
    */
   async sendRequest(method: string, params?: unknown): Promise<unknown> {
-    contractRequire(this.state === 'connected', 'Transport must be connected to send requests');
+    // The message carries the stderr tail so a server that died before the
+    // handshake still explains itself instead of surfacing as a bare
+    // "not connected" contract violation.
+    contractRequire(this.state === 'connected',
+      this.withStderr(`Transport must be connected to send requests (state: ${this.state})`));
 
     const id = this.nextId++;
     const msg: JsonRpcRequest = { jsonrpc: '2.0', method, id };
@@ -125,7 +183,7 @@ export class MCPTransport {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`MCP request timed out: ${method} (${this.requestTimeout}ms)`));
+        reject(new Error(this.withStderr(`MCP request timed out: ${method} (${this.requestTimeout}ms)`)));
       }, this.requestTimeout);
 
       this.pending.set(id, { resolve, reject, timer });

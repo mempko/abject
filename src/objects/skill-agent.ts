@@ -23,6 +23,21 @@ const log = new Log('SkillAgent');
 
 const SKILL_AGENT_INTERFACE: InterfaceId = 'abjects:skill-agent';
 
+/**
+ * Deadline for requests that can stall behind a user permission dialog.
+ * ShellExecutor and HostFileSystem wait up to 120s for the user's decision,
+ * so anything shorter here turns "the user is still deciding" into a spurious
+ * timeout for the agent.
+ */
+const PERMISSION_AWARE_TIMEOUT = 180000;
+
+/** Show enough of a secret to confirm which value is set, never the value. */
+function maskSecret(value: string): string {
+  if (!value) return '(unset)';
+  if (value.length <= 8) return '(set)';
+  return `(set: ${value.slice(0, 4)}…${value.slice(-2)}, ${value.length} chars)`;
+}
+
 interface TaskExtra {
   lastResult?: string;
   /**
@@ -405,9 +420,17 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
         );
         if (servers.length > 0) {
-          skillState += '\n\nConnected MCP servers:\n' + servers.map(s =>
-            `- ${s.name}: ${s.tools.length} tools available`
-          ).join('\n');
+          // Name the tools, not just count them. A server that connects
+          // mid-task is absent from the system prompt built at task start, so
+          // this is the only place the agent learns what it can call without
+          // reaching for a shell. `list_mcp_tools` gives the full schemas.
+          skillState += '\n\nConnected MCP servers (call these with mcp_tool_call):\n' + servers.map(s => {
+            if (s.tools.length === 0) return `- ${s.name}: 0 tools (server connected but exposes nothing)`;
+            const names = s.tools.map(t => t.name);
+            const shown = names.slice(0, 25).join(', ');
+            const more = names.length > 25 ? `, +${names.length - 25} more (list_mcp_tools for all)` : '';
+            return `- ${s.name} (${names.length} tools): ${shown}${more}`;
+          }).join('\n');
         }
       } catch { /* best effort */ }
     }
@@ -430,6 +453,11 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           if (!command) return { success: false, error: 'shell action requires "command" field' };
           if (!this.shellExecutorId) return { success: false, error: 'ShellExecutor not available' };
 
+          // ShellExecutor may pause to ask the user for permission, and it
+          // gives them two minutes to answer. The request deadline has to
+          // outlast that dialog: a shorter one reports a bogus timeout while
+          // the user is still reading the prompt, and the agent responds by
+          // retrying a variant command, which raises yet another dialog.
           const execResult = await this.request<{ stdout: string; stderr: string; exitCode: number }>(
             request(this.id, this.shellExecutorId, 'exec', {
               command,
@@ -438,6 +466,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               timeout: 30000,
               skillName: 'skill-agent',
             }),
+            PERMISSION_AWARE_TIMEOUT,
           );
           result = execResult.exitCode === 0
             ? (execResult.stdout || '(no output)')
@@ -469,6 +498,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
 
           const fileResult = await this.request<{ content: string; lines: number }>(
             request(this.id, this.hostFileSystemId, 'readFile', { path }),
+            PERMISSION_AWARE_TIMEOUT,
           );
           result = fileResult.content.slice(0, 30000);
           break;
@@ -482,6 +512,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
 
           await this.request(
             request(this.id, this.hostFileSystemId, 'writeFile', { path, content }),
+            PERMISSION_AWARE_TIMEOUT,
           );
           result = `Wrote ${content.length} chars to ${path}`;
           break;
@@ -564,10 +595,80 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           const name = action.name as string;
           if (!name) return { success: false, error: 'enable_skill requires "name" field' };
 
-          await this.request(
+          const enabled = await this.request<{
+            success: boolean; warning?: string; mcpStatus?: string; toolCount?: number;
+            error?: string; missingEnv?: string[]; hint?: string;
+          }>(
             request(this.id, this.skillRegistryId, 'enableSkill', { name }),
+            60000,
           );
-          result = `Enabled skill "${name}"`;
+
+          // An MCP server that died on startup is a failed enable, not a
+          // successful one with a footnote. Fail the action so the next think
+          // sees the subprocess's own error instead of "Enabled skill X".
+          if (enabled.mcpStatus === 'error') {
+            const parts = [
+              `Enabled skill "${name}" but its MCP server failed to start.`,
+              enabled.error ? `Error: ${enabled.error}` : '',
+              enabled.missingEnv?.length ? `Missing env: ${enabled.missingEnv.join(', ')}` : '',
+              enabled.hint ?? '',
+            ].filter(Boolean);
+            return { success: false, error: parts.join('\n') };
+          }
+
+          result = enabled.mcpStatus
+            ? `Enabled skill "${name}" — MCP bridge running with ${enabled.toolCount ?? 0} tools. Call them with mcp_tool_call.`
+            : `Enabled skill "${name}"`;
+          if (enabled.warning) result += `\nWarning: ${enabled.warning}`;
+          break;
+        }
+
+        case 'set_skill_config': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          const env = action.env as Record<string, string> | undefined;
+          if (!name || !env || typeof env !== 'object') {
+            return { success: false, error: 'set_skill_config requires "name" and an "env" object' };
+          }
+
+          const saved = await this.request<{
+            success: boolean; keys?: string[]; restarted?: boolean;
+            mcpStatus?: string; toolCount?: number; error?: string;
+          }>(
+            request(this.id, this.skillRegistryId, 'setSkillConfig', {
+              name, env, merge: action.merge !== false,
+            }),
+            60000,
+          );
+
+          // Never echo the values back: this string lands in the agent's
+          // observation and from there in the LLM context and the log.
+          const summary = Object.entries(env)
+            .map(([k, v]) => `${k}: ${maskSecret(String(v ?? ''))}`)
+            .join(', ');
+          if (saved.restarted && saved.mcpStatus === 'error') {
+            return {
+              success: false,
+              error: `Saved config for "${name}" (${summary}) but the MCP server still fails to start.\n${saved.error ?? ''}`,
+            };
+          }
+          result = `Saved config for "${name}" — ${summary}.`
+            + (saved.restarted ? ` MCP bridge restarted: ${saved.toolCount ?? 0} tools available.` : '');
+          break;
+        }
+
+        case 'get_skill_config': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          if (!name) return { success: false, error: 'get_skill_config requires "name" field' };
+
+          const config = await this.request<{ env?: Record<string, string> }>(
+            request(this.id, this.skillRegistryId, 'getSkillConfig', { name }),
+          );
+          const entries = Object.entries(config?.env ?? {});
+          result = entries.length > 0
+            ? entries.map(([k, v]) => `${k}: ${maskSecret(String(v ?? ''))}`).join('\n')
+            : `No configuration set for "${name}".`;
           break;
         }
 
@@ -601,12 +702,12 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           const input = (action.input as Record<string, unknown>) ?? {};
           if (!server || !tool) return { success: false, error: 'mcp_tool_call requires "server" and "tool" fields' };
 
-          // Discover the MCPBridge for this server
-          const bridgeId = await this.discoverDep(`MCPBridge-${server}`);
-          if (!bridgeId) return { success: false, error: `MCP server "${server}" not running. Is it enabled?` };
+          const resolved = await this.resolveBridge(server);
+          if (!resolved.bridgeId) return { success: false, error: resolved.error };
 
           const toolResult = await this.request<{ content: string; isError: boolean }>(
-            request(this.id, bridgeId, 'callTool', { toolName: tool, input }),
+            request(this.id, resolved.bridgeId, 'callTool', { toolName: tool, input }),
+            120000,
           );
 
           if (toolResult.isError) {
@@ -614,6 +715,22 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           } else {
             result = toolResult.content;
           }
+          break;
+        }
+
+        case 'list_mcp_tools': {
+          const server = action.server as string;
+          if (!server) return { success: false, error: 'list_mcp_tools requires "server" field' };
+
+          const resolved = await this.resolveBridge(server);
+          if (!resolved.bridgeId) return { success: false, error: resolved.error };
+
+          const tools = await this.request<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>>(
+            request(this.id, resolved.bridgeId, 'listTools', {}),
+          );
+          result = tools.length > 0
+            ? `${server} exposes ${tools.length} tool(s):\n${formatMCPToolList(tools)}`
+            : `${server} is connected but exposes no tools.`;
           break;
         }
 
@@ -657,6 +774,38 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     }
   }
 
+  /**
+   * Resolve a server name to its running MCPBridge, with an explanation
+   * instead of a shrug when there isn't one. SkillRegistry's diagnostic
+   * lookup distinguishes "never installed" from "disabled" from "enabled but
+   * the subprocess died", and carries the server's own stderr, so a failed
+   * tool call points at the actual fix rather than inviting the agent to go
+   * looking for a shell workaround.
+   */
+  private async resolveBridge(server: string): Promise<{ bridgeId?: AbjectId; error?: string }> {
+    if (this.skillRegistryId) {
+      try {
+        const info = await this.request<{
+          found: boolean; status: string; bridgeId?: string;
+          error?: string; stderrTail?: string; hint?: string;
+        }>(
+          request(this.id, this.skillRegistryId, 'getMCPBridgeInfo', { serverName: server }),
+        );
+        if (info.found && info.bridgeId) return { bridgeId: info.bridgeId as AbjectId };
+        const parts = [
+          `MCP server "${server}" is not usable (status: ${info.status}).`,
+          info.error ? `Error: ${info.error}` : '',
+          info.hint ?? '',
+        ].filter(Boolean);
+        return { error: parts.join('\n') };
+      } catch { /* fall through to direct discovery */ }
+    }
+
+    const bridgeId = await this.discoverDep(`MCPBridge-${server}`);
+    if (bridgeId) return { bridgeId };
+    return { error: `MCP server "${server}" not running. Is it installed and enabled?` };
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // System Prompt
   // ═══════════════════════════════════════════════════════════════════
@@ -664,7 +813,45 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   private async buildSystemPrompt(): Promise<string> {
     if (this.cachedSystemPrompt) return this.cachedSystemPrompt;
 
-    let prompt = `You are a skill execution agent. You complete tasks by exercising installed skills: running shell commands, making HTTP requests, reading/writing configuration and data files, calling MCP server tools, and searching the web.
+    let prompt = `You are a skill execution agent. You complete tasks by exercising installed skills: calling MCP server tools, making HTTP requests, reading/writing configuration and data files, running shell commands, and searching the web.
+
+## Reach for the MCP bridge first
+
+When an installed MCP server covers what the task needs, call its tools with
+\`mcp_tool_call\`. The bridge is a live connection to the running server: it
+validates your arguments against each tool's schema, returns structured
+results, and needs no credentials in your command line. Prefer it over shell
+and HTTP for anything the server already exposes.
+
+- \`list_mcp_tools\` shows a server's tools and their parameters, including
+  servers that connected after this task started.
+- Reproducing a server's API by hand (curl against the vendor's REST endpoint,
+  tokens pasted into command lines) is a fallback for when no server covers the
+  need. If a server exists but is broken, fix the server: read its error, set
+  the missing credential with \`set_skill_config\`, and try the tool again.
+- Credentials belong in skill config, never in a shell command. A token in a
+  command line is echoed into permission dialogs and logs.
+
+## Live state outranks anything you remember
+
+The injected skill list and MCP server list in each observation are ground
+truth for what is installed, enabled, and connected right now. Recalled
+knowledge, task descriptions, and notes from earlier runs describe how things
+were, and some of it was written while a bug was active, so it can assert that
+a working path is broken or name a config file that nothing here reads.
+
+When a remembered claim disagrees with the live lists, the live lists win.
+Before acting on a remembered claim about this system's plumbing (where
+credentials live, which transport works, whether a server is installed),
+confirm it against \`list_skills\`, the skill list in your observation, or
+\`list_mcp_tools\`. A config file belonging to another tool (\`~/.openclaw/...\`,
+\`~/.config/...\`, \`claude_desktop_config.json\`) is never evidence that
+something is installed here: those files configure other applications, and
+this system neither reads nor writes them at runtime.
+
+In particular, "the MCP bridge does not work for X, use the API directly" is
+not a conclusion to inherit. Reproduce it against the live bridge first: enable
+the skill and read the error it actually returns.
 
 ## Task Scope
 
@@ -694,9 +881,12 @@ Example response:
 | write_file | path, content | Write a file |
 | search | query | Search the web |
 | fetch | url | Fetch a URL as cleaned text |
-| mcp_tool_call | server, tool, input | Call a tool on a connected MCP server |
+| mcp_tool_call | server, tool, input | Call a tool on a connected MCP server. Preferred way to reach any capability a server provides. |
+| list_mcp_tools | server | List a connected server's tools and their parameters |
 | install_skill | name, content | Install a skill by writing a SKILL.md file |
-| enable_skill | name | Enable an installed skill (starts its MCP bridge if applicable) |
+| enable_skill | name | Enable an installed skill (starts its MCP bridge if applicable) and report the bridge's real status |
+| set_skill_config | name, env, merge? | Set a skill's environment variables (credentials go here). Merges by default; restarts the MCP bridge so the values take effect. |
+| get_skill_config | name | Show which env vars a skill has set (values masked) |
 | search_catalog | query, limit? | Search the official MCP registry and the ClawHub skills registry (vendor-neutral, ~13k+ community skills). Use this first when the user asks to install something generic like "a PDF reader" — you can present matches before committing. |
 | install_mcp_server | name | Install an MCP server by its registry name (e.g. the result of search_catalog). Fetches the package details, synthesises a SKILL.md, installs, and enables. |
 | install_clawhub_skill | slug | Install a skill from ClawHub by slug (result of search_catalog). Downloads the ZIP bundle and writes it under the local skills directory. Does NOT auto-enable — the user reviews first. |
@@ -738,10 +928,10 @@ Worked example. Task: "what are the most important emails I should look at today
 Two paths, depending on whether the user named a specific package:
 
 **By specific package name** (e.g., "install @shinzolabs/gmail-mcp"):
-1. Use install_skill directly with a SKILL.md (exact format below). npx handles package installation automatically.
-2. Use enable_skill to start the MCP bridge.
-3. Check the observation to confirm the bridge connected and tools were discovered.
-4. Report done.
+1. Use install_skill directly with a SKILL.md (exact format below), listing the server's env var names with empty values. npx handles package installation automatically.
+2. Use set_skill_config to supply any credentials you have.
+3. Use enable_skill to start the MCP bridge. Its result reports the bridge's real status.
+4. Verify with an actual tool call before reporting done (see below).
 
 **By capability** (e.g., "install a PDF reader", "install something that lets me search GitHub"):
 1. Use search_catalog with a focused query to see what's in the MCP registry and ClawHub.
@@ -758,7 +948,7 @@ description: "<what the server provides>"
 mcp-command: npx
 mcp-args: ["-y", "<npm-package-name>"]
 env:
-  <ENV_VAR_NAME>: "<value>"
+  <ENV_VAR_NAME>: ""
 ---
 
 <Brief description of the MCP server.>
@@ -768,9 +958,63 @@ Frontmatter rules:
 - All keys are hyphenated: \`mcp-command\`, \`mcp-args\`
 - \`mcp-command\` is always \`npx\` for npm packages
 - \`mcp-args\` always starts with \`"-y"\` followed by the package name
-- Include \`env\` with any required environment variables and their values
-- When the user provides credentials, include them in the env block. Otherwise leave values empty and tell the user what is needed before enabling.
+- List every environment variable the server needs under \`env\` with an EMPTY
+  value. The names document what must be supplied; the values come from
+  \`set_skill_config\`.
 - Include \`config-file\` if the MCP server uses an external config file (e.g. \`config-file: ~/.config/email-mcp/config.toml\`)
+
+## Credentials
+
+\`set_skill_config\` is the only place skill credentials go:
+
+\`\`\`json
+{ "action": "set_skill_config", "name": "<skill>", "env": { "SOME_TOKEN": "<value>" } }
+\`\`\`
+
+Values are stored by SkillRegistry and injected into the MCP subprocess and the
+shell environment at spawn time. Setting config on an enabled MCP skill
+restarts its bridge, and the result tells you whether the server came up.
+
+Do not put live credentials in a SKILL.md file, and do not write them into
+host config files for other tools (\`~/.openclaw/...\`, \`~/.config/...\`,
+\`claude_desktop_config.json\`). Those files configure *other* applications;
+this system does not read credentials back out of them, so a token written
+there has no effect and simply leaks. If you cannot find where a credential
+goes, the answer is \`set_skill_config\`.
+
+When you do not have the credential, \`reply\` to ask the user for it and say
+exactly which value you need and how to obtain it. Never invent a file path
+for them to paste it into.
+
+## Verifying an MCP server actually works
+
+"Installed" and "enabled" are not "working". Before reporting an integration as
+set up, prove it with the bridge:
+
+1. \`enable_skill\` — its result gives mcpStatus and the tool count.
+2. \`list_mcp_tools\` — confirms which tools you can actually call.
+3. One cheap read-only \`mcp_tool_call\` (list, search, whoami) against real data.
+
+Report \`done\` only after step 3 returns real data, and quote what came back.
+
+## When an MCP server fails to start
+
+The failure result carries the server subprocess's own stderr. That text is the
+diagnosis; read it before doing anything else. Servers say plainly what they
+want ("Authentication required: set X_TOKEN", "config file not found",
+"unknown flag").
+
+Work the error in this order:
+1. Missing or empty credential → \`set_skill_config\` with that exact env var name.
+2. Wrong command or args → \`install_skill\` again with corrected \`mcp-command\` / \`mcp-args\`.
+3. Only then consider anything else.
+
+Do not respond to a failed bridge by running the server yourself from the
+shell, wrapping it in a background process or service, switching it to a
+different transport, or reimplementing its API with curl. Those leave the
+system with nothing reusable. If you genuinely cannot get the bridge up, stop
+and \`fail\` with the server's error text, or \`reply\` to ask the user for what
+is missing.
 
 ## MCP Server Config Files
 
@@ -779,8 +1023,12 @@ Some MCP servers use external config files (TOML, JSON, YAML) in addition to or 
 ## Environment
 
 Configured environment variables for enabled skills are pre-set in the shell.
-You can reference them directly in commands: $VARIABLE_NAME
-If a variable is not set, follow the skill's credential-loading instructions as a fallback.
+Reference them by name: $VARIABLE_NAME. Never paste a secret's literal value
+into a command; the value appears in permission prompts and logs, and a command
+prefixed with an inline assignment is harder for the permission system to
+recognise than a plain \`curl ...\`.
+If a variable is not set, set it with \`set_skill_config\` rather than working
+around it.
 When using curl, use -s (silent) and pipe JSON through jq.
 `;
 
