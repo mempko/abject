@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.8.30",
+    "date": "2026-07-26",
+    "title": "Skill credentials that stick",
+    "summary": "Skills and MCP servers now keep the credentials you give them, and when an MCP server fails to start you see why instead of a silent no-op. Also adds a /theory page explaining the ideas behind Abject.",
+    "highlights": [
+      "New /theory page on abject.world: the thinking behind Abject, why objects (not agents) and why local-first",
+      "MCP server startup failures now surface the actual error (captured server output) instead of failing quietly",
+      "Links to abject.world now show a proper preview card when shared"
+    ],
+    "fixes": [
+      "Credentials entered for a skill were silently dropped instead of being saved to the skill's config",
+      "Enabling a skill backed by an MCP server reported success even when the server never started"
+    ]
+  },
+  {
     "version": "0.8.29",
     "date": "2026-07-24",
     "title": "3D on Your Phone, For Real",
