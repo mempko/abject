@@ -12,6 +12,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { LLMProviderDescription } from '../llm/provider.js';
+import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 
 const log = new Log('GlobalSettings');
 
@@ -20,6 +21,38 @@ function toListItems(
   arr: string[],
 ): Array<{ label: string; value: string; actions: Array<{ id: string; label: string }> }> {
   return arr.map(s => ({ label: s, value: s, actions: [{ id: 'remove', label: 'Remove' }] }));
+}
+
+/**
+ * Parse a per-object shell grant written as "ObjectName: command". The command
+ * is a program name, so anything with whitespace or a path separator in it is
+ * rejected rather than silently stored as a grant that can never match.
+ */
+/** Per-object shell rules: programs the object may run, and programs it may not. */
+interface ObjectCommandRules {
+  allow: string[];
+  deny: string[];
+}
+
+/** Read a stored rules record, tolerating the plain allow-array first written. */
+function parseObjectRules(json: string): ObjectCommandRules {
+  const parsed = JSON.parse(json) as unknown;
+  if (Array.isArray(parsed)) return { allow: parsed as string[], deny: [] };
+  const record = parsed as Partial<ObjectCommandRules>;
+  return {
+    allow: Array.isArray(record.allow) ? record.allow : [],
+    deny: Array.isArray(record.deny) ? record.deny : [],
+  };
+}
+
+function parseObjectPermEntry(entry: string): { objectName: string; commandName: string } | undefined {
+  const sep = entry.indexOf(':');
+  if (sep <= 0) return undefined;
+  const objectName = entry.slice(0, sep).trim();
+  const commandName = entry.slice(sep + 1).trim();
+  if (!objectName || !commandName) return undefined;
+  if (/[\s/\\]/.test(commandName)) return undefined;
+  return { objectName, commandName };
 }
 
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
@@ -45,6 +78,9 @@ const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
 const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
 const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
 const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
+/** Index of object names holding per-object shell grants; one key per name. */
+const STORAGE_KEY_OBJECT_PERM_NAMES = 'global-settings:objectPermNames';
+const objectPermKey = (objectName: string) => `global-settings:objectPerms:${objectName}`;
 
 // Per-tier routing storage keys
 const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
@@ -243,6 +279,14 @@ export class GlobalSettings extends Abject {
   private shellDeniedAddBtnId?: AbjectId;
   private shellDeniedListId?: AbjectId;
   private shellDeniedRemoveBtnId?: AbjectId;
+  private objectPermInputId?: AbjectId;
+  private objectPermAddBtnId?: AbjectId;
+  private objectPermListId?: AbjectId;
+  private objectPermRemoveBtnId?: AbjectId;
+  private objectDenyInputId?: AbjectId;
+  private objectDenyAddBtnId?: AbjectId;
+  private objectDenyListId?: AbjectId;
+  private objectDenyRemoveBtnId?: AbjectId;
   // Web
   private webEnabledCheckboxId?: AbjectId;
   private webDomainInputId?: AbjectId;
@@ -261,6 +305,12 @@ export class GlobalSettings extends Abject {
   private shellEnabled = true;
   private shellAllowedCmds: string[] = [];
   private shellDeniedCmds: string[] = [];
+  /**
+   * Per-object shell rules: object name -> programs it may or may not run,
+   * whatever the arguments. Keyed by name, so a rule survives the object being
+   * respawned with a fresh AbjectId.
+   */
+  private objectPermissions: Map<string, ObjectCommandRules> = new Map();
   private webEnabled = true;
   private webAllowedDomains: string[] = [];
   private webDeniedDomains: string[] = [];
@@ -650,16 +700,24 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Handle permission requests from capability objects
     this.on('requestPermission', async (msg: AbjectMessage) => {
-      const { type, resource, description, skillName } = msg.payload as {
+      const { type, resource, description, skillName, objectName, commandName, canAllow } = msg.payload as {
         type: 'shell' | 'directory' | 'skill_shell' | 'domain';
         resource: string;
         description: string;
         skillName?: string;
+        objectName?: string;
+        commandName?: string;
+        canAllow?: boolean;
       };
       if (type === 'skill_shell' && skillName) {
         return this.showSkillPermissionPrompt(skillName, resource, description);
       }
-      return this.showPermissionPrompt(type as 'shell' | 'directory' | 'domain', resource, description);
+      return this.showPermissionPrompt(
+        type as 'shell' | 'directory' | 'domain', resource, description,
+        objectName && commandName
+          ? { objectName, commandName, canAllow: canAllow !== false }
+          : undefined,
+      );
     });
 
     // Handle 'changed' events from widget dependents
@@ -673,6 +731,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         if (fromId === this._promptAcceptAlwaysBtnId) { this._pendingPermissionPrompt.resolve('accept_always'); return; }
         if (fromId === this._promptDenyBtnId) { this._pendingPermissionPrompt.resolve('deny'); return; }
         if (fromId === this._promptDenyAlwaysBtnId) { this._pendingPermissionPrompt.resolve('deny_always'); return; }
+        if (fromId === this._promptAcceptObjectBtnId) { this._pendingPermissionPrompt.resolve('accept_object'); return; }
+        if (fromId === this._promptDenyObjectBtnId) { this._pendingPermissionPrompt.resolve('deny_object'); return; }
+      }
+
+      // The prompt's resource block measured itself; grow the window to fit.
+      if (fromId === this._promptResourceBlockId && aspect === 'contentHeight') {
+        const height = typeof value === 'number' ? value : Number(value);
+        if (Number.isFinite(height) && height > 0) await this.resizePromptForResource(height);
+        return;
       }
 
       // Tab bar changed
@@ -897,6 +964,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           this.shellDeniedCmds = this.shellDeniedCmds.filter(c => c !== sel);
           await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: toListItems(this.shellDeniedCmds) }));
         }
+        return;
+      }
+      // Shell: per-object rules, entered as "ObjectName: command"
+      if (fromId === this.objectPermAddBtnId && aspect === 'click') {
+        await this.addObjectPermEntry('allow', this.objectPermInputId!, this.objectPermListId!);
+        return;
+      }
+      if (fromId === this.objectDenyAddBtnId && aspect === 'click') {
+        await this.addObjectPermEntry('deny', this.objectDenyInputId!, this.objectDenyListId!);
+        return;
+      }
+      if (fromId === this.objectPermRemoveBtnId && aspect === 'click') {
+        await this.removeObjectPermEntry('allow', this.objectPermListId!);
+        return;
+      }
+      if (fromId === this.objectDenyRemoveBtnId && aspect === 'click') {
+        await this.removeObjectPermEntry('deny', this.objectDenyListId!);
         return;
       }
 
@@ -1995,6 +2079,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.shellDeniedAddBtnId = undefined;
     this.shellDeniedListId = undefined;
     this.shellDeniedRemoveBtnId = undefined;
+    this.objectPermInputId = undefined;
+    this.objectPermAddBtnId = undefined;
+    this.objectPermListId = undefined;
+    this.objectPermRemoveBtnId = undefined;
+    this.objectDenyInputId = undefined;
+    this.objectDenyAddBtnId = undefined;
+    this.objectDenyListId = undefined;
+    this.objectDenyRemoveBtnId = undefined;
     this.webEnabledCheckboxId = undefined;
     this.webDomainInputId = undefined;
     this.webAddBtnId = undefined;
@@ -3041,6 +3133,30 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.shellDeniedListId = ed.listId;
       this.shellDeniedRemoveBtnId = ed.removeBtnId;
     }
+    {
+      const ed = await this.stringListEditor(
+        shellCard,
+        'Per-object allowed (object runs it with any arguments)',
+        'e.g. TmuxSession: tmux',
+        this.objectPermEntries('allow'),
+      );
+      this.objectPermInputId = ed.inputId;
+      this.objectPermAddBtnId = ed.addBtnId;
+      this.objectPermListId = ed.listId;
+      this.objectPermRemoveBtnId = ed.removeBtnId;
+    }
+    {
+      const ed = await this.stringListEditor(
+        shellCard,
+        'Per-object blocked (refused before any allow list)',
+        'e.g. TmuxSession: rm',
+        this.objectPermEntries('deny'),
+      );
+      this.objectDenyInputId = ed.inputId;
+      this.objectDenyAddBtnId = ed.addBtnId;
+      this.objectDenyListId = ed.listId;
+      this.objectDenyRemoveBtnId = ed.removeBtnId;
+    }
 
     // ── Web card ──
     const webCard = await this.sectionCard(cId, 'Web',
@@ -3274,6 +3390,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       key: STORAGE_KEY_CAP_ENFORCEMENT, value: this.capabilityEnforcement,
     }));
 
+    await this.saveObjectPermissions();
     await this.propagatePermissions();
     log.info('Permissions saved and propagated');
     await this.setStatus('Permissions saved!');
@@ -3290,25 +3407,68 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private _promptAcceptAlwaysBtnId?: AbjectId;
   private _promptDenyBtnId?: AbjectId;
   private _promptDenyAlwaysBtnId?: AbjectId;
+  private _promptAcceptObjectBtnId?: AbjectId;
+  private _promptDenyObjectBtnId?: AbjectId;
+  /** The self-measuring block holding the requested resource. */
+  private _promptResourceBlockId?: AbjectId;
+  private _promptResourceLayoutId?: AbjectId;
+  /** Window height with the resource block at zero, for contentHeight resizes. */
+  private _promptChromeHeight = 0;
+  private _promptRect?: { x: number; y: number; width: number; height: number };
 
+  /**
+   * Two decisions live in this dialog, and the layout says so: the top group
+   * acts on the exact command line, the bottom group on the pair (object,
+   * program) so an object that drives one tool is not re-asked per argument
+   * list. The resource itself is a self-measuring block, because a command
+   * line is any length and the old fixed-height label overlapped it.
+   *
+   * @param grant present when the caller resolved to a registered object.
+   *        `canAllow` false means the line does not reduce to a program name
+   *        (a shell line with metacharacters), so only the block half is
+   *        offered.
+   */
   private async showPermissionPrompt(
     type: 'shell' | 'directory' | 'domain',
     resource: string,
     description: string,
+    grant?: { objectName: string; commandName: string; canAllow: boolean },
   ): Promise<{ decision: string }> {
     if (!this.widgetManagerId) return { decision: 'deny' };
 
     // If there's already a prompt open, deny (don't stack prompts)
     if (this._pendingPermissionPrompt) return { decision: 'deny' };
 
+    const WIDTH = 560;
+    const MARGIN = 16;
+    const SPACING = 10;
+    const HEADER_H = 20;
+    const SECTION_H = 16;
+    const ROW_H = 34;
+    const RESOURCE_START_H = 22;
+
     try {
       const title = type === 'shell' ? 'Shell Permission'
         : type === 'domain' ? 'Network Permission'
         : 'Filesystem Permission';
+
+      // Title bar + margins + header + resource + one labeled button row,
+      // plus a second labeled row when the object group is shown.
+      const objectGroup = !!grant;
+      this._promptChromeHeight = TITLE_BAR_HEIGHT + MARGIN * 2
+        + HEADER_H + SPACING
+        + SPACING + SECTION_H + SPACING + ROW_H
+        + (objectGroup ? SPACING + SECTION_H + SPACING + ROW_H : 0);
+      const rect = {
+        x: 300, y: 180, width: WIDTH,
+        height: this._promptChromeHeight + RESOURCE_START_H,
+      };
+      this._promptRect = rect;
+
       const windowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId, 'createWindowAbject', {
           title,
-          rect: { x: 300, y: 200, width: 440, height: 200 },
+          rect,
           resizable: false,
           chromeless: false,
         })
@@ -3318,72 +3478,90 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const layoutId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId, 'createVBox', {
           windowId,
-          margins: { top: 16, right: 16, bottom: 16, left: 16 },
-          spacing: 12,
+          margins: { top: MARGIN, right: MARGIN, bottom: MARGIN, left: MARGIN },
+          spacing: SPACING,
         })
       );
 
-      // Description label
+      // Who is asking, and for what.
       const { widgetIds: [descLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId, 'create', { specs: [
           { type: 'label', windowId, text: description,
-            style: { color: this.theme.textPrimary, fontSize: 14, wordWrap: true } },
+            style: { color: this.theme.textPrimary, fontSize: 14 } },
         ]})
       );
       await this.request(request(this.id, layoutId, 'addLayoutChild', {
         widgetId: descLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 40 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: HEADER_H },
       }));
 
-      // Resource label
-      const { widgetIds: [resLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      // The command line itself: wraps and reports its own height, so nothing
+      // is clipped or overlapped however long it is.
+      const { widgetIds: [resBlockId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId, 'create', { specs: [
-          { type: 'label', windowId, text: `"${resource}"`,
-            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'monospace' } },
+          { type: 'contentBlock', windowId, text: resource,
+            style: {
+              color: this.theme.statusWarning, fontSize: 13,
+              fontFamily: 'monospace', markdown: false,
+            } },
         ]})
       );
+      this._promptResourceBlockId = resBlockId;
+      this._promptResourceLayoutId = layoutId;
+      await this.request(request(this.id, resBlockId, 'addDependent', {}));
       await this.request(request(this.id, layoutId, 'addLayoutChild', {
-        widgetId: resLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 24 },
+        widgetId: resBlockId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: RESOURCE_START_H },
       }));
 
-      // Button row
-      const btnRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId, 'createHBox', {
-          windowId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, layoutId, 'addLayoutChild', {
-        widgetId: btnRowId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 36 },
-      }));
-
+      // ── Group 1: this exact command line ──
+      await this.promptSectionLabel(layoutId, windowId, 'This command, exactly as written', SECTION_H);
+      const cmdRowId = await this.promptButtonRow(layoutId, windowId, ROW_H);
       const { widgetIds: [acceptOnceId, acceptAlwaysId, denyId, denyAlwaysId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId, 'create', { specs: [
-          { type: 'button', windowId, text: 'Once', style: { fontSize: 12 } },
-          { type: 'button', windowId, text: 'Always', style: { fontSize: 12, color: this.theme.statusSuccess } },
-          { type: 'button', windowId, text: 'Deny', style: { fontSize: 12 } },
-          { type: 'button', windowId, text: 'Never', style: { fontSize: 12, color: this.theme.statusError } },
+          { type: 'button', windowId, text: 'Allow once', style: { fontSize: 12 } },
+          { type: 'button', windowId, text: 'Always allow', style: { fontSize: 12, color: this.theme.statusSuccess } },
+          { type: 'button', windowId, text: 'Deny once', style: { fontSize: 12 } },
+          { type: 'button', windowId, text: 'Never allow', style: { fontSize: 12, color: this.theme.statusError } },
         ]})
       );
-
       this._promptAcceptOnceBtnId = acceptOnceId;
       this._promptAcceptAlwaysBtnId = acceptAlwaysId;
       this._promptDenyBtnId = denyId;
       this._promptDenyAlwaysBtnId = denyAlwaysId;
-
       for (const btnId of [acceptOnceId, acceptAlwaysId, denyId, denyAlwaysId]) {
-        await this.request(request(this.id, btnId, 'addDependent', {}));
-        await this.request(request(this.id, btnRowId, 'addLayoutChild', {
-          widgetId: btnId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
+        await this.promptAddButton(cmdRowId, btnId, ROW_H);
+      }
+
+      // ── Group 2: the calling object and this program, any arguments ──
+      if (grant) {
+        await this.promptSectionLabel(
+          layoutId, windowId,
+          `Every "${grant.commandName}" command from ${grant.objectName}, whatever the arguments`,
+          SECTION_H,
+        );
+        const objRowId = await this.promptButtonRow(layoutId, windowId, ROW_H);
+        const specs: Array<Record<string, unknown>> = [];
+        if (grant.canAllow) {
+          specs.push({ type: 'button', windowId, text: `Always allow ${grant.commandName}`,
+            style: { fontSize: 12, color: this.theme.statusSuccess } });
+        }
+        specs.push({ type: 'button', windowId, text: `Block ${grant.commandName}`,
+          style: { fontSize: 12, color: this.theme.statusError } });
+        const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId, 'create', { specs })
+        );
+        if (grant.canAllow) {
+          this._promptAcceptObjectBtnId = widgetIds[0];
+          this._promptDenyObjectBtnId = widgetIds[1];
+        } else {
+          this._promptDenyObjectBtnId = widgetIds[0];
+        }
+        for (const btnId of widgetIds) {
+          await this.promptAddButton(objRowId, btnId, ROW_H);
+        }
       }
 
       // Wait for user decision
@@ -3404,6 +3582,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           if (!this.shellDeniedCmds.includes(resource)) this.shellDeniedCmds.push(resource);
         }
         await this.savePermissions();
+      } else if (decision === 'accept_object' && grant) {
+        await this.setObjectCommandRule(grant.objectName, grant.commandName, 'allow');
+      } else if (decision === 'deny_object' && grant) {
+        await this.setObjectCommandRule(grant.objectName, grant.commandName, 'deny');
       }
 
       return { decision };
@@ -3422,6 +3604,230 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this._promptAcceptAlwaysBtnId = undefined;
       this._promptDenyBtnId = undefined;
       this._promptDenyAlwaysBtnId = undefined;
+      this._promptAcceptObjectBtnId = undefined;
+      this._promptDenyObjectBtnId = undefined;
+      this._promptResourceBlockId = undefined;
+      this._promptResourceLayoutId = undefined;
+      this._promptRect = undefined;
+    }
+  }
+
+  /** Small caption introducing a group of prompt buttons. */
+  private async promptSectionLabel(
+    layoutId: AbjectId, windowId: AbjectId, text: string, height: number,
+  ): Promise<void> {
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId, text,
+          style: { color: this.theme.textTertiary, fontSize: 11 } },
+      ]})
+    );
+    await this.request(request(this.id, layoutId, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height },
+    }));
+  }
+
+  private async promptButtonRow(
+    layoutId: AbjectId, windowId: AbjectId, height: number,
+  ): Promise<AbjectId> {
+    const rowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createHBox', {
+        windowId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, layoutId, 'addLayoutChild', {
+      widgetId: rowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height },
+    }));
+    return rowId;
+  }
+
+  private async promptAddButton(rowId: AbjectId, btnId: AbjectId, height: number): Promise<void> {
+    await this.request(request(this.id, btnId, 'addDependent', {}));
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: btnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: height - 4 },
+    }));
+  }
+
+  /**
+   * Grow the open prompt to fit the command line it is showing. The resource
+   * block measures itself once the layout settles; the window follows.
+   */
+  private async resizePromptForResource(contentHeight: number): Promise<void> {
+    if (!this._promptWindowId || !this._promptResourceBlockId || !this._promptRect) return;
+    const height = Math.min(Math.max(Math.ceil(contentHeight), 22), 260);
+    const windowHeight = this._promptChromeHeight + height;
+    if (windowHeight === this._promptRect.height) return;
+
+    const layoutId = this._promptResourceLayoutId;
+    if (layoutId) {
+      await this.request(request(this.id, layoutId, 'updateLayoutChild', {
+        widgetId: this._promptResourceBlockId,
+        preferredSize: { height },
+      })).catch(() => { /* widget gone */ });
+    }
+    this._promptRect = { ...this._promptRect, height: windowHeight };
+    await this.request(request(this.id, this._promptWindowId, 'windowRect', this._promptRect))
+      .catch(() => { /* window gone */ });
+  }
+
+  /**
+   * Record that a named object may (or may not) run a command with any
+   * arguments, persist it, and push it to ShellExecutor. The two rules are
+   * exclusive: granting clears a block on the same pair and vice versa.
+   */
+  private async setObjectCommandRule(
+    objectName: string, commandName: string, rule: 'allow' | 'deny',
+  ): Promise<void> {
+    const record = this.objectPermissions.get(objectName) ?? { allow: [], deny: [] };
+    const [into, outOf] = rule === 'allow'
+      ? ['allow', 'deny'] as const
+      : ['deny', 'allow'] as const;
+    if (!record[into].includes(commandName)) record[into].push(commandName);
+    record[outOf] = record[outOf].filter((c) => c !== commandName);
+    this.objectPermissions.set(objectName, record);
+    await this.saveObjectPermissions();
+    await this.refreshObjectPermLists();
+  }
+
+  /** Add a hand-typed "ObjectName: command" rule from a list editor's input. */
+  private async addObjectPermEntry(
+    kind: 'allow' | 'deny', inputId: AbjectId, listId: AbjectId,
+  ): Promise<void> {
+    const val = await this.request<string>(request(this.id, inputId, 'getValue', {}));
+    const parsed = parseObjectPermEntry(val ?? '');
+    if (!parsed) {
+      await this.setStatus('Use the form "ObjectName: command"');
+      return;
+    }
+    const record = this.objectPermissions.get(parsed.objectName) ?? { allow: [], deny: [] };
+    const other = kind === 'allow' ? 'deny' : 'allow';
+    if (!record[kind].includes(parsed.commandName)) record[kind].push(parsed.commandName);
+    record[other] = record[other].filter((c) => c !== parsed.commandName);
+    this.objectPermissions.set(parsed.objectName, record);
+    await this.refreshObjectPermLists();
+    await this.request(request(this.id, listId, 'update', { items: toListItems(this.objectPermEntries(kind)) }));
+    await this.request(request(this.id, inputId, 'update', { text: '' }));
+  }
+
+  private async removeObjectPermEntry(kind: 'allow' | 'deny', listId: AbjectId): Promise<void> {
+    const sel = await this.request<string | null>(request(this.id, listId, 'getValue', {}));
+    const parsed = sel ? parseObjectPermEntry(sel) : undefined;
+    if (!parsed) return;
+    const record = this.objectPermissions.get(parsed.objectName);
+    if (!record) return;
+    record[kind] = record[kind].filter((c) => c !== parsed.commandName);
+    if (record.allow.length === 0 && record.deny.length === 0) {
+      this.objectPermissions.delete(parsed.objectName);
+      this.staleObjectPermNames.add(parsed.objectName);
+    }
+    await this.request(request(this.id, listId, 'update', { items: toListItems(this.objectPermEntries(kind)) }));
+  }
+
+  /** Repaint the settings list editors, if the settings window is open. */
+  private async refreshObjectPermLists(): Promise<void> {
+    for (const [listId, kind] of [
+      [this.objectPermListId, 'allow'] as const,
+      [this.objectDenyListId, 'deny'] as const,
+    ]) {
+      if (!listId) continue;
+      try {
+        await this.request(request(this.id, listId, 'update', {
+          items: toListItems(this.objectPermEntries(kind)),
+        }));
+      } catch { /* settings window not open */ }
+    }
+  }
+
+  /** Flat "Name: command" view of one rule direction, for the list editors. */
+  private objectPermEntries(kind: 'allow' | 'deny'): string[] {
+    const entries: string[] = [];
+    for (const [objectName, record] of this.objectPermissions) {
+      for (const cmd of record[kind]) entries.push(`${objectName}: ${cmd}`);
+    }
+    return entries.sort();
+  }
+
+  /** Persist every per-object rule and push the whole set to ShellExecutor. */
+  private async saveObjectPermissions(): Promise<void> {
+    const names = Array.from(this.objectPermissions.keys());
+    // A dropped name keeps its storage key and its live rules inside
+    // ShellExecutor, so both are overwritten with empty lists.
+    const revoked = Array.from(this.staleObjectPermNames)
+      .filter((name) => !this.objectPermissions.has(name));
+    this.staleObjectPermNames.clear();
+
+    if (this.storageId) {
+      try {
+        for (const [objectName, record] of this.objectPermissions) {
+          await this.request(request(this.id, this.storageId, 'set', {
+            key: objectPermKey(objectName), value: JSON.stringify(record),
+          }));
+        }
+        for (const stale of revoked) {
+          await this.request(request(this.id, this.storageId, 'set', {
+            key: objectPermKey(stale), value: JSON.stringify({ allow: [], deny: [] }),
+          }));
+        }
+        await this.request(request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_OBJECT_PERM_NAMES, value: JSON.stringify(names),
+        }));
+      } catch (e) { log.warn('Failed to persist object permissions', e); }
+    }
+
+    const shellId = await this.discoverDep('ShellExecutor');
+    if (!shellId) return;
+    const updates: Array<[string, ObjectCommandRules]> = [
+      ...this.objectPermissions.entries(),
+      ...revoked.map((name) => [name, { allow: [], deny: [] }] as [string, ObjectCommandRules]),
+    ];
+    for (const [objectName, record] of updates) {
+      try {
+        await this.request(request(this.id, shellId, 'updateObjectPermissions', {
+          objectName, allowedCommands: record.allow, deniedCommands: record.deny,
+        }));
+      } catch (e) { log.warn(`Failed to propagate object permissions for ${objectName}`, e); }
+    }
+  }
+
+  /** Names whose rules were dropped this session, pending a storage rewrite. */
+  private staleObjectPermNames: Set<string> = new Set();
+
+  /** Read persisted per-object rules and hand them to ShellExecutor. */
+  private async loadObjectPermissions(): Promise<void> {
+    if (!this.storageId) return;
+    const namesJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OBJECT_PERM_NAMES })
+    );
+    if (!namesJson) return;
+
+    let names: string[];
+    try { names = JSON.parse(namesJson); } catch { return; }
+
+    const shellId = await this.discoverDep('ShellExecutor');
+    for (const objectName of names) {
+      const recordJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: objectPermKey(objectName) })
+      );
+      if (!recordJson) continue;
+      let record: ObjectCommandRules;
+      try { record = parseObjectRules(recordJson); } catch { continue; }
+      if (record.allow.length === 0 && record.deny.length === 0) continue;
+      this.objectPermissions.set(objectName, record);
+      if (shellId) {
+        try {
+          await this.request(request(this.id, shellId, 'updateObjectPermissions', {
+            objectName, allowedCommands: record.allow, deniedCommands: record.deny,
+          }));
+        } catch (e) { log.warn(`Failed to restore object permissions for ${objectName}`, e); }
+      }
     }
   }
 
@@ -3666,6 +4072,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Always claim authority, even if no permissions saved yet
     await this.claimAuthority();
+
+    // Per-object grants load ahead of the "nothing saved" early return below:
+    // they are written on their own, without the rest of the permission set.
+    await this.loadObjectPermissions();
 
     // Capability enforcement mode loads independently of the permission keys
     // so the interceptor hears the persisted (or default) mode at boot.

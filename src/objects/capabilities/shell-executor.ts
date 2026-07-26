@@ -62,6 +62,12 @@ export class ShellExecutor extends Abject {
   private permissionsAuthorityId?: AbjectId;
   /** Per-skill command whitelists (command name only, no args). */
   private skillAllowedCommands: Map<string, Set<string>> = new Map();
+  /** Per-calling-object command whitelists (command name only, no args). */
+  private objectAllowedCommands: Map<string, Set<string>> = new Map();
+  /** Per-calling-object blocklists; outrank every allow list. */
+  private objectDeniedCommands: Map<string, Set<string>> = new Map();
+  /** AbjectId -> registered name, so the caller lookup is one registry hit. */
+  private callerNames: Map<AbjectId, string> = new Map();
   /** Environment variables injected by skills (via SkillRegistry). */
   private skillEnv: Record<string, string> = {};
 
@@ -196,6 +202,30 @@ export class ShellExecutor extends Abject {
       return { success: true };
     });
 
+    // Per-object grants: "this named object may run this program". The name is
+    // the caller's registered name, resolved here from the message sender, so a
+    // caller cannot claim to be someone else by putting a name in the payload.
+    this.on('updateObjectPermissions', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
+        return { success: false, error: 'Unauthorized' };
+      }
+      const { objectName, allowedCommands, deniedCommands } = msg.payload as {
+        objectName: string;
+        allowedCommands?: string[];
+        deniedCommands?: string[];
+      };
+      contractRequire(typeof objectName === 'string' && objectName.length > 0, 'objectName must be a non-empty string');
+      if (allowedCommands !== undefined) {
+        if (allowedCommands.length > 0) this.objectAllowedCommands.set(objectName, new Set(allowedCommands));
+        else this.objectAllowedCommands.delete(objectName);
+      }
+      if (deniedCommands !== undefined) {
+        if (deniedCommands.length > 0) this.objectDeniedCommands.set(objectName, new Set(deniedCommands));
+        else this.objectDeniedCommands.delete(objectName);
+      }
+      return { success: true };
+    });
+
     this.on('setSkillEnv', async (msg: AbjectMessage) => {
       const { env } = msg.payload as { env: Record<string, string> };
       this.skillEnv = env ?? {};
@@ -205,7 +235,7 @@ export class ShellExecutor extends Abject {
 
     this.on('exec', (msg: AbjectMessage) => {
       const req = msg.payload as ExecRequest;
-      this.executeCommand(req).then(
+      this.executeCommand(req, msg.routing.from).then(
         (result) => {
           log.info(`exec result: exit=${result.exitCode} stdout=${result.stdout.length}b stderr=${result.stderr.length}b`);
           this.sendDeferredReply(msg, result);
@@ -220,7 +250,7 @@ export class ShellExecutor extends Abject {
     });
   }
 
-  private async executeCommand(req: ExecRequest): Promise<ExecResult> {
+  private async executeCommand(req: ExecRequest, callerId?: AbjectId): Promise<ExecResult> {
     if (this.shellDisabled) throw new Error('Shell execution is disabled. Enable it in Settings > Permissions.');
     contractRequire(typeof req.command === 'string' && req.command.length > 0, 'command must be a non-empty string');
     log.info(`exec: ${req.command.slice(0, 120)}${req.command.length > 120 ? '...' : ''} (shell=${!!req.shell}, cwd=${req.cwd ?? 'default'})`);
@@ -234,7 +264,7 @@ export class ShellExecutor extends Abject {
     if (req.skillName) {
       await this.validateSkillCommand(req.skillName, fullCommand);
     } else {
-      await this.validateCommand(fullCommand);
+      await this.validateCommand(fullCommand, { callerId, usesShell: !!req.shell });
     }
 
     // Validate working directory (may prompt user)
@@ -288,14 +318,34 @@ export class ShellExecutor extends Abject {
     });
   }
 
-  private async validateCommand(fullCommand: string): Promise<void> {
+  private async validateCommand(
+    fullCommand: string,
+    opts: { callerId?: AbjectId; usesShell: boolean },
+  ): Promise<void> {
     const trimmed = fullCommand.trim();
 
     if (this.deniedCommands?.has(trimmed)) {
       throw new Error(`Command "${trimmed}" is permanently denied`);
     }
 
+    // Per-object rules: the whole command line varies on every call (tmux
+    // send-keys carries a different payload each time), so an object that
+    // drives one program is matched on the program name alone.
+    const callerName = await this.resolveCallerName(opts.callerId);
+    const cmdName = extractCommandName(trimmed);
+
+    // A block on the object is the narrowest, most deliberate statement the
+    // user can make about this pair, so it outranks the broad allow lists.
+    if (callerName && this.objectDeniedCommands.get(callerName)?.has(cmdName)) {
+      throw new Error(`${callerName} is blocked from running "${cmdName}"`);
+    }
+
     if (this.allowedCommands?.has(trimmed)) return;
+
+    // A program-name grant says nothing about what a shell would do with the
+    // rest of the line, so `tmux ls; rm -rf ~` still goes to the user.
+    const reducible = !opts.usesShell || !hasShellMetacharacters(trimmed);
+    if (reducible && callerName && this.objectAllowedCommands.get(callerName)?.has(cmdName)) return;
 
     // Command not in allow list -- ask the permissions authority
     if (this.permissionsAuthorityId) {
@@ -303,7 +353,14 @@ export class ShellExecutor extends Abject {
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'shell',
           resource: trimmed,
-          description: `Shell command: ${trimmed}`,
+          description: callerName
+            ? `${callerName} wants to run:`
+            : `An object wants to run:`,
+          objectName: callerName,
+          commandName: callerName ? cmdName : undefined,
+          // Blocking a program for an object is always well defined; granting
+          // it is only meaningful when the line reduces to that program.
+          canAllow: reducible,
         }),
         120000,
       );
@@ -313,6 +370,20 @@ export class ShellExecutor extends Abject {
           if (!this.allowedCommands) this.allowedCommands = new Set();
           this.allowedCommands.add(trimmed);
           return;
+        case 'accept_object': {
+          if (!callerName) return;
+          addTo(this.objectAllowedCommands, callerName, cmdName);
+          this.objectDeniedCommands.get(callerName)?.delete(cmdName);
+          return;
+        }
+        case 'deny_object': {
+          if (callerName) {
+            addTo(this.objectDeniedCommands, callerName, cmdName);
+            this.objectAllowedCommands.get(callerName)?.delete(cmdName);
+            throw new Error(`${callerName} is blocked from running "${cmdName}"`);
+          }
+          throw new Error(`Command "${trimmed}" was denied by user`);
+        }
         case 'accept_once':
           return;
         case 'deny_always':
@@ -327,6 +398,60 @@ export class ShellExecutor extends Abject {
 
     // No authority registered -- deny by default
     throw new Error(`Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`);
+  }
+
+  /**
+   * Registered name of the Abject that sent an exec request, or undefined when
+   * it cannot be resolved. Cached: an AbjectId belongs to one object for its
+   * lifetime, and a respawned object arrives with a fresh id.
+   *
+   * User-created objects register in their workspace's registry rather than
+   * the global one, so a miss here falls back to asking WorkspaceManager which
+   * workspace owns the caller and looking the name up in that registry.
+   */
+  private async resolveCallerName(callerId?: AbjectId): Promise<string | undefined> {
+    if (!callerId) return undefined;
+    const cached = this.callerNames.get(callerId);
+    if (cached) return cached;
+
+    const name = await this.lookupName(await this.resolveRegistryId(), callerId)
+      ?? await this.lookupNameInWorkspace(callerId);
+    if (!name) return undefined;
+
+    // Dead ids are never reused, so the cache only grows; drop it wholesale
+    // rather than tracking liveness for what is a lookup optimization.
+    if (this.callerNames.size >= 512) this.callerNames.clear();
+    this.callerNames.set(callerId, name);
+    return name;
+  }
+
+  private async lookupName(registryId: AbjectId | null, objectId: AbjectId): Promise<string | undefined> {
+    if (!registryId) return undefined;
+    try {
+      const reg = await this.request<{ name?: string; manifest?: { name?: string } } | null>(
+        request(this.id, registryId, 'lookup', { objectId }),
+        5000,
+      );
+      return reg?.name ?? reg?.manifest?.name;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async lookupNameInWorkspace(objectId: AbjectId): Promise<string | undefined> {
+    const wmId = await this.discoverDep('WorkspaceManager');
+    if (!wmId) return undefined;
+    try {
+      const workspaces = await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
+        request(this.id, wmId, 'listWorkspacesDetailed', {}),
+        5000,
+      );
+      const owner = workspaces.find((ws) => ws.childIds?.includes(objectId));
+      if (!owner) return undefined;
+      return await this.lookupName(owner.registryId, objectId);
+    } catch {
+      return undefined;
+    }
   }
 
   private async validateSkillCommand(skillName: string, fullCommand: string): Promise<void> {
@@ -425,7 +550,14 @@ export class ShellExecutor extends Abject {
       if (this.allowedPaths) {
         lines.push(`Allowed working directories: ${this.allowedPaths.join(', ')}`);
       }
-      if (!this.allowedCommands && !this.deniedCommands && !this.allowedPaths) {
+      for (const [objectName, cmds] of this.objectAllowedCommands) {
+        lines.push(`${objectName} may run: ${[...cmds].join(', ')} (any arguments)`);
+      }
+      for (const [objectName, cmds] of this.objectDeniedCommands) {
+        lines.push(`${objectName} is blocked from: ${[...cmds].join(', ')}`);
+      }
+      if (!this.allowedCommands && !this.deniedCommands && !this.allowedPaths
+          && this.objectAllowedCommands.size === 0 && this.objectDeniedCommands.size === 0) {
         lines.push(`No restrictions configured.`);
       }
     }
@@ -445,6 +577,25 @@ export class ShellExecutor extends Abject {
  * assignments, step through an `env` prefix, and take the basename of what's
  * left.
  */
+/** Add one entry to a name -> set-of-commands map, creating the set as needed. */
+function addTo(map: Map<string, Set<string>>, key: string, value: string): void {
+  const existing = map.get(key);
+  if (existing) existing.add(value);
+  else map.set(key, new Set([value]));
+}
+
+/**
+ * Whether a command line contains characters a shell would read as anything
+ * other than plain arguments: chaining, piping, substitution, redirection.
+ *
+ * Only meaningful for `shell: true` requests. Without a shell the command and
+ * its args go straight to execFile, where these are ordinary bytes, and tmux
+ * send-keys payloads are full of them.
+ */
+export function hasShellMetacharacters(fullCommand: string): boolean {
+  return /[;&|<>`$(){}\n\r]/.test(fullCommand);
+}
+
 export function extractCommandName(fullCommand: string): string {
   // Multi-line scripts routinely open with comments or an assignment line, so
   // the program being run is not on the first line. Take the first line that
