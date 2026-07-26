@@ -355,7 +355,13 @@ export class AgentAbject extends Abject {
    * tasks) and drained by `runTaskAsync`'s tail when each task terminates.
    */
   private agentTaskQueues = new Map<AbjectId, {
-    inFlight?: { taskId: string; goalId?: string };
+    /**
+     * `queued` is retained alongside the ids so a slot the stale sweep has to
+     * reclaim can still be reported to whoever is waiting on it — by the time
+     * a task wedges, its QueuedTask has already been spliced out of `pending`
+     * and the TaskEntry may never have existed.
+     */
+    inFlight?: { taskId: string; goalId?: string; queued?: QueuedTask };
     pending: QueuedTask[];
   }>();
 
@@ -366,6 +372,16 @@ export class AgentAbject extends Abject {
    * pauseTasksByGoal/resumeTasksByGoal (called from GoalManager).
    */
   private pausedGoals = new Set<string>();
+
+  /** Periodic reclaim of wedged queue slots — see sweepStaleQueueSlots. */
+  private queueSweepTimer?: ReturnType<typeof setInterval>;
+  private static readonly QUEUE_SWEEP_INTERVAL_MS = 60_000;
+  /**
+   * Consecutive sweeps that saw a given in-flight slot pointing at a task
+   * that had already ended. Two strikes (so, a minute of grace) before the
+   * slot is reclaimed, so a teardown still in progress is never raced.
+   */
+  private staleSlotStrikes = new Map<string, number>();
 
   /** Lazy Ajv instance for response schema validation. */
   private _ajv?: Ajv;
@@ -828,9 +844,20 @@ The registered object must implement these handlers to participate in the agent 
     // ScrumMaster places tasks via enqueueTask. AgentAbject runs the OTA
     // loop for each queued task and pops the next one when the current
     // task terminates. There is nothing to scan for.
+    //
+    // The one thing worth sweeping is the queues themselves — see
+    // sweepStaleQueueSlots.
+    this.queueSweepTimer = setInterval(
+      () => { void this.sweepStaleQueueSlots(); },
+      AgentAbject.QUEUE_SWEEP_INTERVAL_MS,
+    );
   }
 
   protected override async onStop(): Promise<void> {
+    if (this.queueSweepTimer) {
+      clearInterval(this.queueSweepTimer);
+      this.queueSweepTimer = undefined;
+    }
     // Drain in-flight tasks to error so any awaiting callers get a clean
     // signal rather than hanging. Pending queues drop on the floor — they
     // weren't started so there's no partial work to surface.
@@ -938,7 +965,13 @@ The registered object must implement these handlers to participate in the agent 
 
       // Determine agent: explicit agentId, or caller if registered
       const agentId = targetAgentId ?? (this.registeredAgents.has(callerId) ? callerId : undefined);
-      if (!agentId) throw new Error('No agentId specified and caller is not a registered agent');
+      if (!agentId) {
+        const known = [...this.registeredAgents.values()].map(a => a.name).join(', ');
+        throw new Error(
+          `startTask needs an 'agentId': the caller is not itself a registered agent. ` +
+          `Registered agents: ${known || '(none)'}. To hand work to one of them, use enqueueTask with its agentId.`
+        );
+      }
 
       const agent = this.registeredAgents.get(agentId);
       if (!agent) throw new Error(`Agent "${agentId}" is not registered`);
@@ -985,8 +1018,13 @@ The registered object must implement these handlers to participate in the agent 
 
       this.taskEntries.set(taskId, entry);
 
-      // Fire-and-forget: run the state machine asynchronously
-      this.runTaskAsync(entry);
+      // Fire-and-forget: run the state machine asynchronously. runTaskAsync
+      // handles its own failures, but an unhandled rejection here would
+      // escape to the worker's unhandledRejection handler, so catch as well.
+      this.runTaskAsync(entry).catch((err) => {
+        log.error(`runTaskAsync for ${taskId.slice(0, 8)} escaped: ${err instanceof Error ? err.message : String(err)}`);
+        this.releaseQueueSlot(entry.agentId, taskId);
+      });
       return { ticketId: taskId };
     });
 
@@ -1557,6 +1595,38 @@ The registered object must implement these handlers to participate in the agent 
       entry.state.error = err instanceof Error ? err.message : String(err);
     }
 
+    try {
+      await this.finalizeTask(entry);
+    } catch (err) {
+      // Teardown itself failed. Log it, then fall through to the finally so
+      // the queue never inherits the damage.
+      log.error(`Teardown for task ${entry.state.id.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      entry.finished = true;
+      // ── Queue runner ──
+      // Clear inFlight for this agent and pop the next pending task, if any.
+      // The queue's inFlight slot is the one-task-at-a-time guard that
+      // replaces the legacy `busyAgents` set. This MUST run even when
+      // teardown blew up: a leaked slot silently wedges the agent forever,
+      // and every task queued behind it waits on a task that already ended.
+      this.releaseQueueSlot(entry.agentId, entry.state.id);
+    }
+  }
+
+  /**
+   * Post-run teardown: report the outcome to the goal machinery, the ticket
+   * holder, and the dependents. Every step is independently guarded — a
+   * failure to reach one listener must not cost the others their signal.
+   */
+  private async finalizeTask(entry: TaskEntry): Promise<void> {
+    // Already settled — the stale-slot sweep reached this task first (it only
+    // does that for a machine that looked finished) and has told everyone how
+    // it ended. Re-announcing would double-report the result to ScrumMaster.
+    if (entry.finished) {
+      log.info(`Task ${entry.state.id.slice(0, 8)} was already settled; skipping teardown`);
+      return;
+    }
+
     // Send deferred reply to startTask caller
     const success = entry.state.phase === 'done';
 
@@ -1580,15 +1650,15 @@ The registered object must implement these handlers to participate in the agent 
     // lifecycle for those, so we don't compete with it.
     if (entry.goalId && this.goalManagerId && !entry.dispatchTupleId) {
       if (success) {
-        this.send(event(this.id, this.goalManagerId, 'completeGoal', {
+        this.safeSend(event(this.id, this.goalManagerId, 'completeGoal', {
           goalId: entry.goalId,
           result: entry.state.result,
-        }));
+        }), 'completeGoal');
       } else {
-        this.send(event(this.id, this.goalManagerId, 'failGoal', {
+        this.safeSend(event(this.id, this.goalManagerId, 'failGoal', {
           goalId: entry.goalId,
           error: entry.state.error,
-        }));
+        }), 'failGoal');
       }
     }
 
@@ -1621,8 +1691,10 @@ The registered object must implement these handlers to participate in the agent 
       }
     }
 
-    // Send taskResult event to the ticket holder (caller)
-    this.send(event(this.id, entry.callerId, 'taskResult', {
+    // Send taskResult event to the ticket holder (caller). This is the only
+    // notice the caller gets that its ticket is settled — ScrumMaster runs
+    // its terminal action from here — so it is never allowed to be skipped.
+    this.safeSend(event(this.id, entry.callerId, 'taskResult', {
       ticketId: entry.state.id,
       success,
       result: entry.state.result,
@@ -1631,41 +1703,169 @@ The registered object must implement these handlers to participate in the agent 
       maxStepsReached: entry.state.step >= entry.state.maxSteps,
       validationErrors,
       lastAction: entry.state.action,
-    }));
+    }), 'taskResult');
 
     entry.finished = true;
 
     // The task is over — release its prompt-cache warmth (requests carried
     // cacheKey = task id) so the keepalive never keeps a dead session warm.
     if (this.llmId) {
-      this.send(event(this.id, this.llmId, 'releaseCache', { cacheKey: entry.state.id }));
+      this.safeSend(event(this.id, this.llmId, 'releaseCache', { cacheKey: entry.state.id }), 'releaseCache');
     }
 
-    this.changed('taskCompleted', {
-      taskId: entry.state.id,
-      agentId: entry.agentId,
-      agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
-      goalId: entry.goalId ?? entry.incomingGoalId ?? null,
-      steps: entry.state.step,
-      success,
-      result: success ? entry.state.result : undefined,
-      error: success ? undefined : entry.state.error,
-    });
+    try {
+      this.changed('taskCompleted', {
+        taskId: entry.state.id,
+        agentId: entry.agentId,
+        agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
+        goalId: entry.goalId ?? entry.incomingGoalId ?? null,
+        steps: entry.state.step,
+        success,
+        result: success ? entry.state.result : undefined,
+        error: success ? undefined : entry.state.error,
+      });
+    } catch (err) {
+      log.warn(`changed(taskCompleted) failed for ${entry.state.id.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     // Bound the task graveyard: keep only the most recent terminal entries so
     // long-lived workspaces stop accumulating dead transcripts. The reviewer
     // releases entries earlier via releaseTask; this is the backstop when no
     // reviewer is running. In-flight entries are never pruned.
     this.pruneTerminalEntries();
+  }
 
-    // ── Queue runner ──
-    // Clear inFlight for this agent and pop the next pending task, if any.
-    // The queue's inFlight slot is the one-task-at-a-time guard that
-    // replaces the legacy `busyAgents` set.
-    const q = this.agentTaskQueues.get(entry.agentId);
-    if (q && q.inFlight?.taskId === entry.state.id) {
+  /**
+   * Send that never throws. Used on every teardown notification: a send that
+   * escapes mid-teardown skips the notifications after it and (before the
+   * try/finally in runTaskAsync) leaked the queue slot as well.
+   */
+  private safeSend(message: AbjectMessage, what: string): void {
+    try {
+      this.send(message);
+    } catch (err) {
+      log.warn(`send(${what}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Free an agent's in-flight slot (when it still belongs to `taskId`) and
+   * start whatever is next. Idempotent, and never throws.
+   */
+  private releaseQueueSlot(agentId: AbjectId, taskId: string): void {
+    try {
+      const q = this.agentTaskQueues.get(agentId);
+      if (!q || q.inFlight?.taskId !== taskId) return;
       q.inFlight = undefined;
-      this.processNextInQueue(entry.agentId);
+      this.processNextInQueue(agentId);
+    } catch (err) {
+      log.error(`releaseQueueSlot(${taskId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Reclaim in-flight queue slots whose task has already ended.
+   *
+   * The slot is the agent's one-task-at-a-time guard, and it is cleared by
+   * exactly one place: the end of `runTaskAsync`. Anything that stops that
+   * code from running — a throw in teardown, a task entry released out from
+   * under it — wedges the agent permanently: every later task queues behind
+   * a task that finished long ago, and their goals wait forever on results
+   * that will never come. That failure is silent and only a restart clears
+   * it, so this sweep is the backstop.
+   *
+   * Only structurally-dead slots are reclaimed (task entry gone, torn down,
+   * or the state machine already in a terminal phase). Deliberately NOT
+   * time-based: an OTA loop can legitimately sit in one long call for many
+   * minutes, and killing live work is worse than the wedge.
+   */
+  private async sweepStaleQueueSlots(): Promise<void> {
+    const stale: Array<{ agentId: AbjectId; taskId: string; reason: string; queued?: QueuedTask }> = [];
+
+    for (const [agentId, q] of this.agentTaskQueues) {
+      const inFlight = q.inFlight;
+      if (!inFlight) continue;
+
+      const entry = this.taskEntries.get(inFlight.taskId);
+      // Strikes needed before acting. A task that ran and ended is unambiguous
+      // — one extra sweep is plenty of grace for a teardown still in flight.
+      // A slot with no entry at all is more delicate: the agent's executeTask
+      // handler does its own setup (which may call the LLM) before calling
+      // back into startTask, and the entry does not exist until it does, so
+      // that case gets a much longer benefit of the doubt.
+      let reason: string | undefined;
+      let needed = 2;
+      if (!entry) {
+        reason = 'agent never started the task (no task entry)';
+        needed = 5;
+      } else if (entry.finished) {
+        reason = 'task already torn down';
+      } else if (entry.state.phase === 'done' || entry.state.phase === 'error') {
+        reason = `state machine ended in phase '${entry.state.phase}' without releasing the slot`;
+      }
+
+      if (!reason) {
+        this.staleSlotStrikes.delete(inFlight.taskId);
+        continue;
+      }
+
+      const strikes = (this.staleSlotStrikes.get(inFlight.taskId) ?? 0) + 1;
+      this.staleSlotStrikes.set(inFlight.taskId, strikes);
+      if (strikes < needed) continue;
+
+      stale.push({ agentId, taskId: inFlight.taskId, reason, queued: inFlight.queued });
+    }
+
+    // Drop strike records for slots that are no longer in flight.
+    const live = new Set<string>();
+    for (const q of this.agentTaskQueues.values()) {
+      if (q.inFlight) live.add(q.inFlight.taskId);
+    }
+    for (const taskId of [...this.staleSlotStrikes.keys()]) {
+      if (!live.has(taskId)) this.staleSlotStrikes.delete(taskId);
+    }
+
+    for (const { agentId, taskId, reason, queued } of stale) {
+      const agentName = this.registeredAgents.get(agentId)?.name ?? agentId.slice(0, 8);
+      const q = this.agentTaskQueues.get(agentId);
+      log.warn(
+        `Stale queue slot on agent ${agentName}: task ${taskId.slice(0, 8)} — ${reason}. ` +
+        `Reclaiming (${q?.pending.length ?? 0} task(s) were waiting behind it).`
+      );
+
+      // Nobody downstream heard how this task ended. Settle it before freeing
+      // the slot, so the goal it belongs to can move on instead of waiting
+      // forever on a result that is never coming.
+      const entry = this.taskEntries.get(taskId);
+      const detail = `Task abandoned: ${reason}`;
+      const tupleId = entry?.dispatchTupleId ?? queued?.dispatchTupleId ?? queued?.taskId;
+      const goalId = entry?.incomingGoalId ?? entry?.goalId ?? queued?.goalId;
+      const callerId = entry?.callerId ?? queued?.callerId;
+
+      if (!entry || !entry.finished) {
+        if (entry) entry.finished = true;
+        if (tupleId && this.goalManagerId) {
+          this.safeSend(event(this.id, this.goalManagerId, 'failTask', {
+            taskId: tupleId,
+            goalId,
+            error: detail,
+            agentName,
+            agentId,
+          }), 'failTask(stale slot)');
+        }
+        if (callerId) {
+          this.safeSend(event(this.id, callerId, 'taskResult', {
+            ticketId: taskId,
+            success: false,
+            error: detail,
+            steps: entry?.state.step ?? 0,
+            lastAction: entry?.state.action,
+          }), 'taskResult(stale slot)');
+        }
+      }
+
+      this.staleSlotStrikes.delete(taskId);
+      this.releaseQueueSlot(agentId, taskId);
     }
   }
 
@@ -1683,7 +1883,7 @@ The registered object must implement these handlers to participate in the agent 
     const idx = q.pending.findIndex(t => !t.goalId || !this.pausedGoals.has(t.goalId));
     if (idx === -1) return;
     const next = q.pending.splice(idx, 1)[0];
-    q.inFlight = { taskId: next.taskId, goalId: next.goalId };
+    q.inFlight = { taskId: next.taskId, goalId: next.goalId, queued: next };
     this.startQueuedTask(agentId, next).catch(err => {
       log.warn(`startQueuedTask for ${agentId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
       // Free the slot so subsequent enqueues aren't stuck.

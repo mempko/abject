@@ -727,10 +727,20 @@ You are this object. Your capabilities are exactly what the manifest above descr
 
   /**
    * Send a message to another object (synchronous — bus never blocks).
+   *
+   * `error` is deliberately a sending state. It is a sticky health flag set
+   * by a failed handler and cleared by the next handler that succeeds — not
+   * a lifecycle gate. Objects that serve many concurrent conversations (an
+   * AgentAbject runs every agent's task loop) would otherwise have one
+   * failed handler poison every unrelated async continuation that happens
+   * to resume in the same window, stranding callers and leaking state that
+   * teardown code was on its way to release. Only `stopped` and pre-init
+   * genuinely have nowhere to send.
    */
   protected send(message: AbjectMessage): void {
     require(this._bus !== undefined, 'Object not initialized');
-    require(this._status === 'ready' || this._status === 'busy', 'Object not ready');
+    require(this._status !== 'stopped', 'Object stopped');
+    require(this._status !== 'initializing', 'Object not initialized');
 
     this.lastActivity = Date.now();
     this._bus!.send(message);
