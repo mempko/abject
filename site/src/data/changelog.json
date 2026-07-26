@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.8.31",
+    "date": "2026-07-26",
+    "title": "Per-Object Shell Permissions",
+    "summary": "Objects that want to run shell commands now ask for permission individually, so you can grant one object access without opening the door for everything else. The permission dialog has been redesigned to make what you are approving clearer.",
+    "highlights": [
+      "Shell access is now granted per object: each object carries its own permission rather than sharing a single global setting",
+      "Redesigned permission dialog: clearer presentation of which object is asking and what it wants to do"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.8.30",
     "date": "2026-07-26",
     "title": "Skill credentials that stick",
