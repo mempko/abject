@@ -233,6 +233,11 @@ export class FrontendClient {
     if (!proxy) return;
     this.mobileKeyboardProxy = proxy;
 
+    // Keep a zero-width-space sentinel in the proxy: iOS fires no event at
+    // all for backspace on an empty field, so deletion must always have a
+    // character to consume.
+    proxy.addEventListener('focus', () => this.resetProxySentinel(proxy));
+
     // Track composition state to avoid double-sending during autocomplete/predictive text
     let composing = false;
     proxy.addEventListener('compositionstart', () => { composing = true; });
@@ -262,21 +267,27 @@ export class FrontendClient {
             modifiers: { shift: false, ctrl: false, alt: false, meta: false },
           } as FrontendToBackendMsg);
         }
-        proxy.value = '';
+        this.resetProxySentinel(proxy);
         return;
       }
 
-      // deleteContentBackward = Backspace on mobile
-      if (e.inputType === 'deleteContentBackward') {
+      // Deletions: backspace variants map to Backspace (word-level deletes
+      // send a single Backspace), forward delete maps to Delete. While an
+      // IME composition is active the IME edits the proxy itself and
+      // compositionend flushes the net result, so let those pass through.
+      if (e.inputType.startsWith('delete')) {
+        if (composing || e.inputType === 'deleteCompositionText') return;
         e.preventDefault();
+        const key = e.inputType === 'deleteContentForward' ? 'Delete' : 'Backspace';
         this.sendToBackend({
           type: 'input',
           inputType: 'keydown',
           surfaceId: this.focusedSurface,
-          key: 'Backspace',
-          code: 'Backspace',
+          key,
+          code: key,
           modifiers: { shift: false, ctrl: false, alt: false, meta: false },
         } as FrontendToBackendMsg);
+        this.resetProxySentinel(proxy);
         return;
       }
 
@@ -319,10 +330,23 @@ export class FrontendClient {
     });
   }
 
+  /** Zero-width space kept in the proxy so backspace always has a target. */
+  private static readonly KB_SENTINEL = '\u200b';
+
+  /** Restore the proxy to just the sentinel with the caret after it. */
+  private resetProxySentinel(proxy: HTMLInputElement): void {
+    proxy.value = FrontendClient.KB_SENTINEL;
+    proxy.setSelectionRange(proxy.value.length, proxy.value.length);
+  }
+
   /** Flush any remaining text in the proxy input (after composition ends). */
   private flushProxyInput(proxy: HTMLInputElement): void {
-    if (!this.focusedSurface || !proxy.value) return;
-    for (const ch of proxy.value) {
+    const text = proxy.value.split(FrontendClient.KB_SENTINEL).join('');
+    if (!this.focusedSurface || !text) {
+      this.resetProxySentinel(proxy);
+      return;
+    }
+    for (const ch of text) {
       this.sendToBackend({
         type: 'input',
         inputType: 'keydown',
@@ -332,7 +356,7 @@ export class FrontendClient {
         modifiers: { shift: false, ctrl: false, alt: false, meta: false },
       } as FrontendToBackendMsg);
     }
-    proxy.value = '';
+    this.resetProxySentinel(proxy);
   }
 
   /**
