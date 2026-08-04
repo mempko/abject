@@ -1863,6 +1863,10 @@ export class FrontendClient {
       this.focusCanvasUnlessTyping();
       const canvasRect = this.canvas.getBoundingClientRect();
 
+      // Extra fingers are mobile-layout vocabulary (pinch-zoom). In desktop
+      // layout ignore them so the first finger's gesture continues untouched.
+      if (!this.mobileMode && e.touches.length > 1) return;
+
       // Two-finger touch: start pinch-zoom (not in card overview)
       if (e.touches.length === 2) {
         this.cancelActiveTouch();
@@ -1954,6 +1958,14 @@ export class FrontendClient {
       lastX: cx, lastY: cy, lastTime: now, lastVy: 0,
       mode: 'undecided' as const,
     } as NonNullable<FrontendClient['activeTouch']>;
+
+    // Desktop layout: a finger is a mouse — always content mode, regardless
+    // of any mobile view state left behind by stray pinches or double-taps.
+    if (!this.mobileMode) {
+      at.mode = 'content';
+      this.handleTouchEvent(touch, 'mousedown');
+      return;
+    }
 
     const view = this.compositor.getMobileView();
 
@@ -2111,6 +2123,7 @@ export class FrontendClient {
 
   /** Toggle 1:1 native zoom on a quick second tap near the first. */
   private maybeDoubleTap(cx: number, cy: number): void {
+    if (!this.mobileMode) return;
     const now = performance.now();
     if (now - this.lastTapTime < FrontendClient.DOUBLE_TAP_MS
         && Math.hypot(cx - this.lastTapX, cy - this.lastTapY) < FrontendClient.TAP_SLOP_PX) {
