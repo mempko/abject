@@ -108,6 +108,10 @@ export class FrontendClient {
   /** Touch-capable device (phones AND tablets in desktop layout) -- gates the virtual keyboard. */
   private touchDevice = false;
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
+  /** Backend wants the virtual keyboard up (a text widget holds focus). */
+  private keyboardWanted = false;
+  /** Virtual keyboard currently shown (tracked via visualViewport shrink). */
+  private keyboardVisible = false;
   // Pinch-zoom state
   private pinchStartDist?: number;
   private pinchStartZoom?: number;
@@ -412,6 +416,24 @@ export class FrontendClient {
     return btoa(binary);
   }
 
+  /**
+   * Summon the virtual keyboard from inside a trusted touch gesture. iOS only
+   * raises the keyboard for focus() calls made during user interaction, so
+   * the async showMobileKeyboard round-trip records intent (keyboardWanted)
+   * and the tap that follows completes the summon here.
+   */
+  private summonKeyboardIfWanted(): void {
+    if (!this.keyboardWanted || !this.touchDevice || !this.mobileKeyboardProxy) return;
+    if (this.keyboardVisible) return;
+    // Refocus from scratch: iOS ignores focus() on an already-focused
+    // element, and the earlier async attempt may have left the proxy
+    // focused without a keyboard.
+    if (document.activeElement === this.mobileKeyboardProxy) {
+      this.mobileKeyboardProxy.blur();
+    }
+    this.focusMobileKeyboard();
+  }
+
   /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
   private focusMobileKeyboard(): void {
     if (!this.touchDevice || !this.mobileKeyboardProxy) return;
@@ -437,7 +459,14 @@ export class FrontendClient {
       // When the keyboard opens, visualViewport.height shrinks.
       // Shift the canvas up by the difference.
       const keyboardHeight = window.innerHeight - vv.height;
-      if (keyboardHeight > 50) {
+      const visible = keyboardHeight > 50;
+      if (this.keyboardVisible && !visible) {
+        // Keyboard closed (user dismissed it, or focus moved on): drop the
+        // summon intent so the next tap doesn't immediately resurrect it.
+        this.keyboardWanted = false;
+      }
+      this.keyboardVisible = visible;
+      if (visible) {
         // Keyboard is open -- shift canvas up
         this.canvas.style.transform = `translateY(-${keyboardHeight}px)`;
       } else {
@@ -824,9 +853,14 @@ export class FrontendClient {
 
       case 'showMobileKeyboard':
         if (msg.show) {
+          // Try to focus right away; platforms that reject programmatic
+          // focus outside a user gesture (iOS) are covered by the next tap
+          // completing the summon in-gesture via keyboardWanted.
+          this.keyboardWanted = true;
           this.focusMobileKeyboard();
-        } else if (this.mobileKeyboardProxy) {
-          this.mobileKeyboardProxy.blur();
+        } else {
+          this.keyboardWanted = false;
+          if (this.mobileKeyboardProxy) this.mobileKeyboardProxy.blur();
         }
         break;
 
@@ -1615,21 +1649,41 @@ export class FrontendClient {
     }
   }
 
+  /** Follow the pointer/finger during a client-side local move drag. */
+  private applyLocalDragMove(x: number, y: number): void {
+    if (!this.localDragState || this.localDragState.dragType !== 'move') return;
+    this.lastCanvasX = x;
+    this.lastCanvasY = y;
+    const dx = x - this.localDragState.startX;
+    const dy = y - this.localDragState.startY;
+    this.compositor.moveSurface(
+      this.localDragState.surfaceId,
+      this.localDragState.startSurfaceX + dx,
+      this.localDragState.startSurfaceY + dy,
+    );
+  }
+
+  /** Commit a local move drag: send the final position and clean up. */
+  private finishLocalDragMove(): void {
+    if (!this.localDragState || this.localDragState.dragType !== 'move') return;
+    const surface = this.compositor.getSurface(this.localDragState.surfaceId);
+    if (surface) {
+      this.sendToBackend({
+        type: 'endWindowDrag',
+        surfaceId: this.localDragState.surfaceId,
+        x: surface.rect.x,
+        y: surface.rect.y,
+      } as FrontendToBackendMsg);
+    }
+    this.localDragState = undefined;
+    this.grabbedSurface = undefined;
+    this.canvas.style.cursor = 'default';
+  }
+
   private handleMouseUp(e: MouseEvent): void {
     // If in local move drag, send final position to server and clean up
     if (this.localDragState && this.localDragState.dragType === 'move') {
-      const surface = this.compositor.getSurface(this.localDragState.surfaceId);
-      if (surface) {
-        this.sendToBackend({
-          type: 'endWindowDrag',
-          surfaceId: this.localDragState.surfaceId,
-          x: surface.rect.x,
-          y: surface.rect.y,
-        } as FrontendToBackendMsg);
-      }
-      this.localDragState = undefined;
-      this.grabbedSurface = undefined;
-      this.canvas.style.cursor = 'default';
+      this.finishLocalDragMove();
       return;
     }
 
@@ -1976,7 +2030,10 @@ export class FrontendClient {
     switch (at.mode) {
       case 'content':
         this.handleTouchEvent(touch, 'mouseup');
-        if (isTap) this.maybeDoubleTap(cx, cy);
+        if (isTap) {
+          this.summonKeyboardIfWanted();
+          this.maybeDoubleTap(cx, cy);
+        }
         return;
       case 'edgeSwipe':
         // Tap (or partial swipe) on the bottom indicator also opens the overview.
@@ -2020,6 +2077,7 @@ export class FrontendClient {
           // NATIVE_ZOOMED tap → forward a click, and detect double-tap.
           this.handleTouchEvent(touch, 'mousedown');
           this.handleTouchEvent(touch, 'mouseup');
+          this.summonKeyboardIfWanted();
           this.maybeDoubleTap(cx, cy);
         }
         return;
@@ -2076,6 +2134,23 @@ export class FrontendClient {
     const canvasRect = this.canvas.getBoundingClientRect();
     const canvasX = touch.clientX - canvasRect.left;
     const canvasY = touch.clientY - canvasRect.top;
+
+    // Title-bar drags run in client-side local drag mode (the backend answers
+    // the title-bar mousedown with startWindowDrag). Mirror the mouse path:
+    // follow the finger locally, commit on lift. A mousedown finding stale
+    // drag state (a tap that outran the round-trip) commits it first so the
+    // window doesn't stay wedged in drag mode.
+    if (this.localDragState?.dragType === 'move') {
+      if (type === 'mousemove') {
+        this.applyLocalDragMove(canvasX, canvasY);
+        return;
+      }
+      if (type === 'mouseup') {
+        this.finishLocalDragMove();
+        return;
+      }
+      this.finishLocalDragMove();
+    }
 
     this.lastCanvasX = canvasX;
     this.lastCanvasY = canvasY;
@@ -2296,17 +2371,7 @@ export class FrontendClient {
     // Client-side local move drag — move surface instantly, no server round-trip
     if (this.localDragState && this.localDragState.dragType === 'move') {
       const canvasRect = this.canvas.getBoundingClientRect();
-      const x = e.clientX - canvasRect.left;
-      const y = e.clientY - canvasRect.top;
-      this.lastCanvasX = x;
-      this.lastCanvasY = y;
-      const dx = x - this.localDragState.startX;
-      const dy = y - this.localDragState.startY;
-      this.compositor.moveSurface(
-        this.localDragState.surfaceId,
-        this.localDragState.startSurfaceX + dx,
-        this.localDragState.startSurfaceY + dy,
-      );
+      this.applyLocalDragMove(e.clientX - canvasRect.left, e.clientY - canvasRect.top);
       return;
     }
 
