@@ -1,0 +1,161 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+---
+
+<Layout
+  title="Links - Abject"
+  description="Quick links to Abject: the website, the source code, and the author. Point your phone at a square."
+>
+  <Header />
+  <main class="links">
+    <div class="links-container">
+      <header class="links-hero">
+        <p class="links-eyebrow">// TAKE IT WITH YOU</p>
+        <h1>Point Your Phone at a Square</h1>
+        <p class="links-thesis">
+          The website, the source, and the human responsible.
+        </p>
+      </header>
+
+      <div class="qr-row">
+        <a class="qr-card" href="https://abject.world" aria-label="abject.world QR code">
+          <div class="qr-tile">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for abject.world"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m7 0h1m1 0h1m1 0h7M4 5.5h1m5 0h1m2 0h2m1 0h2m1 0h2m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m2 0h2m3 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m3 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h4m2 0h3m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m1 0h2m4 0h1M4 12.5h1m1 0h5m6 0h4m1 0h5M4 13.5h1m6 0h2m1 0h1m1 0h1m3 0h1m2 0h1m3 0h1M4 14.5h4m2 0h2m1 0h1m1 0h1m2 0h2m2 0h2m1 0h1m1 0h2M9 15.5h1m1 0h1m2 0h1m5 0h1m7 0h1M7 16.5h2m1 0h4m1 0h1m5 0h2m1 0h1m1 0h3M4 17.5h1m1 0h1m1 0h2m1 0h1m4 0h2m5 0h1m1 0h1m1 0h1M4 18.5h1m1 0h1m3 0h2m2 0h1m2 0h3m3 0h3m1 0h2M4 19.5h1m1 0h1m1 0h1m2 0h3m2 0h2m1 0h2m2 0h2m3 0h1M4 20.5h1m2 0h2m1 0h1m1 0h2m2 0h1m1 0h7m1 0h1M12 21.5h1m7 0h1m3 0h2M4 22.5h7m4 0h2m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m1 0h2m2 0h1m1 0h1m3 0h2m2 0h1M4 24.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h6m1 0h3M4 25.5h1m1 0h3m1 0h1m1 0h1m3 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h1m1 0h1m2 0h3m5 0h2m1 0h1M4 27.5h1m5 0h1m5 0h2m1 0h7m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m2 0h8"/></svg>
+          </div>
+          <p class="qr-name">The Website</p>
+          <p class="qr-url">abject.world</p>
+        </a>
+
+        <a class="qr-card" href="https://github.com/mempko/abject" aria-label="GitHub repository QR code">
+          <div class="qr-tile">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 37 37" shape-rendering="crispEdges" role="img" aria-label="QR code for github.com/mempko/abject"><path fill="#ffffff" d="M0 0h37v37H0z"/><path stroke="#000000" d="M4 4.5h7m3 0h1m1 0h4m3 0h2m1 0h7M4 5.5h1m5 0h1m2 0h2m2 0h4m1 0h1m1 0h1m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m1 0h1m2 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h3m3 0h2m1 0h1m1 0h1m2 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m2 0h1m5 0h2m1 0h1m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h3m1 0h1m1 0h1m1 0h1m3 0h1M4 12.5h1m1 0h5m3 0h2m4 0h2m4 0h5M4 13.5h1m2 0h1m1 0h1m3 0h1m3 0h3m1 0h4m1 0h3m3 0h1M6 14.5h2m1 0h5m2 0h6m2 0h1m3 0h1M4 15.5h1m3 0h2m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m4 0h1m4 0h1m1 0h1M5 16.5h2m3 0h2m3 0h2m1 0h2m1 0h3m5 0h2M4 17.5h1m1 0h4m2 0h1m2 0h1m3 0h10m3 0h1M4 18.5h1m3 0h1m1 0h1m5 0h1m4 0h1m2 0h2m2 0h3M4 19.5h2m1 0h1m3 0h3m1 0h1m2 0h1m1 0h1m2 0h6m2 0h1M4 20.5h1m1 0h2m2 0h1m1 0h2m2 0h1m4 0h1m1 0h1m1 0h1m1 0h1m1 0h2M4 21.5h2m1 0h1m1 0h1m2 0h1m4 0h3m2 0h2m1 0h4m1 0h1m1 0h1M4 22.5h1m1 0h1m1 0h1m1 0h2m1 0h3m1 0h3m2 0h1m1 0h1m1 0h3m1 0h1M4 23.5h1m1 0h2m1 0h1m1 0h2m4 0h1m1 0h2m3 0h3m4 0h1M4 24.5h1m2 0h1m2 0h3m5 0h4m1 0h6m1 0h3M12 25.5h5m3 0h1m1 0h1m1 0h1m3 0h5M4 26.5h7m4 0h2m2 0h6m1 0h1m1 0h3M4 27.5h1m5 0h1m1 0h1m3 0h1m1 0h1m3 0h3m3 0h1m2 0h1M4 28.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h1m1 0h1m2 0h5m1 0h2M4 29.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h2m1 0h5m4 0h4M4 30.5h1m1 0h3m1 0h1m1 0h3m1 0h1m2 0h13M4 31.5h1m5 0h1m6 0h4m1 0h1m1 0h2m1 0h1m1 0h1m1 0h1M4 32.5h7m1 0h3m1 0h2m1 0h1m1 0h1m1 0h1m2 0h3m1 0h1"/></svg>
+          </div>
+          <p class="qr-name">The Source</p>
+          <p class="qr-url">github.com/mempko/abject</p>
+        </a>
+
+        <a class="qr-card" href="https://mempko.com" aria-label="mempko.com QR code">
+          <div class="qr-tile">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for mempko.com"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m4 0h3m2 0h1m1 0h7M4 5.5h1m5 0h1m4 0h1m2 0h3m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h2m6 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m3 0h2m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m3 0h5m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m2 0h1m1 0h1M4 12.5h1m1 0h5m2 0h1m2 0h1m1 0h2m2 0h5M7 13.5h2m2 0h4m1 0h1m3 0h1m2 0h1m3 0h1M5 14.5h1m1 0h1m2 0h1m2 0h2m1 0h1m2 0h1m1 0h3m1 0h1m1 0h2M6 15.5h3m3 0h1m2 0h2m1 0h1m1 0h5m3 0h1M5 16.5h1m1 0h4m3 0h2m5 0h2m1 0h1m1 0h3M4 17.5h4m5 0h1m2 0h3m4 0h1m1 0h1m1 0h1M4 18.5h1m1 0h2m2 0h3m4 0h5m1 0h3m1 0h2M4 19.5h1m3 0h2m1 0h4m1 0h2m2 0h5m3 0h1M4 20.5h1m1 0h2m1 0h2m3 0h1m1 0h1m1 0h1m1 0h5m1 0h1M12 21.5h3m4 0h2m3 0h2M4 22.5h7m3 0h3m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m2 0h1m2 0h1m1 0h1m3 0h2M4 24.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h1M4 25.5h1m1 0h3m1 0h1m1 0h3m1 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h3m2 0h5m3 0h2m1 0h1M4 27.5h1m5 0h1m2 0h1m2 0h2m1 0h2m1 0h4m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m3 0h7"/></svg>
+          </div>
+          <p class="qr-name">The Human</p>
+          <p class="qr-url">mempko.com</p>
+        </a>
+      </div>
+
+      <p class="links-footnote">
+        Your phone's camera app reads these. Nothing to install&mdash;that would be missing the point.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  .links {
+    min-height: 70vh;
+    display: flex;
+    align-items: center;
+  }
+
+  .links-container {
+    /* Wider than the prose pages: three presentation-sized QR tiles abreast. */
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 4rem 2rem 5rem;
+    width: 100%;
+  }
+
+  .links-hero {
+    text-align: center;
+    margin-bottom: 3.5rem;
+  }
+
+  .links-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    letter-spacing: 0.15em;
+    color: var(--accent);
+    margin-bottom: 1rem;
+  }
+
+  .links-hero h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2rem, 4vw, 3rem);
+    color: var(--text-primary);
+    margin-bottom: 1rem;
+  }
+
+  .links-thesis {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+  }
+
+  .qr-row {
+    display: flex;
+    justify-content: center;
+    align-items: stretch;
+    gap: clamp(1rem, 2.5vw, 2.5rem);
+    flex-wrap: wrap;
+  }
+
+  .qr-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1 1 240px;
+    max-width: 420px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem 1.75rem 1.5rem;
+    text-decoration: none;
+    transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .qr-card:hover {
+    border-color: var(--border-accent);
+    transform: translateY(-3px);
+    box-shadow: 0 8px 30px var(--accent-glow);
+  }
+
+  .qr-tile {
+    background: #ffffff;
+    border-radius: 8px;
+    padding: 0.6rem;
+    line-height: 0;
+    width: 100%;
+    max-width: 360px;
+  }
+
+  .qr-tile svg {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  .qr-name {
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    margin-top: 1.25rem;
+  }
+
+  .qr-url {
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    color: var(--text-dim);
+    margin-top: 0.35rem;
+  }
+
+  .links-footnote {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    margin-top: 3rem;
+    font-style: italic;
+  }
+</style>
