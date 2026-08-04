@@ -2159,64 +2159,58 @@ export class FrontendClient {
     const canvasX = touch.clientX - canvasRect.left;
     const canvasY = touch.clientY - canvasRect.top;
 
-    // Title-bar drags run in client-side local drag mode (the backend answers
-    // the title-bar mousedown with startWindowDrag). Mirror the mouse path:
-    // follow the finger locally, commit on lift. A mousedown finding stale
-    // drag state (a tap that outran the round-trip) commits it first so the
-    // window doesn't stay wedged in drag mode.
-    if (this.localDragState?.dragType === 'move') {
-      if (type === 'mousemove') {
-        this.applyLocalDragMove(canvasX, canvasY);
-        return;
+    // Phone layout keeps its dedicated 2D path (mobile scale transform).
+    if (this.mobileMode) {
+      this.lastCanvasX = canvasX;
+      this.lastCanvasY = canvasY;
+      const hitSurface = this.compositor.surfaceAt(canvasX, canvasY);
+      const grabbed = this.grabbedSurface
+        ? this.compositor.getSurface(this.grabbedSurface)
+        : undefined;
+      const surface = grabbed ?? hitSurface;
+      if (!surface) return;
+
+      const coords = this.compositor.mobileToSurfaceCoords(canvasX, canvasY);
+      this.sendToBackend({
+        type: 'input',
+        inputType: type,
+        surfaceId: surface.id,
+        x: coords.x,
+        y: coords.y,
+        button: 0,
+        modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+      } as FrontendToBackendMsg);
+
+      if (type === 'mousedown') {
+        this.grabbedSurface = surface.id;
+        this.focusedSurface = surface.id;
+        this.compositor.setFocusedSurface(surface.id);
       }
       if (type === 'mouseup') {
-        this.finishLocalDragMove();
-        return;
+        this.grabbedSurface = undefined;
       }
-      this.finishLocalDragMove();
+      return;
     }
 
-    this.lastCanvasX = canvasX;
-    this.lastCanvasY = canvasY;
-
-    // Hit test
-    const hitSurface = this.compositor.surfaceAt(canvasX, canvasY);
-    const grabbed = this.grabbedSurface
-      ? this.compositor.getSurface(this.grabbedSurface)
-      : undefined;
-    const surface = grabbed ?? hitSurface;
-
-    if (!surface) return;
-
-    // In mobile mode, transform coordinates through the mobile scale
-    let localX: number;
-    let localY: number;
-    if (this.mobileMode) {
-      const coords = this.compositor.mobileToSurfaceCoords(canvasX, canvasY);
-      localX = coords.x;
-      localY = coords.y;
-    } else {
-      localX = canvasX - surface.rect.x;
-      localY = canvasY - surface.rect.y;
-    }
-
-    this.sendToBackend({
-      type: 'input',
-      inputType: type,
-      surfaceId: surface.id,
-      x: localX,
-      y: localY,
+    // Desktop layout: a finger is a mouse. Synthesize the minimal MouseEvent
+    // surface the mouse handlers read (clientX/Y, button, modifiers) and
+    // reuse them wholesale so touch gets 3D node picking, node drags, local
+    // window drags, and projection-correct hit testing identical to a mouse.
+    const synth = {
+      clientX: touch.clientX,
+      clientY: touch.clientY,
       button: 0,
-      modifiers: { shift: false, ctrl: false, alt: false, meta: false },
-    } as FrontendToBackendMsg);
-
+      shiftKey: false,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+    } as unknown as MouseEvent;
     if (type === 'mousedown') {
-      this.grabbedSurface = surface.id;
-      this.focusedSurface = surface.id;
-      this.compositor.setFocusedSurface(surface.id);
-    }
-    if (type === 'mouseup') {
-      this.grabbedSurface = undefined;
+      this.handleMouseEvent(synth, 'mousedown');
+    } else if (type === 'mousemove') {
+      this.handleMouseMoveThrottled(synth);
+    } else {
+      this.handleMouseUp(synth);
     }
   }
 
@@ -2288,6 +2282,14 @@ export class FrontendClient {
     e: MouseEvent,
     type: 'mousedown' | 'mouseup' | 'mousemove'
   ): void {
+    // A mousedown that finds local drag state still active means the ending
+    // event was lost (a tap that outran the startWindowDrag round-trip, or a
+    // release outside the canvas). Commit the stale drag so the window
+    // doesn't stay wedged in drag mode.
+    if (type === 'mousedown' && this.localDragState) {
+      this.finishLocalDragMove();
+    }
+
     const canvasRect = this.canvas.getBoundingClientRect();
     const x = e.clientX - canvasRect.left;
     const y = e.clientY - canvasRect.top;
