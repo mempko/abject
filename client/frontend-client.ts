@@ -105,6 +105,8 @@ export class FrontendClient {
   /** Scrollbar thumb drag in progress. */
   private draggingScrollbar = false;
   private mobileMode = false;
+  /** Touch-capable device (phones AND tablets in desktop layout) -- gates the virtual keyboard. */
+  private touchDevice = false;
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
   // Pinch-zoom state
   private pinchStartDist?: number;
@@ -184,15 +186,19 @@ export class FrontendClient {
   private detectMobileMode(): void {
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const narrow = window.innerWidth < 768;
-    const touch = 'ontouchstart' in window;
-    this.mobileMode = (coarse || touch) && narrow;
+    // maxTouchPoints catches iPadOS Safari, which masquerades as desktop macOS
+    const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    // touchDevice gates the virtual keyboard; mobileMode additionally gates
+    // the phone layout. Tablets are touchDevice but usually not mobileMode.
+    this.touchDevice = coarse || touch;
+    this.mobileMode = this.touchDevice && narrow;
     this.compositor.setMobileMode(this.mobileMode);
 
     // Re-detect on resize (tablet rotation)
     window.addEventListener('resize', () => {
       const wasMobile = this.mobileMode;
       const nowNarrow = window.innerWidth < 768;
-      this.mobileMode = (coarse || touch) && nowNarrow;
+      this.mobileMode = this.touchDevice && nowNarrow;
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
       }
@@ -406,10 +412,10 @@ export class FrontendClient {
 
   /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
   private focusMobileKeyboard(): void {
-    if (!this.mobileMode || !this.mobileKeyboardProxy) return;
+    if (!this.touchDevice || !this.mobileKeyboardProxy) return;
     // Move proxy on-screen briefly so iOS respects the focus
     this.mobileKeyboardProxy.style.left = '0';
-    this.mobileKeyboardProxy.focus();
+    this.mobileKeyboardProxy.focus({ preventScroll: true });
     // Move it back off-screen after focus is established
     requestAnimationFrame(() => {
       if (this.mobileKeyboardProxy) {
@@ -1744,7 +1750,7 @@ export class FrontendClient {
     this.canvas.style.outline = 'none';
 
     this.canvas.addEventListener('mousedown', (e) => {
-      this.canvas.focus();
+      this.focusCanvasUnlessTyping();
       if (this.handleScrollOrPanMouseDown(e)) return;
       this.handleMouseEvent(e, 'mousedown');
     });
@@ -1774,7 +1780,7 @@ export class FrontendClient {
     // Touch events for mobile
     this.canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
-      this.canvas.focus();
+      this.focusCanvasUnlessTyping();
       const canvasRect = this.canvas.getBoundingClientRect();
 
       // Two-finger touch: start pinch-zoom (not in card overview)
@@ -1841,6 +1847,18 @@ export class FrontendClient {
       const canvasRect = this.canvas.getBoundingClientRect();
       this.onTouchEnd(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
     }, { passive: false });
+  }
+
+  /**
+   * Focus the canvas so document-level key handling wins, but never steal
+   * focus from the keyboard proxy: on iOS that would dismiss the virtual
+   * keyboard on every tap (including caret taps inside the same text box).
+   * The backend explicitly blurs the proxy via showMobileKeyboard(false)
+   * when focus moves to a non-text widget.
+   */
+  private focusCanvasUnlessTyping(): void {
+    if (this.mobileKeyboardProxy && document.activeElement === this.mobileKeyboardProxy) return;
+    this.canvas.focus();
   }
 
   private cancelActiveTouch(): void {
