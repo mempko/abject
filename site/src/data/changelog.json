@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.8.32",
+    "date": "2026-08-04",
+    "title": "Touch comes to the desktop",
+    "summary": "This release makes Abject usable on tablets: the 3D desktop now responds properly to touch, and the on-screen keyboard works on iPads and other tablets. It also fixes a bug where one failed handler could stall an agent permanently.",
+    "highlights": [
+      "Touch input now works on the 3D desktop layout: you can drag windows, interact with 3D objects, and type, all by touch",
+      "The virtual keyboard now appears on tablets, not just phones, and comes up as part of the gesture that focuses a window",
+      "iPad keyboard input is more reliable; backspace now registers correctly",
+      "Tablets in desktop mode get the full desktop layout instead of the phone layout, and pinch-to-zoom no longer interferes with it",
+      "Added an input diagnostics page to help troubleshoot touch and keyboard issues on your device"
+    ],
+    "fixes": [
+      "A handler that failed mid-task could wedge an agent's queue forever; agents now recover and move on to the next task"
+    ]
+  },
+  {
     "version": "0.8.31",
     "date": "2026-07-26",
     "title": "Per-Object Shell Permissions",
