@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Abjects input diagnostics</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 1.5rem; background: #14121a; color: #e8e4f0; }
+    h1 { font-size: 1.2rem; }
+    table { border-collapse: collapse; margin-bottom: 1.5rem; }
+    td { padding: 0.3rem 0.8rem; border-bottom: 1px solid #333; }
+    td:first-child { color: #9a8fc0; }
+    button { display: block; width: 100%; margin: 0.6rem 0; padding: 1rem; font-size: 1rem;
+             background: #2a2440; color: #e8e4f0; border: 1px solid #554a80; border-radius: 8px; }
+    input { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; }
+    #log { white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; color: #8fc09a; }
+    p { color: #9a8fc0; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Abjects input diagnostics</h1>
+  <table id="facts"></table>
+
+  <p>Each button below tries to summon the keyboard a different way.
+     After tapping one, note whether the keyboard appeared, then tap
+     "dismiss" before trying the next.</p>
+  <button id="t0">Test 1: focus immediately (in tap handler)</button>
+  <button id="t150">Test 2: focus after 150ms delay</button>
+  <button id="t600">Test 3: focus after 600ms delay</button>
+  <button id="dismiss">Dismiss keyboard</button>
+  <div id="log"></div>
+
+  <input id="probe" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+
+  <script>
+    const facts = {
+      'pointer: coarse': matchMedia('(pointer: coarse)').matches,
+      'pointer: fine': matchMedia('(pointer: fine)').matches,
+      'hover: hover': matchMedia('(hover: hover)').matches,
+      "'ontouchstart' in window": 'ontouchstart' in window,
+      'navigator.maxTouchPoints': navigator.maxTouchPoints,
+      'navigator.platform': navigator.platform,
+      'navigator.standalone (PWA)': navigator.standalone,
+      'innerWidth x innerHeight': innerWidth + ' x ' + innerHeight,
+      'devicePixelRatio': devicePixelRatio,
+      'visualViewport': visualViewport ? (visualViewport.width.toFixed(0) + ' x ' + visualViewport.height.toFixed(0)) : 'none',
+      'userAgent': navigator.userAgent,
+    };
+    const coarse = facts['pointer: coarse'], touch = facts["'ontouchstart' in window"];
+    facts['=> touchDevice (keyboard gate)'] = coarse || touch || navigator.maxTouchPoints > 0;
+    facts['=> mobileMode (phone layout)'] = (coarse || touch) && innerWidth < 768;
+    document.getElementById('facts').innerHTML =
+      Object.entries(facts).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+
+    const probe = document.getElementById('probe');
+    const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+    let kbVisible = false;
+    if (visualViewport) {
+      visualViewport.addEventListener('resize', () => {
+        const shrunk = innerHeight - visualViewport.height > 100;
+        if (shrunk !== kbVisible) {
+          kbVisible = shrunk;
+          log((shrunk ? 'KEYBOARD APPEARED' : 'keyboard hidden') + ' (viewport ' + visualViewport.height.toFixed(0) + 'px)');
+        }
+      });
+    }
+    const tryFocus = (delay) => {
+      log('--- focusing after ' + delay + 'ms...');
+      const go = () => { probe.focus({ preventScroll: true }); log('focus() called, activeElement=' + (document.activeElement === probe ? 'probe' : document.activeElement.tagName)); };
+      delay === 0 ? go() : setTimeout(go, delay);
+    };
+    document.getElementById('t0').addEventListener('click', () => tryFocus(0));
+    document.getElementById('t150').addEventListener('click', () => tryFocus(150));
+    document.getElementById('t600').addEventListener('click', () => tryFocus(600));
+    document.getElementById('dismiss').addEventListener('click', () => probe.blur());
+  </script>
+</body>
+</html>

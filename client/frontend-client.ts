@@ -186,19 +186,21 @@ export class FrontendClient {
   private detectMobileMode(): void {
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const narrow = window.innerWidth < 768;
-    // maxTouchPoints catches iPadOS Safari, which masquerades as desktop macOS
-    const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-    // touchDevice gates the virtual keyboard; mobileMode additionally gates
-    // the phone layout. Tablets are touchDevice but usually not mobileMode.
-    this.touchDevice = coarse || touch;
-    this.mobileMode = this.touchDevice && narrow;
+    const touch = 'ontouchstart' in window;
+    // touchDevice gates the virtual keyboard only. maxTouchPoints catches
+    // iPadOS Safari, which masquerades as desktop macOS (pointer: fine, no
+    // ontouchstart) yet still needs the on-screen keyboard.
+    this.touchDevice = coarse || touch || navigator.maxTouchPoints > 0;
+    // mobileMode gates the phone layout. Deliberately narrower than
+    // touchDevice: a desktop-masquerading tablet keeps the desktop layout.
+    this.mobileMode = (coarse || touch) && narrow;
     this.compositor.setMobileMode(this.mobileMode);
 
     // Re-detect on resize (tablet rotation)
     window.addEventListener('resize', () => {
       const wasMobile = this.mobileMode;
       const nowNarrow = window.innerWidth < 768;
-      this.mobileMode = this.touchDevice && nowNarrow;
+      this.mobileMode = (coarse || touch) && nowNarrow;
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
       }
