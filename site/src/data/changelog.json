@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.8.33",
+    "date": "2026-08-05",
+    "title": "Sharper Questions, Easier Sharing",
+    "summary": "A small release that makes agent-to-object conversations more precise and adds a quick way to share Abject from the website. When an agent asks an object what it can do, the answer is now scoped to that specific object, so agents get cleaner guidance and fewer irrelevant suggestions.",
+    "highlights": [
+      "The ask protocol is now scoped to the object being asked: objects describe only their own abilities instead of surfacing system-wide guidance, which keeps agent decisions grounded in what the target object can actually do",
+      "The website has a new /links page with QR codes, making it easy to share Abject from a phone or point someone to it in person"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.8.32",
     "date": "2026-08-04",
     "title": "Touch comes to the desktop",
