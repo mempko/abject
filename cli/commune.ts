@@ -13,6 +13,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import * as readline from 'node:readline';
 import {
   CommuneClient, Credentials, PushedEvent, WorkspaceRow, ConversationRow, MessageEvent, DialogInfo, GoalTask,
 } from './client.js';
@@ -1180,7 +1181,6 @@ async function runPlain(url: string): Promise<void> {
   };
   await openLatestOrNew();
 
-  const readline = await import('node:readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' });
   rl.prompt();
 
@@ -1275,7 +1275,9 @@ async function runPlain(url: string): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('usage: pnpm commune [--plain] [--url ws://host:port]');
+    console.log('usage: commune [--plain] [--url ws://host:port]');
+    console.log('  (from a source checkout: pnpm commune)');
+    console.log('Requires a running Abject desktop app or backend on this machine.');
     console.log('env: CLI_PORT, COMMUNE_URL, ABJECTS_AUTH_USER, ABJECTS_AUTH_PASSWORD');
     return;
   }

@@ -35,6 +35,17 @@ const linuxDeb = linux?.files.find(f => f.url.endsWith('.deb'))?.url;
 const winExe = win?.files.find(f => f.url.endsWith('.exe'))?.url;
 const macDmg = mac?.files.find(f => f.url.endsWith('.dmg'))?.url;
 const macZip = mac?.files.find(f => f.url.endsWith('.zip'))?.url;
+
+// commune (terminal client) binaries ship with releases from 0.8.34 on.
+// Deterministic asset names, one per platform, built on native runners.
+function versionAtLeast(v: string, minMinor: number, minPatch: number): boolean {
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return false;
+  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (major > 0) return true;
+  return minor > minMinor || (minor === minMinor && patch >= minPatch);
+}
+const hasCommune = !!version && versionAtLeast(version, 8, 34);
 ---
 
 <section id="downloads">
@@ -102,6 +113,29 @@ const macZip = mac?.files.find(f => f.url.endsWith('.zip'))?.url;
       </div>
 
     </div>
+
+    {hasCommune && (
+      <div class="dl-terminal">
+        <div class="dl-terminal-head">
+          <span class="dl-terminal-title">commune — the terminal client</span>
+          <span class="dl-terminal-tag">companion</span>
+        </div>
+        <p class="dl-terminal-desc">
+          Your chats, goals, and permission prompts in a tabbed TUI. A single
+          executable, no install — it talks to the desktop app above, which
+          must be running.<sup>†</sup>
+        </p>
+        <div class="dl-terminal-links">
+          <a href={`${dlBase}/abject-commune-linux-x64`} target="_blank" rel="noopener">Linux (x64)</a>
+          <a href={`${dlBase}/abject-commune-win-x64.exe`} target="_blank" rel="noopener">Windows (x64)</a>
+          <a href={`${dlBase}/abject-commune-mac-arm64`} target="_blank" rel="noopener">macOS (Apple&nbsp;Silicon)</a>
+        </div>
+        <p class="dl-terminal-foot">
+          † The terminal is a view, not a second brain. All the Abjects live in the app.
+        </p>
+      </div>
+    )}
+
     <p class="dl-invite">
       Try it. Break it. Build something slightly cursed.
     </p>
@@ -211,6 +245,67 @@ const macZip = mac?.files.find(f => f.url.endsWith('.zip'))?.url;
   .dl-alt:hover {
     color: var(--eldritch);
     text-decoration: underline;
+  }
+
+  .dl-terminal {
+    max-width: 720px;
+    margin: 1.5rem auto 0;
+    padding: 1.25rem 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+
+  .dl-terminal-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+
+  .dl-terminal-title {
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .dl-terminal-tag {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--eldritch-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+  }
+
+  .dl-terminal-desc {
+    margin: 0.5rem 0 0.75rem;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+  }
+
+  .dl-terminal-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1.25rem;
+  }
+
+  .dl-terminal-links a {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--eldritch);
+    text-decoration: none;
+  }
+
+  .dl-terminal-links a:hover {
+    text-decoration: underline;
+  }
+
+  .dl-terminal-foot {
+    margin: 0.75rem 0 0;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    font-style: italic;
   }
 
   .dl-invite {

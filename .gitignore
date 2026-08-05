@@ -3,6 +3,7 @@ dist/
 dist-server/
 dist-client/
 dist-electron/
+dist-cli/
 release/
 .env*
 playwright-report/

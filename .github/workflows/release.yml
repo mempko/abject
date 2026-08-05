@@ -44,6 +44,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ${{ matrix.cmd }}
 
+      # commune, the terminal client — a single self-contained executable
+      # (Node SEA). Companion to the desktop app: it connects to the running
+      # app's CLI gateway and does nothing without it.
+      - name: Package terminal client
+        run: pnpm distill
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -55,6 +61,7 @@ jobs:
             release/*.dmg
             release/*.zip
             release/*.yml
+            dist-cli/abject-commune-*
           if-no-files-found: error
 
   release:

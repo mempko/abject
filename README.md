@@ -127,6 +127,9 @@ pnpm scry                       # http://localhost:5174
 
 # Start a local signaling server (optional, signal.abject.world is used by default)
 pnpm whisper                    # :7720
+
+# Chat with the system from your terminal (optional, needs awaken running)
+pnpm commune                    # connects to ws://localhost:7723
 ```
 
 | Command | What it does |
@@ -135,8 +138,33 @@ pnpm whisper                    # :7720
 | `pnpm awaken` | Start the Node.js backend where all Abjects live |
 | `pnpm scry` | Start the thin browser client (Canvas UI over WebSocket) |
 | `pnpm whisper` | Start a local signaling server (optional, `signal.abject.world` is used by default) |
+| `pnpm commune` | Terminal client: chat with your Abjects from a tabbed TUI |
 
 Three processes. One living system.
+
+### Commune (Terminal Client)
+
+The desktop has a canvas; the terminal gets `commune`. It connects to the
+backend's CLI gateway (`ws://127.0.0.1:7723`) and mirrors the desktop's
+chats: one tab per open chat window, across every workspace at once. New
+chats opened in the GUI appear as tabs live; goals render as a panel with
+the task list and per-agent activity; permission dialogs and toasts reach
+the terminal, and answering a dialog in either place resolves it in both.
+Markdown renders as terminal styling.
+
+Keys are tmux-safe chords: `Ctrl+A` then `c` (open chat picker), `n`/`p`
+or arrows (switch tab), `1`-`9` (jump), `x` (close tab), `w` (list),
+`d` (quit). `Ctrl+A Ctrl+A` jumps to line start; set `COMMUNE_PREFIX` to
+rebind. Every action also exists as a slash command (`/help` lists them),
+and `--plain` gives a line-oriented REPL for pipes and dumb terminals.
+
+`commune` is a companion, not a standalone: it requires a running Abject
+desktop app (or `pnpm awaken` backend) on the same machine, and speaks
+only to it. If the app has password protection enabled, `commune` prompts
+for the same credentials and shares the same session tokens as the browser
+client. Packaged single-file executables for Linux, Windows, and macOS
+ship with every [release](https://github.com/mempko/abject/releases) —
+no Node install needed.
 
 ### Incarnation (Desktop App)
 
@@ -157,6 +185,7 @@ pnpm incarnate:all
 | `pnpm incarnate:<platform>` | Package as a standalone Electron desktop app |
 | `pnpm bind` | Compile the server bundle only |
 | `pnpm etch` | Compile the client bundle only |
+| `pnpm distill` | Package `commune` as a single self-contained terminal executable for the current platform |
 
 Requires Electron. Cross-compilation from Linux to Windows works out of the
 box. macOS builds from Linux produce unsigned binaries (code signing requires

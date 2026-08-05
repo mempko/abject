@@ -24,6 +24,7 @@
     "asc": "asc",
     "hack": "tsx hack/security-audit.ts",
     "bind": "node build-server.mjs",
+    "distill": "node build-cli.mjs",
     "etch": "vite build --config vite.client.config.ts",
     "etch:p2p": "VITE_DEFAULT_MODE=p2p vite build --config vite.client.config.ts",
     "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch",
@@ -62,6 +63,7 @@
     "electron": "^35.0.0",
     "electron-builder": "^26.0.0",
     "esbuild": "^0.25.0",
+    "postject": "1.0.0-alpha.6",
     "tsx": "^4.19.0",
     "typescript": "^5.3.0",
     "vite": "^5.0.0"
