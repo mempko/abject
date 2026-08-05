@@ -36,8 +36,9 @@ export interface HealthConfig {
 
 interface ConnectionHealth {
   agreementId: AgreementId;
-  messageCount: number;
-  errorCount: number;
+  messageCount: number; // messages within the rolling window
+  errorCount: number; // errors within the rolling window
+  messageTimestamps: number[]; // one entry per message, pruned with the window
   errors: Array<{ timestamp: number; error: AbjectError }>;
   lastCheck: number;
 }
@@ -402,6 +403,7 @@ export class HealthMonitor extends Abject {
         agreementId,
         messageCount: 0,
         errorCount: 0,
+        messageTimestamps: [],
         errors: [],
         lastCheck: Date.now(),
       });
@@ -422,6 +424,7 @@ export class HealthMonitor extends Abject {
     const health = this.health.get(agreementId);
     if (health) {
       health.messageCount++;
+      health.messageTimestamps.push(Date.now());
     }
   }
 
@@ -433,6 +436,7 @@ export class HealthMonitor extends Abject {
     if (health) {
       health.messageCount++;
       health.errorCount++;
+      health.messageTimestamps.push(Date.now());
       health.errors.push({ timestamp: Date.now(), error });
     }
   }
@@ -568,6 +572,7 @@ export class HealthMonitor extends Abject {
         // Reset counters after renegotiation
         health.messageCount = 0;
         health.errorCount = 0;
+        health.messageTimestamps = [];
         health.errors = [];
       }
 
@@ -654,17 +659,29 @@ export class HealthMonitor extends Abject {
   }
 
   /**
-   * Prune errors outside the rolling window.
+   * Prune messages and errors outside the rolling window.
+   *
+   * Both counters must be windowed together: pruning only errors while
+   * messageCount accumulated for the connection's lifetime made the error
+   * rate decay toward zero as a connection aged, so a long-lived connection
+   * could never cross the threshold again no matter how broken it was.
    */
   private pruneOldErrors(health: ConnectionHealth): void {
     const cutoff = Date.now() - this.config.windowSize;
-    const originalCount = health.errors.length;
 
+    const originalMessages = health.messageTimestamps.length;
+    health.messageTimestamps = health.messageTimestamps.filter(
+      (t) => t > cutoff
+    );
+    const prunedMessages = originalMessages - health.messageTimestamps.length;
+    health.messageCount = Math.max(0, health.messageCount - prunedMessages);
+
+    const originalErrors = health.errors.length;
     health.errors = health.errors.filter((e) => e.timestamp > cutoff);
 
     // Adjust error count
-    const pruned = originalCount - health.errors.length;
-    health.errorCount = Math.max(0, health.errorCount - pruned);
+    const prunedErrors = originalErrors - health.errors.length;
+    health.errorCount = Math.max(0, health.errorCount - prunedErrors);
   }
 
   /**
