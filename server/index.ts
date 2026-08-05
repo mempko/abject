@@ -114,6 +114,7 @@ import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
 import { WebSocketUITransport, toUIWireData, postUIWireData, normalizeWsPayload } from './ui-transport.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
+import { CliServer } from './cli-server.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import os from 'node:os';
@@ -122,6 +123,7 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import type { PeerId } from '../src/core/identity.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
+const CLI_PORT = parseInt(process.env.CLI_PORT ?? '7723', 10);
 const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const DEDICATED_WORKERS = process.env.ABJECTS_DEDICATED_WORKERS !== '0'; // default: enabled
 const alog = new Log('ABJECTS');
@@ -474,6 +476,12 @@ async function main(): Promise<void> {
   log.timed('WS server listening');
 
   // Register constructors with Factory
+  // CliServer shares the browser client's auth gate: the same live authConfig
+  // (kept current by the updateAuth interceptor above) and the same
+  // SessionStore, so one login token works on both sockets. Main thread only
+  // (owns live sockets), so it is deliberately absent from workerEligible.
+  runtime.objectFactory.registerConstructor('CliServer',
+    () => new CliServer({ port: CLI_PORT, authConfig, sessions: sessionStore }));
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
   runtime.objectFactory.registerConstructor('Storage', (args?: unknown) => {
@@ -963,6 +971,16 @@ async function main(): Promise<void> {
     }
   }
 
+  // CLI gateway. Spawned and registered as the sole remote dialog responder
+  // BEFORE any workspace boots: the responder set is then sealed, so no user
+  // abject (they only exist inside workspaces) can ever register itself and
+  // auto-answer permission dialogs. The GUI needs no registration — it
+  // answers through real widget clicks, never through respondDialog.
+  const cliServerId = await supervisedSpawn('CliServer', 'permanent', systemTypeId('CliServer'));
+  await bootstrapRequest(widgetManagerId, 'registerDialogResponder', { objectId: cliServerId });
+  await bootstrapRequest(widgetManagerId, 'sealDialogResponders', {});
+  log.timed('CLI gateway spawned, dialog responders sealed');
+
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
   const workspaceManagerId = await supervisedSpawn('WorkspaceManager', 'permanent', systemTypeId('WorkspaceManager'));
   log.timed('WorkspaceManager spawned');
@@ -997,7 +1015,7 @@ async function main(): Promise<void> {
     mcpRegistryClientId, clawHubClientId, catalogBrowserId,
     secretsVaultId, oauthHelperId,
     proxyGenId, negotiatorId,
-    workspaceSwitcherId, workspaceManagerId,
+    workspaceSwitcherId, workspaceManagerId, cliServerId,
   ];
   await Promise.all(monitoredIds.map(async (objId) => {
     await bootstrapRequest(healthMonitorId, 'monitorObject', { objectId: objId });
@@ -1015,6 +1033,7 @@ async function main(): Promise<void> {
   console.log(`  ABJECTS server running`);
   console.log('');
   console.log(`  WebSocket:  ws://localhost:${WS_PORT}`);
+  console.log(`  CLI:        ws://localhost:${CLI_PORT}  (pnpm commune)`);
   console.log(`  Auth:       ${authConfig.enabled ? 'enabled' : 'disabled'}`);
   console.log(`  Workers:    ${DEDICATED_WORKERS ? 'UI + P2P dedicated' : 'disabled'}`);
   console.log(`  Objects:    ${runtime.objectRegistry.objectCount}`);

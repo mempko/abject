@@ -133,6 +133,24 @@ export class NotificationCenter extends Abject {
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
           ],
+          events: [
+            {
+              name: 'notificationAdded',
+              description: 'Fires with the full content of every new notification, so mirroring surfaces can show the toast.',
+              payload: { kind: 'object', properties: {
+                message: { kind: 'primitive', primitive: 'string' },
+                level: { kind: 'primitive', primitive: 'string' },
+                at: { kind: 'primitive', primitive: 'number' },
+              } },
+            },
+            {
+              name: 'historyChanged',
+              description: 'Fires when the history count changes (add or clear).',
+              payload: { kind: 'object', properties: {
+                count: { kind: 'primitive', primitive: 'number' },
+              } },
+            },
+          ],
         },
         requiredCapabilities: [],
         providedCapabilities: [],
@@ -162,6 +180,9 @@ export class NotificationCenter extends Abject {
         // Record before showing the toast — even if the toast spawn fails
         // (no WidgetManager yet, etc.), the entry still lands in history.
         this.recordHistory(text, lvl);
+        // Full toast content for mirroring surfaces (terminal gateways);
+        // historyChanged above only carries the count.
+        this.changed('notificationAdded', { message: text, level: lvl, at: Date.now() });
       }
       await this.spawnToast(text, lvl, durationMs ?? DEFAULT_DURATION_MS);
       return true;

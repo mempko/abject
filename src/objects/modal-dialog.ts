@@ -68,6 +68,15 @@ export class ModalDialog extends Abject {
               ],
               returns: { kind: 'union', variants: [{ kind: 'primitive', primitive: 'string' }, { kind: 'primitive', primitive: 'null' }] },
             },
+            {
+              name: 'respond',
+              description: 'Resolve the dialog on behalf of the user (e.g. from a remote surface like a terminal). Confirmed prompts use the given value.',
+              parameters: [
+                { name: 'confirmed', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True to confirm, false to cancel' },
+                { name: 'value', type: { kind: 'primitive', primitive: 'string' }, description: 'Entered text for prompt dialogs', optional: true },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
           ],
         },
         requiredCapabilities: [],
@@ -170,6 +179,26 @@ Interface: abjects:modal-dialog`;
 
     this.on('windowCloseRequested', async () => {
       this.pendingResolve?.(this.cancelResult());
+    });
+
+    // Remote answer, relayed exclusively by WidgetManager's respondDialog
+    // gate (which enforces the boot-sealed responder allowlist). Direct
+    // respond messages from anything else are refused — otherwise any object
+    // could auto-accept dialogs.
+    this.on('respond', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.widgetManagerId) return false;
+      const { confirmed, value } = msg.payload as { confirmed: boolean; value?: string };
+      if (!this.pendingResolve) return false;
+      if (!confirmed) {
+        this.pendingResolve(this.cancelResult());
+        return true;
+      }
+      if (this.promptMode && typeof value === 'string') {
+        this.pendingResolve(value);
+        return true;
+      }
+      await this.resolveConfirm();
+      return true;
     });
 
     // Backdrop click dismisses the dialog (like cancel)

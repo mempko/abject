@@ -118,6 +118,15 @@ export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
   private defaultTheme: ThemeData = ARCANE_GRIMOIRE;
+  /**
+   * Objects allowed to answer dialogs remotely via `respondDialog`.
+   * Registered by bootstrap and then sealed BEFORE workspaces spawn, so no
+   * user abject can ever add itself and auto-grant permissions.
+   */
+  private dialogResponders: Set<AbjectId> = new Set();
+  private dialogRespondersSealed = false;
+  /** Open dialog id -> the AbjectId whose `respond` handler resolves it. */
+  private openDialogRoutes: Map<string, AbjectId> = new Map();
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   /**
    * The currently active workspace. System-level widgets (workspace switcher,
@@ -346,6 +355,38 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'announceDialog',
+                description: 'Announce a custom dialog owned by the calling object so remote surfaces (terminal gateways) can mirror it. The caller receives a `respond` message with the user\'s answer.',
+                parameters: [
+                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-unique dialog id, echoed back in respond' },
+                  { name: 'kind', type: { kind: 'primitive', primitive: 'string' }, description: "'confirm', 'prompt', or 'options'" },
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog title' },
+                  { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog message' },
+                  { name: 'resource', type: { kind: 'primitive', primitive: 'string' }, description: 'The resource being decided on (e.g. a command line)', optional: true },
+                  { name: 'options', type: { kind: 'array', elementType: { kind: 'reference', reference: 'DialogOption' } }, description: 'Choice list for options dialogs: [{id, label}]', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'retractDialog',
+                description: 'Withdraw a previously announced dialog (it was resolved or expired); mirrors dismiss it.',
+                parameters: [
+                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'The announced dialog id' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'respondDialog',
+                description: 'Answer an open dialog on the user\'s behalf. Restricted: only responders registered and sealed during bootstrap may call this.',
+                parameters: [
+                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'The open dialog id' },
+                  { name: 'confirmed', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True to confirm, false to cancel', optional: true },
+                  { name: 'value', type: { kind: 'primitive', primitive: 'string' }, description: 'Entered text for prompt dialogs', optional: true },
+                  { name: 'option', type: { kind: 'primitive', primitive: 'string' }, description: 'Chosen option id for options dialogs', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'destroyWindowsForOwner',
                 description: 'Destroy all windows owned by a specific object',
                 parameters: [
@@ -459,6 +500,23 @@ export class WidgetManager extends Abject {
                 name: 'widgetEvent',
                 description: 'Widget interaction event (click, change, submit)',
                 payload: { kind: 'reference', reference: 'WMWidgetEventPayload' },
+              },
+              {
+                name: 'dialogOpened',
+                description: 'A modal confirm/prompt dialog appeared. Subscribers may answer on the user\'s behalf by sending `respond` to the dialogId.',
+                payload: { kind: 'object', properties: {
+                  dialogId: { kind: 'primitive', primitive: 'string' },
+                  kind: { kind: 'primitive', primitive: 'string' },
+                  title: { kind: 'primitive', primitive: 'string' },
+                  message: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'dialogClosed',
+                description: 'A modal dialog was resolved or timed out; mirrors should dismiss it.',
+                payload: { kind: 'object', properties: {
+                  dialogId: { kind: 'primitive', primitive: 'string' },
+                } },
               },
               {
                 name: 'windowMoved',
@@ -1035,6 +1093,66 @@ export class WidgetManager extends Abject {
       return DEFERRED_REPLY;
     });
 
+    // ── Custom dialog announcements ──
+    // Objects that build their own dialog windows (permission prompts etc.)
+    // announce them here so mirroring surfaces can render and answer them.
+    // Answers route back to the announcer as a `respond` message.
+
+    this.on('announceDialog', (msg: AbjectMessage) => {
+      const payload = msg.payload as { dialogId?: string };
+      if (!payload.dialogId) return false;
+      this.openDialogRoutes.set(payload.dialogId, msg.routing.from);
+      this.changed('dialogOpened', { respondTo: msg.routing.from, ...payload });
+      return true;
+    });
+
+    this.on('retractDialog', (msg: AbjectMessage) => {
+      const { dialogId } = msg.payload as { dialogId?: string };
+      if (!dialogId) return false;
+      this.openDialogRoutes.delete(dialogId);
+      this.changed('dialogClosed', { dialogId });
+      return true;
+    });
+
+    // ── Dialog responder gate ──
+    // Dialogs (including permission prompts) accept answers ONLY from this
+    // object; this object forwards answers only for senders in the responder
+    // set, which bootstrap registers and SEALS before any workspace — and
+    // therefore any user abject — exists. This is what stops an arbitrary
+    // object from granting itself permissions by answering dialogs.
+
+    this.on('registerDialogResponder', (msg: AbjectMessage) => {
+      if (this.dialogRespondersSealed) {
+        log.warn(`registerDialogResponder rejected (sealed): from=${msg.routing.from}`);
+        throw new Error('Dialog responder registration is sealed');
+      }
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      require(typeof objectId === 'string' && objectId.length > 0, 'objectId required');
+      this.dialogResponders.add(objectId);
+      log.info(`Dialog responder registered: ${objectId.slice(0, 8)}`);
+      return true;
+    });
+
+    this.on('sealDialogResponders', () => {
+      this.dialogRespondersSealed = true;
+      log.info(`Dialog responders sealed (${this.dialogResponders.size} registered)`);
+      return true;
+    });
+
+    this.on('respondDialog', async (msg: AbjectMessage) => {
+      if (!this.dialogResponders.has(msg.routing.from)) {
+        log.warn(`respondDialog DENIED for unauthorized sender ${msg.routing.from.slice(0, 8)}`);
+        throw new Error('Not authorized to answer dialogs');
+      }
+      const { dialogId, confirmed, value, option } = msg.payload as {
+        dialogId: string; confirmed?: boolean; value?: string; option?: string;
+      };
+      const target = this.openDialogRoutes.get(dialogId);
+      if (!target) throw new Error('Unknown or already-resolved dialog');
+      return this.request<boolean>(
+        request(this.id, target, 'respond', { dialogId, confirmed, value, option }), 10000);
+    });
+
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       await this.destroyWindowsForOwner(objectId);
@@ -1298,15 +1416,26 @@ export class WidgetManager extends Abject {
     const dialog = new ModalDialog();
     dialog.setWidgetManagerId(this.id);
     await dialog.init(this.bus, this.id);
-    return this.request<boolean>(
-      request(this.id, dialog.id, 'show', {
-        title,
-        message: dialogMessage,
-        ...opts,
-        theme: this.defaultTheme,
-      }),
-      120000,
-    );
+    // Announce to dependents (e.g. terminal gateways) so remote surfaces can
+    // mirror the dialog and answer it through the respondDialog gate.
+    this.openDialogRoutes.set(dialog.id, dialog.id);
+    this.changed('dialogOpened', {
+      dialogId: dialog.id, kind: 'confirm', title, message: dialogMessage, ...opts,
+    });
+    try {
+      return await this.request<boolean>(
+        request(this.id, dialog.id, 'show', {
+          title,
+          message: dialogMessage,
+          ...opts,
+          theme: this.defaultTheme,
+        }),
+        120000,
+      );
+    } finally {
+      this.openDialogRoutes.delete(dialog.id);
+      this.changed('dialogClosed', { dialogId: dialog.id });
+    }
   }
 
   /** Spawn an ephemeral ModalDialog in text-input mode; resolves to the entered string or null. */
@@ -1317,10 +1446,17 @@ export class WidgetManager extends Abject {
     const dialog = new ModalDialog();
     dialog.setWidgetManagerId(this.id);
     await dialog.init(this.bus, this.id);
-    return this.request<string | null>(
-      request(this.id, dialog.id, 'showPrompt', { ...opts, theme: this.defaultTheme }),
-      120000,
-    );
+    this.openDialogRoutes.set(dialog.id, dialog.id);
+    this.changed('dialogOpened', { dialogId: dialog.id, kind: 'prompt', ...opts });
+    try {
+      return await this.request<string | null>(
+        request(this.id, dialog.id, 'showPrompt', { ...opts, theme: this.defaultTheme }),
+        120000,
+      );
+    } finally {
+      this.openDialogRoutes.delete(dialog.id);
+      this.changed('dialogClosed', { dialogId: dialog.id });
+    }
   }
 
   /**

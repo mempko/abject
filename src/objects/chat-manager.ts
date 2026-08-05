@@ -89,11 +89,30 @@ export class ChatManager extends Abject {
             },
             {
               name: 'showConversation',
-              description: 'Open or raise the window for an existing conversation.',
+              description: 'Open or raise the window for an existing conversation. Returns the conversation and Chat ids, or false if the conversation is unknown.',
               parameters: [
                 { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
               ],
-              returns: { kind: 'primitive', primitive: 'boolean' },
+              returns: { kind: 'object', properties: {
+                conversationId: { kind: 'primitive', primitive: 'string' },
+                chatId: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'getHistory',
+              description: 'Return the persisted transcript of a conversation without opening it.',
+              parameters: [
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ConversationEntry' } },
+            },
+            {
+              name: 'getActiveGoal',
+              description: 'Return the goal id a conversation is currently running, or null.',
+              parameters: [
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
+              ],
+              returns: { kind: 'primitive', primitive: 'string' },
             },
             {
               name: 'showLatest',
@@ -133,6 +152,15 @@ export class ChatManager extends Abject {
               description: 'Fires when a conversation is removed from the roster.',
               payload: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'conversationOpened',
+              description: 'Fires when a conversation window is shown (newly created or reopened). Lets attached clients mirror the set of open chats live.',
+              payload: { kind: 'object', properties: {
+                conversationId: { kind: 'primitive', primitive: 'string' },
+                title: { kind: 'primitive', primitive: 'string' },
+                chatId: { kind: 'primitive', primitive: 'string' },
               } },
             },
             {
@@ -194,6 +222,9 @@ export class ChatManager extends Abject {
           rect: c.rect,
           createdAt: c.createdAt,
           lastActiveAt: c.lastActiveAt,
+          // Runtime id of the spawned Chat (absent while the conversation is
+          // dormant) so gateways can attach to live chats without re-showing.
+          chatId: c.chatId,
         }));
     });
 
@@ -204,7 +235,37 @@ export class ChatManager extends Abject {
 
     this.on('showConversation', async (msg: AbjectMessage) => {
       const { conversationId } = msg.payload as { conversationId: string };
-      return this.openChatWindow(conversationId);
+      const opened = await this.openChatWindow(conversationId);
+      if (!opened) return false;
+      const c = this.conversations.get(conversationId);
+      return { conversationId, chatId: c?.chatId ?? '' };
+    });
+
+    this.on('getHistory', async (msg: AbjectMessage) => {
+      const { conversationId } = msg.payload as { conversationId: string };
+      if (!this.storageId || !this.conversations.has(conversationId)) return [];
+      try {
+        const entries = await this.request<unknown[] | null>(
+          request(this.id, this.storageId, 'get', { key: `chats:history:${conversationId}` })
+        );
+        return Array.isArray(entries) ? entries : [];
+      } catch (err) {
+        log.warn(`getHistory failed for ${conversationId.slice(0, 8)}: ${String(err)}`);
+        return [];
+      }
+    });
+
+    this.on('getActiveGoal', async (msg: AbjectMessage) => {
+      const { conversationId } = msg.payload as { conversationId: string };
+      if (!this.storageId || !this.conversations.has(conversationId)) return null;
+      try {
+        const goalId = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: `chats:activegoal:${conversationId}` })
+        );
+        return typeof goalId === 'string' && goalId ? goalId : null;
+      } catch {
+        return null;
+      }
     });
 
     this.on('showLatest', async () => {
@@ -404,6 +465,7 @@ export class ChatManager extends Abject {
     if (chatId) {
       try {
         await this.request(request(this.id, chatId, 'show', {}), 5000);
+        this.changed('conversationOpened', { conversationId, title: c.title, chatId });
       } catch { /* best effort */ }
     }
 
@@ -421,6 +483,7 @@ export class ChatManager extends Abject {
     this.changed('rosterChanged', {});
     try {
       await this.request(request(this.id, chatId, 'show', {}), 5000);
+      this.changed('conversationOpened', { conversationId, title: c.title, chatId });
       return true;
     } catch {
       return false;

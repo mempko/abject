@@ -720,6 +720,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
     });
 
+    // Remote answer to the active permission prompt, relayed exclusively by
+    // WidgetManager's respondDialog gate (boot-sealed responder allowlist).
+    // Anything else attempting to answer a permission prompt directly is
+    // refused — this is a security boundary, not a convenience check.
+    this.on('respond', async (m: AbjectMessage) => {
+      if (!this.widgetManagerId || m.routing.from !== this.widgetManagerId) return false;
+      const { dialogId, option, confirmed } = m.payload as {
+        dialogId?: string; option?: string; confirmed?: boolean;
+      };
+      const pending = this._pendingPermissionPrompt;
+      if (!pending) return false;
+      if (dialogId && this._promptDialogId && dialogId !== this._promptDialogId) return false;
+      if (confirmed === false) { pending.resolve('deny'); return true; }
+      if (option && this._promptDecisions.includes(option)) { pending.resolve(option); return true; }
+      return false;
+    });
+
     // Handle 'changed' events from widget dependents
     this.on('changed', async (m: AbjectMessage) => {
       const { aspect, value } = m.payload as { aspect: string; value?: unknown };
@@ -3402,6 +3419,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
   /** Active permission prompt: resolves when user clicks a button. */
   private _pendingPermissionPrompt?: { resolve: (decision: string) => void };
+  /** Decisions offered by the active prompt (remote respond validates against these). */
+  private _promptDecisions: string[] = [];
+  private _promptDialogId?: string;
+  private _promptCounter = 0;
   private _promptWindowId?: AbjectId;
   private _promptAcceptOnceBtnId?: AbjectId;
   private _promptAcceptAlwaysBtnId?: AbjectId;
@@ -3564,6 +3585,33 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         }
       }
 
+      // Announce to mirroring surfaces (terminal clients) via WidgetManager;
+      // they answer with a `respond` message back to us.
+      const options = [
+        { id: 'accept_once', label: 'Allow once' },
+        { id: 'accept_always', label: 'Always allow' },
+        { id: 'deny', label: 'Deny once' },
+        { id: 'deny_always', label: 'Never allow' },
+      ];
+      if (grant) {
+        if (grant.canAllow) {
+          options.push({ id: 'accept_object', label: `Always allow "${grant.commandName}" from ${grant.objectName}` });
+        }
+        options.push({ id: 'deny_object', label: `Block "${grant.commandName}" from ${grant.objectName}` });
+      }
+      this._promptDecisions = options.map(o => o.id);
+      this._promptDialogId = `perm-${++this._promptCounter}`;
+      try {
+        this.send(request(this.id, this.widgetManagerId, 'announceDialog', {
+          dialogId: this._promptDialogId,
+          kind: 'options',
+          title,
+          message: description,
+          resource,
+          options,
+        }));
+      } catch { /* mirroring is best-effort */ }
+
       // Wait for user decision
       const decision = await new Promise<string>((resolve) => {
         this._pendingPermissionPrompt = { resolve };
@@ -3592,6 +3640,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     } finally {
       // Clean up prompt window
       this._pendingPermissionPrompt = undefined;
+      if (this._promptDialogId && this.widgetManagerId) {
+        try {
+          this.send(request(this.id, this.widgetManagerId, 'retractDialog', {
+            dialogId: this._promptDialogId,
+          }));
+        } catch { /* best effort */ }
+      }
+      this._promptDialogId = undefined;
+      this._promptDecisions = [];
       if (this._promptWindowId && this.widgetManagerId) {
         try {
           await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {

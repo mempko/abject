@@ -14,6 +14,7 @@
     "scry": "vite --config vite.client.config.ts",
     "divine": "VITE_DEFAULT_MODE=p2p VITE_CLIENT_PORT=5180 vite --config vite.client.config.ts",
     "whisper": "tsx server/signaling-server.ts",
+    "commune": "tsx cli/commune.ts",
     "awaken2": "ABJECTS_DATA_DIR=.abjects2 WS_PORT=7721 tsx --watch server/index.ts",
     "scry2": "VITE_WS_PORT=7721 VITE_CLIENT_PORT=5175 vite --config vite.client.config.ts",
     "awaken3": "ABJECTS_DATA_DIR=.abjects3 WS_PORT=7722 tsx --watch server/index.ts",
