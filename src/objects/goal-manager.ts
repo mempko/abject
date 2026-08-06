@@ -65,6 +65,15 @@ export interface Goal {
   updatedAt: number;
   scratchpad: Record<string, unknown>;
   /**
+   * Messages the user sent while the goal was running (typed into the chat
+   * during the sprint). ScrumMaster reads these at every decision point —
+   * planning, review scrums, mid-round interjection checks — and marks them
+   * `incorporated` once a committed decision has weighed them. They live
+   * here rather than in the scratchpad so they are never mistaken for task
+   * outputs by the synthesis prompt or the execution record.
+   */
+  interjections: Array<{ note: string; at: number; status: 'pending' | 'incorporated' }>;
+  /**
    * Scrum-shaped orchestration: each ScrumMaster scrum that plans more work
    * increments this. New tasks created in that round carry the same scrumNumber
    * on their tuple, so the next scrum only fires when every task at the
@@ -234,12 +243,49 @@ export class GoalManager extends Abject {
             },
             {
               name: 'appendGoalNote',
-              description: 'Append a user note to the goal scratchpad (under user/notes/). Agents and the next scrum see it through the goal context, so notes steer the remaining work — the interjection channel for paused goals.',
+              description: 'Queue a user interjection on a running or paused goal. ScrumMaster weighs pending interjections at every decision point (planning, review scrums, mid-round checks) and may re-plan, continue, stop, or ask for clarification. Emits goalInterjection.',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
                 { name: 'note', type: { kind: 'primitive', primitive: 'string' }, description: 'The note text' },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'reportGoalProgress',
+              description: 'Broadcast a human-readable progress line for a goal (emits goalUpdated) without changing goal state.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'The progress line to show the user' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'requestClarification',
+              description: 'Pause the goal and ask the user a question (emits goalClarificationRequested to goal subscribers). The user\'s next message queues as an interjection and resumes the goal.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'question', type: { kind: 'primitive', primitive: 'string' }, description: 'The question to put to the user' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'markInterjectionsIncorporated',
+              description: 'Flip pending interjections (with timestamp <= upTo) to incorporated. Called when a scrum commits a decision that weighed them. Returns the count flipped.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'upTo', type: { kind: 'primitive', primitive: 'number' }, description: 'Latest interjection timestamp the committed decision saw' },
+              ],
+              returns: { kind: 'primitive', primitive: 'number' },
+            },
+            {
+              name: 'cancelOutstandingTasks',
+              description: 'Cancel every non-terminal task of a goal without failing it — clears the way for an immediate re-plan. Completed and failed task records survive.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'object', properties: {
+                cancelled: { kind: 'primitive', primitive: 'number' },
+              } },
             },
             {
               name: 'getGoal',
@@ -393,6 +439,8 @@ export class GoalManager extends Abject {
             { name: 'goalFailed', description: 'A goal failed', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalPaused', description: 'A goal was paused by the user', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'goalResumed', description: 'A paused goal was resumed', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
+            { name: 'goalInterjection', description: 'The user sent a message while the goal was running. ScrumMaster weighs it against the plan and in-flight work — possibly re-planning, continuing, stopping, or asking for clarification.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, note: { kind: 'primitive', primitive: 'string' }, at: { kind: 'primitive', primitive: 'number' } } } },
+            { name: 'goalClarificationRequested', description: 'ScrumMaster paused the goal to ask the user a question. The next user message answers it and resumes the goal.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, question: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'goalsCleared', description: 'Completed/failed goals were cleared', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'goalsSwept', description: 'Goals were archived or deleted by lifecycle sweep', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'taskCompleted', description: 'A task was completed', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, result: { kind: 'primitive', primitive: 'string' } } } },
@@ -470,6 +518,7 @@ export class GoalManager extends Abject {
               progress: goalData.progress ?? [],
               scratchpad: goalData.scratchpad ?? {},
               currentScrumNumber: goalData.currentScrumNumber ?? 0,
+              interjections: goalData.interjections ?? [],
               // Legacy goals from before description was required: backfill
               // from title so the field invariant holds.
               description: goalData.description ?? goalData.title,
@@ -798,6 +847,7 @@ reviews results and either plans another round or completes/fails the goal.
           updatedAt: goal.updatedAt,
           scratchpad: goal.scratchpad,
           currentScrumNumber: goal.currentScrumNumber,
+          interjections: goal.interjections,
         },
         persist: true,
       }));
@@ -832,6 +882,7 @@ reviews results and either plans another round or completes/fails the goal.
         updatedAt: Date.now(),
         scratchpad: {},
         currentScrumNumber: 0,
+        interjections: [],
       };
 
       this.goals.set(goalId, goal);
@@ -1023,10 +1074,10 @@ reviews results and either plans another round or completes/fails the goal.
     });
 
     /**
-     * Append a user note to the goal's scratchpad (under `user/notes/...`).
-     * This is how a paused goal receives the user's interjection: agents and
-     * the next scrum read the scratchpad through the goal context, so the
-     * note steers the remaining work.
+     * Queue a user interjection on a running or paused goal. Notes live in
+     * goal.interjections (not the scratchpad, so they are never mistaken for
+     * task outputs). ScrumMaster reads pending notes at every decision point
+     * and marks them incorporated once a committed decision weighed them.
      */
     this.on('appendGoalNote', async (msg: AbjectMessage) => {
       const { goalId, note } = msg.payload as { goalId: GoalId; note: string };
@@ -1034,14 +1085,134 @@ reviews results and either plans another round or completes/fails the goal.
       const goal = this.goals.get(goalId);
       if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
 
-      if (!goal.scratchpad) goal.scratchpad = {};
-      goal.scratchpad[`user/notes/${Date.now()}`] = note;
-      goal.updatedAt = Date.now();
+      const at = Date.now();
+      if (!goal.interjections) goal.interjections = [];
+      goal.interjections.push({ note, at, status: 'pending' });
+      goal.updatedAt = at;
 
-      log.info(`Goal note appended to "${goal.title}" (${goalId}): ${note.slice(0, 80)}`);
+      log.info(`Goal interjection queued for "${goal.title}" (${goalId}): ${note.slice(0, 80)}`);
       this.changed('goalUpdated', { goalId, parentId: goal.parentId, message: `User note: ${note.slice(0, 120)}` });
+      // Dedicated aspect so ScrumMaster can wake mid-round and weigh the note
+      // against the plan and in-flight work.
+      this.changed('goalInterjection', { goalId, parentId: goal.parentId, note, at });
       this.syncGoalToSharedState(goal);
       return true;
+    });
+
+    /**
+     * Broadcast a human-readable progress line for a goal (shows up in the
+     * chat activity bubble and terminal goal panels). For orchestrators that
+     * want to acknowledge something without touching goal state.
+     */
+    this.on('reportGoalProgress', async (msg: AbjectMessage) => {
+      const { goalId, message } = msg.payload as { goalId: GoalId; message: string };
+      requireNonEmpty(message, 'message');
+      const goal = this.goals.get(goalId);
+      if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false;
+      goal.updatedAt = Date.now();
+      this.changed('goalUpdated', { goalId, parentId: goal.parentId, message: message.slice(0, 300) });
+      return true;
+    });
+
+    /**
+     * ScrumMaster asks the user a question: the goal pauses (agents stop at
+     * their next phase boundary, scrums stop firing, staleness sweeps ignore
+     * it) and `goalClarificationRequested` reaches every goal subscriber —
+     * Chat and terminal clients render the question; the user's next message
+     * queues as an interjection and resumes the goal.
+     */
+    this.on('requestClarification', async (msg: AbjectMessage) => {
+      const { goalId, question } = msg.payload as { goalId: GoalId; question: string };
+      requireNonEmpty(question, 'question');
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'active') return false;
+
+      goal.status = 'paused';
+      goal.updatedAt = Date.now();
+      if (this.agentAbjectId) {
+        try {
+          await this.request(request(this.id, this.agentAbjectId, 'pauseTasksByGoal', { goalId }));
+        } catch { /* best effort — the claimTask/scrum gates still hold */ }
+      }
+
+      log.info(`Clarification requested for "${goal.title}" (${goalId}): ${question.slice(0, 80)}`);
+      this.changed('goalPaused', { goalId });
+      this.changed('goalClarificationRequested', { goalId, parentId: goal.parentId, question });
+      this.syncGoalToSharedState(goal);
+      return true;
+    });
+
+    /**
+     * Flip pending interjections (up to a timestamp) to incorporated. Called
+     * by ScrumMaster only when a scrum COMMITS a decision that weighed them,
+     * so a crashed or retried scrum re-reads them as pending.
+     */
+    this.on('markInterjectionsIncorporated', async (msg: AbjectMessage) => {
+      const { goalId, upTo } = msg.payload as { goalId: GoalId; upTo: number };
+      const goal = this.goals.get(goalId);
+      if (!goal?.interjections?.length) return 0;
+      let flipped = 0;
+      for (const entry of goal.interjections) {
+        if (entry.status === 'pending' && entry.at <= upTo) {
+          entry.status = 'incorporated';
+          flipped++;
+        }
+      }
+      if (flipped > 0) {
+        goal.updatedAt = Date.now();
+        this.syncGoalToSharedState(goal);
+      }
+      return flipped;
+    });
+
+    /**
+     * Cancel every non-terminal task of a goal WITHOUT failing the goal —
+     * the re-plan-now primitive. Completed/failed tuples stay (the review
+     * record survives); pending tuples are removed; in-flight agents cancel
+     * cooperatively at their next phase boundary, exactly like stopGoal's
+     * cancellation. The goal itself stays active so the caller can dispatch
+     * a fresh round immediately.
+     */
+    this.on('cancelOutstandingTasks', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'active' || !this.tupleSpaceId) return { cancelled: 0 };
+
+      const ns = this.getTupleNamespace(goalId);
+      const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId }, namespace: ns })
+      );
+
+      let cancelled = 0;
+      for (const task of tasks) {
+        const status = String(task.fields?.status ?? 'pending');
+        if (status === 'done' || status === 'failed') continue;
+        try {
+          if (task.claimedBy) {
+            try {
+              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
+            } catch { /* best effort */ }
+          }
+          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
+          this.emittedTerminalTasks.delete(task.id);
+          cancelled++;
+        } catch { /* tuple may already be gone */ }
+      }
+
+      if (this.agentAbjectId) {
+        try {
+          await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
+        } catch { /* best effort */ }
+      }
+
+      if (cancelled > 0) {
+        goal.updatedAt = Date.now();
+        this.changed('goalUpdated', {
+          goalId, parentId: goal.parentId,
+          message: `Re-planning: ${cancelled} outstanding task(s) cancelled to make way for the new plan`,
+        });
+      }
+      return { cancelled };
     });
 
     this.on('getGoal', async (msg: AbjectMessage) => {

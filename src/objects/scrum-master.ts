@@ -132,7 +132,24 @@ export class ScrumMaster extends Abject {
   private scrumInFlight = new Map<string, {
     goalId: string;
     staged: StagedTask[];
+    /**
+     * Timestamp of the newest pending user interjection included in this
+     * scrum's opening snapshot. When the scrum commits a decision, notes up
+     * to this moment are marked incorporated — later ones stay pending for
+     * the next decision point.
+     */
+    interjectionsUpTo?: number;
   }>();
+
+  /**
+   * Debounce timers for mid-round interjection checks, keyed by goalId. A
+   * burst of user messages collapses into one check; the timer also
+   * reschedules itself while a scrum for the goal is already queued or
+   * running (that scrum's own commit weighs the notes).
+   */
+  private interjectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly INTERJECTION_DEBOUNCE_MS = 3_000;
+  private static readonly INTERJECTION_RECHECK_MS = 20_000;
 
   /**
    * Fast path. A goal `quick_dispatch`ed straight to one agent — no planning
@@ -239,6 +256,8 @@ export class ScrumMaster extends Abject {
             complete_goal: { type: 'success' },
             fail_goal: { type: 'error', resultFields: ['reason'] },
             dispatch_scrum: { type: 'success' },
+            continue_scrum: { type: 'success' },
+            ask_user: { type: 'success', resultFields: ['question'] },
           },
           intermediateActions: [],
         },
@@ -252,6 +271,8 @@ export class ScrumMaster extends Abject {
   protected override async onStop(): Promise<void> {
     for (const timer of this.scrumRetryTimers) clearTimeout(timer);
     this.scrumRetryTimers.clear();
+    for (const timer of this.interjectionTimers.values()) clearTimeout(timer);
+    this.interjectionTimers.clear();
     await super.onStop();
   }
 
@@ -277,20 +298,37 @@ export class ScrumMaster extends Abject {
         if (oneShot) {
           this.oneShotGoals.delete(goalId);
           if ((doneTaskIds ?? []).includes(oneShot.taskId)) {
-            // Success → complete the goal directly, no review scrum.
-            await this.completeOneShotGoal(goalId, oneShot.taskId).catch(err =>
-              log.warn(`completeOneShotGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
-            );
-            return;
+            // The zero-LLM completion is only safe when the user stayed
+            // silent: a pending interjection deserves a review scrum that
+            // weighs it before the goal closes.
+            const pendingNotes = await this.pendingInterjections(goalId);
+            if (pendingNotes > 0) {
+              log.info(`quick_dispatch goal ${goalId.slice(0, 8)} has ${pendingNotes} pending user note(s) — upgrading to a review scrum`);
+              this.forceFullScrum.add(goalId);
+            } else {
+              // Success → complete the goal directly, no review scrum.
+              await this.completeOneShotGoal(goalId, oneShot.taskId).catch(err =>
+                log.warn(`completeOneShotGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
+              );
+              return;
+            }
+          } else {
+            // Failure → let the normal review scrum below see the failed task
+            // (it re-reads task state) and plan a real recovery. Suppress a
+            // repeat quick_dispatch offer so it doesn't retry the same shortcut.
+            this.forceFullScrum.add(goalId);
           }
-          // Failure → let the normal review scrum below see the failed task
-          // (it re-reads task state) and plan a real recovery. Suppress a
-          // repeat quick_dispatch offer so it doesn't retry the same shortcut.
-          this.forceFullScrum.add(goalId);
         }
         await this.enqueueScrumTask(goalId, scrumNumber).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         );
+      } else if (aspect === 'goalInterjection') {
+        // The user typed something while the goal ran. Debounce, then — if
+        // no scrum for this goal is about to weigh it anyway — run a
+        // mid-round interjection check so contradictions with in-flight work
+        // are caught now instead of at the round boundary.
+        const { goalId } = value as { goalId: string };
+        this.scheduleInterjectionCheck(goalId);
       } else if (aspect === 'goalCompleted' || aspect === 'goalFailed') {
         const { goalId } = value as { goalId: string };
         for (const [pendingId, info] of this.pendingDeps) {
@@ -301,6 +339,11 @@ export class ScrumMaster extends Abject {
         }
         this.oneShotGoals.delete(goalId);
         this.forceFullScrum.delete(goalId);
+        const interjectionTimer = this.interjectionTimers.get(goalId);
+        if (interjectionTimer) {
+          clearTimeout(interjectionTimer);
+          this.interjectionTimers.delete(goalId);
+        }
       } else if (aspect === 'taskCompleted') {
         const { taskId } = value as { taskId: string };
         this.unblockDependents(taskId).catch(err =>
@@ -349,6 +392,8 @@ export class ScrumMaster extends Abject {
                 fail_goal: { type: 'error', resultFields: ['reason'] },
                 dispatch_scrum: { type: 'success' },
                 quick_dispatch: { type: 'success' },
+                continue_scrum: { type: 'success' },
+                ask_user: { type: 'success', resultFields: ['question'] },
               },
             },
           }),
@@ -399,7 +444,11 @@ export class ScrumMaster extends Abject {
       const attemptInfo = this.scrumAttempts.get(payload.ticketId);
       if (attemptInfo) {
         this.scrumAttempts.delete(payload.ticketId);
-        if (payload.success === false) {
+        // A cancelled scrum was deliberately superseded (re-plan cancelled
+        // the round, or the goal ended) — retrying it would race the new
+        // plan. Only genuine deaths (provider outage, step errors) retry.
+        const wasCancelled = (payload.error ?? '').includes('Cancelled');
+        if (payload.success === false && !wasCancelled) {
           this.scheduleScrumRetry(attemptInfo, payload.error);
         }
       }
@@ -544,6 +593,92 @@ export class ScrumMaster extends Abject {
   }
 
   // ═══════════════════════════════════════════════════════════════════
+  // Mid-round interjection checks
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Count of interjections the user sent that no committed scrum has weighed yet. */
+  private async pendingInterjections(goalId: string): Promise<number> {
+    if (!this.goalManagerId) return 0;
+    const goal = await this.request<{
+      status?: string;
+      interjections?: Array<{ status: string }>;
+    } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+    ).catch(() => null);
+    if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return 0;
+    return (goal.interjections ?? []).filter(i => i.status === 'pending').length;
+  }
+
+  /** True when a scrum task for this goal is already queued or running. */
+  private scrumActiveFor(goalId: string): boolean {
+    for (const info of this.scrumAttempts.values()) {
+      if (info.goalId === goalId) return true;
+    }
+    for (const entry of this.scrumInFlight.values()) {
+      if (entry.goalId === goalId) return true;
+    }
+    return false;
+  }
+
+  /** Debounced entry point from the goalInterjection event. */
+  private scheduleInterjectionCheck(goalId: string, delayMs = ScrumMaster.INTERJECTION_DEBOUNCE_MS): void {
+    const existing = this.interjectionTimers.get(goalId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.interjectionTimers.delete(goalId);
+      void this.runInterjectionCheck(goalId).catch(err =>
+        log.warn(`interjection check for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),
+      );
+    }, delayMs);
+    this.interjectionTimers.set(goalId, timer);
+  }
+
+  /**
+   * Decide whether the user's mid-round message needs a scrum NOW. A scrum
+   * already queued or running will weigh it at commit time; a paused goal
+   * (clarification or user pause) resumes into a boundary scrum; otherwise
+   * enqueue a dedicated interjection check that can continue, re-plan,
+   * complete, stop, or ask for clarification while agents keep working.
+   */
+  private async runInterjectionCheck(goalId: string): Promise<void> {
+    if (!this.goalManagerId || !this.agentAbjectId) return;
+
+    const pending = await this.pendingInterjections(goalId);
+    if (pending === 0) return; // already weighed by a boundary scrum
+
+    const goal = await this.request<{ status?: string; currentScrumNumber?: number } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+    ).catch(() => null);
+    if (!goal || goal.status !== 'active') return; // paused/terminal — resume path handles it
+
+    if (this.scrumActiveFor(goalId)) {
+      // A scrum is already queued or running; its commit weighs the notes.
+      // Re-check later in case that scrum's snapshot predates them.
+      this.scheduleInterjectionCheck(goalId, ScrumMaster.INTERJECTION_RECHECK_MS);
+      return;
+    }
+
+    log.info(`User interjection on goal ${goalId.slice(0, 8)} mid-round — enqueueing interjection check`);
+    const { taskId } = await this.request<{ taskId: string }>(
+      request(this.id, this.agentAbjectId, 'enqueueTask', {
+        agentId: this.id,
+        task:
+          `Interjection check for goal ${goalId.slice(0, 8)}: the user sent new message(s) while agents are working. ` +
+          `Weigh the pending userInterjections in the goal state against the plan and in-flight work. ` +
+          `If the current work already covers them, continue_scrum. If they change the plan, stage tasks and dispatch_scrum ` +
+          `(outstanding tasks are cancelled automatically). If they mean stop, fail_goal with a friendly explanation. ` +
+          `If they are ambiguous, ask_user.`,
+        goalId,
+      }),
+    );
+    this.scrumAttempts.set(taskId, {
+      goalId,
+      priorScrumNumber: goal.currentScrumNumber ?? 0,
+      attempt: 1,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // OTA — observe
   // ═══════════════════════════════════════════════════════════════════
 
@@ -564,18 +699,31 @@ export class ScrumMaster extends Abject {
       const goalId = await this.lookupGoalIdForOTATask(taskId);
       const snap = goalId ? await this.buildReviewSnapshot(goalId) : { error: 'goal not resolved yet' };
       if ('data' in snap) {
-        // Tier the first decision by trouble: a goal with failed tasks or a
-        // loop warning needs the strongest reasoning to recover/replan; a
-        // clean goal (quick_dispatch, straightforward plan, or completion
+        // Record which interjections this scrum saw, so the commit marks
+        // exactly those incorporated — never ones that arrive mid-scrum.
+        const notes = snap.data.userInterjections as Array<{ at: number; status: string }> | undefined;
+        const pendingNotes = (notes ?? []).filter(n => n.status === 'pending');
+        const inFlightEntry = this.scrumInFlight.get(taskId);
+        if (inFlightEntry && pendingNotes.length > 0) {
+          inFlightEntry.interjectionsUpTo = Math.max(...pendingNotes.map(n => n.at));
+        }
+        const interjectionNudge = pendingNotes.length > 0
+          ? ` The user sent ${pendingNotes.length} message(s) while this goal ran — see \`userInterjections\`; pending ones take precedence over the original plan (continue_scrum / re-plan / complete / fail / ask_user as they warrant).`
+          : '';
+
+        // Tier the first decision by trouble: a goal with failed tasks, a
+        // loop warning, or live user steering needs the strongest reasoning;
+        // a clean goal (quick_dispatch, straightforward plan, or completion
         // judgment) is well within balanced, and a misjudgment self-heals.
         const inTrouble = ((snap.data.failed as unknown[] | undefined)?.length ?? 0) > 0
-          || snap.data.loopWarning !== undefined;
+          || snap.data.loopWarning !== undefined
+          || pendingNotes.length > 0;
         return {
           tier: inTrouble ? 'smart' : 'balanced',
           observation:
             `Scrum for this goal. Its full state is below — you already have it, so decide your action directly (no need to call review_scrum first):\n\n` +
             `${JSON.stringify(snap.data, null, 2)}\n\n` +
-            `Choose ONE action now: if \`quickDispatchAvailable\` is set and the goal is a single obvious step one \`team\` agent covers, \`quick_dispatch\`; otherwise \`poll_team\` to learn capabilities, \`add_task\`(+\`dispatch_scrum\`) to plan, \`complete_goal\` if already satisfied, or \`fail_goal\` if unreachable.`,
+            `Choose ONE action now: if \`quickDispatchAvailable\` is set and the goal is a single obvious step one \`team\` agent covers, \`quick_dispatch\`; otherwise \`poll_team\` to learn capabilities, \`add_task\`(+\`dispatch_scrum\`) to plan, \`complete_goal\` if already satisfied, or \`fail_goal\` if unreachable.${interjectionNudge}`,
         };
       }
       // Snapshot unavailable (goal not resolvable yet) — fall back to the
@@ -632,7 +780,7 @@ export class ScrumMaster extends Abject {
         // straight to `done` from the thinking phase). Their side effects
         // execute in the `taskResult` listener via executeTerminalAction.
         default:
-          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch.` };
+          return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch, continue_scrum, ask_user.` };
       }
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -678,24 +826,82 @@ export class ScrumMaster extends Abject {
     // arrive as `{ action: "complete_goal", params: { synthesis: ... } }`.
     const normalized = this.normalizeActionEnvelope(lastAction);
 
+    // A committed decision has weighed the interjections its snapshot
+    // carried — mark them incorporated so they stop re-triggering checks.
+    // continue_scrum deliberately leaves them pending: "no change needed
+    // right now" still deserves a second look at the round boundary.
+    const markIncorporated = async (): Promise<void> => {
+      const upTo = this.scrumInFlight.get(otaTaskId)?.interjectionsUpTo;
+      if (!upTo || !this.goalManagerId) return;
+      await this.request(
+        request(this.id, this.goalManagerId, 'markInterjectionsIncorporated', { goalId, upTo }), 10000,
+      ).catch(() => { /* best effort */ });
+    };
+
     switch (normalized.action) {
       case 'complete_goal':
+        await markIncorporated();
         await this.commitCompleteGoal(goalId, normalized);
         return;
       case 'fail_goal':
+        await markIncorporated();
         await this.commitFailGoal(goalId, normalized);
         return;
       case 'dispatch_scrum':
+        await markIncorporated();
         await this.commitDispatchScrum(otaTaskId, goalId);
         return;
       case 'quick_dispatch':
+        await markIncorporated();
         await this.commitQuickDispatch(goalId, normalized);
+        return;
+      case 'continue_scrum':
+        await this.commitContinueScrum(goalId);
+        return;
+      case 'ask_user':
+        await markIncorporated();
+        await this.commitAskUser(goalId, normalized);
         return;
       default:
         // Non-terminal lastAction — nothing to commit. Means the OTA hit
         // maxSteps or errored without a clean terminal. Log so we can see it.
         log.info(`executeTerminalAction: lastAction "${lastAction.action}" not a terminal — no commit needed`);
         return;
+    }
+  }
+
+  /**
+   * The interjection check found the current plan already serves the user's
+   * note. Nothing changes; the note stays pending so the round-boundary
+   * review weighs it once more with the round's results in hand.
+   */
+  private async commitContinueScrum(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    log.info(`continue_scrum: goal ${goalId.slice(0, 8)} — current plan stands`);
+    await this.request(
+      request(this.id, this.goalManagerId, 'reportGoalProgress', {
+        goalId,
+        message: 'Reviewed your note — the current plan already covers it; work continues',
+      }), 10000,
+    ).catch(() => { /* best effort */ });
+  }
+
+  /**
+   * The scrum needs the user's input to proceed. GoalManager pauses the
+   * goal and broadcasts the question to every goal subscriber (Chat and
+   * terminal clients render it); the user's next message queues as an
+   * interjection and resumes the goal into a review scrum that reads it.
+   */
+  private async commitAskUser(goalId: string, action: Record<string, unknown>): Promise<void> {
+    if (!this.goalManagerId) return;
+    const question = (action.question as string | undefined)?.trim()
+      || 'The scrum needs a bit more direction — how would you like to proceed?';
+    log.info(`ask_user: goal ${goalId.slice(0, 8)} — "${question.slice(0, 80)}"`);
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'requestClarification', { goalId, question }), 10000,
+    ).catch(() => false);
+    if (!ok) {
+      log.warn(`ask_user for ${goalId.slice(0, 8)} could not pause the goal (already terminal?)`);
     }
   }
 
@@ -749,6 +955,7 @@ export class ScrumMaster extends Abject {
     const goal = await this.request<{
       title: string; description: string; status: string; currentScrumNumber: number;
       scratchpad?: Record<string, unknown>;
+      interjections?: Array<{ note: string; at: number; status: 'pending' | 'incorporated' }>;
     } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     );
@@ -817,6 +1024,17 @@ export class ScrumMaster extends Abject {
         `A clear, actionable failure beats an endless "final attempt" loop.`;
     }
 
+    // Live user steering: messages typed while the goal ran. Pending notes
+    // take precedence over the original plan; incorporated ones are shown
+    // for continuity so a re-plan doesn't unknowingly undo earlier steering.
+    const interjections = goal.interjections ?? [];
+    const pendingNotes = interjections.filter(i => i.status === 'pending');
+    const incorporatedNotes = interjections.filter(i => i.status === 'incorporated');
+    const userInterjections = [
+      ...pendingNotes.map(i => ({ note: i.note.slice(0, 1000), at: i.at, status: 'pending' as const })),
+      ...incorporatedNotes.slice(-3).map(i => ({ note: i.note.slice(0, 300), at: i.at, status: 'incorporated' as const })),
+    ];
+
     return {
       data: {
         goal: {
@@ -825,6 +1043,7 @@ export class ScrumMaster extends Abject {
           currentScrumNumber: goal.currentScrumNumber,
           status: goal.status,
         },
+        ...(userInterjections.length > 0 ? { userInterjections } : {}),
         ...(loopWarning ? { loopWarning } : {}),
         completed: completed.map(t => ({
           description: (t.fields.description as string ?? '').slice(0, 300),
@@ -1091,6 +1310,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
 
     const goal = await this.request<{
       title: string; description: string; scratchpad?: Record<string, unknown>;
+      interjections?: Array<{ note: string; at: number; status: string }>;
     } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
       5000,
@@ -1145,8 +1365,16 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       .filter((id): id is string => Boolean(id))
       .map(id => agentNames.get(id) ?? id.slice(0, 8)))];
 
+    // Near the top: the reviewer truncates the record at 4000 chars, and how
+    // the user steered the sprint mid-flight is prime review material.
+    const interjectionLines = (goal.interjections ?? [])
+      .map(i => `- [${i.status}] ${compactLine(i.note, 200)}`);
+
     const plan = [
       `Goal:\n${goal.description}`,
+      interjectionLines.length > 0
+        ? `User interjections (messages sent while the sprint ran):\n${interjectionLines.join('\n')}`
+        : undefined,
       participatingAgents.length > 0
         ? `Participating agents:\n${participatingAgents.join(', ')}`
         : 'Participating agents:\n(none)',
@@ -1160,7 +1388,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
         ? `Scratchpad keys produced:\n${scratchpadKeys.map(k => `- ${k}`).join('\n')}`
         : 'Scratchpad keys produced:\n(none)',
       `Final answer excerpt:\n${synthesis.slice(0, 1800)}`,
-    ].join('\n\n');
+    ].filter((section): section is string => typeof section === 'string').join('\n\n');
 
     await this.request(
       request(this.id, this.goalManagerId, 'writeGoalData', {
@@ -1188,6 +1416,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
 
     const goal = await this.request<{
       title: string; description: string; scratchpad?: Record<string, unknown>;
+      interjections?: Array<{ note: string; at: number; status: string }>;
     } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     ).catch(() => null);
@@ -1205,12 +1434,19 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       ? `\n\nFraming hint from the planner: ${hint}`
       : '';
 
+    // The user steered the sprint mid-flight; the final answer must honor
+    // the latest steering over the original phrasing.
+    const interjectionBlock = (goal.interjections ?? []).length > 0
+      ? `\n\nWhile the work ran, the user sent these follow-up messages (the LATEST steering wins over the original intent where they differ):\n` +
+        (goal.interjections ?? []).map(i => `- ${i.note.slice(0, 500)}`).join('\n')
+      : '';
+
     const prompt = `Synthesize a complete, self-contained final answer for the user.
 
 Goal: "${goal.title}"
 
 User's intent:
-${goal.description}
+${goal.description}${interjectionBlock}
 
 Scratchpad (results from completed tasks — this is the data your answer must inline):
 ${scratchpadBlock}${hintBlock}
@@ -1493,6 +1729,14 @@ Rules:
       return;
     }
 
+    // Clear the way: a dispatch committed while the previous round is still
+    // running (an interjection check re-planning around new user input)
+    // cancels the outstanding tasks first so the old plan and the new one
+    // never race. At a normal round boundary this is a no-op.
+    await this.request<{ cancelled: number }>(
+      request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId }), 15000,
+    ).catch(() => ({ cancelled: 0 }));
+
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId }),
     );
@@ -1619,6 +1863,22 @@ Rules:
 1. The sprint is **done** — call \`complete_goal({ synthesis })\` with a complete, self-contained final answer for the user.
 2. The sprint needs more work — call \`add_task\` (one or more times to stage), then \`dispatch_scrum\` to commit.
 3. The sprint is unreachable — call \`fail_goal({ reason })\`.
+4. The user steered mid-sprint and the current plan already covers it — call \`continue_scrum\` (only for interjection checks).
+5. The user's steering is ambiguous and the sprint depends on the answer — call \`ask_user({ question })\`.
+
+## User interjections — live steering
+
+The goal state may carry \`userInterjections\`: messages the user typed while the sprint ran. **Pending interjections take precedence over the original goal description** — they are the user's most recent word. Read them at every scrum and act on them:
+
+- They refine or extend the plan → fold them into the tasks you stage (\`add_task\` + \`dispatch_scrum\`). Carry their key phrases through verbatim, same as goal requirements.
+- They contradict work currently in flight → re-plan: stage the corrected tasks and \`dispatch_scrum\`; the outstanding tasks of the old plan are cancelled automatically when you commit.
+- They say the work is unnecessary or should stop → \`fail_goal\` with a warm, brief explanation acknowledging the user's request (this is a user decision, not an error).
+- They already describe what the current tasks are doing → \`continue_scrum\` (during an interjection check) or simply proceed with your boundary decision; the note remains visible at the next review.
+- They are ambiguous in a way that changes the plan → \`ask_user({ question })\` with ONE specific question. The goal pauses until the user answers; the answer arrives as the next interjection.
+
+Entries marked \`incorporated\` were already weighed by an earlier scrum — they are shown so your plan stays consistent with earlier steering; re-honor them, never undo them by reverting to the original description.
+
+Some scrum tasks are **interjection checks** (the task description says so): the user typed mid-round and agents are still working. Judge quickly — \`continue_scrum\` when the work in flight already serves the note; anything else follows the guidance above.
 
 ## Your first action
 
@@ -1711,7 +1971,13 @@ Use it when the request is a single concrete step that one agent's \`team\` desc
 - \`target\`: OPTIONAL concrete object the task operates on (prefer a registered name over a UUID), same meaning as \`add_task\`'s \`target\`.
 
 ### \`dispatch_scrum\` — TERMINAL success
-Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.
+Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty. When committed while a prior round's tasks are still running (a mid-round re-plan after a user interjection), those outstanding tasks are cancelled first — the new plan fully replaces the old round.
+
+### \`continue_scrum\` — TERMINAL success (interjection checks only)
+The user's mid-round message needs no plan change: the work in flight already serves it. Nothing is cancelled, nothing is staged; agents keep working and the user sees a short acknowledgment. The note stays visible at the round boundary so the review scrum confirms the finished work really honors it.
+
+### \`ask_user({ question })\` — TERMINAL success
+Pause the sprint and put ONE specific question to the user. Use when a user interjection (or the goal itself) is ambiguous in a way that changes what you would plan — a wrong guess costs a whole round, a good question costs seconds. The user sees the question in their chat; their reply arrives as the next interjection and the sprint resumes into a review scrum that reads it. Ask sparingly and concretely: name the alternatives you are choosing between.
 
 ### \`save_knowledge({ title, content, type?, tags? })\`
 Persist a genuinely reusable FACT to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact that holds on its own, not a log of this sprint.

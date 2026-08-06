@@ -179,6 +179,8 @@ function formatGoal(data: Record<string, unknown>): { line: Line | null; busy: b
       return { line: { text: '· goal paused', color: 'yellow' }, busy: null };
     case 'goalResumed':
       return { line: { text: '· goal resumed', color: 'dim' }, busy: true };
+    case 'goalClarificationRequested':
+      return { line: { text: `? ${clip(data.question, 500)} (type to answer)`, color: 'yellow' }, busy: null };
     default:
       return { line: null, busy: null };
   }
@@ -474,6 +476,17 @@ class TuiApp {
             case 'goalResumed':
               if (tab.goal) tab.goal.activity = 'working…';
               tab.busy = true;
+              break;
+            case 'goalInterjection':
+              // A note (ours or the GUI's) reached the goal — acknowledge.
+              if (tab.goal && tab.goal.goalId === goalId) {
+                tab.goal.activity = 'note queued — the scrum master will weigh it';
+              }
+              break;
+            case 'goalClarificationRequested':
+              if (tab.goal && tab.goal.goalId !== goalId) break;
+              this.appendTo(tab, [{ text: `? ${clip(data.question, 500)}`, color: 'yellow' }]);
+              if (tab.goal) tab.goal.activity = 'waiting for your answer — type to reply';
               break;
           }
         }

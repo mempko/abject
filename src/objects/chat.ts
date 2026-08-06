@@ -41,8 +41,9 @@ const STOP_GLYPH = '\u25A0';       // ■ stop the goal entirely
 const SEND_BTN_SIZE = 44;
 const INPUT_MIN_HEIGHT = 44;
 const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
-const COMPOSER_HINT_GOAL = `${PAUSE_GLYPH}  Pause the goal   \u00B7   ${STOP_GLYPH}  Stop it`;
+const COMPOSER_HINT_GOAL = `\u21B5  Queue a note for the goal   \u00B7   ${PAUSE_GLYPH}  Pause   \u00B7   ${STOP_GLYPH}  Stop`;
 const COMPOSER_HINT_PAUSED = `\u21B5  Send note   \u00B7   ${RESUME_GLYPH}  Resume   \u00B7   ${STOP_GLYPH}  Stop`;
+const COMPOSER_HINT_CLARIFY = `\u21B5  Answer to continue the goal   \u00B7   ${STOP_GLYPH}  Stop`;
 
 // ── Attachments ────────────────────────────────────────────────────────
 /** Image MIME types the LLM vision content part accepts. */
@@ -157,6 +158,12 @@ export class Chat extends Abject {
   private goalControlsActive = false;
   /** True while the current goal is paused (input unlocked for interjections). */
   private goalPaused = false;
+  /**
+   * The scrum master paused the goal to ask the user a question (ask_user).
+   * The next typed message answers it and auto-resumes the goal — unlike a
+   * user-initiated pause, which resumes only on the Resume button.
+   */
+  private clarificationPending = false;
   private uploadBtnId?: AbjectId;
   private fileSystemId?: AbjectId;
 
@@ -491,8 +498,21 @@ export class Chat extends Abject {
     this.on('sendMessage', async (msg: AbjectMessage) => {
       const { message } = msg.payload as { message: string };
       if (!message?.trim()) return false;
-      log.info(`[Chat] sendMessage: "${message.trim().slice(0, 80)}"`);
-      this.triggerSend(message.trim());
+      const text = message.trim();
+      // While a goal runs, external messages (terminal client, command
+      // palette, speech) queue as interjections — same path as typing into
+      // the composer.
+      if (this.goalControlsActive && this._currentGoalId) {
+        log.info(`[Chat] sendMessage → goal interjection: "${text.slice(0, 80)}"`);
+        await this.sendInterjection(text);
+        return true;
+      }
+      if (this.uiPhase !== 'idle') {
+        log.info(`[Chat] sendMessage dropped (uiPhase=${this.uiPhase}): "${text.slice(0, 80)}"`);
+        return false;
+      }
+      log.info(`[Chat] sendMessage: "${text.slice(0, 80)}"`);
+      this.triggerSend(text);
       return true;
     });
 
@@ -758,6 +778,14 @@ export class Chat extends Abject {
         // Goal lifecycle events — feed the liveGoals tree so the activity
         // bubble can render the same hierarchy the GoalBrowser shows.
         if (this._currentGoalId) {
+          if (aspect === 'goalClarificationRequested') {
+            const data = value as { goalId: string; question: string };
+            if (data.goalId === this._currentGoalId) {
+              await this.handleClarificationRequested(data.question);
+            }
+            return;
+          }
+
           if (aspect === 'goalCreated') {
             const data = value as { goalId: string; title: string; description?: string; parentId?: string };
             // Only track goals that are part of the current task's tree
@@ -2092,7 +2120,9 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async handleSendClick(): Promise<void> {
     // While the goal is paused the composer is the interjection channel:
     // Enter sends a note into the goal instead of starting a new chat task.
-    const interjecting = this.goalControlsActive && this.goalPaused;
+    // A running goal keeps the composer live: typed text queues as an
+    // interjection the scrum master weighs at its next decision point.
+    const interjecting = this.goalControlsActive && !!this._currentGoalId;
     if ((this.uiPhase !== 'idle' && !interjecting) || !this.textInputId) return;
 
     const text = await this.request<string>(
@@ -2441,6 +2471,12 @@ A single successful creation goal is a complete turn. End it with **done**.
         alignment: 'right' as const,
       }));
       await this.setComposerHint(COMPOSER_HINT_GOAL);
+      // The composer stays live during the goal: typed text queues as an
+      // interjection the scrum master weighs (runChatTask locked the input
+      // for the LLM turn just before the goal spun up).
+      if (this.textInputId) {
+        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: false } })); } catch { /* widget gone */ }
+      }
     } catch { /* widget gone — controls degrade to plain busy state */ }
   }
 
@@ -2449,6 +2485,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (!this.goalControlsActive) return;
     this.goalControlsActive = false;
     this.goalPaused = false;
+    this.clarificationPending = false;
     if (this.sendBtnId) {
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: SEND_GLYPH })); } catch { /* widget gone */ }
     }
@@ -2491,11 +2528,10 @@ A single successful creation goal is a complete turn. End it with **done**.
       ).catch(() => false);
       if (!ok) return;
       this.goalPaused = false;
+      this.clarificationPending = false;
       this.setGoalWaitPaused(goalId, false);
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
-      if (this.textInputId) {
-        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: true } })); } catch { /* widget gone */ }
-      }
+      // The input stays live: typing during the running goal queues a note.
       await this.setComposerHint(COMPOSER_HINT_GOAL);
     }
   }
@@ -2517,9 +2553,28 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   /**
-   * Interjection while paused: show the note as a user bubble, keep it in
-   * the conversation history, and write it into the goal's scratchpad where
-   * agents and the next scrum read it.
+   * The scrum master paused the goal to ask the user a question. Render it,
+   * switch the composer into answer mode (paused state whose next message
+   * auto-resumes), and suspend the goal-wait timer while we wait.
+   */
+  private async handleClarificationRequested(question: string): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId) return;
+    this.goalPaused = true;
+    this.clarificationPending = true;
+    this.setGoalWaitPaused(goalId, true);
+    if (this.sendBtnId) {
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
+    }
+    await this.setComposerHint(COMPOSER_HINT_CLARIFY);
+    await this.appendBubble('assistant', 'Agent', question, true);
+  }
+
+  /**
+   * Interjection during a running or paused goal: show the note as a user
+   * bubble, keep it in the conversation history, and queue it on the goal
+   * where the scrum master weighs it. Answering a clarification question
+   * auto-resumes the goal.
    */
   private async sendInterjection(note: string): Promise<void> {
     const goalId = this._currentGoalId;
@@ -2532,6 +2587,23 @@ A single successful creation goal is a complete turn. End it with **done**.
     ).catch(() => false);
     if (!ok) {
       await this.appendBubble('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
+      return;
+    }
+    if (this.clarificationPending && this.goalPaused) {
+      // The note answers the scrum master's question — resume the sprint so
+      // the review scrum reads it.
+      this.clarificationPending = false;
+      const resumed = await this.request<boolean>(
+        request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
+      ).catch(() => false);
+      if (resumed) {
+        this.goalPaused = false;
+        this.setGoalWaitPaused(goalId, false);
+        if (this.sendBtnId) {
+          try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
+        }
+        await this.setComposerHint(COMPOSER_HINT_GOAL);
+      }
     }
   }
 

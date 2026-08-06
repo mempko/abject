@@ -59,6 +59,7 @@ const GOAL_ASPECTS = [
   'goalCreated', 'goalUpdated', 'goalCompleted', 'goalFailed',
   'goalPaused', 'goalResumed', 'scrumPlanned',
   'taskCompleted', 'taskPermanentlyFailed', 'taskUnblocked',
+  'goalInterjection', 'goalClarificationRequested',
 ] as const;
 
 export class CliServer extends Abject {
