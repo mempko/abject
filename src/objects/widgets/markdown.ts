@@ -25,8 +25,14 @@ export type BlockType = 'paragraph' | 'heading' | 'bullet' | 'code-block' | 'blo
 
 export interface MarkdownBlock {
   type: BlockType;
-  /** Heading level (1-3) or bullet nesting (always 1). */
+  /** Heading level (1-6) or bullet nesting (always 1). */
   level?: number;
+  /**
+   * List marker rendered before a bullet block's content. Unset for plain
+   * bullets (the renderer draws •); ordered-list items carry their number
+   * ("3. ") so numbering survives rendering.
+   */
+  marker?: string;
   spans: TextSpan[];
   /** Optional language hint for code blocks. */
   language?: string;
@@ -272,7 +278,7 @@ export function parseMarkdown(text: string): ParsedMarkdown {
     }
 
     // Heading: # text
-    const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
     if (headingMatch) {
       const level = headingMatch[1].length;
       const contentText = headingMatch[2];
@@ -297,6 +303,24 @@ export function parseMarkdown(text: string): ParsedMarkdown {
       blocks.push({
         type: 'bullet',
         level: 1,
+        spans: parseInline(contentText, contentOffset),
+        sourceStart: lineStart,
+        sourceEnd: lineEnd,
+      });
+      offset = lineEnd + 1;
+      i++;
+      continue;
+    }
+
+    // Ordered list item: "1. text" or "23) text"
+    const orderedMatch = line.match(/^\s*(\d{1,3})[.)]\s+(.*)$/);
+    if (orderedMatch) {
+      const contentText = orderedMatch[2];
+      const contentOffset = lineStart + (line.length - contentText.length);
+      blocks.push({
+        type: 'bullet',
+        level: 1,
+        marker: `${orderedMatch[1]}. `,
         spans: parseInline(contentText, contentOffset),
         sourceStart: lineStart,
         sourceEnd: lineEnd,
@@ -394,8 +418,9 @@ export function parseMarkdown(text: string): ParsedMarkdown {
       const nextLine = lines[i];
       if (
         nextLine.trim() === '' ||
-        nextLine.match(/^#{1,3}\s/) ||
+        nextLine.match(/^#{1,6}\s/) ||
         nextLine.match(/^\s*[-*]\s+/) ||
+        nextLine.match(/^\s*\d{1,3}[.)]\s+/) ||
         nextLine.startsWith('> ') ||
         nextLine.trimStart().startsWith('```') ||
         nextLine.trimStart().startsWith('|') ||
@@ -467,7 +492,7 @@ export function estimateMarkdownHeight(
     if (prevBlock) totalHeight += 4;
 
     // Heading
-    const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
     if (headingMatch) {
       const level = headingMatch[1].length;
       const scale = level === 1 ? 1.4 : level === 2 ? 1.25 : 1.1;
@@ -479,9 +504,9 @@ export function estimateMarkdownHeight(
       continue;
     }
 
-    // Bullet
-    if (line.match(/^\s*[-*]\s+/)) {
-      const bulletText = line.replace(/^\s*[-*]\s+/, '');
+    // Bullet (unordered or ordered list item)
+    if (line.match(/^\s*[-*]\s+/) || line.match(/^\s*\d{1,3}[.)]\s+/)) {
+      const bulletText = line.replace(/^\s*[-*]\s+/, '').replace(/^\s*\d{1,3}[.)]\s+/, '');
       const availWidth = maxWidthPx - 16; // indent
       totalHeight += estimateTextHeight(bulletText, availWidth, baseFontSize);
       prevBlock = true;

@@ -220,11 +220,12 @@ export async function layoutRichText(
     // Build word segments from all spans in this block
     const segments: WordSegment[] = [];
 
-    // Prepend bullet character
+    // Prepend the list marker: \u2022 for plain bullets, the item's own number
+    // ("3. ") for ordered lists.
     if (block.type === 'bullet') {
       const bulletFont = buildFontForStyle('normal', baseFontSize, 1, false);
       segments.push({
-        text: '\u2022 ',
+        text: block.marker ?? '\u2022 ',
         font: bulletFont,
         fill: blockFill,
         sourceStart: block.sourceStart,
