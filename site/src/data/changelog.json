@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.9.0",
+    "date": "2026-08-06",
+    "title": "Commune: Abject from the Terminal",
+    "summary": "This release brings Abject to the terminal. Commune is a new text client that connects to your running peer, ships as a single-file executable, and lets you talk to your objects from anywhere a shell runs. Conversations also got smoother: you can keep typing while a goal is in progress.",
+    "highlights": [
+      "Commune, a new terminal client for Abject: chat with your workspaces over a dedicated CliServer gateway (port 7723) using the same auth tokens as the web client, with tmux-friendly Alt-key bindings",
+      "Commune is packaged as a single-file executable in releases, so you can drop it on any machine without installing Node or cloning the repo",
+      "Type while agents work: messages sent during a running goal are queued as interjections and folded into the plan instead of being lost or interrupting mid-task"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.8.33",
     "date": "2026-08-05",
     "title": "Sharper Questions, Easier Sharing",
