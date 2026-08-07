@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.9.1",
+    "date": "2026-08-07",
+    "title": "Richer Markdown on the Canvas",
+    "summary": "A small release that rounds out markdown rendering in canvas windows: documents with deep heading structure and numbered lists now display properly instead of falling back to plain text.",
+    "highlights": [
+      "Canvas markdown now renders h4 through h6 headings and ordered (numbered) lists, so agent output and notes with deeper structure display correctly."
+    ],
+    "fixes": [
+      "Release packaging: asset upload now handles the two-root artifact layout, so downloadable builds attach to releases reliably."
+    ]
+  },
+  {
     "version": "0.9.0",
     "date": "2026-08-06",
     "title": "Commune: Abject from the Terminal",
