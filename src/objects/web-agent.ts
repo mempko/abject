@@ -12,6 +12,7 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
 import type { AgentAction, AgentActionResult } from './agent-abject.js';
+import { LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 
@@ -1198,7 +1199,23 @@ Set keepPageOpen: false to explicitly close the page when done.
               pageId, script: action.script as string,
             })
           );
-          return { success: true, data: result.result };
+          const value = result.result;
+          // A page script commonly returns something enormous — innerText of
+          // an article, every row of a table. Below the threshold the raw
+          // value goes back as-is, which is what a script returning a number
+          // or a short list should look like. Above it, the text is handed
+          // over whole for the runtime to hold and index: a string stays a
+          // string so a search matches what the page actually says, and a
+          // structure is serialized once so the outline can parse it back.
+          const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? '');
+          if (text.length > LARGE_PAYLOAD_CHARS) {
+            return {
+              success: true,
+              data: { extracted: typeof value === 'string' ? 'text' : 'json', chars: text.length },
+              payload: text,
+            };
+          }
+          return { success: true, data: value };
         }
 
         case 'attach_screenshot': {
@@ -1402,6 +1419,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 
 ### Extraction (escape hatch for complex JavaScript)
 - extract: Run JavaScript in the page context. The script is evaluated as an expression.
+  A large result comes back whole as a searchable handle (see "Large results"), so
+  return the text you need rather than pre-slicing it inside the script.
   Simple: { "action": "extract", "script": "document.title" }
   Complex: { "action": "extract", "script": "(() => { const items = []; document.querySelectorAll('h2 a').forEach(a => items.push({title: a.textContent.trim(), url: a.href})); return items.slice(0, 10); })()" }
   For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()

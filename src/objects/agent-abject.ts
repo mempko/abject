@@ -78,6 +78,16 @@ export interface AgentMessage {
 }
 
 /**
+ * The size at which text stops being something to paste and starts being
+ * something to navigate.
+ *
+ * Exported so an agent deciding whether to hand bulk over as `payload` uses
+ * the same number the runtime uses to decide whether to store it, rather
+ * than each side keeping its own copy to drift apart.
+ */
+export const LARGE_PAYLOAD_CHARS = 8000;
+
+/**
  * A payload too large to put in the conversation whole, kept intact and
  * addressed by id.
  *
@@ -3477,7 +3487,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   // ═══════════════════════════════════════════════════════════════════
 
   /** Above this, a payload is stored and summarized instead of pasted in. */
-  private static readonly PAYLOAD_HANDLE_THRESHOLD = 8000;
+  private static readonly PAYLOAD_HANDLE_THRESHOLD = LARGE_PAYLOAD_CHARS;
   /** How much of a stored payload rides along with the handle for free. */
   private static readonly PAYLOAD_PREVIEW_CHARS = 2000;
   /** Payloads kept per task; the oldest is dropped past this. */
