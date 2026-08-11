@@ -13,6 +13,23 @@ export type ContentPart = TextPart | ImagePart | DocumentPart;
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
   content: string | ContentPart[];
+  /**
+   * Marks this message as the end of a stable, cacheable prefix.
+   *
+   * Callers that can separate unchanging text (an agent's own instructions,
+   * framework guidance) from per-request text (retrieved knowledge, the
+   * current goal) put the stable part first and set this on it. Providers
+   * with explicit cache breakpoints (Anthropic) place one here instead of
+   * only at the very end, so the stable span is reused across requests that
+   * differ in their volatile tail. Providers with automatic prefix caching
+   * (OpenAI) ignore the flag and simply benefit from the ordering; providers
+   * with no caching ignore it entirely.
+   *
+   * Only set this on content that is genuinely byte-identical between
+   * requests. A prefix that varies pays a cache-write premium and is never
+   * read back.
+   */
+  cacheBreakpoint?: boolean;
 }
 
 export type ModelTier = 'smart' | 'balanced' | 'fast' | 'code';
@@ -159,6 +176,14 @@ export interface LLMCompletionResult {
     cacheWriteTokens?: number;
     /** Tokens the model spent on hidden reasoning (when the provider reports them). */
     reasoningTokens?: number;
+    /**
+     * What this call actually cost, as reported by the provider (OpenRouter's
+     * `usage.cost`). Token counts alone cannot answer whether prompt caching
+     * pays for itself: reads are discounted, writes carry a premium, and how
+     * each is folded into `inputTokens` varies by route. A provider-reported
+     * charge settles it without arithmetic.
+     */
+    costUsd?: number;
   };
 }
 
@@ -182,6 +207,14 @@ export interface LLMStreamChunk {
     cacheWriteTokens?: number;
     /** Tokens the model spent on hidden reasoning (when the provider reports them). */
     reasoningTokens?: number;
+    /**
+     * What this call actually cost, as reported by the provider (OpenRouter's
+     * `usage.cost`). Token counts alone cannot answer whether prompt caching
+     * pays for itself: reads are discounted, writes carry a premium, and how
+     * each is folded into `inputTokens` varies by route. A provider-reported
+     * charge settles it without arithmetic.
+     */
+    costUsd?: number;
   };
 }
 
@@ -732,18 +765,29 @@ export function enforceConversationCharBudget(
     const total = conversationTextChars(msgs);
     if (total <= maxChars) return;
 
-    let largestIdx = -1;
-    let largestLen = floorChars;
-    msgs.forEach((m, i) => {
-      const len = messageTextChars(m);
-      if (len > largestLen) {
-        largestLen = len;
-        largestIdx = i;
-      }
-    });
+    // Pick the largest message, preferring conversation over system. A system
+    // message holds the agent's own instructions and, for the stable one, the
+    // cached prefix: clipping it amputates the instructions AND invalidates
+    // the cache entry for every later request, which is a poor trade while a
+    // fat observation is still sitting there. Systems become eligible only
+    // once nothing else is above the floor.
+    const pick = (systemsToo: boolean): number => {
+      let idx = -1;
+      let len = floorChars;
+      msgs.forEach((m, i) => {
+        if (!systemsToo && m.role === 'system') return;
+        const size = messageTextChars(m);
+        if (size > len) { len = size; idx = i; }
+      });
+      return idx;
+    };
+
+    const conversationIdx = pick(false);
+    const largestIdx = conversationIdx >= 0 ? conversationIdx : pick(true);
     if (largestIdx === -1) return; // everything at floor — nothing left to shrink
 
     // Shrink by the overage (plus marker allowance), never below the floor.
+    const largestLen = messageTextChars(msgs[largestIdx]);
     const target = Math.max(floorChars, largestLen - (total - maxChars) - 200);
     truncateMessageTo(msgs[largestIdx], target);
   }

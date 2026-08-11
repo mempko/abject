@@ -96,12 +96,36 @@ export class OpenRouterProvider extends OpenAIProvider {
     return { reasoningActive: false };
   }
 
-  protected override applyRequestExtras(request: OpenAIRequest, _model: string, _options: LLMCompletionOptions, stream: boolean): void {
-    // Ask for token accounting (incl. the reasoning-token breakdown) — with
-    // `include` the final SSE chunk carries `usage`. Non-streaming responses
-    // always carry usage, so only ask on streams.
-    if (stream) request.usage = { include: true };
+  protected override applyRequestExtras(request: OpenAIRequest, _model: string, _options: LLMCompletionOptions, _stream: boolean): void {
+    // Ask for usage accounting on every call, streaming or not. On streams it
+    // is what makes the final SSE chunk carry `usage` at all; on non-streaming
+    // calls token counts come back regardless, but `cost` — the charge this
+    // call actually incurred — only appears when accounting is requested, and
+    // that is the one number that says whether prompt caching is paying off.
+    request.usage = { include: true };
     if (this.providerPreferences) request.provider = this.providerPreferences;
+  }
+
+  /**
+   * Model families that cache only when the request marks where to cache.
+   *
+   * OpenRouter's split (docs: features/prompt-caching): OpenAI, Grok,
+   * Moonshot, Groq, DeepSeek and Z.AI cache long prefixes on their own, and
+   * so does Gemini 2.5+ implicitly, while Anthropic, Qwen and the older
+   * Gemini line cache nothing at all without explicit `cache_control`.
+   * Marking the families in the second group is what turns caching on for
+   * them; sending nothing, as this provider used to, means a Claude route
+   * re-reads the entire prompt on every single call.
+   *
+   * Gemini is included deliberately even though the current models cache
+   * implicitly: an explicit breakpoint is honoured where it is understood and
+   * ignored where it is not, whereas omitting it on a route that needs it
+   * silently costs full price.
+   */
+  private static readonly EXPLICIT_CACHE_FAMILIES = /^(anthropic|qwen|google)\//i;
+
+  protected override supportsExplicitCacheBreakpoints(model: string): boolean {
+    return OpenRouterProvider.EXPLICIT_CACHE_FAMILIES.test(model);
   }
 
   /**
@@ -121,8 +145,16 @@ export class OpenRouterProvider extends OpenAIProvider {
    * machine pin, so keepalive pings may occasionally miss — the keepalive's
    * failure handling tolerates a lossy cache.
    */
-  override cacheProfile(_modelId: string): CacheProfile | undefined {
-    return { ttlSeconds: 300, readRatio: 0.10, writeRatio: 1.0, minPrefixTokens: 1024 };
+  override cacheProfile(modelId: string): CacheProfile | undefined {
+    // Minimum cacheable prefix varies by route, and a prefix under it is
+    // simply not cached, so the keepalive must not spend pings warming one.
+    // Per OpenRouter's published per-provider minimums: Claude Opus and
+    // Gemini Pro sit at 4096, Claude Haiku at 2048, everything else at 1024.
+    const minPrefixTokens =
+      /opus|gemini[^/]*pro/i.test(modelId) ? 4096
+      : /haiku/i.test(modelId) ? 2048
+      : 1024;
+    return { ttlSeconds: 300, readRatio: 0.10, writeRatio: 1.0, minPrefixTokens };
   }
 
   override async listModels(): Promise<ModelInfo[]> {

@@ -40,8 +40,17 @@ export interface OpenAIConfig {
   extraHeaders?: Record<string, string>;
 }
 
+/**
+ * Prompt-cache breakpoint, spelled the way Anthropic spells it. OpenRouter
+ * forwards this verbatim to providers that need explicit breakpoints
+ * (Anthropic, Qwen, older Gemini) and ignores it for providers that cache
+ * automatically. Plain OpenAI has no such field, which is why the base
+ * provider never emits one.
+ */
+type CacheControl = { type: 'ephemeral'; ttl?: string };
+
 type OpenAIContentPart =
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; cache_control?: CacheControl }
   | { type: 'image_url'; image_url: { url: string } }
   | { type: 'file'; file: { filename: string; file_data: string } };
 
@@ -95,8 +104,11 @@ interface OpenAIStreamEvent {
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
-    prompt_tokens_details?: { cached_tokens?: number };
+    prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
     completion_tokens_details?: { reasoning_tokens?: number };
+    /** OpenRouter usage accounting: what this call was charged. */
+    cost?: number;
+    cost_details?: { upstream_inference_cost?: number };
   };
   /** Mid-stream upstream error frame (OpenRouter): the gateway reports a
    * failed upstream as data instead of an HTTP status. */
@@ -134,10 +146,14 @@ interface OpenAIResponse {
     total_tokens: number;
     prompt_tokens_details?: {
       cached_tokens?: number;
+      cache_write_tokens?: number;
     };
     completion_tokens_details?: {
       reasoning_tokens?: number;
     };
+    /** OpenRouter usage accounting: what this call was charged. */
+    cost?: number;
+    cost_details?: { upstream_inference_cost?: number };
   };
 }
 
@@ -279,7 +295,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     const model = this.resolveModel(options);
     const request: OpenAIRequest = {
       model,
-      messages: messages.map((m) => ({ role: m.role, content: this.mapContent(m.content) })),
+      messages: this.mapMessages(messages, model),
       temperature: options.temperature,
       stop: options.stopSequences,
     };
@@ -504,6 +520,8 @@ export class OpenAIProvider extends BaseLLMProvider {
           inputTokens: data.usage.prompt_tokens,
           outputTokens: data.usage.completion_tokens,
           cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
+          cacheWriteTokens: data.usage.prompt_tokens_details?.cache_write_tokens,
+          costUsd: data.usage.cost,
           reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
         },
       };
@@ -698,6 +716,8 @@ export class OpenAIProvider extends BaseLLMProvider {
               inputTokens: event.usage.prompt_tokens ?? 0,
               outputTokens: event.usage.completion_tokens ?? 0,
               cacheReadTokens: event.usage.prompt_tokens_details?.cached_tokens,
+              cacheWriteTokens: event.usage.prompt_tokens_details?.cache_write_tokens,
+              costUsd: event.usage.cost,
               reasoningTokens: event.usage.completion_tokens_details?.reasoning_tokens,
             };
           }
@@ -760,6 +780,63 @@ export class OpenAIProvider extends BaseLLMProvider {
    * Map LLMMessage content to OpenAI API format.
    * String content passes through; ContentPart[] maps to OpenAI content parts.
    */
+  /**
+   * Whether this model needs explicit cache breakpoints to cache at all.
+   *
+   * False here: plain OpenAI caches long prefixes automatically and has no
+   * `cache_control` field, so emitting one would be noise at best. Providers
+   * that front models requiring explicit breakpoints override this.
+   */
+  protected supportsExplicitCacheBreakpoints(_model: string): boolean {
+    return false;
+  }
+
+  /**
+   * Map the conversation, honouring cache breakpoints where the model needs
+   * them.
+   *
+   * Two breakpoints, matching the Anthropic provider so behaviour does not
+   * depend on which door a Claude model is reached through:
+   *   - the message the caller marked (the stable prompt prefix), which is
+   *     what makes one agent's instructions reusable across its tasks;
+   *   - the tail, so the next turn of THIS conversation reuses everything up
+   *     to here.
+   * That is 2 of the 4 breakpoints providers allow per request.
+   *
+   * A breakpoint has to ride on a content block, so only the messages that
+   * carry one are converted to the array form; everything else stays a plain
+   * string, exactly as before.
+   */
+  protected mapMessages(messages: LLMMessage[], model: string): OpenAIMessage[] {
+    const mapped: OpenAIMessage[] = messages.map((m) => ({
+      role: m.role,
+      content: this.mapContent(m.content),
+    }));
+    if (!this.supportsExplicitCacheBreakpoints(model) || mapped.length === 0) return mapped;
+
+    const mark = (index: number): void => {
+      const msg = mapped[index];
+      if (msg === undefined) return;
+      const parts: OpenAIContentPart[] = typeof msg.content === 'string'
+        ? (msg.content ? [{ type: 'text', text: msg.content }] : [])
+        : msg.content;
+      // Breakpoints attach to text; an image or file tail has nothing to hang
+      // one on, so leave such a message alone rather than inventing a block.
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const part = parts[i];
+        if (part.type === 'text') {
+          part.cache_control = { type: 'ephemeral' };
+          msg.content = parts;
+          return;
+        }
+      }
+    };
+
+    messages.forEach((m, i) => { if (m.cacheBreakpoint) mark(i); });
+    mark(mapped.length - 1);
+    return mapped;
+  }
+
   protected mapContent(content: string | ContentPart[]): string | OpenAIContentPart[] {
     if (typeof content === 'string') return content;
     return content.map((part): OpenAIContentPart => {

@@ -281,7 +281,7 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   /** Build the shared request body with per-model generation settings applied. */
   private buildRequest(messages: LLMMessage[], options: LLMCompletionOptions, stream: boolean): AnthropicRequest {
-    const systemMsg = messages.find((m) => m.role === 'system');
+    const systemMsgs = messages.filter((m) => m.role === 'system');
     const conversationMessages = messages.filter((m) => m.role !== 'system');
     const anthropicMessages: AnthropicMessage[] = conversationMessages.map((m) => ({
       role: m.role as 'user' | 'assistant',
@@ -303,7 +303,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     if (cfg.thinking) request.thinking = cfg.thinking;
     if (cfg.effort) request.output_config = { effort: cfg.effort };
 
-    const systemBlocks = this.buildSystem(systemMsg);
+    const systemBlocks = this.buildSystem(systemMsgs);
     if (systemBlocks) request.system = systemBlocks;
 
     return request;
@@ -381,11 +381,33 @@ export class AnthropicProvider extends BaseLLMProvider {
     this.model = config.model ?? 'claude-sonnet-4-6';
   }
 
-  private buildSystem(systemMsg: LLMMessage | undefined): AnthropicSystemBlock[] | undefined {
-    if (!systemMsg) return undefined;
-    const text = getTextContent(systemMsg);
-    if (!text) return undefined;
-    return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+  /**
+   * Map every system message to a system block, in order.
+   *
+   * All of them: a caller that splits its system prompt into a stable half
+   * and a per-request half sends two, and reading only the first would drop
+   * the second on the floor while other providers still saw it.
+   *
+   * Breakpoint placement follows the caller's `cacheBreakpoint` markers when
+   * there are any, so the cached span ends where the stable text ends rather
+   * than swallowing the volatile tail with it. With no markers this falls
+   * back to breaking after the last block, which is the whole system prompt
+   * for the single-message callers that have always worked that way.
+   */
+  private buildSystem(systemMsgs: LLMMessage[]): AnthropicSystemBlock[] | undefined {
+    const blocks: AnthropicSystemBlock[] = [];
+    let markedIndex = -1;
+    for (const msg of systemMsgs) {
+      const text = getTextContent(msg);
+      if (!text) continue;
+      blocks.push({ type: 'text', text });
+      if (msg.cacheBreakpoint) markedIndex = blocks.length - 1;
+    }
+    if (blocks.length === 0) return undefined;
+
+    const breakAt = markedIndex >= 0 ? markedIndex : blocks.length - 1;
+    blocks[breakAt].cache_control = { type: 'ephemeral' };
+    return blocks;
   }
 
   /**

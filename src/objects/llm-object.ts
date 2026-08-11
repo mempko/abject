@@ -713,8 +713,19 @@ export class LLMObject extends Abject {
       }
 
       const elapsed = Date.now() - start;
+      // Reads and writes both, never one or the other: a call typically does
+      // both (it reads the stable prefix back and writes a new entry for the
+      // grown tail), and reporting only the read makes a write-heavy call
+      // look free. Cost is what actually settles whether caching pays —
+      // reads are discounted, writes carry a premium, and how each is folded
+      // into inputTokens varies by route, so the token counts alone cannot
+      // answer it.
+      const cacheNote =
+        (usage?.cacheReadTokens ? `/cached=${usage.cacheReadTokens}` : '') +
+        (usage?.cacheWriteTokens ? `/cachewrite=${usage.cacheWriteTokens}` : '');
+      const costNote = typeof usage?.costUsd === 'number' ? ` | cost=$${usage.costUsd.toFixed(5)}` : '';
       const tokenSummary = usage
-        ? ` | tokens=${usage.inputTokens}in/${usage.outputTokens}out${usage.reasoningTokens ? `/reasoning=${usage.reasoningTokens}` : ''}`
+        ? ` | tokens=${usage.inputTokens}in/${usage.outputTokens}out${cacheNote}${usage.reasoningTokens ? `/reasoning=${usage.reasoningTokens}` : ''}${costNote}`
         : '';
       // A stream that ends without a finish frame is suspect: the generation
       // may have been cut off upstream. Name it so truncation hunts don't
