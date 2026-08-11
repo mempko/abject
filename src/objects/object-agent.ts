@@ -179,7 +179,8 @@ When asked about a task, describe which objects you would message and what you w
       this._currentGoalId = goalId;
 
       try {
-        const systemPrompt = this.buildSystemPrompt(data);
+        const systemPrompt = this.buildSystemPrompt();
+        const taskPrompt = this.buildTaskPrompt(data);
 
         // Seed conversation with approach and failure context from previous attempts.
         const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
@@ -206,6 +207,7 @@ When asked about a task, describe which objects you would message and what you w
             taskId,
             task: description,
             systemPrompt,
+            taskPrompt,
             goalId,
             dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
@@ -564,8 +566,28 @@ When asked about a task, describe which objects you would message and what you w
   // System Prompt
   // ═══════════════════════════════════════════════════════════════════
 
-  private buildSystemPrompt(taskData?: Record<string, unknown>): string {
-    let prompt = `You are ObjectAgent. You accomplish tasks by discovering and calling existing objects in the system.
+  /**
+   * The per-task hints, kept out of buildSystemPrompt so the instructions
+   * above stay byte-identical across tasks and can be served from the
+   * provider's prompt cache. Returns undefined when there is nothing to say.
+   */
+  private buildTaskPrompt(taskData?: Record<string, unknown>): string | undefined {
+    if (!taskData) return undefined;
+    const { object, method, payload } = taskData as {
+      object?: string; method?: string; payload?: unknown;
+    };
+    if (!object && !method) return undefined;
+
+    let hints = '\n\n## Task Hints\n\n';
+    if (object) hints += `Target object: ${object}\n`;
+    if (method) hints += `Method to call: ${method}\n`;
+    if (payload !== undefined) hints += `Payload: ${JSON.stringify(payload).slice(0, 500)}\n`;
+    hints += '\nYou may use these hints to skip discovery and call directly, or use "ask" to verify the API first.\n';
+    return hints;
+  }
+
+  private buildSystemPrompt(): string {
+    return `You are ObjectAgent. You accomplish tasks by discovering and calling existing objects in the system.
 
 ## What You Do
 
@@ -631,21 +653,6 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
 | fail | reason | Task cannot be completed. |
 | reply | message | Send a progress update. |
 `;
-
-    if (taskData) {
-      const { object, method, payload } = taskData as {
-        object?: string; method?: string; payload?: unknown;
-      };
-      if (object || method) {
-        prompt += '\n## Task Hints\n\n';
-        if (object) prompt += `Target object: ${object}\n`;
-        if (method) prompt += `Method to call: ${method}\n`;
-        if (payload !== undefined) prompt += `Payload: ${JSON.stringify(payload).slice(0, 500)}\n`;
-        prompt += '\nYou may use these hints to skip discovery and call directly, or use "ask" to verify the API first.\n';
-      }
-    }
-
-    return prompt;
   }
 
   // ═══════════════════════════════════════════════════════════════════

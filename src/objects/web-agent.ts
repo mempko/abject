@@ -51,6 +51,7 @@ interface WebTaskExtra {
 
 export class WebAgent extends Abject {
   private webBrowserId?: AbjectId;
+  private httpClientId?: AbjectId;
   private consoleId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private jobManagerId?: AbjectId;
@@ -414,6 +415,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     this.consoleId = await this.discoverDep('Console') ?? undefined;
     this.agentAbjectId = await this.requireDep('AgentAbject');
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
+    this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
     // Register with AgentAbject
@@ -480,7 +482,8 @@ Set keepPageOpen: false to explicitly close the page when done.
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId,
           task: instruction,
-          systemPrompt: this.buildSystemPrompt(instruction),
+          systemPrompt: this.buildSystemPrompt(),
+          taskPrompt: this.buildTaskPrompt(instruction),
           config: {
             maxSteps: 3,
             timeout: 120000,
@@ -594,7 +597,8 @@ Set keepPageOpen: false to explicitly close the page when done.
           request(this.id, this.agentAbjectId!, 'startTask', {
             taskId,
             task: description,
-            systemPrompt: this.buildSystemPrompt(description),
+            systemPrompt: this.buildSystemPrompt(),
+            taskPrompt: this.buildTaskPrompt(description),
             goalId,
             dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
@@ -847,7 +851,8 @@ Set keepPageOpen: false to explicitly close the page when done.
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId,
           task: taskText,
-          systemPrompt: this.buildSystemPrompt(taskText, options?.maxSteps),
+          systemPrompt: this.buildSystemPrompt(),
+          taskPrompt: this.buildTaskPrompt(taskText, options?.maxSteps),
           responseSchema: extra.responseSchema,
           config: {
             maxSteps: options?.maxSteps,
@@ -917,8 +922,15 @@ Set keepPageOpen: false to explicitly close the page when done.
 
   private static readonly MAX_SNAPSHOT_CHARS = 25000;
 
+  /** Cap on an http action's body before it enters the conversation. */
+  private static readonly MAX_HTTP_BODY_CHARS = 30000;
+
+  /**
+   * Above this many interactive refs a page is a real choice among many
+   * controls and earns the smarter tier. Snapshot length deliberately does
+   * not enter into it; see the tier decision in handleObserve.
+   */
   private static readonly FAST_TIER_REF_THRESHOLD = 30;
-  private static readonly FAST_TIER_CHAR_THRESHOLD = 8000;
 
   /** Cached tier vision capabilities from the LLM service. */
   private tierVisionCache?: { caps: Record<string, boolean | null>; at: number };
@@ -965,12 +977,16 @@ Set keepPageOpen: false to explicitly close the page when done.
 
       const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
 
-      // Pick LLM tier for the think decision by page complexity. The hint is
-      // now honored by the OTA loop (floored at balanced), so a simple page
-      // decides on 'balanced' and a complex one keeps 'smart' — no regression
-      // on hard navigation, savings on easy pages.
-      let tier = (refCount <= WebAgent.FAST_TIER_REF_THRESHOLD && snapshot.length <= WebAgent.FAST_TIER_CHAR_THRESHOLD)
-        ? 'balanced' : 'smart';
+      // Pick the think tier by INTERACTION complexity, not payload size.
+      // What makes the next decision hard is how many things there are to
+      // choose between, and a page with a handful of refs is an easy choice
+      // however much text it carries. Sizing by characters sent a raw JSON
+      // body (1 element, 102k chars) to the costly tier, producing the two
+      // most expensive calls of a run: priciest per token, longest prompt,
+      // and cold cache, since cache entries do not survive a model switch.
+      // Large payloads are a reading problem, handled by how the observation
+      // is presented, not by paying a reasoning model to skim them.
+      let tier = refCount <= WebAgent.FAST_TIER_REF_THRESHOLD ? 'balanced' : 'smart';
 
       // Vision-aware routing: only ship a screenshot a model can actually
       // see. If the complexity-chosen tier is text-only but the other think
@@ -1146,6 +1162,31 @@ Set keepPageOpen: false to explicitly close the page when done.
           }));
           return { success: true, data: { waited: action.selector } };
 
+        case 'http': {
+          // A data endpoint is not a page. Browsing one renders its body into
+          // an accessibility snapshot (one element, sometimes 100k+ chars),
+          // which then rides into the prompt and pays for a model to skim it.
+          // Fetching it returns the bytes directly, in one step.
+          if (!this.httpClientId) {
+            return { success: false, error: 'No HTTP capability is available in this workspace; navigate to the URL instead.' };
+          }
+          const url = action.url as string | undefined;
+          if (!url) return { success: false, error: 'http action requires "url"' };
+          const res = await this.request<{ status: number; body: string; ok: boolean }>(
+            request(this.id, this.httpClientId, 'request', {
+              method: (action.method as string) ?? 'GET',
+              url,
+              headers: action.headers as Record<string, string> | undefined,
+              body: action.body,
+            }),
+            60000,
+          );
+          return {
+            success: res.ok !== false,
+            data: { status: res.status, body: res.body?.slice(0, WebAgent.MAX_HTTP_BODY_CHARS) ?? '' },
+          };
+        }
+
         case 'extract': {
           const result = await this.request<{ result: unknown }>(
             request(this.id, webId, 'evaluate', {
@@ -1281,14 +1322,21 @@ Set keepPageOpen: false to explicitly close the page when done.
   // System prompt
   // ═══════════════════════════════════════════════════════════════════
 
-  private buildSystemPrompt(taskText: string, maxSteps?: number): string {
-    const stepLimit = maxSteps ?? 15;
-    return `You are WebAgent, an autonomous browser agent with vision. You receive an accessibility tree snapshot of the page alongside a screenshot. Each interactive element has a ref like [ref=e5]. Use refs to target elements in your actions.
-
-You have a maximum of ${stepLimit} steps. Be efficient and call "done" as soon as you have useful data.
+  /**
+   * The task and its step budget, kept out of buildSystemPrompt so the
+   * instructions there stay byte-identical from one browsing task to the
+   * next and can be served from the provider's prompt cache. Placed after
+   * the cache breakpoint, where varying costs nothing.
+   */
+  private buildTaskPrompt(taskText: string, maxSteps?: number): string {
+    return `\n\nYou have a maximum of ${maxSteps ?? 15} steps. Be efficient and call "done" as soon as you have useful data.
 
 ## Task
-${taskText}
+${taskText}`;
+  }
+
+  private buildSystemPrompt(): string {
+    return `You are WebAgent, an autonomous browser agent with vision. You receive an accessibility tree snapshot of the page alongside a screenshot. Each interactive element has a ref like [ref=e5]. Use refs to target elements in your actions.
 
 ## ARIA Snapshot Format
 The observation contains an accessibility tree in YAML-like format. Example:
@@ -1314,6 +1362,17 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 \`\`\`
 
 ## Available Actions
+
+### Fetching data (prefer this over browsing for APIs and feeds)
+- http: Fetch a URL directly and get the response body back, without a browser.
+  { "action": "http", "url": "https://api.example.com/v1/thing.json" }
+  Optional: "method" (default GET), "headers", "body".
+  Use this whenever the URL returns DATA rather than a page: JSON APIs, RSS or
+  Atom feeds, CSV, plain text. It is one step instead of navigate-then-read, and
+  it hands you the body verbatim instead of the browser's rendering of it.
+  Reach for navigate when you need the rendered page: something behind a
+  login, a site that builds its content with JavaScript, or anything you must
+  click, fill, or see.
 
 ### Navigation
 - navigate: Go to a URL. { "action": "navigate", "url": "https://..." }

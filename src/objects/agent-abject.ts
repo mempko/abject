@@ -50,6 +50,39 @@ export interface AgentActionResult {
 }
 
 /**
+ * A conversation message as AgentAbject stores it: an LLMMessage with a
+ * loose `role` (the runtime carries roles the provider layer narrows later)
+ * plus the optional prompt-cache marker, which rides through to the provider.
+ */
+export interface AgentMessage {
+  role: string;
+  content: string | ContentPart[];
+  /** Set on the stable system message; see LLMMessage.cacheBreakpoint. */
+  cacheBreakpoint?: boolean;
+}
+
+/**
+ * One named piece of a system prompt, classified by whether it survives
+ * unchanged from one task to the next.
+ *
+ * Assembly keeps the pieces in reading order and then partitions them, so
+ * every stable piece lands in a single prefix that is byte-identical across
+ * an agent's tasks and can be served from the provider's prompt cache, while
+ * anything task-specific follows the cache breakpoint. Ordering by
+ * volatility is what makes the prefix reusable at all: one per-task sentence
+ * early in the prompt invalidates everything after it.
+ *
+ * `stable` is a claim about bytes, not about importance. Content that varies
+ * between tasks pays a cache-write premium and is never read back, so when
+ * in doubt classify it volatile.
+ */
+interface PromptBlock {
+  key: string;
+  content: string;
+  stable: boolean;
+}
+
+/**
  * One stated prediction paired with what actually happened. Collected per task
  * and handed to the post-task reviewer, which mines the divergences: a step
  * where the agent's expectation and reality parted is where its model of the
@@ -82,7 +115,7 @@ export interface AgentTaskState {
   lastResult?: AgentActionResult;
   result?: unknown;
   error?: string;
-  llmMessages: { role: string; content: string | ContentPart[] }[];
+  llmMessages: AgentMessage[];
   timeout: number;
   /** Rolling log of action signatures (action:target:method:errorClass) for loop detection. */
   actionHistory?: string[];
@@ -157,7 +190,8 @@ interface QueuedTask {
   taskId: string;
   task: string;
   systemPrompt?: string;
-  initialMessages?: { role: string; content: string | ContentPart[] }[];
+  taskPrompt?: string;
+  initialMessages?: AgentMessage[];
   config?: Partial<AgentConfig>;
   responseSchema?: Record<string, unknown>;
   goalId?: string;
@@ -177,8 +211,28 @@ interface TaskEntry {
   agentId: AbjectId;
   callerId: AbjectId;
   config: ResolvedAgentConfig;
+  /**
+   * The agent's own instructions, expected to be identical for every task it
+   * runs; it heads the cacheable prefix. Anything the agent needs to say
+   * about THIS task belongs in `taskPrompt`, where it costs nothing to vary.
+   */
   systemPrompt: string;
-  initialMessages?: { role: string; content: string | ContentPart[] }[];
+  /** Per-task addendum from the caller, placed after the cache breakpoint. */
+  taskPrompt?: string;
+  /**
+   * How many leading system messages the conversation opens with (one for
+   * the cacheable prefix, one for the volatile remainder, or fewer when a
+   * half is empty). Trimming reads this instead of assuming a single system
+   * message, so the pinned window still reaches the first real turn.
+   */
+  systemMessageCount?: number;
+  /**
+   * Assembled prompt block keys in order, volatile ones suffixed '*'.
+   * Diagnostics only: it makes "what is in this agent's prompt, and what is
+   * keeping it out of the cache" answerable without dumping 40KB of text.
+   */
+  promptBlockKeys?: string[];
+  initialMessages?: AgentMessage[];
   lastObservationLlmContent?: ContentPart[];
   /** LLM tier hint from the last observe callback (e.g. 'fast', 'balanced'). */
   observeTier?: string;
@@ -306,7 +360,7 @@ function sanitizeInjectedFact(content: string): string {
  */
 const TRANSCRIPT_CHAR_CAP = 40000;
 
-function flattenTranscript(messages: { role: string; content: string | ContentPart[] }[]): string {
+function flattenTranscript(messages: AgentMessage[]): string {
   const lines = messages.map(m => {
     const text = typeof m.content === 'string'
       ? m.content
@@ -989,6 +1043,7 @@ The registered object must implement these handlers to participate in the agent 
         taskId: callerTaskId,
         task,
         systemPrompt,
+        taskPrompt,
         initialMessages,
         config: taskConfig,
         responseSchema,
@@ -999,7 +1054,8 @@ The registered object must implement these handlers to participate in the agent 
         taskId?: string;
         task: string;
         systemPrompt?: string;
-        initialMessages?: { role: string; content: string | ContentPart[] }[];
+        taskPrompt?: string;
+        initialMessages?: AgentMessage[];
         config?: Partial<AgentConfig>;
         responseSchema?: Record<string, unknown>;
         goalId?: string;
@@ -1037,6 +1093,7 @@ The registered object must implement these handlers to participate in the agent 
         callerId,
         config,
         systemPrompt: prompt,
+        taskPrompt,
         initialMessages,
         responseSchema,
         goalId,
@@ -1089,6 +1146,7 @@ The registered object must implement these handlers to participate in the agent 
         task,
         taskId: callerTaskId,
         systemPrompt,
+        taskPrompt,
         initialMessages,
         config: taskConfig,
         responseSchema,
@@ -1101,7 +1159,8 @@ The registered object must implement these handlers to participate in the agent 
         task: string;
         taskId?: string;
         systemPrompt?: string;
-        initialMessages?: { role: string; content: string | ContentPart[] }[];
+        taskPrompt?: string;
+        initialMessages?: AgentMessage[];
         config?: Partial<AgentConfig>;
         responseSchema?: Record<string, unknown>;
         goalId?: string;
@@ -1125,6 +1184,7 @@ The registered object must implement these handlers to participate in the agent 
         taskId,
         task,
         systemPrompt,
+        taskPrompt,
         initialMessages,
         config: taskConfig,
         responseSchema,
@@ -1971,6 +2031,7 @@ The registered object must implement these handlers to participate in the agent 
       description: queued.task,
       callerId: queued.callerId,
       systemPrompt: queued.systemPrompt,
+      taskPrompt: queued.taskPrompt,
       initialMessages: queued.initialMessages,
       config: queued.config,
       responseSchema: queued.responseSchema,
@@ -2376,12 +2437,18 @@ The registered object must implement these handlers to participate in the agent 
             // Job calls agent directly (not through _act handler) to avoid
             // deadlocks — the agent's act callback may call other objects that
             // send messages back to AgentAbject (e.g. Chat → WebAgent → startTask).
-            const actionJson = JSON.stringify(task.action);
+            // The action travels as job CONTEXT, never interpolated into the
+            // code string. Inlining it made the model's own words part of a
+            // program: a script the agent wanted the browser to run got the
+            // whole job rejected because the sandbox's source scan found
+            // `fetch(` inside the payload, and any action text could reshape
+            // the code around it. As data it is inert.
             const actResult = await this.executeStep(
               entry,
               `[${agentName}] ${desc} (step ${task.step + 1})`,
-              `return await call('${entry.agentId}', 'agentAct', { taskId: '${task.id}', step: ${task.step}, action: ${actionJson}, batchRemaining: ${entry.pendingActions?.length ?? 0} })`,
+              `return await call('${entry.agentId}', 'agentAct', { taskId: '${task.id}', step: ${task.step}, action: __agentAction, batchRemaining: ${entry.pendingActions?.length ?? 0} })`,
               async () => this.actStep(entry),
+              { __agentAction: task.action },
             );
             task.lastResult = {
               success: actResult.success,
@@ -2616,6 +2683,7 @@ The registered object must implement these handlers to participate in the agent 
     description: string,
     jobCode: string,
     directFn: () => Promise<unknown>,
+    jobContext?: Record<string, unknown>,
   ): Promise<AgentActionResult> {
     if (entry.config.directExecution) {
       try {
@@ -2646,7 +2714,7 @@ The registered object must implement these handlers to participate in the agent 
       this.recover();
     }
 
-    return this.submitJob(entry, description, jobCode);
+    return this.submitJob(entry, description, jobCode, jobContext);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2657,6 +2725,7 @@ The registered object must implement these handlers to participate in the agent 
     entry: TaskEntry,
     description: string,
     code: string,
+    jobContext?: Record<string, unknown>,
   ): Promise<AgentActionResult> {
     try {
       // The OTA loop's job code is a fixed dispatch wrapper (call → agentObserve
@@ -2672,6 +2741,7 @@ The registered object must implement these handlers to participate in the agent 
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
         description,
         code: fullCode,
+        ...(jobContext ? { context: jobContext } : {}),
         ...(entry.config.queueName ? { queue: entry.config.queueName } : {}),
       });
       const jobResult = await this.request<JobResult>(submitMsg, entry.state.timeout);
@@ -2743,12 +2813,12 @@ The registered object must implement these handlers to participate in the agent 
     }
   }
 
-  private static conversationHasImages(messages: { role: string; content: string | ContentPart[] }[]): boolean {
+  private static conversationHasImages(messages: AgentMessage[]): boolean {
     return messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image'));
   }
 
   /** Replace image parts with a text note in place; returns how many were replaced. */
-  private static stripImageParts(messages: { role: string; content: string | ContentPart[] }[]): number {
+  private static stripImageParts(messages: AgentMessage[]): number {
     let replaced = 0;
     for (const m of messages) {
       if (typeof m.content === 'string') continue;
@@ -3024,27 +3094,40 @@ The registered object must implement these handlers to participate in the agent 
   // Conversation Management
   // ═══════════════════════════════════════════════════════════════════
 
-  private async initializeConversation(entry: TaskEntry): Promise<{ role: string; content: string | ContentPart[] }[]> {
-    const messages: { role: string; content: string | ContentPart[] }[] = [];
+  private async initializeConversation(entry: TaskEntry): Promise<AgentMessage[]> {
+    const messages: AgentMessage[] = [];
 
-    let prompt = entry.systemPrompt;
-    if (entry.skillPromptSuffix) {
-      prompt += entry.skillPromptSuffix;
-    }
+    // Blocks accumulate in reading order and are partitioned at the end:
+    // stable first as one cacheable prefix, volatile after the breakpoint.
+    // Adding a block is where the stable/volatile judgment gets made, so keep
+    // the classification next to the content it describes.
+    const blocks: PromptBlock[] = [];
+    const add = (key: string, content: string | undefined, stable: boolean): void => {
+      if (content) blocks.push({ key, content, stable });
+    };
+
+    add('agent', entry.systemPrompt, true);
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
-    prompt += '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.';
+    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
-    prompt += '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.';
+    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.', true);
+
+    // Per-task addendum from the caller (task hints, the browsing goal): the
+    // reason `systemPrompt` can stay identical across an agent's tasks.
+    add('task-prompt', entry.taskPrompt, false);
+    // Skill instructions belong to whichever skill this task runs, so they
+    // vary between tasks of the same agent.
+    add('skill', entry.skillPromptSuffix, false);
     if (entry.responseSchema) {
-      prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
+      add('response-schema', `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`, false);
     }
 
     // Inject goal + task progress and scratchpad into context
     if (entry.goalId && this.goalManagerId) {
-      prompt += await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId);
+      add('goal-progress', await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId), false);
     }
 
     // Inject relevant knowledge from KnowledgeBase in three passes:
@@ -3117,7 +3200,7 @@ The registered object must implement these handlers to participate in the agent 
           if (omitted > 0) {
             block += `(${omitted} more profile fact${omitted === 1 ? '' : 's'} exist — recall with tags: ["${PROFILE_TAG}"] when you need the full set.)\n`;
           }
-          prompt += block;
+          add('profile', block, false);
         }
 
         const patterns = (woven?.patterns ?? []).filter(e => e.id);
@@ -3131,7 +3214,7 @@ The registered object must implement these handlers to participate in the agent 
           for (const e of relevant) {
             kb += `- **${e.title}** (${e.type}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
-          prompt += kb;
+          add('knowledge', kb, false);
         }
 
         if (patterns.length > 0) {
@@ -3140,7 +3223,7 @@ The registered object must implement these handlers to participate in the agent 
             const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
             block += `\n### PATTERN: ${e.title}${via}\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
           }
-          prompt += block;
+          add('patterns', block, false);
         }
 
         // Record what was injected so the post-task reviewer can judge which
@@ -3156,7 +3239,7 @@ The registered object must implement these handlers to participate in the agent 
     // that drives them. Injected once here so every agent shares one baseline
     // instead of each prompt re-deriving (or omitting) it; per-agent prompts
     // add only their own specifics on top.
-    prompt += `\n\n## How this system works
+    add('system-primer', `\n\n## How this system works
 Everything here is an Abject: an autonomous object with a manifest (its declared methods and events), a mailbox, and message handlers. Abjects never call each other directly; they communicate only by passing messages, find each other through the Registry, and coordinate by subscribing to each other's change events. Nothing is a local library or an imported function: every read, write, or action is a message to some Abject, addressed by its durable registered name (or its AbjectId). You act through the actions in your vocabulary below, and the system turns each one into the right messages for you, so you never hand-write raw envelopes; \`submit_job\` additionally hands you \`call\`/\`dep\`/\`find\` to message objects directly for mechanical multi-step work.
 
 An Abject's capabilities are live, not a fixed list: the way to know what an object can do right now is to ask it (the ask protocol), and it answers from its current, real capabilities, which shift as skills, tools, and connections come and go. Prefer asking over assuming from a name or a remembered fact. Other parts of the system may ask you the same way; answer from what you can genuinely do this moment, and decline plainly when a request falls outside your role.
@@ -3168,10 +3251,10 @@ Every Abject has two kinds of handle:
 - Its **registered name** (e.g. "GraphViewer") and its **typeId** are DURABLE — they persist across restarts and always point at the live object.
 - Its **AbjectId** (a UUID like \`adac6cc1-...\`) is EPHEMERAL — objects are re-spawned with a fresh AbjectId every time they are restored on restart, so a UUID copied from an earlier goal, scratchpad, or saved memory is usually stale and resolves to nothing.
 
-Reference objects by their registered name wherever possible — name-based calls and lookups always reach the live object. When you write a goal, hand off a target, or save a fact about an object, use its name (and typeId if you have one), not its UUID.`;
+Reference objects by their registered name wherever possible — name-based calls and lookups always reach the live object. When you write a goal, hand off a target, or save a fact about an object, use its name (and typeId if you have one), not its UUID.`, true);
 
     // Always-present guidance on memory tools
-    prompt += `\n\n## Memory Tools
+    add('memory-tools', `\n\n## Memory Tools
 
 **remember** action (persistent across all goals and restarts):
 You can emit a remember action to save knowledge for future tasks:
@@ -3192,16 +3275,18 @@ After remembering, you will be prompted to continue with the task.
 \`\`\`json
 { "action": "recall", "query": "keywords to search" }
 \`\`\`
-Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact identifiers, \`{ "action": "recall", "id": "<entry id>" }\` to fetch one full entry, \`{ "action": "recall", "tags": ["profile"] }\` to list by tag. Keyword results are compact previews (id, title, snippet); refine your terms when results are thin, then fetch the full entries you will actually use by id. Recall when a task resembles previous work, when you are unsure of user preferences or conventions, and before re-deriving anything the system may already know.`;
+Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact identifiers, \`{ "action": "recall", "id": "<entry id>" }\` to fetch one full entry, \`{ "action": "recall", "tags": ["profile"] }\` to list by tag. Keyword results are compact previews (id, title, snippet); refine your terms when results are thin, then fetch the full entries you will actually use by id. Recall when a task resembles previous work, when you are unsure of user preferences or conventions, and before re-deriving anything the system may already know.`, true);
 
     if (entry.knownTagsLine) {
-      prompt += `\nTags currently in use (with entry counts) — reuse these when remembering, and filter by them when recalling: ${entry.knownTagsLine}`;
+      // Own separator: this used to hang off the end of the memory-tools
+      // block, and the partition now stands it on its own.
+      add('known-tags', `\n\nTags currently in use (with entry counts) — reuse these when remembering, and filter by them when recalling: ${entry.knownTagsLine}`, false);
     }
 
     // Guidance on the built-in submit_job verb. Safe to state for every
     // agent because the verb is handled by the runtime itself (like
     // `remember`), not by the agent's own action switch.
-    prompt += `\n\n## Mechanical pipelines (submit_job)
+    add('submit-job', `\n\n## Mechanical pipelines (submit_job)
 
 **submit_job** action (built-in, available alongside your other actions):
 \`\`\`json
@@ -3215,10 +3300,10 @@ Use it when your next chunk of work is a mechanical multi-step sequence with no 
 \`\`\`
 Keep the return value small — aggregate or summarize inside the job instead of returning raw bulk data (results are truncated past 20k chars). Use your regular actions when each step's outcome should change what you do next; use one job when it wouldn't. Your own domain actions (browsing, shell, drafting) stay as actions — the job sandbox has no browser, no shell, and no filesystem, only object messaging.
 
-Object names in job code must be EXACT registered object names as they appear in your context (goals, scratchpad, registry listings) — a skill, service, or server name is not an object name. When unsure a name exists, use \`find(name)\` and handle null instead of \`dep(name)\`, which fails the whole job. Anything you reach through a dedicated action of yours (like a tool-call action) has no object of that name on the bus; keep using your action for it.`;
+Object names in job code must be EXACT registered object names as they appear in your context (goals, scratchpad, registry listings) — a skill, service, or server name is not an object name. When unsure a name exists, use \`find(name)\` and handle null instead of \`dep(name)\`, which fails the whole job. Anything you reach through a dedicated action of yours (like a tool-call action) has no object of that name on the bus; keep using your action for it.`, true);
 
     if (entry.goalId) {
-      prompt += `
+      add('goal-context', `
 
 ## Goal context
 This task belongs to a goal whose id is \`${entry.goalId}\` — you never need to look it up, scan \`listGoals\`, or guess a goalId; use this one. GoalManager owns the goal and a scratchpad shared by every agent working on it. You reach GoalManager the same way you reach any object: through your normal action vocabulary (for most agents that is a \`call\` action targeting "GoalManager"; some agents also expose a dedicated scratchpad action). These are GoalManager METHODS — invoke them through your actions, they are not free-standing functions you call directly. Each takes the goalId above:
@@ -3228,12 +3313,32 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
 **Goal scratchpad** (shared with the other agents on this goal): write intermediate findings, specs, and errors here so collaborators can read them, and fulfill each of your task's declared \`produces\` keys by writing it to the scratchpad (\`writeGoalData\`). Read \`consumes\` data the same way (\`readGoalData\`). Prefer the scratchpad over \`remember\` for anything tied to the current task.
 
-**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (Calling GoalManager's \`completeGoal\` / \`failGoal\` / \`addTask\` yourself is only for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)`;
+**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (Calling GoalManager's \`completeGoal\` / \`failGoal\` / \`addTask\` yourself is only for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)`, false);
     }
 
-    if (prompt) {
-      messages.push({ role: 'system', content: prompt });
-    }
+    // Partition. The stable half is byte-identical across this agent's tasks,
+    // so it is sent as its own system message carrying the cache breakpoint;
+    // the volatile half follows as a second system message, outside the
+    // cached span. Providers without explicit breakpoints see two system
+    // messages in the same order and simply get a longer identical prefix.
+    const stable = blocks.filter(b => b.stable).map(b => b.content).join('');
+    const volatile = blocks.filter(b => !b.stable).map(b => b.content).join('');
+    entry.promptBlockKeys = blocks.map(b => `${b.key}${b.stable ? '' : '*'}`);
+
+    if (stable) messages.push({ role: 'system', content: stable, cacheBreakpoint: true });
+    if (volatile) messages.push({ role: 'system', content: volatile });
+    entry.systemMessageCount = messages.length;
+
+    // The cacheable prefix only earns its breakpoint above the provider's
+    // minimum (4096 tokens on Anthropic today, roughly 16k chars); below it
+    // the breakpoint is ignored and the prompt is re-read in full every task.
+    // Logging both halves makes that visible per agent instead of leaving it
+    // to be inferred from a bill.
+    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'unknown';
+    log.info(
+      `[${agentName}] prompt: ${stable.length} stable + ${volatile.length} volatile chars ` +
+      `(~${Math.round(stable.length / 4)} cacheable tokens) [${(entry.promptBlockKeys ?? []).join(' ')}]`,
+    );
 
     if (entry.initialMessages && entry.initialMessages.length > 0) {
       messages.push(...entry.initialMessages);
@@ -3375,7 +3480,13 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private async trimConversation(entry: TaskEntry): Promise<void> {
     const task = entry.state;
     const maxMsgs = entry.config.maxConversationMessages;
-    const pinnedCount = entry.config.pinnedMessageCount;
+    // pinnedMessageCount was written when the prompt was one system message,
+    // so it counts that message plus the opening turns. Splitting the prompt
+    // in two would otherwise silently cost one pinned turn: re-express it as
+    // "every system message, plus the same number of real turns as before".
+    const systemCount = entry.systemMessageCount ?? 1;
+    const pinnedTurns = Math.max(0, entry.config.pinnedMessageCount - 1);
+    const pinnedCount = systemCount + pinnedTurns;
 
     // 1. Count cap — cheap, always apply first.
     if (task.llmMessages.length > maxMsgs) {
