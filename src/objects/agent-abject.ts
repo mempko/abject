@@ -3202,7 +3202,7 @@ The registered object must implement these handlers to participate in the agent 
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
-    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.', true);
+    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
     add('large-payloads', `\n\n## Large results
@@ -3914,17 +3914,28 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * (so the user sees something) but marked as cut off rather than passed off
    * as a complete reply. Non-terminal actions are left to fail/observe normally.
    */
-  private handleTruncatedAction(entry: TaskEntry, parsed: AgentAction): AgentAction | null {
+  /**
+   * @param cutOff true when the stream really ended early; false when the
+   *   text arrived complete but its JSON had to be salvaged.
+   */
+  private handleTruncatedAction(entry: TaskEntry, parsed: AgentAction, cutOff = true): AgentAction | null {
     const terminal = entry.config.terminalActions[parsed.action];
     if (!terminal) return null;
 
     entry.truncationRetries = (entry.truncationRetries ?? 0) + 1;
     if (entry.truncationRetries <= AgentAbject.MAX_TRUNCATION_RETRIES) {
-      entry.state.llmMessages.push({
-        role: 'user',
-        content: `[Error] Your "${parsed.action}" response was cut off mid-generation (the output ended incompletely or hit the length limit). Re-emit the COMPLETE action as a single \`\`\`json block. If the content is long, make it more concise so it finishes within the limit rather than getting truncated again.`,
-      });
-      return { action: '_reparse', reasoning: `Retrying truncated "${parsed.action}" terminal (attempt ${entry.truncationRetries}/${AgentAbject.MAX_TRUNCATION_RETRIES})` };
+      // Name the actual fault. Telling a model that finished cleanly it was
+      // "cut off" and should be "more concise" asks it to shorten an answer
+      // that was the right length, when the real problem was a raw line
+      // break inside a JSON string.
+      const correction = cutOff
+        ? `[Error] Your "${parsed.action}" response was cut off mid-generation (the output ended incompletely or hit the length limit). Re-emit the COMPLETE action as a single \`\`\`json block. If the content is long, make it more concise so it finishes within the limit rather than getting truncated again.`
+        : `[Error] Your "${parsed.action}" response arrived complete but its JSON did not parse, so it had to be guessed at. The usual cause is a real line break inside a string: every newline in a string value must be written \\n. Re-emit the same content, same length, as one valid \`\`\`json block.`;
+      entry.state.llmMessages.push({ role: 'user', content: correction });
+      return {
+        action: '_reparse',
+        reasoning: `Retrying ${cutOff ? 'truncated' : 'malformed'} "${parsed.action}" terminal (attempt ${entry.truncationRetries}/${AgentAbject.MAX_TRUNCATION_RETRIES})`,
+      };
     }
 
     // Retries exhausted: ship the partial content rather than nothing, but mark
@@ -4040,7 +4051,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // partial with a visible marker) BEFORE the empty-content check, so a
       // half-message is never silently promoted to a successful reply.
       if (streamTruncated || repaired) {
-        const truncatedHandling = this.handleTruncatedAction(entry, parsed);
+        const truncatedHandling = this.handleTruncatedAction(entry, parsed, streamTruncated);
         if (truncatedHandling) return truncatedHandling;
       } else {
         entry.truncationRetries = 0;
@@ -4223,6 +4234,32 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     return objects;
   }
 
+  /**
+   * Escape raw control characters sitting inside JSON string literals.
+   *
+   * Writing markdown into a string field and pressing enter is the single
+   * most common way a well-formed answer becomes invalid JSON. Nothing is
+   * missing in that case, only mis-encoded, so this is a lossless rewrite
+   * rather than a salvage: the parse that follows either yields the exact
+   * content the model meant or fails and leaves the salvage paths to run.
+   */
+  private static escapeRawControlChars(raw: string): string {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for (const ch of raw) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === '\\') { out += ch; escaped = true; continue; }
+      if (ch === '"') { inString = !inString; out += ch; continue; }
+      if (inString && (ch === '\n' || ch === '\r' || ch === '\t')) {
+        out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : '\\t';
+        continue;
+      }
+      out += ch;
+    }
+    return out;
+  }
+
   private tryParseActionJson(raw: string): { action: AgentAction; repaired: boolean } | null {
     try {
       const parsed = JSON.parse(raw);
@@ -4230,6 +4267,20 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         return { action: parsed as AgentAction, repaired: false };
       }
     } catch {
+      // A raw newline inside a string costs nothing to fix and loses nothing,
+      // so try that before treating the response as damaged. Reported as NOT
+      // repaired: the content is complete and exact, and asking the model to
+      // send it again would only risk a shorter answer.
+      const escaped = AgentAbject.escapeRawControlChars(raw);
+      if (escaped !== raw) {
+        try {
+          const parsed = JSON.parse(escaped);
+          if (typeof parsed.action === 'string') {
+            return { action: parsed as AgentAction, repaired: false };
+          }
+        } catch { /* genuinely damaged; fall through to salvage */ }
+      }
+
       // Try repairing truncated JSON — these salvage paths mean the original
       // content was incomplete, which the caller treats as a truncation signal.
       const suffixes = ['"}', '"}]', '}}', '}'];
