@@ -117,6 +117,8 @@ import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js'
 import { CliServer } from './cli-server.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { MessageChannel, type MessagePort } from 'node:worker_threads';
@@ -480,8 +482,13 @@ async function main(): Promise<void> {
   // (kept current by the updateAuth interceptor above) and the same
   // SessionStore, so one login token works on both sockets. Main thread only
   // (owns live sockets), so it is deliberately absent from workerEligible.
+  // Held so shutdown can release the CLI port up front. Going through the
+  // runtime teardown to reach its onStop means a teardown that wedges leaves
+  // this socket bound, and a bound CLI port is what stops the NEXT `awaken`
+  // from starting at all.
+  let cliServer: CliServer | undefined;
   runtime.objectFactory.registerConstructor('CliServer',
-    () => new CliServer({ port: CLI_PORT, authConfig, sessions: sessionStore }));
+    () => (cliServer = new CliServer({ port: CLI_PORT, authConfig, sessions: sessionStore })));
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
   runtime.objectFactory.registerConstructor('Storage', (args?: unknown) => {
@@ -1041,13 +1048,25 @@ async function main(): Promise<void> {
 
   // Handle graceful shutdown
   let shuttingDown = false;
-  const shutdown = () => {
-    if (shuttingDown) return;
+  const shutdown = (signal: string) => {
+    // A second signal means the first one did not get us out. Leave now:
+    // swallowing it turns a wedged teardown into a process that survives
+    // every subsequent Ctrl-C, outlives its supervisor, and sits on the
+    // ports until someone hunts it down with SIGKILL.
+    if (shuttingDown) {
+      alog.warn(`${signal} received while already shutting down — exiting immediately`);
+      process.exit(1);
+    }
     shuttingDown = true;
-    alog.info('Shutting down...');
+    alog.info(`Shutting down (${signal})...`);
     sessionStore.destroy();
-    // Close WS server first to release the port, then clean up runtime
-    wsServer.close()
+    // Release every listening socket before the slow work. Whatever happens
+    // to the runtime teardown after this, the next `awaken` can bind.
+    const releasePorts = Promise.allSettled([
+      wsServer.close(),
+      cliServer ? cliServer.stop() : Promise.resolve(),
+    ]);
+    releasePorts
       .then(() => runtime.stop())
       .catch(() => {})
       .finally(() => process.exit(0));
@@ -1055,15 +1074,56 @@ async function main(): Promise<void> {
     setTimeout(() => process.exit(1), 3000);
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 process.on('unhandledRejection', (reason) => {
   alog.error('Unhandled rejection (server stayed up):', reason);
 });
 
+/**
+ * Name the process sitting on a port we needed.
+ *
+ * A bare EADDRINUSE stack says a port is taken but not by what, and the
+ * usual culprit is a previous server of our own that outlived its
+ * supervisor. Worse, such a process can be wedged past the point where it
+ * answers signals at all, so "just Ctrl-C it" is not always available and
+ * the reader needs a pid to SIGKILL. Best effort: `ss` may be missing, in
+ * which case the caller still gets the plain error.
+ */
+function describePortHolder(port: number): string | undefined {
+  try {
+    const out = execFileSync('ss', ['-lptnH'], { encoding: 'utf-8', timeout: 2000 });
+    const line = out.split('\n').find(l => l.includes(`:${port} `));
+    const pid = line?.match(/pid=(\d+)/)?.[1];
+    if (!pid) return undefined;
+    let cmd = '';
+    try {
+      cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ').trim().slice(0, 120);
+    } catch { /* process may have just exited */ }
+    return `port ${port} is held by pid ${pid}${cmd ? ` (${cmd})` : ''}. ` +
+      `If that is a stale server of ours, clear it with: kill -9 ${pid}`;
+  } catch {
+    return undefined;
+  }
+}
+
 main().catch((err) => {
+  // A spawn failure travels back over the bus as a plain Error rebuilt from
+  // the reply payload, so `code`/`port` do not survive the trip. Fall back to
+  // the message text, which does.
+  const text = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: string } | null)?.code;
+  if (code === 'EADDRINUSE' || text.includes('EADDRINUSE')) {
+    const port = (err as { port?: number }).port ?? Number(text.match(/:(\d+)\s*$/)?.[1]);
+    const detail = Number.isFinite(port) ? describePortHolder(port as number) : undefined;
+    alog.error(`Fatal startup error: ${detail ?? String(err)}`);
+    if (detail) {
+      alog.error('A previous server that lost its supervisor keeps its sockets bound until it is killed.');
+    }
+    process.exit(1);
+  }
   alog.error('Fatal startup error:', err);
   process.exit(1);
 });

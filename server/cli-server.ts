@@ -234,8 +234,12 @@ export class CliServer extends Abject {
     }
     this.clients.clear();
     if (this.wsServer) {
-      await this.wsServer.close();
+      // Drop the reference before awaiting: shutdown releases this port up
+      // front and the runtime teardown stops every object again afterwards,
+      // so a close that rejects must not leave a second attempt behind.
+      const server = this.wsServer;
       this.wsServer = null;
+      await server.close().catch(() => { /* already closed */ });
     }
   }
 
