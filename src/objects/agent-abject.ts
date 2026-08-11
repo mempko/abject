@@ -87,6 +87,26 @@ export interface AgentMessage {
  */
 export const LARGE_PAYLOAD_CHARS = 8000;
 
+/** What an agent's observe callback returns. */
+export interface ObserveReply {
+  observation: string;
+  llmContent?: ContentPart[];
+  /** LLM tier hint for the think step that follows. */
+  tier?: string;
+  /**
+   * Set when this observation is BULK — a scraped page, a fetched body —
+   * rather than a composed briefing. Only then may an oversized observation
+   * be held back and read in chunks.
+   *
+   * It is opt-in because size alone does not tell the two apart, and getting
+   * it wrong is expensive in the wrong direction: a long briefing is long
+   * because the agent needs all of it, and handing it over as something to
+   * search made one agent spend three LLM calls grepping its own briefing
+   * for the affordances it plans with.
+   */
+  chunkable?: boolean;
+}
+
 /**
  * A payload too large to put in the conversation whole, kept intact and
  * addressed by id.
@@ -302,6 +322,8 @@ interface TaskEntry {
    * through getTaskTranscript.
    */
   predictions?: PredictionRecord[];
+  /** Whether the last observe callback declared its observation as bulk. */
+  observationChunkable?: boolean;
   /** Oversized observations/results held whole, addressed by read_chunk. */
   payloads?: StoredPayload[];
   /** Monotonic counter behind payload ids, so an id is never reused. */
@@ -1594,8 +1616,8 @@ The registered object must implement these handlers to participate in the agent 
    * Returns the full result (observation + optional llmContent).
    * Used by directExecution mode; job mode calls the agent directly.
    */
-  private async observeStep(entry: TaskEntry): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
-    return this.request<{ observation: string; llmContent?: ContentPart[]; tier?: string }>(
+  private async observeStep(entry: TaskEntry): Promise<ObserveReply> {
+    return this.request<ObserveReply>(
       request(this.id, entry.agentId, 'agentObserve', {
         taskId: entry.state.id,
         step: entry.state.step,
@@ -2152,11 +2174,12 @@ The registered object must implement these handlers to participate in the agent 
               task.error = obsResult.error;
               break;
             }
-            const obsData = obsResult.data as { observation: string; llmContent?: ContentPart[]; tier?: string };
+            const obsData = obsResult.data as ObserveReply;
             task.observation = obsData.observation;
             if (obsData.llmContent) entry.lastObservationLlmContent = obsData.llmContent;
             else entry.lastObservationLlmContent = undefined;
             if (obsData.tier) entry.observeTier = obsData.tier;
+            entry.observationChunkable = obsData.chunkable === true;
 
 
             setPhase('thinking');
@@ -3448,10 +3471,17 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
     // If agent provided llmContent (e.g. screenshot), use it directly
     if (entry.lastObservationLlmContent) {
-      // Prepend step info to the first text part
+      // Prepend step info to the first text part, and hold that text back if
+      // the producer declared it bulk. This branch carried no cap at all, so
+      // a huge page snapshot rode into the prompt whole purely because a
+      // screenshot came with it.
       const content = entry.lastObservationLlmContent.map((part, i) => {
         if (i === 0 && part.type === 'text') {
-          return { ...part, text: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${part.text}` };
+          const body = entry.observationChunkable && part.text.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+            ? this.renderPayloadHandle(
+                this.storePayload(entry, part.text, 'observation'), part.text, 'observation')
+            : part.text;
+          return { ...part, text: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${body}` };
         }
         return part;
       });
@@ -3463,12 +3493,14 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return;
     }
 
-    // A fat observation (a scraped page, a Registry dump, a JSON body) is
-    // held whole and replaced by a handle rather than clipped: the agent is
-    // told how big it is, sees its shape and its head, and reads the rest on
-    // its own terms with read_chunk. truncateText remains the backstop for
-    // anything still oversized after that.
-    const observation = task.observation.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+    // An observation the producer declared as BULK (a scraped page, a fetched
+    // body) is held whole and replaced by a handle rather than clipped: the
+    // agent is told how big it is, sees its shape and its head, and reads the
+    // rest on its own terms with read_chunk. Everything else — above all a
+    // composed briefing, which is long precisely because the agent needs all
+    // of it — is delivered as it always was, with truncateText as backstop.
+    const observation = entry.observationChunkable
+      && task.observation.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
       ? this.renderPayloadHandle(
           this.storePayload(entry, task.observation, 'observation'),
           task.observation,

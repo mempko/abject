@@ -11,7 +11,7 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
-import type { AgentAction, AgentActionResult } from './agent-abject.js';
+import type { AgentAction, AgentActionResult, ObserveReply } from './agent-abject.js';
 import { LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
@@ -964,7 +964,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     }
   }
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
+  private async handleObserve(taskId: string): Promise<ObserveReply> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { observation: 'No page open.' };
 
@@ -1040,11 +1040,15 @@ Set keepPageOpen: false to explicitly close the page when done.
         extra.lastScreenshot = undefined;
       }
 
-      // Return with llmContent for vision support
+      // A page snapshot is bulk: it is the raw shape of whatever was loaded,
+      // and a long one is long because the page is big, not because the agent
+      // needs every line. Declaring it chunkable lets an oversized snapshot be
+      // held whole and searched instead of clipped mid-tree.
       if (extra.lastScreenshot) {
         return {
           observation,
           tier,
+          chunkable: true,
           llmContent: [
             { type: 'text' as const, text: `[Observation - Step]\n${observation}` },
             { type: 'image' as const, mediaType: 'image/png' as const, data: extra.lastScreenshot },
@@ -1052,7 +1056,7 @@ Set keepPageOpen: false to explicitly close the page when done.
         };
       }
 
-      return { observation, tier };
+      return { observation, tier, chunkable: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('Unknown page handle')) {
