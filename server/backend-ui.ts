@@ -2758,21 +2758,29 @@ IMPORTANT:
   private async handleCaptureScreenshot(
     objectId: AbjectId
   ): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    // The topmost non-degenerate surface is the one the user actually sees;
+    // insertion order would happily pick a stale or zero-size sibling.
     const objectSurfaces = Array.from(this.surfaces.values())
-      .filter(s => s.objectId === objectId);
+      .filter(s => s.objectId === objectId && s.rect.width > 0 && s.rect.height > 0)
+      .sort((a, b) => b.zIndex - a.zIndex);
     if (objectSurfaces.length === 0) return null;
     if (!this.hasReadyClient) return null;
 
-    const surface = objectSurfaces[0];
-    try {
-      return await this.requestFromFrontend<{ imageBase64: string; width: number; height: number }>({
-        type: 'captureSurfaceRequest',
-        requestId: this.nextRequestId(),
-        surfaceId: surface.surfaceId,
-      }, 15000);
-    } catch {
-      return null;
+    for (const surface of objectSurfaces) {
+      try {
+        const shot = await this.requestFromFrontend<{ imageBase64: string; width: number; height: number }>({
+          type: 'captureSurfaceRequest',
+          requestId: this.nextRequestId(),
+          surfaceId: surface.surfaceId,
+        }, 15000);
+        // The frontend replies with an empty imageBase64 when the compositor
+        // could not produce a crop — that is a failure, not a screenshot.
+        if (shot?.imageBase64) return shot;
+      } catch {
+        return null;
+      }
     }
+    return null;
   }
 
   private async handleCaptureDesktop(): Promise<{ imageBase64: string; width: number; height: number }> {

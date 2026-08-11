@@ -61,6 +61,8 @@ export interface AgentTaskState {
   nudgedSignatures?: string[];
   /** Step-budget extensions granted so far (progress-aware; capped at MAX_STEP_EXTENSIONS). */
   extensionsGranted?: number;
+  /** Reparse retries taken so far; the first FREE_REPARSE_STEPS of them do not consume step budget. */
+  reparseCount?: number;
 }
 
 export interface AgentTaskOptions {
@@ -2065,10 +2067,18 @@ The registered object must implement these handlers to participate in the agent 
             // _reparse: unparseable LLM output, correction message already pushed — loop back into thinking.
             // _reparse_abort: retries exhausted and no error terminal configured — fail hard.
             if (task.action.action === '_reparse') {
-              task.step++;
-              if (task.step >= task.maxSteps) {
-                await this.handleMaxStepsReached(entry, agentName, setPhase);
-                break;
+              // A reparse is the model failing to emit the action envelope,
+              // not the task making a move. Charging early ones against the
+              // step budget lets a chatty model exhaust the budget before the
+              // work is done; past the free allowance they cost steps again
+              // so a pathological responder still terminates.
+              task.reparseCount = (task.reparseCount ?? 0) + 1;
+              if (task.reparseCount > AgentAbject.FREE_REPARSE_STEPS) {
+                task.step++;
+                if (task.step >= task.maxSteps) {
+                  await this.handleMaxStepsReached(entry, agentName, setPhase);
+                  break;
+                }
               }
               setPhase('thinking');
               break;
@@ -2961,6 +2971,10 @@ The registered object must implement these handlers to participate in the agent 
     if (entry.skillPromptSuffix) {
       prompt += entry.skillPromptSuffix;
     }
+    // Chatty models narrate their plan as prose instead of emitting the action
+    // envelope; each such turn costs a reparse round-trip. Give every agent
+    // one clear place to put the narration.
+    prompt += '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.';
     if (entry.responseSchema) {
       prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
     }
@@ -3322,6 +3336,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
   /** Maximum consecutive unparseable LLM responses before we force a terminal fail. */
   private static readonly MAX_PARSE_FAILURES = 2;
+  /** Reparse retries per task that do not consume step budget (see the _reparse sentinel). */
+  private static readonly FREE_REPARSE_STEPS = 10;
   /** Maximum consecutive empty LLM responses before we force a terminal fail. */
   private static readonly MAX_EMPTY_RESPONSES = 3;
 

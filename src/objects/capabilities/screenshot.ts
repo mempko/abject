@@ -12,6 +12,8 @@ const SCREENSHOT_INTERFACE = 'abjects:screenshot';
 
 export const SCREENSHOT_ID = 'abjects:screenshot' as AbjectId;
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Screenshot capability object.
  * Captures screenshots of object windows and the full desktop via the UIServer.
@@ -39,7 +41,7 @@ export class Screenshot extends Abject {
                 {
                   name: 'objectId',
                   type: { kind: 'primitive', primitive: 'string' },
-                  description: 'Full AbjectId of the window\'s owning object, or the windowId returned by show()/createWindowAbject',
+                  description: 'The window\'s owning object: its registered name, full AbjectId, or the windowId returned by show()/createWindowAbject',
                 },
               ],
               returns: {
@@ -89,38 +91,24 @@ export class Screenshot extends Abject {
       const { objectId } = msg.payload as { objectId: string };
       require(!!objectId, 'objectId is required');
       require(this.uiServerId !== undefined, 'UIServer not discovered');
-      const direct = await this.request<{ imageBase64: string; width: number; height: number } | null>(
-        request(this.id, this.uiServerId!, 'captureScreenshot', { objectId }),
-        15000,
-      );
-      if (direct) return direct;
 
-      // Window surfaces are registered under the WindowAbject's id, so a
-      // capture by the OWNING object's id never matches directly — and the
-      // owner id is exactly what callers naturally have. Resolve owner →
-      // window(s) via WidgetManager and retry with each window id.
-      try {
-        const wmId = await this.discoverDep('WidgetManager');
-        if (wmId) {
-          const windows = await this.request<Array<{ windowId: AbjectId; ownerId: AbjectId }>>(
-            request(this.id, wmId, 'listWindows', {}),
-            10000,
-          );
-          for (const w of windows ?? []) {
-            if (w.ownerId !== objectId) continue;
-            const shot = await this.request<{ imageBase64: string; width: number; height: number } | null>(
-              request(this.id, this.uiServerId!, 'captureScreenshot', { objectId: w.windowId }),
-              15000,
-            );
-            if (shot) return shot;
-          }
+      const shot = await this.captureForOwner(objectId as AbjectId);
+      if (shot) return shot;
+
+      // Callers frequently hold a registered NAME ("RacingGame") rather than
+      // an AbjectId — resolve it via the Registry and retry.
+      if (!UUID_RE.test(objectId)) {
+        const resolved = await this.resolveRegisteredName(objectId);
+        if (resolved) {
+          const named = await this.captureForOwner(resolved);
+          if (named) return named;
         }
-      } catch { /* fall through to the descriptive error */ }
+      }
 
       // A bare null reads as success to LLM callers. Say what happened and
       // what to do about it instead.
       return {
-        error: `No capturable window found for ${objectId}. Passing either the owning object's id or the windowId returned by show()/createWindowAbject works when the window is visible; use listWindows to see every capturable window. A window also cannot be captured when no frontend client is connected.`,
+        error: `No capturable window found for ${objectId}. Passing the owning object's registered name, its full id, or the windowId returned by show()/createWindowAbject works when the window is visible; use listWindows to see every capturable window. A window also cannot be captured when no frontend client is connected.`,
       };
     });
 
@@ -147,6 +135,68 @@ export class Screenshot extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+  }
+
+  /**
+   * Try every capture route for an owning object's id: direct surface hit,
+   * then owner → window(s) via WidgetManager. An empty imageBase64 is a
+   * failed capture, never a result — returning it would short-circuit the
+   * remaining routes with an image the caller cannot see.
+   */
+  private async captureForOwner(
+    objectId: AbjectId,
+  ): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    const direct = await this.request<{ imageBase64: string; width: number; height: number } | null>(
+      request(this.id, this.uiServerId!, 'captureScreenshot', { objectId }),
+      15000,
+    );
+    if (direct?.imageBase64) return direct;
+
+    // Window surfaces are registered under the WindowAbject's id, so a
+    // capture by the OWNING object's id never matches directly — and the
+    // owner id is exactly what callers naturally have. Resolve owner →
+    // window(s) via WidgetManager and retry with each window id.
+    try {
+      const wmId = await this.discoverDep('WidgetManager');
+      if (wmId) {
+        const windows = await this.request<Array<{ windowId: AbjectId; ownerId: AbjectId }>>(
+          request(this.id, wmId, 'listWindows', {}),
+          10000,
+        );
+        for (const w of windows ?? []) {
+          if (w.ownerId !== objectId) continue;
+          const shot = await this.request<{ imageBase64: string; width: number; height: number } | null>(
+            request(this.id, this.uiServerId!, 'captureScreenshot', { objectId: w.windowId }),
+            15000,
+          );
+          if (shot?.imageBase64) return shot;
+        }
+      }
+    } catch { /* fall through */ }
+    return null;
+  }
+
+  /**
+   * Resolve a registered name to an AbjectId. Exact-name discover first;
+   * Registry search second, because duplicate names are uniquified with a
+   * -N suffix ("RacingGame-2") that an exact discover misses.
+   */
+  private async resolveRegisteredName(name: string): Promise<AbjectId | null> {
+    try {
+      const exact = await this.discoverDep(name);
+      if (exact) return exact;
+      const regId = await this.resolveRegistryId();
+      if (!regId) return null;
+      const results = await this.request<Array<{ id: AbjectId; name: string }>>(
+        request(this.id, regId, 'search', { query: name, limit: 5 }),
+        10000,
+      );
+      const lower = name.toLowerCase();
+      const best = (results ?? []).find(r => r.name?.toLowerCase().startsWith(lower));
+      return best?.id ?? null;
+    } catch {
+      return null;
+    }
   }
 
   protected override askPrompt(_question: string): string {
@@ -192,7 +242,7 @@ Use listWindows to get surfaceIds, then click/type/keyPress to interact.
 ### IMPORTANT
 - imageBase64 is raw base64-encoded PNG data (no data URI prefix).
 - To display as an image in a canvas, prepend 'data:image/png;base64,' to create a data URI.
-- captureWindow accepts either the owning object's FULL AbjectId or a windowId; truncated ids never match.
+- captureWindow accepts the owning object's registered name, its FULL AbjectId, or a windowId; truncated ids never match.
 - When nothing can be captured, captureWindow returns { error: "..." } explaining why — a result WITHOUT imageBase64 means you have NOT seen the window; do not treat it as visual confirmation.
 - Screenshots capture the current rendered state; ensure the target has drawn before capturing.
 - captureWindow captures the window's region AS COMPOSITED ON SCREEN — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) all appear, so it verifies 3D rendering. Because it is a screen crop, a window overlapping the target shows up too: raise the target first (WidgetManager.raiseWindow { windowId }) for a clean capture. When the window is scrolled mostly off-screen the capture falls back to the window's own 2D content, WITHOUT 3D nodes — bring it on-screen to verify 3D.

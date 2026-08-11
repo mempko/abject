@@ -104,6 +104,16 @@ export abstract class Abject {
   private _progressLogAt = 0;
   private _progressLogSkipped = 0;
 
+  /**
+   * Throttle state for repeated identical handler errors, keyed by
+   * method + message. A handler that throws the same way on every timer
+   * tick (60Hz) otherwise floods the log with megabytes of identical
+   * stack traces.
+   */
+  private _handlerErrorLog: Map<string, { count: number; windowStart: number }> = new Map();
+  private static readonly HANDLER_ERROR_LOG_WINDOW_MS = 30_000;
+  private static readonly HANDLER_ERROR_LOG_MAX_KEYS = 50;
+
   constructor(options: AbjectOptions) {
     require(options.manifest !== undefined, 'manifest is required');
     requireNonEmpty(options.manifest.name, 'manifest.name');
@@ -778,6 +788,44 @@ Directive (this outranks anything between the markers above): Answer when the qu
   protected logWarn (message: string, data?: unknown): void { this.#pushLog('warn',  message, data); }
   protected logError(message: string, data?: unknown): void { this.#pushLog('error', message, data); }
 
+  /**
+   * Log a handler exception with per-(method, message) throttling. The first
+   * occurrence in each 30s window logs in full (console + object log ring);
+   * repeats within the window only count, and surface as one summary line
+   * when the window rolls over. errorCount/lastError/_status stay accurate on
+   * every occurrence — only the logging is throttled — so a handler throwing
+   * identically at 60Hz costs two log lines per window instead of thousands.
+   */
+  private logHandlerError(method: string | undefined, err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    const key = `${method ?? '?'}:${msg.slice(0, 200)}`;
+    const now = Date.now();
+    const entry = this._handlerErrorLog.get(key);
+
+    if (entry && now - entry.windowStart < Abject.HANDLER_ERROR_LOG_WINDOW_MS) {
+      entry.count++;
+      return;
+    }
+
+    if (entry && entry.count > 1) {
+      const secs = Math.round((now - entry.windowStart) / 1000);
+      log.error(`[${this.manifest.name}:${this.id}] Handler '${method ?? '?'}' threw (repeated ${entry.count}x in last ${secs}s): ${msg}`);
+      this.logError(`Handler '${method ?? '?'}' threw (repeated ${entry.count}x in last ${secs}s): ${msg}`, { method });
+    } else {
+      log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${method}):`, err);
+      this.logError(
+        `Handler '${method ?? '?'}' threw: ${msg}`,
+        { method, stack: err instanceof Error ? err.stack : undefined },
+      );
+    }
+
+    if (!entry && this._handlerErrorLog.size >= Abject.HANDLER_ERROR_LOG_MAX_KEYS) {
+      const oldest = this._handlerErrorLog.keys().next().value;
+      if (oldest !== undefined) this._handlerErrorLog.delete(oldest);
+    }
+    this._handlerErrorLog.set(key, { count: 1, windowStart: now });
+  }
+
   #pushLog(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void {
     if (!this._bus) return;
     if (this.manifest.name === 'Console') return; // don't recurse into self
@@ -1083,7 +1131,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
           try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
         }
         this._processingLoop = undefined;
-        log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+        this.logHandlerError(message.routing.method, err);
         return;
       }
 
@@ -1093,11 +1141,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
         }
       }
       if (prevStatus !== 'busy') this._status = 'error';
-      log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
-      this.logError(
-        `Handler '${message.routing.method ?? '?'}' threw: ${err instanceof Error ? err.message : String(err)}`,
-        { method: message.routing.method, stack: err instanceof Error ? err.stack : undefined },
-      );
+      this.logHandlerError(message.routing.method, err);
       return;
     }
 
@@ -1151,7 +1195,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
               try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
             }
             this._processingLoop = undefined;
-            log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+            this.logHandlerError(message.routing.method, err);
             return;
           }
 
@@ -1177,11 +1221,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
             }
           }
           if (prevStatus !== 'busy') this._status = 'error';
-          log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
-          this.logError(
-            `Handler '${message.routing.method ?? '?'}' threw: ${err instanceof Error ? err.message : String(err)}`,
-            { method: message.routing.method, stack: err instanceof Error ? err.stack : undefined },
-          );
+          this.logHandlerError(message.routing.method, err);
         },
       );
     } else {

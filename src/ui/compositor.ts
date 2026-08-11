@@ -682,15 +682,52 @@ export class Compositor {
 
   /**
    * Crop the surface's projected screen region out of a freshly rendered GL
-   * frame. Returns null when the crop would mislead — window mostly
-   * off-screen, filtered by workspace, mobile layout — so the caller can fall
-   * back to the 2D surface canvas.
+   * frame. Returns null when no faithful crop is possible — workspace
+   * filtered, mobile layout, GL context lost — so the caller can fall back
+   * to the 2D surface canvas.
+   *
+   * The capture frame is rendered with the surface centered in the viewport
+   * (when it is mostly off-screen) and raised above its siblings, so an
+   * off-screen or occluded window still yields a clean image. Scroll and
+   * z-order are restored and re-rendered before returning; both renders
+   * happen in this task, so only the restored frame is ever presented.
    */
   private async captureSurfaceFromFrame(surface: Surface): Promise<{ imageBase64: string; width: number; height: number } | null> {
     if (this.renderer.isContextLost || this.mobileMode) return null;
     if (!surface.visible || this.isWorkspaceFiltered(surface)) return null;
 
+    // Mutate → render → crop → restore all happens synchronously: the first
+    // await comes only after state is restored, so the capture layout is
+    // never presented to the user.
+    const savedScrollX = this.scrollX;
+    const savedScrollY = this.scrollY;
+    const savedZ = surface.zIndex;
+    let out: OffscreenCanvas | null = null;
+    let cropW = 0;
+    let cropH = 0;
     try {
+      // Center the surface when the viewport shows less than ~90% of it.
+      const { x, y, width, height } = surface.rect;
+      const ovW = Math.min(x + width, this.scrollX + this.width) - Math.max(x, this.scrollX);
+      const ovH = Math.min(y + height, this.scrollY + this.height) - Math.max(y, this.scrollY);
+      const shownFrac = (Math.max(0, ovW) * Math.max(0, ovH)) / Math.max(1, width * height);
+      if (shownFrac < 0.9) {
+        this.scrollTo(
+          Math.round(x + width / 2 - this.width / 2),
+          Math.round(y + height / 2 - this.height / 2),
+        );
+        this.clampScroll();
+      }
+
+      // Raise above every sibling so an overlapping window can't bleed into
+      // the crop. Overlay-tier surfaces (zIndex >= 999) stay above.
+      let maxZ = surface.zIndex;
+      for (const s of this.surfaces.values()) {
+        if (s !== surface && s.zIndex < 999 && s.zIndex > maxZ) maxZ = s.zIndex;
+      }
+      surface.zIndex = maxZ + 1;
+      this.sortSurfaces();
+
       // The GL drawing buffer is invalidated after compositing, so render
       // synchronously and read back in the same task (same as captureDesktop).
       this.render();
@@ -698,7 +735,6 @@ export class Compositor {
       // Project the rect's corners (z=0 content plane) to screen px. Slab
       // tilt/lift and popped-out (occlude:false) nodes reach past the flat
       // rect; the pad absorbs the usual amount.
-      const { x, y, width, height } = surface.rect;
       const corners: Array<[number, number]> = [[x, y], [x + width, y], [x, y + height], [x + width, y + height]];
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (const [cx, cy] of corners) {
@@ -713,25 +749,34 @@ export class Compositor {
 
       const cropX = Math.max(0, minX);
       const cropY = Math.max(0, minY);
-      const cropW = Math.min(this.width, maxX) - cropX;
-      const cropH = Math.min(this.height, maxY) - cropY;
-      if (cropW < 8 || cropH < 8) return null;
-      // A mostly off-screen window would capture mostly backdrop — mislead.
-      const visibleFrac = (cropW * cropH) / Math.max(1, (maxX - minX) * (maxY - minY));
-      if (visibleFrac < 0.5) return null;
+      cropW = Math.min(this.width, maxX) - cropX;
+      cropH = Math.min(this.height, maxY) - cropY;
+      if (cropW >= 8 && cropH >= 8) {
+        const dpr = this.canvas.width / Math.max(1, this.width);
+        const outW = Math.max(1, Math.round(cropW * dpr));
+        const outH = Math.max(1, Math.round(cropH * dpr));
+        const candidate = new OffscreenCanvas(outW, outH);
+        const ctx = candidate.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(
+            this.canvas,
+            cropX * dpr, cropY * dpr, cropW * dpr, cropH * dpr,
+            0, 0, outW, outH,
+          );
+          out = candidate;
+        }
+      }
+    } catch {
+      out = null;
+    } finally {
+      surface.zIndex = savedZ;
+      this.sortSurfaces();
+      this.scrollTo(savedScrollX, savedScrollY);
+      try { this.render(); } catch { /* rAF loop repaints */ }
+    }
+    if (!out) return null;
 
-      const dpr = this.canvas.width / Math.max(1, this.width);
-      const outW = Math.max(1, Math.round(cropW * dpr));
-      const outH = Math.max(1, Math.round(cropH * dpr));
-      const out = new OffscreenCanvas(outW, outH);
-      const ctx = out.getContext('2d');
-      if (!ctx) return null;
-      ctx.drawImage(
-        this.canvas,
-        cropX * dpr, cropY * dpr, cropW * dpr, cropH * dpr,
-        0, 0, outW, outH,
-      );
-
+    try {
       const blob = await out.convertToBlob({ type: 'image/png' });
       const buffer = await blob.arrayBuffer();
       const bytes = new Uint8Array(buffer);
