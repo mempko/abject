@@ -62,6 +62,24 @@ export interface AgentMessage {
 }
 
 /**
+ * A payload too large to put in the conversation whole, kept intact and
+ * addressed by id.
+ *
+ * The alternative was clipping it, which loses the middle silently: the
+ * agent cannot tell that anything is missing, cannot get it back, and
+ * reasons over an amputated copy as though it were the whole thing. Holding
+ * it and handing over a handle keeps the agent in charge of how much it
+ * reads and in what order.
+ */
+interface StoredPayload {
+  id: string;
+  text: string;
+  /** Where it came from, for the handle's wording ('observation' | 'result'). */
+  kind: string;
+  storedAt: number;
+}
+
+/**
  * One named piece of a system prompt, classified by whether it survives
  * unchanged from one task to the next.
  *
@@ -258,6 +276,10 @@ interface TaskEntry {
    * through getTaskTranscript.
    */
   predictions?: PredictionRecord[];
+  /** Oversized observations/results held whole, addressed by read_chunk. */
+  payloads?: StoredPayload[];
+  /** Monotonic counter behind payload ids, so an id is never reused. */
+  payloadSeq?: number;
   /**
    * Set when the state machine has actually exited. Cancellation flips
    * state.phase to 'error' while the loop may still be parked in an await,
@@ -2321,6 +2343,22 @@ The registered object must implement these handlers to participate in the agent 
               break; // re-enter thinking
             }
 
+            // ── read_chunk: read more of a payload held back as a handle.
+            // A runtime verb like `recall`: every agent gets it, and it costs
+            // a step but no LLM round trip beyond the next think.
+            if (task.action.action === 'read_chunk') {
+              const rendered = this.readChunk(entry, task.action);
+              task.llmMessages.push({ role: 'user', content: `[Chunk] ${rendered}` });
+              task.observation = undefined;
+              task.lastResult = undefined;
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              break; // re-enter thinking
+            }
+
             // ── submit_job: run a mechanical pipeline through JobManager,
             // continue thinking with the result. A runtime-level verb (like
             // `remember`): every agent has it without implementing anything,
@@ -3113,6 +3151,19 @@ The registered object must implement these handlers to participate in the agent 
     add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
+    add('large-payloads', `\n\n## Large results
+
+When an observation or a result is too big to sit in the conversation, you get a handle instead of the text: its size, its shape, and its first couple of thousand characters. **Nothing is discarded** — the whole thing is held, and you decide what to read.
+
+\`\`\`json
+{ "action": "read_chunk", "id": "obs-3", "grep": "temperature" }
+{ "action": "read_chunk", "id": "obs-3", "outline": true }
+{ "action": "read_chunk", "id": "obs-3", "offset": 2000, "length": 4000 }
+\`\`\`
+
+Reach for \`grep\` first: a big payload is usually many similar records and you want one of them, so searching for the field or value you care about beats paging from the start. \`outline\` shows the structure when you are not yet sure what to search for. Use \`offset\`/\`length\` when order matters and you mean to read through.
+
+The preview often answers the question on its own — when it does, just act. Read further only when what you need is genuinely not in front of you, and say in your reasoning what you are looking for.`, true);
     add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
@@ -3381,17 +3432,195 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return;
     }
 
-    // Cap at ingestion — a single fat observation (a Registry dump, a
-    // scraped page, a scratchpad readback) must never ride into the prompt
-    // whole. Action results get the same treatment in
-    // addActionResultToConversation; the budget enforcer in trimConversation
-    // is the backstop for everything else.
-    const observation = truncateText(task.observation, AgentAbject.MAX_OBSERVATION_CHARS);
+    // A fat observation (a scraped page, a Registry dump, a JSON body) is
+    // held whole and replaced by a handle rather than clipped: the agent is
+    // told how big it is, sees its shape and its head, and reads the rest on
+    // its own terms with read_chunk. truncateText remains the backstop for
+    // anything still oversized after that.
+    const observation = task.observation.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+      ? this.renderPayloadHandle(
+          this.storePayload(entry, task.observation, 'observation'),
+          task.observation,
+          'observation',
+        )
+      : truncateText(task.observation, AgentAbject.MAX_OBSERVATION_CHARS);
 
     task.llmMessages.push({
       role: 'user',
       content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${observation}`,
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Large payloads: held whole, read in chunks
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Above this, a payload is stored and summarized instead of pasted in. */
+  private static readonly PAYLOAD_HANDLE_THRESHOLD = 8000;
+  /** How much of a stored payload rides along with the handle for free. */
+  private static readonly PAYLOAD_PREVIEW_CHARS = 2000;
+  /** Payloads kept per task; the oldest is dropped past this. */
+  private static readonly MAX_STORED_PAYLOADS = 5;
+  /** Largest slice one read_chunk may return. */
+  private static readonly MAX_CHUNK_CHARS = 8000;
+  /** Matches returned by a single grep, and the context kept around each. */
+  private static readonly MAX_GREP_MATCHES = 10;
+  private static readonly GREP_CONTEXT_CHARS = 300;
+
+  /** Keep a payload whole and return its id. */
+  private storePayload(entry: TaskEntry, text: string, kind: string): string {
+    const seq = (entry.payloadSeq = (entry.payloadSeq ?? 0) + 1);
+    const id = `${kind === 'observation' ? 'obs' : 'res'}-${seq}`;
+    (entry.payloads ??= []).push({ id, text, kind, storedAt: Date.now() });
+    // Bounded: a task that pulls down five big pages should not carry all of
+    // them for the rest of its life. Oldest goes first; the agent still has
+    // whatever it copied out of them.
+    while (entry.payloads.length > AgentAbject.MAX_STORED_PAYLOADS) entry.payloads.shift();
+    return id;
+  }
+
+  /**
+   * Describe a payload's SHAPE rather than its first N bytes.
+   *
+   * A JSON body's opening characters are almost never the interesting part:
+   * 156 near-identical forecast periods all start the same way. Top-level
+   * keys, array lengths and one representative element answer "what is in
+   * here, and how do I get at it" in a fraction of the space, and often
+   * answer the question outright.
+   */
+  private static outlinePayload(text: string): string | undefined {
+    const trimmed = text.trimStart();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+      // Markdown-ish: the headings are the outline.
+      const headings = text.split('\n').filter(l => /^#{1,6}\s/.test(l)).slice(0, 40);
+      return headings.length > 0 ? `Headings:\n${headings.join('\n')}` : undefined;
+    }
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      const describe = (v: unknown, depth: number): string => {
+        const pad = '  '.repeat(depth + 1);
+        if (Array.isArray(v)) {
+          const inner = v.length > 0 ? describe(v[0], depth) : 'empty';
+          return `array(${v.length}) of ${inner}`;
+        }
+        if (v && typeof v === 'object') {
+          const keys = Object.keys(v as object);
+          if (depth >= 2) return `object{${keys.slice(0, 12).join(', ')}${keys.length > 12 ? ', …' : ''}}`;
+          return `object{\n${keys.slice(0, 25).map(k =>
+            `${pad}${k}: ${describe((v as Record<string, unknown>)[k], depth + 1)}`).join('\n')}${keys.length > 25 ? `\n${pad}…` : ''}\n${'  '.repeat(depth)}}`;
+        }
+        if (typeof v === 'string') return v.length > 60 ? `string(${v.length} chars)` : JSON.stringify(v);
+        return String(v);
+      };
+      let out = `JSON shape:\n${describe(parsed, 0)}`;
+      // One real record beats any amount of shape description. The array
+      // worth showing is the biggest one holding records, not the first one
+      // encountered: a JSON-LD @context or a coordinate pair sits earlier in
+      // most payloads and teaches nothing about the data underneath.
+      const sample = AgentAbject.largestRecordArray(parsed);
+      if (sample && sample.length > 0) {
+        out += `\n\nFirst of the ${sample.length} items in the largest array:\n${JSON.stringify(sample[0]).slice(0, 600)}`;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The array most likely to BE the data: the longest one whose elements are
+   * objects, falling back to the longest array of anything.
+   */
+  private static largestRecordArray(v: unknown, depth = 0): unknown[] | undefined {
+    if (depth > 5) return undefined;
+    let best: unknown[] | undefined;
+    const better = (candidate: unknown[]): boolean => {
+      if (!best) return true;
+      const candidateHasRecords = typeof candidate[0] === 'object' && candidate[0] !== null;
+      const bestHasRecords = typeof best[0] === 'object' && best[0] !== null;
+      if (candidateHasRecords !== bestHasRecords) return candidateHasRecords;
+      return candidate.length > best.length;
+    };
+    const visit = (node: unknown, d: number): void => {
+      if (d > 5 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        if (node.length > 0 && better(node)) best = node;
+        // Elements may themselves hold the real records.
+        if (node.length > 0) visit(node[0], d + 1);
+        return;
+      }
+      for (const inner of Object.values(node as Record<string, unknown>)) visit(inner, d + 1);
+    };
+    visit(v, depth);
+    return best;
+  }
+
+  /**
+   * The text that replaces an oversized payload: how big it is, how to reach
+   * the rest, its shape, and a free head slice so a small question still
+   * resolves in one step.
+   */
+  private renderPayloadHandle(id: string, text: string, kind: string): string {
+    const outline = AgentAbject.outlinePayload(text);
+    const preview = text.slice(0, AgentAbject.PAYLOAD_PREVIEW_CHARS);
+    return (
+      `[Large ${kind}: ${text.length.toLocaleString()} chars, held whole as "${id}". ` +
+      `Nothing has been discarded. Read more with read_chunk: ` +
+      `{"action":"read_chunk","id":"${id}","grep":"<text>"} to jump to what you need, ` +
+      `or {"action":"read_chunk","id":"${id}","offset":${AgentAbject.PAYLOAD_PREVIEW_CHARS},"length":4000} to continue.]\n` +
+      (outline ? `\n${outline}\n` : '') +
+      `\nFirst ${Math.min(preview.length, AgentAbject.PAYLOAD_PREVIEW_CHARS).toLocaleString()} chars:\n${preview}`
+    );
+  }
+
+  /** Serve one read_chunk request against a stored payload. */
+  private readChunk(entry: TaskEntry, action: AgentAction): string {
+    const id = typeof action.id === 'string' ? action.id : undefined;
+    const stored = (entry.payloads ?? []).find(p => p.id === id);
+    if (!stored) {
+      const have = (entry.payloads ?? []).map(p => `${p.id} (${p.text.length} chars)`).join(', ');
+      return id
+        ? `No payload "${id}". Available: ${have || '(none)'}.`
+        : `read_chunk needs an "id". Available: ${have || '(none)'}.`;
+    }
+    const text = stored.text;
+
+    if (action.outline === true) {
+      return AgentAbject.outlinePayload(text) ?? `No structure detected in ${stored.id}; read it with offset/length.`;
+    }
+
+    const grep = typeof action.grep === 'string' ? action.grep : undefined;
+    if (grep) {
+      let re: RegExp;
+      try {
+        re = new RegExp(grep, 'gi');
+      } catch {
+        re = new RegExp(grep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      }
+      const hits: string[] = [];
+      for (const m of text.matchAll(re)) {
+        if (hits.length >= AgentAbject.MAX_GREP_MATCHES) break;
+        const at = m.index ?? 0;
+        const from = Math.max(0, at - AgentAbject.GREP_CONTEXT_CHARS);
+        const to = Math.min(text.length, at + AgentAbject.GREP_CONTEXT_CHARS);
+        hits.push(`@${at}: …${text.slice(from, to)}…`);
+      }
+      if (hits.length === 0) return `No match for "${grep}" in ${stored.id} (${text.length} chars). Try a different term, or "outline": true to see its shape.`;
+      const total = [...text.matchAll(re)].length;
+      return `${hits.length} of ${total} match(es) for "${grep}" in ${stored.id}:\n\n${hits.join('\n\n')}` +
+        (total > hits.length ? `\n\n(${total - hits.length} further matches; narrow the term or read around an offset.)` : '');
+    }
+
+    const offset = Math.max(0, typeof action.offset === 'number' ? action.offset : 0);
+    const length = Math.min(
+      typeof action.length === 'number' ? action.length : AgentAbject.MAX_CHUNK_CHARS,
+      AgentAbject.MAX_CHUNK_CHARS,
+    );
+    if (offset >= text.length) return `Offset ${offset} is past the end of ${stored.id} (${text.length} chars).`;
+    const slice = text.slice(offset, offset + length);
+    const end = offset + slice.length;
+    return `${stored.id} [${offset}..${end} of ${text.length}]:\n${slice}` +
+      (end < text.length ? `\n\n(${text.length - end} chars remain; continue at offset ${end}.)` : '\n\n(End of payload.)');
   }
 
   /** Longest stated expectation carried into the ledger and the result block. */
@@ -3432,7 +3661,11 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const action = task.action;
     let resultStr: string;
     if (task.lastResult.success) {
-      resultStr = `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? 'ok'}`;
+      const body = JSON.stringify(task.lastResult.data) ?? 'ok';
+      resultStr = body.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+        ? `Action "${action?.action}" succeeded.\n${this.renderPayloadHandle(
+            this.storePayload(entry, body, 'result'), body, 'result')}`
+        : `Action "${action?.action}" succeeded: ${body}`;
     } else {
       // On failure, include any partial `data` alongside the error. Callers
       // like Chat's `goal` action attach scratchpad/successful sub-task
