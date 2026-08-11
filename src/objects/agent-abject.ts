@@ -33,6 +33,13 @@ export type AgentPhase = 'idle' | 'observing' | 'thinking' | 'acting' | 'done' |
 export interface AgentAction {
   action: string;
   reasoning?: string;
+  /**
+   * One line stating the observable outcome the agent expects this action to
+   * produce, written BEFORE the action runs. Optional and never enforced: it
+   * exists so the agent commits to a claim the result can contradict, which
+   * turns each step into a check on the agent's model of the system.
+   */
+  expect?: string;
   [key: string]: unknown;
 }
 
@@ -40,6 +47,28 @@ export interface AgentActionResult {
   success: boolean;
   data?: unknown;
   error?: string;
+}
+
+/**
+ * One stated prediction paired with what actually happened. Collected per task
+ * and handed to the post-task reviewer, which mines the divergences: a step
+ * where the agent's expectation and reality parted is where its model of the
+ * system was wrong, and that is exactly the durable lesson worth keeping.
+ *
+ * `missed` is set only where the framework can PROVE the prediction failed
+ * (the agent predicted an outcome and the action errored). Semantic agreement
+ * between a natural-language expectation and a result payload is left to the
+ * reviewer, which reads both.
+ */
+export interface PredictionRecord {
+  step: number;
+  action: string;
+  expect: string;
+  outcome: 'success' | 'failure';
+  /** True when the action failed, which contradicts any expectation of it working. */
+  missed?: boolean;
+  /** Short rendering of the actual result, so the reviewer sees both sides. */
+  actual?: string;
 }
 
 export interface AgentTaskState {
@@ -169,6 +198,12 @@ interface TaskEntry {
   injectedKnowledge?: Array<{ id: string; title: string }>;
   /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
   knownTagsLine?: string;
+  /**
+   * Predictions this task's agent stated before acting, paired with the
+   * outcome. Bounded by the step budget. Read by the post-task reviewer
+   * through getTaskTranscript.
+   */
+  predictions?: PredictionRecord[];
   /**
    * Set when the state machine has actually exited. Cancellation flips
    * state.phase to 'error' while the loop may still be parked in an await,
@@ -496,7 +531,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'getTaskTranscript',
-              description: 'Fetch a finished task\'s full record for post-task review: the flattened LLM conversation, outcome, and which knowledge entries were injected at init. Only terminal (done/error) tasks have a stable transcript.',
+              description: 'Fetch a finished task\'s full record for post-task review: the flattened LLM conversation, outcome, which knowledge entries were injected at init, and the prediction ledger (what the agent said it expected before each action, paired with what happened). Only terminal (done/error) tasks have a stable transcript.',
               parameters: [
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
               ],
@@ -506,6 +541,14 @@ export class AgentAbject extends Abject {
                 task: { kind: 'primitive', primitive: 'string' },
                 phase: { kind: 'primitive', primitive: 'string' },
                 goalId: { kind: 'primitive', primitive: 'string' },
+                predictions: { kind: 'array', elementType: { kind: 'object', properties: {
+                  step: { kind: 'primitive', primitive: 'number' },
+                  action: { kind: 'primitive', primitive: 'string' },
+                  expect: { kind: 'primitive', primitive: 'string' },
+                  outcome: { kind: 'primitive', primitive: 'string' },
+                  missed: { kind: 'primitive', primitive: 'boolean' },
+                  actual: { kind: 'primitive', primitive: 'string' },
+                } } },
                 transcript: { kind: 'primitive', primitive: 'string' },
               } },
             },
@@ -1182,6 +1225,7 @@ The registered object must implement these handlers to participate in the agent 
         error: entry.state.error,
         goalId: entry.goalId ?? entry.incomingGoalId ?? null,
         injectedKnowledge: entry.injectedKnowledge ?? [],
+        predictions: entry.predictions ?? [],
         transcript: flattenTranscript(entry.state.llmMessages),
       };
     });
@@ -2344,6 +2388,7 @@ The registered object must implement these handlers to participate in the agent 
               data: actResult.data,
               error: actResult.error,
             };
+            this.recordPrediction(entry);
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
 
@@ -2575,6 +2620,21 @@ The registered object must implement these handlers to participate in the agent 
     if (entry.config.directExecution) {
       try {
         const data = await directFn();
+        // Same unwrap the job path performs: when the agent's callback
+        // returned an AgentActionResult-shaped object, its success/error is
+        // the real outcome. Reporting the enclosing call's success instead
+        // labels a failed action "succeeded", which hides the failure from
+        // the conversation, from oscillation detection, and from the
+        // prediction ledger. The think step returns an AgentAction (no
+        // boolean `success`), so it passes through untouched.
+        const r = data as { success?: unknown; data?: unknown; error?: unknown } | null;
+        if (r && typeof r === 'object' && typeof r.success === 'boolean') {
+          return {
+            success: r.success,
+            data: r.data,
+            error: r.error === undefined ? undefined : String(r.error),
+          };
+        }
         return { success: true, data };
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -2975,6 +3035,9 @@ The registered object must implement these handlers to participate in the agent 
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
     prompt += '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.';
+    // Every agent gets this, so the envelope stays one shape across the system
+    // and no agent has to redeclare the field in its own action table.
+    prompt += '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.';
     if (entry.responseSchema) {
       prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
     }
@@ -3226,6 +3289,37 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     });
   }
 
+  /** Longest stated expectation carried into the ledger and the result block. */
+  private static readonly MAX_EXPECT_CHARS = 300;
+
+  /**
+   * File the just-executed action's stated expectation against its outcome.
+   * Called from the acting phase, where the action and its result are both in
+   * hand. Actions that stated nothing are skipped entirely: an empty ledger
+   * means the agent never committed to a claim, which is itself worth seeing.
+   */
+  private recordPrediction(entry: TaskEntry): void {
+    const task = entry.state;
+    const expect = typeof task.action?.expect === 'string' ? task.action.expect.trim() : '';
+    if (!expect || !task.lastResult) return;
+
+    const success = task.lastResult.success;
+    const actual = success
+      ? JSON.stringify(task.lastResult.data)?.slice(0, 400)
+      : String(task.lastResult.error ?? 'unknown error').slice(0, 400);
+
+    (entry.predictions ??= []).push({
+      step: task.step + 1,
+      action: String(task.action?.action ?? 'unknown'),
+      expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS),
+      outcome: success ? 'success' : 'failure',
+      // A failed action contradicts every expectation of it working, so this
+      // one direction is provable without judging natural language.
+      ...(success ? {} : { missed: true }),
+      ...(actual ? { actual } : {}),
+    });
+  }
+
   private addActionResultToConversation(entry: TaskEntry): void {
     const task = entry.state;
     if (!task.lastResult) return;
@@ -3246,6 +3340,18 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         ? `\nPartial data (from sub-tasks that succeeded):\n${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? ''}`
         : '';
       resultStr = `Action "${action?.action}" failed: ${errStr}${dataStr}`;
+    }
+
+    // Put the agent's own prediction next to the outcome it was about. Seeing
+    // the two side by side is what makes a miss legible: without it, a result
+    // that quietly contradicts the plan reads as just another observation and
+    // the wrong model survives to the next step.
+    const expect = typeof action?.expect === 'string' ? action.expect.trim() : '';
+    if (expect) {
+      const stated = expect.slice(0, AgentAbject.MAX_EXPECT_CHARS);
+      resultStr += task.lastResult.success
+        ? `\n\nYou predicted: "${stated}"\nCompare that against the result above. When it holds, continue. When it diverges, say what actually happened and what it teaches you about this system in your next action's reasoning, then act on the corrected understanding.`
+        : `\n\nYou predicted: "${stated}"\nThe action failed, so the prediction missed. The gap is information about how this system really works: name what you now believe instead, and let it choose your next action rather than repeating this one.`;
     }
 
     task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });

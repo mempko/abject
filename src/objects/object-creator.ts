@@ -3739,6 +3739,16 @@ For a complex, stateful UI this Model-View split is often two cooperating Abject
 
 An Organism is one Abject with an internal registry: organelles (internal ScriptableAbjects) discover each other by name and cooperate behind a membrane interface, and external callers meet a single object with a single curated surface. Reach for \`compose_organism\` when several cooperating objects form one coherent thing and their interplay is an implementation detail: the user should see one name and one interface (a model object plus its view object that always travel together, a pipeline of steps used only as a whole). Keep objects separate when each part is independently useful to the user or to other objects; free-living objects compose through the registry and the ask protocol just fine. Author the membrane thin: each public method forwards to the right organelle via \`await this.call(await this.dep('<OrganelleName>'), '<method>', msg.payload)\`, with contracts at entry and domain logic staying in the organelles. Composition copies the originals (endosymbiosis by copy), so they keep running until deliberately removed; \`extract_organelle\` is the reverse move and leaves the organism intact.
 
+# Rules you cannot ask about
+
+The ask protocol answers how to USE an object: its methods, payloads, and usage guidance. Some tasks also turn on rules nothing here can tell you, because they belong to something outside this system: how an external site or service actually behaves, what a data source really returns, how a described world evolves as it runs, what emerges when parts interact. Those rules are learned by experiment, and where you keep what you learn decides whether it survives the task.
+
+**Keep it in the object, not in your reasoning.** Give the object a small named method that states the rule as code: one that takes the current state plus a move and returns the state it expects to follow, alongside a clearly named handful of fields that rule actually reads. That method is the object's model of its world. It is worth writing while it is still crude, because a crude model you can check beats an accurate hunch you cannot.
+
+**Then sharpen it by being wrong on purpose.** Before each exercising call, put what the model predicts in the action's \`expect\` field. Compare the real result against it. A miss is the useful outcome: it localizes exactly which rule you have wrong, which a success never does. Correct the model method so it would have predicted what really happened, then carry on. Patching the call site to route around the surprise leaves the wrong rule sitting in the object, ready to mislead the next change.
+
+A model that lives in the object stays available once this task ends: the object consults it, a later loop reads and refines it, and anyone can ask the object what it believes. A model that lives only in this conversation dies with the conversation and gets rediscovered from scratch, at full price, every time.
+
 # Discipline
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.

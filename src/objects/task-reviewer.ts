@@ -83,6 +83,14 @@ interface TranscriptResponse {
   error?: string;
   goalId: string | null;
   injectedKnowledge: Array<{ id: string; title: string }>;
+  predictions?: Array<{
+    step: number;
+    action: string;
+    expect: string;
+    outcome: 'success' | 'failure';
+    missed?: boolean;
+    actual?: string;
+  }>;
   transcript: string;
 }
 
@@ -478,6 +486,23 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return record?.transcript ? record : null;
   }
 
+  /**
+   * Render the task's prediction ledger: what the agent said it expected
+   * before each action, next to what happened. Divergences are the review's
+   * richest ore, so they lead and are labelled; a task where the agent
+   * predicted nothing renders nothing rather than an empty heading.
+   */
+  private formatPredictions(record: TranscriptResponse): string {
+    const predictions = record.predictions ?? [];
+    if (predictions.length === 0) return '';
+    const lines = predictions.map(p => {
+      const verdict = p.missed ? 'MISSED (the action failed)' : 'action succeeded, judge the match yourself';
+      const actual = p.actual ? `\n  actual: ${p.actual.slice(0, 300)}` : '';
+      return `- step ${p.step} (${p.action}) [${verdict}]\n  expected: ${p.expect}${actual}`;
+    });
+    return `\n\n### Prediction ledger\n${lines.join('\n')}`;
+  }
+
   private formatTaskSection(record: TranscriptResponse, transcript: string): string {
     const injected = record.injectedKnowledge.length > 0
       ? record.injectedKnowledge.map(k => `- ${k.id}: ${k.title}`).join('\n')
@@ -486,8 +511,9 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       `Agent: ${record.agentName}\n` +
       `Task: ${record.task}\n` +
       `Reported outcome: ${record.phase === 'done' ? 'success' : `failure (${record.error ?? 'unknown'})`} after ${record.steps} steps\n\n` +
-      `### Knowledge entries injected into this agent's prompt\n${injected}\n\n` +
-      `### Transcript\n${transcript}`
+      `### Knowledge entries injected into this agent's prompt\n${injected}` +
+      this.formatPredictions(record) +
+      `\n\n### Transcript\n${transcript}`
     );
   }
 
@@ -965,11 +991,12 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 
 ## How to review
 1. **Credit first.** Compare the injected knowledge list against the transcript: entries the agent visibly relied on get one mark_useful call with their ids. When none were used, skip straight to lessons.
-2. **Distill sparingly.** Most tasks teach nothing durable; finishing with done and "no learnings" is a good review. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
-3. **Recall before saving.** Search with recall_knowledge first; when a close entry exists, update_entry it rather than adding a sibling.
-4. **Record capabilities, skip grievances.** Write what worked and what things are for. Leave transient failures (timeouts, one-off errors, flaky runs) unrecorded: a "this tool is broken" entry outlives the outage and talks future agents out of a working tool. Record a limitation only when the transcript proves it is permanent and structural, and phrase it as what to do instead.
-5. **Procedures become skills.** When the transcript shows a reusable multi-step procedure that took real effort to get right (3+ steps, especially after retries), author_skill it. Skills are shared beyond this workspace, so keep them fully generic: the procedure, its steps, its pitfalls. Every personal or workspace-specific detail (names, addresses, accounts, file paths) belongs in save_entry, never in a skill.
-6. **Scratchpad material stays out.** Goal-specific findings, intermediate data, and in-progress state already live on the goal's scratchpad; the knowledge base is only for lessons that outlive the goal.
+2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Entries marked MISSED are proven wrong; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. When every prediction held, that is evidence the agent's model was sound and there is likely nothing durable to save.
+3. **Distill sparingly.** Most tasks teach nothing durable; finishing with done and "no learnings" is a good review. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
+4. **Recall before saving.** Search with recall_knowledge first; when a close entry exists, update_entry it rather than adding a sibling.
+5. **Record capabilities, skip grievances.** Write what worked and what things are for. Leave transient failures (timeouts, one-off errors, flaky runs) unrecorded: a "this tool is broken" entry outlives the outage and talks future agents out of a working tool. Record a limitation only when the transcript proves it is permanent and structural, and phrase it as what to do instead.
+6. **Procedures become skills.** When the transcript shows a reusable multi-step procedure that took real effort to get right (3+ steps, especially after retries), author_skill it. Skills are shared beyond this workspace, so keep them fully generic: the procedure, its steps, its pitfalls. Every personal or workspace-specific detail (names, addresses, accounts, file paths) belongs in save_entry, never in a skill.
+7. **Scratchpad material stays out.** Goal-specific findings, intermediate data, and in-progress state already live on the goal's scratchpad; the knowledge base is only for lessons that outlive the goal.
 
 ## Grow the pattern language
 The workspace's memory includes a generative pattern language in the Alexander/Coplien tradition: write patterns the way Christopher Alexander and James Coplien do, where each pattern names a recurring context, lays out forces genuinely in tension, and resolves them, and the patterns link into a language that generates good solutions piecemeal. The anatomy of an entry of type 'pattern' is Context (when the pattern applies), Forces (the tensions that make the naive approach fail), Therefore (the resolution of those forces, not a mere tip), optional Contract (checkable obligations), optional Program (a worked example), Resulting context (what holds afterwards, and which patterns apply next), Evidence (how proven it is, Alexander's confidence stars in prose), and Links to related patterns. Goal reviews may include the goal's execution record; that record is your ore for pattern mining.
