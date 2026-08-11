@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.9.2",
+    "date": "2026-08-11",
+    "title": "Pictures in the Terminal",
+    "summary": "The terminal client can now show inline images as ANSI art, so you no longer have to switch to the desktop to see what an object sent you. This release also fixes window capture and stops two runaway loops that wasted work in the background.",
+    "highlights": [
+      "Inline images now render as ANSI art in the terminal client (pnpm commune), so pictures in a chat show up in place instead of as an unreadable reference"
+    ],
+    "fixes": [
+      "Window capture works again",
+      "Repeated handler errors are throttled instead of flooding the logs",
+      "Stopped the reparse loop from burning steps it did not need"
+    ]
+  },
+  {
     "version": "0.9.1",
     "date": "2026-08-07",
     "title": "Richer Markdown on the Canvas",
