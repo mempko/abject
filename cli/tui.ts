@@ -131,14 +131,39 @@ const INVERSE = '\x1b[7m';
 
 /** Track SGR codes that are currently active, for re-applying after a wrap. */
 function updateSgrState(active: string[], params: string): void {
-  for (const code of (params || '0').split(';')) {
-    const n = code === '' ? 0 : parseInt(code, 10);
+  const parts = (params || '0').split(';');
+  for (let i = 0; i < parts.length; i++) {
+    const n = parts[i] === '' ? 0 : parseInt(parts[i], 10);
+    // Extended colors (38/48;2;r;g;b or 38/48;5;n) are one atomic sequence.
+    if (n === 38 || n === 48) {
+      const take = parts[i + 1] === '2' ? 5 : parts[i + 1] === '5' ? 3 : 1;
+      (n === 38 ? removeFg : removeBg)(active);
+      active.push(`\x1b[${parts.slice(i, i + take).join(';')}m`);
+      i += take - 1;
+      continue;
+    }
     if (n === 0) { active.length = 0; continue; }
     if (n === 22) { removeSgr(active, [1, 2]); continue; }
     if (n === 23) { removeSgr(active, [3]); continue; }
-    if (n === 39) { removeSgr(active, range(30, 38).concat(range(90, 97))); continue; }
-    if (n === 49) { removeSgr(active, range(40, 48).concat(range(100, 107))); continue; }
+    if (n === 39) { removeFg(active); continue; }
+    if (n === 49) { removeBg(active); continue; }
     active.push(`\x1b[${n}m`);
+  }
+}
+
+function removeFg(active: string[]): void {
+  removeSgr(active, range(30, 38).concat(range(90, 97)));
+  removePrefixed(active, '\x1b[38;');
+}
+
+function removeBg(active: string[]): void {
+  removeSgr(active, range(40, 48).concat(range(100, 107)));
+  removePrefixed(active, '\x1b[48;');
+}
+
+function removePrefixed(active: string[], prefix: string): void {
+  for (let i = active.length - 1; i >= 0; i--) {
+    if (active[i].startsWith(prefix)) active.splice(i, 1);
   }
 }
 

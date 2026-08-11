@@ -19,6 +19,7 @@ import {
 } from './client.js';
 import { Screen, parseKeys, Key, Line, LineColor, TabInfo } from './tui.js';
 import { renderMarkdown, stripAnsi } from './markdown.js';
+import { extractImages, renderImage } from './image.js';
 
 function helpLines(p: string): string[] {
   const P = `C-${p}`;
@@ -136,22 +137,36 @@ function makeCredentialProvider(url: string): (attempt: number, error?: string) 
 
 // ── Shared formatting ──────────────────────────────────────────────────
 
-function formatMessage(role: string, sender: string, text: string, markdown = false): Line[] {
+/** Cells available for inline image art, leaving room for the indent. */
+function artWidth(): number {
+  return Math.max(16, Math.min((process.stdout.columns || 80) - 4, 76));
+}
+
+function formatMessage(role: string, sender: string, text: string, markdown = false, art = true): Line[] {
   const color: LineColor =
     role === 'user' ? 'cyan' :
     role === 'error' ? 'red' :
     role === 'system' ? 'dim' : 'normal';
   const prefix = `${sender || role}: `;
-  if (markdown) {
-    return renderMarkdown(text).map((line, i) => ({
-      text: (i === 0 ? prefix : '  ') + line.text,
-      color: line.dim ? 'dim' : color,
-    }));
+  // Data-URI images become an inline "⧉ name" marker plus ANSI art below;
+  // the base64 itself never reaches the transcript.
+  const { text: stripped, images } = extractImages(text);
+  const lines: Line[] = markdown
+    ? renderMarkdown(stripped).map((line, i) => ({
+        text: (i === 0 ? prefix : '  ') + line.text,
+        color: line.dim ? 'dim' : color,
+      }))
+    : stripped.split('\n').map((line, i) => ({
+        text: i === 0 ? prefix + line : '  ' + line,
+        color,
+      }));
+  for (const image of images) {
+    const rendered = art ? renderImage(image, artWidth(), 40) : null;
+    if (rendered) {
+      lines.push(...rendered.map(row => ({ text: '  ' + row, color: 'normal' as LineColor })));
+    }
   }
-  return text.split('\n').map((line, i) => ({
-    text: i === 0 ? prefix + line : '  ' + line,
-    color,
-  }));
+  return lines;
 }
 
 /** Agents write markdown; user/system/error text renders literally. */
@@ -1112,6 +1127,8 @@ async function runPlain(url: string): Promise<void> {
   let workspace: WorkspaceRow | null = null;
   let conversationId: string | null = null;
   let pendingDialog: DialogInfo | null = null;
+  // Piped output gets image markers only; art needs a color-capable terminal.
+  const art = process.stdout.isTTY === true;
 
   const print = (line: Line) => {
     const codes: Record<LineColor, string> = {
@@ -1133,7 +1150,7 @@ async function runPlain(url: string): Promise<void> {
       if (event.event === 'message' && event.conversationId === conversationId) {
         const data = event.data as unknown as MessageEvent;
         for (const line of formatMessage(data.role, data.sender, data.text,
-          isMarkdownMessage(data.role, data.markdown))) print(line);
+          isMarkdownMessage(data.role, data.markdown), art)) print(line);
       } else if (event.event === 'goalProgress' && event.workspaceId === workspace?.id) {
         // Milestones only — the step-by-step goalUpdated chatter would flood a
         // line-oriented log.
@@ -1188,7 +1205,7 @@ async function runPlain(url: string): Promise<void> {
     const history = await client.history(workspace!.id, conversationId);
     for (const entry of history) {
       for (const line of formatMessage(entry.role, entry.sender ?? entry.role, entry.content,
-        isMarkdownMessage(entry.role))) print(line);
+        isMarkdownMessage(entry.role), art)) print(line);
     }
     print({ text: `— ${workspace!.name} / ${chats.find(c => c.conversationId === conversationId)?.title ?? 'new chat'} —`, color: 'dim' });
   };
