@@ -47,6 +47,22 @@ export interface AgentActionResult {
   success: boolean;
   data?: unknown;
   error?: string;
+  /**
+   * Bulk text the agent may want to read but should not be forced to read
+   * whole: an HTTP body, a file, a scraped page.
+   *
+   * Kept out of `data` deliberately. Anything in `data` is JSON-stringified
+   * into the conversation, so a body placed there arrives escaped, and a
+   * search for `"temperature"` would have to match `\\"temperature\\"`
+   * instead. Handed over here it is stored verbatim, so the chunk reader
+   * greps and outlines the real text.
+   */
+  payload?: string;
+  /**
+   * Set by the runtime once `payload` has been stored, at which point the
+   * raw text is dropped so bulk never rides along in task state or events.
+   */
+  payloadId?: string;
 }
 
 /**
@@ -2492,7 +2508,10 @@ The registered object must implement these handlers to participate in the agent 
               success: actResult.success,
               data: actResult.data,
               error: actResult.error,
+              payload: actResult.payload,
             };
+            // Before emitActionResult forwards it anywhere.
+            this.absorbResultPayload(entry);
             this.recordPrediction(entry);
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
@@ -2733,12 +2752,13 @@ The registered object must implement these handlers to participate in the agent 
         // the conversation, from oscillation detection, and from the
         // prediction ledger. The think step returns an AgentAction (no
         // boolean `success`), so it passes through untouched.
-        const r = data as { success?: unknown; data?: unknown; error?: unknown } | null;
+        const r = data as { success?: unknown; data?: unknown; error?: unknown; payload?: unknown } | null;
         if (r && typeof r === 'object' && typeof r.success === 'boolean') {
           return {
             success: r.success,
             data: r.data,
             error: r.error === undefined ? undefined : String(r.error),
+            ...(typeof r.payload === 'string' ? { payload: r.payload } : {}),
           };
         }
         return { success: true, data };
@@ -2793,6 +2813,7 @@ The registered object must implement these handlers to participate in the agent 
             success: r.success as boolean,
             data: r.data ?? r.result,
             error: r.error as string | undefined,
+            ...(typeof r.payload === 'string' ? { payload: r.payload } : {}),
           };
         }
         return { success: true, data: jobResult.result };
@@ -3573,6 +3594,39 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     );
   }
 
+  /**
+   * Take an act callback's bulk text out of the result and into the store.
+   *
+   * Runs the moment the result lands, before anything forwards it: a body
+   * left on `lastResult` would ride into every taskProgress event and sit in
+   * task state for the rest of the run. Small bulk is folded back into
+   * `data` so a short body still reads inline and costs no extra step.
+   */
+  private absorbResultPayload(entry: TaskEntry): void {
+    const result = entry.state.lastResult;
+    const text = result?.payload;
+    if (!result || typeof text !== 'string' || text.length === 0) return;
+    result.payload = undefined;
+
+    if (text.length <= AgentAbject.PAYLOAD_HANDLE_THRESHOLD) {
+      if (result.data === undefined) {
+        result.data = text;
+      } else if (typeof result.data === 'object' && result.data !== null && !Array.isArray(result.data)) {
+        result.data = { ...(result.data as Record<string, unknown>), body: text };
+      } else {
+        result.data = { meta: result.data, body: text };
+      }
+      return;
+    }
+    result.payloadId = this.storePayload(entry, text, 'result');
+  }
+
+  /** Render the handle for an already-stored payload. */
+  private renderStoredHandle(entry: TaskEntry, id: string): string | undefined {
+    const stored = (entry.payloads ?? []).find(p => p.id === id);
+    return stored ? this.renderPayloadHandle(stored.id, stored.text, stored.kind) : undefined;
+  }
+
   /** Serve one read_chunk request against a stored payload. */
   private readChunk(entry: TaskEntry, action: AgentAction): string {
     const id = typeof action.id === 'string' ? action.id : undefined;
@@ -3662,10 +3716,20 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     let resultStr: string;
     if (task.lastResult.success) {
       const body = JSON.stringify(task.lastResult.data) ?? 'ok';
-      resultStr = body.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
-        ? `Action "${action?.action}" succeeded.\n${this.renderPayloadHandle(
-            this.storePayload(entry, body, 'result'), body, 'result')}`
-        : `Action "${action?.action}" succeeded: ${body}`;
+      // Bulk handed over as `payload` was stored verbatim when the result
+      // landed; show the structured part next to its handle.
+      const storedHandle = task.lastResult.payloadId
+        ? this.renderStoredHandle(entry, task.lastResult.payloadId)
+        : undefined;
+      if (storedHandle) {
+        resultStr = `Action "${action?.action}" succeeded: ${body}\n${storedHandle}`;
+      } else if (body.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD) {
+        // No dedicated payload, but `data` itself is oversized: hold that.
+        resultStr = `Action "${action?.action}" succeeded.\n${this.renderPayloadHandle(
+          this.storePayload(entry, body, 'result'), body, 'result')}`;
+      } else {
+        resultStr = `Action "${action?.action}" succeeded: ${body}`;
+      }
     } else {
       // On failure, include any partial `data` alongside the error. Callers
       // like Chat's `goal` action attach scratchpad/successful sub-task

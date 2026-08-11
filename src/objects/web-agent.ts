@@ -11,7 +11,7 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
-import type { AgentAction } from './agent-abject.js';
+import type { AgentAction, AgentActionResult } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 
@@ -922,8 +922,6 @@ Set keepPageOpen: false to explicitly close the page when done.
 
   private static readonly MAX_SNAPSHOT_CHARS = 25000;
 
-  /** Cap on an http action's body before it enters the conversation. */
-  private static readonly MAX_HTTP_BODY_CHARS = 30000;
 
   /**
    * Above this many interactive refs a page is a real choice among many
@@ -1068,7 +1066,7 @@ Set keepPageOpen: false to explicitly close the page when done.
   // Act callback — browser interactions
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  private async handleAct(taskId: string, action: AgentAction): Promise<AgentActionResult> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { success: false, error: 'No page open' };
 
@@ -1181,9 +1179,16 @@ Set keepPageOpen: false to explicitly close the page when done.
             }),
             60000,
           );
+          // The body goes back WHOLE as `payload`, not clipped into `data`.
+          // A data endpoint is exactly where a cap hurts most: the answer is
+          // as likely to sit at the end of a long array as at the front, and
+          // the runtime already holds oversized payloads intact and hands
+          // the agent a searchable handle instead of a severed prefix.
+          const body = res.body ?? '';
           return {
             success: res.ok !== false,
-            data: { status: res.status, body: res.body?.slice(0, WebAgent.MAX_HTTP_BODY_CHARS) ?? '' },
+            data: { status: res.status, chars: body.length },
+            payload: body,
           };
         }
 
@@ -1370,6 +1375,9 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
   Use this whenever the URL returns DATA rather than a page: JSON APIs, RSS or
   Atom feeds, CSV, plain text. It is one step instead of navigate-then-read, and
   it hands you the body verbatim instead of the browser's rendering of it.
+  A large body comes back whole, as a searchable handle (see "Large results"),
+  so fetch the endpoint you actually want and search it rather than hunting for
+  a smaller one.
   Reach for navigate when you need the rendered page: something behind a
   login, a site that builds its content with JavaScript, or anything you must
   click, fill, or see.
