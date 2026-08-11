@@ -246,6 +246,10 @@ class TuiApp {
   private cursor = 0;
   private status = '';
   private ctrlCArmed = false;
+  /** False between a dropped link and a successful reconnect. */
+  private connected = true;
+  /** Guards against rival reconnect loops from repeated disconnect events. */
+  private reconnecting = false;
   private quitting = false;
   private url: string;
   private wsNames = new Map<string, string>();
@@ -572,29 +576,51 @@ class TuiApp {
 
   private handleDisconnect(reason: string): void {
     if (this.quitting) return;
-    this.status = 'reconnecting…';
-    this.render();
+    this.connected = false;
+    this.setStatus('reconnecting… (Ctrl+C quits)');
+    // One loop at a time: a second disconnect while reconnecting would
+    // otherwise start a rival loop, doubling the status churn and racing
+    // the first one's openChat replay.
+    if (this.reconnecting) return;
     void this.reconnectLoop();
   }
 
   private async reconnectLoop(): Promise<void> {
+    this.reconnecting = true;
     let delay = 1000;
-    for (;;) {
-      await new Promise(r => setTimeout(r, delay));
-      delay = Math.min(delay * 2, 15000);
-      try {
-        await this.client.connect();
-        for (const tab of this.tabs) {
-          try { await this.client.openChat(tab.workspaceId, tab.conversationId); } catch { /* retried on send */ }
+    try {
+      for (;;) {
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 15000);
+        if (this.quitting) return;
+        try {
+          await this.client.connect();
+          for (const tab of this.tabs) {
+            try { await this.client.openChat(tab.workspaceId, tab.conversationId); } catch { /* retried on send */ }
+          }
+          this.connected = true;
+          this.setStatus('');
+          this.note('reconnected', 'green');
+          return;
+        } catch {
+          this.setStatus('reconnecting… (Ctrl+C quits)');
         }
-        this.status = '';
-        this.note('reconnected', 'green');
-        return;
-      } catch {
-        this.status = 'reconnecting…';
-        this.render();
       }
+    } finally {
+      this.reconnecting = false;
     }
+  }
+
+  /**
+   * Write the status line, except when a transient prompt owns it.
+   * Background writers (the reconnect loop above all) would otherwise erase
+   * "Ctrl+C again to quit" the instant it appears, leaving the user pressing
+   * a key that looks like it does nothing.
+   */
+  private setStatus(text: string): void {
+    if (this.ctrlCArmed || this.prefixArmed) return;
+    this.status = text;
+    this.render();
   }
 
   // ── Goal panel ───────────────────────────────────────────────────────
@@ -788,11 +814,18 @@ class TuiApp {
 
   private handleKey(key: Key): void {
     if (key.type === 'ctrl' && key.ch === 'c') {
-      if (this.ctrlCArmed) this.quit();
+      // The two-press guard protects a live session from a fat finger. While
+      // the link is down there is no session to protect, and this is exactly
+      // when someone most wants out, so a single press leaves.
+      if (this.ctrlCArmed || !this.connected) this.quit();
       this.ctrlCArmed = true;
       this.status = 'Ctrl+C again to quit';
       this.render();
-      setTimeout(() => { this.ctrlCArmed = false; this.status = ''; this.render(); }, 2000);
+      setTimeout(() => {
+        this.ctrlCArmed = false;
+        this.status = '';
+        this.render();
+      }, 3000);
       return;
     }
 
