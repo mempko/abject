@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.9.4",
+    "date": "2026-08-12",
+    "title": "Bulk Results Off The Critical Path",
+    "summary": "Large agent results now travel on the payload channel and stay where they are, so generated code can work with them without pulling everything into memory first. Connection health is also judged on recent traffic instead of a lifetime tally.",
+    "highlights": [
+      "Every agent's bulk results now go out on the payload channel, keeping big result sets out of the regular message path",
+      "Generated code can operate directly on held payloads instead of paging them in, which avoids copying large data just to read part of it"
+    ],
+    "fixes": [
+      "Connection health is now measured over a recent window of messages; a long history of successful traffic can no longer mask a connection that has broken"
+    ]
+  },
+  {
     "version": "0.9.3",
     "date": "2026-08-12",
     "title": "Big results stay whole, agents stay honest",
