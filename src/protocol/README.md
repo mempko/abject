@@ -32,9 +32,9 @@ Protocol agreement utilities and storage.
 Connection health monitoring and self-healing trigger.
 
 - **Config**: `errorThreshold` (10%), `windowSize` (60s), `minMessages` (10), `checkInterval` (5s)
-- **Per-connection tracking**: `messageCount`, `errorCount`, timestamped errors
-- **Rolling window**: prunes errors outside `windowSize`
-- **Trigger**: when `errorRate >= errorThreshold` and `messageCount >= minMessages` → calls `Negotiator.renegotiate()` with recent error context → resets counters
+- **Per-connection tracking**: `messageCount`, `errorCount`, timestamped messages and errors
+- **Rolling window**: prunes both messages and errors outside `windowSize`, so `errorRate` always reflects the window, not the connection's lifetime
+- **Trigger**: when `errorRate >= errorThreshold` and `messageCount >= minMessages` (both within the window) → calls `Negotiator.renegotiate()` with recent error context → resets counters
 - **Methods**: `getStatus`, `getAllStatus`, `forceRenegotiate`
 - **`INCOMPREHENSION_ERRORS`**: `PARSE_ERROR`, `UNKNOWN_METHOD`, `INVALID_PAYLOAD`, `SCHEMA_MISMATCH`, `TYPE_ERROR`, `SEMANTIC_ERROR`
 - **Well-known ID**: `HEALTH_MONITOR_ID`
