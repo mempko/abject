@@ -201,6 +201,13 @@ export interface AgentTaskOptions {
 export interface TerminalActionConfig {
   type: 'success' | 'error';
   resultFields?: string[];
+  /**
+   * Set when this terminal's content is addressed TO the user — a question
+   * they are expected to answer — so the agent's own narration cannot stand
+   * in for it. Everywhere else an empty result field falls back to
+   * `reasoning`, which is where agents are told to put narration.
+   */
+  ownContentRequired?: boolean;
 }
 
 export interface AgentConfig {
@@ -3202,7 +3209,7 @@ The registered object must implement these handlers to participate in the agent 
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
-    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
+    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nA terminal action still needs its own content field filled in: "reasoning" says why you are finishing, and the result field says what you are delivering. When the action asks the user something, that field carries the question itself, phrased for them to answer.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
     add('large-payloads', `\n\n## Large results
@@ -3979,6 +3986,23 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return true;
     });
     if (hasContent) return null;
+
+    // Narration counts as content, because we asked for it there. Every
+    // agent is told "narration belongs inside the action's reasoning field,
+    // where it is read and kept", and the default terminal config already
+    // accepts `reasoning` for `done` — so an agent that narrates its finish
+    // and leaves `result` empty has followed the instructions, and throwing
+    // the turn away to ask for the same words in a different slot spends a
+    // call to gain nothing. Promote it into the field the callers read.
+    //
+    // The exception is a terminal whose content is a question put to the
+    // user: narration explains a decision, and "I should ask where they
+    // live" is not a question anyone can answer, so those still re-ask.
+    const narration = typeof parsed.reasoning === 'string' ? parsed.reasoning.trim() : '';
+    if (narration.length > 0 && !terminal.ownContentRequired) {
+      parsed[fields[0]] = narration;
+      return null;
+    }
 
     entry.parseFailures = (entry.parseFailures ?? 0) + 1;
     if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {

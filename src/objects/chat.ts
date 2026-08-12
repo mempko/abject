@@ -473,7 +473,7 @@ export class Chat extends Abject {
         pinnedMessageCount: 1,
         terminalActions: {
           done: { type: 'success', resultFields: ['text', 'result', 'reasoning'] },
-          clarify: { type: 'success', resultFields: ['question'] },
+          clarify: { type: 'success', resultFields: ['question'], ownContentRequired: true },
           fail: { type: 'error', resultFields: ['reason'] },
         },
         intermediateActions: ['reply'],
