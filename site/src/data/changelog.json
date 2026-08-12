@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.9.3",
+    "date": "2026-08-12",
+    "title": "Big results stay whole, agents stay honest",
+    "summary": "Agents can now work with large results without losing anything: long observations, extracts, and action outputs are held intact and read in chunks instead of being truncated. Prompts are cached across tasks, and the server and terminal client recover cleanly instead of hanging.",
+    "highlights": [
+      "Large results are kept whole and read in chunks: observations, action results, and extracts no longer get cut off partway through",
+      "Producers now declare when a result is bulk, rather than the system guessing from its size; large extracts are handed over intact and every path shares one size threshold",
+      "Agent prompts are split into a stable, cacheable prefix and a per-task tail, with prefix caching enabled on the routes that need it: less repeated work per task",
+      "Agent predictions are recorded and the misses reviewed, so you can see where an agent expected one thing and got another",
+      "The server survives a wedged shutdown instead of holding its ports, so a restart works without hunting down a stuck process"
+    ],
+    "fixes": [
+      "An agent's narration is now treated as the result it forgot to fill in, instead of the step coming back empty",
+      "Markdown answers whose newlines were not escaped are accepted rather than rejected",
+      "Ctrl-C now exits the terminal client while it is reconnecting"
+    ]
+  },
+  {
     "version": "0.9.2",
     "date": "2026-08-11",
     "title": "Pictures in the Terminal",
