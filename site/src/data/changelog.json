@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.9.5",
+    "date": "2026-08-12",
+    "title": "Every LLM Call, Accounted For",
+    "summary": "Abject now keeps a ledger of every LLM call it makes, including what each one cost. The Eye shows the running record, so you can see where your tokens and money actually go.",
+    "highlights": [
+      "An LLM call ledger records each request your objects make, with per-call cost",
+      "The Eye displays the ledger, giving you a live view of spending across the system"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.9.4",
     "date": "2026-08-12",
     "title": "Bulk Results Off The Critical Path",
