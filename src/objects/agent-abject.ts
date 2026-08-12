@@ -1393,6 +1393,22 @@ The registered object must implement these handlers to participate in the agent 
       };
     });
 
+    // Reachable from a pipeline job so code can operate on a held payload
+    // rather than the model reading it back a chunk at a time. Filtering 200
+    // records by date is one job; through the chunk reader it is a dozen
+    // steps and a blown step budget.
+    this.on('readPayload', async (msg: AbjectMessage) => {
+      const { taskId, id } = msg.payload as { taskId: string; id: string };
+      const entry = this.taskEntries.get(taskId);
+      if (!entry) throw new Error(`No task "${taskId}"`);
+      const stored = (entry.payloads ?? []).find(p => p.id === id);
+      if (!stored) {
+        const have = (entry.payloads ?? []).map(p => p.id).join(', ') || '(none)';
+        throw new Error(`No payload "${id}" on task ${taskId}. Available: ${have}`);
+      }
+      return stored.text;
+    });
+
     this.on('releaseTask', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
       const entry = this.taskEntries.get(taskId);
@@ -2478,6 +2494,18 @@ The registered object must implement these handlers to participate in the agent 
                       request(this.id, jmId, 'submitJob', {
                         description,
                         code,
+                        // Held payloads are reachable from job code by
+                        // message, so filtering or counting a large result
+                        // is one job instead of paging it in by hand. Only
+                        // the handles travel here; the bulk crosses the bus
+                        // when the job actually asks for it.
+                        ...(entry.payloads?.length
+                          ? { context: {
+                              payloadHost: this.id,
+                              taskId: entry.state.id,
+                              payloadIds: entry.payloads.map(pl => pl.id),
+                            } }
+                          : {}),
                         // Dedicated queue per agent: pipeline jobs never
                         // interleave with the OTA loop's own phase jobs.
                         queue: `pipeline-${entry.agentId.slice(0, 8)}`,
@@ -3248,9 +3276,18 @@ When an observation or a result is too big to sit in the conversation, you get a
 { "action": "read_chunk", "id": "obs-3", "offset": 2000, "length": 4000 }
 \`\`\`
 
-Reach for \`grep\` first: a big payload is usually many similar records and you want one of them, so searching for the field or value you care about beats paging from the start. \`outline\` shows the structure when you are not yet sure what to search for. Use \`offset\`/\`length\` when order matters and you mean to read through.
+**When the question is about ALL of it, use code, not the reader.** Filtering records by a field, counting them, extracting every match, reshaping a list: that is one \`submit_job\` over the payload, and it costs one step however many records there are. Reading the same data back a chunk at a time costs a step per chunk and runs out of budget before it finishes. Inside job code a held payload arrives by message:
 
-The preview often answers the question on its own — when it does, just act. Read further only when what you need is genuinely not in front of you, and say in your reasoning what you are looking for.`, true);
+\`\`\`json
+{ "action": "submit_job", "description": "list yesterday's senders",
+  "code": "const raw = await call(payloadHost, 'readPayload', { taskId, id: 'res-1' });\\nconst rows = JSON.parse(raw);\\nreturn rows.filter(r => r.date.startsWith('2026-08-10')).map(r => r.from);" }
+\`\`\`
+
+\`payloadHost\`, \`taskId\` and \`payloadIds\` are already in scope there. Keep what you return small — the filtered answer, not the data you filtered.
+
+**The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
+
+The preview often answers the question on its own — when it does, just act.`, true);
     add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
@@ -3557,10 +3594,19 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private static readonly PAYLOAD_PREVIEW_CHARS = 2000;
   /** Payloads kept per task; the oldest is dropped past this. */
   private static readonly MAX_STORED_PAYLOADS = 5;
-  /** Largest slice one read_chunk may return. */
-  private static readonly MAX_CHUNK_CHARS = 8000;
-  /** Matches returned by a single grep, and the context kept around each. */
-  private static readonly MAX_GREP_MATCHES = 10;
+  /**
+   * Largest slice one read_chunk may return. Sized so reading a payload
+   * through is a couple of calls rather than a dozen: at 8k a 50k body took
+   * six steps and exhausted an agent's whole budget.
+   */
+  private static readonly MAX_CHUNK_CHARS = 30000;
+  /**
+   * Grep output is bounded by total size, not by an arbitrary match count.
+   * Ten matches suits "find the needle" and fails "which of these records
+   * match", which is the question agents actually ask of a fetched dataset.
+   */
+  private static readonly MAX_GREP_MATCHES = 100;
+  private static readonly MAX_GREP_OUTPUT_CHARS = 30000;
   private static readonly GREP_CONTEXT_CHARS = 300;
 
   /** Keep a payload whole and return its id. */
@@ -3727,17 +3773,27 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         re = new RegExp(grep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       }
       const hits: string[] = [];
+      let budget = AgentAbject.MAX_GREP_OUTPUT_CHARS;
+      let total = 0;
       for (const m of text.matchAll(re)) {
-        if (hits.length >= AgentAbject.MAX_GREP_MATCHES) break;
+        total++;
+        if (hits.length >= AgentAbject.MAX_GREP_MATCHES || budget <= 0) continue;
         const at = m.index ?? 0;
         const from = Math.max(0, at - AgentAbject.GREP_CONTEXT_CHARS);
         const to = Math.min(text.length, at + AgentAbject.GREP_CONTEXT_CHARS);
-        hits.push(`@${at}: …${text.slice(from, to)}…`);
+        const hit = `@${at}: …${text.slice(from, to)}…`;
+        budget -= hit.length;
+        if (budget <= 0) continue;
+        hits.push(hit);
       }
-      if (hits.length === 0) return `No match for "${grep}" in ${stored.id} (${text.length} chars). Try a different term, or "outline": true to see its shape.`;
-      const total = [...text.matchAll(re)].length;
-      return `${hits.length} of ${total} match(es) for "${grep}" in ${stored.id}:\n\n${hits.join('\n\n')}` +
-        (total > hits.length ? `\n\n(${total - hits.length} further matches; narrow the term or read around an offset.)` : '');
+      if (total === 0) return `No match for "${grep}" in ${stored.id} (${text.length} chars). Try a different term, or "outline": true to see its shape.`;
+      const shown = `${hits.length} of ${total} match(es) for "${grep}" in ${stored.id}:\n\n${hits.join('\n\n')}`;
+      // Say plainly when the answer is incomplete, and point at the tool that
+      // can answer it in full, rather than letting a capped list read as the
+      // whole set.
+      return total > hits.length
+        ? `${shown}\n\n(${total - hits.length} further matches were not shown. When you need them ALL — filtering, counting, extracting every record — run one submit_job over the payload instead of paging it.)`
+        : shown;
     }
 
     const offset = Math.max(0, typeof action.offset === 'number' ? action.offset : 0);
