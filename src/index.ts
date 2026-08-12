@@ -18,7 +18,11 @@ export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';
 export { LLMObject, LLM_OBJECT_ID } from './objects/llm-object.js';
-export type { TierConfig, TierRouting, TierCapability, TierCapabilities } from './objects/llm-object.js';
+export type {
+  TierConfig, TierRouting, TierCapability, TierCapabilities,
+  LLMUsage, LLMStats, LLMActiveRequest, LLMHistoryEntry, LLMModelSpend, LLMSpendReport,
+  LLMLedgerEntry, LLMLedgerRetention, LLMLedgerQuery,
+} from './objects/llm-object.js';
 export { ObjectCreator, OBJECT_CREATOR_ID } from './objects/object-creator.js';
 export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js';
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
@@ -243,6 +247,8 @@ export { GeminiProvider } from './llm/google-gemini.js';
 export { KimiProvider } from './llm/kimi.js';
 export { MiniMaxProvider } from './llm/minimax.js';
 export { MetaProvider } from './llm/meta.js';
+export type { ModelPricing, PricingEntry } from './llm/pricing.js';
+export { lookupPricing, estimateCostUsd } from './llm/pricing.js';
 
 // Export network
 export { Transport } from './network/transport.js';

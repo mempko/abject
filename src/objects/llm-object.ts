@@ -30,6 +30,14 @@ import {
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
+import {
+  ModelPricing,
+  estimateCostUsd,
+  lookupPricing,
+  listPricingOverrides,
+  loadPricingOverrides,
+  setPricingOverride,
+} from '../llm/pricing.js';
 
 export interface TierConfig {
   provider: string;
@@ -124,22 +132,44 @@ export interface LLMAnalyzePayload {
   task: string;
 }
 
-export interface LLMActiveRequest {
-  id: string;
-  callerId: AbjectId;
-  callerName?: string;
-  method: string;
-  provider: string;
-  model: string;
-  startTime: number;
-  inputChars: number;
-  outputChars: number;
-  streaming: boolean;
-  killed: boolean;
-  inputMessages?: string;
+/**
+ * An in-flight call. Not a separate record: it is the same ledger entry the
+ * call will finish as, still in `active` status.
+ */
+export type LLMActiveRequest = LLMLedgerEntry;
+
+/**
+ * Everything a provider told us about what one call consumed. Cache and
+ * reasoning counts ride alongside the plain input/output pair because they
+ * are separately priced, and `costUsd` is the provider's own charge when it
+ * reports one (OpenRouter does) — always preferred over our arithmetic.
+ */
+export interface LLMUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+  costUsd?: number;
 }
 
-export interface LLMHistoryEntry {
+/**
+ * One call, start to finish: who asked, what it ran on, what it consumed,
+ * what it cost, and what was actually said. This is the ledger's unit of
+ * record — the LLM object keeps every call as one of these, and everything
+ * else (the monitor's active and history tabs, the stats line, the per-model
+ * spend table) is a view or a rollup over them. Nothing is aggregated at
+ * write time.
+ *
+ * `inputMessages` and `outputContent` are part of the entry, but they are
+ * the one part that is not always resident: text is held in memory only for
+ * the newest `residentTextEntries` calls and read back from storage on
+ * demand for older ones. `hasText` says whether it is retrievable at all —
+ * an entry whose text has been dropped, or that was recorded while text
+ * storage was off, has `hasText: false` rather than an empty string that
+ * would read as "the model said nothing".
+ */
+export interface LLMLedgerEntry {
   id: string;
   callerId: AbjectId;
   callerName?: string;
@@ -147,15 +177,109 @@ export interface LLMHistoryEntry {
   provider: string;
   model: string;
   startTime: number;
+  /** Undefined while the call is still running. */
+  endTime?: number;
   elapsedMs: number;
   inputChars: number;
   outputChars: number;
-  inputMessages: string;
-  outputContent: string;
+  streaming: boolean;
+  /** `active` entries are the in-flight calls the monitor's first tab shows. */
+  status: 'active' | 'complete' | 'error';
+  killed?: boolean;
   error?: string;
-  usage?: { inputTokens: number; outputTokens: number };
+  /**
+   * The tier the caller asked for (smart/balanced/fast/code), when it routed
+   * by tier rather than naming a model. Without this, "what is the smart tier
+   * costing me" is unanswerable from the ledger even though tier routing is
+   * how most callers pick a model.
+   */
+  tier?: ModelTier;
+  /** Reasoning effort the call ran at. Drives token spend on reasoning models. */
+  effort?: EffortLevel;
+  /** The caller's output cap, for reading alongside a truncated finishReason. */
+  maxTokens?: number;
+  /**
+   * How generation ended. `length`/`max_tokens` means the answer was cut off
+   * mid-thought — a real failure that otherwise looks identical to a clean
+   * completion, since the call returns normally and is billed in full.
+   */
+  finishReason?: string;
+  usage?: LLMUsage;
+  /**
+   * What this call cost, in USD. Set from the provider's reported charge
+   * when there is one, otherwise estimated from list prices. Undefined
+   * means the model is unpriced — which is not the same as free.
+   */
+  costUsd?: number;
+  /** True when costUsd came from a list-price estimate rather than the provider. */
+  costEstimated?: boolean;
+  /**
+   * The prompt as sent, roles included. Present when this entry's text is
+   * resident; read it back for an older entry with `getRequestDetail` or
+   * `getLedger({ includeText: true })`.
+   */
+  inputMessages?: string;
+  /** The completion as returned. Same residency rule as inputMessages. */
+  outputContent?: string;
+  /** Whether this entry's text is retrievable at all, resident or in storage. */
+  hasText?: boolean;
 }
 
+/** The name the monitor's detail view speaks: an entry with its text filled in. */
+export type LLMHistoryEntry = LLMLedgerEntry;
+
+/**
+ * How much of the ledger to keep, and how much of it to hold in memory.
+ *
+ * One clock governs everything an entry carries, text included — a call is
+ * either still on the books with what it said, or it is gone. The resident
+ * bound is separate and is about memory, not history: text is the bulky
+ * part, so only the newest few calls keep theirs in RAM while the rest stay
+ * one storage read away.
+ */
+export interface LLMLedgerRetention {
+  /** Drop entries, text and all, older than this many days. 0 disables the age bound. */
+  maxAgeDays: number;
+  /**
+   * Hard ceiling on retained entries regardless of age, oldest dropped
+   * first. 0 disables it — a safety valve, not the primary bound.
+   */
+  maxEntries: number;
+  /** Whether to store prompt and completion text at all. */
+  keepText: boolean;
+  /**
+   * How many of the newest entries hold their text in memory. Older entries
+   * keep their text in storage and load it on demand.
+   */
+  residentTextEntries: number;
+}
+
+/** Filter for reading back the ledger. */
+export interface LLMLedgerQuery {
+  limit?: number;
+  offset?: number;
+  /** Only entries started at or after this timestamp. */
+  since?: number;
+  /** Only entries started at or before this timestamp. */
+  until?: number;
+  provider?: string;
+  model?: string;
+  status?: 'active' | 'complete' | 'error';
+  callerName?: string;
+  /**
+   * Fill in prompt/completion text for entries whose text is not resident.
+   * Off by default: the history list renders from metadata, and paging text
+   * nobody is going to read is the expensive part.
+   */
+  includeText?: boolean;
+}
+
+/**
+ * Headline totals. A rollup over the retained ledger, recomputed from the
+ * entries rather than maintained as running counters — so it can never drift
+ * from the calls it claims to summarize, and it always describes exactly the
+ * window the ledger still holds (`windowStart`..`windowEnd`).
+ */
 export interface LLMStats {
   totalRequests: number;
   totalInputChars: number;
@@ -164,6 +288,85 @@ export interface LLMStats {
   totalOutputTokens: number;
   totalErrors: number;
   totalLatencyMs: number;
+  /** Total spend across every model, in USD (reported + estimated). */
+  totalCostUsd: number;
+  /** Ledger entries the totals were computed from. */
+  entryCount: number;
+  /** Start time of the oldest retained entry (0 when the ledger is empty). */
+  windowStart: number;
+  /** Start time of the newest retained entry (0 when the ledger is empty). */
+  windowEnd: number;
+}
+
+/**
+ * Spend for one provider/model pair. Derived on demand by rolling up the
+ * ledger — there is no separate stored aggregate to fall out of step with
+ * the calls.
+ */
+export interface LLMModelSpend {
+  key: string;
+  provider: string;
+  model: string;
+  requests: number;
+  errors: number;
+  inputChars: number;
+  outputChars: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  /** Total cost over the retained window: reportedCostUsd + estimatedCostUsd. */
+  costUsd: number;
+  /** Portion the provider billed us for directly. */
+  reportedCostUsd: number;
+  /** Portion derived from list prices. */
+  estimatedCostUsd: number;
+  /** Completed calls whose cost is unknown (no reported charge, no price entry). */
+  unpricedRequests: number;
+  totalLatencyMs: number;
+  firstUsed: number;
+  lastUsed: number;
+  /** Cost per calendar day (local time), YYYY-MM-DD → USD. */
+  byDay: Record<string, number>;
+  /** Spend from calls made since this process started. */
+  sessionCostUsd: number;
+  /** Calls made since this process started. */
+  sessionRequests: number;
+}
+
+/** The spend picture the LLM monitor renders, rolled up from the ledger. */
+export interface LLMSpendReport {
+  models: LLMModelSpend[];
+  totals: {
+    costUsd: number;
+    reportedCostUsd: number;
+    estimatedCostUsd: number;
+    requests: number;
+    errors: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    unpricedRequests: number;
+  };
+  todayCostUsd: number;
+  sessionCostUsd: number;
+  sessionStartedAt: number;
+  /** Cost per day across all models, oldest first. */
+  days: Array<{ day: string; costUsd: number }>;
+  /**
+   * Cost per routing tier. Tier is how most callers pick a model, so this is
+   * usually the cut that answers "what is the expensive part of my setup".
+   */
+  byTier: Array<{ tier: string; costUsd: number; requests: number }>;
+  /** Prices the user supplied, which override the built-in list. */
+  pricingOverrides: Array<{ key: string; pricing: ModelPricing }>;
+  /** How much history these totals cover. */
+  retention: LLMLedgerRetention;
+  entryCount: number;
+  windowStart: number;
+  windowEnd: number;
 }
 
 /**
@@ -224,20 +427,43 @@ export class LLMObject extends Abject {
   private visionFallback?: TierConfig;
   private httpClientId?: AbjectId;
 
-  // Stats and request tracking
-  private _activeRequests: Map<string, LLMActiveRequest> = new Map();
-  private _stats: LLMStats = {
-    totalRequests: 0,
-    totalInputChars: 0,
-    totalOutputChars: 0,
-    totalInputTokens: 0,
-    totalOutputTokens: 0,
-    totalErrors: 0,
-    totalLatencyMs: 0,
+  // ── The ledger ────────────────────────────────────────────────────
+  // Every call is one entry, from start to finish. Active requests are the
+  // entries still in `active` status; history is the rest; the stats line
+  // and the per-model spend table are rollups over the whole thing. There
+  // is no second copy of any of it.
+  //
+  // Entries are resident for the whole retained window, because every
+  // rollup scans them and metadata is cheap. Their TEXT is not: only the
+  // newest `residentTextEntries` keep it in memory, and older entries load
+  // it from storage on demand. Persistence is by calendar day — entries
+  // chunk into one key per day (without text, so a rollup load stays cheap)
+  // and each call's text gets its own key, written once and never rewritten.
+  private _ledger: LLMLedgerEntry[] = [];
+  private _byId: Map<string, LLMLedgerEntry> = new Map();
+  /** Prompt text for in-flight calls, held until the entry completes. */
+  private _pendingText: Map<string, string> = new Map();
+  private readonly _sessionStartedAt = Date.now();
+  private storageId?: AbjectId;
+
+  private _retention: LLMLedgerRetention = {
+    maxAgeDays: 7,
+    maxEntries: 0,
+    keepText: true,
+    residentTextEntries: 50,
   };
+
+  /** Day keys whose chunk changed and needs rewriting. */
+  private dirtyDays: Set<string> = new Set();
+  private ledgerSaveTimer?: ReturnType<typeof setTimeout>;
+  private static readonly LEDGER_SAVE_DEBOUNCE_MS = 5000;
+  private static readonly LEDGER_DAY_PREFIX = 'llm:ledger:day:';
+  private static readonly LEDGER_TEXT_PREFIX = 'llm:ledger:text:';
+  private static readonly LEDGER_INDEX_KEY = 'llm:ledger:days';
+  private static readonly RETENTION_STORAGE_KEY = 'llm:ledgerRetention';
+  private static readonly PRICING_STORAGE_KEY = 'llm:pricingOverrides';
+
   private _paused = false;
-  private _history: LLMHistoryEntry[] = [];
-  private readonly _MAX_HISTORY = 50;
   private readonly _MAX_CONTENT_CHARS = 10_000;
 
   // ── Prompt-cache keepalive (the "cache warmer") ───────────────────────
@@ -424,13 +650,98 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'getStats',
-                description: 'Get LLM stats, active requests, and paused state',
+                description: 'Get rolled-up stats, the calls currently in flight, recent history, and paused state. The stats are recomputed from the call ledger rather than kept as running counters, so they always describe exactly the window the ledger still retains (see stats.windowStart/windowEnd and the retention policy); activeRequests and history are cuts of that same ledger, not separate records.',
                 parameters: [],
                 returns: { kind: 'object', properties: {
                   stats: { kind: 'reference', reference: 'LLMStats' },
                   activeRequests: { kind: 'array', elementType: { kind: 'reference', reference: 'LLMActiveRequest' } },
+                  history: { kind: 'array', elementType: { kind: 'reference', reference: 'LLMLedgerEntry' } },
+                  retention: { kind: 'reference', reference: 'LLMLedgerRetention' },
                   paused: { kind: 'primitive', primitive: 'boolean' },
                 }},
+              },
+              {
+                name: 'getSpend',
+                description: 'Get spend broken down by provider and model, rolled up from the call ledger. Returns { models, totals, todayCostUsd, sessionCostUsd, sessionStartedAt, days, pricingOverrides, retention, entryCount, windowStart, windowEnd }. Costs are the provider-reported charge where the provider reports one, otherwise an estimate from published list prices; calls with neither are counted in unpricedRequests rather than as free. The totals cover the retained ledger window, not necessarily all time — widen retention to widen the window. Session figures cover this process only.',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'LLMSpendReport' },
+              },
+              {
+                name: 'setModelPricing',
+                description: 'Set (or clear) the price used to estimate cost for a model whose provider does not report one. The model is matched as a prefix, so a family name covers every dated snapshot in it. Pass pricing null to clear an override and fall back to the built-in price list. Persisted.',
+                parameters: [
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name, e.g. anthropic' },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Model id or id prefix, e.g. claude-opus-5' },
+                  { name: 'pricing', type: { kind: 'reference', reference: 'ModelPricing' }, description: 'USD per million tokens: { inputPerMTok, outputPerMTok, cacheReadPerMTok?, cacheWritePerMTok? }. Null clears the override.', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getModelPricing',
+                description: 'Get the price that would be applied to a provider/model pair, including whether it came from the built-in list or a user override. Returns null when the model is unpriced.',
+                parameters: [
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name' },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Model id' },
+                ],
+                returns: { kind: 'reference', reference: 'ModelPricing' },
+              },
+              {
+                name: 'getLedger',
+                description: 'Read back recorded calls, newest first. Every LLM call is one ledger entry carrying caller, method, provider, model, routing (tier/effort/maxTokens), how generation ended, timings, character and token counts (including cache reads/writes and reasoning tokens), cost, and the prompt and completion text. Active requests and history are both cuts of this list — filter by status. Returns { entries, total, retention }.',
+                parameters: [
+                  { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max entries to return (default 200, cap 2000)', optional: true },
+                  { name: 'offset', type: { kind: 'primitive', primitive: 'number' }, description: 'Entries to skip, for paging', optional: true },
+                  { name: 'since', type: { kind: 'primitive', primitive: 'number' }, description: 'Only calls started at or after this epoch-ms timestamp', optional: true },
+                  { name: 'until', type: { kind: 'primitive', primitive: 'number' }, description: 'Only calls started at or before this epoch-ms timestamp', optional: true },
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Only calls on this provider', optional: true },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Only calls on this model', optional: true },
+                  { name: 'status', type: { kind: 'primitive', primitive: 'string' }, description: "'active' | 'complete' | 'error'", optional: true },
+                  { name: 'callerName', type: { kind: 'primitive', primitive: 'string' }, description: 'Only calls made by this object', optional: true },
+                  { name: 'includeText', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Fill in prompt/completion text for entries whose text is no longer resident. Off by default — the history list renders from metadata.', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  entries: { kind: 'array', elementType: { kind: 'reference', reference: 'LLMLedgerEntry' } },
+                  total: { kind: 'primitive', primitive: 'number' },
+                  retention: { kind: 'reference', reference: 'LLMLedgerRetention' },
+                }},
+              },
+              {
+                name: 'getLedgerRetention',
+                description: 'Get how much of the call ledger is kept and how much of it is held in memory: { maxAgeDays, maxEntries, keepText, residentTextEntries }.',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'LLMLedgerRetention' },
+              },
+              {
+                name: 'setLedgerRetention',
+                description: 'Set how much of the call ledger to keep, and how much of it to hold in memory. One clock governs everything an entry carries, prompt and completion text included: a call is either still on the books with what it said, or it is gone. residentTextEntries is a memory bound rather than a history one — text beyond the newest N entries stays in storage and loads on demand. A tightened policy is applied immediately, not at the next call. Persisted. Returns the effective policy.',
+                parameters: [
+                  { name: 'maxAgeDays', type: { kind: 'primitive', primitive: 'number' }, description: 'Drop entries, text and all, older than this many days (0 = no age bound). Default 7.', optional: true },
+                  { name: 'maxEntries', type: { kind: 'primitive', primitive: 'number' }, description: 'Hard ceiling on retained entries regardless of age, oldest dropped first (0 = no count bound). A safety valve; the age bound is the primary one. Default 0.', optional: true },
+                  { name: 'keepText', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether to store prompt and completion text at all. Turning this off deletes what is already stored. Default true.', optional: true },
+                  { name: 'residentTextEntries', type: { kind: 'primitive', primitive: 'number' }, description: 'How many of the newest entries hold their text in memory; older ones read it back from storage on demand. Default 50.', optional: true },
+                ],
+                returns: { kind: 'reference', reference: 'LLMLedgerRetention' },
+              },
+              {
+                name: 'repriceLedger',
+                description: 'Recompute recorded costs against the current price list, using the token counts each call already carries. Calls the provider billed directly are left untouched. Run this after setModelPricing to apply a new price to calls that were already recorded, including ones that were unpriced at the time. Returns { repriced, nowPriced }.',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  repriced: { kind: 'primitive', primitive: 'number' },
+                  nowPriced: { kind: 'primitive', primitive: 'number' },
+                }},
+              },
+              {
+                name: 'clearLedger',
+                description: 'Delete every recorded call, its stored prompt/completion text, and therefore every total rolled up from them. Calls still in flight are kept. Does not affect the price list or the retention policy.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'resetSpend',
+                description: 'Alias for clearLedger, kept for callers written against the earlier name.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'killRequest',
@@ -651,6 +962,7 @@ export class LLMObject extends Abject {
       const activeReq = await this.trackRequestStart(
         correlationId, callerId, 'stream', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, true, messages,
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens },
       );
 
       // Keep-alive heartbeat sent every 30s for the entire stream lifetime.
@@ -734,7 +1046,7 @@ export class LLMObject extends Abject {
         ? 'unknown (no finish frame — possible truncation)'
         : (stopReason ?? 'unknown');
       log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${reasonNote}${tokenSummary}`);
-      this.trackRequestEnd(correlationId, fullContent, usage);
+      this.trackRequestEnd(correlationId, fullContent, usage, stopReason);
       this.trackCacheWarmth(providerName, options, messages, usage);
       return { content: fullContent, stopReason, usage };
     });
@@ -829,10 +1141,18 @@ export class LLMObject extends Abject {
     });
 
     this.on('getStats', async () => {
+      // Both lists are cuts of the same ledger, and the stats are a rollup
+      // over it — nothing here is stored separately from the calls.
+      const active = this._ledger.filter(e => e.status === 'active');
+      // The recent-history working set matches the resident-text bound: it
+      // is the same "recent calls you might actually open" window.
+      const history = this.queryLedger({ limit: Math.max(1, this._retention.residentTextEntries) }).entries
+        .filter(e => e.status !== 'active');
       return {
-        stats: { ...this._stats },
-        activeRequests: Array.from(this._activeRequests.values()),
-        history: this._history,
+        stats: this.rollupStats(),
+        activeRequests: active,
+        history,
+        retention: { ...this._retention },
         paused: this._paused,
         keepalive: {
           enabled: this.cacheKeepaliveEnabled,
@@ -852,35 +1172,116 @@ export class LLMObject extends Abject {
       };
     });
 
+    this.on('getSpend', async () => {
+      return this.buildSpendReport();
+    });
+
+    this.on('setModelPricing', async (m: AbjectMessage) => {
+      const { provider, model, pricing } = m.payload as {
+        provider?: string;
+        model?: string;
+        pricing?: ModelPricing | null;
+      };
+      require(typeof provider === 'string' && provider.length > 0, 'setModelPricing needs a provider');
+      require(typeof model === 'string' && model.length > 0, 'setModelPricing needs a model (or model prefix)');
+      if (pricing) {
+        require(
+          typeof pricing.inputPerMTok === 'number' && pricing.inputPerMTok >= 0 &&
+          typeof pricing.outputPerMTok === 'number' && pricing.outputPerMTok >= 0,
+          'setModelPricing needs non-negative inputPerMTok and outputPerMTok'
+        );
+      }
+      setPricingOverride(provider!, model!, pricing ?? undefined);
+      await this.savePricing();
+      log.info(`Pricing ${pricing ? 'set' : 'cleared'} for ${provider}/${model}`);
+      return true;
+    });
+
+    this.on('getModelPricing', async (m: AbjectMessage) => {
+      const { provider, model } = m.payload as { provider?: string; model?: string };
+      require(typeof provider === 'string' && typeof model === 'string', 'getModelPricing needs provider and model');
+      return lookupPricing(provider!, model!) ?? null;
+    });
+
+    this.on('getLedger', async (m: AbjectMessage) => {
+      const q = (m.payload ?? {}) as LLMLedgerQuery;
+      const { entries, total } = this.queryLedger(q);
+      const withText = q.includeText
+        ? await Promise.all(entries.map(e => this.withText(e)))
+        : entries;
+      return { entries: withText, total, retention: { ...this._retention } };
+    });
+
+    this.on('getLedgerRetention', async () => ({ ...this._retention }));
+
+    this.on('setLedgerRetention', async (m: AbjectMessage) => {
+      const p = (m.payload ?? {}) as Partial<LLMLedgerRetention>;
+      const next: LLMLedgerRetention = { ...this._retention };
+      if (p.maxAgeDays !== undefined) {
+        require(typeof p.maxAgeDays === 'number' && p.maxAgeDays >= 0, 'maxAgeDays must be a non-negative number');
+        next.maxAgeDays = Math.floor(p.maxAgeDays);
+      }
+      if (p.maxEntries !== undefined) {
+        require(typeof p.maxEntries === 'number' && p.maxEntries >= 0, 'maxEntries must be a non-negative number');
+        next.maxEntries = Math.floor(p.maxEntries);
+      }
+      if (p.keepText !== undefined) {
+        require(typeof p.keepText === 'boolean', 'keepText must be a boolean');
+        next.keepText = p.keepText;
+      }
+      if (p.residentTextEntries !== undefined) {
+        require(typeof p.residentTextEntries === 'number' && p.residentTextEntries >= 0,
+          'residentTextEntries must be a non-negative number');
+        next.residentTextEntries = Math.floor(p.residentTextEntries);
+      }
+      this._retention = next;
+      await this.saveRetention();
+      // A tightened policy takes effect now, not at the next call.
+      this.enforceRetention();
+      if (!next.keepText) await this.dropAllText();
+      this.scheduleLedgerSave();
+      log.info(`Ledger retention set: ${next.maxAgeDays}d${next.maxEntries > 0 ? ` / ${next.maxEntries} calls` : ''}, text ${next.keepText ? `on (${next.residentTextEntries} resident)` : 'off'}`);
+      return { ...this._retention };
+    });
+
+    this.on('repriceLedger', async () => {
+      const result = this.repriceLedger();
+      log.info(`Repriced ${result.repriced} ledger entries (${result.nowPriced} previously unpriced)`);
+      return result;
+    });
+
+    this.on('clearLedger', async () => {
+      await this.clearLedger();
+      return true;
+    });
+
+    // Retained under its old name: the monitor's reset button and any script
+    // written against it still mean "throw away the recorded calls".
+    this.on('resetSpend', async () => {
+      await this.clearLedger();
+      return true;
+    });
+
     this.on('getRequestDetail', async (m: AbjectMessage) => {
       const { requestId } = m.payload as { requestId: string };
-      // Check history first (most common case)
-      const entry = this._history.find(h => h.id === requestId);
-      if (entry) return entry;
-      // Check active requests (no output content yet)
-      const active = this._activeRequests.get(requestId);
-      if (active) {
+      const entry = this._byId.get(requestId);
+      if (!entry) return null;
+
+      if (entry.status === 'active') {
         return {
-          id: active.id,
-          callerId: active.callerId,
-          callerName: active.callerName,
-          method: active.method,
-          provider: active.provider,
-          startTime: active.startTime,
-          elapsedMs: Date.now() - active.startTime,
-          inputChars: active.inputChars,
-          outputChars: active.outputChars,
-          inputMessages: active.inputMessages ?? '',
+          ...entry,
+          elapsedMs: Date.now() - entry.startTime,
+          inputMessages: this._pendingText.get(requestId) ?? '',
           outputContent: '(still in progress)',
         } as LLMHistoryEntry;
       }
-      return null;
+      return await this.withText(entry);
     });
 
     this.on('killRequest', async (m: AbjectMessage) => {
       const { requestId } = m.payload as { requestId: string };
-      const req = this._activeRequests.get(requestId);
-      if (!req) return false;
+      const req = this._byId.get(requestId);
+      if (!req || req.status !== 'active') return false;
       req.killed = true;
       log.info(`Kill requested for ${requestId}`);
       return true;
@@ -925,6 +1326,16 @@ export class LLMObject extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
+    if (this.storageId) {
+      // Order matters: the retention policy decides what the ledger load is
+      // allowed to keep, and prices are needed before anything is re-priced.
+      await this.loadRetention();
+      await this.loadPricing();
+      await this.loadLedger();
+    } else {
+      log.warn('Storage unavailable; the call ledger will reset when the process restarts');
+    }
   }
 
   /**
@@ -1060,7 +1471,9 @@ export class LLMObject extends Abject {
     // Track active request
     const trackId = requestId ?? `internal-${Date.now()}`;
     if (callerId) {
-      await this.trackRequestStart(trackId, callerId, 'complete', provider.name, this.modelFor(provider, effectiveOptions), totalChars, false, messages);
+      await this.trackRequestStart(trackId, callerId, 'complete', provider.name,
+        this.modelFor(provider, effectiveOptions), totalChars, false, messages,
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens });
     }
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
@@ -1085,7 +1498,7 @@ export class LLMObject extends Abject {
       const result = await provider.complete(messages, effectiveOptions);
       const elapsed = Date.now() - start;
       log.info(`← ${provider.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
-      if (callerId) this.trackRequestEnd(trackId, result.content, result.usage);
+      if (callerId) this.trackRequestEnd(trackId, result.content, result.usage, result.finishReason);
       return result;
     } catch (err) {
       const elapsed = Date.now() - start;
@@ -1449,6 +1862,22 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     }
   }
 
+  // ── The ledger: write path ────────────────────────────────────────
+
+  /** Local calendar day key, the unit both retention and persistence use. */
+  private static dayKey(ts: number): string {
+    const d = new Date(ts);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${mm}-${dd}`;
+  }
+
+  /**
+   * Open a ledger entry for a call that is starting. The entry goes into the
+   * ledger immediately, in `active` status — the monitor's Active Requests
+   * tab is a filter over these, not a separate collection — and is mutated
+   * in place as the call streams and finishes.
+   */
   private async trackRequestStart(
     requestId: string,
     callerId: AbjectId,
@@ -1458,9 +1887,10 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     inputChars: number,
     streaming: boolean,
     messages?: LLMMessage[],
-  ): Promise<LLMActiveRequest> {
+    routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number },
+  ): Promise<LLMLedgerEntry> {
     const callerName = await this.resolveCallerName(callerId);
-    const activeReq: LLMActiveRequest = {
+    const entry: LLMLedgerEntry = {
       id: requestId,
       callerId,
       callerName,
@@ -1468,108 +1898,636 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       provider: providerName,
       model,
       startTime: Date.now(),
+      elapsedMs: 0,
       inputChars,
       outputChars: 0,
       streaming,
       killed: false,
-      inputMessages: messages ? this.serializeMessages(messages) : undefined,
+      status: 'active',
+      tier: routing?.tier,
+      effort: routing?.effort,
+      maxTokens: routing?.maxTokens,
     };
-    this._activeRequests.set(requestId, activeReq);
-    this._stats.totalRequests++;
-    this.changed('requestStarted', { ...activeReq });
-    return activeReq;
+    this._ledger.push(entry);
+    this._byId.set(requestId, entry);
+    if (messages) this._pendingText.set(requestId, this.serializeMessages(messages));
+    this.changed('requestStarted', { ...entry });
+    return entry;
   }
 
   /**
-   * Record completion of a tracked request and save to history.
+   * Close a ledger entry that completed: fold in the token counts, price the
+   * call, and hand its message bodies to storage.
    */
   private trackRequestEnd(
     requestId: string,
     outputContent: string,
-    usage?: { inputTokens: number; outputTokens: number },
+    usage?: LLMUsage,
+    finishReason?: string,
   ): void {
-    const req = this._activeRequests.get(requestId);
-    if (!req) return;
-    const elapsed = Date.now() - req.startTime;
-    const outChars = outputContent.length;
-    this._stats.totalLatencyMs += elapsed;
-    this._stats.totalInputChars += req.inputChars;
-    this._stats.totalOutputChars += outChars;
-    if (usage) {
-      this._stats.totalInputTokens += usage.inputTokens;
-      this._stats.totalOutputTokens += usage.outputTokens;
-    }
-    // Save to history before deleting
-    this._history.push({
-      id: req.id,
-      callerId: req.callerId,
-      callerName: req.callerName,
-      method: req.method,
-      provider: req.provider,
-      model: req.model,
-      startTime: req.startTime,
-      elapsedMs: elapsed,
-      inputChars: req.inputChars,
-      outputChars: outChars,
-      inputMessages: req.inputMessages ?? '',
-      outputContent: this.truncate(outputContent),
-      usage,
-    });
-    if (this._history.length > this._MAX_HISTORY) {
-      this._history.shift();
-    }
-    this._activeRequests.delete(requestId);
+    const entry = this._byId.get(requestId);
+    if (!entry || entry.status !== 'active') return;
+    const now = Date.now();
+    entry.endTime = now;
+    entry.elapsedMs = now - entry.startTime;
+    entry.outputChars = outputContent.length;
+    entry.usage = usage;
+    entry.finishReason = finishReason;
+    entry.status = 'complete';
+
+    const cost = this.priceCall(entry.provider, entry.model, usage);
+    entry.costUsd = cost.costUsd;
+    // Left undefined when the call is unpriced. `false` has to mean exactly
+    // "the provider billed us this", or an unpriced call is indistinguishable
+    // from a billed one and re-pricing would skip it forever.
+    entry.costEstimated = cost.costUsd === undefined ? undefined : cost.estimated;
+
+    this.finishEntry(entry, outputContent);
     this.changed('requestCompleted', {
       id: requestId,
-      callerName: req.callerName,
-      method: req.method,
-      provider: req.provider,
-      model: req.model,
-      elapsedMs: elapsed,
-      inputChars: req.inputChars,
-      outputChars: outChars,
+      callerName: entry.callerName,
+      method: entry.method,
+      provider: entry.provider,
+      model: entry.model,
+      elapsedMs: entry.elapsedMs,
+      inputChars: entry.inputChars,
+      outputChars: entry.outputChars,
       usage,
+      costUsd: entry.costUsd,
+      costEstimated: entry.costEstimated,
     });
   }
 
-  /**
-   * Record an error on a tracked request and save to history.
-   */
+  /** Close a ledger entry that failed. A failed call has no cost to price. */
   private trackRequestError(requestId: string, error: string): void {
-    const req = this._activeRequests.get(requestId);
-    if (!req) return;
-    const elapsed = Date.now() - req.startTime;
-    this._stats.totalErrors++;
-    this._stats.totalLatencyMs += elapsed;
-    // Save error to history
-    this._history.push({
-      id: req.id,
-      callerId: req.callerId,
-      callerName: req.callerName,
-      method: req.method,
-      provider: req.provider,
-      model: req.model,
-      startTime: req.startTime,
-      elapsedMs: elapsed,
-      inputChars: req.inputChars,
-      outputChars: 0,
-      inputMessages: req.inputMessages ?? '',
-      outputContent: '',
-      error,
-    });
-    if (this._history.length > this._MAX_HISTORY) {
-      this._history.shift();
-    }
-    this._activeRequests.delete(requestId);
+    const entry = this._byId.get(requestId);
+    if (!entry || entry.status !== 'active') return;
+    const now = Date.now();
+    entry.endTime = now;
+    entry.elapsedMs = now - entry.startTime;
+    entry.outputChars = 0;
+    entry.status = 'error';
+    entry.error = error;
+
+    this.finishEntry(entry, '');
     this.changed('requestError', {
       id: requestId,
-      callerName: req.callerName,
-      method: req.method,
-      provider: req.provider,
-      model: req.model,
-      elapsedMs: elapsed,
+      callerName: entry.callerName,
+      method: entry.method,
+      provider: entry.provider,
+      model: entry.model,
+      elapsedMs: entry.elapsedMs,
       error,
     });
+  }
+
+  /** Shared tail of both close paths: attach the text, mark dirty, prune. */
+  private finishEntry(entry: LLMLedgerEntry, outputContent: string): void {
+    const prompt = this._pendingText.get(entry.id);
+    this._pendingText.delete(entry.id);
+
+    if (this._retention.keepText) {
+      const inputMessages = prompt ?? '';
+      const output = this.truncate(outputContent);
+      if (inputMessages || output) {
+        entry.inputMessages = inputMessages;
+        entry.outputContent = output;
+        entry.hasText = true;
+        void this.writeText(entry.id, { inputMessages, outputContent: output });
+      }
+    }
+
+    this.dirtyDays.add(LLMObject.dayKey(entry.startTime));
+    this.enforceRetention();
+    this.scheduleLedgerSave();
+  }
+
+  /**
+   * What a call cost. The provider's own charge wins when it reports one;
+   * otherwise the token counts are priced off the list. Neither available
+   * means UNPRICED — deliberately left undefined rather than zero, so a
+   * $0.00 total always means $0.00 spent and never "nobody knew the price".
+   */
+  private priceCall(
+    provider: string,
+    model: string,
+    usage: LLMUsage | undefined,
+  ): { costUsd?: number; estimated: boolean } {
+    if (typeof usage?.costUsd === 'number') return { costUsd: usage.costUsd, estimated: false };
+    if (!usage) return { costUsd: undefined, estimated: false };
+    const estimate = estimateCostUsd(provider, model, usage);
+    return estimate === undefined
+      ? { costUsd: undefined, estimated: false }
+      : { costUsd: estimate, estimated: true };
+  }
+
+  // ── The ledger: retention ─────────────────────────────────────────
+
+  /**
+   * Drop what the retention policy says to drop: entries past the age or
+   * count bound, and bodies past their own (shorter) age bound. Active
+   * entries are never pruned — a long-running call is not stale history.
+   */
+  private enforceRetention(): void {
+    const { maxAgeDays, maxEntries, residentTextEntries } = this._retention;
+    const now = Date.now();
+    const dropped: LLMLedgerEntry[] = [];
+
+    if (maxAgeDays > 0) {
+      const cutoff = now - maxAgeDays * 86_400_000;
+      for (const e of this._ledger) {
+        if (e.status !== 'active' && e.startTime < cutoff) dropped.push(e);
+      }
+    }
+    if (maxEntries > 0) {
+      const closed = this._ledger.filter(e => e.status !== 'active');
+      const surplus = closed.length - dropped.length - maxEntries;
+      if (surplus > 0) {
+        // Oldest first; `closed` is in insertion order, which is start order.
+        const alreadyDropped = new Set(dropped.map(e => e.id));
+        let taken = 0;
+        for (const e of closed) {
+          if (taken >= surplus) break;
+          if (alreadyDropped.has(e.id)) continue;
+          dropped.push(e);
+          taken++;
+        }
+      }
+    }
+
+    if (dropped.length > 0) {
+      const dropIds = new Set(dropped.map(e => e.id));
+      for (const e of dropped) {
+        this._byId.delete(e.id);
+        this.dirtyDays.add(LLMObject.dayKey(e.startTime));
+        if (e.hasText) void this.deleteText(e.id);
+      }
+      this._ledger = this._ledger.filter(e => !dropIds.has(e.id));
+    }
+
+    // Text follows the entry's clock, so nothing expires separately. What
+    // IS bounded separately is how much of it sits in RAM: keep the newest
+    // few entries' text resident and let the rest live in storage.
+    this.enforceResidentText(residentTextEntries);
+  }
+
+  /**
+   * Hold text in memory only for the newest N entries. Dropping it here is
+   * an eviction, not a deletion: `hasText` stays true and the text is still
+   * in storage, so opening an older call just costs one read.
+   */
+  private enforceResidentText(limit: number): void {
+    if (limit <= 0) {
+      for (const e of this._ledger) {
+        e.inputMessages = undefined;
+        e.outputContent = undefined;
+      }
+      return;
+    }
+    const withText: LLMLedgerEntry[] = [];
+    for (const e of this._ledger) {
+      if (e.inputMessages !== undefined || e.outputContent !== undefined) withText.push(e);
+    }
+    if (withText.length <= limit) return;
+    withText.sort((a, b) => b.startTime - a.startTime);
+    for (const e of withText.slice(limit)) {
+      e.inputMessages = undefined;
+      e.outputContent = undefined;
+    }
+  }
+
+  // ── The ledger: rollups ───────────────────────────────────────────
+
+  /** Headline totals, recomputed from the retained entries. */
+  private rollupStats(): LLMStats {
+    const stats: LLMStats = {
+      totalRequests: 0,
+      totalInputChars: 0,
+      totalOutputChars: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalErrors: 0,
+      totalLatencyMs: 0,
+      totalCostUsd: 0,
+      entryCount: this._ledger.length,
+      windowStart: 0,
+      windowEnd: 0,
+    };
+    for (const e of this._ledger) {
+      stats.totalRequests++;
+      stats.totalInputChars += e.inputChars;
+      stats.totalOutputChars += e.outputChars;
+      stats.totalInputTokens += e.usage?.inputTokens ?? 0;
+      stats.totalOutputTokens += e.usage?.outputTokens ?? 0;
+      stats.totalLatencyMs += e.elapsedMs;
+      stats.totalCostUsd += e.costUsd ?? 0;
+      if (e.status === 'error') stats.totalErrors++;
+      if (stats.windowStart === 0 || e.startTime < stats.windowStart) stats.windowStart = e.startTime;
+      if (e.startTime > stats.windowEnd) stats.windowEnd = e.startTime;
+    }
+    return stats;
+  }
+
+  /** Spend rolled up per provider/model, plus per-day and session cuts. */
+  private buildSpendReport(): LLMSpendReport {
+    const models = new Map<string, LLMModelSpend>();
+    const dayTotals = new Map<string, number>();
+    const tierTotals = new Map<string, { costUsd: number; requests: number }>();
+    const totals = {
+      costUsd: 0, reportedCostUsd: 0, estimatedCostUsd: 0,
+      requests: 0, errors: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      unpricedRequests: 0,
+    };
+    let sessionCostUsd = 0;
+    let windowStart = 0;
+    let windowEnd = 0;
+
+    for (const e of this._ledger) {
+      if (e.status === 'active') continue; // nothing settled to charge yet
+      const key = `${e.provider}/${e.model || '(default)'}`;
+      let m = models.get(key);
+      if (!m) {
+        m = {
+          key, provider: e.provider, model: e.model || '(default)',
+          requests: 0, errors: 0, inputChars: 0, outputChars: 0,
+          inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+          reasoningTokens: 0,
+          costUsd: 0, reportedCostUsd: 0, estimatedCostUsd: 0, unpricedRequests: 0,
+          totalLatencyMs: 0, firstUsed: e.startTime, lastUsed: e.startTime,
+          byDay: {}, sessionCostUsd: 0, sessionRequests: 0,
+        };
+        models.set(key, m);
+      }
+
+      m.totalLatencyMs += e.elapsedMs;
+      m.firstUsed = Math.min(m.firstUsed, e.startTime);
+      m.lastUsed = Math.max(m.lastUsed, e.startTime);
+      if (windowStart === 0 || e.startTime < windowStart) windowStart = e.startTime;
+      if (e.startTime > windowEnd) windowEnd = e.startTime;
+
+      if (e.status === 'error') {
+        m.errors++;
+        totals.errors++;
+        continue;
+      }
+
+      m.requests++;
+      totals.requests++;
+      const tierKey = e.tier ?? '(no tier)';
+      let tierRec = tierTotals.get(tierKey);
+      if (!tierRec) { tierRec = { costUsd: 0, requests: 0 }; tierTotals.set(tierKey, tierRec); }
+      tierRec.requests++;
+      m.inputChars += e.inputChars;
+      m.outputChars += e.outputChars;
+      if (e.startTime >= this._sessionStartedAt) m.sessionRequests++;
+
+      const u = e.usage;
+      if (u) {
+        m.inputTokens += u.inputTokens;
+        m.outputTokens += u.outputTokens;
+        m.cacheReadTokens += u.cacheReadTokens ?? 0;
+        m.cacheWriteTokens += u.cacheWriteTokens ?? 0;
+        m.reasoningTokens += u.reasoningTokens ?? 0;
+        totals.inputTokens += u.inputTokens;
+        totals.outputTokens += u.outputTokens;
+        totals.cacheReadTokens += u.cacheReadTokens ?? 0;
+        totals.cacheWriteTokens += u.cacheWriteTokens ?? 0;
+      }
+
+      if (e.costUsd === undefined) {
+        m.unpricedRequests++;
+        totals.unpricedRequests++;
+        continue;
+      }
+
+      m.costUsd += e.costUsd;
+      totals.costUsd += e.costUsd;
+      if (e.costEstimated) {
+        m.estimatedCostUsd += e.costUsd;
+        totals.estimatedCostUsd += e.costUsd;
+      } else {
+        m.reportedCostUsd += e.costUsd;
+        totals.reportedCostUsd += e.costUsd;
+      }
+      if (e.startTime >= this._sessionStartedAt) {
+        m.sessionCostUsd += e.costUsd;
+        sessionCostUsd += e.costUsd;
+      }
+      tierRec.costUsd += e.costUsd;
+      const day = LLMObject.dayKey(e.startTime);
+      m.byDay[day] = (m.byDay[day] ?? 0) + e.costUsd;
+      dayTotals.set(day, (dayTotals.get(day) ?? 0) + e.costUsd);
+    }
+
+    const days = Array.from(dayTotals.entries())
+      .map(([day, costUsd]) => ({ day, costUsd }))
+      .sort((a, b) => a.day.localeCompare(b.day));
+
+    return {
+      models: Array.from(models.values()),
+      totals,
+      todayCostUsd: dayTotals.get(LLMObject.dayKey(Date.now())) ?? 0,
+      sessionCostUsd,
+      sessionStartedAt: this._sessionStartedAt,
+      days,
+      byTier: Array.from(tierTotals.entries())
+        .map(([tier, v]) => ({ tier, ...v }))
+        .sort((a, b) => b.costUsd - a.costUsd),
+      pricingOverrides: listPricingOverrides(),
+      retention: { ...this._retention },
+      entryCount: this._ledger.length,
+      windowStart,
+      windowEnd,
+    };
+  }
+
+  /**
+   * Return an entry with its text filled in, reading storage when the text
+   * is no longer resident. An entry that never had text, or whose text was
+   * dropped, says so rather than coming back with empty strings that would
+   * read as "the model was sent nothing and said nothing".
+   */
+  private async withText(entry: LLMLedgerEntry): Promise<LLMLedgerEntry> {
+    if (entry.inputMessages !== undefined || entry.outputContent !== undefined) {
+      return { ...entry };
+    }
+    if (!entry.hasText) {
+      return {
+        ...entry,
+        inputMessages: '',
+        outputContent: '(prompt and output not retained)',
+      };
+    }
+    const stored = await this.readText(entry.id);
+    return {
+      ...entry,
+      inputMessages: stored?.inputMessages ?? '',
+      outputContent: stored?.outputContent ?? '(prompt and output no longer retained)',
+    };
+  }
+
+  /** Read back ledger entries, newest first, with optional filters. */
+  private queryLedger(q: LLMLedgerQuery): { entries: LLMLedgerEntry[]; total: number } {
+    let rows = this._ledger;
+    if (q.status) rows = rows.filter(e => e.status === q.status);
+    if (q.provider) rows = rows.filter(e => e.provider === q.provider);
+    if (q.model) rows = rows.filter(e => e.model === q.model);
+    if (q.callerName) rows = rows.filter(e => e.callerName === q.callerName);
+    if (q.since !== undefined) rows = rows.filter(e => e.startTime >= q.since!);
+    if (q.until !== undefined) rows = rows.filter(e => e.startTime <= q.until!);
+
+    const total = rows.length;
+    // Newest first, breaking ties by insertion order — a burst of calls can
+    // share a millisecond, and without the tiebreak those land oldest-first
+    // in the middle of a newest-first list.
+    const order = new Map(this._ledger.map((e, i) => [e.id, i]));
+    const sorted = [...rows].sort((a, b) =>
+      (b.startTime - a.startTime) || ((order.get(b.id) ?? 0) - (order.get(a.id) ?? 0)));
+    const offset = Math.max(0, q.offset ?? 0);
+    const limit = Math.max(1, Math.min(q.limit ?? 200, 2000));
+    return { entries: sorted.slice(offset, offset + limit), total };
+  }
+
+  // ── The ledger: persistence ───────────────────────────────────────
+  //
+  // One Storage key per calendar day holds that day's entries. Appending a
+  // call rewrites only today; a day aging out of the retention window is a
+  // single delete. Message bodies are separate keys, written once and never
+  // rewritten, so the hot path never re-serializes prompt text.
+
+  private scheduleLedgerSave(): void {
+    if (this.ledgerSaveTimer || !this.storageId) return;
+    this.ledgerSaveTimer = setTimeout(() => {
+      this.ledgerSaveTimer = undefined;
+      this.saveLedger().catch(err => log.warn('Failed to persist LLM ledger:', err));
+    }, LLMObject.LEDGER_SAVE_DEBOUNCE_MS);
+  }
+
+  private async writeText(id: string, text: { inputMessages: string; outputContent: string }): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(
+        msg.request(this.id, this.storageId, 'set', { key: LLMObject.LEDGER_TEXT_PREFIX + id, value: text })
+      );
+    } catch (err) {
+      log.warn(`Failed to persist ledger text ${id}:`, err);
+    }
+  }
+
+  private async deleteText(id: string): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(
+        msg.request(this.id, this.storageId, 'delete', { key: LLMObject.LEDGER_TEXT_PREFIX + id })
+      );
+    } catch { /* already gone */ }
+  }
+
+  private async readText(id: string): Promise<{ inputMessages: string; outputContent: string } | null> {
+    if (!this.storageId) return null;
+    try {
+      const v = await this.request<unknown>(
+        msg.request(this.id, this.storageId, 'get', { key: LLMObject.LEDGER_TEXT_PREFIX + id })
+      );
+      return v && typeof v === 'object' ? v as { inputMessages: string; outputContent: string } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Rewrite every day chunk that changed, and the day index alongside. */
+  private async saveLedger(): Promise<void> {
+    if (!this.storageId || this.dirtyDays.size === 0) return;
+    const days = Array.from(this.dirtyDays);
+    this.dirtyDays.clear();
+
+    // Group the closed entries by day. Active ones are deliberately excluded:
+    // a call in flight when the process dies did not happen as far as any
+    // later boot can tell, and persisting it would strand an entry that can
+    // never leave `active`.
+    const byDay = new Map<string, LLMLedgerEntry[]>();
+    for (const e of this._ledger) {
+      if (e.status === 'active') continue;
+      const day = LLMObject.dayKey(e.startTime);
+      let bucket = byDay.get(day);
+      if (!bucket) { bucket = []; byDay.set(day, bucket); }
+      // Strip the text: it lives under its own key, and keeping it out of
+      // the day chunk is what lets a rollup load seven days cheaply.
+      const { inputMessages: _i, outputContent: _o, ...meta } = e;
+      bucket.push(meta as LLMLedgerEntry);
+    }
+
+    try {
+      for (const day of days) {
+        const entries = byDay.get(day);
+        const key = LLMObject.LEDGER_DAY_PREFIX + day;
+        if (!entries || entries.length === 0) {
+          await this.request(msg.request(this.id, this.storageId, 'delete', { key }));
+        } else {
+          await this.request(msg.request(this.id, this.storageId, 'set', { key, value: entries }));
+        }
+      }
+      await this.request(msg.request(this.id, this.storageId, 'set', {
+        key: LLMObject.LEDGER_INDEX_KEY,
+        value: Array.from(byDay.keys()).sort(),
+      }));
+    } catch (err) {
+      // Stay dirty so the next call retries rather than losing the record.
+      for (const day of days) this.dirtyDays.add(day);
+      throw err;
+    }
+  }
+
+  private async loadLedger(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const index = await this.request<unknown>(
+        msg.request(this.id, this.storageId, 'get', { key: LLMObject.LEDGER_INDEX_KEY })
+      );
+      if (!Array.isArray(index)) return;
+      const loaded: LLMLedgerEntry[] = [];
+      for (const day of (index as string[]).slice().sort()) {
+        const chunk = await this.request<unknown>(
+          msg.request(this.id, this.storageId, 'get', { key: LLMObject.LEDGER_DAY_PREFIX + day })
+        );
+        if (Array.isArray(chunk)) loaded.push(...(chunk as LLMLedgerEntry[]));
+      }
+      loaded.sort((a, b) => a.startTime - b.startTime);
+      for (const e of loaded) {
+        if (!e || typeof e.id !== 'string') continue;
+        // Belt and braces: nothing should have been stored active, but a
+        // stranded active entry would never age out of the Active tab.
+        if (e.status === 'active') e.status = 'error';
+        this._ledger.push(e);
+        this._byId.set(e.id, e);
+      }
+      // Policy may have tightened, or the process may have been down for
+      // longer than the window, so prune against today's clock on the way in.
+      const before = this._ledger.length;
+      this.enforceRetention();
+      const stats = this.rollupStats();
+      log.info(
+        `Restored ${this._ledger.length} ledger entries` +
+        `${before !== this._ledger.length ? ` (${before - this._ledger.length} aged out)` : ''}` +
+        `, $${stats.totalCostUsd.toFixed(4)} over the retained window`
+      );
+      if (this.dirtyDays.size > 0) this.scheduleLedgerSave();
+    } catch (err) {
+      log.warn('Failed to restore LLM ledger:', err);
+    }
+  }
+
+  /** Drop every entry, every body, and every day chunk. */
+  private async clearLedger(): Promise<void> {
+    const ids = this._ledger.filter(e => e.status !== 'active').map(e => e.id);
+    const days = new Set(this._ledger.map(e => LLMObject.dayKey(e.startTime)));
+    const active = this._ledger.filter(e => e.status === 'active');
+
+    this._ledger = active;
+    this._byId = new Map(active.map(e => [e.id, e]));
+    this.dirtyDays.clear();
+
+    if (!this.storageId) return;
+    for (const day of days) {
+      try {
+        await this.request(msg.request(this.id, this.storageId, 'delete', {
+          key: LLMObject.LEDGER_DAY_PREFIX + day,
+        }));
+      } catch { /* already gone */ }
+    }
+    for (const id of ids) await this.deleteText(id);
+    try {
+      await this.request(msg.request(this.id, this.storageId, 'set', {
+        key: LLMObject.LEDGER_INDEX_KEY, value: [],
+      }));
+    } catch { /* best effort */ }
+    log.info('Ledger cleared');
+  }
+
+  /**
+   * Re-price recorded calls against the current price list. Entries whose
+   * cost came from the provider are left alone — a billed charge is not ours
+   * to recompute. Everything else is re-derived from the token counts the
+   * entry already carries, which is what makes setting a price for a model
+   * that was unpriced at the time worth anything.
+   */
+  private repriceLedger(): { repriced: number; nowPriced: number } {
+    let repriced = 0;
+    let nowPriced = 0;
+    for (const e of this._ledger) {
+      if (e.status !== 'complete') continue;
+      // Only a priced-and-not-estimated entry is a real provider charge;
+      // an unpriced one carries costEstimated undefined and must be re-tried.
+      if (e.costUsd !== undefined && e.costEstimated === false) continue;
+      if (!e.usage) continue;
+      const next = estimateCostUsd(e.provider, e.model, e.usage);
+      if (next === e.costUsd) continue;
+      if (e.costUsd === undefined && next !== undefined) nowPriced++;
+      e.costUsd = next;
+      e.costEstimated = next === undefined ? undefined : true;
+      repriced++;
+      this.dirtyDays.add(LLMObject.dayKey(e.startTime));
+    }
+    if (repriced > 0) this.scheduleLedgerSave();
+    return { repriced, nowPriced };
+  }
+
+  /** Forget every retained prompt/completion, keeping the cost records. */
+  private async dropAllText(): Promise<void> {
+    for (const e of this._ledger) {
+      if (!e.hasText) continue;
+      e.hasText = false;
+      e.inputMessages = undefined;
+      e.outputContent = undefined;
+      this.dirtyDays.add(LLMObject.dayKey(e.startTime));
+      await this.deleteText(e.id);
+    }
+  }
+
+  private async loadRetention(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const stored = await this.request<unknown>(
+        msg.request(this.id, this.storageId, 'get', { key: LLMObject.RETENTION_STORAGE_KEY })
+      );
+      if (stored && typeof stored === 'object') {
+        this._retention = { ...this._retention, ...(stored as Partial<LLMLedgerRetention>) };
+      }
+    } catch (err) {
+      log.warn('Failed to restore ledger retention policy:', err);
+    }
+  }
+
+  private async saveRetention(): Promise<void> {
+    if (!this.storageId) return;
+    await this.request(msg.request(this.id, this.storageId, 'set', {
+      key: LLMObject.RETENTION_STORAGE_KEY, value: this._retention,
+    }));
+  }
+
+  private async loadPricing(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const stored = await this.request<unknown>(
+        msg.request(this.id, this.storageId, 'get', { key: LLMObject.PRICING_STORAGE_KEY })
+      );
+      if (Array.isArray(stored)) {
+        loadPricingOverrides(stored as Array<{ key: string; pricing: ModelPricing }>);
+      }
+    } catch (err) {
+      log.warn('Failed to restore LLM pricing overrides:', err);
+    }
+  }
+
+  private async savePricing(): Promise<void> {
+    if (!this.storageId) return;
+    await this.request(
+      msg.request(this.id, this.storageId, 'set', {
+        key: LLMObject.PRICING_STORAGE_KEY,
+        value: listPricingOverrides(),
+      })
+    );
   }
 
   /**
@@ -2136,6 +3094,12 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
   protected override async onStop(): Promise<void> {
     this.dropAllWarmEntries('stopping');
+    if (this.ledgerSaveTimer) {
+      clearTimeout(this.ledgerSaveTimer);
+      this.ledgerSaveTimer = undefined;
+    }
+    // Flush rather than losing up to a debounce window of recorded calls.
+    try { await this.saveLedger(); } catch (err) { log.warn('Failed to flush LLM ledger on stop:', err); }
     await super.onStop();
   }
 

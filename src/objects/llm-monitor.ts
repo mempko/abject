@@ -1,9 +1,11 @@
 /**
- * LLMMonitor -- real-time viewer for LLM request activity, history, and stats.
+ * LLMMonitor -- real-time viewer over the LLM object's call ledger.
  *
- * Shows active requests and recent history with requester, method, provider,
- * model, elapsed time, and output characters. Provides controls to kill requests,
- * pause/unpause the LLM object, and view full prompt/output of any request.
+ * Every tab is a view of the same thing. Active Requests are the ledger
+ * entries still in flight, Recent History is the settled ones, and Stats
+ * rolls the whole ledger up by provider, model, tier, and day. Each row
+ * carries the call's token counts and what it cost; the Stats tab also owns
+ * the retention policy that decides how long any of it is kept.
  * Accessible from the GlobalToolbar.
  */
 
@@ -16,7 +18,14 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import type { LLMActiveRequest, LLMStats, LLMHistoryEntry } from './llm-object.js';
+import type {
+  LLMActiveRequest,
+  LLMStats,
+  LLMHistoryEntry,
+  LLMLedgerEntry,
+  LLMLedgerRetention,
+  LLMSpendReport,
+} from './llm-object.js';
 
 const log = new Log('LLMMonitor');
 
@@ -30,7 +39,8 @@ const DETAIL_H = 500;
 interface StatsSnapshot {
   stats: LLMStats;
   activeRequests: LLMActiveRequest[];
-  history: LLMHistoryEntry[];
+  history: LLMLedgerEntry[];
+  retention?: LLMLedgerRetention;
   paused: boolean;
 }
 
@@ -39,30 +49,25 @@ interface StatsSnapshot {
  * entry of the sorted desired list, and cells update in place (diffed against
  * `desc`). This makes arbitrary ordering (newest-on-top, column sorts) free —
  * no layout reordering, no widget churn beyond count changes.
- * Labels order: name, method, provider, model, started, time, output.
+ * Labels are positional against HEADER_COLUMNS.
  */
 interface RowWidgets {
   requestId: string;
   containerId: AbjectId;  // the row's HBox; destroying it cascades to labels + btn
-  labels: AbjectId[];  // [name, method, provider, model, started, time, output]
+  labels: AbjectId[];  // one per HEADER_COLUMNS entry, in that order
   btn: AbjectId;
   /** Last rendered desc; cells whose value is unchanged are not re-sent. */
   desc?: RowDesc;
 }
 
 /** Sortable columns, in header order. */
-type SortCol = 'name' | 'method' | 'provider' | 'model' | 'started' | 'time' | 'output';
+type SortCol = 'name' | 'method' | 'provider' | 'model' | 'started' | 'time' | 'output' | 'tokens' | 'cost';
 
 /** Desired state for a single row, diffed against the slot currently rendered. */
 interface RowDesc {
   id: string;
-  name: string;
-  method: string;
-  provider: string;
-  model: string;
-  started: string;
-  time: string;
-  output: string;
+  /** Rendered cell text, aligned to HEADER_COLUMNS. */
+  cells: string[];
   nameColor: string;
   actionText: string;
   isKill: boolean;
@@ -72,17 +77,82 @@ interface RowDesc {
 
 const HEADER_COLUMNS: Array<{ col: SortCol; text: string; width?: number }> = [
   { col: 'name', text: 'Requester' },
-  { col: 'method', text: 'Method', width: 70 },
-  { col: 'provider', text: 'Provider', width: 80 },
-  { col: 'model', text: 'Model', width: 120 },
-  { col: 'started', text: 'Started', width: 62 },
-  { col: 'time', text: 'Time', width: 50 },
-  { col: 'output', text: 'Output', width: 60 },
+  { col: 'method', text: 'Method', width: 62 },
+  { col: 'provider', text: 'Provider', width: 72 },
+  { col: 'model', text: 'Model', width: 108 },
+  { col: 'started', text: 'Started', width: 58 },
+  { col: 'time', text: 'Time', width: 46 },
+  { col: 'output', text: 'Chars', width: 52 },
+  { col: 'tokens', text: 'Tokens', width: 92 },
+  { col: 'cost', text: 'Cost', width: 66 },
 ];
 
 /** Numeric columns read best newest/biggest first; text columns A→Z. */
 function defaultSortDir(col: SortCol): 1 | -1 {
-  return col === 'started' || col === 'time' || col === 'output' ? -1 : 1;
+  return col === 'started' || col === 'time' || col === 'output'
+    || col === 'tokens' || col === 'cost' ? -1 : 1;
+}
+
+/** Compact token summary for a request row: in/out, with cache reads noted. */
+function formatTokens(usage?: {
+  inputTokens: number; outputTokens: number; cacheReadTokens?: number;
+}): string {
+  if (!usage) return '';
+  const cached = usage.cacheReadTokens ? `+${compactCount(usage.cacheReadTokens)}c` : '';
+  return `${compactCount(usage.inputTokens)}/${compactCount(usage.outputTokens)}${cached}`;
+}
+
+/** Did generation stop because it ran out of room rather than finishing? */
+function isTruncated(e: LLMLedgerEntry): boolean {
+  return e.finishReason === 'length' || e.finishReason === 'max_tokens';
+}
+
+function compactCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/**
+ * Spend table columns. Numeric cells carry raw numbers rather than
+ * pre-formatted strings so the table's own header-click sort compares them
+ * numerically — "$9.10" sorts above "$12.00" as text, which is exactly the
+ * wrong answer for a spend view. Units live in the headers instead.
+ */
+const STATS_COLUMNS = [
+  { key: 'provider', label: 'Provider', width: 90 },
+  { key: 'model', label: 'Model' },
+  { key: 'requests', label: 'Reqs', width: 60, align: 'right' as const },
+  { key: 'inputTokens', label: 'In tok', width: 80, align: 'right' as const },
+  { key: 'outputTokens', label: 'Out tok', width: 80, align: 'right' as const },
+  { key: 'cachedTokens', label: 'Cached', width: 80, align: 'right' as const },
+  { key: 'cost', label: 'Cost $', width: 80, align: 'right' as const },
+  { key: 'session', label: 'Session $', width: 80, align: 'right' as const },
+];
+
+/** One row of the spend table. */
+interface StatsRow extends Record<string, unknown> {
+  provider: string;
+  model: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cost: number;
+  session: number;
+}
+
+/** Money with enough precision to see a single cheap call, without noise. */
+function formatUsd(amount: number): string {
+  if (amount === 0) return '$0.00';
+  if (Math.abs(amount) < 0.01) return `$${amount.toFixed(5)}`;
+  if (Math.abs(amount) < 1) return `$${amount.toFixed(4)}`;
+  return `$${amount.toFixed(2)}`;
+}
+
+/** Round to cents-and-then-some for table cells, keeping the value numeric. */
+function roundUsd(amount: number): number {
+  return Math.round(amount * 100000) / 100000;
 }
 
 export class LLMMonitor extends Abject {
@@ -100,10 +170,27 @@ export class LLMMonitor extends Abject {
 
   // Tab state
   private tabBarId?: AbjectId;
-  private tabContents: AbjectId[] = [];       // [activeTab, historyTab]
+  private tabContents: AbjectId[] = [];       // [activeTab, historyTab, spendTab]
   private activeTabListId?: AbjectId;
   private historyTabListId?: AbjectId;
   private selectedTabIndex: number = 0;
+
+  // Spend tab
+  private statsSummaryId?: AbjectId;
+  private statsNoteId?: AbjectId;
+  private statsChartId?: AbjectId;
+  private statsTableId?: AbjectId;
+  private clearLedgerBtnId?: AbjectId;
+  private retentionDaysInputId?: AbjectId;
+  private retentionEntriesInputId?: AbjectId;
+  private residentTextInputId?: AbjectId;
+  private applyRetentionBtnId?: AbjectId;
+  private footerNoteId?: AbjectId;
+  /** Last rendered spend rows, so an unchanged ledger costs no widget traffic. */
+  private lastStatsRowsJson?: string;
+  private lastStatsDaysJson?: string;
+  /** Retention last written into the inputs, so typing is not overwritten mid-edit. */
+  private lastRetentionJson?: string;
 
   private killButtons: Map<AbjectId, string> = new Map();
   private viewButtons: Map<AbjectId, string> = new Map();
@@ -227,6 +314,9 @@ export class LLMMonitor extends Abject {
             style: { visible: i === idx },
           }));
         }
+        // Spend is only fetched while its tab shows, so switching to it has
+        // to pull the ledger rather than wait out the refresh interval.
+        await this.refreshStatsTab();
         return;
       }
 
@@ -329,6 +419,19 @@ export class LLMMonitor extends Abject {
     this.refreshBtnId = undefined;
     this.statsLabelId = undefined;
     this.pauseStatusLabelId = undefined;
+    this.statsSummaryId = undefined;
+    this.statsNoteId = undefined;
+    this.statsChartId = undefined;
+    this.statsTableId = undefined;
+    this.clearLedgerBtnId = undefined;
+    this.retentionDaysInputId = undefined;
+    this.retentionEntriesInputId = undefined;
+    this.residentTextInputId = undefined;
+    this.applyRetentionBtnId = undefined;
+    this.footerNoteId = undefined;
+    this.lastStatsRowsJson = undefined;
+    this.lastStatsDaysJson = undefined;
+    this.lastRetentionJson = undefined;
     this.killButtons.clear();
     this.viewButtons.clear();
     this.tabRows = [[], []];
@@ -419,7 +522,7 @@ export class LLMMonitor extends Abject {
         specs: [{
           type: 'tabBar',
           windowId: this.windowId!,
-          tabs: ['Active Requests', 'Recent History'],
+          tabs: ['Active Requests', 'Recent History', 'Stats'],
           selectedIndex: 0,
           closable: false,
         }],
@@ -457,9 +560,120 @@ export class LLMMonitor extends Abject {
     this.activeTabListId = this.tabContents[0];
     this.historyTabListId = this.tabContents[1];
 
+    await this.buildStatsTab();
+
     // clearViewTracking() above reset row state, so this first refresh builds
     // every row from empty via the normal incremental reconcile path.
     await this.refreshView();
+  }
+
+  /**
+   * Build the Spend tab: headline totals, the per-day cost bars, and a
+   * sortable per-model table. Unlike the request tabs this one is a table
+   * widget rather than hand-reconciled rows — the data is a small aggregate
+   * that is cheap to re-send whole, and the widget brings its own sorting.
+   */
+  private async buildStatsTab(): Promise<void> {
+    const spendBox = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: this.rootLayoutId!,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      widgetId: spendBox,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    await this.request(request(this.id, spendBox, 'update', { style: { visible: false } }));
+    this.tabContents.push(spendBox);
+
+    const { widgetIds: [summaryId, noteId, chartId, tableId] } =
+      await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [
+            { type: 'label', windowId: this.windowId!, text: 'Loading spend...', style: { fontSize: 13, fontWeight: 'bold', color: this.theme.textHeading } },
+            { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 11, color: this.theme.sectionLabel } },
+            {
+              type: 'chart', windowId: this.windowId!, kind: 'bar',
+              series: [{ name: 'Cost (USD)', points: [] }],
+              showGrid: true, showLegend: false,
+            },
+            {
+              type: 'table', windowId: this.windowId!, sortable: true,
+              columns: STATS_COLUMNS,
+              rowsData: [],
+            },
+          ],
+        })
+      );
+
+    this.statsSummaryId = summaryId;
+    this.statsNoteId = noteId;
+    this.statsChartId = chartId;
+    this.statsTableId = tableId;
+
+    await this.request(request(this.id, spendBox, 'addLayoutChildren', {
+      children: [
+        { widgetId: summaryId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 } },
+        { widgetId: noteId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 16 } },
+        { widgetId: chartId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 110 } },
+        { widgetId: tableId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+      ],
+    }));
+
+    // Footer: clearing the ledger is destructive and rare, so it lives here
+    // rather than in the window-wide control bar.
+    const footerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: spendBox,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 6,
+      })
+    );
+    await this.request(request(this.id, spendBox, 'addLayoutChild', {
+      widgetId: footerId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 26 },
+    }));
+
+    const { widgetIds: [keepLabelId, daysInputId, entriesLabelId, entriesInputId, bodiesLabelId, bodyDaysInputId, applyId, resetId, footerNoteId] } =
+      await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [
+            { type: 'label', windowId: this.windowId!, text: 'Keep (days)', style: { fontSize: 10, color: this.theme.sectionLabel } },
+            { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
+            { type: 'label', windowId: this.windowId!, text: 'max calls', style: { fontSize: 10, color: this.theme.sectionLabel } },
+            { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
+            { type: 'label', windowId: this.windowId!, text: 'prompts in memory', style: { fontSize: 10, color: this.theme.sectionLabel } },
+            { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
+            { type: 'button', windowId: this.windowId!, text: 'Apply', style: { fontSize: 10 } },
+            { type: 'button', windowId: this.windowId!, text: 'Clear ledger', style: { fontSize: 10, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } },
+            { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 10, color: this.theme.sectionLabel, fontStyle: 'italic' } },
+          ],
+        })
+      );
+    this.retentionDaysInputId = daysInputId;
+    this.retentionEntriesInputId = entriesInputId;
+    this.residentTextInputId = bodyDaysInputId;
+    this.applyRetentionBtnId = applyId;
+    this.clearLedgerBtnId = resetId;
+    this.footerNoteId = footerNoteId;
+    await this.addDep(applyId);
+    await this.addDep(resetId);
+    await this.request(request(this.id, footerId, 'addLayoutChildren', {
+      children: [
+        { widgetId: keepLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 62, height: 24 } },
+        { widgetId: daysInputId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 44, height: 24 } },
+        { widgetId: entriesLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 54, height: 24 } },
+        { widgetId: entriesInputId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 54, height: 24 } },
+        { widgetId: bodiesLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 96, height: 24 } },
+        { widgetId: bodyDaysInputId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 44, height: 24 } },
+        { widgetId: applyId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 54, height: 24 } },
+        { widgetId: resetId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 84, height: 24 } },
+        { widgetId: footerNoteId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 24 } },
+      ],
+    }));
   }
 
   /**
@@ -508,6 +722,7 @@ export class LLMMonitor extends Abject {
     // Always update stats and pause labels in-place (no flicker)
     await this.updateStatsLabel(snapshot);
     await this.updatePauseLabel(snapshot);
+    await this.refreshStatsTab();
 
     const now = Date.now();
     const activeRequests = snapshot?.activeRequests ?? [];
@@ -520,53 +735,26 @@ export class LLMMonitor extends Abject {
     const cappedActive = activeRequests.length > MAX_ACTIVE_ROWS
       ? activeRequests.slice(-MAX_ACTIVE_ROWS)
       : activeRequests;
+    // Both tabs render the same ledger entries; only the elapsed-time
+    // reading and the row action differ between a call in flight and one
+    // that has settled.
     const activeDesc: RowDesc[] = cappedActive.map((req) => {
       const elapsedSec = Math.round((now - req.startTime) / 1000);
-      return {
-        id: req.id,
-        name: req.callerName ?? req.callerId.slice(0, 8),
-        method: req.method,
-        provider: req.provider,
-        model: req.model ?? '',
-        started: this.formatClock(req.startTime),
+      return this.ledgerRowDesc(req, {
         time: `${elapsedSec}s`,
-        output: `${req.outputChars}`,
+        timeSort: elapsedSec,
         nameColor: req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
         actionText: 'Kill',
         isKill: true,
-        sort: {
-          name: (req.callerName ?? req.callerId).toLowerCase(),
-          method: req.method,
-          provider: req.provider,
-          model: req.model ?? '',
-          started: req.startTime,
-          time: elapsedSec,
-          output: req.outputChars,
-        },
-      };
+      });
     });
 
-    const historyDesc: RowDesc[] = history.map((entry) => ({
-      id: entry.id,
-      name: entry.callerName ?? entry.callerId.slice(0, 8),
-      method: entry.method,
-      provider: entry.provider,
-      model: entry.model ?? '',
-      started: this.formatClock(entry.startTime),
+    const historyDesc: RowDesc[] = history.map((entry) => this.ledgerRowDesc(entry, {
       time: `${(entry.elapsedMs / 1000).toFixed(1)}s`,
-      output: `${entry.outputChars}`,
+      timeSort: entry.elapsedMs,
       nameColor: entry.error ? this.theme.statusError : this.theme.textHeading,
       actionText: 'View',
       isKill: false,
-      sort: {
-        name: (entry.callerName ?? entry.callerId).toLowerCase(),
-        method: entry.method,
-        provider: entry.provider,
-        model: entry.model ?? '',
-        started: entry.startTime,
-        time: entry.elapsedMs,
-        output: entry.outputChars,
-      },
     }));
 
     // Order by the tab's sort state (default: started, newest on top). Rows
@@ -576,6 +764,225 @@ export class LLMMonitor extends Abject {
 
     await this.reconcileTab(0, this.activeTabListId!, activeDesc, true, 'No active requests');
     await this.reconcileTab(1, this.historyTabListId!, historyDesc, false, 'No history yet');
+  }
+
+  /**
+   * Turn one ledger entry into a row. Cells are positional against
+   * HEADER_COLUMNS, so adding a column is a change in one place.
+   */
+  private ledgerRowDesc(
+    e: LLMLedgerEntry,
+    opts: { time: string; timeSort: number; nameColor: string; actionText: string; isKill: boolean },
+  ): RowDesc {
+    const name = e.callerName ?? e.callerId.slice(0, 8);
+    // A truncated answer returns normally and bills in full, so nothing else
+    // in the row would tell you it was cut off. Mark the model it ran on.
+    const model = (e.model ?? '') + (isTruncated(e) ? ' ✂' : '');
+    const tokens = formatTokens(e.usage);
+    // An unpriced call is not a free one: leave the cell blank rather than
+    // printing $0.00 for a model nobody has a price for.
+    const cost = e.costUsd === undefined ? '' : `${e.costEstimated ? '~' : ''}${formatUsd(e.costUsd)}`;
+    return {
+      id: e.id,
+      cells: [
+        name, e.method, e.provider, model,
+        this.formatClock(e.startTime), opts.time, `${e.outputChars}`,
+        tokens, cost,
+      ],
+      nameColor: opts.nameColor,
+      actionText: opts.actionText,
+      isKill: opts.isKill,
+      sort: {
+        name: name.toLowerCase(),
+        method: e.method,
+        provider: e.provider,
+        model,
+        started: e.startTime,
+        time: opts.timeSort,
+        output: e.outputChars,
+        tokens: (e.usage?.inputTokens ?? 0) + (e.usage?.outputTokens ?? 0),
+        cost: e.costUsd ?? -1,
+      },
+    };
+  }
+
+  /**
+   * Pull the spend rollup and repaint the Spend tab. Only runs while that
+   * tab is showing: the rollup is a separate request, and the request tabs
+   * refresh every two seconds whether or not anyone is looking at spend.
+   */
+  private async refreshStatsTab(): Promise<void> {
+    if (this.selectedTabIndex !== 2 || !this.statsTableId || !this.llmObjectId) return;
+
+    let report: LLMSpendReport | null = null;
+    try {
+      report = await this.request<LLMSpendReport>(
+        request(this.id, this.llmObjectId, 'getSpend', {})
+      );
+    } catch (err) {
+      log.warn('Failed to fetch LLM spend:', err);
+      return;
+    }
+    if (!report) return;
+
+    const { totals } = report;
+    const summary =
+      `All time ${formatUsd(totals.costUsd)}` +
+      `   ·   Today ${formatUsd(report.todayCostUsd)}` +
+      `   ·   This session ${formatUsd(report.sessionCostUsd)}` +
+      `   ·   ${totals.requests} calls across ${report.models.length} model${report.models.length === 1 ? '' : 's'}`;
+
+    const noteParts: string[] = [];
+    if (totals.reportedCostUsd > 0) noteParts.push(`${formatUsd(totals.reportedCostUsd)} billed by the provider`);
+    if (totals.estimatedCostUsd > 0) noteParts.push(`${formatUsd(totals.estimatedCostUsd)} estimated from list prices`);
+    if (totals.unpricedRequests > 0) {
+      noteParts.push(`${totals.unpricedRequests} call${totals.unpricedRequests === 1 ? '' : 's'} unpriced (no published price for that model — set one with setModelPricing)`);
+    }
+    if (totals.cacheReadTokens > 0 || totals.cacheWriteTokens > 0) {
+      noteParts.push(`cache ${compactCount(totals.cacheReadTokens)} read / ${compactCount(totals.cacheWriteTokens)} written`);
+    }
+    // Tier is how most callers pick a model, so a per-tier cut usually names
+    // the expensive part of a setup faster than the per-model table does.
+    if (report.byTier.length > 0) {
+      const tiers = report.byTier
+        .map(t => `${t.tier} ${formatUsd(t.costUsd)}`)
+        .join('  ·  ');
+      noteParts.push(`by tier: ${tiers}`);
+    }
+    const note = noteParts.length > 0 ? noteParts.join('   ·   ') : 'No calls recorded yet.';
+
+    const rows: StatsRow[] = report.models
+      .map(m => ({
+        provider: m.provider,
+        // An unpriced model would otherwise read as a free one; say so in
+        // the row rather than letting a 0 in the cost column stand for it.
+        model: m.unpricedRequests > 0 && m.costUsd === 0 ? `${m.model}  (unpriced)` : m.model,
+        requests: m.requests,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        cachedTokens: m.cacheReadTokens + m.cacheWriteTokens,
+        cost: roundUsd(m.costUsd),
+        session: roundUsd(m.sessionCostUsd),
+      }))
+      .sort((a, b) => b.cost - a.cost);
+
+    const rowsJson = JSON.stringify(rows);
+    if (rowsJson !== this.lastStatsRowsJson) {
+      this.lastStatsRowsJson = rowsJson;
+      try {
+        await this.request(request(this.id, this.statsTableId, 'update', { rowsData: rows }));
+      } catch { /* widget gone */ }
+    }
+
+    // Day labels shortened to MM-DD; the year is the same for every bar in a
+    // 14-day window and just eats axis width.
+    const points = report.days.map(d => ({ x: d.day.slice(5), y: roundUsd(d.costUsd) }));
+    const daysJson = JSON.stringify(points);
+    if (daysJson !== this.lastStatsDaysJson && this.statsChartId) {
+      this.lastStatsDaysJson = daysJson;
+      try {
+        await this.request(request(this.id, this.statsChartId, 'update', {
+          series: [{ name: 'Cost (USD)', points }],
+        }));
+      } catch { /* widget gone */ }
+    }
+
+    for (const [widgetId, text] of [[this.statsSummaryId, summary], [this.statsNoteId, note]] as const) {
+      if (!widgetId) continue;
+      try {
+        await this.request(request(this.id, widgetId, 'update', { text }));
+      } catch { /* widget gone */ }
+    }
+
+    await this.renderRetention(report);
+  }
+
+  /**
+   * Show the retention policy and the window it produced. The inputs are
+   * only written when the stored policy actually changed, so a refresh
+   * landing mid-edit does not yank what the user is typing.
+   */
+  private async renderRetention(report: LLMSpendReport): Promise<void> {
+    const r = report.retention;
+    const json = JSON.stringify(r);
+    if (json !== this.lastRetentionJson) {
+      this.lastRetentionJson = json;
+      const fields: Array<[AbjectId | undefined, string]> = [
+        [this.retentionDaysInputId, String(r.maxAgeDays)],
+        [this.retentionEntriesInputId, String(r.maxEntries)],
+        [this.residentTextInputId, r.keepText ? String(r.residentTextEntries) : '0'],
+      ];
+      for (const [widgetId, text] of fields) {
+        if (!widgetId) continue;
+        try {
+          await this.request(request(this.id, widgetId, 'update', { text }));
+        } catch { /* widget gone */ }
+      }
+    }
+
+    if (!this.footerNoteId) return;
+    // Say what the totals above actually cover — a spend figure whose window
+    // is unstated invites being read as all time when it is not.
+    const span = report.windowStart > 0
+      ? `${report.entryCount} calls recorded, ${this.formatDate(report.windowStart)} to ${this.formatDate(report.windowEnd)}`
+      : 'No calls recorded yet';
+    const bounds = [
+      r.maxAgeDays > 0 ? `${r.maxAgeDays} days` : 'no age limit',
+      r.maxEntries > 0 ? `max ${r.maxEntries} calls` : null,
+    ].filter(Boolean).join(' / ');
+    const text = r.keepText
+      ? `prompts and completions kept with them, newest ${r.residentTextEntries} held in memory`
+      : 'prompts and completions not stored';
+    try {
+      await this.request(request(this.id, this.footerNoteId, 'update', {
+        text: `${span}. Everything rolls off at ${bounds}; ${text}.`,
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  private formatDate(ts: number): string {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /** Read the retention inputs and push the policy to the LLM object. */
+  private async applyRetention(): Promise<void> {
+    if (!this.llmObjectId) return;
+    const read = async (widgetId?: AbjectId): Promise<number | undefined> => {
+      if (!widgetId) return undefined;
+      try {
+        const v = await this.request<string>(request(this.id, widgetId, 'getValue', {}));
+        const n = parseInt(String(v ?? '').trim(), 10);
+        return Number.isFinite(n) && n >= 0 ? n : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const maxAgeDays = await read(this.retentionDaysInputId);
+    const maxEntries = await read(this.retentionEntriesInputId);
+    const resident = await read(this.residentTextInputId);
+
+    const payload: Partial<LLMLedgerRetention> = {};
+    if (maxAgeDays !== undefined) payload.maxAgeDays = maxAgeDays;
+    if (maxEntries !== undefined) payload.maxEntries = maxEntries;
+    if (resident !== undefined) {
+      // One field drives both: holding zero prompts in memory is the same
+      // ask as not keeping prompts at all.
+      payload.keepText = resident > 0;
+      payload.residentTextEntries = resident;
+    }
+    if (Object.keys(payload).length === 0) return;
+
+    try {
+      await this.request(request(this.id, this.llmObjectId, 'setLedgerRetention', payload));
+    } catch (err) {
+      log.warn('Failed to set ledger retention:', err);
+    }
+    this.lastRetentionJson = undefined;
+    this.lastStatsRowsJson = undefined;
+    this.lastStatsDaysJson = undefined;
+    await this.refreshStatsTab();
+    await this.refreshView();
   }
 
   private sortDescs(descs: RowDesc[], sort: { col: SortCol; dir: 1 | -1 }): void {
@@ -656,26 +1063,16 @@ export class LLMMonitor extends Abject {
     const prev = row.desc;
     if (prev === d) return;
     try {
-      if (!prev || prev.name !== d.name || prev.nameColor !== d.nameColor) {
-        await this.request(request(this.id, row.labels[0], 'update', { text: d.name, style: { color: d.nameColor } }));
+      // Column 0 carries the row's status colour as well as its text.
+      if (!prev || prev.cells[0] !== d.cells[0] || prev.nameColor !== d.nameColor) {
+        await this.request(request(this.id, row.labels[0], 'update', {
+          text: d.cells[0], style: { color: d.nameColor },
+        }));
       }
-      if (!prev || prev.method !== d.method) {
-        await this.request(request(this.id, row.labels[1], 'update', { text: d.method }));
-      }
-      if (!prev || prev.provider !== d.provider) {
-        await this.request(request(this.id, row.labels[2], 'update', { text: d.provider }));
-      }
-      if (!prev || prev.model !== d.model) {
-        await this.request(request(this.id, row.labels[3], 'update', { text: d.model }));
-      }
-      if (!prev || prev.started !== d.started) {
-        await this.request(request(this.id, row.labels[4], 'update', { text: d.started }));
-      }
-      if (!prev || prev.time !== d.time) {
-        await this.request(request(this.id, row.labels[5], 'update', { text: d.time }));
-      }
-      if (!prev || prev.output !== d.output) {
-        await this.request(request(this.id, row.labels[6], 'update', { text: d.output }));
+      for (let c = 1; c < HEADER_COLUMNS.length; c++) {
+        if (!prev || prev.cells[c] !== d.cells[c]) {
+          await this.request(request(this.id, row.labels[c], 'update', { text: d.cells[c] }));
+        }
       }
       // Rebind the action button when the slot now shows a different request.
       // isKill/actionText are constant within a tab, so only the id mapping moves.
@@ -713,7 +1110,7 @@ export class LLMMonitor extends Abject {
       ? Math.round(stats.totalLatencyMs / stats.totalRequests)
       : 0;
     const statsText = stats
-      ? `${stats.totalRequests} requests | ${this.formatCount(stats.totalInputChars)} in | ${this.formatCount(stats.totalOutputChars)} out | ${stats.totalErrors} errors | avg ${avgMs}ms`
+      ? `${stats.totalRequests} calls | ${this.formatCount(stats.totalInputTokens)} in / ${this.formatCount(stats.totalOutputTokens)} out tokens | ${stats.totalErrors} errors | avg ${avgMs}ms | ${formatUsd(stats.totalCostUsd ?? 0)} spent`
       : 'No LLM provider available';
     try {
       await this.request(request(this.id, this.statsLabelId, 'update', { text: statsText }));
@@ -834,30 +1231,37 @@ export class LLMMonitor extends Abject {
       preferredSize: { height: rowH },
     }));
 
-    const { widgetIds: [nameId, methodId, providerId, modelId, startedId, timeId, outputId] } =
-      await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', {
-          specs: [
-            { type: 'label', windowId: this.windowId!, text: d.name, style: { fontSize: 12, color: d.nameColor } },
-            { type: 'label', windowId: this.windowId!, text: d.method, style: { fontSize: 11, color: this.theme.sectionLabel } },
-            { type: 'label', windowId: this.windowId!, text: d.provider, style: { fontSize: 11, color: this.theme.sectionLabel } },
-            { type: 'label', windowId: this.windowId!, text: d.model, style: { fontSize: 11, color: this.theme.sectionLabel } },
-            { type: 'label', windowId: this.windowId!, text: d.started, style: { fontSize: 11, color: this.theme.textMeta } },
-            { type: 'label', windowId: this.windowId!, text: d.time, style: { fontSize: 11, color: this.theme.textMeta } },
-            { type: 'label', windowId: this.windowId!, text: d.output, style: { fontSize: 11, color: this.theme.textMeta } },
-          ],
-        })
-      );
+    // One label per column, built from HEADER_COLUMNS so a new column needs
+    // no matching edit here. Cost gets the accent colour: it is the reason
+    // most people open this window.
+    const { widgetIds: labelIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: HEADER_COLUMNS.map((c, i) => ({
+          type: 'label' as const,
+          windowId: this.windowId!,
+          text: d.cells[i] ?? '',
+          style: i === 0
+            ? { fontSize: 12, color: d.nameColor }
+            : {
+              fontSize: 11,
+              color: c.col === 'cost' ? this.theme.accent
+                : c.col === 'started' || c.col === 'time' || c.col === 'output' || c.col === 'tokens'
+                  ? this.theme.textMeta
+                  : this.theme.sectionLabel,
+            },
+        })),
+      })
+    );
     await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
-      widgetId: nameId,
+      widgetId: labelIds[0],
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: rowH },
     }));
-    for (const [wid, w] of [[methodId, 70], [providerId, 80], [modelId, 120], [startedId, 62], [timeId, 50], [outputId, 60]] as const) {
+    for (let c = 1; c < HEADER_COLUMNS.length; c++) {
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
-        widgetId: wid,
+        widgetId: labelIds[c],
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width: w, height: rowH },
+        preferredSize: { width: HEADER_COLUMNS[c].width, height: rowH },
       }));
     }
 
@@ -888,7 +1292,7 @@ export class LLMMonitor extends Abject {
     return {
       requestId: d.id,
       containerId: rowLayoutId,
-      labels: [nameId, methodId, providerId, modelId, startedId, timeId, outputId],
+      labels: labelIds.slice(0, HEADER_COLUMNS.length),
       btn: btnId,
       desc: d,
     };
@@ -925,11 +1329,36 @@ export class LLMMonitor extends Abject {
       })
     );
 
+    // The detail window is where the whole ledger entry gets shown, so it
+    // reports every field the row had no room for: routing, token split,
+    // cost basis, and whether the answer was cut off.
     const timeSec = (entry.elapsedMs / 1000).toFixed(1);
-    const modelPart = entry.model ? ` | Model: ${entry.model}` : '';
-    const summaryText = entry.error
-      ? `Provider: ${entry.provider}${modelPart} | Time: ${timeSec}s | Error: ${entry.error}`
-      : `Provider: ${entry.provider}${modelPart} | Time: ${timeSec}s | Chars: ${entry.inputChars} > ${entry.outputChars}`;
+    const parts: string[] = [`Provider: ${entry.provider}`];
+    if (entry.model) parts.push(`Model: ${entry.model}`);
+    if (entry.tier) parts.push(`Tier: ${entry.tier}`);
+    if (entry.effort) parts.push(`Effort: ${entry.effort}`);
+    parts.push(`Time: ${timeSec}s`);
+    if (entry.error) {
+      parts.push(`Error: ${entry.error}`);
+    } else {
+      parts.push(`Chars: ${entry.inputChars} > ${entry.outputChars}`);
+      if (entry.usage) {
+        const u = entry.usage;
+        const cache = [
+          u.cacheReadTokens ? `${u.cacheReadTokens} cached` : '',
+          u.cacheWriteTokens ? `${u.cacheWriteTokens} written` : '',
+          u.reasoningTokens ? `${u.reasoningTokens} reasoning` : '',
+        ].filter(Boolean).join(', ');
+        parts.push(`Tokens: ${u.inputTokens} in / ${u.outputTokens} out${cache ? ` (${cache})` : ''}`);
+      }
+      parts.push(entry.costUsd === undefined
+        ? 'Cost: unpriced'
+        : `Cost: ${formatUsd(entry.costUsd)}${entry.costEstimated ? ' (estimated from list prices)' : ' (billed by provider)'}`);
+      if (isTruncated(entry)) {
+        parts.push(`TRUNCATED at maxTokens${entry.maxTokens ? ` (${entry.maxTokens})` : ''} — the answer was cut off`);
+      }
+    }
+    const summaryText = parts.join(' | ');
 
     const { widgetIds: [summaryId, promptLabelId, promptAreaId, outputLabelId, outputAreaId] } =
       await this.request<{ widgetIds: AbjectId[] }>(
@@ -996,6 +1425,28 @@ export class LLMMonitor extends Abject {
 
     if (fromId === this.refreshBtnId) {
       await this.refreshView();
+      return;
+    }
+
+    if (fromId === this.applyRetentionBtnId) {
+      await this.applyRetention();
+      return;
+    }
+
+    if (fromId === this.clearLedgerBtnId) {
+      if (this.llmObjectId) {
+        try {
+          await this.request(request(this.id, this.llmObjectId, 'clearLedger', {}));
+        } catch (err) {
+          log.warn('Failed to clear the ledger:', err);
+        }
+        this.lastStatsRowsJson = undefined;
+        this.lastStatsDaysJson = undefined;
+        // History and the stats line are views over the same ledger, so they
+        // have to repaint too — clearing spend clears them by construction.
+        await this.refreshStatsTab();
+        await this.refreshView();
+      }
       return;
     }
 
@@ -1073,10 +1524,13 @@ export class LLMMonitor extends Abject {
 - \`getState()\` -- Returns { visible: boolean }.
 
 ### Features
-- Real-time view of active LLM requests with kill controls.
-- Recent history of completed requests (newest on top by default) with View button to inspect prompt and output.
-- Columns: Requester, Method, Provider, Model (the concrete model id the request ran on), Started (wall-clock HH:MM:SS), Time (elapsed), Output. Click any column header to sort by it; clicking again flips the direction (▼/▲ marks the active column).
-- Aggregate stats: total requests, input/output chars, errors, average latency.
+- Every tab is a view over one call ledger. Each LLM call is recorded once, with its token counts and cost; nothing is aggregated separately.
+- Active Requests: the calls in flight, with kill controls.
+- Recent History: the settled calls, newest first, with a View button that opens the full prompt and output (when still retained) plus the call's tier, effort, token split, cost basis, and truncation state. Text for older calls is read back from storage on demand.
+- Columns on both: Requester, Method, Provider, Model (with a scissors mark when the answer was cut off at maxTokens), Started (HH:MM:SS), Time, Chars, Tokens (in/out, with +Nc cache reads), Cost. Click any header to sort; click again to flip (▼/▲ marks the active column). A tilde before a cost means it was estimated from list prices rather than billed by the provider; a blank cost means the model is unpriced.
+- Stats: totals for the retained window / today / this session, spend broken out by routing tier, a per-day cost chart, and a sortable per-model table of calls, tokens, cached tokens, and cost.
+- Retention lives on the Stats tab: how many days to keep everything (prompts and completions included), an optional hard call ceiling, and how many recent prompts to hold in memory (0 stops storing prompt text at all). "Clear ledger" throws away every recorded call, and with it every total rolled up from them.
+- The ledger persists across restarts, so yesterday's spend is still there tomorrow. The stats line describes exactly the retained window, which the Spend tab footer names.
 - Pause/Unpause buttons to control the LLM object.
 - Flicker-free updates: rows are fixed slots whose cells update in place, so re-sorting or new arrivals never rebuild the list.
 - Auto-refreshes every 2 seconds and on LLM state change events (event-driven refreshes are debounced).
