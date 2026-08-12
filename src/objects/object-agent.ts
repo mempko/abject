@@ -12,6 +12,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
+import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 
@@ -504,8 +505,11 @@ When asked about a task, describe which objects you would message and what you w
           return { success: false, error: `Unknown action: ${action.action}` };
       }
 
-      extra.lastResult = result;
-      return { success: true, data: result };
+      // Point the next observation at a large result rather than quoting it
+      // back: this agent echoes its last result as the following observation,
+      // and the result is already in the conversation as a handle.
+      extra.lastResult = resultEcho(result);
+      return bulkAwareResult(result);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       extra.lastResult = `Error: ${errMsg}`;

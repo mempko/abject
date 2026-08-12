@@ -12,6 +12,7 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
+import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
 import type { MCPServerSummary, MCPServerDetail } from './mcp-registry-client.js';
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
@@ -487,7 +488,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               body: action.body as string | undefined,
             }),
           );
-          result = `HTTP ${httpResult.status}\n${httpResult.body?.slice(0, 30000) ?? ''}`;
+          result = `HTTP ${httpResult.status}\n${httpResult.body ?? ''}`;
           break;
         }
 
@@ -500,7 +501,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             request(this.id, this.hostFileSystemId, 'readFile', { path }),
             PERMISSION_AWARE_TIMEOUT,
           );
-          result = fileResult.content.slice(0, 30000);
+          result = fileResult.content;
           break;
         }
 
@@ -765,8 +766,12 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           return { success: false, error: `Unknown action: ${action.action}` };
       }
 
-      extra.lastResult = result;
-      return { success: true, data: result };
+      // Bulk (an MCP tool's rows, a fetched body, a file) goes back through
+      // the payload channel, and the observation points at it rather than
+      // quoting it back — this agent echoes its last result as the next
+      // observation, so a large one used to be paid for twice.
+      extra.lastResult = resultEcho(result);
+      return bulkAwareResult(result);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       extra.lastResult = `Error: ${errMsg}`;

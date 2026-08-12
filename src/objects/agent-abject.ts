@@ -108,6 +108,32 @@ export interface ObserveReply {
 }
 
 /**
+ * Package an act callback's string result so bulk takes the payload channel.
+ *
+ * Agents that funnel every action into one string result share this rather
+ * than each deciding what "too big" means and how to hand it over.
+ */
+export function bulkAwareResult(text: string): AgentActionResult {
+  if (text.length <= LARGE_PAYLOAD_CHARS) return { success: true, data: text };
+  return { success: true, data: { chars: text.length }, payload: text };
+}
+
+/**
+ * What an agent should carry into its NEXT observation for a result it just
+ * returned.
+ *
+ * Several agents echo their last result as the following observation, which
+ * means a large one is paid for twice: once as the action result and again
+ * as the observation quoting it back. The action result is already in the
+ * conversation, as a searchable handle when it was big, so point at it
+ * instead of repeating it.
+ */
+export function resultEcho(text: string): string {
+  if (text.length <= LARGE_PAYLOAD_CHARS) return text;
+  return `(${text.length.toLocaleString()} chars — the full result is in the action result above; reach the rest of it with read_chunk.)`;
+}
+
+/**
  * A payload too large to put in the conversation whole, kept intact and
  * addressed by id.
  *
