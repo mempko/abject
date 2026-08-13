@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.9.6",
+    "date": "2026-08-13",
+    "title": "CLI Providers, Warm and Separate",
+    "summary": "The CLI-based LLM providers now run as persistent terminal sessions instead of spawning a fresh process for every request, so responses start faster. Each CLI transport is also listed as its own provider, so you choose the one you want rather than having the system pick for you.",
+    "highlights": [
+      "Both CLI transports are offered as separate providers: pick the one you want in settings instead of getting an automatic choice",
+      "CLI providers run as warm terminal sessions kept alive between requests, replacing the one-process-per-request model (less startup overhead on each call)"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.9.5",
     "date": "2026-08-12",
     "title": "Every LLM Call, Accounted For",
