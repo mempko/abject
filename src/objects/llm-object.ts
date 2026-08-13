@@ -3094,6 +3094,9 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
   protected override async onStop(): Promise<void> {
     this.dropAllWarmEntries('stopping');
+    // Warm CLI sessions are live child processes holding pseudo-terminals;
+    // without this they outlive the runtime that spawned them.
+    await this.shutdownCliProviders();
     if (this.ledgerSaveTimer) {
       clearTimeout(this.ledgerSaveTimer);
       this.ledgerSaveTimer = undefined;
@@ -3101,6 +3104,27 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     // Flush rather than losing up to a debounce window of recorded calls.
     try { await this.saveLedger(); } catch (err) { log.warn('Failed to flush LLM ledger on stop:', err); }
     await super.onStop();
+  }
+
+  /**
+   * Shut down any registered provider that holds warm CLI sessions.
+   *
+   * Structural rather than by-name: a provider opts in by exposing
+   * `shutdown()`, so a new CLI-backed provider is cleaned up without
+   * touching this method.
+   */
+  private async shutdownCliProviders(): Promise<void> {
+    const shutdowns: Array<Promise<void>> = [];
+    for (const provider of this.providers.values()) {
+      const disposable = provider as { shutdown?: () => Promise<void> };
+      if (typeof disposable.shutdown !== 'function') continue;
+      shutdowns.push(
+        // One provider failing to close must not strand the others.
+        disposable.shutdown().catch(err =>
+          log.warn(`Failed to shut down provider '${provider.name}':`, err)),
+      );
+    }
+    await Promise.all(shutdowns);
   }
 
   /**
