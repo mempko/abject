@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PtySessionPool } from './pty-session.js';
 import { codexDialect } from './pty-dialects.js';
+import type { CliTransport } from './claude-cli.js';
 import {
   BaseLLMProvider,
   LLMCompletionOptions,
@@ -59,7 +60,10 @@ const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
 const DEFAULT_MAX_SESSIONS = 2;
 
 export class CodexCliProvider extends BaseLLMProvider {
-  readonly name = 'codex-cli';
+  /** See the note on the same field in ClaudeCliProvider. */
+  readonly name: string;
+
+  private readonly transport: CliTransport;
 
   private readonly bin: string;
   private readonly idleTimeoutMs: number;
@@ -72,8 +76,15 @@ export class CodexCliProvider extends BaseLLMProvider {
    */
   private readonly pools = new Map<string, PtySessionPool>();
 
-  constructor(config: { bin?: string; idleTimeoutMs?: number; maxSessions?: number } = {}) {
+  constructor(config: {
+    bin?: string;
+    idleTimeoutMs?: number;
+    maxSessions?: number;
+    transport?: CliTransport;
+  } = {}) {
     super({});
+    this.transport = config.transport ?? 'stream-json';
+    this.name = this.transport === 'terminal' ? 'codex-cli-pty' : 'codex-cli';
     this.bin = config.bin ?? 'codex';
     this.idleTimeoutMs = config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.maxSessions = config.maxSessions ?? DEFAULT_MAX_SESSIONS;
@@ -91,11 +102,11 @@ export class CodexCliProvider extends BaseLLMProvider {
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const model = this.resolveModel(options);
 
-    // Same split as the claude provider: a pty carries keystrokes, not
-    // pictures, so image requests leave the warm session for a one-shot
-    // call. Codex takes images as file paths rather than inline blocks,
-    // so they are written to disk for the duration of the call.
-    if (hasImages(messages)) return this.completeWithImages(messages, model);
+    // Images always take the one-shot path, whatever the configured
+    // transport: a pty carries keystrokes, not pictures.
+    if (this.transport === 'stream-json' || hasImages(messages)) {
+      return this.completeOneShot(messages, model);
+    }
 
     const prompt = buildPrompt(messages);
 
@@ -108,7 +119,7 @@ export class CodexCliProvider extends BaseLLMProvider {
         // routed here contribute no usage figures to the ledger.
         usage: undefined,
       };
-    }, { isRetryable: cliIsRetryable, label: 'codex-cli.complete' });
+    }, { isRetryable: cliIsRetryable, label: `${this.name}.complete` });
   }
 
   /**
@@ -139,14 +150,21 @@ export class CodexCliProvider extends BaseLLMProvider {
   }
 
   override describe(): LLMProviderDescription {
+    const terminal = this.transport === 'terminal';
     return {
-      id: 'codex-cli',
-      label: 'Codex CLI',
-      storageSuffix: 'codexCli',
+      id: this.name,
+      label: terminal ? 'Codex CLI (warm terminal session)' : 'Codex CLI',
+      storageSuffix: terminal ? 'codexCliPty' : 'codexCli',
       credentialMode: 'cli',
       cli: {
         binary: 'codex',
-        installHint: 'Install Codex: npm install -g @openai/codex',
+        installHint: terminal
+          ? 'Reuses one warm `codex` session per model. Reports no token usage, reads '
+            + 'replies off the rendered screen, and runs in the working directory with '
+            + 'codex\'s own tools available, so a request can see the current project. '
+            + 'Install Codex: npm install -g @openai/codex'
+          : 'One `codex exec` per request, reading structured output: reports token usage '
+            + 'and returns the reply verbatim. Install Codex: npm install -g @openai/codex',
       },
       // vision: true because image requests take the one-shot `codex exec
       // -i` transport; the warm terminal session cannot carry an image and
@@ -177,14 +195,17 @@ export class CodexCliProvider extends BaseLLMProvider {
   }
 
   /**
-   * One-shot call for requests carrying images.
+   * One-shot `codex exec --json` call reading structured events.
    *
-   * `codex exec` takes images as `-i <file>`, so each one is written to a
-   * scratch directory for the call and removed afterwards. Uses
+   * Reports token usage on `turn.completed` and returns the reply verbatim,
+   * neither of which the terminal session can do. Images ride the same path
+   * as `-i <file>`, written to a scratch directory for the call and removed
+   * afterwards, since codex takes paths rather than inline blocks.
+   *
    * `--skip-git-repo-check` because a scratch directory is not a trusted
    * work tree, which the interactive session has no way around.
    */
-  private async completeWithImages(messages: LLMMessage[], model: string): Promise<LLMCompletionResult> {
+  private async completeOneShot(messages: LLMMessage[], model: string): Promise<LLMCompletionResult> {
     const dir = mkdtempSync(join(tmpdir(), 'abjects-codex-img-'));
     const paths: string[] = [];
     try {
@@ -214,10 +235,10 @@ export class CodexCliProvider extends BaseLLMProvider {
         }
         const final = extractCodexFinalMessage(stdout);
         if (!final) {
-          throw new Error(`codex returned no message for an image request. raw=${stdout.slice(0, 300)}`);
+          throw new Error(`codex returned no message. raw=${stdout.slice(0, 300)}`);
         }
         return { content: final.text, finishReason: 'stop' as const, usage: final.usage };
-      }, { isRetryable: cliIsRetryable, label: 'codex-cli.complete(vision)' });
+      }, { isRetryable: cliIsRetryable, label: `${this.name}.complete` });
     } finally {
       // The images are the user's content; do not leave them on disk.
       rmSync(dir, { recursive: true, force: true });

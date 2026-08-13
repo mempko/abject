@@ -1397,8 +1397,15 @@ export class LLMObject extends Abject {
     // ones. Always registered; their own `isAvailable()` reports whether
     // the binary is on PATH. Routing to an unreachable CLI surfaces a
     // clear error toast at call time.
+    // Each CLI is offered under both transports so the user picks in tier
+    // routing rather than through a separate setting. The stream-json entry
+    // is the plain name because it is the one that reports token usage and
+    // returns output verbatim; the pty entry trades both away for warm
+    // startup.
     this.registerProvider(new ClaudeCliProvider());
+    this.registerProvider(new ClaudeCliProvider({ transport: 'terminal' }));
     this.registerProvider(new CodexCliProvider());
+    this.registerProvider(new CodexCliProvider({ transport: 'terminal' }));
 
     // API-key-credentialed providers, registered when a key is present.
     const apiKeyFactories: Array<[string, (apiKey: string) => LLMProvider]> = [
@@ -1797,7 +1804,9 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new AnthropicProvider({ apiKey: '' }),
     new OpenAIProvider({ apiKey: '' }),
     new ClaudeCliProvider(),
+    new ClaudeCliProvider({ transport: 'terminal' }),
     new CodexCliProvider(),
+    new CodexCliProvider({ transport: 'terminal' }),
     new OllamaProvider(),
     new OpenRouterProvider({ apiKey: '' }),
     new DeepSeekProvider({ apiKey: '' }),

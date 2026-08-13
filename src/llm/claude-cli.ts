@@ -21,7 +21,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { PtySessionPool } from './pty-session.js';
+import { PtySessionPool, sessionSandboxDir } from './pty-session.js';
 import { claudeDialect } from './pty-dialects.js';
 import {
   BaseLLMProvider,
@@ -68,9 +68,31 @@ const DEFAULT_IDLE_TIMEOUT_MS = 360_000;
  */
 const DEFAULT_MAX_SESSIONS = 2;
 
+/**
+ * How a provider talks to the CLI binary. The two differ in what they can
+ * report, not in what model answers.
+ *
+ * 'stream-json' runs a one-shot `-p` call per request and reads structured
+ * events: the reply arrives as data, and token usage comes back with it.
+ *
+ * 'terminal' keeps an interactive session warm in a pseudo-terminal and
+ * reads the reply off the rendered screen. It saves the binary's startup
+ * cost on every request after the first, and pays for it by reporting no
+ * token usage (a terminal UI prints none per turn) and by depending on
+ * patterns that match a UI rather than an interface.
+ */
+export type CliTransport = 'stream-json' | 'terminal';
+
 export class ClaudeCliProvider extends BaseLLMProvider {
-  /** Top-level provider name; lives alongside `anthropic` etc. */
-  readonly name = 'claude-cli';
+  /**
+   * Top-level provider name; lives alongside `anthropic` etc. The two
+   * transports register as separate providers so tier routing can pick
+   * between them the same way it picks any other provider, with no new
+   * settings machinery.
+   */
+  readonly name: string;
+
+  private readonly transport: CliTransport;
 
   /** Path to the binary; default 'claude' resolved via PATH. */
   private readonly bin: string;
@@ -93,8 +115,15 @@ export class ClaudeCliProvider extends BaseLLMProvider {
    */
   private readonly pools = new Map<string, PtySessionPool>();
 
-  constructor(config: { bin?: string; idleTimeoutMs?: number; maxSessions?: number } = {}) {
+  constructor(config: {
+    bin?: string;
+    idleTimeoutMs?: number;
+    maxSessions?: number;
+    transport?: CliTransport;
+  } = {}) {
     super({});
+    this.transport = config.transport ?? 'stream-json';
+    this.name = this.transport === 'terminal' ? 'claude-cli-pty' : 'claude-cli';
     this.bin = config.bin ?? 'claude';
     this.idleTimeoutMs = config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.maxSessions = config.maxSessions ?? DEFAULT_MAX_SESSIONS;
@@ -120,15 +149,13 @@ export class ClaudeCliProvider extends BaseLLMProvider {
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const model = this.resolveModel(options);
 
-    // Two transports, chosen by whether the request carries images.
-    //
-    // The warm terminal session cannot take an image at all: a pty carries
-    // keystrokes, and there is no way to put a picture on the child's
-    // clipboard. Requests with images therefore drop to a one-shot
-    // `-p --input-format stream-json` call, which accepts base64 image
-    // blocks as a documented input. Text requests keep the warm session and
-    // its saved startup cost.
-    if (hasImages(messages)) return this.completeWithImages(messages, model);
+    // Images always take the one-shot path, whatever the configured
+    // transport. A pty carries keystrokes, and there is no way to put a
+    // picture on the child's clipboard, so a terminal session simply
+    // cannot express the request.
+    if (this.transport === 'stream-json' || hasImages(messages)) {
+      return this.completeOneShot(messages, model);
+    }
 
     const prompt = buildPrompt(messages);
     return this.withRetries(async () => {
@@ -140,21 +167,20 @@ export class ClaudeCliProvider extends BaseLLMProvider {
         // routed here contribute no usage figures to the ledger.
         usage: undefined,
       };
-    }, { isRetryable: cliIsRetryable, label: 'claude-cli.complete' });
+    }, { isRetryable: cliIsRetryable, label: `${this.name}.complete` });
   }
 
   /**
-   * One-shot call for requests carrying images.
+   * One-shot `-p` call reading structured events.
    *
-   * Uses print mode rather than the terminal UI, so nothing here is scraped
-   * off a screen: the reply arrives as structured events and token usage is
-   * reported, unlike the warm-session path. Slower by the binary's boot cost,
-   * which is the price of the only image input these CLIs document.
+   * Nothing here is scraped off a screen: the reply arrives as data and
+   * token usage comes back with it. Costs the binary's startup on every
+   * request, which is the whole of what the warm terminal session saves.
    *
-   * The same flags that make the warm session toolless apply here, so a
-   * vision request cannot reach tools that a text request cannot.
+   * The same flags that make the terminal session toolless apply here, so
+   * neither transport can reach tools the other cannot.
    */
-  private async completeWithImages(messages: LLMMessage[], model: string): Promise<LLMCompletionResult> {
+  private async completeOneShot(messages: LLMMessage[], model: string): Promise<LLMCompletionResult> {
     const argv = [
       '-p',
       '--input-format', 'stream-json',
@@ -176,7 +202,13 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       let cliError: string | undefined;
 
       const { code, stdout, stderr } = await runCliIdleStreaming(
-        this.bin, argv, stdin, { idleTimeoutMs: this.idleTimeoutMs },
+        this.bin, argv, stdin,
+        // Run somewhere empty, matching the terminal transport. Claude Code
+        // injects the working directory and its git status into the default
+        // system prompt, so running here would put the user's repo state
+        // into every request: wasted tokens, and context an agent asked for
+        // a JSON action has no business seeing.
+        { idleTimeoutMs: this.idleTimeoutMs, cwd: sessionSandboxDir() },
         (line) => {
           const err = extractStreamError(line);
           if (err) cliError = err;
@@ -196,10 +228,10 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       // the fallback for builds that do not emit incremental text.
       const content = text || resultText;
       if (!content) {
-        throw new Error(`${this.bin} returned no result for an image request. raw=${stdout.slice(0, 300)}`);
+        throw new Error(`${this.bin} returned no result. raw=${stdout.slice(0, 300)}`);
       }
       return { content, finishReason: 'stop' as const, usage };
-    }, { isRetryable: cliIsRetryable, label: 'claude-cli.complete(vision)' });
+    }, { isRetryable: cliIsRetryable, label: `${this.name}.complete` });
   }
 
   /**
@@ -237,16 +269,26 @@ export class ClaudeCliProvider extends BaseLLMProvider {
   }
 
   override describe(): LLMProviderDescription {
+    const terminal = this.transport === 'terminal';
     return {
-      id: 'claude-cli',
-      label: 'Claude CLI',
+      id: this.name,
+      // Named for what the user is choosing between. The trade is startup
+      // cost against token accounting and output fidelity, so the label
+      // says which one this is rather than leaving them to guess.
+      label: terminal ? 'Claude CLI (warm terminal session)' : 'Claude CLI',
       // No persisted credential - the binary owns auth. We still need a
       // unique storage suffix so per-provider keys don't collide.
-      storageSuffix: 'claudeCli',
+      storageSuffix: terminal ? 'claudeCliPty' : 'claudeCli',
       credentialMode: 'cli',
       cli: {
         binary: 'claude',
-        installHint: 'Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup',
+        installHint: terminal
+          ? 'Reuses one warm `claude` session per model: saves process startup on every '
+            + 'request, reports no token usage, and reads replies off the rendered screen. '
+            + 'Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup'
+          : 'One `claude` process per request, reading structured output: reports token '
+            + 'usage and returns the reply verbatim. '
+            + 'Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup',
       },
       models: [
         { id: AUTO_MODEL, name: 'Auto (latest default)', vision: true },
@@ -442,11 +484,11 @@ interface CliResult { code: number; stdout: string; stderr: string; }
  */
 function runCliIdleStreaming(
   bin: string, argv: string[], stdin: string,
-  opts: { idleTimeoutMs: number },
+  opts: { idleTimeoutMs: number; cwd?: string },
   onLine: (line: string) => void,
 ): Promise<CliResult> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd });
     let stdout = '';
     let stderr = '';
     let buffer = '';
