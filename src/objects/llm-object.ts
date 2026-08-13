@@ -1490,7 +1490,7 @@ export class LLMObject extends Abject {
       // a heartbeat cadence EQUAL to the timeout loses the race every time
       // (the timer fires at 30.000s; the first beat lands at 30.00x plus bus
       // hops), which killed every ask whose LLM synthesis ran past ~29s.
-      const KEEPALIVE_MS = 10000;
+      const KEEPALIVE_MS = 5000;
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     if (callerId) {
       keepaliveTimer = setInterval(() => {

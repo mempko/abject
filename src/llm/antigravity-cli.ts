@@ -267,6 +267,7 @@ function runCliIdle(
       idleTimer = setTimeout(() => {
         killed = true;
         try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
         reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
       }, opts.idleTimeoutMs);
     };
@@ -306,6 +307,7 @@ function runCliIdleStreaming(
       idleTimer = setTimeout(() => {
         killed = true;
         try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
         reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
       }, opts.idleTimeoutMs);
     };
