@@ -21,11 +21,20 @@ async function runTests() {
   assert(desc.credentialMode === 'cli', 'desc.credentialMode should be cli');
   assert(desc.cli?.binary === 'agy', 'desc.cli.binary should be agy');
   assert(desc.defaultTierModels?.smart === 'auto', 'desc.defaultTierModels.smart should be auto');
-  assert(desc.models.some(m => m.id === 'gemini-3.6-flash'), 'desc.models should include gemini-3.6-flash');
+  assert(desc.models.some(m => m.id === 'gemini-3.7-flash-medium'), 'desc.models should include gemini-3.7-flash-medium');
+  assert(desc.models.some(m => m.id === 'gemini-3.6-flash-medium'), 'desc.models should include gemini-3.6-flash-medium');
+  assert(desc.models.some(m => m.id === 'gemini-3.1-pro-high'), 'desc.models should include gemini-3.1-pro-high');
+  assert(!desc.models.some(m => m.id === 'gemini-3.6-pro'), 'desc.models must not include gemini-3.6-pro (not a real agy model)');
+  const models = await provider.listModels();
+  assert(models.length === desc.models.length, 'listModels() and describe().models should stay in sync');
 
   const available = await provider.isAvailable();
   console.log('AntigravityCliProvider isAvailable:', available);
-  assert(available === true, 'provider.isAvailable() should return true when agy is on PATH');
+  if (!available) {
+    // Not an assertion: the agy binary is an environment precondition, not
+    // provider behavior — parser tests below run everywhere regardless.
+    console.warn('agy not on PATH — skipping availability check');
+  }
 
   // Test stream delta extraction
   const stepUpdateLine = JSON.stringify({

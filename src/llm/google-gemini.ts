@@ -89,10 +89,10 @@ export class GeminiProvider extends BaseLLMProvider {
   // Verified ids: bare gemini-3.1-pro / -flash are not callable on v1beta;
   // -pro-preview and gemini-3.5-flash are the current accepted ids.
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'gemini-3.6-flash',
-    balanced: 'gemini-3.6-flash',
-    fast: 'gemini-3.6-flash',
-    code: 'gemini-3.6-flash',
+    smart: 'gemini-3.1-pro-preview',
+    balanced: 'gemini-3.5-flash',
+    fast: 'gemini-3.1-flash-lite',
+    code: 'gemini-3.1-pro-preview',
   };
 
   // Thinking counts against maxOutputTokens (default is only ~8192), so size it
@@ -229,10 +229,8 @@ export class GeminiProvider extends BaseLLMProvider {
       credentialLabel: 'Google Gemini API Key',
       credentialPlaceholder: 'AIza...',
       models: [
-        { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', vision: true },
-        { id: 'gemini-3.6-pro', name: 'Gemini 3.6 Pro', vision: true },
-        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true },
         { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', vision: true },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true },
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true },
       ],
       defaultTierModels: GeminiProvider.TIER_MODELS,

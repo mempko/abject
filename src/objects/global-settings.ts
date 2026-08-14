@@ -2571,10 +2571,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     if (!newValue && this.storageId && desc.storageSuffix) {
       const key = `${STORAGE_PREFIX}${desc.storageSuffix}`;
       const val = await this.request<string | null>(request(this.id, this.storageId, 'get', { key }));
-      if (val) {
-        newValue = val;
-        this.credentialValues[newProvider] = val;
-      }
+      // The dropdown may have moved again while the storage read was in
+      // flight; caching is still fine, but stop before painting stale widgets.
+      if (val) this.credentialValues[newProvider] = val;
+      if (this.activeAiProvider !== newProvider) return;
+      if (val) newValue = val;
     }
     if (!newValue) newValue = isUrl ? (desc.credentialPlaceholder ?? '') : '';
 
@@ -2615,22 +2616,21 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
     }
 
-    // Auto-apply the default preset for the selected provider so Model Tiers match the provider
+    // Preselect the provider's default preset so applying it is one click.
+    // Deliberately NOT auto-applied: applyTierPreset ends in saveSettings(),
+    // so applying here would silently overwrite and persist the user's custom
+    // tier routing every time they browse the provider dropdown.
     const presetName = `${desc.label} defaults`;
-    const preset = this.resolvePreset(presetName);
-    if (preset) {
-      if (this.presetSelectId) {
-        const options = this.presetOptionNames();
-        const pIdx = options.indexOf(presetName);
-        if (pIdx >= 0) {
-          try {
-            await this.request(request(this.id, this.presetSelectId, 'update', {
-              options, selectedIndex: pIdx,
-            }));
-          } catch { /* widget gone */ }
-        }
+    if (this.resolvePreset(presetName) && this.presetSelectId) {
+      const options = this.presetOptionNames();
+      const pIdx = options.indexOf(presetName);
+      if (pIdx >= 0) {
+        try {
+          await this.request(request(this.id, this.presetSelectId, 'update', {
+            options, selectedIndex: pIdx,
+          }));
+        } catch { /* widget gone */ }
       }
-      await this.applyTierPreset(preset);
     }
 
     // Background refresh for the newly-active provider (idempotent + deduped)

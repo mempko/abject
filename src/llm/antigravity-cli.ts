@@ -13,7 +13,7 @@
  * Reports under provider name `'antigravity-cli'`.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import {
   BaseLLMProvider,
   LLMCompletionOptions,
@@ -27,6 +27,30 @@ import {
 } from './provider.js';
 
 const AUTO_MODEL = 'auto';
+
+/**
+ * Mirrors `agy models`. IDs carry the reasoning effort suffix where the CLI
+ * requires one (bare names like `gemini-3.7-flash` are rejected without a
+ * separate `--effort`, and pro/claude models reject `--effort` outright), so
+ * passing the suffixed ID alone is the only form that works for every model.
+ */
+const AGY_MODELS: ModelInfo[] = [
+  { id: AUTO_MODEL,                 name: 'Auto (recommended)', vision: false },
+  { id: 'gemini-3.7-flash-high',    name: 'Gemini 3.7 Flash (High)', vision: false },
+  { id: 'gemini-3.7-flash-medium',  name: 'Gemini 3.7 Flash (Medium)', vision: false },
+  { id: 'gemini-3.7-flash-low',     name: 'Gemini 3.7 Flash (Low)', vision: false },
+  { id: 'gemini-3.6-flash-high',    name: 'Gemini 3.6 Flash (High)', vision: false },
+  { id: 'gemini-3.6-flash-medium',  name: 'Gemini 3.6 Flash (Medium)', vision: false },
+  { id: 'gemini-3.6-flash-low',     name: 'Gemini 3.6 Flash (Low)', vision: false },
+  { id: 'gemini-3.5-flash-high',    name: 'Gemini 3.5 Flash (High)', vision: false },
+  { id: 'gemini-3.5-flash-medium',  name: 'Gemini 3.5 Flash (Medium)', vision: false },
+  { id: 'gemini-3.5-flash-low',     name: 'Gemini 3.5 Flash (Low)', vision: false },
+  { id: 'gemini-3.1-pro-high',      name: 'Gemini 3.1 Pro (High)', vision: false },
+  { id: 'gemini-3.1-pro-low',       name: 'Gemini 3.1 Pro (Low)', vision: false },
+  { id: 'claude-sonnet-4-6',        name: 'Claude Sonnet 4.6 (Thinking)', vision: false },
+  { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)', vision: false },
+  { id: 'gpt-oss-120b-medium',      name: 'GPT-OSS 120B (Medium)', vision: false },
+];
 
 function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
@@ -80,7 +104,8 @@ export class AntigravityCliProvider extends BaseLLMProvider {
         },
       );
 
-      if (code !== 0) {
+      // agy can report {status:'ERROR'} in the result event yet still exit 0.
+      if (code !== 0 || cliErrorMessage) {
         throw new Error(formatCliError('agy', code, stderr, stdout, args.argv, cliErrorMessage));
       }
 
@@ -133,13 +158,21 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     if (stdin.length > 0) proc.stdin.end(stdin);
     else proc.stdin.end();
 
+    // Attached before any await: 'close' can fire while the generator is
+    // suspended at a yield, and a listener added afterwards would wait forever.
+    let exited = false;
+    const exitCode = new Promise<number>((resolve) => proc.on('close', (c) => {
+      exited = true;
+      resolve(c ?? 0);
+    }));
+
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let timeoutFired = false;
     const armIdle = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         timeoutFired = true;
-        try { proc.kill('SIGTERM'); } catch { /* gone */ }
+        killProc(proc);
       }, this.idleTimeoutMs);
     };
     armIdle();
@@ -148,6 +181,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     let allStdout = '';
     let stderr = '';
     let cliErrorMessage: string | undefined;
+    let consumedToEnd = false;
 
     proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
 
@@ -169,27 +203,40 @@ export class AntigravityCliProvider extends BaseLLMProvider {
           if (delta) yield { content: delta, done: false };
         }
       }
+      // The final NDJSON line (usually the 'result' event) may arrive without
+      // a trailing newline; without this flush an ERROR status there is lost.
+      const tail = buffer.trim();
+      if (tail) {
+        const errMsg = extractAgyStreamError(tail);
+        if (errMsg) cliErrorMessage = errMsg;
+        const delta = extractAgyStreamDelta(tail);
+        if (delta) yield { content: delta, done: false };
+      }
+      consumedToEnd = true;
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
+      // Consumer abandoned the stream mid-flight (goal cancelled) or the loop
+      // threw: without this the child keeps running with no watchdog left.
+      if (!consumedToEnd && !exited) killProc(proc);
     }
 
-    const code = await new Promise<number>((resolve) => proc.on('close', (c) => resolve(c ?? 0)));
+    const code = await exitCode;
     if (timeoutFired) {
       throw new Error(`agy idle for ${this.idleTimeoutMs}ms — no output, subprocess killed`);
     }
     if (code !== 0) {
       throw new Error(formatCliError('agy', code, stderr, allStdout, argv, cliErrorMessage));
     }
+    if (cliErrorMessage) {
+      // agy can report {status:'ERROR'} in the result event yet still exit 0;
+      // surfacing it here keeps the caller from treating an empty stream as success.
+      throw new Error(formatCliError('agy', code, stderr, allStdout, argv, cliErrorMessage));
+    }
     yield { content: '', done: true };
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    return [
-      { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: false },
-      { id: 'gemini-3.6-flash',  name: 'Gemini 3.6 Flash', vision: false },
-      { id: 'gemini-3.6-pro',    name: 'Gemini 3.6 Pro', vision: false },
-      { id: 'gemini-3.1-pro',    name: 'Gemini 3.1 Pro', vision: false },
-    ];
+    return AGY_MODELS;
   }
 
   override describe(): LLMProviderDescription {
@@ -202,12 +249,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
         binary: 'agy',
         installHint: 'Install Antigravity CLI: agy install or https://antigravity.google',
       },
-      models: [
-        { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: false },
-        { id: 'gemini-3.6-flash',  name: 'Gemini 3.6 Flash', vision: false },
-        { id: 'gemini-3.6-pro',    name: 'Gemini 3.6 Pro', vision: false },
-        { id: 'gemini-3.1-pro',    name: 'Gemini 3.1 Pro', vision: false },
-      ],
+      models: AGY_MODELS,
       defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL, code: AUTO_MODEL },
     };
   }
@@ -232,15 +274,33 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     }
 
     const prompt = transcript.join('\n\n');
+
+    // agy has no stdin prompt channel (verified: bare -p prints help, '-p -'
+    // treats the dash as the prompt, and piped stdin is ignored), so the whole
+    // prompt must ride argv. Fail fast with an actionable message instead of a
+    // cryptic spawn E2BIG: Linux caps a single arg at MAX_ARG_STRLEN (128 KiB);
+    // macOS caps total argv+env at ARG_MAX (~1 MB).
+    const promptBytes = Buffer.byteLength(prompt, 'utf8');
+    const maxPromptBytes = process.platform === 'linux' ? 120_000 : 700_000;
+    if (promptBytes > maxPromptBytes) {
+      throw new Error(
+        `Prompt is ${promptBytes} bytes but the agy CLI only accepts prompts via argv ` +
+        `(limit ~${maxPromptBytes} bytes on this platform). Shorten the conversation ` +
+        `or use an API-key provider for prompts this large.`,
+      );
+    }
+
     const argv: string[] = [
       '-p', prompt,
       '--output-format', outputFormat,
       '--disable-slash-commands',
     ];
 
+    // Effort-suffixed IDs (see AGY_MODELS) are self-contained; a separate
+    // --effort flag is rejected by pro/claude models, so never pass one.
     const model = options?.model;
     if (!shouldOmitModelFlag(model)) {
-      argv.push('--model', model!, '--effort', 'medium');
+      argv.push('--model', model!);
     }
 
     return { argv, stdin: '' };
@@ -248,6 +308,14 @@ export class AntigravityCliProvider extends BaseLLMProvider {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/** SIGTERM now, SIGKILL in 2s if the process ignores it. unref'd so the
+ *  fallback timer never holds the event loop open. */
+function killProc(proc: ChildProcess): void {
+  try { proc.kill('SIGTERM'); } catch { /* gone */ }
+  const t = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
+  t.unref?.();
+}
 
 interface CliResult { code: number; stdout: string; stderr: string; }
 
@@ -266,8 +334,7 @@ function runCliIdle(
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         killed = true;
-        try { proc.kill('SIGTERM'); } catch { /* gone */ }
-        setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
+        killProc(proc);
         reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
       }, opts.idleTimeoutMs);
     };
@@ -306,8 +373,7 @@ function runCliIdleStreaming(
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         killed = true;
-        try { proc.kill('SIGTERM'); } catch { /* gone */ }
-        setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } }, 2000);
+        killProc(proc);
         reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
       }, opts.idleTimeoutMs);
     };
