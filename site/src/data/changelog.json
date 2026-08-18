@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.9.7",
+    "date": "2026-08-18",
+    "title": "Antigravity Lands",
+    "summary": "Abject can now use the Antigravity CLI (agy) as an LLM provider, joining the other CLI providers your objects can think through. A round of follow-up fixes makes it dependable from day one: a correct model catalog, resilient streaming, and runs that report progress and shut down cleanly.",
+    "highlights": [
+      "New LLM provider: the Antigravity CLI (agy). If you have agy installed, your objects can use it for their thinking, right alongside the existing CLI providers.",
+      "The agy provider ships hardened, not just added: it inherits everything the other CLI providers already learned, with a corrected model catalog and a sturdier streaming path."
+    ],
+    "fixes": [
+      "Long-running agy goals no longer stall silently: progress keepalives fire every 5 seconds, and a SIGKILL fallback cleans up processes that refuse to exit.",
+      "SkillAgent now advertises the host's ShellExecutor CLI capability in its ask prompt, so work that needs a shell gets routed to an agent that actually has one."
+    ]
+  },
+  {
     "version": "0.9.6",
     "date": "2026-08-13",
     "title": "CLI Providers, Warm and Separate",
