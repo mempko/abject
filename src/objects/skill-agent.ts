@@ -139,17 +139,23 @@ export class SkillAgent extends Abject {
   }
 
   protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## SkillAgent: Installed Skill Execution Agent
+    let base = super.askPrompt(_question) + `\n\n## SkillAgent: Installed Skill Execution Agent
 
-I install, enable, disable, and list skills. I execute tasks that match an installed skill's domain at runtime — e.g. "send a Slack message", "list my Linear issues", "create a Gmail draft".
+I install, enable, disable, and list skills. I execute tasks that match an installed skill's domain at runtime — e.g. "send a Slack message", "list my Linear issues", "create a Gmail draft".`;
 
-Currently installed skills and their domains:
+    if (this.shellExecutorId) {
+      base += `\n\nI have host shell execution enabled via ShellExecutor. I can run CLI commands (git, pytest, gh, npm, terminal scripts) to inspect repositories, run tests, and manage PRs.`;
+    }
+
+    const hasShell = Boolean(this.shellExecutorId);
+    base += `\n\nCurrently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
 ### My Scope
-Skill installation, management, and at-runtime execution of tasks that match an installed skill's domain. Authoring or modifying Abject source code is outside my scope; that's a different agent's job. Web browsing of arbitrary public URLs is also outside my scope.
+Skill installation, management, and at-runtime execution of tasks that match an installed skill's domain${hasShell ? ' or host shell execution' : ''}. Authoring or modifying Abject source code is outside my scope; that's a different agent's job. Web browsing of arbitrary public URLs is also outside my scope.
 
-When invited to contribute to a Sprint Plan, describe the specific task I could run using one of my installed skills. If no installed skill matches the goal, reply PASS.`;
+When invited to contribute to a Sprint Plan, describe the specific task I could run using one of my installed skills${hasShell ? ' or host shell execution via ShellExecutor' : ''}. If no installed skill${hasShell ? ' or shell capability' : ''} matches the goal, reply PASS.`;
+    return base;
   }
 
   protected override async handleAsk(question: string): Promise<string> {

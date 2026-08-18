@@ -2567,8 +2567,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     if (!desc) return;
     const isCli = desc.credentialMode === 'cli';
     const isUrl = desc.credentialMode === 'url';
-    const newValue = this.credentialValues[newProvider]
-      ?? (isUrl ? (desc.credentialPlaceholder ?? '') : '');
+    let newValue = this.credentialValues[newProvider];
+    if (!newValue && this.storageId && desc.storageSuffix) {
+      const key = `${STORAGE_PREFIX}${desc.storageSuffix}`;
+      const val = await this.request<string | null>(request(this.id, this.storageId, 'get', { key }));
+      // The dropdown may have moved again while the storage read was in
+      // flight; caching is still fine, but stop before painting stale widgets.
+      if (val) this.credentialValues[newProvider] = val;
+      if (this.activeAiProvider !== newProvider) return;
+      if (val) newValue = val;
+    }
+    if (!newValue) newValue = isUrl ? (desc.credentialPlaceholder ?? '') : '';
 
     // Reset masking state for the input
     this.unmasked.delete(this.credentialInputId);
@@ -2605,6 +2614,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       await this.request(request(this.id, this.providerModelsLabelId, 'update', {
         text: this.formatModelListLine(newProvider),
       }));
+    }
+
+    // Preselect the provider's default preset so applying it is one click.
+    // Deliberately NOT auto-applied: applyTierPreset ends in saveSettings(),
+    // so applying here would silently overwrite and persist the user's custom
+    // tier routing every time they browse the provider dropdown.
+    const presetName = `${desc.label} defaults`;
+    if (this.resolvePreset(presetName) && this.presetSelectId) {
+      const options = this.presetOptionNames();
+      const pIdx = options.indexOf(presetName);
+      if (pIdx >= 0) {
+        try {
+          await this.request(request(this.id, this.presetSelectId, 'update', {
+            options, selectedIndex: pIdx,
+          }));
+        } catch { /* widget gone */ }
+      }
     }
 
     // Background refresh for the newly-active provider (idempotent + deduped)
@@ -4306,6 +4332,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const desc = this.descById(provider);
       if (!desc) continue;
       if (desc.credentialMode === 'cli' || desc.credentialMode === 'url' || desc.credentialMode === 'none') continue;
+      if (!this.credentialValues[provider] && this.storageId && desc.storageSuffix) {
+        const key = `${STORAGE_PREFIX}${desc.storageSuffix}`;
+        const val = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key })
+        );
+        if (val) {
+          this.credentialValues[provider] = val;
+        }
+      }
       if (!this.credentialValues[provider]) {
         const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
         await this.setStatus(

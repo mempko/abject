@@ -101,6 +101,7 @@ import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { ClaudeCliProvider } from '../llm/claude-cli.js';
 import { CodexCliProvider } from '../llm/codex-cli.js';
+import { AntigravityCliProvider } from '../llm/antigravity-cli.js';
 import { OllamaProvider } from '../llm/ollama.js';
 import { OpenRouterProvider } from '../llm/openrouter.js';
 import { DeepSeekProvider } from '../llm/deepseek.js';
@@ -1406,6 +1407,7 @@ export class LLMObject extends Abject {
     this.registerProvider(new ClaudeCliProvider({ transport: 'terminal' }));
     this.registerProvider(new CodexCliProvider());
     this.registerProvider(new CodexCliProvider({ transport: 'terminal' }));
+    this.registerProvider(new AntigravityCliProvider());
 
     // API-key-credentialed providers, registered when a key is present.
     const apiKeyFactories: Array<[string, (apiKey: string) => LLMProvider]> = [
@@ -1807,6 +1809,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new ClaudeCliProvider({ transport: 'terminal' }),
     new CodexCliProvider(),
     new CodexCliProvider({ transport: 'terminal' }),
+    new AntigravityCliProvider(),
     new OllamaProvider(),
     new OpenRouterProvider({ apiKey: '' }),
     new DeepSeekProvider({ apiKey: '' }),
