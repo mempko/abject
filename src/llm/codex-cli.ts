@@ -18,10 +18,10 @@
  * the provider registry, picked via tier routing in GlobalSettings.
  */
 
-import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { flattenConversation, hasImages, runCliIdle } from './cli-process.js';
 import { PtySessionPool } from './pty-session.js';
 import { codexDialect } from './pty-dialects.js';
 import type { CliTransport } from './claude-cli.js';
@@ -34,7 +34,6 @@ import {
   LLMStreamChunk,
   ModelInfo,
   cliIsRetryable,
-  getTextContent,
 } from './provider.js';
 
 /**
@@ -131,8 +130,11 @@ export class CodexCliProvider extends BaseLLMProvider {
     if (result.content.length > 0) yield { content: result.content, done: false };
     // The terminal chunk must carry a stop reason. Without one the consumer
     // cannot tell a complete answer from a stream that died mid-generation,
-    // and logs every call as "no finish frame - possible truncation".
-    yield { content: '', done: true, stopReason: result.finishReason };
+    // and logs every call as "no finish frame - possible truncation". Usage
+    // rides the same chunk because it is the only place the ledger reads it
+    // from on the streaming path; the terminal transport has none to give,
+    // but the stream-json one does and used to lose it here.
+    yield { content: '', done: true, stopReason: result.finishReason, usage: result.usage };
   }
 
   override resolveModel(options?: LLMCompletionOptions): string {
@@ -228,7 +230,7 @@ export class CodexCliProvider extends BaseLLMProvider {
       const prompt = buildPrompt(messages);
       return await this.withRetries(async () => {
         const { code, stdout, stderr } = await runCliIdle(
-          this.bin, argv, { idleTimeoutMs: this.idleTimeoutMs }, prompt, dir,
+          this.bin, argv, { idleTimeoutMs: this.idleTimeoutMs, stdin: prompt, cwd: dir },
         );
         if (code !== 0) {
           throw new Error(`codex exec exited ${code} | stderr=${stderr.trim().slice(0, 400)}`);
@@ -295,68 +297,11 @@ export class CodexCliProvider extends BaseLLMProvider {
  * system messages become a leading delimited block.
  */
 function buildPrompt(messages: LLMMessage[]): string {
-  const systemParts: string[] = [];
-  const transcript: string[] = [];
-  for (const msg of messages) {
-    const text = getTextContent(msg);
-    if (msg.role === 'system') systemParts.push(text);
-    else if (msg.role === 'assistant') transcript.push(`Assistant: ${text}`);
-    else transcript.push(`User: ${text}`);
-  }
+  const { system, transcript } = flattenConversation(messages);
   const parts: string[] = [];
-  if (systemParts.length) parts.push(`[Instructions]\n${systemParts.join('\n\n')}\n[/Instructions]`);
-  parts.push(transcript.join('\n\n'));
+  if (system) parts.push(`[Instructions]\n${system}\n[/Instructions]`);
+  parts.push(transcript);
   return parts.join('\n\n');
-}
-
-interface CliResult { code: number; stdout: string; stderr: string; }
-
-/**
- * Spawn a CLI without a terminal and return its output when it closes.
- * Only used for one-shot checks like `--version`; the request path goes
- * through the pty pool.
- */
-function runCliIdle(
-  bin: string, argv: string[],
-  opts: { idleTimeoutMs: number },
-  stdin = '',
-  cwd?: string,
-): Promise<CliResult> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd });
-    let stdout = '';
-    let stderr = '';
-    let killed = false;
-
-    let idleTimer: ReturnType<typeof setTimeout>;
-    const armIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        killed = true;
-        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
-        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms - no output, subprocess killed`));
-      }, opts.idleTimeoutMs);
-    };
-    armIdle();
-
-    proc.stdout.on('data', (b) => { stdout += b.toString(); armIdle(); });
-    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
-    proc.on('error', (err) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (!killed) reject(err);
-    });
-    proc.on('close', (code) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (!killed) resolve({ code: code ?? 0, stdout, stderr });
-    });
-    proc.stdin.end(stdin);
-  });
-}
-
-/** True when any message carries an image part. */
-function hasImages(messages: LLMMessage[]): boolean {
-  return messages.some(m =>
-    Array.isArray(m.content) && m.content.some(p => p.type === 'image'));
 }
 
 interface CodexFinalMessage {

@@ -69,6 +69,7 @@ const BUILTIN_PRICES: Record<string, ModelPricing> = {
   'ollama/': { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 },
   'claude-cli/': { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 },
   'codex-cli/': { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 },
+  'antigravity-cli/': { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 },
 };
 
 /** User-supplied prices, keyed the same way. These win over the built-ins. */

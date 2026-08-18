@@ -20,7 +20,13 @@
  * alongside `anthropic`, `openai`, etc.
  */
 
-import { spawn } from 'node:child_process';
+import {
+  flattenConversation,
+  formatCliError,
+  hasImages,
+  runCliIdle,
+  runCliIdleStreaming,
+} from './cli-process.js';
 import { PtySessionPool, sessionSandboxDir } from './pty-session.js';
 import { claudeDialect } from './pty-dialects.js';
 import {
@@ -32,7 +38,6 @@ import {
   LLMStreamChunk,
   ModelInfo,
   cliIsRetryable,
-  getTextContent,
 } from './provider.js';
 
 /**
@@ -131,7 +136,7 @@ export class ClaudeCliProvider extends BaseLLMProvider {
 
   async isAvailable(): Promise<boolean> {
     try {
-      const { code } = await runCliIdle(this.bin, ['--version'], '', { idleTimeoutMs: 5_000 });
+      const { code } = await runCliIdle(this.bin, ['--version'], { idleTimeoutMs: 5_000 });
       return code === 0;
     } catch {
       return false;
@@ -202,13 +207,13 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       let cliError: string | undefined;
 
       const { code, stdout, stderr } = await runCliIdleStreaming(
-        this.bin, argv, stdin,
+        this.bin, argv,
         // Run somewhere empty, matching the terminal transport. Claude Code
         // injects the working directory and its git status into the default
         // system prompt, so running here would put the user's repo state
         // into every request: wasted tokens, and context an agent asked for
         // a JSON action has no business seeing.
-        { idleTimeoutMs: this.idleTimeoutMs, cwd: sessionSandboxDir() },
+        { idleTimeoutMs: this.idleTimeoutMs, stdin, cwd: sessionSandboxDir() },
         (line) => {
           const err = extractStreamError(line);
           if (err) cliError = err;
@@ -247,8 +252,11 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     if (result.content.length > 0) yield { content: result.content, done: false };
     // The terminal chunk must carry a stop reason. Without one the consumer
     // cannot tell a complete answer from a stream that died mid-generation,
-    // and logs every call as "no finish frame - possible truncation".
-    yield { content: '', done: true, stopReason: result.finishReason };
+    // and logs every call as "no finish frame - possible truncation". Usage
+    // rides the same chunk because it is the only place the ledger reads it
+    // from on the streaming path; the terminal transport has none to give,
+    // but the stream-json one does and used to lose it here.
+    yield { content: '', done: true, stopReason: result.finishReason, usage: result.usage };
   }
 
   override resolveModel(options?: LLMCompletionOptions): string {
@@ -348,24 +356,11 @@ export class ClaudeCliProvider extends BaseLLMProvider {
  * session would mean a separate warm session per agent.
  */
 function buildPrompt(messages: LLMMessage[]): string {
-  const systemParts: string[] = [];
-  const transcript: string[] = [];
-  for (const msg of messages) {
-    const text = getTextContent(msg);
-    if (msg.role === 'system') systemParts.push(text);
-    else if (msg.role === 'assistant') transcript.push(`Assistant: ${text}`);
-    else transcript.push(`User: ${text}`);
-  }
+  const { system, transcript } = flattenConversation(messages);
   const parts: string[] = [];
-  if (systemParts.length) parts.push(`[Instructions]\n${systemParts.join('\n\n')}\n[/Instructions]`);
-  parts.push(transcript.join('\n\n'));
+  if (system) parts.push(`[Instructions]\n${system}\n[/Instructions]`);
+  parts.push(transcript);
   return parts.join('\n\n');
-}
-
-/** True when any message carries an image part. */
-function hasImages(messages: LLMMessage[]): boolean {
-  return messages.some(m =>
-    Array.isArray(m.content) && m.content.some(p => p.type === 'image'));
 }
 
 /**
@@ -460,122 +455,4 @@ function extractStreamError(line: string): string | undefined {
     return JSON.stringify(obj);
   } catch { /* not json */ }
   return undefined;
-}
-
-/** Everything known about a failed call, so it can be replayed by hand. */
-function formatCliError(
-  bin: string, code: number, stderr: string, stdout: string,
-  argv: string[], parsedError?: string,
-): string {
-  const parts = [`${bin} CLI exited ${code}`];
-  if (parsedError) parts.push(`error=${parsedError}`);
-  if (stderr.trim()) parts.push(`stderr=${stderr.trim().slice(0, 500)}`);
-  if (stdout.trim()) parts.push(`stdout=${stdout.trim().slice(-500)}`);
-  parts.push(`argv=${bin} ${argv.join(' ')}`);
-  return parts.join(' | ');
-}
-
-interface CliResult { code: number; stdout: string; stderr: string; }
-
-/**
- * Like {@link runCliIdle}, but hands each line of stdout to `onLine` as it
- * arrives, so a long generation keeps resetting the idle timer instead of
- * looking hung.
- */
-function runCliIdleStreaming(
-  bin: string, argv: string[], stdin: string,
-  opts: { idleTimeoutMs: number; cwd?: string },
-  onLine: (line: string) => void,
-): Promise<CliResult> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd });
-    let stdout = '';
-    let stderr = '';
-    let buffer = '';
-    let killed = false;
-
-    let idleTimer: ReturnType<typeof setTimeout>;
-    const armIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        killed = true;
-        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
-        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms - no output, subprocess killed`));
-      }, opts.idleTimeoutMs);
-    };
-    armIdle();
-
-    proc.stdout.on('data', (b) => {
-      const s = b.toString();
-      stdout += s;
-      buffer += s;
-      armIdle();
-      let nl = buffer.indexOf('\n');
-      while (nl >= 0) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        nl = buffer.indexOf('\n');
-        // A parser fault must never take down the subprocess runner.
-        if (line) { try { onLine(line); } catch { /* skip */ } }
-      }
-    });
-    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
-    proc.on('error', (err) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (!killed) reject(err);
-    });
-    proc.on('close', (code) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (killed) return;
-      const tail = buffer.trim();
-      if (tail) { try { onLine(tail); } catch { /* skip */ } }
-      resolve({ code: code ?? 0, stdout, stderr });
-    });
-
-    proc.stdin.end(stdin);
-  });
-}
-
-/**
- * Spawn a CLI without a terminal and return its output when it closes.
- *
- * Only used for one-shot checks like `--version`; the request path goes
- * through the pty pool. Uses an idle timeout, so the timer resets on every
- * chunk and only a true hang triggers SIGTERM.
- */
-function runCliIdle(
-  bin: string, argv: string[], stdin: string,
-  opts: { idleTimeoutMs: number },
-): Promise<CliResult> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    let killed = false;
-
-    let idleTimer: ReturnType<typeof setTimeout>;
-    const armIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        killed = true;
-        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
-        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms - no output, subprocess killed`));
-      }, opts.idleTimeoutMs);
-    };
-    armIdle();
-
-    proc.stdout.on('data', (b) => { stdout += b.toString(); armIdle(); });
-    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
-    proc.on('error', (err) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (!killed) reject(err);
-    });
-    proc.on('close', (code) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      if (!killed) resolve({ code: code ?? 0, stdout, stderr });
-    });
-
-    if (stdin.length > 0) proc.stdin.end(stdin);
-    else proc.stdin.end();
-  });
 }
