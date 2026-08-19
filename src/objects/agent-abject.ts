@@ -661,6 +661,22 @@ export class AgentAbject extends Abject {
    */
   private staleSlotStrikes = new Map<string, number>();
 
+  /**
+   * Tasks cancelled while they held a queue slot but had not yet started a
+   * loop, with the time they were cancelled.
+   *
+   * An agent does its own setup in `executeTask` before calling back into
+   * `startTask`, and that setup can run for a while — capturing a baseline,
+   * resolving a project, opening a page. A cancellation arriving in that
+   * window has no task entry to stop, so it frees the slot instead. Without
+   * this record the agent would finish its setup and start a task the user
+   * had already cancelled, and the cancellation would have been a false
+   * promise rather than a slow one.
+   */
+  private cancelledBeforeStart = new Map<string, number>();
+  /** How long a cancellation keeps blocking a late start. */
+  private static readonly CANCEL_MEMORY_MS = 10 * 60_000;
+
   /** Lazy Ajv instance for response schema validation. */
   private _ajv?: Ajv;
   private get ajv(): Ajv {
@@ -1265,6 +1281,11 @@ The registered object must implement these handlers to participate in the agent 
       if (!agent) throw new Error(`Agent "${agentId}" is not registered`);
 
       const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Cancelled while the agent was still setting up. Starting now would run
+      // work the caller already withdrew, in a slot that has been given away.
+      if (this.cancelledBeforeStart.delete(taskId)) {
+        throw new Error(`Task ${taskId} was cancelled before it started`);
+      }
       const config = mergeConfig(agent.config, taskConfig);
       const prompt = systemPrompt ?? agent.systemPrompt ?? '';
 
@@ -1580,6 +1601,25 @@ The registered object must implement these handlers to participate in the agent 
           return { success: true, where: 'queue' };
         }
       }
+
+      // Finally, a slot held by a task that is not running in it: the agent is
+      // still in its own `executeTask` setup and has not called back into
+      // startTask, or it never will. The entry check above handles a live
+      // loop, whose slot belongs to runTaskAsync's tail and must not be freed
+      // out from under it. What is left here is a slot nothing is executing
+      // in, which otherwise stays held until the stale sweep notices minutes
+      // later, with every queued task behind it waiting on a task the caller
+      // already cancelled.
+      for (const [agentId, q] of this.agentTaskQueues) {
+        if (!q.inFlight.has(taskId)) continue;
+        if (entry && !entry.finished) continue; // live loop; leave it to the tail
+        q.inFlight.delete(taskId);
+        this.cancelledBeforeStart.set(taskId, Date.now());
+        log.info(`cancelTask: freed the slot held by ${taskId.slice(0, 8)} (no loop was running in it)`);
+        this.processNextInQueue(agentId);
+        return { success: true, where: 'slot' };
+      }
+
       return { success: false };
     });
 
@@ -1598,7 +1638,11 @@ The registered object must implement these handlers to participate in the agent 
           log.info(`cancelTasksByGoal: cancelled in-flight task ${taskId} for goal ${goalId}`);
         }
       }
-      // Drain pending tasks for this goal from every agent's queue.
+      // Drain pending tasks for this goal from every agent's queue, and free
+      // any slot this goal holds that nothing is running in — the same window
+      // cancelTask covers, where the agent is still in its own setup and has
+      // no loop to stop. Without this, cancelling a goal leaves its slots held
+      // until the stale sweep and every other goal queues behind them.
       for (const [agentId, q] of this.agentTaskQueues) {
         const before = q.pending.length;
         q.pending = q.pending.filter(t => t.goalId !== goalId);
@@ -1606,6 +1650,21 @@ The registered object must implement these handlers to participate in the agent 
         if (dropped > 0) {
           log.info(`cancelTasksByGoal: dropped ${dropped} pending task(s) from agent ${agentId.slice(0, 8)} for goal ${goalId}`);
           cancelled += dropped;
+        }
+
+        let freed = 0;
+        for (const [taskId, f] of [...q.inFlight]) {
+          if (f.goalId !== goalId) continue;
+          const entry = this.taskEntries.get(taskId);
+          if (entry && !entry.finished) continue; // live loop; its tail owns the slot
+          q.inFlight.delete(taskId);
+          this.cancelledBeforeStart.set(taskId, Date.now());
+          freed++;
+          cancelled++;
+        }
+        if (freed > 0) {
+          log.info(`cancelTasksByGoal: freed ${freed} slot(s) on agent ${agentId.slice(0, 8)} that no loop was running in`);
+          this.processNextInQueue(agentId);
         }
       }
       return { cancelled };
@@ -2137,6 +2196,13 @@ The registered object must implement these handlers to participate in the agent 
     }
     for (const taskId of [...this.staleSlotStrikes.keys()]) {
       if (!live.has(taskId)) this.staleSlotStrikes.delete(taskId);
+    }
+
+    // A cancellation only has to outlive the setup it was racing. Keeping the
+    // record forever would grow a map that nothing ever reads again.
+    const cancelCutoff = Date.now() - AgentAbject.CANCEL_MEMORY_MS;
+    for (const [taskId, at] of this.cancelledBeforeStart) {
+      if (at < cancelCutoff) this.cancelledBeforeStart.delete(taskId);
     }
 
     for (const { agentId, taskId, reason, queued } of stale) {

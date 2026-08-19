@@ -356,12 +356,12 @@ a key name.
 waits on work, the other on a slot, and only the first has a reason worth
 showing. There was no suitable icon, so `icons.ts` gained a clock.
 
-### Found while implementing, not fixed
+### Found while implementing, fixed separately
 
-`cancelTask` does not free an in-flight slot when the task never created a
-`TaskEntry` — it falls through to the pending scan and returns
-`{ success: false }`. Such a slot is only reclaimed by the stale sweep, five
-minutes later. Pre-existing, unrelated to this plan, and worth its own change.
+`cancelTask` did not free an in-flight slot when the task never created a
+`TaskEntry`. Fixed in a follow-up commit, which also closed the larger hole
+underneath it: a cancellation arriving during an agent's own setup was a false
+promise, because the agent would finish that setup and start the task anyway.
 
 ### Verification
 
