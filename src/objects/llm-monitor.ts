@@ -1310,7 +1310,10 @@ export class LLMMonitor extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - DETAIL_H) / 2) + 30);
 
     const callerName = entry.callerName ?? entry.callerId.slice(0, 8);
-    const title = `Request Detail: ${callerName} > ${entry.method}`;
+    // `via` is only set when the sender was acting for someone else, so naming
+    // it here keeps the route visible without cluttering ordinary calls.
+    const attribution = entry.via ? `${callerName} (via ${entry.via})` : callerName;
+    const title = `Request Detail: ${attribution} > ${entry.method}`;
 
     this.detailWindowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {

@@ -382,6 +382,8 @@ interface TaskEntry {
   finished?: boolean;
   /** TupleSpace tuple id of the goal task this entry is executing (when dispatched). Enables scratchpad contract injection for the current task. */
   dispatchTupleId?: string;
+  /** Last time this task's stream emitted a keep-alive, for per-task throttling. */
+  lastStreamProgressTs?: number;
   /** Consecutive LLM responses that failed to parse into a valid action. Reset on every successful parse. */
   parseFailures?: number;
   /** Consecutive LLM streams that returned empty content. Reset on every non-empty response. */
@@ -547,9 +549,18 @@ export class AgentAbject extends Abject {
   private static readonly SUBMIT_JOB_RESULT_CAP = 20000;
 
   /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
-  private activeStreamEntry?: TaskEntry;
+  /**
+   * Tasks with an LLM stream in flight, keyed by the request's message id.
+   *
+   * This was a single field, which was correct only while one task ran at a
+   * time: with several streaming at once the last one to start captured every
+   * chunk, and the first one to finish cleared the field out from under the
+   * rest. The chunk events already carry the correlation id of the request
+   * that produced them, so routing by it is exact and costs nothing.
+   */
+  private streamingEntries = new Map<string, TaskEntry>();
   /** Throttle timestamp for streaming progress events (1/sec max). */
-  private lastStreamProgressTs = 0;
+
 
   /**
    * Per-agent task queues. Each registered agent runs up to
@@ -1583,7 +1594,7 @@ The registered object must implement these handlers to participate in the agent 
       const { correlationId, content, done } = msg.payload as {
         correlationId: string; content: string; done: boolean;
       };
-      const entry = this.activeStreamEntry;
+      const entry = this.streamingEntries.get(correlationId);
       if (!entry) return;
       // Forward to ticket caller via taskStream event
       this.send(event(this.id, entry.callerId, 'taskStream', {
@@ -1597,9 +1608,11 @@ The registered object must implement these handlers to participate in the agent 
       // timers (including the 120s stream request timer) and bubbles the
       // signal upstream through the call tree. Throttled to 1/sec so we
       // don't flood the bus on fast streams.
+      // Throttled per task, not globally: a shared clock would let one busy
+      // stream starve the keep-alives that other tasks depend on.
       const now = Date.now();
-      if (now - this.lastStreamProgressTs > 1000) {
-        this.lastStreamProgressTs = now;
+      if (now - (entry.lastStreamProgressTs ?? 0) > 1000) {
+        entry.lastStreamProgressTs = now;
         this.send(event(this.id, this.id, 'progress', {
           phase: 'streaming',
           message: `streaming (${content.length} chars)`,
@@ -2797,6 +2810,7 @@ The registered object must implement these handlers to participate in the agent 
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
+          onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           // Thinking / action decisions run on 'smart' regardless of the observe
           // hint (fast-tier models drop the JSON action envelope under load,
           // producing prose that the parser can't accept), adjusted for vision
@@ -3072,35 +3086,38 @@ The registered object must implement these handlers to participate in the agent 
     await this.trimConversation(entry);
 
     this.llmId = await this.resolveDep('LLM', this.llmId);
-    // Use streaming — llmChunk events are forwarded to the ticket caller
-    this.activeStreamEntry = entry;
+    // Build the request first: its message id is the correlation id the
+    // chunk events come back with, which is how a chunk finds its own task.
+    const streamRequest = request(this.id, this.llmId, 'stream', {
+      messages: task.llmMessages,
+      // Thinking is the JSON-action-decision step. Tier comes from the
+      // agent's per-state observe hint, floored at 'balanced' (never 'fast'
+      // — haiku drops the action envelope under load), then adjusted for
+      // vision when the conversation carries images (possibly routing to
+      // the configured vision-fallback model via provider+model override).
+      // Routine/verification states run on balanced; hard states (code
+      // gen, error recovery, planning) stay on smart.
+      ...(route.provider ? { provider: route.provider } : {}),
+      options: {
+        tier: route.tier,
+        // No maxTokens override: the provider's per-tier sizing already
+        // accounts for reasoning models (whose hidden thinking shares the
+        // output cap). A fixed 16K cap starved code-emitting responses —
+        // K3 spent ~19K tokens reasoning and the visible answer was cut.
+        ...(route.model ? { model: route.model } : {}),
+        cacheKey: entry.state.id,
+      },
+      // The ledger should name the agent whose work this is, not the
+      // runtime that happens to run every agent's loop.
+      onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
+        });
+
+    this.streamingEntries.set(streamRequest.header.messageId, entry);
     let llmResult: { content: string; stopReason?: string };
     try {
-      llmResult = await this.request<{ content: string; stopReason?: string }>(
-        request(this.id, this.llmId, 'stream', {
-          messages: task.llmMessages,
-          // Thinking is the JSON-action-decision step. Tier comes from the
-          // agent's per-state observe hint, floored at 'balanced' (never 'fast'
-          // — haiku drops the action envelope under load), then adjusted for
-          // vision when the conversation carries images (possibly routing to
-          // the configured vision-fallback model via provider+model override).
-          // Routine/verification states run on balanced; hard states (code
-          // gen, error recovery, planning) stay on smart.
-          ...(route.provider ? { provider: route.provider } : {}),
-          options: {
-            tier: route.tier,
-            // No maxTokens override: the provider's per-tier sizing already
-            // accounts for reasoning models (whose hidden thinking shares the
-            // output cap). A fixed 16K cap starved code-emitting responses —
-            // K3 spent ~19K tokens reasoning and the visible answer was cut.
-            ...(route.model ? { model: route.model } : {}),
-            cacheKey: entry.state.id,
-          },
-        }),
-        120000,
-      );
+      llmResult = await this.request<{ content: string; stopReason?: string }>(streamRequest, 120000);
     } finally {
-      this.activeStreamEntry = undefined;
+      this.streamingEntries.delete(streamRequest.header.messageId);
     }
 
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
@@ -3961,6 +3978,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const result = await this.request<{ messages: typeof task.llmMessages; originalChars: number; compressedChars: number; methods: string[] }>(
         request(this.id, this.llmId, 'compress', {
           messages: task.llmMessages,
+          onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           options: {
             targetChars: AgentAbject.MAX_CONVERSATION_CHARS,
             pinnedCount,

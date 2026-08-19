@@ -120,6 +120,14 @@ export interface LLMQueryPayload {
   messages: LLMMessage[];
   options?: LLMCompletionOptions;
   provider?: string;
+  /**
+   * Who this call is really for, when the sender is calling on someone's
+   * behalf. AgentAbject runs every agent's think step, so without this the
+   * ledger attributes every agent's spend to AgentAbject and the one thing a
+   * cost view has to answer — which agent is spending this — is unanswerable.
+   * The sender's own identity is still recorded, as `via`.
+   */
+  onBehalfOf?: string;
 }
 
 export interface LLMGenerateCodePayload {
@@ -173,7 +181,17 @@ export interface LLMUsage {
 export interface LLMLedgerEntry {
   id: string;
   callerId: AbjectId;
+  /**
+   * Display name for whoever this call is attributed to: the `onBehalfOf`
+   * subject when the sender named one, otherwise the sender itself.
+   */
   callerName?: string;
+  /**
+   * The object that actually sent the request, when it differs from
+   * `callerName`. Set only for on-behalf-of calls, so the machinery stays
+   * visible without crowding the common case.
+   */
+  via?: string;
   method: string;
   provider: string;
   model: string;
@@ -911,9 +929,9 @@ export class LLMObject extends Abject {
   private setupHandlers(): void {
     this.on('complete', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
-      const { messages, options, provider } = m.payload as LLMQueryPayload;
+      const { messages, options, provider, onBehalfOf } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
-      const result = await this.complete(messages, options, provider, m.routing.from, m.header.messageId);
+      const result = await this.complete(messages, options, provider, m.routing.from, m.header.messageId, onBehalfOf);
       this.trackCacheWarmth(provider, options, messages, result.usage);
       return result;
     });
@@ -932,16 +950,17 @@ export class LLMObject extends Abject {
 
     this.on('compress', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
-      const { messages, options } = m.payload as {
+      const { messages, options, onBehalfOf } = m.payload as {
         messages: LLMMessage[];
         options?: CompressOptions;
+        onBehalfOf?: string;
       };
-      return this.compressMessages(messages, options ?? {}, m.routing.from, m.header.messageId);
+      return this.compressMessages(messages, options ?? {}, m.routing.from, m.header.messageId, onBehalfOf);
     });
 
     this.on('stream', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
-      const { messages, options, provider: providerName } = m.payload as LLMQueryPayload;
+      const { messages, options, provider: providerName, onBehalfOf } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
       const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
       const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
@@ -951,7 +970,7 @@ export class LLMObject extends Abject {
 
       // If provider doesn't support streaming, fall back to complete
       if (!provider.stream) {
-        const result = await this.complete(messages, options, providerName, callerId, correlationId);
+        const result = await this.complete(messages, options, providerName, callerId, correlationId, onBehalfOf);
         // 'length' is the provider-agnostic signal for a truncated response.
         return { content: result.content, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
       }
@@ -964,6 +983,7 @@ export class LLMObject extends Abject {
         correlationId, callerId, 'stream', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, true, messages,
         { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens },
+        onBehalfOf,
       );
 
       // Keep-alive heartbeat sent every 30s for the entire stream lifetime.
@@ -1469,6 +1489,7 @@ export class LLMObject extends Abject {
     providerName?: string,
     callerId?: AbjectId,
     requestId?: string,
+    onBehalfOf?: string,
   ): Promise<LLMCompletionResult> {
     const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
     const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
@@ -1482,7 +1503,8 @@ export class LLMObject extends Abject {
     if (callerId) {
       await this.trackRequestStart(trackId, callerId, 'complete', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, false, messages,
-        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens });
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens },
+        onBehalfOf);
     }
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
@@ -1552,6 +1574,7 @@ export class LLMObject extends Abject {
     options: CompressOptions,
     callerId?: AbjectId,
     requestId?: string,
+    onBehalfOf?: string,
   ): Promise<CompressResult> {
     const targetChars = options.targetChars ?? 180_000;
     const pinnedCount = options.pinnedCount ?? 2;
@@ -1582,7 +1605,7 @@ export class LLMObject extends Abject {
         if (len <= LLMObject.DISTILL_MESSAGE_THRESHOLD) return;
         jobs.push(async () => {
           const text = getTextContent(m);
-          const summary = await this.distillText(text, taskHint, callerId, `${baseId}-m${i}`, () => distillSeq++);
+          const summary = await this.distillText(text, taskHint, callerId, `${baseId}-m${i}`, () => distillSeq++, onBehalfOf);
           const replacement = `[Oversized message (${len} chars) distilled to preserve context budget]\n${summary}`;
           if (typeof m.content === 'string') {
             m.content = replacement;
@@ -1628,7 +1651,7 @@ export class LLMObject extends Abject {
           const serialized = chunk
             .map((m, mi) => `---- message ${mi + 1} (${m.role}) ----\n${truncateText(getTextContent(m), LLMObject.DISTILL_CHUNK_CHARS)}`)
             .join('\n\n');
-          summaries[ci] = await this.distillText(serialized, taskHint, callerId, `${baseId}-c${ci}`, () => distillSeq++);
+          summaries[ci] = await this.distillText(serialized, taskHint, callerId, `${baseId}-c${ci}`, () => distillSeq++, onBehalfOf);
         });
         methods.push('distill-middle');
         await this.runPool(jobs, LLMObject.DISTILL_CONCURRENCY);
@@ -1663,6 +1686,7 @@ export class LLMObject extends Abject {
     callerId: AbjectId | undefined,
     idPrefix: string,
     nextSeq: () => number,
+    onBehalfOf?: string,
   ): Promise<string> {
     const systemPrompt = `You are compressing part of a working conversation so an agent can keep going without losing its progress. Distil the content below into a tight, factual summary (target: under 2000 chars). Include every one of:
 - findings and discovered facts (IDs, names, states, values)
@@ -1691,6 +1715,7 @@ Omit: duplicated schema dumps, long method catalogs, decorative headers. Write i
           undefined,
           callerId,
           `${idPrefix}-d${nextSeq()}`,
+          onBehalfOf,
         );
         const summary = result.content?.trim();
         if (!summary) throw new Error('empty summary');
@@ -1900,12 +1925,17 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     streaming: boolean,
     messages?: LLMMessage[],
     routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number },
+    onBehalfOf?: string,
   ): Promise<LLMLedgerEntry> {
-    const callerName = await this.resolveCallerName(callerId);
+    const senderName = await this.resolveCallerName(callerId);
+    // Attribute to the subject when the sender named one; keep the sender as
+    // `via` so the route is still inspectable rather than erased.
+    const callerName = onBehalfOf ?? senderName;
     const entry: LLMLedgerEntry = {
       id: requestId,
       callerId,
       callerName,
+      ...(onBehalfOf && senderName && senderName !== onBehalfOf ? { via: senderName } : {}),
       method,
       provider: providerName,
       model,
