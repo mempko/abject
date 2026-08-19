@@ -21,6 +21,7 @@ import {
 } from '../../core/tool-output.js';
 import { IgnoreSet } from '../../core/ignore-rules.js';
 import { applyEdits, formatEditFailures, type FileEdit } from '../../core/file-edit.js';
+import { withFileMutationQueue } from '../../core/file-mutation-queue.js';
 import { Log } from '../../core/timed-log.js';
 
 const log = new Log('HostFileSystem');
@@ -473,10 +474,12 @@ export class HostFileSystem extends Abject {
     this.requireWrite();
     filePath = await this.validateAndResolve(filePath);
 
-    const dir = path.dirname(filePath);
-    await fs.mkdir(dir, { recursive: true });
-    await this.atomicWrite(filePath, content);
-    return { success: true };
+    return withFileMutationQueue(filePath, async () => {
+      const dir = path.dirname(filePath);
+      await fs.mkdir(dir, { recursive: true });
+      await this.atomicWrite(filePath, content);
+      return { success: true };
+    });
   }
 
   private async handleEditFile(filePath: string, oldText: string, newText: string): Promise<{ success: boolean; replacements: number }> {
@@ -486,19 +489,23 @@ export class HostFileSystem extends Abject {
     this.requireWrite();
     filePath = await this.validateAndResolve(filePath);
 
-    const content = await fs.readFile(filePath, 'utf-8');
-    let replacements = 0;
-    const result = content.replaceAll(oldText, () => {
-      replacements++;
-      return newText;
+    // Read-modify-write: the read and the write have to be one turn, or a
+    // concurrent edit between them is lost.
+    return withFileMutationQueue(filePath, async () => {
+      const content = await fs.readFile(filePath, 'utf-8');
+      let replacements = 0;
+      const result = content.replaceAll(oldText, () => {
+        replacements++;
+        return newText;
+      });
+
+      if (replacements === 0) {
+        return { success: false, replacements: 0 };
+      }
+
+      await this.atomicWrite(filePath, result);
+      return { success: true, replacements };
     });
-
-    if (replacements === 0) {
-      return { success: false, replacements: 0 };
-    }
-
-    await this.atomicWrite(filePath, result);
-    return { success: true, replacements };
   }
 
   /**
@@ -516,19 +523,24 @@ export class HostFileSystem extends Abject {
     this.requireWrite();
     filePath = await this.validateAndResolve(filePath);
 
-    const original = await fs.readFile(filePath, 'utf-8');
-    const result = applyEdits(original, edits);
-    if (!result.ok) {
-      return { success: false, applied: 0, error: formatEditFailures(result.failures) };
-    }
+    // The whole read-validate-write cycle holds the file: every oldText is
+    // matched against the content this call read, so another mutation landing
+    // mid-cycle would make the diff describe a file that never existed.
+    return withFileMutationQueue(filePath, async () => {
+      const original = await fs.readFile(filePath, 'utf-8');
+      const result = applyEdits(original, edits);
+      if (!result.ok) {
+        return { success: false, applied: 0, error: formatEditFailures(result.failures) };
+      }
 
-    await this.atomicWrite(filePath, result.content);
-    return {
-      success: true,
-      applied: result.applied,
-      diff: result.diff,
-      changedLines: result.changedLines,
-    };
+      await this.atomicWrite(filePath, result.content);
+      return {
+        success: true,
+        applied: result.applied,
+        diff: result.diff,
+        changedLines: result.changedLines,
+      };
+    });
   }
 
   private async handleLs(dirPath: string, limit?: number): Promise<{ entries: string[]; truncated: boolean }> {
@@ -655,8 +667,10 @@ export class HostFileSystem extends Abject {
     this.requireWrite();
     filePath = await this.validateAndResolve(filePath);
 
-    await fs.unlink(filePath);
-    return { success: true };
+    return withFileMutationQueue(filePath, async () => {
+      await fs.unlink(filePath);
+      return { success: true };
+    });
   }
 
   // ─── Helpers ────────────────────────────────────────────────────
@@ -847,6 +861,12 @@ export class HostFileSystem extends Abject {
       `  // { matches: [{ file, line, content, before?, after? }], truncated, filesSearched }`,
       `  // grep reports line numbers; that is how you turn a compiler error's`,
       `  // file:line into the unique text an edit needs.`,
+      ``,
+      `### Concurrency`,
+      `Mutations to the SAME file are serialized, so two overlapping edits cannot`,
+      `lose each other's change; mutations to different files stay concurrent.`,
+      `Reads never wait: writes land by atomic rename, so a read sees the whole`,
+      `old file or the whole new one, never a half-written one.`,
       ``,
       `### Restrictions`,
     ];
