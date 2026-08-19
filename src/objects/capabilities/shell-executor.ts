@@ -12,6 +12,7 @@ import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error as errorMsg, request } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
+import { truncateTail, droppedNotice, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from '../../core/tool-output.js';
 import { Log } from '../../core/timed-log.js';
 
 interface PlatformInfo {
@@ -31,6 +32,48 @@ const platformInfo: PlatformInfo = {
 };
 
 const log = new Log('ShellExecutor');
+
+/**
+ * Bound a command's output to the shared truncation contract.
+ *
+ * stderr is budgeted first and stdout gets what is left, because when a build
+ * fails the diagnostics are on stderr and the 40,000 lines of progress chatter
+ * on stdout are what you can afford to lose.
+ */
+function boundOutput(stdout: string, stderr: string, exitCode: number): ExecResult {
+  const totalBytes = Buffer.byteLength(stdout, 'utf-8') + Buffer.byteLength(stderr, 'utf-8');
+
+  const errT = truncateTail(stderr, {
+    maxLines: DEFAULT_MAX_LINES,
+    maxBytes: DEFAULT_MAX_BYTES,
+  });
+  const remainingBytes = Math.max(0, DEFAULT_MAX_BYTES - Buffer.byteLength(errT.content, 'utf-8'));
+  const remainingLines = Math.max(0, DEFAULT_MAX_LINES - errT.outputLines);
+  const outT = truncateTail(stdout, {
+    // Always leave a usable window for stdout even when stderr filled the budget:
+    // a caller that sees nothing at all cannot tell a quiet success from a flood.
+    maxLines: Math.max(200, remainingLines),
+    maxBytes: Math.max(8 * 1024, remainingBytes),
+  });
+
+  if (!errT.truncated && !outT.truncated) {
+    return { stdout, stderr, exitCode };
+  }
+
+  const stream: 'stdout' | 'stderr' | 'both' =
+    errT.truncated && outT.truncated ? 'both' : errT.truncated ? 'stderr' : 'stdout';
+
+  return {
+    stdout: outT.truncated ? droppedNotice(outT) + outT.content : outT.content,
+    stderr: errT.truncated ? droppedNotice(errT) + errT.content : errT.content,
+    exitCode,
+    truncated: {
+      stream,
+      droppedLines: (outT.totalLines - outT.outputLines) + (errT.totalLines - errT.outputLines),
+      totalBytes,
+    },
+  };
+}
 const SHELL_INTERFACE: InterfaceId = 'abjects:shell';
 
 export interface ExecRequest {
@@ -49,6 +92,17 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * Set when output was too large to return whole. The kept text is the TAIL,
+   * because a build or test run puts the part you need at the bottom.
+   */
+  truncated?: {
+    stream: 'stdout' | 'stderr' | 'both';
+    /** Lines dropped off the front, across both streams. */
+    droppedLines: number;
+    /** Original size, so the caller can say how much it is not seeing. */
+    totalBytes: number;
+  };
 }
 
 export class ShellExecutor extends Abject {
@@ -58,6 +112,14 @@ export class ShellExecutor extends Abject {
   private defaultTimeout: number;
   /** If true, all command execution is blocked. */
   private shellDisabled = false;
+  /**
+   * Working directory to use when a caller omits one, keyed by the calling
+   * Abject. An agent working inside one project sets this once instead of
+   * repeating an absolute cwd on every command, and no other caller's default
+   * is affected. Kept here rather than resolved from a project registry so
+   * ShellExecutor stays a capability with no opinion about projects.
+   */
+  private defaultCwds = new Map<AbjectId, string>();
   /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
   private permissionsAuthorityId?: AbjectId;
   /** Per-skill command whitelists (command name only, no args). */
@@ -109,6 +171,16 @@ export class ShellExecutor extends Abject {
                   exitCode: { kind: 'primitive', primitive: 'number' },
                 },
               },
+            },
+            {
+              name: 'setDefaultCwd',
+              description:
+                'Set the working directory this caller gets when it omits cwd on exec. ' +
+                'Omit cwd to clear it. Scoped to the calling object only.',
+              parameters: [
+                { name: 'cwd', type: { kind: 'primitive', primitive: 'string' }, description: 'Absolute directory path', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
               name: 'getPlatformInfo',
@@ -233,6 +305,17 @@ export class ShellExecutor extends Abject {
       return { success: true };
     });
 
+    this.on('setDefaultCwd', async (msg: AbjectMessage) => {
+      const { cwd } = msg.payload as { cwd?: string };
+      if (cwd) {
+        await this.validatePath(cwd);
+        this.defaultCwds.set(msg.routing.from, cwd);
+      } else {
+        this.defaultCwds.delete(msg.routing.from);
+      }
+      return { success: true };
+    });
+
     this.on('exec', (msg: AbjectMessage) => {
       const req = msg.payload as ExecRequest;
       this.executeCommand(req, msg.routing.from).then(
@@ -258,6 +341,7 @@ export class ShellExecutor extends Abject {
     const command = req.command;
     const args = req.args ?? [];
     const timeout = req.timeout ?? this.defaultTimeout;
+    const cwd = req.cwd ?? (callerId ? this.defaultCwds.get(callerId) : undefined);
 
     // Validate command (may prompt user)
     const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
@@ -267,7 +351,9 @@ export class ShellExecutor extends Abject {
       await this.validateCommand(fullCommand, { callerId, usesShell: !!req.shell });
     }
 
-    // Validate working directory (may prompt user)
+    // Validate working directory (may prompt user). A default set earlier by
+    // this caller was validated when it was set, so only an explicit cwd needs
+    // checking again.
     if (req.cwd) {
       await this.validatePath(req.cwd);
     }
@@ -281,7 +367,7 @@ export class ShellExecutor extends Abject {
         const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
         const child = nodeSpawn(fullCommand, {
           shell: true,
-          cwd: req.cwd,
+          cwd,
           env,
           timeout,
         });
@@ -294,24 +380,24 @@ export class ShellExecutor extends Abject {
 
         child.on('error', (err) => reject(err));
         child.on('close', (code) => {
-          resolve({ stdout, stderr, exitCode: code ?? 1 });
+          resolve(boundOutput(stdout, stderr, code ?? 1));
         });
       } else {
         // No shell: safer, uses execFile
         execFile(command, args, {
-          cwd: req.cwd,
+          cwd,
           env,
           timeout,
           maxBuffer: 10 * 1024 * 1024, // 10MB
         }, (err, stdout, stderr) => {
           if (err && 'code' in err && typeof err.code === 'number') {
             // Process exited with non-zero code -- not an error, just a non-zero exit
-            resolve({ stdout: stdout ?? '', stderr: stderr ?? '', exitCode: err.code });
+            resolve(boundOutput(stdout ?? '', stderr ?? '', err.code));
           } else if (err) {
             // Some other error (e.g. command not found, timeout)
             reject(err);
           } else {
-            resolve({ stdout: stdout ?? '', stderr: stderr ?? '', exitCode: 0 });
+            resolve(boundOutput(stdout ?? '', stderr ?? '', 0));
           }
         });
       }
@@ -530,6 +616,16 @@ export class ShellExecutor extends Abject {
       `  const result = await this.call(this.dep('ShellExecutor'), 'exec', {`,
       `    command: 'ls', args: ['-la'], cwd: '/tmp' });`,
       `  // result = { stdout: '...', stderr: '...', exitCode: 0 }`,
+      ``,
+      `### Default working directory`,
+      `  await this.call(this.dep('ShellExecutor'), 'setDefaultCwd', { cwd: '/abs/project' });`,
+      `  // Later execs that omit cwd run there. Scoped to you alone.`,
+      ``,
+      `### Output size`,
+      `  Output is bounded (${DEFAULT_MAX_LINES} lines / ${DEFAULT_MAX_BYTES / 1024}KB). The TAIL is kept, since a`,
+      `  failing build puts its diagnostics at the end. stderr is budgeted first.`,
+      `  A bounded result carries { truncated: { stream, droppedLines, totalBytes } }.`,
+      `  Narrow the command (grep, tail, --quiet) rather than asking for more.`,
       ``,
       `### Shell mode (pipes, globs)`,
       `  const result = await this.call(this.dep('ShellExecutor'), 'exec', {`,

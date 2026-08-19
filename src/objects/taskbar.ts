@@ -35,6 +35,7 @@ export class Taskbar extends Abject {
   private agentBrowserId?: AbjectId;
   private schedulerBrowserId?: AbjectId;
   private fileManagerId?: AbjectId;
+  private externalProjectBrowserId?: AbjectId;
   private registryId?: AbjectId;
   private windowManagerId?: AbjectId;
 
@@ -145,6 +146,7 @@ can restore windows from the sidebar.
     this.agentBrowserId = await this.discoverDep('AgentBrowser') ?? undefined;
     this.schedulerBrowserId = await this.discoverDep('SchedulerBrowser') ?? undefined;
     this.fileManagerId = await this.discoverDep('FileManager') ?? undefined;
+    this.externalProjectBrowserId = await this.discoverDep('ExternalProjectBrowser') ?? undefined;
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -281,6 +283,12 @@ can restore windows from the sidebar.
   private async rebuild(): Promise<void> {
     if (this.buildingUI) return;
     if (!this.windowId || !this.sectionLayoutId) return;
+    // Optional browsers are discovered once at init, so one that registers
+    // later — a different spawn order, a respawn — would never get a row.
+    // Retrying only what is still missing costs nothing on the common path.
+    if (!this.externalProjectBrowserId) {
+      this.externalProjectBrowserId = await this.discoverDep('ExternalProjectBrowser') ?? undefined;
+    }
     this.buildingUI = true;
     try {
       await this.rebuildSection();
@@ -383,6 +391,10 @@ can restore windows from the sidebar.
       if (this.fileManagerId) {
         specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCC1', 'Files'), style: rowStyle('Files') });
       }
+      // Projects — the on-disk counterpart to Files (optional)
+      if (this.externalProjectBrowserId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCC2', 'Projects'), style: rowStyle('Projects') });
+      }
     }
 
     // User object buttons. Use the manifest icon when present, else a neutral
@@ -425,6 +437,7 @@ can restore windows from the sidebar.
       if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
       if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
       if (this.fileManagerId) this.systemButtons.set(widgetIds[idx++], this.fileManagerId);
+      if (this.externalProjectBrowserId) this.systemButtons.set(widgetIds[idx++], this.externalProjectBrowserId);
     }
 
     for (let i = 0; i < showableObjects.length; i++) {
@@ -488,6 +501,7 @@ can restore windows from the sidebar.
     const depIds = [this.appExplorerId!, this.chatBrowserId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
     if (this.fileManagerId) depIds.push(this.fileManagerId);
+    if (this.externalProjectBrowserId) depIds.push(this.externalProjectBrowserId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     if (this.knowledgeBrowserId) depIds.push(this.knowledgeBrowserId);
     if (this.agentBrowserId) depIds.push(this.agentBrowserId);

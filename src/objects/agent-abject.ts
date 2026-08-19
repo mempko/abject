@@ -4257,7 +4257,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const a = r.action;
       if (a.action.startsWith('_')) continue;
       const isTerminal = !!entry.config.terminalActions[a.action];
-      const isSteering = ['replan', 'remember', 'recall', 'ask_user', 'submit_job'].includes(a.action);
+      // read_chunk belongs here with the other runtime verbs: it is served in
+      // the thinking phase, so a batched one would be forwarded to the agent,
+      // which has never heard of it and rightly rejects it.
+      const isSteering = ['replan', 'remember', 'recall', 'ask_user', 'submit_job', 'read_chunk'].includes(a.action);
       if (isTerminal || isSteering) {
         droppedSpecials.push(a.action);
         continue;

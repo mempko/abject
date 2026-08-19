@@ -641,14 +641,14 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
 
 ### When to remember (durable knowledge only)
 - User preferences or personal facts (location, name, role): tag these with "profile" so every future task always has them, even when the task wording does not mention them
-- Facts about the workspace or project structure
+- Facts about this workspace or an external project you are working in
 - Stable patterns or capabilities that help future unrelated tasks
 - References to external resources or object capabilities
 Ephemeral problems (runtime errors, connection failures, debugging context) belong in the goal scratchpad, and the knowledge base stays clean for durable lessons.
 
 ### When to recall
 - Before starting a task, check if relevant knowledge exists
-- When uncertain about user preferences or project conventions
+- When uncertain about user preferences or a project’s conventions
 - When a task is similar to a previous one`;
   }
 

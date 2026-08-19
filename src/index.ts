@@ -185,6 +185,10 @@ export { Speech, SPEECH_ID, createSpeech } from './objects/capabilities/speech.j
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
+export { ExternalProjectRegistry, EXTERNAL_PROJECT_REGISTRY_ID, ALWAYS_PROTECTED } from './objects/external-project-registry.js';
+export type { ExternalProject, IsolationMode } from './objects/external-project-registry.js';
+export { ExternalCreator, EXTERNAL_CREATOR_ID } from './objects/external-creator.js';
+export { ExternalProjectBrowser, EXTERNAL_PROJECT_BROWSER_ID } from './objects/external-project-browser.js';
 export { SkillBrowser, SKILL_BROWSER_ID } from './objects/skill-browser.js';
 export { MCPRegistryClient, MCP_REGISTRY_CLIENT_ID } from './objects/mcp-registry-client.js';
 export type { MCPServerSummary, MCPServerDetail } from './objects/mcp-registry-client.js';

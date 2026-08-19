@@ -95,6 +95,9 @@ import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
+import { ExternalProjectRegistry } from '../src/objects/external-project-registry.js';
+import { ExternalCreator } from '../src/objects/external-creator.js';
+import { ExternalProjectBrowser } from '../src/objects/external-project-browser.js';
 import { MCPBridge } from '../src/objects/mcp-bridge.js';
 import { MCPRegistryClient } from '../src/objects/mcp-registry-client.js';
 import { ClawHubClient } from '../src/objects/clawhub-client.js';
@@ -586,6 +589,9 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
   runtime.objectFactory.registerConstructor('ObjectAgent', () => new ObjectAgent());
+  runtime.objectFactory.registerConstructor('ExternalProjectRegistry', () => new ExternalProjectRegistry());
+  runtime.objectFactory.registerConstructor('ExternalCreator', () => new ExternalCreator());
+  runtime.objectFactory.registerConstructor('ExternalProjectBrowser', () => new ExternalProjectBrowser());
   runtime.objectFactory.registerConstructor('MCPRegistryClient', () => new MCPRegistryClient());
   runtime.objectFactory.registerConstructor('ClawHubClient', () => new ClawHubClient());
   runtime.objectFactory.registerConstructor('CatalogBrowser', () => new CatalogBrowser());
@@ -624,7 +630,7 @@ async function main(): Promise<void> {
       'KnowledgeBase', 'KnowledgeBrowser',
       'FileManager', 'FileViewer',
       'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
-      'ObjectAgent', 'SkillAgent', 'WebAgent',
+      'ObjectAgent', 'SkillAgent', 'WebAgent', 'ExternalProjectRegistry', 'ExternalCreator', 'ExternalProjectBrowser',
       'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',

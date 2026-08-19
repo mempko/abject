@@ -51,6 +51,8 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  // ExternalProjectRegistry precedes ExternalCreator: the agent resolves it at init.
+  'ExternalProjectRegistry', 'ExternalCreator',
   // TaskReviewer discovers KnowledgeBase, so it spawns after it.
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'ChatManager',
   'Console', 'CollectionStore', 'TriggerManager',
@@ -59,7 +61,10 @@ const INFRA_OBJECTS = [
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ExternalProjectBrowser', 'ChatBrowser', 'ObjectCreator',
+  // Taskbar resolves its optional browsers at init, so every object it offers a
+  // row for has to be spawned before it.
+  'AbjectEditor', 'Taskbar',
   'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
 ] as const;
 
