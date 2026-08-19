@@ -350,6 +350,20 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     // surfacing it here keeps the caller from treating an empty stream as
     // success.
     if (code !== 0 || cliErrorMessage) {
+      // agy ignores an input message whose `event` it does not recognize and
+      // says so on stderr, which otherwise surfaces as an empty turn or a
+      // timeout further downstream. Name the cause here: a CLI that changed
+      // its input vocabulary is a one-line fix, but only once someone can see
+      // that is what happened.
+      if (/unsupported stream input message event/.test(stderr + allStdout)) {
+        throw new Error(
+          `agy rejected our input message: it does not recognize the event name we send. ` +
+          `This provider speaks the stream-json input format introduced in agy 1.1.15 ` +
+          `({"event":"user","message":{...}}); a newer agy has probably renamed it. ` +
+          `Check \`agy changelog\` and update buildStreamJsonUserMessage. ` +
+          formatCliError('agy', code, stderr, allStdout, argv, cliErrorMessage, AGY_HINT),
+        );
+      }
       throw new Error(formatCliError('agy', code, stderr, allStdout, argv, cliErrorMessage, AGY_HINT));
     }
     // Deltas are authoritative when present; the result event's whole reply
@@ -441,10 +455,20 @@ function buildPrompt(messages: LLMMessage[]): string {
   return [`System Instructions: ${instructions}`, transcript].join('\n\n');
 }
 
-/** The single NDJSON user message agy reads in stream-json input mode. */
+/**
+ * The single NDJSON user message agy reads in stream-json input mode.
+ *
+ * The discriminator is `event`, not the `type` the Claude-style CLIs use.
+ * agy decodes `message` first and dispatches on `event` second, so getting
+ * the discriminator wrong produced `stream input message is missing the
+ * "event" field` rather than anything naming the field it wanted. Confirmed
+ * against agy 1.1.15, which is the release that introduced this input mode:
+ * `{"event":"user","message":{"role":"user","content":[{"type":"text",...}]}}`
+ * runs a turn, and any other event name is ignored with a warning.
+ */
 function buildStreamJsonUserMessage(messages: LLMMessage[]): unknown {
   return {
-    type: 'user',
+    event: 'user',
     message: { role: 'user', content: [{ type: 'text', text: buildPrompt(messages) }] },
   };
 }
