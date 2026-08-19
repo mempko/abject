@@ -1250,14 +1250,25 @@ clean result I did not observe.`;
 
     this.on('progress', (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts();
-      if (this._currentGoalId && this.goalManagerId) {
+      // Progress arrives untagged, so it cannot be attributed to one task by
+      // inspection. With several running, every live goal is genuinely being
+      // worked on and each needs its timer reset, so all of them hear about it
+      // — but the message itself belongs to whichever task emitted it, so it
+      // is only quoted when there is no ambiguity about whose it is.
+      if (this.goalManagerId) {
         const payload = msg.payload as { phase?: string; message?: string } | undefined;
-        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-          goalId: this._currentGoalId,
-          message: payload?.message ?? 'working...',
-          phase: payload?.phase ?? 'acting',
-          agentName: 'ExternalCreator',
-        }));
+        const goals = new Set<string>();
+        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
+        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const attributable = goals.size === 1;
+        for (const goalId of goals) {
+          this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+            goalId,
+            message: attributable ? (payload?.message ?? 'working...') : 'working...',
+            phase: payload?.phase ?? 'acting',
+            agentName: 'ExternalCreator',
+          }));
+        }
       }
     });
 
@@ -1434,12 +1445,18 @@ clean result I did not observe.`;
     return { success: true, result: `${reportText}\n\n${evidence}` };
   }
 
-  private async setDefaultCwd(extra: TaskExtra): Promise<void> {
-    if (!extra.workRoot) return;
-    try {
-      const shellId = await this.shell();
-      await this.call(shellId, 'setDefaultCwd', { cwd: extra.workRoot }, 130_000);
-    } catch { /* commands can still pass cwd explicitly */ }
+  /**
+   * Deliberately does nothing to ShellExecutor's per-caller default cwd.
+   *
+   * That default is keyed by calling object, not by task, so two concurrent
+   * tasks in different projects would overwrite each other's — and the one
+   * that lost would run its commands in the other project's root, which is
+   * the kind of failure that looks like a mystery rather than a bug. Every
+   * command this agent runs carries an explicit cwd from its own task state
+   * (see runCommand), so nothing here needs the default.
+   */
+  private async setDefaultCwd(_extra: TaskExtra): Promise<void> {
+    return;
   }
 
   // ─── Observe ────────────────────────────────────────────────────

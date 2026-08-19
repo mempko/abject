@@ -30,6 +30,7 @@ import { buildOrganismManifest } from './organism.js';
 import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
+import { withKeyedLock } from '../core/keyed-lock.js';
 import * as acorn from 'acorn';
 
 const log = new Log('OBJECT-CREATOR');
@@ -2022,12 +2023,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { ok: false, summary: 'deploy_update: no target', error: 'pass {objectId} or {targetName} in the action payload, or use deploy_spawn for new objects' };
     }
 
+    // Everything from here is one write to one object. Two modify loops
+    // running at once would otherwise interleave their four steps and leave
+    // the live object, the Registry's cache, and the store each holding a
+    // different version of the source.
+    // Captured before the closure: the guard above proved it is a string, and
+    // a later staging op must not change what this deploy writes.
+    const draftSource = state.draftSource;
+    return withKeyedLock(`abject-source:${targetId}`, async () => {
+      const conflict = await this.detectSourceConflict(state, targetId!);
+      if (conflict) return conflict;
+
     // 1. Hot-swap on the live ScriptableAbject.
     try {
       const updateRes = await this.sendRequest<{ success: boolean; error?: string }>(
         targetId,
         'updateSource',
-        { source: state.draftSource },
+        { source: draftSource },
         60000,
       );
       if (updateRes && updateRes.success === false) {
@@ -2040,9 +2052,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     // 2. Update Registry's cached source.
     try {
-      await this.sendRequest<unknown>(this.registryId, 'updateSource', {
+      await this.sendRequest<unknown>(this.registryId!, 'updateSource', {
         objectId: targetId,
-        source: state.draftSource,
+        source: draftSource,
       }, 30000);
     } catch (err) {
       log.warn('deploy_update: Registry.updateSource failed:', err instanceof Error ? err.message : String(err));
@@ -2052,7 +2064,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // 3. If we have a manifest draft, update Registry's cached manifest too.
     if (state.draftManifest) {
       try {
-        await this.sendRequest<unknown>(this.registryId, 'updateManifest', {
+        await this.sendRequest<unknown>(this.registryId!, 'updateManifest', {
           objectId: targetId,
           manifest: state.draftManifest,
         }, 30000);
@@ -2095,7 +2107,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           {
             objectId: targetId,
             manifest: manifestForPersist,
-            source: state.draftSource,
+            source: draftSource,
             owner: this.id,
           },
           15000,
@@ -2106,20 +2118,74 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     state.deployedViaUpdateSource = true;
-    state.lastDeployedSource = state.draftSource;
+    state.lastDeployedSource = draftSource;
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
     if (targetLabel && !state.targetName) state.targetName = targetLabel;
+    // What is live is now what we just wrote, so a second deploy in this same
+    // loop compares against the right base instead of reporting itself as a
+    // conflict.
+    state.targetSource = draftSource;
 
     const advisory = await this.adviseSemantics(state);
 
     return {
       ok: true,
-      summary: `deploy_update: ${targetLabel ?? targetId} updated (${state.draftSource.split('\n').length} lines)`,
+      summary: `deploy_update: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)`,
       data: {
         objectId: targetId,
         ...(advisory ? { semanticReview: advisory } : {}),
         next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI. If the edit touched show()/createCanvas/widget wiring, hide() then show() the target first.',
       },
+    };
+    });
+  }
+
+  /**
+   * Refuse a deploy whose draft was built from a version of the source that no
+   * longer exists.
+   *
+   * A file edit re-reads the file on every call, so a second writer's change is
+   * always visible to the next one. A modify loop does not work that way: it
+   * loads the source once and edits a draft across many turns, so a deploy can
+   * land minutes after the read it was based on. Serializing the deploys alone
+   * would order two such writers without stopping the later one from erasing
+   * the earlier one's work.
+   *
+   * So the base is checked as well as the order. `targetSource` is the source
+   * as loaded (or as last deployed by this loop); if what is live has moved on,
+   * the right answer is to tell the agent rather than to pick a winner.
+   */
+  private async detectSourceConflict(
+    state: LoopState,
+    targetId: AbjectId,
+  ): Promise<{ ok: false; summary: string; error: string } | undefined> {
+    // No base means no claim about what this draft was built from: a full
+    // authored rewrite, or a create loop that discovered an existing object.
+    // Nothing to compare, and refusing would block a legitimate deploy.
+    if (!state.targetSource) return undefined;
+
+    let live: string | undefined;
+    try {
+      const res = await this.sendRequest<{ source?: string } | string | null>(
+        targetId, 'getSource', {}, 15000,
+      );
+      live = typeof res === 'string' ? res : res?.source;
+    } catch {
+      // An object that cannot report its source cannot be checked. Deploying
+      // blind beats refusing every modify because one handler is missing.
+      return undefined;
+    }
+    if (typeof live !== 'string' || live === state.targetSource) return undefined;
+
+    return {
+      ok: false,
+      summary: 'deploy_update: the object changed underneath this draft',
+      error:
+        `This object's source has changed since it was loaded, so deploying now would erase ` +
+        `whoever made that change. Your draft is based on ${state.targetSource.split('\n').length} ` +
+        `lines; the live object now has ${live.split('\n').length}. ` +
+        `Re-load the target (load_target) to pick up the current source, re-apply your change ` +
+        `with edit_source, and deploy again.`,
     };
   }
 

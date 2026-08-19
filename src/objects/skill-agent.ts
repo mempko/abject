@@ -293,14 +293,25 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     // Forward progress to GoalManager so Chat's timeout resets during long operations.
     this.on('progress', (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts();
-      if (this._currentGoalId && this.goalManagerId) {
+      // Progress arrives untagged, so it cannot be attributed to one task by
+      // inspection. With several running, every live goal is genuinely being
+      // worked on and each needs its timer reset, so all of them hear about it
+      // — but the message itself belongs to whichever task emitted it, so it
+      // is only quoted when there is no ambiguity about whose it is.
+      if (this.goalManagerId) {
         const payload = msg.payload as { phase?: string; message?: string } | undefined;
-        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-          goalId: this._currentGoalId,
-          message: payload?.message ?? 'working...',
-          phase: payload?.phase ?? 'acting',
-          agentName: 'SkillAgent',
-        }));
+        const goals = new Set<string>();
+        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
+        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const attributable = goals.size === 1;
+        for (const goalId of goals) {
+          this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+            goalId,
+            message: attributable ? (payload?.message ?? 'working...') : 'working...',
+            phase: payload?.phase ?? 'acting',
+            agentName: 'SkillAgent',
+          }));
+        }
       }
     });
 

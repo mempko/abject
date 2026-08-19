@@ -238,6 +238,16 @@ export interface TerminalActionConfig {
 
 export interface AgentConfig {
   maxSteps?: number;
+  /**
+   * How many of this agent's tasks may run at once.
+   *
+   * An agent is a single object, so raising this only makes sense when its
+   * per-task state is keyed by taskId and the things it writes are ordered
+   * (see keyed-lock.ts). Every built-in agent meets both conditions; a
+   * user-authored agent that keeps one task's state in instance fields should
+   * set this to 1.
+   */
+  maxConcurrentTasks?: number;
   timeout?: number;
   pinnedMessageCount?: number;
   maxConversationMessages?: number;
@@ -252,6 +262,7 @@ export interface AgentConfig {
 /** Resolved config with all defaults filled in. */
 interface ResolvedAgentConfig {
   maxSteps: number;
+  maxConcurrentTasks: number;
   timeout: number;
   pinnedMessageCount: number;
   maxConversationMessages: number;
@@ -397,6 +408,9 @@ const MAX_STEP_EXTENSIONS = 2;
 
 const DEFAULT_CONFIG: ResolvedAgentConfig = {
   maxSteps: 25,
+  // Independent tasks assigned to one agent used to run strictly one after
+  // another, which made a planner's parallel branches serial in practice.
+  maxConcurrentTasks: 3,
   timeout: 300000,
   pinnedMessageCount: 2,
   maxConversationMessages: 32,
@@ -415,6 +429,7 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
   if (!partial) return { ...DEFAULT_CONFIG, terminalActions: { ...DEFAULT_CONFIG.terminalActions } };
   return {
     maxSteps: partial.maxSteps ?? DEFAULT_CONFIG.maxSteps,
+    maxConcurrentTasks: partial.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks,
     timeout: partial.timeout ?? DEFAULT_CONFIG.timeout,
     pinnedMessageCount: partial.pinnedMessageCount ?? DEFAULT_CONFIG.pinnedMessageCount,
     maxConversationMessages: partial.maxConversationMessages ?? DEFAULT_CONFIG.maxConversationMessages,
@@ -484,6 +499,7 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
   if (!override) return base;
   return {
     maxSteps: override.maxSteps ?? base.maxSteps,
+    maxConcurrentTasks: override.maxConcurrentTasks ?? base.maxConcurrentTasks,
     timeout: override.timeout ?? base.timeout,
     pinnedMessageCount: override.pinnedMessageCount ?? base.pinnedMessageCount,
     maxConversationMessages: override.maxConversationMessages ?? base.maxConversationMessages,
@@ -536,12 +552,13 @@ export class AgentAbject extends Abject {
   private lastStreamProgressTs = 0;
 
   /**
-   * Per-agent task queues. Each registered agent runs one task at a time
-   * through its OTA loop; additional tasks queue up here and the queue
-   * runner pops the next one when the current task finishes.
+   * Per-agent task queues. Each registered agent runs up to
+   * `config.maxConcurrentTasks` at once through its OTA loop; the rest queue
+   * here and the runner starts them as slots free up.
    *
-   * The `inFlight` slot replaces the legacy `busyAgents` mutual-exclusion
-   * mechanism. Cancellation: pending tasks splice out of `pending`;
+   * The `inFlight` map replaces the legacy `busyAgents` mutual-exclusion
+   * mechanism, and before that a single slot that made every agent serial.
+   * Cancellation: pending tasks splice out of `pending`;
    * in-flight tasks set `entry.state.phase = 'error'` with `error: 'Cancelled'`
    * which the OTA loop checks at observe/think boundaries.
    *
@@ -555,7 +572,8 @@ export class AgentAbject extends Abject {
      * a task wedges, its QueuedTask has already been spliced out of `pending`
      * and the TaskEntry may never have existed.
      */
-    inFlight?: { taskId: string; goalId?: string; queued?: QueuedTask };
+    /** Running tasks, keyed by taskId. Bounded by the agent's concurrency limit. */
+    inFlight: Map<string, { taskId: string; goalId?: string; queued?: QueuedTask }>;
     pending: QueuedTask[];
   }>();
 
@@ -1064,8 +1082,8 @@ The registered object must implement these handlers to participate in the agent 
     // signal rather than hanging. Pending queues drop on the floor — they
     // weren't started so there's no partial work to surface.
     for (const [agentId, q] of this.agentTaskQueues) {
-      if (q.inFlight) {
-        const entry = this.taskEntries.get(q.inFlight.taskId);
+      for (const taskId of q.inFlight.keys()) {
+        const entry = this.taskEntries.get(taskId);
         if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
           entry.state.phase = 'error';
           entry.state.error = 'AgentAbject stopped';
@@ -1280,7 +1298,7 @@ The registered object must implement these handlers to participate in the agent 
 
       let q = this.agentTaskQueues.get(targetAgentId);
       if (!q) {
-        q = { pending: [] };
+        q = { inFlight: new Map(), pending: [] };
         this.agentTaskQueues.set(targetAgentId, q);
       }
       const queued: QueuedTask = {
@@ -1298,8 +1316,9 @@ The registered object must implement these handlers to participate in the agent 
         data,
       };
       q.pending.push(queued);
-      const queuePosition = q.pending.length - 1 + (q.inFlight ? 1 : 0);
-      log.info(`enqueueTask: agent=${agent.name} task="${task.slice(0, 60)}" position=${queuePosition} (inFlight=${q.inFlight ? 'yes' : 'no'})`);
+      const limit = agent.config.maxConcurrentTasks;
+      const queuePosition = q.pending.length - 1 + q.inFlight.size;
+      log.info(`enqueueTask: agent=${agent.name} task="${task.slice(0, 60)}" position=${queuePosition} (running=${q.inFlight.size}/${limit})`);
       // Kick the queue runner — no-op if inFlight is already set.
       this.processNextInQueue(targetAgentId);
       return { taskId, queuePosition };
@@ -1321,7 +1340,7 @@ The registered object must implement these handlers to participate in the agent 
         enqueuedAt: t.enqueuedAt,
       });
       return {
-        inFlight: q.inFlight ? { taskId: q.inFlight.taskId, goalId: q.inFlight.goalId ?? null } : null,
+        inFlight: [...q.inFlight.values()].map(f => ({ taskId: f.taskId, goalId: f.goalId ?? null })),
         pending: q.pending.map(summarise),
       };
     });
@@ -1980,8 +1999,8 @@ The registered object must implement these handlers to participate in the agent 
   private releaseQueueSlot(agentId: AbjectId, taskId: string): void {
     try {
       const q = this.agentTaskQueues.get(agentId);
-      if (!q || q.inFlight?.taskId !== taskId) return;
-      q.inFlight = undefined;
+      if (!q || !q.inFlight.has(taskId)) return;
+      q.inFlight.delete(taskId);
       this.processNextInQueue(agentId);
     } catch (err) {
       log.error(`releaseQueueSlot(${taskId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`);
@@ -2008,8 +2027,7 @@ The registered object must implement these handlers to participate in the agent 
     const stale: Array<{ agentId: AbjectId; taskId: string; reason: string; queued?: QueuedTask }> = [];
 
     for (const [agentId, q] of this.agentTaskQueues) {
-      const inFlight = q.inFlight;
-      if (!inFlight) continue;
+      for (const inFlight of q.inFlight.values()) {
 
       const entry = this.taskEntries.get(inFlight.taskId);
       // Strikes needed before acting. A task that ran and ended is unambiguous
@@ -2039,12 +2057,13 @@ The registered object must implement these handlers to participate in the agent 
       if (strikes < needed) continue;
 
       stale.push({ agentId, taskId: inFlight.taskId, reason, queued: inFlight.queued });
+      }
     }
 
     // Drop strike records for slots that are no longer in flight.
     const live = new Set<string>();
     for (const q of this.agentTaskQueues.values()) {
-      if (q.inFlight) live.add(q.inFlight.taskId);
+      for (const taskId of q.inFlight.keys()) live.add(taskId);
     }
     for (const taskId of [...this.staleSlotStrikes.keys()]) {
       if (!live.has(taskId)) this.staleSlotStrikes.delete(taskId);
@@ -2102,20 +2121,25 @@ The registered object must implement these handlers to participate in the agent 
    */
   private processNextInQueue(agentId: AbjectId): void {
     const q = this.agentTaskQueues.get(agentId);
-    if (!q || q.inFlight || q.pending.length === 0) return;
-    // Skip queued tasks whose goal is paused — they stay pending and the
-    // queue is re-kicked by resumeTasksByGoal.
-    const idx = q.pending.findIndex(t => !t.goalId || !this.pausedGoals.has(t.goalId));
-    if (idx === -1) return;
-    const next = q.pending.splice(idx, 1)[0];
-    q.inFlight = { taskId: next.taskId, goalId: next.goalId, queued: next };
-    this.startQueuedTask(agentId, next).catch(err => {
-      log.warn(`startQueuedTask for ${agentId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
-      // Free the slot so subsequent enqueues aren't stuck.
-      const q2 = this.agentTaskQueues.get(agentId);
-      if (q2) q2.inFlight = undefined;
-      this.processNextInQueue(agentId);
-    });
+    if (!q || q.pending.length === 0) return;
+    const limit = this.registeredAgents.get(agentId)?.config.maxConcurrentTasks ?? 1;
+
+    // Fill every free slot, not just one: a planner that dispatches four
+    // independent tasks to one agent expects them to start together.
+    while (q.inFlight.size < limit) {
+      // Skip queued tasks whose goal is paused — they stay pending and the
+      // queue is re-kicked by resumeTasksByGoal.
+      const idx = q.pending.findIndex(t => !t.goalId || !this.pausedGoals.has(t.goalId));
+      if (idx === -1) return;
+      const next = q.pending.splice(idx, 1)[0];
+      q.inFlight.set(next.taskId, { taskId: next.taskId, goalId: next.goalId, queued: next });
+      this.startQueuedTask(agentId, next).catch(err => {
+        log.warn(`startQueuedTask for ${agentId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
+        // Free the slot so subsequent enqueues aren't stuck.
+        this.agentTaskQueues.get(agentId)?.inFlight.delete(next.taskId);
+        this.processNextInQueue(agentId);
+      });
+    }
   }
 
   /**
@@ -2133,7 +2157,7 @@ The registered object must implement these handlers to participate in the agent 
       log.warn(`startQueuedTask: agent ${agentId.slice(0, 8)} no longer registered; dropping task ${queued.taskId.slice(0, 8)}`);
       const q = this.agentTaskQueues.get(agentId);
       if (q) {
-        q.inFlight = undefined;
+        q.inFlight.delete(queued.taskId);
         this.processNextInQueue(agentId);
       }
       return;
