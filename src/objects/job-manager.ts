@@ -11,8 +11,12 @@ import { request, event } from '../core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../core/contracts.js';
 import { validateCode, runSandboxed, SANDBOX_BUILTIN_NAMES } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
+import { levenshtein } from './source-diff.js';
 
 const log = new Log('JobManager');
+
+/** An id is a UUID; anything else a job passes as a recipient is a name. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
@@ -370,6 +374,45 @@ export class JobManager extends Abject {
     }
   }
 
+  /**
+   * What to say when a name matches nothing.
+   *
+   * The failure that motivated this spent four agent steps listing the
+   * registry to work out what the object was "really" called. Answering that
+   * question in the error costs one message and saves the search.
+   */
+  private async unknownRecipientError(name: string): Promise<string> {
+    let suggestions = '';
+    try {
+      const regId = await this.resolveRegistryId();
+      if (regId) {
+        // Registry search matches substrings, which is exactly what a typo is
+        // not: "GoalManger" contains no substring of "GoalManager" long enough
+        // to hit. So rank the registered names by edit distance instead —
+        // a misspelling is the case this error exists to answer.
+        const listed = await this.request<Array<{ name?: string }>>(
+          request(this.id, regId, 'list', {}), 10000,
+        );
+        const names = [...new Set((listed ?? []).map(o => o.name).filter((n): n is string => !!n))];
+        const lower = name.toLowerCase();
+        const near = names
+          .map(n => ({ n, d: levenshtein(lower, n.toLowerCase()) }))
+          // Half the name's length is loose enough to catch a dropped letter or
+          // a wrong case, tight enough that an unrelated object never appears.
+          .filter(c => c.d <= Math.max(2, Math.floor(name.length / 2)))
+          .sort((a, b) => a.d - b.d)
+          .slice(0, 3)
+          .map(c => c.n);
+        if (near.length > 0) suggestions = ` Did you mean: ${near.join(', ')}?`;
+        else if (names.length > 0) suggestions = ` Registered: ${names.slice(0, 12).join(', ')}${names.length > 12 ? ', …' : ''}.`;
+      }
+    } catch { /* a registry that will not answer must not mask the real error */ }
+    return (
+      `call() could not find an object named "${name}".${suggestions} ` +
+      `Pass a registered object name or an id — both work here.`
+    );
+  }
+
   private async executeCode(
     code: string,
     callerId: AbjectId | undefined,
@@ -378,6 +421,48 @@ export class JobManager extends Abject {
   ): Promise<unknown> {
     q.currentJobCallerId = callerId;
     log.info(`Executing job code (queue: ${q.name}):\n${code}`);
+
+    // Names resolved during this job. Scoped to the run rather than to the
+    // object: an id belongs to one object for its lifetime, but a respawn
+    // hands out a new one, and a cache outliving the job would eventually
+    // address something that no longer exists.
+    const resolvedNames = new Map<string, AbjectId>();
+
+    /**
+     * Turn whatever the job passed as a recipient into an address.
+     *
+     * `call(await dep('X'), ...)` was the only correct form, and
+     * `call('X', ...)` — which is what everyone writes first — produced
+     * `RECIPIENT_NOT_FOUND: Recipient X is not registered`. That message reads
+     * like the object is missing rather than like the argument is the wrong
+     * kind of thing, so the recovery it invites is a hunt for the object's
+     * "real" name. Accepting both forms removes the trap; naming what is
+     * actually registered removes the hunt when a name is genuinely wrong.
+     */
+    const resolveTarget = async (to: unknown): Promise<AbjectId> => {
+      const raw = await to;
+      if (typeof raw !== 'string' || raw.length === 0) {
+        throw new Error('call() needs a recipient: an object id, or the name of a registered object');
+      }
+      if (UUID_RE.test(raw)) return raw as AbjectId;
+
+      const cached = resolvedNames.get(raw);
+      if (cached) return cached;
+
+      // Single-shot first: the common case is a name that is registered right
+      // now, and a hard requireDep would spend its whole retry window on a typo.
+      let id = await this.discoverDep(raw);
+      if (!id) {
+        // One short retry covers the real race — an object registering moments
+        // after the job started — without turning a typo into a long stall.
+        await new Promise(r => setTimeout(r, 500));
+        id = await this.discoverDep(raw);
+      }
+      if (!id) throw new Error(await this.unknownRecipientError(raw));
+
+      resolvedNames.set(raw, id);
+      return id;
+    };
 
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,
@@ -392,7 +477,7 @@ export class JobManager extends Abject {
         actualMethod = payload as unknown as string;
         actualPayload = _unused;
       }
-      const resolved = await to;
+      const resolved = await resolveTarget(to);
       const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
       q.currentCallMsgId = msg.header.messageId;
       try {
