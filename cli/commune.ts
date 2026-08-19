@@ -20,6 +20,9 @@ import {
 import { Screen, parseKeys, Key, Line, LineColor, TabInfo } from './tui.js';
 import { renderMarkdown, stripAnsi } from './markdown.js';
 import { extractImages, renderImage } from './image.js';
+// Shared with the windowed surfaces so the terminal and the desktop cannot
+// drift into disagreeing about the shape of one round.
+import { orderTopologically, blockedOn, indexById } from '../src/core/task-graph.js';
 
 function helpLines(p: string): string[] {
   const P = `C-${p}`;
@@ -654,9 +657,22 @@ class TuiApp {
     if (goal.description && goal.description !== goal.title) {
       lines.push({ text: `   ⓘ ${goal.description}`, color: 'dim' });
     }
-    for (const task of goal.tasks) {
+    // Dependencies before dependents, and the same blocked-on annotation the
+    // windowed surfaces show. Shared with them via task-graph so the terminal
+    // and the desktop cannot drift into disagreeing about one round.
+    const ordered = orderTopologically(goal.tasks);
+    const byId = indexById(goal.tasks);
+    const label = (id: string): string => {
+      const dep = byId.get(id);
+      if (!dep) return id.slice(0, 8);
+      const text = dep.description.replace(/\s+/g, ' ').trim();
+      return text.length > 28 ? `${text.slice(0, 28)}…` : text || id.slice(0, 8);
+    };
+
+    for (const task of ordered) {
       const description = task.description.replace(/\s+/g, ' ').slice(0, 140);
       const agent = task.agentName ? `  [${task.agentName}]` : '';
+      const waiting = task.status === 'pending' ? blockedOn(task, byId) : [];
       switch (task.status) {
         case 'done':
           lines.push({ text: `   ✓ ${description}`, color: 'dim' });
@@ -666,7 +682,16 @@ class TuiApp {
           lines.push({ text: `   ✗ ${description}`, color: 'red' });
           break;
         case 'pending':
-          lines.push({ text: `   ○ ${description}${agent}`, color: 'dim' });
+          // Waiting on work reads differently from waiting on a free slot, and
+          // only the first has a reason worth naming.
+          if (waiting.length > 0) {
+            lines.push({
+              text: `   ◷ ${description}${agent} — waiting on ${waiting.map(label).join(', ')}`,
+              color: 'dim',
+            });
+          } else {
+            lines.push({ text: `   ○ ${description}${agent}`, color: 'dim' });
+          }
           break;
         default: // claimed / in progress
           lines.push({ text: `   ▸ ${description}${agent}`, color: 'normal' });

@@ -26,7 +26,8 @@ export type IconName =
   | 'warning'
   | 'info'
   | 'help'
-  | 'dot';
+  | 'dot'
+  | 'clock';
 
 export interface IconDrawOpts {
   surfaceId: string;
@@ -301,6 +302,24 @@ const dotIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
   return [circle(surfaceId, x + size / 2, y + size / 2, size * 0.18, color)];
 };
 
+/**
+ * A clock face: the "waiting on something else" state, which needs to read
+ * differently at a glance from "queued" (a dot) and "running" (a chevron).
+ */
+const clockIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const cx = x + size / 2;
+  const cy = y + size / 2;
+  const r = size * 0.36;
+  const lw = Math.max(1, size * 0.08);
+  return [
+    circle(surfaceId, cx, cy, r, undefined, color, lw),
+    // Hands at roughly 10:10, which reads as a clock at small sizes better
+    // than any vertical/horizontal pair does.
+    line(surfaceId, cx, cy, cx, cy - r * 0.55, color, lw),
+    line(surfaceId, cx, cy, cx + r * 0.45, cy + r * 0.2, color, lw),
+  ];
+};
+
 const ICONS: Record<IconName, Renderer> = {
   close: closeIcon,
   minimize: minimizeIcon,
@@ -319,4 +338,5 @@ const ICONS: Record<IconName, Renderer> = {
   info: infoIcon,
   help: helpIcon,
   dot: dotIcon,
+  clock: clockIcon,
 };

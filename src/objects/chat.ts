@@ -237,6 +237,7 @@ export class Chat extends Abject {
     claimedBy?: string;
     attempts: number;
     maxAttempts: number;
+    dependsOn?: string[];
   }>>();
 
   /** Welcome-card widget ids (destroyed on first send / clear). */
@@ -2905,6 +2906,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         claimedBy: t.claimedBy,
         attempts: (t.fields?.attempts as number) ?? 0,
         maxAttempts: (t.fields?.maxAttempts as number) ?? 3,
+        dependsOn: (t.fields?.dependsOn as string[]) ?? undefined,
       }));
       this.liveTasks.set(goalId, tasks);
     } catch { /* GoalManager may not be ready */ }

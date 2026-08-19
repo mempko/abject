@@ -10,6 +10,7 @@
  */
 
 import type { IconName } from '../ui/icons.js';
+import { orderTopologically, blockedOn, indexById } from '../core/task-graph.js';
 
 export type GoalRowKind = 'goal' | 'description' | 'task' | 'progress' | 'error';
 
@@ -77,6 +78,8 @@ export interface TaskNode {
   maxAttempts: number;
   claimedBy?: string;
   agentName?: string;
+  /** Task ids this one waits on. A round is a graph, not a list. */
+  dependsOn?: string[];
 }
 
 const GOAL_STATUS_ICON_NAMES: Record<string, IconName> = {
@@ -88,6 +91,8 @@ const GOAL_STATUS_ICON_NAMES: Record<string, IconName> = {
 
 const TASK_STATUS_ICON_NAMES: Record<string, IconName> = {
   pending:            'dot',
+  // Waiting on other work, as distinct from waiting on a free slot.
+  blocked:            'clock',
   claimed:            'chevronRight',
   in_progress:        'chevronRight',
   done:               'check',
@@ -189,15 +194,37 @@ export function buildGoalRows(input: {
     }
 
     // Tasks
-    for (const task of tasks) {
-      const effectiveStatus = task.status === 'pending' && task.claimedBy ? 'claimed' : task.status;
+    // Dependencies before dependents, so reading top to bottom follows the
+    // order the work actually happens in rather than the order it was staged.
+    const ordered = orderTopologically(tasks);
+    const byId = indexById(tasks);
+    // Short labels keep the blocked-on note readable: a task id is a UUID, and
+    // what the reader wants is which task, not which identifier.
+    const label = (id: string): string => {
+      const dep = byId.get(id);
+      if (!dep) return id.slice(0, 8);
+      const text = dep.description.trim();
+      return text.length > 32 ? `${text.slice(0, 32)}…` : text || id.slice(0, 8);
+    };
+
+    for (const task of ordered) {
+      const waiting = blockedOn(task, byId);
+      // "Blocked" is a distinct state from "pending": one is waiting on work,
+      // the other is waiting on a slot, and only the first has a reason worth
+      // showing.
+      const effectiveStatus = task.status === 'pending' && task.claimedBy ? 'claimed'
+        : task.status === 'pending' && waiting.length > 0 ? 'blocked'
+        : task.status;
       const attempts = task.attempts > 0 ? ` (${task.attempts}/${task.maxAttempts})` : '';
       const agent = task.agentName ? `[${task.agentName}] ` : '';
+      const blockedNote = effectiveStatus === 'blocked'
+        ? ` — waiting on ${waiting.map(label).join(', ')}`
+        : '';
       rows.push({
         id: `task:${task.id}`,
         kind: 'task',
         depth: depth + 1,
-        text: `${agent}${task.description}${attempts}`,
+        text: `${agent}${task.description}${attempts}${blockedNote}`,
         iconName: TASK_STATUS_ICON_NAMES[effectiveStatus] ?? 'dot',
         iconColorRole: effectiveStatus === 'done' ? 'success'
           : effectiveStatus === 'permanently_failed' ? 'error'

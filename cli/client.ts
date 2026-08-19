@@ -74,6 +74,8 @@ export interface GoalTask {
   description: string;
   status: string;
   agentName?: string;
+  /** Task ids this one waits on, so the panel can order and annotate them. */
+  dependsOn?: string[];
 }
 
 export interface GoalStatus {

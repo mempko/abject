@@ -44,6 +44,9 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { safeStringify } from '../core/format.js';
+import {
+  deriveContractEdges, validateDataFlow, transitiveDependentCounts,
+} from '../core/task-graph.js';
 
 const log = new Log('ScrumMaster');
 
@@ -60,6 +63,12 @@ interface TeamContribution {
 
 /** A task staged by `add_task`, awaiting commit by `dispatch_scrum`. */
 interface StagedTask {
+  /**
+   * Planner-chosen name, when it gave one. Edges read far better as names than
+   * as positions, and an off-by-one index produces a valid graph of the wrong
+   * shape that nothing downstream can detect.
+   */
+  name?: string;
   description: string;
   assignedAgentName: string;
   assignedAgentId: AbjectId;
@@ -1194,7 +1203,9 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
 
     const description = action.description as string | undefined;
     const assignedAgentName = action.assignedAgentName as string | undefined;
-    const dependsOnIdx = (action.dependsOn as number[] | undefined);
+    // A dependency may be named or positional; a batch may mix both.
+    const dependsOnRaw = (action.dependsOn as Array<number | string> | undefined);
+    const stagedName = (action.id ?? action.name) as string | undefined;
     const produces = action.produces as Array<{ key: string; description: string }> | undefined;
     const consumes = action.consumes as string[] | undefined;
     // Optional concrete target object (UUID or registered name) when the task
@@ -1222,14 +1233,43 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       this.scrumInFlight.set(otaTaskId, inflight);
     }
 
-    // Validate dependsOn indices at stage time.
-    let resolvedDeps: number[];
-    if (Array.isArray(dependsOnIdx)) {
-      const invalid = dependsOnIdx.filter(idx => idx < 0 || idx >= inflight!.staged.length);
-      if (invalid.length > 0) {
-        return { success: false, error: `Invalid dependsOn indices ${invalid.join(',')} — current staged batch has ${inflight.staged.length} task(s) (valid range 0..${inflight.staged.length - 1})` };
+    // A name has to be unique within the round, or an edge naming it is
+    // ambiguous and the planner gets a graph it did not describe.
+    if (stagedName !== undefined) {
+      if (typeof stagedName !== 'string' || stagedName.trim().length === 0) {
+        return { success: false, error: 'id must be a non-empty string' };
       }
-      resolvedDeps = dependsOnIdx;
+      if (inflight.staged.some(t => t.name === stagedName)) {
+        return { success: false, error: `id "${stagedName}" is already used by another task in this round` };
+      }
+    }
+
+    // Validate dependsOn at stage time, resolving names to positions.
+    let resolvedDeps: number[];
+    if (Array.isArray(dependsOnRaw)) {
+      const resolved: number[] = [];
+      const unknown: string[] = [];
+      const outOfRange: number[] = [];
+      for (const dep of dependsOnRaw) {
+        // A string is a name; a number (or numeric string) is a position.
+        if (typeof dep === 'string' && !/^\d+$/.test(dep.trim())) {
+          const idx = inflight.staged.findIndex(t => t.name === dep);
+          if (idx === -1) unknown.push(dep);
+          else resolved.push(idx);
+          continue;
+        }
+        const idx = typeof dep === 'number' ? dep : parseInt(String(dep), 10);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= inflight.staged.length) outOfRange.push(idx);
+        else resolved.push(idx);
+      }
+      if (unknown.length > 0) {
+        const known = inflight.staged.map((t, i) => t.name ?? `#${i}`).join(', ');
+        return { success: false, error: `Unknown dependsOn id(s) ${unknown.map(u => `"${u}"`).join(', ')} — staged so far: ${known || '(nothing yet)'}. A task can only depend on one staged BEFORE it.` };
+      }
+      if (outOfRange.length > 0) {
+        return { success: false, error: `Invalid dependsOn indices ${outOfRange.join(',')} — current staged batch has ${inflight.staged.length} task(s) (valid range 0..${inflight.staged.length - 1})` };
+      }
+      resolvedDeps = resolved;
     } else if (inflight.staged.length > 0) {
       // Default sequential — wait on the previous staged task.
       resolvedDeps = [inflight.staged.length - 1];
@@ -1238,6 +1278,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     }
 
     inflight.staged.push({
+      name: stagedName,
       description,
       assignedAgentName,
       assignedAgentId: agent.agentId,
@@ -1729,6 +1770,47 @@ Rules:
       return;
     }
 
+    // Edges implied by the data contracts. A task that consumes what another
+    // produces depends on it whether or not the planner said so, and "declared
+    // consumes, forgot dependsOn" otherwise runs the consumer first, against a
+    // key that is not there yet.
+    const derived = deriveContractEdges(inflight.staged);
+    let inferred = 0;
+    for (const e of derived) {
+      const deps = inflight.staged[e.to].dependsOnIdx;
+      if (!deps.includes(e.from)) { deps.push(e.from); inferred++; }
+    }
+
+    // With the contracts now load-bearing, they are worth checking. A consumed
+    // key nobody produces is a planning bug whose symptom arrives much later.
+    // The goal's existing scratchpad counts as a producer: consuming a key from
+    // an earlier round is legitimate and common.
+    let existingKeys: Set<string> = new Set();
+    try {
+      const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId }), 15000,
+      );
+      existingKeys = new Set(Object.keys(goal?.scratchpad ?? {}));
+    } catch { /* an unreadable scratchpad must not block a dispatch */ }
+
+    const problems = validateDataFlow(inflight.staged, existingKeys);
+    if (problems.length > 0) {
+      const detail = problems.map(p => `- ${p.message}`).join('\n');
+      log.warn(`dispatch_scrum: ${problems.length} data-flow problem(s) in goal ${goalId.slice(0, 8)}:\n${detail}`);
+      // The round is refused rather than run: the next scrum sees this on the
+      // goal and can restage. Failing the goal outright would throw away work
+      // over what is usually a typo in a key name.
+      await this.request(
+        request(this.id, this.goalManagerId, 'writeGoalData', {
+          goalId,
+          key: 'scrum/dispatch-rejected',
+          value: { scrumNumber: null, problems: problems.map(p => p.message), at: Date.now() },
+        }), 15000,
+      ).catch(() => { /* best effort */ });
+      inflight.staged = [];
+      return;
+    }
+
     // Clear the way: a dispatch committed while the previous round is still
     // running (an interjection check re-planning around new user input)
     // cancels the outstanding tasks first so the old plan and the new one
@@ -1739,6 +1821,14 @@ Rules:
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId }),
+    );
+
+    // How much work sits behind each task, so the scheduler can start the one
+    // with the longest tail when there are more ready tasks than free slots.
+    // The graph is known here and nowhere else, so the weight travels with the
+    // task rather than being rediscovered by the queue.
+    const weights = transitiveDependentCounts(
+      inflight.staged.map((t, i) => ({ id: String(i), dependsOn: t.dependsOnIdx.map(String) })),
     );
 
     // Phase 1: addTask for everything.
@@ -1791,13 +1881,17 @@ Rules:
             taskId: taskIds[i],
             goalId,
             dispatchTupleId: taskIds[i],
+            priority: weights.get(String(i)) ?? 0,
             data: staged.target ? { target: staged.target } : undefined,
           }),
         );
       }
     }
 
-    log.info(`dispatch_scrum: round ${scrumNumber} of goal ${goalId.slice(0, 8)} → ${taskIds.length} task(s) committed`);
+    log.info(
+      `dispatch_scrum: round ${scrumNumber} of goal ${goalId.slice(0, 8)} → ${taskIds.length} task(s) committed` +
+      (inferred > 0 ? `, ${inferred} edge(s) inferred from data contracts` : ''),
+    );
     this.changed('scrumPlanned', { goalId, scrumNumber, tasksPlanned: taskIds.length });
   }
 
@@ -1924,15 +2018,16 @@ Restrict via \`members\` when you can narrow the candidate set to a couple of pl
 
 Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the agent's full reply naming its capabilities and proposed contribution. PASS / empty replies are filtered out.
 
-### \`add_task({ description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
+### \`add_task({ id?, description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong. **Carry the goal's key requirement phrases through VERBATIM** (quote them): a paraphrase softens the requirement into something weaker that an agent can satisfy with an imitation — "use 3D graphics" rewritten as "a 3D presentation" invites a flat perspective drawing; "delete the old entries" rewritten as "clean up" invites archiving. Outcome wording is yours; the requirement words stay the user's.
 - \`assignedAgentName\`: must match a \`name\` in the \`team\` roster (from the goal state in your opening observation).
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
-- \`dependsOn\`: array of indices into THIS scrum's prior add_task calls (0-indexed). This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason.
+- \`dependsOn\`: names (from \`id\`) or indices of THIS scrum's prior add_task calls. This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason.
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
-- \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context).
+- \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context). **A consumed key is an edge.** If another task in this round produces it, this task automatically waits for that task, whether or not you also list it in \`dependsOn\`. So describing the data a task needs is enough; you do not have to keep the topology right by hand as well. A key nothing in the round produces has to already be on the goal scratchpad from an earlier round, otherwise the whole round is refused and you plan it again.
+- \`id\`: an optional short name for this task (\`"audit-web"\`). Other tasks can then depend on it by name instead of by position, which is worth doing the moment a round has more than two or three tasks: a mistaken index produces a valid graph of the wrong shape and nothing downstream can tell.
 
 Returns \`{ position, stagedCount, deps }\`. Multiple add_task calls accumulate.
 

@@ -531,6 +531,9 @@ export class CliServer extends Abject {
         description: String(t.fields?.description ?? ''),
         status: String(t.fields?.status ?? 'pending'),
         agentName: typeof t.fields?.agentName === 'string' ? t.fields.agentName : undefined,
+        // A round is a graph, and the terminal client cannot show one without
+        // the edges. Dropping them here is why it could only ever show a list.
+        dependsOn: Array.isArray(t.fields?.dependsOn) ? (t.fields.dependsOn as string[]) : undefined,
       })),
     };
   }

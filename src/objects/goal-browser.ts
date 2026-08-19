@@ -29,6 +29,7 @@ interface TaskInfo {
   description: string;
   attempts: number;
   maxAttempts: number;
+  dependsOn?: string[];
   claimedBy?: string;
   agentName?: string;
 }
@@ -319,6 +320,7 @@ Click the arrow to expand/collapse a goal.
         maxAttempts: (t.fields.maxAttempts as number) ?? 3,
         claimedBy: t.claimedBy,
         agentName: (t.fields.agentName as string) ?? undefined,
+        dependsOn: (t.fields.dependsOn as string[]) ?? undefined,
       }));
     } catch { return []; }
   }

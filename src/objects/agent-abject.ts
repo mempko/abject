@@ -297,6 +297,12 @@ interface RegisteredAgent {
 interface QueuedTask {
   taskId: string;
   task: string;
+  /**
+   * How much work waits on this task, supplied by whoever planned the graph.
+   * Higher runs first when slots are scarce. Absent means zero, so a caller
+   * that knows nothing about a graph is simply never preferred.
+   */
+  priority?: number;
   systemPrompt?: string;
   taskPrompt?: string;
   initialMessages?: AgentMessage[];
@@ -392,6 +398,55 @@ interface TaskEntry {
   truncationRetries?: number;
   /** Actions 2..N from a multi-action LLM response, drained in order by the thinking phase without an LLM round-trip between them. Replaced on every parse; discarded on failure or max-steps. */
   pendingActions?: AgentAction[];
+}
+
+/**
+ * Choose which queued task starts next, or -1 when none may.
+ *
+ * Two rules, in order.
+ *
+ * Fairness first: a goal already holding a slot on this agent yields to one
+ * holding none, so a goal that staged six tasks cannot occupy an agent while
+ * another goal's single task waits behind all of them. That starvation path
+ * did not exist while agents ran one task at a time, and it is the kind that
+ * looks like a hang rather than a queue.
+ *
+ * Then critical path: among what survives the fairness rule, start the task
+ * with the most work waiting on it. Staging order, which is what a plain queue
+ * uses, is an arbitrary basis for that decision once a round is a graph rather
+ * than a line. Equal weights keep arrival order so ordinary work stays
+ * predictable.
+ *
+ * Exported and pure: the policy is the part worth reasoning about, and it
+ * should be checkable without standing up an agent to watch.
+ */
+export function selectNextQueued(
+  pending: ReadonlyArray<{ goalId?: string; priority?: number; enqueuedAt: number }>,
+  busyGoals: ReadonlySet<string>,
+  pausedGoals: ReadonlySet<string>,
+): number {
+  const eligible: number[] = [];
+  pending.forEach((t, i) => {
+    // Paused goals stay pending; resuming re-kicks the queue.
+    if (t.goalId && pausedGoals.has(t.goalId)) return;
+    eligible.push(i);
+  });
+  if (eligible.length === 0) return -1;
+
+  const unrepresented = eligible.filter(i => {
+    const g = pending[i].goalId;
+    return !g || !busyGoals.has(g);
+  });
+  const pool = unrepresented.length > 0 ? unrepresented : eligible;
+
+  let best = pool[0];
+  for (const i of pool) {
+    const a = pending[i];
+    const b = pending[best];
+    const byPriority = (b.priority ?? 0) - (a.priority ?? 0);
+    if (byPriority < 0 || (byPriority === 0 && a.enqueuedAt < b.enqueuedAt)) best = i;
+  }
+  return best;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -1299,6 +1354,7 @@ The registered object must implement these handlers to participate in the agent 
         dispatchTupleId?: string;
         callerId?: AbjectId;
         data?: Record<string, unknown>;
+        priority?: number;
       };
       if (!targetAgentId) throw new Error('enqueueTask requires agentId');
       const agent = this.registeredAgents.get(targetAgentId);
@@ -1325,6 +1381,7 @@ The registered object must implement these handlers to participate in the agent 
         callerId,
         enqueuedAt: Date.now(),
         data,
+        priority: (msg.payload as { priority?: number }).priority,
       };
       q.pending.push(queued);
       const limit = agent.config.maxConcurrentTasks;
@@ -2140,9 +2197,7 @@ The registered object must implement these handlers to participate in the agent 
     // Fill every free slot, not just one: a planner that dispatches four
     // independent tasks to one agent expects them to start together.
     while (q.inFlight.size < limit) {
-      // Skip queued tasks whose goal is paused — they stay pending and the
-      // queue is re-kicked by resumeTasksByGoal.
-      const idx = q.pending.findIndex(t => !t.goalId || !this.pausedGoals.has(t.goalId));
+      const idx = this.selectNextPending(q);
       if (idx === -1) return;
       const next = q.pending.splice(idx, 1)[0];
       q.inFlight.set(next.taskId, { taskId: next.taskId, goalId: next.goalId, queued: next });
@@ -2153,6 +2208,12 @@ The registered object must implement these handlers to participate in the agent 
         this.processNextInQueue(agentId);
       });
     }
+  }
+
+  private selectNextPending(q: { inFlight: Map<string, { goalId?: string }>; pending: QueuedTask[] }): number {
+    const busyGoals = new Set<string>();
+    for (const f of q.inFlight.values()) if (f.goalId) busyGoals.add(f.goalId);
+    return selectNextQueued(q.pending, busyGoals, this.pausedGoals);
   }
 
   /**
