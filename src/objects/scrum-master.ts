@@ -732,7 +732,7 @@ export class ScrumMaster extends Abject {
           observation:
             `Scrum for this goal. Its full state is below — you already have it, so decide your action directly (no need to call review_scrum first):\n\n` +
             `${JSON.stringify(snap.data, null, 2)}\n\n` +
-            `Choose ONE action now: if \`quickDispatchAvailable\` is set and the goal is a single obvious step one \`team\` agent covers, \`quick_dispatch\`; otherwise \`poll_team\` to learn capabilities, \`add_task\`(+\`dispatch_scrum\`) to plan, \`complete_goal\` if already satisfied, or \`fail_goal\` if unreachable.${interjectionNudge}`,
+            `Choose ONE action now: if \`quickDispatchAvailable\` is set and the goal is ONE step (not several independent parts to combine — those get a planned round so they run at the same time) that one \`team\` agent covers, \`quick_dispatch\`; otherwise \`poll_team\` to learn capabilities, \`add_task\`(+\`dispatch_scrum\`) to plan, \`complete_goal\` if already satisfied, or \`fail_goal\` if unreachable.${interjectionNudge}`,
         };
       }
       // Snapshot unavailable (goal not resolvable yet) — fall back to the
@@ -2060,6 +2060,10 @@ Declare the goal unreachable. Use when no team member can contribute and replann
 Offered only when the goal state shows \`quickDispatchAvailable\`. Send ONE task straight to one agent and skip the entire planning cycle — no \`poll_team\`, no \`add_task\`, no \`dispatch_scrum\`, and no second review. On success the goal completes automatically with the agent's result; if the single task fails, a normal planning scrum picks it up with the failure in view, so a wrong guess costs only one attempt.
 
 Use it when the request is a single concrete step that one agent's \`team\` description clearly covers — e.g. calling an existing object's method, one lookup, one navigation. Reach for the normal \`add_task\` + \`dispatch_scrum\` flow instead when the goal spans multiple steps, needs coordination or a verification round, or the right agent isn't obvious from the descriptions (poll first).
+
+**Ask whether the goal decomposes before asking who owns it.** Those are different questions, and answering the second one first is how a goal with independent parts ends up as one sequential task. If the goal names two or more things that can be obtained WITHOUT each other and are then combined — two sources to look up, several places to inspect, a set of items to process — it is not a single step, even when one agent could do all of it. Plan it as a round: one task per independent part with \`dependsOn: []\`, then one task that combines them, depending on the rest. Those parts run at the same time, including several on the SAME agent, because each agent runs multiple tasks concurrently.
+
+The reason is wall-clock. Every step an agent takes costs a think, and thinks are seconds each; a branch that runs beside another branch costs nothing extra in time. Two lookups done in one task are two sets of thinks end to end, and the same two lookups as two tasks are one set. The planning round is worth its own think whenever the parts have real work in them.
 
 - \`agentName\`: a \`name\` from the \`team\` roster.
 - \`task\`: the full, self-contained task description, written the same way an \`add_task\` description is (state the outcome; carry the user's requirement phrases through verbatim).
