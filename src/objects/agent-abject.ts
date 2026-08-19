@@ -401,6 +401,66 @@ interface TaskEntry {
 }
 
 /**
+ * Decide what a multi-action response actually runs.
+ *
+ * Three rules, and the middle one is the reason this is worth naming.
+ *
+ * Runtime verbs (replan, remember, recall, ask_user, submit_job, read_chunk)
+ * are served in the thinking phase, so a batched one would be handed to an
+ * agent that has never heard of it. They are always dropped.
+ *
+ * A terminal may CLOSE a batch but not sit inside one. "Stage these, then
+ * commit" is a single decision, and splitting it across responses costs a full
+ * round-trip to say something the model already knew — on a two-task round
+ * that was two extra waits before any work began. A terminal with actions
+ * still behind it is a different mistake: it finishes before its own batch has
+ * run, so it stays dropped. Nothing is committed on a step that did not
+ * happen, because a mid-batch failure discards everything after it, terminal
+ * included.
+ *
+ * Duplicates and anything past the cap are dropped, so a model repeating
+ * itself does not repeat the work.
+ */
+export function planActionBatch(
+  first: AgentAction,
+  extras: ReadonlyArray<AgentAction | undefined>,
+  opts: { isTerminal: (a: AgentAction) => boolean; maxActions: number },
+): { queue: AgentAction[]; dropped: string[]; overflow: number } {
+  const queue: AgentAction[] = [];
+  const seen = new Set<string>([JSON.stringify(first)]);
+  const dropped: string[] = [];
+  let overflow = 0;
+  let terminalTail: AgentAction | undefined;
+
+  const lastIndex = extras.length - 1;
+  extras.forEach((a, i) => {
+    if (!a || typeof a.action !== 'string') return;
+    if (a.action.startsWith('_')) return;
+
+    if (RUNTIME_VERBS.has(a.action)) { dropped.push(a.action); return; }
+
+    if (opts.isTerminal(a)) {
+      if (i !== lastIndex) { dropped.push(a.action); return; }
+      terminalTail = a;
+      return;
+    }
+
+    const key = JSON.stringify(a);
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (1 + queue.length >= opts.maxActions) { overflow++; return; }
+    queue.push(a);
+  });
+
+  // The terminal goes last, after every ordinary action it was emitted with.
+  if (terminalTail) queue.push(terminalTail);
+  return { queue, dropped, overflow };
+}
+
+/** Verbs the runtime serves itself; an agent would not recognize them. */
+const RUNTIME_VERBS = new Set(['replan', 'remember', 'recall', 'ask_user', 'submit_job', 'read_chunk']);
+
+/**
  * Choose which queued task starts next, or -1 when none may.
  *
  * Two rules, in order.
@@ -2420,9 +2480,19 @@ The registered object must implement these handlers to participate in the agent 
                 task.lastResult = undefined;
                 task.action = entry.pendingActions.shift();
                 log.info(`[${agentName}] Step ${task.step + 1} — draining batched action: ${task.action?.action} (${entry.pendingActions.length} left)`);
-                // Terminals, replan, remember, recall, submit_job, and ask_user were filtered out
-                // at parse time, so only intermediate and plain actions reach
-                // this point.
+
+                // A terminal is allowed as the LAST batched action, so a plan
+                // can be staged and committed in one response. It only gets
+                // here when everything ahead of it succeeded — a mid-batch
+                // failure discards the rest above — so it never commits work
+                // built on a step that did not happen.
+                const batchedTerminal = task.action ? this.isTerminalAction(entry, task.action) : null;
+                if (batchedTerminal === 'success') { setPhase('done'); break; }
+                if (batchedTerminal === 'error') { setPhase('error'); break; }
+
+                // replan, remember, recall, submit_job and ask_user are still
+                // filtered out at parse time, so what remains is intermediate
+                // or plain.
                 if (task.action && this.isIntermediateAction(entry, task.action)) {
                   this.emitIntermediateAction(entry);
                   task.step++;
@@ -4415,51 +4485,33 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * [Batch] notes so a dropped `done` is never a silent no-op.
    */
   private queueBatchedActions(entry: TaskEntry, first: AgentAction, extraRaw: string[]): void {
-    const queue: AgentAction[] = [];
-    const seen = new Set<string>([JSON.stringify(first)]);
-    const droppedSpecials: string[] = [];
-    let overflow = 0;
-
-    for (const raw of extraRaw) {
+    const parsed = extraRaw.map(raw => {
       const r = this.tryParseActionJson(raw);
-      if (!r || r.repaired) continue; // extras get no repair attempts
-      const a = r.action;
-      if (a.action.startsWith('_')) continue;
-      const isTerminal = !!entry.config.terminalActions[a.action];
-      // read_chunk belongs here with the other runtime verbs: it is served in
-      // the thinking phase, so a batched one would be forwarded to the agent,
-      // which has never heard of it and rightly rejects it.
-      const isSteering = ['replan', 'remember', 'recall', 'ask_user', 'submit_job', 'read_chunk'].includes(a.action);
-      if (isTerminal || isSteering) {
-        droppedSpecials.push(a.action);
-        continue;
-      }
-      const key = JSON.stringify(a);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (1 + queue.length >= AgentAbject.MAX_BATCH_ACTIONS) {
-        overflow++;
-        continue;
-      }
-      queue.push(a);
+      return !r || r.repaired ? undefined : r.action; // extras get no repair attempts
+    });
+
+    const plan = planActionBatch(first, parsed, {
+      isTerminal: a => !!entry.config.terminalActions[a.action],
+      maxActions: AgentAbject.MAX_BATCH_ACTIONS,
+    });
+
+    if (plan.dropped.length > 0) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Batch] Your response included "${plan.dropped.join('", "')}" after other actions. It was not executed — you emitted it before seeing the results of the actions ahead of it. Review those results first, then emit it alone.`,
+      });
+    }
+    if (plan.overflow > 0) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Batch] ${plan.overflow} action(s) beyond the limit of ${AgentAbject.MAX_BATCH_ACTIONS} per response were discarded — re-emit them next turn if still needed.`,
+      });
     }
 
-    if (droppedSpecials.length > 0) {
-      entry.state.llmMessages.push({
-        role: 'user',
-        content: `[Batch] Your response included "${droppedSpecials.join('", "')}" after other actions. It was not executed — you emitted it before seeing the results of the actions ahead of it. Review those results first, then emit it alone.`,
-      });
-    }
-    if (overflow > 0) {
-      entry.state.llmMessages.push({
-        role: 'user',
-        content: `[Batch] ${overflow} action(s) beyond the limit of ${AgentAbject.MAX_BATCH_ACTIONS} per response were discarded — re-emit them next turn if still needed.`,
-      });
-    }
-    if (queue.length > 0) {
-      entry.pendingActions = queue;
+    if (plan.queue.length > 0) {
+      entry.pendingActions = plan.queue;
       const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
-      log.info(`[${agentName}] Multi-action response: executing "${first.action}" now, ${queue.length} more queued (${queue.map(a => a.action).join(', ')})`);
+      log.info(`[${agentName}] Multi-action response: executing "${first.action}" now, ${plan.queue.length} more queued (${plan.queue.map(a => a.action).join(', ')})`);
     }
   }
 

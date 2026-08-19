@@ -2146,6 +2146,7 @@ Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad c
 ## Rules
 
 - Output ONE action per cycle as JSON in a \`\`\`json\`\`\` block. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the JSON's \`reasoning\` field.
+- **Staging a round is one decision, so send it as one response.** Emit every \`add_task\` for the round plus the closing \`dispatch_scrum\` as separate \`\`\`json\`\`\` blocks in a single reply. They run in order, and if any \`add_task\` is rejected the rest — including the dispatch — are dropped so you can fix it before anything commits. Splitting them across replies buys nothing: you already know what the next block says, and each extra reply is another wait before the round's tasks begin.
 - The goal state is delivered up front — read the opening observation, then act. \`review_scrum\` is only an optional mid-scrum refresh, not a required first step.
 - Don't poll the team if you can already decide from the scratchpad. Polling is expensive.
 - Multiple \`add_task\` calls = multiple OTA cycles. Each call stages one task; \`dispatch_scrum\` commits the batch.
