@@ -128,7 +128,23 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import type { PeerId } from '../src/core/identity.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
-const CLI_PORT = parseInt(process.env.CLI_PORT ?? '7723', 10);
+/**
+ * The CLI gateway's port, derived from WS_PORT rather than defaulted flat.
+ *
+ * A second instance is started by handing it its own WS_PORT (see the
+ * awaken2/awaken3 scripts). When the CLI gateway arrived it brought a second
+ * port that defaulted to a constant, so every instance quietly raced for the
+ * same 7723: whichever booted first won and the rest died at startup with an
+ * EADDRINUSE that named a port nobody had chosen. Deriving it means a new
+ * instance needs one decision, not two, and the next per-instance port should
+ * follow the same rule.
+ *
+ * The offset preserves the historical default: the stock 7719 still yields
+ * 7723. It does assume WS ports stay clustered below that band, which the
+ * current 7719/7721/7722 ladder does.
+ */
+const CLI_PORT_OFFSET = 4;
+const CLI_PORT = parseInt(process.env.CLI_PORT ?? String(WS_PORT + CLI_PORT_OFFSET), 10);
 const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const DEDICATED_WORKERS = process.env.ABJECTS_DEDICATED_WORKERS !== '0'; // default: enabled
 const alog = new Log('ABJECTS');
@@ -1091,12 +1107,15 @@ process.on('unhandledRejection', (reason) => {
 /**
  * Name the process sitting on a port we needed.
  *
- * A bare EADDRINUSE stack says a port is taken but not by what, and the
- * usual culprit is a previous server of our own that outlived its
- * supervisor. Worse, such a process can be wedged past the point where it
- * answers signals at all, so "just Ctrl-C it" is not always available and
- * the reader needs a pid to SIGKILL. Best effort: `ss` may be missing, in
- * which case the caller still gets the plain error.
+ * A bare EADDRINUSE stack says a port is taken but not by what, and the two
+ * causes want opposite responses: a previous server of our own that outlived
+ * its supervisor should be killed, while another instance that is simply
+ * running (a second dev server, the desktop app) means this one wants
+ * different ports. Naming the holder lets the reader tell them apart. Such a
+ * process can also be wedged past the point where it answers signals at all,
+ * so "just Ctrl-C it" is not always available and the reader needs a pid to
+ * SIGKILL. Best effort: `ss` may be missing, in which case the caller still
+ * gets the plain error.
  */
 function describePortHolder(port: number): string | undefined {
   try {
@@ -1109,7 +1128,8 @@ function describePortHolder(port: number): string | undefined {
       cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ').trim().slice(0, 120);
     } catch { /* process may have just exited */ }
     return `port ${port} is held by pid ${pid}${cmd ? ` (${cmd})` : ''}. ` +
-      `If that is a stale server of ours, clear it with: kill -9 ${pid}`;
+      `If that is a live instance, give this one its own ports (WS_PORT, or CLI_PORT ` +
+      `for the gateway alone); if it is a stale server of ours, clear it with: kill -9 ${pid}`;
   } catch {
     return undefined;
   }
@@ -1126,7 +1146,8 @@ main().catch((err) => {
     const detail = Number.isFinite(port) ? describePortHolder(port as number) : undefined;
     alog.error(`Fatal startup error: ${detail ?? String(err)}`);
     if (detail) {
-      alog.error('A previous server that lost its supervisor keeps its sockets bound until it is killed.');
+      alog.error('A server that lost its supervisor keeps its sockets bound until it is killed; '
+        + 'a server that is simply still running needs a different port here, not a kill.');
     }
     process.exit(1);
   }
