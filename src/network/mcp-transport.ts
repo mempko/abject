@@ -45,6 +45,17 @@ interface PendingRequest {
  */
 export class MCPTransport {
   private child: ChildProcess | null = null;
+  /**
+   * The spawned process group's id, kept after `child` is gone.
+   *
+   * The direct child is a shell, and a shell that has handed off to its
+   * grandchild can exit while the server keeps running. That clears `child`,
+   * and a stop with nothing to signal leaves the server alive — reparented,
+   * invisible, and still holding its working directory open. The group id
+   * outlives the leader as long as the group has members, which is exactly the
+   * case worth cleaning up.
+   */
+  private childPid: number | null = null;
   private reader: ReadlineInterface | null = null;
   private state: MCPTransportState = 'idle';
   private events: MCPTransportEvents = {};
@@ -119,6 +130,14 @@ export class MCPTransport {
           stdio: ['pipe', 'pipe', 'pipe'],
           env: mergedEnv,
           shell: true,
+          // Own process group, so stopping this transport can signal the whole
+          // tree. With `shell: true` the direct child is /bin/sh and the real
+          // server is its grandchild — `npm exec x` becomes sh -> npm -> node —
+          // so signalling the child alone leaves the server running. Those
+          // survivors hold their working directory open, which in the packaged
+          // app is the AppImage mount, which is what kept a closed app's file
+          // busy against the next update.
+          detached: true,
         });
       } catch (err) {
         this.setState('error');
@@ -126,6 +145,7 @@ export class MCPTransport {
         return;
       }
 
+      this.childPid = this.child.pid ?? null;
       const child = this.child;
 
       // Read stdout line-by-line for JSON-RPC messages
@@ -207,7 +227,11 @@ export class MCPTransport {
    * Gracefully stop the MCP server process.
    */
   async stop(): Promise<void> {
-    if (!this.child || this.state === 'closed') return;
+    // Not `!this.child`: a shell that exited after handing off leaves no child
+    // to signal and a server still running. The group id is what makes that
+    // case reachable, so stop proceeds whenever either is still known.
+    if (!this.child && this.childPid === null) return;
+    if (this.state === 'closed' && this.childPid === null) return;
 
     this.setState('closed');
     this.rejectAll(new Error('Transport stopped'));
@@ -216,17 +240,47 @@ export class MCPTransport {
     this.reader = null;
 
     const child = this.child;
+    const pid = this.childPid;
     this.child = null;
+    this.childPid = null;
+
+    /**
+     * Signal the server's whole process group.
+     *
+     * The negative pid addresses the group `detached: true` gave it, and works
+     * even once the group leader has exited, which is the case that leaked.
+     * Falling back to the child alone covers Windows, where process groups do
+     * not work this way.
+     */
+    const signalTree = (sig: NodeJS.Signals): void => {
+      if (pid !== null) {
+        try {
+          process.kill(-pid, sig);
+          return;
+        } catch { /* group already gone, or no process groups here */ }
+      }
+      try {
+        child?.kill(sig);
+      } catch { /* already exited */ }
+    };
 
     // Give the process a chance to exit gracefully
-    child.kill('SIGTERM');
+    signalTree('SIGTERM');
 
     await new Promise<void>((resolve) => {
       const forceTimer = setTimeout(() => {
-        child.kill('SIGKILL');
+        signalTree('SIGKILL');
         resolve();
       }, 3000);
 
+      // No child to wait on when the shell already exited; the group kill above
+      // is the whole of the work, so do not sit on the timer for it.
+      if (!child) {
+        clearTimeout(forceTimer);
+        signalTree('SIGKILL');
+        resolve();
+        return;
+      }
       child.on('close', () => {
         clearTimeout(forceTimer);
         resolve();
