@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.9.10",
+    "date": "2026-08-20",
+    "title": "Stop Means Stop",
+    "summary": "A small patch release focused on one thing: when you cancel a goal, your agents now actually stop. No new features, just a more obedient system.",
+    "highlights": [
+      "Canceling a goal now takes effect promptly: agents check for cancellation between task steps instead of finishing every remaining step first."
+    ],
+    "fixes": [
+      "Agents no longer keep working through queued task steps after their goal has been cancelled; cancellation is honored at each step boundary."
+    ]
+  },
+  {
     "version": "0.9.9",
     "date": "2026-08-20",
     "title": "Nothing Left Behind",
