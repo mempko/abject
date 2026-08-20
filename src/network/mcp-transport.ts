@@ -3,7 +3,7 @@
  * communicates via newline-delimited JSON-RPC 2.0 over stdin/stdout.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import { createInterface, Interface as ReadlineInterface } from 'readline';
 import type {
   JsonRpcRequest,
@@ -131,13 +131,18 @@ export class MCPTransport {
           env: mergedEnv,
           shell: true,
           // Own process group, so stopping this transport can signal the whole
-          // tree. With `shell: true` the direct child is /bin/sh and the real
+          // tree. With `shell: true` the direct child is a shell and the real
           // server is its grandchild — `npm exec x` becomes sh -> npm -> node —
           // so signalling the child alone leaves the server running. Those
           // survivors hold their working directory open, which in the packaged
-          // app is the AppImage mount, which is what kept a closed app's file
-          // busy against the next update.
+          // Linux app is the AppImage mount, which is what kept a closed app's
+          // file busy against the next update.
+          //
+          // On Windows this instead makes the child the root of a group
+          // `taskkill /T` can walk; `windowsHide` keeps that from opening a
+          // console window per server.
           detached: true,
+          windowsHide: true,
         });
       } catch (err) {
         this.setState('error');
@@ -245,19 +250,32 @@ export class MCPTransport {
     this.childPid = null;
 
     /**
-     * Signal the server's whole process group.
+     * End the server and everything it started.
      *
-     * The negative pid addresses the group `detached: true` gave it, and works
-     * even once the group leader has exited, which is the case that leaked.
-     * Falling back to the child alone covers Windows, where process groups do
-     * not work this way.
+     * POSIX: the negative pid addresses the group `detached: true` created,
+     * which reaches the whole tree and still works once the group leader has
+     * exited — the case that leaked.
+     *
+     * Windows has no such groups, and `process.kill` there ignores the signal
+     * and terminates that one process, leaving the grandchildren that actually
+     * are the server. `taskkill /T` is the equivalent walk, so it gets used
+     * instead; the signal only decides whether to ask or insist.
      */
     const signalTree = (sig: NodeJS.Signals): void => {
       if (pid !== null) {
-        try {
-          process.kill(-pid, sig);
-          return;
-        } catch { /* group already gone, or no process groups here */ }
+        if (process.platform === 'win32') {
+          try {
+            const args = ['/pid', String(pid), '/T'];
+            if (sig === 'SIGKILL') args.push('/F');
+            spawnSync('taskkill', args, { stdio: 'ignore', windowsHide: true });
+            return;
+          } catch { /* taskkill missing; fall through to the single-process kill */ }
+        } else {
+          try {
+            process.kill(-pid, sig);
+            return;
+          } catch { /* group already gone */ }
+        }
       }
       try {
         child?.kill(sig);
