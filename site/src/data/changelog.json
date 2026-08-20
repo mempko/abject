@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.9.8",
+    "date": "2026-08-20",
+    "title": "Parallel agents, plans as graphs",
+    "summary": "Agents can now take on several tasks at once, and planners lay out each round of work as a dependency graph so multi-step goals run in the right order. A new ExternalCreator agent brings that work out of the workspace and onto your disk, authoring real projects as ordinary files.",
+    "highlights": [
+      "New ExternalCreator agent: an authoring agent that creates and maintains projects on disk, working with real files instead of only objects inside a workspace.",
+      "Agents can run several tasks at the same time, and edits that target the same file are serialized so parallel work never clobbers itself.",
+      "Planners now express a scrum round as a dependency graph rather than a flat list, so steps that depend on each other are easy to state and run in the right order.",
+      "Smarter goal handling: the system first asks whether a goal breaks into sub-tasks before asking who should own it, and planners no longer add a final task whose only job is to assemble what the parts already wrote down.",
+      "Jobs can name an object as a recipient, so work can be routed to an object by its name without knowing its internal id.",
+      "Every LLM call is attributed to the agent that made it, and streamed output is routed by request correlation, so live output and usage stay accurate while agents work in parallel.",
+      "The CLI gateway now derives its port from WS_PORT, so custom backend ports work with the commune CLI without extra configuration."
+    ],
+    "fixes": [
+      "Cancelling a task now frees its queue slot; previously a slot could stay occupied with nothing running in it, quietly shrinking an agent's capacity.",
+      "A batch of work that ends in a terminal action (such as asking the user a question) now closes properly instead of hanging open.",
+      "Fixed the agy provider's stream-json input discriminator, which broke parsing of streamed input."
+    ]
+  },
+  {
     "version": "0.9.7",
     "date": "2026-08-18",
     "title": "Antigravity Lands",
