@@ -1648,6 +1648,7 @@ The registered object must implement these handlers to participate in the agent 
       if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
         entry.state.phase = 'error';
         entry.state.error = 'Cancelled';
+        this.notifyAgentCancelled(entry, 'task cancelled');
         return { success: true, where: 'in-flight' };
       }
       // Then check queue pending lists
@@ -1695,6 +1696,7 @@ The registered object must implement these handlers to participate in the agent 
           entry.state.phase = 'error';
           entry.state.error = 'Cancelled';
           cancelled++;
+          this.notifyAgentCancelled(entry, 'goal stopped');
           log.info(`cancelTasksByGoal: cancelled in-flight task ${taskId} for goal ${goalId}`);
         }
       }
@@ -2182,6 +2184,26 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   /**
+   * Tell an agent one of its tasks has been cancelled.
+   *
+   * Marking the phase stops the loop between steps, which is enough when the
+   * steps are short. It is not enough when a single action is a fifteen-minute
+   * test run or a page load: the loop cannot end a phase it is waiting on. The
+   * agent can, so it is told, and whether it acts on that is its own business.
+   * An agent that ignores this is no worse off than it was before.
+   */
+  private notifyAgentCancelled(entry: TaskEntry, reason: string): void {
+    this.safeSend(
+      event(this.id, entry.agentId, 'taskCancelled', {
+        taskId: entry.state.id,
+        goalId: entry.goalId ?? entry.incomingGoalId,
+        reason,
+      }),
+      'taskCancelled',
+    );
+  }
+
+  /**
    * Free an agent's in-flight slot (when it still belongs to `taskId`) and
    * start whatever is next. Idempotent, and never throws.
    */
@@ -2403,8 +2425,30 @@ The registered object must implement these handlers to participate in the agent 
       this.emitPhaseChanged(entry, old, newPhase);
     };
 
+    /**
+     * Whether someone outside this loop has cancelled the task.
+     *
+     * Read through a function deliberately: written inline, TypeScript narrows
+     * `task.phase` from the surrounding control flow and decides the check can
+     * never be true. That is exactly wrong for a field another handler
+     * mutates while this loop is awaiting something.
+     */
+    const cancelledExternally = (): boolean => {
+      if (task.phase !== 'error') return false;
+      phase = 'error';
+      task.error = task.error ?? 'Cancelled';
+      return true;
+    };
+
     try {
       while (phase !== 'done' && phase !== 'error') {
+        // Cancellation arrives from OUTSIDE this loop: cancelTasksByGoal and
+        // cancelTask write `entry.state.phase = 'error'` on an entry they do
+        // not otherwise touch. Only the local `phase` was ever read, so a
+        // stopped goal marked itself failed while its agents carried on
+        // working, which is the whole of the "stop did nothing" report.
+        if (cancelledExternally()) break;
+
         // ── Goal pause gate ──
         // A paused goal freezes its agents BETWEEN phases: park here until
         // the user resumes, or until the task is cancelled out from under us
