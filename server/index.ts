@@ -1104,6 +1104,20 @@ async function main(): Promise<void> {
       cliServer ? cliServer.stop() : Promise.resolve(),
     ]);
     await runtime.stop().catch(() => { /* teardown is best effort */ });
+
+    // Shut libdatachannel down explicitly.
+    //
+    // It is loaded by the P2P worker, and a worker is a thread — so the native
+    // addon lives in this process and its static destructors run at exit,
+    // where they abort. That abort is why every headless run ends at 134, and
+    // in the desktop app it is worse than noise: a SIGABRT leaves the
+    // AppImage's own FUSE mount behind, which is what holds the file busy
+    // against the next update. `cleanup` is the library's own answer to this;
+    // terminating the worker does not unload the addon.
+    try {
+      const dc = await import('node-datachannel');
+      await dc.cleanup();
+    } catch { /* never loaded, or a version without it */ }
   };
   backendShutdown = releaseEverything;
 
