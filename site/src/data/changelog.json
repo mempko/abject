@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.9.9",
+    "date": "2026-08-20",
+    "title": "Nothing Left Behind",
+    "summary": "This release is about leaving cleanly. Quitting Abject now takes every helper process with it on every platform, so nothing keeps running (or crashing) after you close the app.",
+    "highlights": [
+      "Quitting is now thorough: the app exits through Electron and shuts down all of its child processes with it, instead of leaving helpers behind.",
+      "MCP servers are stopped completely: Abject terminates the server's whole process tree, not just the shell that launched it, so no tool processes linger after shutdown.",
+      "Process cleanup now works the same on Windows, which lacks process groups: Abject walks the process tree there too, so Windows users get the same clean exit."
+    ],
+    "fixes": [
+      "Fixed a crash on exit: the peer-to-peer networking layer (libdatachannel) is now shut down in an orderly way instead of aborting as the app closes.",
+      "Fixed orphaned MCP server processes that survived because only the wrapper shell in front of them was killed.",
+      "Fixed leftover child processes on Windows after quitting the app."
+    ]
+  },
+  {
     "version": "0.9.8",
     "date": "2026-08-20",
     "title": "Parallel agents, plans as graphs",
