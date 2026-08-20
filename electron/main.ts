@@ -125,11 +125,41 @@ app.on('window-all-closed', () => {
  * and force only as a genuine last resort — through `app.exit`, which goes out
  * the way Electron came in and takes its children with it.
  */
+/**
+ * Kill Electron's own child processes before we do anything that might stop us
+ * from doing it later.
+ *
+ * The process does not always get to exit cleanly: libdatachannel aborts in a
+ * global destructor at exit, and a SIGABRT runs no cleanup at all. Anything
+ * still alive at that moment is orphaned — a zygote and a network service
+ * holding the AppImage mount open, which is how a closed window ends up
+ * blocking an update days later.
+ *
+ * Doing this first, while we are still a healthy process, makes the shutdown
+ * path's own failure survivable. The window is already gone by here, and the
+ * backend talks over Node's own sockets rather than Chromium's network
+ * service, so nothing left to run needs them.
+ */
+function killChildProcesses(): void {
+  try {
+    for (const metric of app.getAppMetrics()) {
+      if (metric.type === 'Browser') continue; // that is this process
+      try {
+        process.kill(metric.pid, 'SIGKILL');
+      } catch { /* already gone */ }
+    }
+  } catch (err) {
+    console.error('[Abject] could not enumerate child processes:', err);
+  }
+}
+
 let quitting = false;
 app.on('before-quit', (event) => {
   if (quitting) return;
   quitting = true;
   event.preventDefault();
+
+  killChildProcesses();
 
   const backend = serverModule?.backendShutdown;
   const released = backend
@@ -145,8 +175,12 @@ app.on('before-quit', (event) => {
 });
 
 app.on('will-quit', () => {
-  // Whatever is still holding the loop open, leave — but leave through
-  // Electron so the child processes go with us rather than outliving us.
+  // Anything spawned since, and a second chance if the metrics call failed
+  // the first time.
+  killChildProcesses();
+  // Whatever is still holding the loop open, leave. Two MessagePorts survive
+  // the backend teardown, so this fires on a normal quit rather than only in
+  // trouble.
   setTimeout(() => app.exit(0), 1500);
 });
 
