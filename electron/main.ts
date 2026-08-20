@@ -53,6 +53,8 @@ const MIME: Record<string, string> = {
 
 let mainWindow: BrowserWindow | null = null;
 let clientServer: http.Server | null = null;
+/** The embedded backend's module namespace, once it has been imported. */
+let serverModule: { backendShutdown?: () => Promise<void> } | undefined;
 
 /** Serve dist-client/ over HTTP so the renderer avoids file:// issues. */
 function startClientServer(): Promise<number> {
@@ -106,10 +108,46 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
-// The backend spawns worker threads and a WebSocket server that keep the
-// process alive after Electron closes. Force exit after a brief grace period.
+/**
+ * Release the embedded backend before Electron tears itself down.
+ *
+ * Closing the last window sends no signal, so the backend never learned it
+ * was over: its WebSocket server and worker pool kept the event loop alive,
+ * and the process sat there. The fix for that used to be a hard
+ * `process.exit(0)` half a second into `will-quit`, which worked on the
+ * symptom and caused a worse one — Node's exit is not Electron's, so the
+ * browser process died before it had reaped its own children. A zygote and a
+ * network service were left running, holding the AppImage mount open, and the
+ * next update failed with "Text file busy" against a window the user had
+ * closed days earlier.
+ *
+ * So: tear the backend down for real, then let Electron do its own shutdown,
+ * and force only as a genuine last resort — through `app.exit`, which goes out
+ * the way Electron came in and takes its children with it.
+ */
+let quitting = false;
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  quitting = true;
+  event.preventDefault();
+
+  const backend = serverModule?.backendShutdown;
+  const released = backend
+    ? backend().catch((err: unknown) => {
+        console.error('[Abject] backend shutdown failed:', err);
+      })
+    : Promise.resolve();
+
+  // Long enough for a worker pool to stop, short enough that a wedged teardown
+  // does not strand the user with a window that will not close.
+  const deadline = new Promise<void>(resolve => setTimeout(resolve, 5000));
+  Promise.race([released, deadline]).finally(() => app.quit());
+});
+
 app.on('will-quit', () => {
-  setTimeout(() => process.exit(0), 500);
+  // Whatever is still holding the loop open, leave — but leave through
+  // Electron so the child processes go with us rather than outliving us.
+  setTimeout(() => app.exit(0), 1500);
 });
 
 app.setName('Abject');
@@ -137,8 +175,19 @@ app.whenReady().then(async () => {
   const port = await startClientServer();
 
   // Import the compiled server -- this triggers its top-level main() call,
-  // which starts the WebSocket server on WS_PORT.
-  await import(path.join(__dirname, '..', 'dist-server', 'server', 'index.js'));
+  // which starts the WebSocket server on WS_PORT. The namespace is kept so
+  // shutdown can reach the backend's own teardown at window close.
+  serverModule = await import(path.join(__dirname, '..', 'dist-server', 'server', 'index.js'));
+
+  // The backend installs its own SIGINT/SIGTERM handlers, and they end in
+  // `process.exit()` — correct when it owns the process, wrong here for the
+  // same reason the old window-close path was wrong: Node's exit leaves
+  // Electron's child processes running. Route every exit through Electron
+  // instead, so a Ctrl-C and a closed window take the same way out.
+  process.removeAllListeners('SIGINT');
+  process.removeAllListeners('SIGTERM');
+  process.on('SIGINT', () => app.quit());
+  process.on('SIGTERM', () => app.quit());
 
   // Give the server time to fully bootstrap before opening the window.
   setTimeout(() => createWindow(port), 2500);

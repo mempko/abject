@@ -149,6 +149,16 @@ const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const DEDICATED_WORKERS = process.env.ABJECTS_DEDICATED_WORKERS !== '0'; // default: enabled
 const alog = new Log('ABJECTS');
 
+/**
+ * Tear the backend down without exiting, once it is running.
+ *
+ * The desktop app embeds this server in Electron's main process, so it needs
+ * to release the ports and stop the worker pool at window close and then let
+ * Electron run its own shutdown. Undefined until `main()` has got far enough
+ * for there to be anything to release.
+ */
+export let backendShutdown: (() => Promise<void>) | undefined;
+
 async function main(): Promise<void> {
   const log = new Log('BOOTSTRAP');
   alog.info('Initializing backend...');
@@ -1070,6 +1080,33 @@ async function main(): Promise<void> {
 
   // Handle graceful shutdown
   let shuttingDown = false;
+
+  /**
+   * Release everything this process is holding, and DO NOT exit.
+   *
+   * Exiting is the caller's decision because the two callers need different
+   * ones. A signal handler owns the process and exits itself. Electron does
+   * not: its main process has child processes of its own — a zygote, a network
+   * service — that only get reaped by Electron's own shutdown, so a
+   * `process.exit()` here would leave them orphaned, holding the AppImage
+   * mount, and the file busy against the next update.
+   *
+   * What this does own is the reason the process would not exit by itself:
+   * the listening sockets and the worker pool keep the event loop alive long
+   * after the last window has gone.
+   */
+  const releaseEverything = async (): Promise<void> => {
+    sessionStore.destroy();
+    // Release every listening socket before the slow work. Whatever happens
+    // to the runtime teardown after this, the next `awaken` can bind.
+    await Promise.allSettled([
+      wsServer.close(),
+      cliServer ? cliServer.stop() : Promise.resolve(),
+    ]);
+    await runtime.stop().catch(() => { /* teardown is best effort */ });
+  };
+  backendShutdown = releaseEverything;
+
   const shutdown = (signal: string) => {
     // A second signal means the first one did not get us out. Leave now:
     // swallowing it turns a wedged teardown into a process that survives
@@ -1081,17 +1118,7 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     alog.info(`Shutting down (${signal})...`);
-    sessionStore.destroy();
-    // Release every listening socket before the slow work. Whatever happens
-    // to the runtime teardown after this, the next `awaken` can bind.
-    const releasePorts = Promise.allSettled([
-      wsServer.close(),
-      cliServer ? cliServer.stop() : Promise.resolve(),
-    ]);
-    releasePorts
-      .then(() => runtime.stop())
-      .catch(() => {})
-      .finally(() => process.exit(0));
+    releaseEverything().finally(() => process.exit(0));
     // If cleanup takes too long, force exit
     setTimeout(() => process.exit(1), 3000);
   };
