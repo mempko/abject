@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.9.11",
+    "date": "2026-08-21",
+    "title": "Patterns Take Shape",
+    "summary": "The knowledge base now stores learned patterns as real structure instead of free-form prose, so agents can link, reuse, and repair them reliably. A small release with one meaningful upgrade to how your objects remember what works.",
+    "highlights": [
+      "Learned patterns are now saved as structured knowledge with explicit links between related entries, instead of blocks of prose; agents can follow those links to find and apply related patterns",
+      "Existing patterns that were stored as prose are automatically healed into the new structured form, so nothing you have already taught the system is lost"
+    ],
+    "fixes": [
+      "Peer-to-peer networking no longer starts building new peer connections while the app is shutting down, which could leave stray connections behind"
+    ]
+  },
+  {
     "version": "0.9.10",
     "date": "2026-08-20",
     "title": "Stop Means Stop",
