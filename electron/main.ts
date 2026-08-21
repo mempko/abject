@@ -20,6 +20,41 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Signal packaged mode so NodeWorkerAdapter loads compiled JS workers
 process.env.ELECTRON_PACKAGED = '1';
 
+// A closed stdout must not become a modal error dialog.
+//
+// Launch the app from a terminal, press Ctrl-C in that terminal, and the pipe
+// goes away while the backend is still logging its way through shutdown. Every
+// subsequent write raises EPIPE on the stream, and an 'error' event with no
+// listener is an uncaught exception, which Electron shows as "A JavaScript
+// error occurred in the main process" — one dialog per log line, on top of an
+// app that is already trying to quit. Worker stdout is piped through here too,
+// so this covers those writes as well.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (err: NodeJS.ErrnoException) => {
+    if (err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED') return;
+    // Anything else is a real problem, but reporting it through the stream that
+    // just failed would recurse.
+  });
+}
+
+// One instance per data directory.
+//
+// A second launch used to start a whole second backend against the same SQLite
+// files and the same WebSocket port, which does not fail cleanly: the newcomer
+// contends for the database and cannot bind its port, so its window opens and
+// then sits there looking hung. Handing focus to the window that already exists
+// is both what the user meant and the only outcome that leaves the data intact.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 // Use OS-standard data directory unless explicitly overridden
 if (!process.env.ABJECTS_DATA_DIR) {
   const home = os.homedir();
