@@ -1857,22 +1857,6 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   }
 
   /**
-   * Resolve an AbjectId to a human-readable name by asking the caller directly.
-   * Every Abject has a built-in 'describe' handler that returns its manifest.
-   */
-  private async resolveCallerName(callerId: AbjectId): Promise<string | undefined> {
-    try {
-      const result = await this.request<{ manifest: { name: string } }>(
-        msg.request(this.id, callerId, 'describe', {}),
-        5000,
-      );
-      return result?.manifest?.name;
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * Begin tracking an active request.
    */
   private truncate(s: string): string {

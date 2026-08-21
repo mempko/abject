@@ -11,6 +11,12 @@
  * CLAUDE.md / AGENTS.md are injected into an agent's prompt, which makes them
  * instructions written by whoever wrote that repository. That is a decision for
  * the person sitting here, so it is a button rather than a default.
+ *
+ * Autonomy is the second. It says how much work here proceeds without a prompt,
+ * and it is deliberately only settable from this window: nothing an agent sends
+ * raises it. What a project asks for is not always what it gets, because the
+ * access mode of the workspace caps it, so each row shows the level actually in
+ * force and what capped it when those differ.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -18,7 +24,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import type { ExternalProject } from './external-project-registry.js';
+import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './external-project-registry.js';
 import type { ListItem } from './widgets/list-widget.js';
 
 const log = new Log('ExternalProjectBrowser');
@@ -38,9 +44,13 @@ export class ExternalProjectBrowser extends Abject {
   private addBtnId?: AbjectId;
   private editBtnId?: AbjectId;
   private trustBtnId?: AbjectId;
+  private autonomyBtnId?: AbjectId;
   private removeBtnId?: AbjectId;
 
   private projects: ExternalProject[] = [];
+  /** Level actually in force per project, and what capped it. */
+  private effective = new Map<string, { effective: AutonomyLevel; cappedBy: string }>();
+  private brokerId?: AbjectId;
   private selected?: string;
 
   constructor() {
@@ -187,17 +197,19 @@ someone else wrote, so it is a button here rather than something granted on add.
           { type: 'button', windowId: this.windowId, text: 'Add…' },
           { type: 'button', windowId: this.windowId, text: 'Commands…' },
           { type: 'button', windowId: this.windowId, text: 'Trust' },
+          { type: 'button', windowId: this.windowId, text: 'Autonomy…' },
           { type: 'button', windowId: this.windowId, text: 'Remove' },
         ],
       }),
     );
-    [this.addBtnId, this.editBtnId, this.trustBtnId, this.removeBtnId] = widgetIds;
+    [this.addBtnId, this.editBtnId, this.trustBtnId, this.autonomyBtnId, this.removeBtnId] = widgetIds;
 
     await this.request(request(this.id, buttonRowId, 'addLayoutChildren', {
       children: [
         { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: BUTTON_ROW_H } },
         { widgetId: this.editBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: BUTTON_ROW_H } },
         { widgetId: this.trustBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 90, height: BUTTON_ROW_H } },
+        { widgetId: this.autonomyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
       ],
     }));
     await this.request(request(this.id, buttonRowId, 'addLayoutSpacer', {}));
@@ -229,6 +241,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.addBtnId = undefined;
     this.editBtnId = undefined;
     this.trustBtnId = undefined;
+    this.autonomyBtnId = undefined;
     this.removeBtnId = undefined;
     this.projects = [];
     this.selected = undefined;
@@ -254,6 +267,7 @@ someone else wrote, so it is a button here rather than something granted on add.
       log.warn(`could not list projects: ${err instanceof Error ? err.message : String(err)}`);
       this.projects = [];
     }
+    await this.refreshEffective();
     await this.rebuildList();
   }
 
@@ -266,14 +280,48 @@ someone else wrote, so it is a button here rather than something granted on add.
       ? 'no commands'
       : `${p.checkCommand ? 'check' : ''}${p.checkCommand && p.verifyCommand ? ' + ' : ''}${p.verifyCommand ? 'verify' : ''}`;
 
+    // What is actually in force, which is not always what the project asks
+    // for: a public workspace holds everything at "ask". Saying so on the row
+    // is the difference between a considered setting and a silent mystery.
+    const eff = this.effective.get(p.name);
+    const level = eff?.effective ?? (p.trusted ? p.autonomy : 'ask');
+    const capped = eff && eff.cappedBy && eff.effective !== p.autonomy
+      ? ` (asks ${p.autonomy}, capped by ${eff.cappedBy})`
+      : '';
+
     return {
-      label: `${p.name} — ${detail}${p.isolation === 'worktree' ? ' · worktree' : ''}`,
+      label: `${p.name} — ${detail}${p.isolation === 'worktree' ? ' · worktree' : ''}${capped}`,
       value: p.name,
       secondary,
-      badge: p.trusted
-        ? { text: 'Trusted', color: this.theme.statusSuccess }
-        : { text: 'Untrusted', color: this.theme.statusNeutral },
+      badge: !p.trusted
+        ? { text: 'Untrusted', color: this.theme.statusNeutral }
+        : level === 'ask'
+          ? { text: 'Asks', color: this.theme.statusNeutral }
+          : level === 'read'
+            ? { text: 'Auto: read', color: this.theme.statusSuccess }
+            : level === 'edit'
+              ? { text: 'Auto: edit', color: this.theme.statusWarning }
+              : { text: 'Auto: full', color: this.theme.statusError },
     };
+  }
+
+  /**
+   * Ask the broker what each project's level comes out as once the workspace
+   * ceiling is applied. Best-effort: without a broker the row falls back to
+   * showing what the project asks for.
+   */
+  private async refreshEffective(): Promise<void> {
+    this.brokerId = await this.resolveDep('PermissionBroker', this.brokerId);
+    if (!this.brokerId) return;
+    for (const p of this.projects) {
+      try {
+        const r = await this.request<{ effective: AutonomyLevel; cappedBy: string }>(
+          request(this.id, this.brokerId, 'getEffectiveAutonomy', { project: p.name, callerId: this.id }),
+          10_000,
+        );
+        if (r) this.effective.set(p.name, { effective: r.effective, cappedBy: r.cappedBy });
+      } catch { /* the row falls back to the requested level */ }
+    }
   }
 
   private async rebuildList(): Promise<void> {
@@ -308,6 +356,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     if (fromId === this.addBtnId) return this.addProject();
     if (fromId === this.editBtnId) return this.editCommands();
     if (fromId === this.trustBtnId) return this.toggleTrust();
+    if (fromId === this.autonomyBtnId) return this.cycleAutonomy();
     if (fromId === this.removeBtnId) return this.removeProject();
   }
 
@@ -437,6 +486,73 @@ someone else wrote, so it is a button here rather than something granted on add.
       }));
     } catch (err) {
       await this.notify(`Could not change trust: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+    await this.load();
+  }
+
+  /**
+   * Step a project through ask → read → edit → full → ask.
+   *
+   * A four-state control as a cycling button rather than a dropdown: the
+   * widget set has confirm and prompt dialogs but no option picker, and every
+   * step that grants more asks for confirmation anyway, which is where the
+   * explanation belongs.
+   */
+  private async cycleAutonomy(): Promise<void> {
+    const reg = await this.registry();
+    const project = this.current();
+    if (!reg || !project) {
+      await this.notify('Select a project first', 'warning');
+      return;
+    }
+    if (!project.trusted) {
+      await this.notify(`Trust ${project.name} first — an untrusted project always asks`, 'warning');
+      return;
+    }
+
+    const next = AUTONOMY_LEVELS[(AUTONOMY_LEVELS.indexOf(project.autonomy) + 1) % AUTONOMY_LEVELS.length];
+
+    const explain: Record<AutonomyLevel, string> = {
+      ask: 'Every command in this project will prompt you, as it does today.',
+      read: 'Read-only commands whose files all sit inside this project will run without asking. '
+        + 'Anything that writes, reaches the network, or touches a path outside the project still prompts.',
+      edit: 'Read-only commands and file edits inside this project will run without asking. '
+        + 'Network access, unknown programs, and anything outside the project still prompt. '
+        + 'Protected paths are never written without asking.',
+      full: 'Nearly everything inside this project will run without asking, including builds and package '
+        + 'installs. Commands that leave the project, and the never-automatic set (sudo, rm -rf of a root, '
+        + 'credential files, piping a download into a shell), still prompt. '
+        + 'Consider pairing this with worktree isolation so changes land in a scratch checkout.',
+    };
+
+    if (next !== 'ask') {
+      const ok = await this.confirm({
+        title: `Set ${project.name} to "${next}"?`,
+        message: `${explain[next]}\n\n`
+          + `This is capped by the workspace: a private workspace allows at most "edit", `
+          + `and a public workspace holds every project at "ask", because anything exposed there `
+          + `can be reached by other peers.`,
+        confirmLabel: `Set ${next}`,
+        destructive: next === 'full',
+      });
+      if (!ok) return;
+    }
+
+    try {
+      const r = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, reg, 'setAutonomy', { name: project.name, autonomy: next }));
+      if (!r?.success) {
+        await this.notify(r?.error ?? 'Could not change autonomy', 'error');
+        return;
+      }
+      const eff = this.effective.get(project.name);
+      await this.notify(
+        eff && eff.cappedBy && eff.effective !== next
+          ? `${project.name} asks for ${next}, capped to ${eff.effective} by ${eff.cappedBy}`
+          : `${project.name} is now ${next}`,
+        'info');
+    } catch (err) {
+      await this.notify(`Could not change autonomy: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }

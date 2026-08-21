@@ -57,6 +57,12 @@ export class WorkspaceRegistry extends Registry {
     // through the workspace registry. Forward the original payload verbatim —
     // getSource/updateSource accept objectId | typeId | name | ref, and the
     // fallback resolves by the same rules.
+    // The registry this one falls back to. Callers that need to identify a
+    // GLOBAL object (a system service calling into a workspace) have to be able
+    // to reach it, and `lookup` deliberately does not chain: several callers
+    // use a miss to mean "not in this workspace".
+    this.on('getFallbackRegistry', async () => this.fallbackRegistryId ?? null);
+
     this.on('getSource', async (msg: AbjectMessage) => {
       const { objectId, typeId, name, ref } = msg.payload as {
         objectId?: string; typeId?: string; name?: string; ref?: string;

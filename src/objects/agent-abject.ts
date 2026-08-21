@@ -1238,7 +1238,7 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   /** Resolve a required dependency lazily. */
-  private async resolveDep(name: string, cached: AbjectId | undefined): Promise<AbjectId> {
+  private async cachedDepOrThrow(name: string, cached: AbjectId | undefined): Promise<AbjectId> {
     if (cached) return cached;
     const id = await this.discoverDep(name);
     if (!id) throw new Error(`Required dependency '${name}' not found in Registry`);
@@ -3047,7 +3047,7 @@ The registered object must implement these handlers to participate in the agent 
       const finalRoute = await this.applyVisionTiering(entry, 'smart');
       await this.trimConversation(entry);
 
-      this.llmId = await this.resolveDep('LLM', this.llmId);
+      this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
@@ -3168,7 +3168,7 @@ The registered object must implement these handlers to participate in the agent 
       // GoalManager methods reached via the agent's normal actions.
       const fullCode = code;
 
-      const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
+      const jobMgrId = await this.cachedDepOrThrow('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
         description,
         code: fullCode,
@@ -3234,7 +3234,7 @@ The registered object must implement these handlers to participate in the agent 
       return this.tierCapsCache.caps;
     }
     try {
-      this.llmId = await this.resolveDep('LLM', this.llmId);
+      this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const caps = await this.request<TierCapabilities>(
         request(this.id, this.llmId!, 'describeTiers', {})
       );
@@ -3326,7 +3326,7 @@ The registered object must implement these handlers to participate in the agent 
     // Trim conversation (may do an LLM-compressor pass when over byte budget)
     await this.trimConversation(entry);
 
-    this.llmId = await this.resolveDep('LLM', this.llmId);
+    this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
     // Build the request first: its message id is the correlation id the
     // chunk events come back with, which is how a chunk finds its own task.
     const streamRequest = request(this.id, this.llmId, 'stream', {
@@ -4215,7 +4215,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     }
 
     try {
-      this.llmId = await this.resolveDep('LLM', this.llmId);
+      this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const result = await this.request<{ messages: typeof task.llmMessages; originalChars: number; compressedChars: number; methods: string[] }>(
         request(this.id, this.llmId, 'compress', {
           messages: task.llmMessages,

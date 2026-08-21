@@ -42,6 +42,41 @@ const STORAGE_KEY = 'external-projects:registry';
 /** How a task's file changes are kept apart from the user's working tree. */
 export type IsolationMode = 'none' | 'worktree';
 
+/**
+ * How much work in a project may proceed without asking the user.
+ *
+ * This is what the project *asks for*. What it gets is capped by the access
+ * mode of the workspace the calling object lives in, which PermissionBroker
+ * applies: a public workspace is reachable by any peer, so nothing in it runs
+ * a host command unseen however trusted the directory is.
+ */
+export type AutonomyLevel = 'ask' | 'read' | 'edit' | 'full';
+
+export const AUTONOMY_LEVELS: AutonomyLevel[] = ['ask', 'read', 'edit', 'full'];
+
+/** Ascending, so two levels can be compared and the smaller one taken. */
+export function autonomyRank(level: AutonomyLevel): number {
+  return Math.max(0, AUTONOMY_LEVELS.indexOf(level));
+}
+
+export function minAutonomy(a: AutonomyLevel, b: AutonomyLevel): AutonomyLevel {
+  return autonomyRank(a) <= autonomyRank(b) ? a : b;
+}
+
+/**
+ * Objects whose word is taken for a change to trust or autonomy.
+ *
+ * Everything else may register a project, but registers it untrusted and at
+ * `ask`.
+ *
+ * Matched on the caller's **typeId**, not its registered name. A name is only
+ * unique while its holder exists, and a workspace that has not spawned its UI
+ * objects leaves those names free for anything to claim; a typeId is stamped by
+ * the Factory at spawn and puts user objects in their own `user/` namespace, so
+ * it cannot be claimed at all.
+ */
+const TRUST_AUTHORITIES = ['ExternalProjectBrowser', 'GlobalSettings', 'PermissionBroker'];
+
 export interface ExternalProject {
   /** Short handle used everywhere else ("abjects", "novel"). */
   name: string;
@@ -79,6 +114,11 @@ export interface ExternalProject {
   protectedPaths?: string[];
   /** Whether this project's instruction files and scripts may be used. */
   trusted: boolean;
+  /**
+   * How much may happen here without a prompt. Only ever raised by the user;
+   * see AutonomyLevel. Requires `trusted`, since untrusted forces `ask`.
+   */
+  autonomy: AutonomyLevel;
   /** Default isolation for tasks working here. */
   isolation: IsolationMode;
   createdAt: number;
@@ -87,6 +127,10 @@ export interface ExternalProject {
 
 /** Paths no agent writes, whatever the project says. */
 export const ALWAYS_PROTECTED = ['.git/', '.env', 'node_modules/', '.ssh/'];
+
+function isAutonomy(v: unknown): v is AutonomyLevel {
+  return typeof v === 'string' && (AUTONOMY_LEVELS as string[]).includes(v);
+}
 
 export const EXTERNAL_PROJECT_REGISTRY_ID = 'abjects:external-project-registry' as AbjectId;
 
@@ -126,8 +170,25 @@ export class ExternalProjectRegistry extends Abject {
                 { name: 'sharedPaths', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Dirs symlinked into a worktree', optional: true },
                 { name: 'protectedPaths', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Relative paths agents must not write', optional: true },
                 { name: 'isolation', type: { kind: 'primitive', primitive: 'string' }, description: "'none' (default) or 'worktree'", optional: true },
-                { name: 'trusted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Trust immediately (default true when a user adds it)', optional: true },
+                { name: 'trusted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Trust immediately. Honored only for the user acting through the UI; any other caller registers an untrusted project.', optional: true },
                 { name: 'vcs', type: { kind: 'primitive', primitive: 'string' }, description: "'git' or 'none'. Detected from the directory when omitted.", optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+                project: { kind: 'object' },
+              }},
+            },
+            {
+              name: 'setAutonomy',
+              description:
+                'Set how much work in this project may proceed without prompting the user: ' +
+                '"ask" (prompt for every command), "read" (read-only commands inside the project), ' +
+                '"edit" (also writes inside the project), or "full". Requires the project to be trusted, ' +
+                'and can only be set by the user through the UI. The workspace access mode caps this: ' +
+                'a public workspace holds every project at "ask".',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+                { name: 'autonomy', type: { kind: 'primitive', primitive: 'string' }, description: 'ask | read | edit | full' },
               ],
               returns: { kind: 'object', properties: {
                 success: { kind: 'primitive', primitive: 'boolean' },
@@ -227,7 +288,7 @@ export class ExternalProjectRegistry extends Abject {
       .map(p => {
         const bits = [`- **${p.name}** — ${p.root}`];
         if (p.description) bits.push(`  ${p.description}`);
-        bits.push(`  vcs: ${p.vcs}, isolation: ${p.isolation}, trusted: ${p.trusted}`);
+        bits.push(`  vcs: ${p.vcs}, isolation: ${p.isolation}, trusted: ${p.trusted}, autonomy: ${p.autonomy}`);
         if (p.checkCommand) bits.push(`  check: \`${p.checkCommand}\``);
         if (p.verifyCommand) bits.push(`  verify: \`${p.verifyCommand}\``);
         if (!p.checkCommand && !p.verifyCommand) bits.push(`  (no commands declared — nothing to run automatically)`);
@@ -276,7 +337,8 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
       if (typeof root !== 'string' || root.trim() === '') {
         return { success: false, error: `addProject requires "root" (absolute path to the directory; "path" is accepted too). Received: ${JSON.stringify(raw).slice(0, 200)}` };
       }
-      return this.addProject({ ...(raw as Partial<ExternalProject>), name, root });
+      const byAuthority = await this.isTrustAuthority(msg.routing.from);
+      return this.addProject({ ...(raw as Partial<ExternalProject>), name, root }, byAuthority);
     });
 
     this.on('updateProject', async (msg: AbjectMessage) => {
@@ -287,7 +349,16 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
 
       // name and createdAt are identity, not settings.
       const { name: _n, createdAt: _c, ...allowed } = changes as Record<string, unknown>;
+      // Trust and autonomy do not ride in on a general-purpose update. Dropping
+      // them silently rather than failing the call keeps an agent's legitimate
+      // edit (a check command, a description) working.
+      if (!(await this.isTrustAuthority(msg.routing.from))) {
+        delete (allowed as Record<string, unknown>).trusted;
+        delete (allowed as Record<string, unknown>).autonomy;
+      }
       const updated: ExternalProject = { ...existing, ...(allowed as Partial<ExternalProject>), updatedAt: Date.now() };
+      // Losing trust drops the level with it: an untrusted project is `ask`.
+      if (!updated.trusted) updated.autonomy = 'ask';
       if (updated.root !== existing.root) {
         updated.root = this.resolveRoot(updated.root);
         await this.grantRoot(updated.root);
@@ -324,15 +395,41 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
     });
 
     this.on('setTrusted', async (msg: AbjectMessage) => {
+      if (!(await this.isTrustAuthority(msg.routing.from))) {
+        return { success: false, error: 'Only the user can change whether a project is trusted' };
+      }
       const { name, trusted } = msg.payload as { name: string; trusted: boolean };
       const p = this.projects.get(name);
       if (!p) return { success: false, error: `No external project named "${name}"` };
       p.trusted = trusted !== false;
+      // Trust is the floor autonomy stands on.
+      if (!p.trusted) p.autonomy = 'ask';
       p.updatedAt = Date.now();
       await this.persist();
       this.changed('projectsChanged', { projects: this.list() });
       log.info(`${name} is now ${p.trusted ? 'trusted' : 'untrusted'}`);
       return { success: true };
+    });
+
+    this.on('setAutonomy', async (msg: AbjectMessage) => {
+      if (!(await this.isTrustAuthority(msg.routing.from))) {
+        return { success: false, error: 'Only the user can change a project\'s autonomy level' };
+      }
+      const { name, autonomy } = msg.payload as { name: string; autonomy: string };
+      const p = this.projects.get(name);
+      if (!p) return { success: false, error: `No external project named "${name}"` };
+      if (!isAutonomy(autonomy)) {
+        return { success: false, error: `autonomy must be one of ${AUTONOMY_LEVELS.join(', ')}` };
+      }
+      if (autonomy !== 'ask' && !p.trusted) {
+        return { success: false, error: `"${name}" is not trusted, so it stays at "ask"` };
+      }
+      p.autonomy = autonomy;
+      p.updatedAt = Date.now();
+      await this.persist();
+      this.changed('projectsChanged', { projects: this.list() });
+      log.info(`${name} autonomy is now ${autonomy}`);
+      return { success: true, project: p };
     });
 
     this.on('protectedPathsFor', async (msg: AbjectMessage) => {
@@ -342,12 +439,29 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
     });
   }
 
+  /**
+   * Whether a caller may speak for the user about trust and autonomy.
+   *
+   * An unresolvable caller is not an authority: not knowing who is asking is
+   * not the same as knowing it is the user.
+   */
+  private async isTrustAuthority(callerId: AbjectId): Promise<boolean> {
+    const identity = await this.resolveCallerIdentity(callerId);
+    if (!identity?.typeId) return false;
+    const segments = String(identity.typeId).split('/');
+    const last = segments[segments.length - 1];
+    // `{peer}/{workspace}/{Name}` is a built-in. Anything longer is namespaced
+    // (`.../user/Name`) and is not one, whatever it calls itself.
+    return segments.length === 3 && TRUST_AUTHORITIES.includes(last);
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // Core
   // ═══════════════════════════════════════════════════════════════════
 
   private async addProject(
     input: Partial<ExternalProject> & { name: string; root: string },
+    byAuthority = false,
   ): Promise<{ success: boolean; project?: ExternalProject; error?: string }> {
     requireNonEmpty(input.name, 'name');
     requireNonEmpty(input.root, 'root');
@@ -372,9 +486,14 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
       vcs,
       protectedPaths: input.protectedPaths,
       // A user adding a project through the UI chose it deliberately, so the
-      // default is trusted; a caller adding one on an agent's behalf passes
-      // false and leaves the decision to the user.
-      trusted: input.trusted !== false,
+      // default is trusted. A caller that is not an authority gets an untrusted
+      // project whatever it asked for: registering a directory is not the same
+      // act as vouching for it, and an agent that could do both could grant
+      // itself the run of the disk.
+      trusted: byAuthority ? input.trusted !== false : false,
+      autonomy: byAuthority
+        ? (isAutonomy(input.autonomy) ? input.autonomy : 'read')
+        : 'ask',
       isolation,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -468,8 +587,16 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY }),
       );
       for (const p of data?.projects ?? []) {
-        // Tolerate records written before a field existed.
-        this.projects.set(p.name, { ...p, isolation: p.isolation ?? 'none', vcs: p.vcs ?? 'none' });
+        // Tolerate records written before a field existed. A project saved
+        // before autonomy existed was one the user had already trusted, so it
+        // lands on the same default a freshly added project gets rather than
+        // being demoted for having been registered early.
+        this.projects.set(p.name, {
+          ...p,
+          isolation: p.isolation ?? 'none',
+          vcs: p.vcs ?? 'none',
+          autonomy: isAutonomy(p.autonomy) ? p.autonomy : (p.trusted ? 'read' : 'ask'),
+        });
       }
       if (this.projects.size > 0) log.info(`loaded ${this.projects.size} external project(s)`);
     } catch (err) {
@@ -484,6 +611,8 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
       invariant(path.isAbsolute(p.root), `project ${p.name} root must be absolute`);
       invariant(p.isolation === 'none' || p.isolation === 'worktree', `project ${p.name} has an unknown isolation mode`);
       invariant(p.isolation !== 'worktree' || p.vcs === 'git', `project ${p.name} cannot use worktree isolation without git`);
+      invariant((AUTONOMY_LEVELS as string[]).includes(p.autonomy), `project ${p.name} has an unknown autonomy level`);
+      invariant(p.trusted || p.autonomy === 'ask', `untrusted project ${p.name} must sit at autonomy "ask"`);
     }
   }
 }

@@ -64,6 +64,7 @@ import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
+import { PermissionBroker } from '../src/objects/permission-broker.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
@@ -580,6 +581,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('Sidebar', () => new Sidebar());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('PermissionBroker', () => new PermissionBroker());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
   runtime.objectFactory.registerConstructor('ProcessExplorer', () => new ProcessExplorer());
@@ -642,7 +644,7 @@ async function main(): Promise<void> {
       'WebSearch', 'WebFetch', 'Screenshot',
       'Storage', 'HttpServer', 'StreamClient', 'AudioOutput', 'Speech',
       // Global services
-      'GlobalSettings', 'PeerNetwork',
+      'GlobalSettings', 'PermissionBroker', 'PeerNetwork',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       'SkillRegistry', 'SkillBrowser',
@@ -955,6 +957,14 @@ async function main(): Promise<void> {
       });
     }
   }
+
+  // The permission authority comes up before GlobalSettings and after the
+  // capability objects it governs. setPermissionsAuthority is
+  // first-caller-wins, so whoever claims it decides what runs on this host, and
+  // it needs a system typeId of its own because changing a project's autonomy
+  // is gated on the caller's type identity.
+  const permissionBrokerId = await supervisedSpawn(
+    'PermissionBroker', 'permanent', systemTypeId('PermissionBroker'));
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
 

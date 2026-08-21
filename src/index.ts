@@ -185,8 +185,16 @@ export { Speech, SPEECH_ID, createSpeech } from './objects/capabilities/speech.j
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
-export { ExternalProjectRegistry, EXTERNAL_PROJECT_REGISTRY_ID, ALWAYS_PROTECTED } from './objects/external-project-registry.js';
-export type { ExternalProject, IsolationMode } from './objects/external-project-registry.js';
+export { ExternalProjectRegistry, EXTERNAL_PROJECT_REGISTRY_ID, ALWAYS_PROTECTED, AUTONOMY_LEVELS, autonomyRank, minAutonomy } from './objects/external-project-registry.js';
+export type { ExternalProject, IsolationMode, AutonomyLevel } from './objects/external-project-registry.js';
+export { PermissionBroker, PERMISSION_BROKER_ID, ceilingFor } from './objects/permission-broker.js';
+export type { Rule as PermissionRule, RuleScope as PermissionRuleScope, DecisionRecord } from './objects/permission-broker.js';
+export {
+  analyzeCommand, checkContainment, protectedWrites, describeAnalysis, redactCommand,
+  isSensitivePath, effectRank, maxEffect,
+} from './core/command-analysis.js';
+export type { CommandAnalysis, EffectClass, Segment as CommandSegment, TouchedPath } from './core/command-analysis.js';
+export { isInside, isInsideAny, expandHome, deepestContaining } from './core/path-scope.js';
 export { ExternalCreator, EXTERNAL_CREATOR_ID } from './objects/external-creator.js';
 export { ExternalProjectBrowser, EXTERNAL_PROJECT_BROWSER_ID } from './objects/external-project-browser.js';
 export { SkillBrowser, SKILL_BROWSER_ID } from './objects/skill-browser.js';

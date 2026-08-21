@@ -14,6 +14,8 @@ import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import { truncateTail, droppedNotice, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from '../../core/tool-output.js';
 import { Log } from '../../core/timed-log.js';
+import { isInsideAny } from '../../core/path-scope.js';
+import { analyzeCommand, isCredentialVarName } from '../../core/command-analysis.js';
 
 interface PlatformInfo {
   os: string;
@@ -32,6 +34,13 @@ const platformInfo: PlatformInfo = {
 };
 
 const log = new Log('ShellExecutor');
+
+/**
+ * How long to wait for a permission answer. The authority queues prompts and a
+ * user may be away from the keyboard; the old two-minute limit turned a coffee
+ * break into a tool failure the agent then spent steps recovering from.
+ */
+const PERMISSION_WAIT_MS = 31 * 60 * 1000;
 
 /**
  * Bound a command's output to the shared truncation contract.
@@ -128,8 +137,6 @@ export class ShellExecutor extends Abject {
   private objectAllowedCommands: Map<string, Set<string>> = new Map();
   /** Per-calling-object blocklists; outrank every allow list. */
   private objectDeniedCommands: Map<string, Set<string>> = new Map();
-  /** AbjectId -> registered name, so the caller lookup is one registry hit. */
-  private callerNames: Map<AbjectId, string> = new Map();
   /** Environment variables injected by skills (via SkillRegistry). */
   private skillEnv: Record<string, string> = {};
 
@@ -308,7 +315,7 @@ export class ShellExecutor extends Abject {
     this.on('setDefaultCwd', async (msg: AbjectMessage) => {
       const { cwd } = msg.payload as { cwd?: string };
       if (cwd) {
-        await this.validatePath(cwd);
+        await this.validatePath(cwd, msg.routing.from);
         this.defaultCwds.set(msg.routing.from, cwd);
       } else {
         this.defaultCwds.delete(msg.routing.from);
@@ -345,21 +352,32 @@ export class ShellExecutor extends Abject {
 
     // Validate command (may prompt user)
     const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
+    let restrictEnv = false;
     if (req.skillName) {
       await this.validateSkillCommand(req.skillName, fullCommand);
     } else {
-      await this.validateCommand(fullCommand, { callerId, usesShell: !!req.shell });
+      ({ restrictEnv } = await this.validateCommand(
+        fullCommand, { callerId, usesShell: !!req.shell, cwd }));
     }
 
     // Validate working directory (may prompt user). A default set earlier by
     // this caller was validated when it was set, so only an explicit cwd needs
     // checking again.
     if (req.cwd) {
-      await this.validatePath(req.cwd);
+      await this.validatePath(req.cwd, callerId);
     }
 
-    // Build environment: process env + skill env + per-request env
-    const env = { ...process.env, ...this.skillEnv, ...req.env };
+    // Build environment: process env + skill env + per-request env.
+    //
+    // A command nobody saw approved does not get the host's credentials. Every
+    // approved `curl` used to carry every API key on the box; stripping them by
+    // variable NAME leaves PATH, HOME and toolchain settings intact, so builds
+    // still work. A command the user was actually shown keeps the full
+    // environment, because they saw what they were agreeing to.
+    const baseEnv = restrictEnv
+      ? Object.fromEntries(Object.entries(process.env).filter(([k]) => !isCredentialVarName(k)))
+      : process.env;
+    const env = { ...baseEnv, ...this.skillEnv, ...req.env };
 
     return new Promise<ExecResult>((resolve, reject) => {
       if (req.shell) {
@@ -406,36 +424,47 @@ export class ShellExecutor extends Abject {
 
   private async validateCommand(
     fullCommand: string,
-    opts: { callerId?: AbjectId; usesShell: boolean },
-  ): Promise<void> {
+    opts: { callerId?: AbjectId; usesShell: boolean; cwd?: string },
+  ): Promise<{ restrictEnv: boolean }> {
     const trimmed = fullCommand.trim();
 
     if (this.deniedCommands?.has(trimmed)) {
       throw new Error(`Command "${trimmed}" is permanently denied`);
     }
 
-    // Per-object rules: the whole command line varies on every call (tmux
-    // send-keys carries a different payload each time), so an object that
-    // drives one program is matched on the program name alone.
     const callerName = await this.resolveCallerName(opts.callerId);
-    const cmdName = extractCommandName(trimmed);
+
+    // A compound line is made of several commands, so it reduces to a SET of
+    // programs rather than one. The old code gave up the moment it saw a shell
+    // metacharacter, which meant the per-object grant below could never fire
+    // for an agent (agents pipe constantly) and the user was re-asked forever.
+    const analysis = analyzeCommand(trimmed, { cwd: opts.cwd });
+    const programs = analysis.segments.map(s => s.program).filter(Boolean);
 
     // A block on the object is the narrowest, most deliberate statement the
-    // user can make about this pair, so it outranks the broad allow lists.
-    if (callerName && this.objectDeniedCommands.get(callerName)?.has(cmdName)) {
-      throw new Error(`${callerName} is blocked from running "${cmdName}"`);
+    // user can make about this pair, so it outranks the broad allow lists. Any
+    // one blocked program in the line is enough.
+    const blocked = programs.find(p => this.objectDeniedCommands.get(callerName ?? '')?.has(p));
+    if (callerName && blocked) {
+      throw new Error(`${callerName} is blocked from running "${blocked}"`);
     }
 
-    if (this.allowedCommands?.has(trimmed)) return;
+    if (this.allowedCommands?.has(trimmed)) return { restrictEnv: false };
 
-    // A program-name grant says nothing about what a shell would do with the
-    // rest of the line, so `tmux ls; rm -rf ~` still goes to the user.
-    const reducible = !opts.usesShell || !hasShellMetacharacters(trimmed);
-    if (reducible && callerName && this.objectAllowedCommands.get(callerName)?.has(cmdName)) return;
+    // A grant is on a program, so a line is covered only when every program in
+    // it is granted. `cd x && sed … | grep …` passes once cd, sed and grep are
+    // all allowed, and stops passing the moment something else joins.
+    const grants = callerName ? this.objectAllowedCommands.get(callerName) : undefined;
+    if (grants && programs.length > 0 && !analysis.opaque
+        && analysis.effect !== 'dangerous'
+        && programs.every(p => grants.has(p))) {
+      return { restrictEnv: false };
+    }
 
-    // Command not in allow list -- ask the permissions authority
+    // Nothing local covers it: put it to the authority, which knows about
+    // projects and workspaces and can answer without a dialog.
     if (this.permissionsAuthorityId) {
-      const response = await this.request<{ decision: string }>(
+      const response = await this.request<{ decision: string; asked?: boolean; restrictEnv?: boolean }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'shell',
           resource: trimmed,
@@ -443,101 +472,41 @@ export class ShellExecutor extends Abject {
             ? `${callerName} wants to run:`
             : `An object wants to run:`,
           objectName: callerName,
-          commandName: callerName ? cmdName : undefined,
-          // Blocking a program for an object is always well defined; granting
-          // it is only meaningful when the line reduces to that program.
-          canAllow: reducible,
+          commandName: analysis.principalProgram,
+          callerId: opts.callerId,
+          cwd: opts.cwd,
+          usesShell: opts.usesShell,
+          // Granting a program is only meaningful when the line reduces to a
+          // known set of them.
+          canAllow: !analysis.opaque && programs.length > 0,
         }),
-        120000,
+        // Long enough to survive the user being away from the keyboard. The
+        // authority queues prompts rather than refusing a second one, so a
+        // wait here is a wait for a human, not a deadlock.
+        PERMISSION_WAIT_MS,
       );
 
-      switch (response.decision) {
-        case 'accept_always':
-          if (!this.allowedCommands) this.allowedCommands = new Set();
-          this.allowedCommands.add(trimmed);
-          return;
-        case 'accept_object': {
-          if (!callerName) return;
-          addTo(this.objectAllowedCommands, callerName, cmdName);
-          this.objectDeniedCommands.get(callerName)?.delete(cmdName);
-          return;
-        }
-        case 'deny_object': {
-          if (callerName) {
-            addTo(this.objectDeniedCommands, callerName, cmdName);
-            this.objectAllowedCommands.get(callerName)?.delete(cmdName);
-            throw new Error(`${callerName} is blocked from running "${cmdName}"`);
-          }
-          throw new Error(`Command "${trimmed}" was denied by user`);
-        }
-        case 'accept_once':
-          return;
-        case 'deny_always':
-          if (!this.deniedCommands) this.deniedCommands = new Set();
-          this.deniedCommands.add(trimmed);
-          throw new Error(`Command "${trimmed}" was permanently denied by user`);
-        case 'deny':
-        default:
-          throw new Error(`Command "${trimmed}" was denied by user`);
+      // Standing rules now live with the authority, which is what makes them
+      // survive a takeTheWheel and stay consistent with what Settings shows.
+      // Anything that starts with accept is a yes.
+      // The authority says whether this ran on policy alone. If it did, the
+      // command goes without the host's credentials.
+      if (response.decision?.startsWith('accept')) {
+        return { restrictEnv: response.restrictEnv === true };
       }
+      if (response.decision === 'deny_object' && callerName) {
+        throw new Error(`${callerName} is blocked from running "${analysis.principalProgram}"`);
+      }
+      if (response.decision === 'deny_always') {
+        if (!this.deniedCommands) this.deniedCommands = new Set();
+        this.deniedCommands.add(trimmed);
+        throw new Error(`Command "${trimmed}" was permanently denied by user`);
+      }
+      throw new Error(`Command "${trimmed}" was denied by user`);
     }
 
     // No authority registered -- deny by default
     throw new Error(`Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`);
-  }
-
-  /**
-   * Registered name of the Abject that sent an exec request, or undefined when
-   * it cannot be resolved. Cached: an AbjectId belongs to one object for its
-   * lifetime, and a respawned object arrives with a fresh id.
-   *
-   * User-created objects register in their workspace's registry rather than
-   * the global one, so a miss here falls back to asking WorkspaceManager which
-   * workspace owns the caller and looking the name up in that registry.
-   */
-  private async resolveCallerName(callerId?: AbjectId): Promise<string | undefined> {
-    if (!callerId) return undefined;
-    const cached = this.callerNames.get(callerId);
-    if (cached) return cached;
-
-    const name = await this.lookupName(await this.resolveRegistryId(), callerId)
-      ?? await this.lookupNameInWorkspace(callerId);
-    if (!name) return undefined;
-
-    // Dead ids are never reused, so the cache only grows; drop it wholesale
-    // rather than tracking liveness for what is a lookup optimization.
-    if (this.callerNames.size >= 512) this.callerNames.clear();
-    this.callerNames.set(callerId, name);
-    return name;
-  }
-
-  private async lookupName(registryId: AbjectId | null, objectId: AbjectId): Promise<string | undefined> {
-    if (!registryId) return undefined;
-    try {
-      const reg = await this.request<{ name?: string; manifest?: { name?: string } } | null>(
-        request(this.id, registryId, 'lookup', { objectId }),
-        5000,
-      );
-      return reg?.name ?? reg?.manifest?.name;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async lookupNameInWorkspace(objectId: AbjectId): Promise<string | undefined> {
-    const wmId = await this.discoverDep('WorkspaceManager');
-    if (!wmId) return undefined;
-    try {
-      const workspaces = await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
-        request(this.id, wmId, 'listWorkspacesDetailed', {}),
-        5000,
-      );
-      const owner = workspaces.find((ws) => ws.childIds?.includes(objectId));
-      if (!owner) return undefined;
-      return await this.lookupName(owner.registryId, objectId);
-    } catch {
-      return undefined;
-    }
   }
 
   private async validateSkillCommand(skillName: string, fullCommand: string): Promise<void> {
@@ -556,10 +525,10 @@ export class ShellExecutor extends Abject {
           skillName,
           description: `Skill "${skillName}" wants to run: ${cmdName}`,
         }),
-        120000,
+        PERMISSION_WAIT_MS,
       );
 
-      if (response.decision === 'accept') {
+      if (response.decision?.startsWith('accept')) {
         if (!skillWhitelist) {
           this.skillAllowedCommands.set(skillName, new Set([cmdName]));
         } else {
@@ -573,8 +542,16 @@ export class ShellExecutor extends Abject {
     throw new Error(`Command "${cmdName}" from skill "${skillName}" is not allowed.`);
   }
 
-  private async validatePath(cwd: string): Promise<void> {
-    if (this.allowedPaths?.some(p => cwd.startsWith(p))) return;
+  /**
+   * @param callerId who wants to work here. The authority needs it: whether a
+   *        directory is already covered depends on which project it belongs to
+   *        and which workspace the caller lives in, and an anonymous request
+   *        can be answered only by asking a human.
+   */
+  private async validatePath(cwd: string, callerId?: AbjectId): Promise<void> {
+    // Boundary-aware: see HostFileSystem.validateAndResolve for why a raw
+    // startsWith is not good enough here.
+    if (isInsideAny(this.allowedPaths, cwd)) return;
 
     // Path not in allow list -- ask the permissions authority
     if (this.permissionsAuthorityId) {
@@ -583,8 +560,9 @@ export class ShellExecutor extends Abject {
           type: 'directory',
           resource: cwd,
           description: `Directory access: ${cwd}`,
+          callerId,
         }),
-        120000,
+        PERMISSION_WAIT_MS,
       );
 
       switch (response.decision) {

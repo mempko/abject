@@ -418,6 +418,112 @@ export abstract class Abject {
   }
 
   /**
+   * A dependency's id, discovering it only when it is not already known.
+   *
+   * The cached id is passed in and handed back rather than stored here, so each
+   * caller keeps its own field and its own invalidation policy.
+   */
+  protected async resolveDep(name: string, cached: AbjectId | undefined): Promise<AbjectId | undefined> {
+    if (cached) return cached;
+    return await this.discoverDep(name) ?? undefined;
+  }
+
+  /** AbjectId -> registered identity, for objects that gate on who is calling. */
+  private _callerNameCache = new Map<AbjectId, { name: string; typeId?: TypeId }>();
+
+  /**
+   * The registered name of whoever sent a message, or undefined when it cannot
+   * be established.
+   *
+   * Security-relevant, so the name is resolved from the registry rather than
+   * read out of the payload: a caller cannot claim to be someone else. User
+   * objects register in their workspace's registry rather than the global one,
+   * so a miss falls back to asking WorkspaceManager which workspace owns the
+   * caller and looking the name up there.
+   *
+   * Cached: an AbjectId belongs to one object for its lifetime, and a respawned
+   * object arrives with a fresh id. Dead ids are never reused, so the cache is
+   * dropped wholesale rather than tracked.
+   */
+  protected async resolveCallerName(callerId?: AbjectId): Promise<string | undefined> {
+    return (await this.resolveCallerIdentity(callerId))?.name;
+  }
+
+  /**
+   * Registered name AND durable type identity of whoever sent a message.
+   *
+   * The typeId is the part to gate privileges on. A registered name is unique
+   * only while its holder exists, so a name that is free (an object the
+   * workspace has not spawned) can be claimed by anything. A typeId cannot be
+   * claimed: WorkspaceManager stamps built-ins `{peer}/{workspace}/{Name}` at
+   * spawn, while a user object is `{peer}/{workspace}/user/{Name}`, and the
+   * Factory is what assigns them.
+   */
+  protected async resolveCallerIdentity(
+    callerId?: AbjectId,
+  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+    if (!callerId) return undefined;
+    const cached = this._callerNameCache.get(callerId);
+    if (cached) return cached;
+
+    const found = await this.lookupIdentityIn(await this.resolveRegistryId(), callerId)
+      ?? await this.lookupIdentityInOwningWorkspace(callerId);
+    if (!found) return undefined;
+
+    if (this._callerNameCache.size >= 512) this._callerNameCache.clear();
+    this._callerNameCache.set(callerId, found);
+    return found;
+  }
+
+  private async lookupIdentityIn(
+    registryId: AbjectId | null, objectId: AbjectId,
+  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+    if (!registryId) return undefined;
+    try {
+      const reg = await this.request<
+        { name?: string; typeId?: TypeId; manifest?: { name?: string } } | null
+      >(
+        request(this.id, registryId, 'lookup', { objectId }),
+        5000,
+      );
+      const name = reg?.name ?? reg?.manifest?.name;
+      return name ? { name, typeId: reg?.typeId } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async lookupIdentityInOwningWorkspace(
+    objectId: AbjectId,
+  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+    const wmId = await this.discoverDep('WorkspaceManager');
+    if (!wmId) return undefined;
+    try {
+      const workspaces = await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
+        request(this.id, wmId, 'listWorkspacesDetailed', {}),
+        5000,
+      );
+      const owner = workspaces.find((ws) => ws.childIds?.includes(objectId));
+      if (owner) {
+        const found = await this.lookupIdentityIn(owner.registryId, objectId);
+        if (found) return found;
+      }
+      // No workspace owns it, so it is a global object. A per-workspace caller
+      // reaches the global registry through its own registry's fallback link.
+      const own = await this.resolveRegistryId();
+      if (!own) return undefined;
+      const globalId = await this.request<AbjectId | null>(
+        request(this.id, own, 'getFallbackRegistry', {}),
+        5000,
+      ).catch(() => null);
+      if (!globalId) return undefined;
+      return await this.lookupIdentityIn(globalId, objectId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Discover a dependency by manifest name. Throws if not found.
    */
   /**

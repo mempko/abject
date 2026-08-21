@@ -23,6 +23,7 @@ import { IgnoreSet } from '../../core/ignore-rules.js';
 import { applyEdits, formatEditFailures, type FileEdit } from '../../core/file-edit.js';
 import { withFileMutationQueue } from '../../core/file-mutation-queue.js';
 import { Log } from '../../core/timed-log.js';
+import { isInsideAny } from '../../core/path-scope.js';
 
 const log = new Log('HostFileSystem');
 
@@ -686,7 +687,9 @@ export class HostFileSystem extends Abject {
   /** Validate a path and return the resolved absolute path (with ~ expanded). */
   private async validateAndResolve(p: string): Promise<string> {
     const resolved = this.resolvePath(p);
-    if (this.allowedPaths?.some(ap => resolved.startsWith(path.resolve(ap)))) return resolved;
+    // Boundary-aware: a raw prefix test would let a grant on
+    // /home/me/project also cover /home/me/project-secrets.
+    if (isInsideAny(this.allowedPaths, resolved)) return resolved;
 
     // Path not in allow list -- ask the permissions authority
     if (this.permissionsAuthorityId) {
@@ -696,7 +699,9 @@ export class HostFileSystem extends Abject {
           resource: resolved,
           description: `Filesystem access: ${resolved}`,
         }),
-        120000,
+        // A user may be away; the authority queues prompts rather than
+        // refusing them, so waiting here waits for a person, not a deadlock.
+        31 * 60 * 1000,
       );
 
       switch (response.decision) {

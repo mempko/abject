@@ -235,11 +235,6 @@ run, I say plainly what I changed and what I could not verify. I never report a
 clean result I did not observe.`;
   }
 
-  private async resolveDep(name: string, cached: AbjectId | undefined): Promise<AbjectId | undefined> {
-    if (cached) return cached;
-    return await this.discoverDep(name) ?? undefined;
-  }
-
   private async hostFs(): Promise<AbjectId> {
     this.hostFsId = await this.resolveDep('HostFileSystem', this.hostFsId);
     if (!this.hostFsId) throw new Error('HostFileSystem is not available');
@@ -1379,6 +1374,13 @@ clean result I did not observe.`;
       return { success: false, error: message };
     } finally {
       try { await this.teardownIsolation(extra); } catch { /* leave the worktree in place */ }
+      // Permissions granted "for this task" end with the task. They also time
+      // out on their own, but a task that finishes should not leave a standing
+      // grant behind for the next one to inherit.
+      try {
+        const brokerId = await this.discoverDep('PermissionBroker');
+        if (brokerId) this.send(request(this.id, brokerId, 'clearSessionGrants', {}));
+      } catch { /* best effort */ }
       this.taskExtras.delete(args.taskId);
       if (this._currentGoalId === args.goalId) this._currentGoalId = undefined;
     }
