@@ -79,6 +79,12 @@ export class PeerRegistry extends Abject {
   // Auto-connect state
   private manuallyDisconnected: Set<PeerId> = new Set();
   private autoConnectTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Set once teardown begins. Every path that builds a PeerTransport checks
+   * it after its awaits, so a connection cannot be created behind a shutdown
+   * that has already swept the transport map.
+   */
+  private stopping = false;
   private static readonly AUTO_CONNECT_INTERVAL = 30_000; // 30s
   private static readonly STALE_OFFER_TIMEOUT = 10_000; // 10s (reduced from 15s for faster cleanup)
   private offerTimestamps: Map<string, number> = new Map();
@@ -581,20 +587,38 @@ export class PeerRegistry extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
+    // Order matters. Building a transport suspends on resolveIceServers(),
+    // which asks the signaling server for ICE credentials, so an offer that
+    // arrived just before shutdown resumes a second or two LATER and builds a
+    // brand-new PeerConnection. Under the old order that connection appeared
+    // after the transport map had been cleared, so nothing was left holding
+    // it and nothing closed it: libdatachannel stayed alive and the process
+    // never exited, which is what "I closed the app and it kept running"
+    // actually was.
+    //
+    // So: refuse new connections, cut the source of offers, and only then
+    // tear down what is left.
+    this.stopping = true;
     this.stopAutoConnect();
 
-    // Disconnect all peers
-    for (const [, transport] of this.transports) {
-      await transport.disconnect();
-    }
-    this.transports.clear();
-    this.networkPeers.clear();
-
-    // Disconnect all signaling clients
     for (const [, client] of this.signalingClients) {
       await client.disconnect();
     }
     this.signalingClients.clear();
+
+    // Drain rather than iterate once: a handler suspended mid-connect can
+    // still add a transport while these disconnects are awaited. The bound is
+    // a backstop; the flag above means the second pass is normally empty.
+    for (let sweep = 0; this.transports.size > 0 && sweep < 5; sweep++) {
+      const pending = [...this.transports.values()];
+      this.transports.clear();
+      for (const transport of pending) {
+        try {
+          await transport.disconnect();
+        } catch { /* it is going away regardless */ }
+      }
+    }
+    this.networkPeers.clear();
   }
 
   // ==========================================================================
@@ -721,6 +745,9 @@ export class PeerRegistry extends Abject {
     this.setContactState(peerId, 'connecting');
 
     const iceServers = await this.resolveIceServers();
+    // Shutdown may have begun while the ICE lookup was in flight; building a
+    // PeerConnection now would outlive the teardown that is already sweeping.
+    if (this.stopping) return false;
 
     const transport = new PeerTransport({
       localPeerId: this.localIdentity!.peerId,
@@ -1037,6 +1064,9 @@ export class PeerRegistry extends Abject {
     this.setContactState(fromPeerId, 'connecting');
 
     const iceServers = await this.resolveIceServers();
+    // Shutdown may have begun while the ICE lookup was in flight; building a
+    // PeerConnection now would outlive the teardown that is already sweeping.
+    if (this.stopping) return;
 
     // Auto-accept connections from known contacts
     let transport = this.transports.get(fromPeerId);
@@ -1449,6 +1479,9 @@ export class PeerRegistry extends Abject {
     }
 
     const iceServers = await this.resolveIceServers();
+    // Shutdown may have begun while the ICE lookup was in flight; building a
+    // PeerConnection now would outlive the teardown that is already sweeping.
+    if (this.stopping) return false;
 
     const transport = new PeerTransport({
       localPeerId: this.localIdentity!.peerId,

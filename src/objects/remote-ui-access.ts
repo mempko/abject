@@ -112,6 +112,11 @@ export class RemoteUIAccess extends Abject {
   private negotiatingTransports: Map<string, PeerTransport> = new Map();
 
   /** Cached ICE servers (STUN + TURN creds) fetched from the signaling server. */
+  /**
+   * Set while teardown is in progress, so an answer that suspended on an ICE
+   * lookup cannot build a transport behind a sweep that has already run.
+   */
+  private stopping = false;
   private cachedIceServers?: RTCIceServer[];
   private cachedIceServersAt = 0;
 
@@ -389,6 +394,8 @@ export class RemoteUIAccess extends Abject {
   // ── Signaling / transport ────────────────────────────────────────────
 
   private async startListening(): Promise<void> {
+    // Listening again after a stop: accept connections once more.
+    this.stopping = false;
     if (this.signalingClient) return;
     if (!this.peerId || !this.signingPubJwk || !this.exchangePubJwk) return;
 
@@ -424,9 +431,18 @@ export class RemoteUIAccess extends Abject {
   }
 
   private async stopListening(): Promise<void> {
-    for (const [peerId, t] of this.connectedTransports) {
+    // Cut the source of offers FIRST. Answering one suspends on an ICE-server
+    // lookup, so an offer taken just before this runs would otherwise resume
+    // afterwards and build a PeerConnection that no map still holds and
+    // nothing closes, keeping the process alive after the window is gone.
+    this.stopping = true;
+    if (this.signalingClient) {
+      try { await this.signalingClient.disconnect(); } catch { /* ignore */ }
+      this.signalingClient = undefined;
+    }
+
+    for (const [, t] of this.connectedTransports) {
       try { await t.disconnect(); } catch { /* ignore */ }
-      void peerId;
     }
     this.connectedTransports.clear();
     for (const [, p] of this.pendingAuth) {
@@ -434,13 +450,15 @@ export class RemoteUIAccess extends Abject {
       try { await p.peerTransport.disconnect(); } catch { /* ignore */ }
     }
     this.pendingAuth.clear();
-    for (const [, t] of this.negotiatingTransports) {
-      try { await t.disconnect(); } catch { /* ignore */ }
-    }
-    this.negotiatingTransports.clear();
-    if (this.signalingClient) {
-      try { await this.signalingClient.disconnect(); } catch { /* ignore */ }
-      this.signalingClient = undefined;
+
+    // Drain: an answer suspended mid-negotiation can still register here
+    // while the disconnects above are awaited.
+    for (let sweep = 0; this.negotiatingTransports.size > 0 && sweep < 5; sweep++) {
+      const pending = [...this.negotiatingTransports.values()];
+      this.negotiatingTransports.clear();
+      for (const t of pending) {
+        try { await t.disconnect(); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -469,6 +487,9 @@ export class RemoteUIAccess extends Abject {
     if (!this.signalingClient || !this.peerId) return;
 
     const iceServers = await this.resolveIceServers();
+    // Teardown may have begun while the ICE lookup was in flight; a
+    // PeerConnection built now would outlive the sweep that already ran.
+    if (this.stopping) return;
 
     // A fresh inbound offer means the remote built a brand-new RTCPeerConnection
     // (e.g. a mobile UI client closed and reopened). Any transport we still hold
