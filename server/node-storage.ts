@@ -139,6 +139,50 @@ export class NodeStorage extends Storage {
   }
 
   /**
+   * A key's value from the newest surviving JSON snapshot.
+   *
+   * The store grew out of a whole-file `storage.json` backend and the
+   * migration keeps those files as `.bak`, so they are the only history this
+   * store has. Reading them is deliberately lazy and uncached: this answers
+   * repair questions asked once at startup, not ordinary reads.
+   *
+   * Snapshots are searched newest first, and the first one holding the key
+   * wins. Returns null when no snapshot has it.
+   */
+  override async getPreviousValue(key: string): Promise<unknown> {
+    const dir = path.dirname(this.dbPath);
+    let snapshots: string[];
+    try {
+      snapshots = fs.readdirSync(dir).filter(f => f.startsWith(`${STORAGE_FILE}.`) || f === STORAGE_FILE);
+    } catch {
+      return null;
+    }
+    const newestFirst = snapshots
+      .map(name => {
+        const full = path.join(dir, name);
+        try {
+          return { full, mtime: fs.statSync(full).mtimeMs };
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((s): s is { full: string; mtime: number } => s !== undefined)
+      .sort((a, b) => b.mtime - a.mtime);
+
+    for (const snapshot of newestFirst) {
+      try {
+        const store = JSON.parse(fs.readFileSync(snapshot.full, 'utf-8')) as Record<string, StorageEntry>;
+        const entry = store[key];
+        if (entry && typeof entry === 'object' && 'value' in entry) return entry.value;
+      } catch {
+        // A truncated or half-written snapshot is not a reason to stop
+        // looking through the older ones.
+      }
+    }
+    return null;
+  }
+
+  /**
    * One-time import of a legacy `storage.json` (the old whole-file backend).
    * Guarded by a `meta` marker so it runs at most once; the legacy file is
    * renamed to `.bak` on success so a rollback to the old build loses nothing

@@ -4,7 +4,7 @@
 // Same message surface and semantics: remember (dedup by normalized
 // title+type, optional origin provenance), recall (BM25 full-text,
 // title-boosted, snippets + scores, previews mode), weave (pattern
-// selection by context match plus 'Links: -> NAME' expansion), match
+// selection by context match plus link expansion), match
 // (exact lookup), get/forget/update/list, markUseful/archive curation, the
 // entryAdded/entryUpdated/entryRemoved events, cross-peer merge through
 // SharedState, and periodic distillation (stale entries are archived, not
@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "bm25.hpp"
+#include "pattern.hpp"
 
 using namespace abject;
 
@@ -96,6 +97,18 @@ struct Entry {
   int64_t last_useful_at = 0;
   /// Archived entries are hidden from recall/match but restorable.
   bool archived = false;
+
+  /// The entry as its readers want it. Patterns are stored as structure and
+  /// rendered here, so every path that hands an entry to a person, a prompt
+  /// or the UI gets prose and the JSON stays an implementation detail of
+  /// storage. Persistence and cross-peer sync use to_json().
+  json to_presented_json() const {
+    json j = to_json();
+    if (type == "pattern") {
+      if (auto p = kbpat::read_structured(content)) j["content"] = p->render();
+    }
+    return j;
+  }
 
   json to_json() const {
     return {{"id", id},           {"title", title},
@@ -193,42 +206,14 @@ static bool has_regex_meta(const std::string& p) {
   return false;
 }
 
-/// Parse pattern link names from a pattern body's 'Links:' line, the
-/// '-> NAME, OTHER NAME' convention. Names resolve by normalized title.
-static std::vector<std::string> parse_pattern_links(const std::string& content) {
-  size_t pos = 0;
-  while (pos <= content.size()) {
-    const size_t eol = content.find('\n', pos);
-    const std::string line =
-        content.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
-    const size_t start = line.find_first_not_of(" \t");
-    if (start != std::string::npos &&
-        kb::to_lower_ascii(line.substr(start, 6)) == "links:") {
-      std::vector<std::string> names;
-      const std::string rest = line.substr(start + 6);
-      size_t piece_start = 0;
-      while (piece_start <= rest.size()) {
-        const size_t comma = rest.find(',', piece_start);
-        std::string piece = rest.substr(
-            piece_start, comma == std::string::npos ? std::string::npos : comma - piece_start);
-        std::string cleaned;
-        for (size_t i = 0; i < piece.size(); i++) {
-          if (piece[i] == '-' && i + 1 < piece.size() && piece[i + 1] == '>') { i++; continue; }
-          cleaned += piece[i];
-        }
-        const size_t b = cleaned.find_first_not_of(" \t\r");
-        if (b != std::string::npos) {
-          const size_t e = cleaned.find_last_not_of(" \t\r");
-          names.push_back(cleaned.substr(b, e - b + 1));
-        }
-        if (comma == std::string::npos) break;
-        piece_start = comma + 1;
-      }
-      return names;
-    }
-    if (eol == std::string::npos) break;
-    pos = eol + 1;
-  }
+/// A pattern's links, read straight off its structure.
+///
+/// This used to hunt for a 'Links:' line in prose, so the links of every
+/// pattern that wrote them as a '## Links' block were invisible and the weave
+/// quietly stopped expanding through them.
+static std::vector<std::string> parse_pattern_links(const std::string& content,
+                                                    const std::string& title) {
+  if (auto p = kbpat::read(content, title)) return p->links;
   return {};
 }
 
@@ -253,7 +238,7 @@ class KnowledgeBase final : public Object {
         "(discovered facts), 'insight' (agent analysis), 'reference' "
         "(pointers to resources), 'pattern' (Alexander/Coplien-style "
         "generative pattern-language entries with Context/Forces/Therefore "
-        "sections and 'Links: -> NAME' cross-references). Knowledge "
+        "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
         "3.2.0", "abjects:knowledge-base");
 
@@ -280,7 +265,7 @@ class KnowledgeBase final : public Object {
         .returns("array");
     m.method("weave",
              "Select pattern entries (type 'pattern') whose contexts match "
-             "the query (BM25-ranked), then follow their 'Links: -> NAME' "
+             "the query (BM25-ranked), then follow their links "
              "references to pull in linked patterns. Returns { patterns, "
              "dangling }: each pattern carries via ('matched' or "
              "'linked-from: NAME'); dangling lists link names that resolve "
@@ -387,9 +372,19 @@ class KnowledgeBase final : public Object {
 
   // ── Loading ────────────────────────────────────────────────────────────
 
+  /// What the full-text index should see. Patterns are stored as JSON, so
+  /// indexing the stored body would feed BM25 braces and field names; the
+  /// prose is indexed instead and recall keeps working as it always did.
+  static std::string index_text(const Entry& e) {
+    if (e.type == "pattern") {
+      if (auto p = kbpat::read_structured(e.content)) return p->search_text();
+    }
+    return e.content;
+  }
+
   void admit_entry(Entry e) {
     if (e.id.empty()) return;
-    index_.add(e.id, e.title, e.content, e.tags);
+    index_.add(e.id, e.title, index_text(e), e.tags);
     entries_[e.id] = std::move(e);
   }
 
@@ -416,9 +411,110 @@ class KnowledgeBase final : public Object {
 
   void finish_load() {
     loaded_ = true;
+    heal_patterns();
     log(LogLevel::Info, "KnowledgeBase (C++) loaded " +
                             std::to_string(entries_.size()) + " entries from Storage");
     distill();
+  }
+
+  /// Force a pattern body into the structured form at write time.
+  ///
+  /// Any agent can save an entry of type 'pattern' through the plain
+  /// `remember` action, and those arrive as freehand prose. Converting on
+  /// the way in means the store holds one shape, so nothing downstream has
+  /// to guess how a given pattern was written. Prose that cannot be read as
+  /// a pattern is stored as-is; refusing the write would lose it entirely.
+  std::string structure_on_write(const std::string& title, const std::string& content) {
+    if (kbpat::is_structured(content)) return content;
+    const auto pattern = kbpat::parse_legacy(content, title);
+    if (!pattern) {
+      log(LogLevel::Warn,
+          "Pattern \"" + title + "\" could not be structured on write; stored as written");
+      return content;
+    }
+    return pattern->to_json().dump();
+  }
+
+  /// Bring every pattern into the structured form, and put back the ones an
+  /// older bug took apart. Runs once per store, at load.
+  ///
+  /// Two things were wrong with patterns before they had a structure. They
+  /// were stored as prose and their sections recovered by matching headings,
+  /// which failed the moment an agent wrote '## Context' where the matcher
+  /// expected 'Context:'. And update_pattern rebuilt entries out of the
+  /// sections it had recognized, so a pattern it could not read came back
+  /// FLATTENED: everything gone but a single Evidence line.
+  ///
+  /// Conversion fixes the first. The second needs the text back, and the only
+  /// place it still exists is the store's own older snapshots, so a flattened
+  /// pattern is looked up there (Storage.getPrevious) before being written.
+  ///
+  /// Entries already structured are skipped, and snapshots are asked for only
+  /// when something is actually flattened. Once a store is healed this costs
+  /// one pass over memory and no snapshot reads at all.
+  void heal_patterns() {
+    size_t converted = 0;
+    size_t unreadable = 0;
+    std::vector<std::string> flattened;
+
+    for (auto& [id, e] : entries_) {
+      if (e.type != "pattern" || kbpat::is_structured(e.content)) continue;
+      const auto p = kbpat::parse_legacy(e.content, e.title);
+      if (!p) {
+        unreadable++;
+        log(LogLevel::Warn, "Pattern \"" + e.title + "\" could not be structured; left as written");
+        continue;
+      }
+      e.content = p->to_json().dump();
+      e.updated_at = static_cast<int64_t>(now_ms());
+      index_.add(e.id, e.title, p->search_text(), e.tags);
+      persist_entry(e);
+      converted++;
+      if (kbpat::is_flattened(*p)) flattened.push_back(e.id);
+    }
+
+    if (converted > 0) {
+      log(LogLevel::Info, "Structured " + std::to_string(converted) +
+                              " pattern(s) written before the format existed");
+    }
+    if (unreadable > 0) {
+      log(LogLevel::Warn, std::to_string(unreadable) + " pattern(s) could not be structured");
+    }
+    for (const std::string& id : flattened) recover_pattern(id);
+  }
+
+  /// Ask Storage for an intact earlier version of one flattened pattern and
+  /// write it back if the copy it finds is whole. A snapshot that is missing
+  /// the entry, or holds a copy damaged the same way, leaves the marker in
+  /// place: the reviewer can see the gap and rewrite the pattern.
+  void recover_pattern(const std::string& id) {
+    request("@Storage", "getPrevious", {{"key", ENTRY_KEY_PREFIX + id}},
+            [this, id](const Result& res) {
+              auto it = entries_.find(id);
+              if (it == entries_.end()) return;
+              Entry& e = it->second;
+
+              const json& prev = res.payload;
+              if (!res.ok || !prev.is_object() || !prev.contains("content") ||
+                  !prev["content"].is_string()) {
+                log(LogLevel::Warn, "Pattern \"" + e.title +
+                                        "\" was flattened and no snapshot still holds it");
+                return;
+              }
+              const auto p = kbpat::read(prev["content"].get<std::string>(), e.title);
+              if (!p || kbpat::is_flattened(*p)) {
+                log(LogLevel::Warn, "Pattern \"" + e.title +
+                                        "\" was flattened before every surviving snapshot");
+                return;
+              }
+              e.content = p->to_json().dump();
+              e.updated_at = static_cast<int64_t>(now_ms());
+              index_.add(e.id, e.title, p->search_text(), e.tags);
+              save_entry(e);
+              changed("entryUpdated", e.to_presented_json());
+              log(LogLevel::Info,
+                  "Restored flattened pattern \"" + e.title + "\" from an earlier snapshot");
+            });
   }
 
   // ── Handlers ───────────────────────────────────────────────────────────
@@ -436,7 +532,7 @@ class KnowledgeBase final : public Object {
       touch(it->second);
       persist_entry(it->second);
       flush_sync(static_cast<int64_t>(now_ms()));
-      req.reply(it->second.to_json());
+      req.reply(it->second.to_presented_json());
     });
 
     on("forget", [this](Request& req) {
@@ -464,7 +560,7 @@ class KnowledgeBase final : public Object {
       std::vector<const Entry*> results = filtered_by_recency(type, {}, include_archived);
       if (results.size() > max) results.resize(max);
       json out = json::array();
-      for (const Entry* e : results) out.push_back(e->to_json());
+      for (const Entry* e : results) out.push_back(e->to_presented_json());
       req.reply(std::move(out));
     });
 
@@ -548,7 +644,7 @@ class KnowledgeBase final : public Object {
         if (re.id.empty()) continue;
         auto it = entries_.find(re.id);
         if (it == entries_.end() || re.updated_at > it->second.updated_at) {
-          index_.add(re.id, re.title, re.content, re.tags);
+          index_.add(re.id, re.title, index_text(re), re.tags);
           const std::string rid = re.id;
           entries_[rid] = std::move(re);
           persist_entry(entries_[rid]);
@@ -580,6 +676,12 @@ class KnowledgeBase final : public Object {
     std::string origin = str_or(p, "origin", "agent");
     if (!valid_origin(origin)) origin = "agent";
 
+    // Patterns are stored as structure whoever writes them. The reviewer
+    // sends structure already; an agent using the plain `remember` action
+    // sends whatever prose it composed, and that is structured here rather
+    // than left to drift into a shape nothing can read back.
+    const std::string body = (type == "pattern") ? structure_on_write(title, content) : content;
+
     const int64_t now = static_cast<int64_t>(now_ms());
 
     // Dedup by normalized title+type: update the existing entry if found. A
@@ -596,11 +698,11 @@ class KnowledgeBase final : public Object {
       existing = nullptr;
     }
     if (existing) {
-      existing->content = content;
+      existing->content = body;
       if (p.contains("tags")) existing->tags = tags;
       existing->archived = false;
       existing->updated_at = now;
-      index_.add(existing->id, existing->title, existing->content, existing->tags);
+      index_.add(existing->id, existing->title, index_text(*existing), existing->tags);
       save_entry(*existing);
       changed("entryUpdated", existing->to_json());
       log(LogLevel::Info, "Updated knowledge: \"" + title + "\" (" + type + ")");
@@ -612,7 +714,7 @@ class KnowledgeBase final : public Object {
     Entry e;
     e.id = gen_id();
     e.title = clip_utf8(title, 200);
-    e.content = content;
+    e.content = body;
     e.type = type;
     e.tags = std::move(tags);
     e.origin = std::move(origin);
@@ -625,7 +727,7 @@ class KnowledgeBase final : public Object {
     e.last_useful_at = 0;
     e.archived = false;
 
-    index_.add(e.id, e.title, e.content, e.tags);
+    index_.add(e.id, e.title, index_text(e), e.tags);
     json entry_json = e.to_json();
     const std::string id = e.id;
     entries_[id] = std::move(e);
@@ -694,7 +796,7 @@ class KnowledgeBase final : public Object {
         if (row.scored) preview["score"] = row.score;
         out.push_back(std::move(preview));
       } else {
-        json full = row.entry->to_json();
+        json full = row.entry->to_presented_json();
         full["snippet"] = row.snippet;
         if (row.scored) full["score"] = row.score;
         out.push_back(std::move(full));
@@ -728,7 +830,7 @@ class KnowledgeBase final : public Object {
     }
 
     // Breadth-first link expansion: a matched pattern pulls in the patterns
-    // its 'Links:' line names, so the language's structure (not just keyword
+    // its links name, so the language's structure (not just keyword
     // overlap) shapes the selection. Total output is capped so a densely
     // linked language can't flood the prompt.
     const size_t total_cap = max * 3;
@@ -737,7 +839,7 @@ class KnowledgeBase final : public Object {
     for (int64_t hop = 0; hop < max_hops && frontier_begin < selected.size(); hop++) {
       const size_t frontier_end = selected.size();
       for (size_t i = frontier_begin; i < frontier_end; i++) {
-        for (const auto& name : parse_pattern_links(selected[i].entry->content)) {
+        for (const auto& name : parse_pattern_links(selected[i].entry->content, selected[i].entry->title)) {
           Entry* linked = find_pattern_by_name(name);
           if (!linked) { dangling.insert(name); continue; }
           if (seen.count(linked->id) || selected.size() >= total_cap) continue;
@@ -755,7 +857,7 @@ class KnowledgeBase final : public Object {
       w.entry->access_count++;
       w.entry->last_accessed_at = now;
       persist_entry(*w.entry);
-      json full = w.entry->to_json();
+      json full = w.entry->to_presented_json();
       if (w.scored) {
         full["snippet"] = w.snippet;
         full["score"] = w.score;
@@ -820,7 +922,7 @@ class KnowledgeBase final : public Object {
       live.access_count++;
       live.last_accessed_at = now;
       persist_entry(live);
-      out.push_back(live.to_json());
+      out.push_back(live.to_presented_json());
     }
     flush_sync(now);
 
@@ -866,7 +968,7 @@ class KnowledgeBase final : public Object {
     }
     const int64_t now = static_cast<int64_t>(now_ms());
     e.updated_at = now;
-    index_.add(e.id, e.title, e.content, e.tags);
+    index_.add(e.id, e.title, index_text(e), e.tags);
     save_entry(e);
     changed("entryUpdated", e.to_json());
     log(LogLevel::Info, "Updated: \"" + e.title + "\"");

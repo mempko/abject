@@ -231,6 +231,7 @@ export * from './core/types.js';
 export * from './core/message.js';
 export * from './core/capability.js';
 export * from './core/contracts.js';
+export * from './core/pattern.js';
 export { validateCode, runSandboxed, compileSandboxed, SANDBOX_BUILTINS, SANDBOX_BUILTIN_NAMES, BLOCKED_CODE_PATTERNS } from './core/sandbox.js';
 export type { SandboxOptions } from './core/sandbox.js';
 export { formatManifestAsDescription } from './core/introspect.js';

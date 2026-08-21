@@ -27,11 +27,21 @@ import {
 } from '../core/contracts.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import {
+  readPattern, readStructured, serializePattern, renderPatternText, isStructuredPattern,
+  isFlattenedPattern, type PatternBody,
+} from '../core/pattern.js';
 
 const log = new Log('KNOWLEDGE-BASE');
 
 const KNOWLEDGE_BASE_INTERFACE = 'abjects:knowledge-base' as InterfaceId;
 const STORAGE_KEY = 'knowledge-base:entries';
+/**
+ * Per-entry Storage key. This implementation keeps entries in SQLite, but the
+ * native KnowledgeBase writes them through Storage under these keys, and both
+ * serve the same workspace store, so snapshots can hold either shape.
+ */
+const ENTRY_KEY_PREFIX = 'knowledge-base:entry:';
 
 /**
  * Tag marking a durable fact about the user (home location, name, role,
@@ -145,7 +155,7 @@ export class KnowledgeBase extends Abject {
             },
             {
               name: 'weave',
-              description: "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their 'Links: -> NAME' references to pull in linked patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
+              description: "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their links to pull in related patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
               parameters: [
                 { name: 'query', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal or task description to match pattern contexts against' },
                 { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max directly matched patterns (default 5)', optional: true },
@@ -438,6 +448,129 @@ export class KnowledgeBase extends Abject {
       const entry = this.rowToEntry(r);
       this.entries.set(entry.id, entry);
     }
+    void this.healPatterns();
+  }
+
+  /**
+   * Bring every pattern into the structured form, and put back the ones an
+   * older bug took apart. Runs once per store, at load.
+   *
+   * Two things were wrong with patterns before they had a structure. They
+   * were stored as prose and their sections recovered by matching headings,
+   * which failed the moment an agent wrote '## Context' where the matcher
+   * expected 'Context:'. And update_pattern rebuilt entries out of the
+   * sections it had recognized, so a pattern it could not read came back
+   * FLATTENED: everything gone but a single Evidence line.
+   *
+   * Conversion fixes the first. The second needs the text back, and the only
+   * place it still exists is the store's own older snapshots, so a flattened
+   * pattern is looked up there before being written.
+   *
+   * Entries already structured are skipped, and the snapshots are read only
+   * when something is actually flattened. Once a store is healed this costs
+   * one pass over memory and no disk at all.
+   */
+  private async healPatterns(): Promise<void> {
+    let converted = 0;
+    let restored = 0;
+    let unreadable = 0;
+    let lost = 0;
+
+    for (const entry of this.entries.values()) {
+      if (entry.type !== 'pattern' || isStructuredPattern(entry.content)) continue;
+      let pattern = readPattern(entry.content, entry.title);
+      if (!pattern) {
+        unreadable++;
+        log.warn(`Pattern "${entry.title}" could not be structured; left as written`);
+        continue;
+      }
+
+      if (isFlattenedPattern(pattern)) {
+        const recovered = await this.recoverPattern(entry);
+        if (recovered) {
+          pattern = recovered;
+          restored++;
+          log.info(`Restored flattened pattern "${entry.title}" from an earlier snapshot`);
+        } else {
+          lost++;
+          log.warn(`Pattern "${entry.title}" was flattened and no snapshot still holds it`);
+        }
+      }
+
+      entry.content = serializePattern(pattern);
+      entry.updatedAt = Date.now();
+      this.writeEntryToDb(entry);
+      converted++;
+    }
+
+    if (converted > 0) log.info(`Structured ${converted} pattern(s) written before the format existed`);
+    if (restored > 0) log.info(`Restored ${restored} pattern(s) damaged by the old update path`);
+    if (unreadable > 0) log.warn(`${unreadable} pattern(s) could not be structured`);
+    if (lost > 0) log.warn(`${lost} flattened pattern(s) could not be recovered`);
+    if (converted > 0) this.syncToSharedState();
+  }
+
+  /**
+   * An intact earlier version of one entry, from the store's own snapshots.
+   * Returns nothing when no snapshot has it, or when the copy found there is
+   * flattened too (the damage predates every surviving snapshot).
+   */
+  private async recoverPattern(entry: KnowledgeEntry): Promise<PatternBody | undefined> {
+    const storageId = await this.discoverDep('Storage');
+    if (!storageId) return undefined;
+    const previous = await this.request<unknown>(
+      request(this.id, storageId, 'getPrevious', { key: `${ENTRY_KEY_PREFIX}${entry.id}` }),
+      10000,
+    ).catch(() => null);
+
+    const fromKey = this.patternFromRecord(previous, entry.title);
+    if (fromKey) return fromKey;
+
+    // Older stores kept every entry in one array under a single key.
+    const legacy = await this.request<unknown>(
+      request(this.id, storageId, 'getPrevious', { key: STORAGE_KEY }),
+      10000,
+    ).catch(() => null);
+    if (!Array.isArray(legacy)) return undefined;
+    const match = legacy.find(
+      (e): e is { id?: unknown; content?: unknown } =>
+        !!e && typeof e === 'object' && (e as { id?: unknown }).id === entry.id,
+    );
+    return this.patternFromRecord(match, entry.title);
+  }
+
+  /** An intact pattern out of a stored record, or nothing if it is damaged too. */
+  private patternFromRecord(record: unknown, title: string): PatternBody | undefined {
+    const stored = record as { content?: unknown } | null | undefined;
+    if (!stored || typeof stored.content !== 'string') return undefined;
+    const pattern = readPattern(stored.content, title);
+    return pattern && !isFlattenedPattern(pattern) ? pattern : undefined;
+  }
+
+  /**
+   * Force a pattern body into the structured form at write time.
+   *
+   * Any agent can save an entry of type 'pattern' through the plain
+   * `remember` action, and those arrive as freehand prose. Converting on the
+   * way in means the store holds one shape, so nothing downstream has to
+   * guess how a given pattern was written. Prose that cannot be read as a
+   * pattern is stored as-is; refusing the write would lose it entirely.
+   */
+  private structureOnWrite(title: string, content: string): string {
+    if (isStructuredPattern(content)) return content;
+    const pattern = readPattern(content, title);
+    if (!pattern) {
+      log.warn(`Pattern "${title}" could not be structured on write; stored as written`);
+      return content;
+    }
+    return serializePattern(pattern);
+  }
+
+  private present(entry: KnowledgeEntry): KnowledgeEntry {
+    if (entry.type !== 'pattern') return entry;
+    const pattern = readStructured(entry.content);
+    if (!pattern) return entry;
+    return { ...entry, content: renderPatternText(pattern) };
   }
 
   private rowToEntry(r: Record<string, unknown>): KnowledgeEntry {
@@ -623,7 +756,7 @@ Search, read the previews, and refine: when results are thin, reformulate with d
     tags: ['ui', 'preferences'],
   });
 
-Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries: Context / Forces / Therefore sections with 'Links: -> NAME' cross-references; usually authored by the post-goal reviewer)
+Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries, written through the reviewer's save_pattern/update_pattern actions rather than composed by hand: each names the context it applies to, the forces in tension, what to do therefore, the evidence behind it, and the patterns it links to)
 
 ### Weave patterns for a goal
 
@@ -694,6 +827,12 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const entryOrigin: KnowledgeOrigin =
         origin && KNOWLEDGE_ORIGINS.includes(origin) ? origin : 'agent';
 
+      // Patterns are stored as structure whoever writes them. The reviewer
+      // sends structure already; an agent using the plain `remember` action
+      // sends whatever prose it composed, and that is structured here rather
+      // than left to drift into a shape nothing can read back.
+      const body = type === 'pattern' ? this.structureOnWrite(title, content) : content;
+
       // Dedup by normalized title+type: update existing if found. A
       // re-remembered archived entry revives; its origin is preserved so a
       // reviewer refresh can never downgrade a user-authored entry.
@@ -706,7 +845,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (existing && existing.origin === 'user' && entryOrigin !== 'user') {
         log.info(`Remember: title collides with user entry "${existing.title}"; creating separate ${entryOrigin} entry`);
       } else if (existing) {
-        existing.content = content;
+        existing.content = body;
         existing.tags = tags ?? existing.tags;
         existing.archived = false;
         existing.updatedAt = Date.now();
@@ -720,7 +859,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const entry: KnowledgeEntry = {
         id: uuidv4(),
         title: title.slice(0, 200),
-        content,
+        content: body,
         type,
         tags: tags ?? [],
         origin: entryOrigin,
@@ -760,9 +899,10 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
           if (!entry || entry.archived) continue;
           if (type && entry.type !== type) continue;
           if (tags?.length && !tags.some(t => entry.tags.includes(t))) continue;
+          const shown = this.present(entry);
           results.push({
-            ...entry,
-            snippet: r.snippet ?? entry.content.slice(0, 160),
+            ...shown,
+            snippet: r.snippet ?? shown.content.slice(0, 160),
             score: r.score,
           });
           if (results.length >= max) break;
@@ -777,7 +917,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
             return true;
           })
           .sort((a, b) => b.updatedAt - a.updatedAt)
-          .slice(0, max);
+          .slice(0, max)
+          .map(e => this.present(e));
       }
 
       // Bump access counts
@@ -823,13 +964,13 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       for (const r of ranked) {
         const entry = this.entries.get(r.id);
         if (!entry || entry.archived || entry.type !== 'pattern') continue;
-        selected.push({ ...entry, snippet: r.snippet, score: r.score, via: 'matched' });
+        selected.push({ ...this.present(entry), snippet: r.snippet, score: r.score, via: 'matched' });
         seen.add(entry.id);
         if (selected.length >= max) break;
       }
 
       // Breadth-first link expansion: a matched pattern pulls in the
-      // patterns its 'Links:' line names, so the language's structure
+      // patterns its links name, so the language's structure
       // (not just keyword overlap) shapes the selection. Total output is
       // capped so a densely linked language can't flood the prompt.
       const totalCap = max * 3;
@@ -845,7 +986,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
               continue;
             }
             if (seen.has(linked.id) || selected.length >= totalCap) continue;
-            const woven: WovenPattern = { ...linked, via: `linked-from: ${pattern.title}` };
+            const woven: WovenPattern = { ...this.present(linked), via: `linked-from: ${pattern.title}` };
             selected.push(woven);
             seen.add(linked.id);
             next.push(woven);
@@ -898,7 +1039,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       }
 
       log.info(`Match "${pattern}" => ${results.length} entries`);
-      return results;
+      return results.map(e => this.present(e));
     });
 
     this.on('get', async (msg: AbjectMessage) => {
@@ -909,7 +1050,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       entry.accessCount++;
       entry.lastAccessedAt = Date.now();
       this.bumpAccessInDb(entry);
-      return entry;
+      return this.present(entry);
     });
 
     this.on('forget', async (msg: AbjectMessage) => {
@@ -968,7 +1109,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       return [...this.entries.values()]
         .filter(e => (includeArchived || !e.archived) && (!type || e.type === type))
         .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, max);
+        .slice(0, max)
+        .map(e => this.present(e));
     });
 
     this.on('listTags', async (msg: AbjectMessage) => {
@@ -1065,16 +1207,14 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
   }
 
   /**
-   * Parse pattern link names from a pattern body's 'Links:' line, the
-   * '-> NAME, OTHER NAME' convention. Names resolve by normalized title.
+   * A pattern's links, read straight off the structure.
+   *
+   * This used to hunt for a 'Links:' line in prose, so the links of every
+   * pattern that wrote them as a '## Links' block were invisible and the
+   * weave quietly stopped expanding through them.
    */
   private parsePatternLinks(content: string): string[] {
-    const line = content.match(/^\s*Links:\s*(.+)$/mi)?.[1];
-    if (!line) return [];
-    return line
-      .split(',')
-      .map(name => name.replace(/->/g, '').trim())
-      .filter(name => name.length > 0);
+    return readPattern(content)?.links ?? [];
   }
 
   /** Resolve a link name to an active pattern entry by normalized title. */

@@ -10,7 +10,7 @@
  * titles).
  *
  * Pattern entries get link navigation: the detail pane renders the
- * pattern's 'Links: -> NAME' references as clickable chips (click opens
+ * pattern's links as clickable chips (click opens
  * the linked pattern), names with no written pattern yet as dimmed
  * "unwritten" labels, and a reverse "Linked from" row of the patterns
  * whose Links name this one.
@@ -21,6 +21,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
 import type { ListItem } from './widgets/list-widget.js';
 
@@ -688,7 +689,7 @@ export class KnowledgeBrowser extends Abject {
         style: { visible: entry.archived },
       })),
       this.request(request(this.id, this.contentLabelId!, 'update', {
-        text: entry.content,
+        text: this.displayContent(entry),
         style: { visible: true },
       })),
     ]);
@@ -703,14 +704,25 @@ export class KnowledgeBrowser extends Abject {
     return title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   }
 
-  /** Parse pattern link names from a pattern body's 'Links: -> NAME, OTHER' line. */
+  /**
+   * A pattern's links, off its structure. The browser used to hunt for a
+   * 'Links:' line here, so patterns that wrote their links as a '## Links'
+   * block drew as isolated nodes in the graph even though they were linked.
+   */
   private parsePatternLinks(content: string): string[] {
-    const line = content.match(/^\s*Links:\s*(.+)$/mi)?.[1];
-    if (!line) return [];
-    return line
-      .split(',')
-      .map(name => name.replace(/->/g, '').trim())
-      .filter(name => name.length > 0);
+    return readPattern(content)?.links ?? [];
+  }
+
+  /**
+   * Patterns are stored as structure. The KnowledgeBase renders them before
+   * handing them out, so this normally receives prose already; it renders
+   * anyway, because an entry can also arrive raw over cross-peer sync and a
+   * wall of JSON is not what the detail pane is for.
+   */
+  private displayContent(entry: { type: string; content: string; title: string }): string {
+    if (entry.type !== 'pattern') return entry.content;
+    const pattern = readStructured(entry.content);
+    return pattern ? renderPatternText(pattern) : entry.content;
   }
 
   private async clearLinkRows(): Promise<void> {
@@ -729,7 +741,7 @@ export class KnowledgeBrowser extends Abject {
 
   /**
    * Render the selected pattern's language neighborhood: its outgoing
-   * 'Links:' names as clickable chips (dimmed "unwritten" when no pattern
+   * link names as clickable chips (dimmed "unwritten" when no pattern
    * has that title yet) and a reverse row of patterns whose Links name it.
    * Non-pattern entries just clear the rows.
    */

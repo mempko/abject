@@ -101,6 +101,25 @@ export class Storage extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'getPrevious',
+                description:
+                  "A key's value from the newest surviving snapshot of the store that still holds it, or null when no snapshot does. Backends that keep no snapshots always answer null. Used to recover a value that a later write damaged.",
+                parameters: [
+                  {
+                    name: 'key',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Storage key',
+                  },
+                ],
+                returns: {
+                  kind: 'union',
+                  variants: [
+                    { kind: 'reference', reference: 'any' },
+                    { kind: 'primitive', primitive: 'null' },
+                  ],
+                },
+              },
+              {
                 name: 'keys',
                 description: 'List all keys',
                 parameters: [],
@@ -155,6 +174,11 @@ export class Storage extends Abject {
       return this.hasKey(key);
     });
 
+    this.on('getPrevious', async (msg: AbjectMessage) => {
+      const { key } = msg.payload as { key: string };
+      return this.getPreviousValue(key);
+    });
+
     this.on('keys', async () => {
       return this.getKeys();
     });
@@ -196,6 +220,18 @@ export class Storage extends Abject {
         }
       };
     });
+  }
+
+  /**
+   * A key's value from the newest surviving snapshot of the store.
+   *
+   * Backends that keep snapshots (the Node one keeps the JSON files it grew
+   * out of) can answer this; the rest have nothing older to offer and say
+   * so. It exists because a store with no history cannot recover a value
+   * that a later write damaged, and the knowledge base needed exactly that.
+   */
+  async getPreviousValue(_key: string): Promise<unknown> {
+    return null;
   }
 
   /**

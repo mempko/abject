@@ -12,7 +12,7 @@
  * execution record (ScrumMaster's scrum/plan scratchpad entry) and, when a
  * recurring shape emerges, the reviewer grows the workspace's generative
  * pattern language (KnowledgeBase entries of type 'pattern' with
- * Context/Forces/Therefore sections and 'Links: -> NAME' cross-references)
+ * named Context/Forces/Therefore sections and links to related patterns)
  * via the save_pattern / update_pattern actions. ScrumMaster records what
  * happened; this object decides what it means.
  *
@@ -37,6 +37,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
+import { makePattern, readPattern, serializePattern, PATTERN_FIELDS } from '../core/pattern.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
 
@@ -722,98 +723,53 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   /**
-   * Assemble the canonical pattern body from structured fields. Format
-   * consistency is by construction: the reviewer LLM supplies section
-   * texts, never raw markdown, so every pattern in the store parses the
-   * same way (including the 'Links: -> NAME' line the weave follows).
-   */
-  private buildPatternContent(f: {
-    context?: string; forces?: string; therefore?: string;
-    contract?: string; program?: string; resultingContext?: string;
-    evidence?: string; links?: string[];
-  }): string {
-    const parts: string[] = [];
-    if (f.context?.trim()) parts.push(`Context: ${f.context.trim()}`);
-    if (f.forces?.trim()) parts.push(`Forces: ${f.forces.trim()}`);
-    if (f.therefore?.trim()) parts.push(`Therefore: ${f.therefore.trim()}`);
-    if (f.contract?.trim()) parts.push(`Contract:\n${f.contract.trim()}`);
-    if (f.program?.trim()) parts.push(`Program:\n${f.program.trim()}`);
-    if (f.resultingContext?.trim()) parts.push(`Resulting context: ${f.resultingContext.trim()}`);
-    parts.push(`Evidence: ${f.evidence?.trim() || 'forming (1 goal)'}`);
-    const links = (f.links ?? []).filter(l => l.trim().length > 0);
-    if (links.length > 0) parts.push(`Links: -> ${links.join(', ')}`);
-    return parts.join('\n\n');
-  }
-
-  /** Split a stored pattern body back into its sections for section-merge updates. */
-  private parsePatternSections(content: string): Record<string, string> {
-    const sections: Record<string, string> = {};
-    let current: string | undefined;
-    let buf: string[] = [];
-    const flush = () => {
-      if (current) sections[current] = buf.join('\n').trim();
-      buf = [];
-    };
-    for (const line of content.split('\n')) {
-      const m = line.match(/^\s*(Context|Forces|Therefore|Contract|Program|Resulting context|Evidence|Links):\s*(.*)$/i);
-      if (m) {
-        flush();
-        current = m[1].toLowerCase();
-        buf = m[2] ? [m[2]] : [];
-      } else if (current) {
-        buf.push(line);
-      }
-    }
-    flush();
-    return sections;
-  }
-
-  /**
-   * Add a pattern to the workspace's pattern language. The title is the
-   * pattern's NAME (capitalized by convention; link resolution is
+   * Add a pattern to the workspace's pattern language.
+   *
+   * The reviewer supplies named fields and nothing else; the body is built
+   * and stored as structure, so there is no format for a caller to get
+   * wrong. The title is the pattern's NAME (link resolution is
    * case-insensitive), and remember's title+type dedup means re-saving a
    * name evolves the existing pattern rather than forking it.
    */
   private async savePattern(action: AgentAction): Promise<string> {
-    const name = ((action.name as string) ?? '').trim();
-    const context = action.context as string;
-    const forces = action.forces as string;
-    const therefore = action.therefore as string;
-    precondition(!!name && !!context && !!forces && !!therefore,
-      'save_pattern requires "name", "context", "forces", and "therefore"');
-
-    const links = Array.isArray(action.links)
-      ? (action.links as string[]).filter(l => typeof l === 'string' && l.trim().length > 0)
-      : [];
-    const content = this.buildPatternContent({
-      context, forces, therefore,
-      contract: action.contract as string | undefined,
-      program: action.program as string | undefined,
-      resultingContext: action.resultingContext as string | undefined,
-      evidence: action.evidence as string | undefined,
-      links,
+    const built = makePattern({
+      name: action.name,
+      aliases: action.aliases,
+      context: action.context,
+      problem: action.problem,
+      forces: action.forces,
+      therefore: action.therefore,
+      contract: action.contract,
+      program: action.program,
+      resultingContext: action.resultingContext,
+      consequences: action.consequences,
+      appliesTo: action.appliesTo,
+      evidence: (action.evidence as string | undefined)?.trim() || 'forming (1 goal)',
+      links: action.links,
     });
+    if (!built.ok) throw new Error(`save_pattern: ${built.error}`);
+
     const domainTags = Array.isArray(action.tags)
       ? (action.tags as string[]).filter(t => typeof t === 'string' && t !== 'pattern')
       : [];
 
     const res = await this.request<{ id: string }>(
       request(this.id, this.knowledgeBaseId!, 'remember', {
-        title: name.toUpperCase(),
-        content,
+        title: built.pattern.name,
+        content: serializePattern(built.pattern),
         type: 'pattern',
         tags: ['pattern', ...domainTags],
         origin: 'reviewer',
       }),
       10000,
     );
-    return `Saved pattern "${name.toUpperCase()}" (${res.id})`;
+    return `Saved pattern "${built.pattern.name}" (${res.id})`;
   }
 
   /**
-   * Section-merge update of an existing pattern: only the supplied sections
-   * change, addLinks extends (never replaces) the Links line, and the body
-   * is reassembled in canonical form.
+   * Revise a pattern field by field. Fields the caller omits keep what they
+   * held, which is the whole point: an update meaning to refresh one
+   * Evidence line must not take the Context, Forces and Therefore with it.
    */
   private async updatePattern(action: AgentAction): Promise<string> {
     const id = action.id as string;
@@ -830,37 +786,32 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       throw new Error(`Entry ${id} is type '${entry.type}', not a pattern; use update_entry`);
     }
 
-    const sections = this.parsePatternSections(entry.content);
-    for (const key of ['context', 'forces', 'therefore', 'contract', 'program', 'evidence'] as const) {
-      const value = action[key];
-      if (typeof value === 'string' && value.trim()) sections[key] = value.trim();
-    }
-    const resulting = action.resultingContext;
-    if (typeof resulting === 'string' && resulting.trim()) sections['resulting context'] = resulting.trim();
+    const stored = readPattern(entry.content, entry.title);
+    if (!stored) throw new Error(`Pattern ${id} ("${entry.title}") could not be read (nothing was changed)`);
 
-    const links = (sections['links'] ?? '')
-      .split(',')
-      .map(l => l.replace(/->/g, '').trim())
-      .filter(l => l.length > 0);
+    const merged: Record<string, unknown> = { ...stored, name: entry.title };
+    for (const field of PATTERN_FIELDS) {
+      const value = action[field];
+      if (typeof value === 'string' && value.trim()) merged[field] = value.trim();
+    }
+
+    const links = [...stored.links];
     const addLinks = Array.isArray(action.addLinks)
       ? (action.addLinks as string[]).map(l => String(l).trim()).filter(l => l.length > 0)
       : [];
     for (const link of addLinks) {
       if (!links.some(l => l.toLowerCase() === link.toLowerCase())) links.push(link);
     }
+    merged.links = links;
 
-    const content = this.buildPatternContent({
-      context: sections['context'],
-      forces: sections['forces'],
-      therefore: sections['therefore'],
-      contract: sections['contract'],
-      program: sections['program'],
-      resultingContext: sections['resulting context'],
-      evidence: sections['evidence'],
-      links,
-    });
+    const built = makePattern(merged);
+    if (!built.ok) throw new Error(`update_pattern: ${built.error} (nothing was changed)`);
+
     const res = await this.request<{ success: boolean; error?: string }>(
-      request(this.id, this.knowledgeBaseId!, 'update', { id, content }),
+      request(this.id, this.knowledgeBaseId!, 'update', {
+        id,
+        content: serializePattern(built.pattern),
+      }),
       10000,
     );
     if (!res.success) throw new Error(res.error ?? 'update failed');
@@ -983,8 +934,8 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
 | forget_entry | id | Remove an entry this transcript proves wrong |
-| save_pattern | name, context, forces, therefore, contract?, program?, resultingContext?, evidence?, links?, tags? | Add a pattern to the workspace's pattern language |
-| update_pattern | id, context?, forces?, therefore?, contract?, program?, resultingContext?, evidence?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
+| save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
+| update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
 | done | result | Finish with a one-line summary of what you recorded |
 | fail | reason | The material was unreviewable |
@@ -1022,8 +973,8 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | recall_knowledge | query | Inspect entries on a topic more closely |
 | merge_entries | title, content, type?, tags?, absorbedIds | Replace 2+ narrow near-duplicates with one umbrella entry; the absorbed entries are archived (restorable) |
 | update_entry | id, content?, title?, tags? | Sharpen a single entry's wording or tags |
-| save_pattern | name, context, forces, therefore, contract?, program?, resultingContext?, evidence?, links?, tags? | Write a pattern (e.g. promote ripe candidate-pattern lessons, or fulfill a dangling link) |
-| update_pattern | id, context?, forces?, therefore?, contract?, program?, resultingContext?, evidence?, addLinks? | Revise a pattern's sections or extend its links |
+| save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Write a pattern (e.g. promote ripe candidate-pattern lessons, or fulfill a dangling link) |
+| update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Revise a pattern's sections or extend its links |
 | archive_entry | id | Archive an entry that is stale or too narrow to help future tasks |
 | forget_entry | id | Delete an entry that is factually wrong |
 | done | result | Finish with a one-line summary of the pass |
@@ -1032,7 +983,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 - **Merge by topic, keep the substance.** When several entries cover one theme (e.g. three lessons about the same tool), write one umbrella entry that preserves every distinct fact, and list ALL of their ids in absorbedIds. The merge is fail-closed: it applies only when every absorbed id checks out, so list them precisely.
 - **Archive, keep delete for falsehoods.** archive_entry hides an entry but keeps it restorable in the browser; forget_entry is only for entries that are wrong.
 - **Entries with useful counts have proven themselves**: prefer merging them INTO umbrellas over archiving them away.
-- **Garden the pattern language.** Entries of type 'pattern' are Alexander/Coplien-style patterns: Context/Forces/Therefore anatomy with 'Links: -> NAME' cross-references, forming a generative language rather than a list of tips. Merge patterns whose contexts have converged into one (merge_entries, then update_pattern the survivor's links); update_pattern one whose context has drifted or split; repair links that name a retitled pattern; and when a dangling link's territory is covered by ripe candidate-pattern lessons, write the missing pattern with save_pattern. A connected language beats a bag of isolated aphorisms.
+- **Garden the pattern language.** Entries of type 'pattern' are Alexander/Coplien-style patterns: Context/Forces/Therefore anatomy with links to related patterns, forming a generative language rather than a list of tips. Merge patterns whose contexts have converged into one (merge_entries, then update_pattern the survivor's links); update_pattern one whose context has drifted or split; repair links that name a retitled pattern; and when a dangling link's territory is covered by ripe candidate-pattern lessons, write the missing pattern with save_pattern. A connected language beats a bag of isolated aphorisms.
 - **A light pass is a good pass.** When the store is already tidy, finish early with done; changing little is the expected outcome.
 
 Work in at most a handful of actions, then done.`;
