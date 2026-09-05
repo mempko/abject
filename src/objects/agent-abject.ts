@@ -21,7 +21,6 @@ import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
 import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
 import type { TierCapabilities } from './llm-object.js';
-import type { EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('AgentAbject');
@@ -356,8 +355,6 @@ interface TaskEntry {
   goalId?: string;
   /** Set when task came from dispatch (the parent goal). */
   incomingGoalId?: string;
-  /** Cached skill instructions appended to system prompt. */
-  skillPromptSuffix?: string;
   /**
    * KnowledgeBase entries injected into this task's system prompt at init.
    * The post-task reviewer reads these to judge which entries actually
@@ -530,7 +527,11 @@ const DEFAULT_CONFIG: ResolvedAgentConfig = {
   maxConcurrentTasks: 3,
   timeout: 300000,
   pinnedMessageCount: 2,
-  maxConversationMessages: 32,
+  // A runaway guard, not the trimming policy. Trimming is driven by the byte
+  // budget (MAX_CONVERSATION_CHARS): dropping messages by count invalidated
+  // the cached prefix on conversations that were nowhere near the budget, and
+  // the whole point of the stable/volatile split is that the prefix survives.
+  maxConversationMessages: 200,
   queueName: undefined,
   directExecution: false,
   skipFirstObservation: false,
@@ -1367,24 +1368,6 @@ The registered object must implement these handlers to participate in the agent 
         goalId,
         dispatchTupleId,
       };
-
-      // Pre-fetch enabled skill instructions for prompt injection
-      try {
-        const skillRegistryId = await this.discoverDep('SkillRegistry');
-        if (skillRegistryId) {
-          const skills = await this.request<EnabledSkillSummary[]>(
-            request(this.id, skillRegistryId, 'getEnabledSkills', {}),
-          );
-          if (skills.length > 0) {
-            let suffix = '\n\n## Available Skills\n';
-            for (const skill of skills) {
-              suffix += `### ${skill.name}\n${skill.description}\n`;
-              suffix += skill.instructions + '\n\n';
-            }
-            entry.skillPromptSuffix = suffix;
-          }
-        }
-      } catch { /* SkillRegistry not available, continue without skills */ }
 
       this.taskEntries.set(taskId, entry);
 
@@ -3575,9 +3558,6 @@ The preview often answers the question on its own — when it does, just act.`, 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
     add('task-prompt', entry.taskPrompt, false);
-    // Skill instructions belong to whichever skill this task runs, so they
-    // vary between tasks of the same agent.
-    add('skill', entry.skillPromptSuffix, false);
     if (entry.responseSchema) {
       add('response-schema', `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`, false);
     }
@@ -4182,9 +4162,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private static readonly KEEP_RECENT_MESSAGES = 4;
   /** Per-observation cap applied at ingestion (head+tail slice). */
   private static readonly MAX_OBSERVATION_CHARS = 60000;
-  /** Floor below which the budget enforcer stops shrinking a message. With
-   *  maxConversationMessages=32, 32 × 4k = 128k < MAX_CONVERSATION_CHARS, so
-   *  enforcement always converges. */
+  /** Floor below which the budget enforcer stops shrinking a message. The
+   *  byte path collapses the middle of the conversation to one summary first
+   *  (compress keeps pinned + KEEP_RECENT_MESSAGES), so what the enforcer sees
+   *  is a handful of messages and 4k each is far under the budget. */
   private static readonly TRUNCATION_FLOOR_CHARS = 4000;
 
   private async trimConversation(entry: TaskEntry): Promise<void> {

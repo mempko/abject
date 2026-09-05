@@ -53,25 +53,70 @@ function lineOf(content: string, offset: number): number {
 }
 
 /**
- * The closest single line to a failed search, so "not found" points somewhere
- * instead of just saying no. Cheap heuristic: the line sharing the longest
- * common prefix with the search text's first line.
+ * Where a failed search probably meant to land, so "not found" points
+ * somewhere the caller can act on without re-reading the file.
+ *
+ * Two questions, in order. Does the text match once whitespace runs are
+ * collapsed? Then the miss is indentation or spacing, and the hint says so
+ * with the line. Otherwise, which line most resembles the search's first
+ * non-empty line? Similarity is the share of the search line's tokens that
+ * appear in the candidate, ties broken by longest common prefix, and the hint
+ * shows that line with a little context and line numbers. The caller's next
+ * edit can quote the region verbatim instead of spending a read step.
  */
-function closestLineHint(content: string, oldText: string): string | undefined {
-  const needle = oldText.split('\n')[0].trim();
-  if (needle.length < 4) return undefined;
+function closestRegionHint(content: string, oldText: string): string | undefined {
   const lines = content.split('\n');
+  const searchLines = oldText.split('\n');
+  const firstMeaningful = searchLines.find(l => l.trim().length >= 4);
+  if (!firstMeaningful) return undefined;
+
+  // Whitespace-only miss: the same text with spacing normalized occurs once.
+  const collapse = (t: string): string => t.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim();
+  const normalizedNeedle = collapse(oldText);
+  if (normalizedNeedle.length >= 8) {
+    const normalizedContent = collapse(content);
+    const at = normalizedContent.indexOf(normalizedNeedle);
+    if (at !== -1 && normalizedContent.indexOf(normalizedNeedle, at + 1) === -1) {
+      // Locate the line by matching the first search line loosely.
+      const needleFirst = collapse(firstMeaningful);
+      const lineIdx = lines.findIndex(l => collapse(l) === needleFirst);
+      const where = lineIdx >= 0 ? ` near line ${lineIdx + 1}` : '';
+      return `the text is present${where} but differs only in whitespace/indentation — copy the exact spacing from the file`;
+    }
+  }
+
+  const needle = firstMeaningful.trim();
+  const needleTokens = new Set(needle.split(/[^A-Za-z0-9_$]+/).filter(t => t.length >= 2));
   let bestScore = 0;
+  let bestPrefix = 0;
   let bestLine = -1;
   for (let i = 0; i < lines.length; i++) {
     const candidate = lines[i].trim();
-    let score = 0;
-    while (score < needle.length && score < candidate.length && needle[score] === candidate[score]) score++;
-    if (score > bestScore) { bestScore = score; bestLine = i; }
+    if (candidate.length === 0) continue;
+    let prefix = 0;
+    while (prefix < needle.length && prefix < candidate.length && needle[prefix] === candidate[prefix]) prefix++;
+    let overlap = 0;
+    if (needleTokens.size > 0) {
+      const candidateTokens = new Set(candidate.split(/[^A-Za-z0-9_$]+/).filter(t => t.length >= 2));
+      for (const t of needleTokens) if (candidateTokens.has(t)) overlap++;
+    }
+    const score = needleTokens.size > 0 ? overlap / needleTokens.size : 0;
+    if (score > bestScore || (score === bestScore && prefix > bestPrefix)) {
+      bestScore = score;
+      bestPrefix = prefix;
+      bestLine = i;
+    }
   }
-  // Require a real prefix overlap before claiming a hint.
-  if (bestLine < 0 || bestScore < Math.max(6, needle.length / 3)) return undefined;
-  return `closest line is ${bestLine + 1}: ${lines[bestLine].trim().slice(0, 120)}`;
+  // Require a real resemblance before claiming a hint.
+  if (bestLine < 0 || (bestScore < 0.5 && bestPrefix < Math.max(6, needle.length / 3))) return undefined;
+
+  const from = Math.max(0, bestLine - 2);
+  const to = Math.min(lines.length - 1, bestLine + Math.max(2, searchLines.length));
+  const region = [];
+  for (let i = from; i <= to; i++) {
+    region.push(`${String(i + 1).padStart(5)}| ${lines[i].slice(0, 160)}`);
+  }
+  return `closest match is around line ${bestLine + 1}:\n${region.join('\n')}`;
 }
 
 /** Render one replacement as a diff hunk with a little context. */
@@ -131,7 +176,7 @@ export function applyEdits(original: string, edits: readonly FileEdit[]): ApplyE
       failures.push({
         index, oldText: edit.oldText, reason: 'not-found',
         message: `edits[${index}].oldText was not found in the file`,
-        hint: closestLineHint(original, edit.oldText),
+        hint: closestRegionHint(original, edit.oldText),
       });
       return;
     }
@@ -195,6 +240,6 @@ export function applyEdits(original: string, edits: readonly FileEdit[]): ApplyE
 /** One-line-per-failure rendering, for handing straight back to an agent. */
 export function formatEditFailures(failures: readonly EditFailure[]): string {
   return failures
-    .map(f => (f.hint ? `${f.message} (${f.hint})` : f.message))
+    .map(f => (f.hint ? `${f.message}. ${f.hint}` : f.message))
     .join('\n');
 }

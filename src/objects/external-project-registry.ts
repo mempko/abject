@@ -132,12 +132,32 @@ function isAutonomy(v: unknown): v is AutonomyLevel {
   return typeof v === 'string' && (AUTONOMY_LEVELS as string[]).includes(v);
 }
 
+/** A task currently working in a project, as its siblings see it. */
+export interface ActiveTask {
+  taskId: string;
+  goalId?: string;
+  description?: string;
+  /** Project-relative paths the task has written so far. */
+  files: string[];
+  startedAt: number;
+  lastSeenAt: number;
+}
+
 export const EXTERNAL_PROJECT_REGISTRY_ID = 'abjects:external-project-registry' as AbjectId;
 
 export class ExternalProjectRegistry extends Abject {
   private storageId?: AbjectId;
   private hostFsId?: AbjectId;
   private projects = new Map<string, ExternalProject>();
+  /**
+   * Who is working where right now. In memory only: a task that outlives the
+   * process is not working any more. Several tasks may run in one project at
+   * once (a scrum round stages them that way); this is what lets each of them
+   * see the others, and it is the whole of the coordination — no lock.
+   */
+  private activeTasks = new Map<string, Map<string, ActiveTask>>();
+  /** A task that has said nothing for this long is presumed gone. */
+  private static readonly ACTIVE_TASK_TTL_MS = 2 * 60 * 60_000;
 
   constructor() {
     super({
@@ -255,9 +275,48 @@ export class ExternalProjectRegistry extends Abject {
               ],
               returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
             },
+            {
+              name: 'taskStarted',
+              description: 'An agent began a task in a project. Several tasks may work in one project at once; this is how they learn of each other.',
+              parameters: [
+                { name: 'project', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'The task' },
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal the task belongs to', optional: true },
+                { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'What the task is doing', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'filesTouched',
+              description: 'A running task has written these project-relative paths so far',
+              parameters: [
+                { name: 'project', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'The task' },
+                { name: 'files', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Project-relative paths' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'taskFinished',
+              description: 'A task in a project ended (any outcome)',
+              parameters: [
+                { name: 'project', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'The task' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'activeTasks',
+              description: 'Tasks currently working in a project: [{ taskId, goalId, description, files, startedAt }]',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Project handle' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'object' } },
+            },
           ],
           events: [
             { name: 'projectsChanged', description: 'The set of registered projects changed', payload: { kind: 'object' } },
+            { name: 'activeTasksChanged', description: 'The set of tasks working in a project changed', payload: { kind: 'object' } },
           ],
         },
         requiredCapabilities: [],
@@ -314,6 +373,11 @@ ${list || '(none registered yet)'}
 \`addProject({ name, root, description?, checkCommand?, verifyCommand?, protectedPaths?, isolation?, trusted? })\`
 \`root\` is the absolute path; \`path\` is accepted as an alias for it. Whether the
 directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
+
+### Who is working where
+Several tasks may work in one project at once. \`activeTasks({ name })\` lists them
+with the files each has written so far; agents report through \`taskStarted\`,
+\`filesTouched\`, and \`taskFinished\`. This is awareness, not a lock.
 
 ### Answering questions
 - "which project is X?" → resolveProject accepts a handle or any path inside one.
@@ -437,6 +501,65 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
       const p = this.projects.get(name);
       return [...ALWAYS_PROTECTED, ...(p?.protectedPaths ?? [])];
     });
+
+    // ── Who is working where ──
+    this.on('taskStarted', async (msg: AbjectMessage) => {
+      const { project, taskId, goalId, description } = msg.payload as {
+        project: string; taskId: string; goalId?: string; description?: string;
+      };
+      requireNonEmpty(project, 'project');
+      requireNonEmpty(taskId, 'taskId');
+      const now = Date.now();
+      this.tasksFor(project).set(taskId, {
+        taskId, goalId, description: description?.slice(0, 200), files: [], startedAt: now, lastSeenAt: now,
+      });
+      this.changed('activeTasksChanged', { project, tasks: this.listActive(project) });
+      return { success: true };
+    });
+
+    this.on('filesTouched', async (msg: AbjectMessage) => {
+      const { project, taskId, files } = msg.payload as { project: string; taskId: string; files: string[] };
+      requireNonEmpty(project, 'project');
+      requireNonEmpty(taskId, 'taskId');
+      const t = this.tasksFor(project).get(taskId);
+      if (!t) return { success: false, error: 'unknown task' };
+      const seen = new Set(t.files);
+      for (const f of Array.isArray(files) ? files : []) {
+        if (typeof f === 'string' && f && !seen.has(f)) { seen.add(f); t.files.push(f); }
+      }
+      t.lastSeenAt = Date.now();
+      this.changed('activeTasksChanged', { project, tasks: this.listActive(project) });
+      return { success: true };
+    });
+
+    this.on('taskFinished', async (msg: AbjectMessage) => {
+      const { project, taskId } = msg.payload as { project: string; taskId: string };
+      requireNonEmpty(project, 'project');
+      requireNonEmpty(taskId, 'taskId');
+      const had = this.tasksFor(project).delete(taskId);
+      if (had) this.changed('activeTasksChanged', { project, tasks: this.listActive(project) });
+      return { success: had };
+    });
+
+    this.on('activeTasks', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      return this.listActive(name);
+    });
+  }
+
+  private tasksFor(project: string): Map<string, ActiveTask> {
+    let m = this.activeTasks.get(project);
+    if (!m) { m = new Map(); this.activeTasks.set(project, m); }
+    return m;
+  }
+
+  /** Live tasks in a project, oldest first, with silent ones expired. */
+  private listActive(project: string): ActiveTask[] {
+    const m = this.activeTasks.get(project);
+    if (!m) return [];
+    const cutoff = Date.now() - ExternalProjectRegistry.ACTIVE_TASK_TTL_MS;
+    for (const [id, t] of m) if (t.lastSeenAt < cutoff) m.delete(id);
+    return [...m.values()].sort((a, b) => a.startedAt - b.startedAt).map(t => ({ ...t, files: [...t.files] }));
   }
 
   /**
@@ -613,6 +736,11 @@ directory is a git checkout is detected here, so \`vcs\` rarely needs passing.
       invariant(p.isolation !== 'worktree' || p.vcs === 'git', `project ${p.name} cannot use worktree isolation without git`);
       invariant((AUTONOMY_LEVELS as string[]).includes(p.autonomy), `project ${p.name} has an unknown autonomy level`);
       invariant(p.trusted || p.autonomy === 'ask', `untrusted project ${p.name} must sit at autonomy "ask"`);
+    }
+    for (const [project, tasks] of this.activeTasks) {
+      for (const [id, t] of tasks) {
+        invariant(id === t.taskId, `active task map key must equal the task id (${project})`);
+      }
     }
   }
 }

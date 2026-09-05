@@ -100,6 +100,16 @@ export interface ExecRequest {
   shell?: boolean;
   /** If set, use command-name-only matching against the skill's whitelist. */
   skillName?: string;
+  /**
+   * The command runs inside a project the user has NOT trusted. Standing
+   * grants (allow lists, per-object grants) are skipped and the request goes
+   * to the permissions authority every time, which knows the project's
+   * autonomy is "ask" and prompts. Trust is a statement about a directory;
+   * a grant is a statement about a program. A grant for `pnpm` made in a
+   * trusted project must not run that project's lifecycle scripts in one
+   * the user never vouched for.
+   */
+  untrusted?: boolean;
 }
 
 export interface ExecResult {
@@ -362,7 +372,7 @@ export class ShellExecutor extends Abject {
       await this.validateSkillCommand(req.skillName, fullCommand);
     } else {
       ({ restrictEnv } = await this.validateCommand(
-        fullCommand, { callerId, usesShell: !!req.shell, cwd }));
+        fullCommand, { callerId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true }));
     }
 
     // Validate working directory (may prompt user). A default set earlier by
@@ -429,7 +439,7 @@ export class ShellExecutor extends Abject {
 
   private async validateCommand(
     fullCommand: string,
-    opts: { callerId?: AbjectId; usesShell: boolean; cwd?: string },
+    opts: { callerId?: AbjectId; usesShell: boolean; cwd?: string; untrusted?: boolean },
   ): Promise<{ restrictEnv: boolean }> {
     const trimmed = fullCommand.trim();
 
@@ -454,16 +464,21 @@ export class ShellExecutor extends Abject {
       throw new Error(`${callerName} is blocked from running "${blocked}"`);
     }
 
-    if (this.allowedCommands?.has(trimmed)) return { restrictEnv: false };
+    // Standing permissions answer for trusted ground only. In an untrusted
+    // project every command is put to the authority, whose project autonomy
+    // for such a directory is "ask", so the user sees each one.
+    if (!opts.untrusted) {
+      if (this.allowedCommands?.has(trimmed)) return { restrictEnv: false };
 
-    // A grant is on a program, so a line is covered only when every program in
-    // it is granted. `cd x && sed … | grep …` passes once cd, sed and grep are
-    // all allowed, and stops passing the moment something else joins.
-    const grants = callerName ? this.objectAllowedCommands.get(callerName) : undefined;
-    if (grants && programs.length > 0 && !analysis.opaque
-        && analysis.effect !== 'dangerous'
-        && programs.every(p => grants.has(p))) {
-      return { restrictEnv: false };
+      // A grant is on a program, so a line is covered only when every program in
+      // it is granted. `cd x && sed … | grep …` passes once cd, sed and grep are
+      // all allowed, and stops passing the moment something else joins.
+      const grants = callerName ? this.objectAllowedCommands.get(callerName) : undefined;
+      if (grants && programs.length > 0 && !analysis.opaque
+          && analysis.effect !== 'dangerous'
+          && programs.every(p => grants.has(p))) {
+        return { restrictEnv: false };
+      }
     }
 
     // Nothing local covers it: put it to the authority, which knows about
@@ -474,8 +489,8 @@ export class ShellExecutor extends Abject {
           type: 'shell',
           resource: trimmed,
           description: callerName
-            ? `${callerName} wants to run:`
-            : `An object wants to run:`,
+            ? `${callerName} wants to run${opts.untrusted ? ' (in an UNTRUSTED project)' : ''}:`
+            : `An object wants to run${opts.untrusted ? ' (in an UNTRUSTED project)' : ''}:`,
           objectName: callerName,
           commandName: analysis.principalProgram,
           callerId: opts.callerId,

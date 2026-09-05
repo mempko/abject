@@ -235,6 +235,8 @@ interface SemanticReviewResult {
   verified: boolean;
   issues: Array<{ severity: 'error' | 'warning'; message: string; callSite?: string }>;
   questions: Array<{ dep: string; question: string }>;
+  /** The reviewer ran but its output could not be read; nothing was reviewed. */
+  unavailable?: boolean;
 }
 
 /** State carried across turns of a single agent task. */
@@ -268,6 +270,21 @@ interface LoopState {
    * deferred" instead of showing a stale verdict.
    */
   checkDeferred?: boolean;
+  /**
+   * The gate's evidence. `deployTurn` is the turn of the last successful
+   * deploy; the two flags record what happened to the live object since.
+   * `done` is downgraded when the staged source is not live, or when nothing
+   * has exercised the live object after the deploy (see gateVerdict).
+   */
+  deployTurn?: number;
+  exercisedSinceDeploy?: boolean;
+  visualSinceDeploy?: boolean;
+  /**
+   * Semantic-review findings that arrived after a deploy had already returned.
+   * The review runs beside the loop rather than holding the deploy for it;
+   * findings are shown once, in the next observation's CHECKS.
+   */
+  pendingAdvice?: string;
   /**
    * Exact source text last rendered into an observation. The source is only
    * re-emitted when it CHANGED; otherwise the observation shows a compact
@@ -389,6 +406,16 @@ export class ObjectCreator extends Abject {
               parameters: [
                 { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target object (UUID or registered name)' },
                 { name: 'prompt', type: { kind: 'primitive', primitive: 'string' }, description: 'What to change or investigate' },
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal to link progress to', optional: true },
+              ],
+              returns: { kind: 'reference', reference: 'CreationResult' },
+            },
+            {
+              name: 'investigate',
+              description: 'Answer a diagnostic question about an existing Abject (how it works, why it fails) with a written report. Read-only: nothing is drafted or deployed. Any object may call this.',
+              parameters: [
+                { name: 'prompt', type: { kind: 'primitive', primitive: 'string' }, description: 'The question to answer' },
+                { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Object to investigate (UUID or registered name)', optional: true },
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal to link progress to', optional: true },
               ],
               returns: { kind: 'reference', reference: 'CreationResult' },
@@ -517,11 +544,11 @@ What I handle:
 - Investigation that ends in code edits (read source, diagnose, fix).
 - Composing existing source-backed objects into one Organism behind a single membrane interface, and extracting an organelle back out as a standalone object.
 
-What I don't handle:
-- Multi-object autonomous-system composition (agent + scheduler + watcher) — that's AgentCreator.
-- Runtime method calls on existing objects — that's ObjectAgent.
-- Public-web browsing — that's WebAgent.
-- Installed skill use at runtime — that's SkillAgent.
+What I don't handle (other objects do; ask the Registry which):
+- Composing several objects into an autonomous system (an agent plus its scheduler and watchers).
+- Runtime method calls on existing objects with no source change.
+- Public-web browsing.
+- Installed skill use at runtime.
 
 When invited to a Sprint Plan, describe the concrete authoring or modification I'd perform, the target Abject (by name), and what would change. If the goal is purely runtime (open a window, call a method, send a Slack message), reply PASS.`;
   }
@@ -1774,18 +1801,22 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         const hasError = issues.some(i => i.severity === 'error');
         result = { verified: !hasError, issues, questions };
       } catch {
-        // Reviewer malfunction — treat as VERIFIED so we don't block the loop.
-        log.warn('review_semantics: unparseable reviewer output, treating as VERIFIED');
-        result = { verified: true, issues: [], questions: [] };
+        // Reviewer malfunction. The review is advisory, so the loop goes on —
+        // but as "nothing was reviewed", never as "verified", or a broken
+        // review tier stays invisible.
+        log.warn('review_semantics: unparseable reviewer output — reviewer unavailable');
+        result = { verified: true, issues: [], questions: [], unavailable: true };
       }
     }
 
     state.lastValidation = { ...(state.lastValidation ?? {}), semantics: result };
     const errs = result.issues.filter(i => i.severity === 'error').length;
     const warns = result.issues.filter(i => i.severity === 'warning').length;
-    const summary = result.verified
-      ? `review_semantics: VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
-      : `review_semantics: ${errs} error${errs === 1 ? '' : 's'}, ${result.questions.length} question${result.questions.length === 1 ? '' : 's'}`;
+    const summary = result.unavailable
+      ? 'review_semantics: reviewer unavailable (its output could not be read) — nothing was reviewed'
+      : result.verified
+        ? `review_semantics: VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
+        : `review_semantics: ${errs} error${errs === 1 ? '' : 's'}, ${result.questions.length} question${result.questions.length === 1 ? '' : 's'}`;
     // Warnings on a verified draft are advisory: the action SUCCEEDS (so a
     // batched deploy behind it still runs) and the findings ride along as
     // data for the agent to weigh — fix the cheap ones, ship, note the rest.
@@ -1880,12 +1911,50 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (state.semanticReviewedSource === state.draftSource) return undefined;
     try {
       const res = await this.opReviewSemantics(state);
+      if (res.result?.unavailable) {
+        return 'Semantic review unavailable: the reviewer\'s output could not be read, so nothing was reviewed. The object is live; rely on behavioral checks.';
+      }
       const issues = res.result?.issues ?? [];
       if (issues.length === 0) return undefined;
       return `Semantic review of the deployed draft (advisory — the object IS live; fix what is real, then deploy again):\n${this.formatSemanticIssues(res.result!)}`;
-    } catch {
-      return undefined;
+    } catch (err) {
+      return `Semantic review unavailable (${err instanceof Error ? err.message.slice(0, 120) : String(err)}); nothing was reviewed.`;
     }
+  }
+
+  /** Below this many changed lines, with call validation clean, the advisory review is skipped. */
+  private static readonly SEMANTIC_REVIEW_MIN_CHANGED_LINES = 40;
+
+  /**
+   * Start the advisory review beside the loop instead of holding the deploy
+   * for it. The object is already live when this runs; the review's findings
+   * land in `pendingAdvice` and the next observation shows them. A small,
+   * call-clean change skips the review entirely: the reviewer's cost is
+   * roughly constant per call and its yield on a few clean lines is low.
+   */
+  private scheduleSemanticAdvice(state: LoopState, previousLive?: string): string {
+    if (!state.draftSource) return '';
+    if (previousLive !== undefined) {
+      const changed = ObjectCreator.changedLineCount(previousLive, state.draftSource);
+      const callsClean = (state.lastValidation?.calls ?? []).length === 0;
+      if (changed < ObjectCreator.SEMANTIC_REVIEW_MIN_CHANGED_LINES && callsClean) {
+        return `Semantic review skipped for a small, call-clean change (${changed} changed line${changed === 1 ? '' : 's'}).`;
+      }
+    }
+    void this.adviseSemantics(state)
+      .then(advice => { if (advice) state.pendingAdvice = advice; })
+      .catch(() => { /* advisory */ });
+    return 'Semantic review is running beside you; findings, if any, appear under CHECKS in a later observation.';
+  }
+
+  /** Lines present in one text and not the other, as a cheap size of a change. */
+  private static changedLineCount(before: string, after: string): number {
+    const a = new Set(before.split('\n').map(l => l.trim()).filter(Boolean));
+    const b = new Set(after.split('\n').map(l => l.trim()).filter(Boolean));
+    let changed = 0;
+    for (const l of b) if (!a.has(l)) changed++;
+    for (const l of a) if (!b.has(l)) changed++;
+    return changed;
   }
 
   /**
@@ -1963,7 +2032,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       ? ` — WARNING: another live object already holds the name "${state.draftManifest.name}" (${state.nameCollisionId}). Name-based calls resolve to THAT older object; your own calls to "${state.draftManifest.name}" are auto-routed to the new instance. Decide what to do about the duplicate: usually the older object should have been modified instead of spawning a twin, or it should be destroyed.`
       : '';
 
-    const advisory = await this.adviseSemantics(state);
+    state.deployTurn = state.turn;
+    state.exercisedSinceDeploy = false;
+    state.visualSinceDeploy = false;
+    const reviewNote = this.scheduleSemanticAdvice(state);
 
     return {
       ok: true,
@@ -1971,8 +2043,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       data: {
         objectId: result.objectId,
         manifest: state.draftManifest,
-        ...(advisory ? { semanticReview: advisory } : {}),
-        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI.',
+        semanticReview: reviewNote,
+        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI. done is refused until the live object has been exercised.',
       },
     };
   }
@@ -2117,6 +2189,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
     }
 
+    const previousLive = state.targetSource;
     state.deployedViaUpdateSource = true;
     state.lastDeployedSource = draftSource;
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
@@ -2126,15 +2199,18 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // conflict.
     state.targetSource = draftSource;
 
-    const advisory = await this.adviseSemantics(state);
+    state.deployTurn = state.turn;
+    state.exercisedSinceDeploy = false;
+    state.visualSinceDeploy = false;
+    const reviewNote = this.scheduleSemanticAdvice(state, previousLive);
 
     return {
       ok: true,
       summary: `deploy_update: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)`,
       data: {
         objectId: targetId,
-        ...(advisory ? { semanticReview: advisory } : {}),
-        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI. If the edit touched show()/createCanvas/widget wiring, hide() then show() the target first.',
+        semanticReview: reviewNote,
+        next: 'Now VERIFY: exercise each behavior the user asked for, and screenshot any UI. If the edit touched show()/createCanvas/widget wiring, hide() then show() the target first. done is refused until the live object has been exercised.',
       },
     };
     });
@@ -2695,6 +2771,17 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // objectModified events.
     this.recordDeployLifecycle(state, target, method, response);
 
+    // Evidence for the gate: a call that drives the live object after the
+    // deploy. Reading its manifest or state proves nothing about behavior, so
+    // those do not count; an `input` event to one of its widgets does.
+    if (state.deployTurn !== undefined) {
+      const live = state.spawnedObjectId ?? state.targetObjectId;
+      const readOnly = new Set(['describe', 'ask', 'getSource', 'probe', 'getState']);
+      if ((resolvedId === live && !readOnly.has(method)) || method === 'input') {
+        state.exercisedSinceDeploy = true;
+      }
+    }
+
     return {
       ok: true,
       summary: (summary ?? `call ${target}.${method}: ok`)
@@ -2736,6 +2823,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
 
       extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
+      if (extra.state.deployTurn !== undefined) extra.state.visualSinceDeploy = true;
       res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
       res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
       return;
@@ -2907,6 +2995,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const { objectId, prompt, goalId } = msg.payload as { objectId: string; prompt: string; goalId?: string };
       this.startAgentTask({
         kind: 'modify',
+        prompt,
+        targetIdOrName: objectId,
+        goalId,
+        callerId: msg.routing.from,
+        deferredMsg: msg,
+      });
+      return DEFERRED_REPLY;
+    });
+
+    this.on('investigate', (msg: AbjectMessage) => {
+      const { prompt, objectId, goalId } = msg.payload as { prompt: string; objectId?: string; goalId?: string };
+      this.startAgentTask({
+        kind: 'investigate',
         prompt,
         targetIdOrName: objectId,
         goalId,
@@ -3532,6 +3633,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       lines.push('');
     }
 
+    // The gate is stated every turn once there is source, so a refused done
+    // is never a surprise.
+    if (state.draftSource && state.kind !== 'investigate') {
+      const gate = this.gateVerdict(state);
+      lines.push(gate.ok ? `GATE: satisfied — ${gate.note}` : `GATE: NOT satisfied — ${gate.reason}`);
+      lines.push('');
+    }
+
     if (state.nameCollisionId) {
       lines.push(`⚠️ NAME COLLISION — a pre-existing live object (${state.nameCollisionId}) also answers to "${state.draftManifest?.name}".`);
       lines.push(`   Name-based routing resolves to that OLDER object, so verifying "by name" would test the wrong instance. Your call actions targeting the name are auto-routed to the instance you spawned (${state.spawnedObjectId ?? '?'}).`);
@@ -3559,10 +3668,17 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (v.semantics) {
         const errs = v.semantics.issues.filter(i => i.severity === 'error').length;
         const warns = v.semantics.issues.filter(i => i.severity === 'warning').length;
-        lines.push(`  semantics: ${v.semantics.verified
-          ? `VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
-          : `${errs} finding${errs === 1 ? '' : 's'} (advisory — never blocks a deploy)`}`);
+        lines.push(`  semantics: ${v.semantics.unavailable
+          ? 'reviewer unavailable — nothing was reviewed'
+          : v.semantics.verified
+            ? `VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
+            : `${errs} finding${errs === 1 ? '' : 's'} (advisory — never blocks a deploy)`}`);
       }
+    }
+    if (state.pendingAdvice) {
+      lines.push(`  review of the deployed draft (arrived after the deploy returned):`);
+      lines.push(state.pendingAdvice.split('\n').map(l => `    ${l}`).join('\n'));
+      state.pendingAdvice = undefined;
     }
     lines.push('');
 
@@ -3597,6 +3713,42 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return lines.join('\n');
   }
 
+  // ── The done gate ─────────────────────────────────────────────────────
+
+  /**
+   * Whether this loop may honestly claim to be done.
+   *
+   * The runtime finishes a task the instant it parses a terminal action, so
+   * this is not an interception; it is the check applied to the claim before
+   * it leaves this object (the same shape ExternalCreator uses). Two things
+   * are refused: staged source that never shipped, and a deploy nothing has
+   * exercised since. A diagnostic loop authors nothing and passes.
+   */
+  private gateVerdict(state: LoopState): { ok: boolean; reason?: string; note: string } {
+    if (state.kind === 'investigate' || !state.draftSource) {
+      return { ok: true, note: 'nothing was authored; the result is a report.' };
+    }
+    if (state.draftSource !== state.lastDeployedSource) {
+      const verb = state.kind === 'create' && !state.spawnedObjectId ? 'deploy_spawn' : 'deploy_update';
+      return {
+        ok: false,
+        reason: `the staged source is NOT deployed — the live object still runs its old code. Run ${verb}, then exercise the object, then done.`,
+        note: 'staged source not deployed.',
+      };
+    }
+    if (state.deployTurn !== undefined && !state.exercisedSinceDeploy) {
+      return {
+        ok: false,
+        reason:
+          'the object is live but nothing has exercised it since the deploy. Drive at least one behavior the user asked for ' +
+          '(a call to the object, or an input event to its widget) and read the result; then done.',
+        note: 'deployed but not exercised.',
+      };
+    }
+    const visual = state.visualSinceDeploy ? ', screenshot taken' : '';
+    return { ok: true, note: `deployed and exercised${visual}.` };
+  }
+
   // ── Finalization: LoopState -> CreationResult ─────────────────────────
 
   private finalizeLoop(state: LoopState, agentSuccess: boolean, agentResult: unknown, agentError?: string): CreationResult {
@@ -3604,6 +3756,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return {
         success: false,
         error: state.terminal?.error ?? agentError ?? 'Agent loop failed',
+      };
+    }
+
+    // A claim that does not survive the gate is downgraded to a failure that
+    // carries the reason. The caller (and the user, through the notice) see
+    // what is true rather than what was said.
+    const gate = this.gateVerdict(state);
+    if (!gate.ok) {
+      log.info(`done refused by the gate: ${gate.note}`);
+      void this.notify(`ObjectCreator reported done, but ${gate.note}`, 'warning', 12_000)
+        .catch(() => { /* no UI is not a reason to fail the task */ });
+      const reported = typeof agentResult === 'string' ? agentResult : JSON.stringify(agentResult ?? '');
+      return {
+        success: false,
+        error: `Reported complete, but ${gate.reason}\n\nWhat the agent reported:\n${reported.slice(0, 2000)}`,
       };
     }
 
@@ -3765,6 +3932,8 @@ Organism composition:
 
 ScrumMaster owns multi-task planning. If the assigned creation/modification task is too broad or needs another specialist first, use \`fail({reason})\` with a concise proposed next scrum rather than trying to split the work locally.
 
+Delegation is a message to any object. Anything you cannot do yourself, some Abject can — a capability, a service, or another agent; they are all reached the same way. Ask the Registry what provides it (\`call("Registry", "ask", {question: "which object ...?"})\`), ask that object how it wants to be called, then message it — as a \`call\` action, or from inside a \`submit_job\` with \`dep\`/\`find\` when the delegation is one step of a mechanical sequence. A self-contained task sent to another agent's method comes back as its report (a long one arrives as a handle). The same is true in reverse: any object may message your \`create\`, \`modify\`, and \`investigate\` methods.
+
 ANTI-PATTERNS — do not do these:
 - \`call("Factory", "spawn", ...)\` — you cannot supply the right owner / parentId, and you cannot inline the drafted manifest+source through a JSON action payload. Use \`deploy_spawn\`.
 - \`call("Registry", "updateSource", ...)\` — Registry alone won't hot-swap the live object. Use \`deploy_update\`.
@@ -3832,11 +4001,7 @@ A model that lives in the object stays available once this task ends: the object
    - User said "fetches data on a timer" → wait briefly (one or two \`getState\` calls separated by a real action), confirm the state advanced.
    - User said "responds to peer messages" → send the message yourself via \`call\` and check the response.
 
-   If the requested behavior is keyboard input, mouse input, or any input event, the canvas widget id is in your draft source — find it from \`state.draftSource\` (look for the \`createCanvas\` call), or read the running object's state for the canvas id, then \`call(<canvasId>, "input", { type, code | x | y, ... })\`.
-
-   **Synthetic input is a partial test, not full verification.** A passing \`call(<canvasId>, "input", payload)\` only proves the input-target's handler logic works. It does NOT exercise the real compositor → window → layout → canvas → inputTargetId chain (the synthetic call dispatches straight to the handler). Before declaring input wired correctly, ALSO check that:
-   1. The drafted source passes \`inputTargetId: this.id\` explicitly to \`createCanvas\` — never rely on the \`msg.routing.from\` default for canvas apps.
-   2. The handler reads fields from \`msg.payload\` (the real shape and the synthetic shape are identical — both wrap fields under \`msg.payload\`). Do NOT add a "top-level fallback" — there is no top-level event shape.
+   If the requested behavior is keyboard input, mouse input, or any input event, the canvas widget id is in your draft source — find it from \`state.draftSource\` (look for the \`createCanvas\` call), or read the running object's state for the canvas id, then \`call(<canvasId>, "input", { type, code | x | y, ... })\`. A synthetic input proves the handler, not the wiring: the UI object's own usage guide (its \`ask\` answer) states how input must be wired for real events to arrive — check the draft against it before claiming input works.
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
 
@@ -3844,7 +4009,7 @@ A model that lives in the object stays available once this task ends: the object
 
    **Do not satisfy a check by changing the thing it checks.** If a criterion reads "the X is visible" and you cannot see X, the fix is to find out WHY it is not visible — not to enlarge, brighten, or recolor X until it is unmissable. Making the artifact louder until it trips your own check moves the goalposts: the criterion passes, the object is still wrong, and you will report success on something the user immediately sees is broken. This is the single most seductive failure in a visual loop, because the resulting screenshot genuinely does show what the criterion asked for. Ask yourself before every visual claim: *did I make this correct, or did I make it conspicuous?* If your change was "make it bigger/brighter so I can see it in the screenshot", you have not fixed the bug — you have hidden it.
 
-   In a perspective 3D scene this has a concrete, checkable form: **distant objects MUST render smaller than near ones.** If a far object needs a larger mesh than its near counterpart before you can spot it, that is proof of a real defect (too little depth in the scene's z-range, a light that does not reach the far end, or a rejected op batch) — and scaling it up destroys the very depth cue that makes the scene read as 3D. Judge the whole rendered image against the goal ("does this look like what the user asked for?"), not against a checklist item you have the power to satisfy by hand.
+   Judge the whole rendered image against the goal ("does this look like what the user asked for?"), not against a checklist item you have the power to satisfy by hand. For rendering-specific rules (what makes a 3D scene read as 3D, what a layout needs), ask the UI object that renders it — its \`ask\` answer carries the live rules, and they change as the renderer does.
 
    ${this.visionCapable === false
     ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
@@ -3852,7 +4017,7 @@ A model that lives in the object stays available once this task ends: the object
 
    **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
 
-   **A timeout is a routing/await bug, not a deadlock.** If \`show\`, a window build, or any call times out, the cause is almost always a recipient addressed by a bare name instead of a resolved AbjectId (resolve via \`this.dep(name)\` first), or a result that was never awaited — NOT the act of awaiting inside a handler, which is correct and supported. Do not "fix" a timeout by detaching the build into a fire-and-forget chain; fix the recipient or the missing await. When verifying a window opened, drive \`show\` with a short timeout and then poll \`getState\` for the window/canvas ids, rather than sitting on a long blocking call.
+   **A timeout is a bug in the call, not a deadlock.** Awaiting inside a handler is correct and supported; the UI object's usage guide explains the build model. When a build call times out, look for a recipient addressed by a bare name instead of a resolved id, or a result never awaited, and fix that rather than detaching the build.
 
    **Clean up probe artifacts before finishing.** Anything you create purely to explore or verify — probe windows, scratch widgets, throwaway objects — must be destroyed once it has served its purpose (e.g. \`destroyWindowAbject\` for a window you opened to test rendering). The user's desktop should end the loop containing only what they asked for.
 5. **Diagnostic prompts terminate with a report.** If the user asked HOW something works, WHY it's failing, or to EXPLAIN behavior — answer with \`done({result: "<written report>"})\` after enough read-only calls (\`describe\`, \`ask\`, \`getState\`, \`getObjectLogs\`). Do not draft, do not deploy.
@@ -3870,7 +4035,7 @@ A model that lives in the object stays available once this task ends: the object
 
    When a single object holds both kinds of data — for example, a notes app that holds the notes themselves AND a private API key for an external service — split them: notes go in \`this.data.notes\` (cloneable), API key goes in Storage (not cloneable).
 8. **User credentials are explicit consent.** When the user shares a username, password, API key, bearer token, or other secret in the task and asks you to wire it into an object, embed it in the source. This runtime is the user's own local system; persisted source lives in their \`.abjects\` directory on their own disk and never leaves it. Don't refuse on "plaintext credentials" grounds, don't lecture about secret stores, and don't substitute placeholders that block the integration. Wire the actual value through. If they ever swap to a secrets backend later, that's a separate refactor — not your call here.
-9. **Deploy before done — compiling is not deploying.** A clean \`compile\` only proves the draft parses; it does NOT change the live object. The single most common silent failure is finishing a task whose best edits were compiled but never deployed — the loop reports success while the user still sees the old object, forcing them to ask again. Before \`done\`, your staged source MUST be live: the observation's DRAFTS line reads "deployed (live)" when it is, or flags "⚠️ NOT YET DEPLOYED" when it isn't. If it is flagged, run \`deploy_update\` (or \`deploy_spawn\` for a new object) — and, if the edit touched \`show()\`/\`createCanvas\`/widget wiring, \`hide()\` then \`show()\` the target — and then re-verify. Never end a multi-task goal by leaving the next task to deploy your work; ship what you edited.
+9. **Deploy before done — compiling is not deploying, and \`done\` is gated.** A clean \`compile\` only proves the draft parses; it does NOT change the live object. Before \`done\`, your staged source MUST be live AND you must have exercised the live object at least once since the deploy: the observation's GATE line says whether both hold. A \`done\` that fails the gate is downgraded to a failure carrying the reason — the user is told the work is not done, not that it is. If the DRAFTS line flags "⚠️ NOT YET DEPLOYED", run \`deploy_update\` (or \`deploy_spawn\` for a new object) — and, if the edit touched \`show()\`/\`createCanvas\`/widget wiring, \`hide()\` then \`show()\` the target — then drive a behavior and read the result. Never end a multi-task goal by leaving the next task to deploy your work; ship what you edited.
 10. **Terminate crisply.** \`done\` carries either a spawned object id, a modified object id, or a written report — and only after your edits are deployed and verified (functionally, and visually for UI). \`fail\` carries a precise reason — what couldn't be done, what was tried, what's available instead.
 
 # What's in your observation

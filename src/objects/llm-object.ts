@@ -1646,8 +1646,18 @@ export class LLMObject extends Abject {
         }
         if (current.length > 0) chunks.push(current);
 
-        const summaries = new Array<string>(chunks.length);
-        const jobs = chunks.map((chunk, ci) => async () => {
+        // A summary written by an earlier compaction sits at the head of the
+        // middle block; it is the document being updated, not more material
+        // to condense.
+        const first = middle[0];
+        const priorText = first ? getTextContent(first) : '';
+        const prior = priorText.startsWith(LLMObject.SUMMARY_MARKER)
+          ? priorText.slice(LLMObject.SUMMARY_MARKER.length).trim()
+          : undefined;
+        const fresh = prior !== undefined ? chunks.map(c => c.filter(m => m !== first)).filter(c => c.length > 0) : chunks;
+
+        const summaries = new Array<string>(fresh.length);
+        const jobs = fresh.map((chunk, ci) => async () => {
           const serialized = chunk
             .map((m, mi) => `---- message ${mi + 1} (${m.role}) ----\n${truncateText(getTextContent(m), LLMObject.DISTILL_CHUNK_CHARS)}`)
             .join('\n\n');
@@ -1656,9 +1666,10 @@ export class LLMObject extends Abject {
         methods.push('distill-middle');
         await this.runPool(jobs, LLMObject.DISTILL_CONCURRENCY);
 
+        const structured = await this.structuredSummary(prior, summaries.join('\n\n'), taskHint, callerId, `${baseId}-s${distillSeq++}`, onBehalfOf);
         const synthetic: LLMMessage = {
           role: 'user',
-          content: `[Earlier context — ${middle.length} messages distilled]\n${summaries.join('\n\n')}`,
+          content: `${LLMObject.SUMMARY_MARKER}\n${structured}`,
         };
         out.splice(pinnedCount, middleEnd - pinnedCount, synthetic);
       }
@@ -1673,6 +1684,72 @@ export class LLMObject extends Abject {
     const compressedChars = conversationTextChars(out);
     log.info(`compress | ${originalChars} → ${compressedChars} chars | ${messages.length} → ${out.length} msgs | stages=${methods.join('+')}`);
     return { messages: out, originalChars, compressedChars, methods };
+  }
+
+  /** Marks a compaction summary so the next compaction updates it instead of re-summarizing it. */
+  private static readonly SUMMARY_MARKER = '[Earlier context — running summary, updated at each compaction]';
+
+  /**
+   * Fold new material into the running summary of a conversation.
+   *
+   * Prose summaries lose the things an agent needs most when it resumes: which
+   * files it read and changed, what it decided, what is still open. A fixed
+   * structure that is UPDATED rather than regenerated keeps those, because the
+   * instruction is to preserve what is there and move items between sections
+   * as they finish. Falls back to the prose when the fast tier fails; the
+   * conversation must still shrink.
+   */
+  private async structuredSummary(
+    prior: string | undefined,
+    material: string,
+    taskHint: string,
+    callerId: AbjectId | undefined,
+    requestId: string,
+    onBehalfOf?: string,
+  ): Promise<string> {
+    const systemPrompt = `You maintain the running summary of an agent's working conversation so the agent can continue after older messages are removed. You are given the previous summary (possibly empty) and a distillation of the messages being removed now. Produce the UPDATED summary.
+
+Rules:
+- PRESERVE everything in the previous summary unless the new material supersedes it.
+- Move items from In Progress to Done when the new material shows they finished; add new work under In Progress or Blocked.
+- Keep exact file paths, object names and ids, scratchpad keys, commands, exit codes, and error messages verbatim. Never paraphrase an identifier.
+- Every path the agent read goes in <read-files>; every path it wrote goes in <modified-files>; one per line; merge with the previous lists.
+- Target under 3000 characters. Omit empty sections' bodies but keep the headings.
+
+Output ONLY this structure, nothing before or after:
+## Goal
+## Constraints & Preferences
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Next Steps
+## Critical Context
+<read-files>
+</read-files>
+<modified-files>
+</modified-files>`;
+    const hint = taskHint ? `The conversation's task: "${taskHint.slice(0, 400)}"\n\n` : '';
+    try {
+      const result = await this.complete(
+        [
+          systemMessage(systemPrompt),
+          userMessage(`${hint}Previous summary:\n${prior ?? '(none — this is the first compaction)'}\n\nNew material (distilled from the messages being removed):\n${material}`),
+        ],
+        { tier: 'fast', maxTokens: 1500 },
+        undefined,
+        callerId,
+        requestId,
+        onBehalfOf,
+      );
+      const text = result.content?.trim();
+      if (text && text.includes('## Goal')) return text;
+      throw new Error('structured summary missing');
+    } catch (err) {
+      log.warn(`structured summary failed (${err instanceof Error ? err.message : String(err)}) — keeping prose`);
+      return prior ? `${prior}\n\n## Additional context\n${material}` : material;
+    }
   }
 
   /**

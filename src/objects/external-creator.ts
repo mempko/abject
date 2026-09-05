@@ -68,6 +68,14 @@ interface CheckOutcome {
    * pre-existing error in it look new.
    */
   signatures: string[];
+  /**
+   * The runner's own failure count, when its summary line states one
+   * ("Found 3 errors", "Tests: 2 failed", "2 failed", "--- FAIL:"). A second
+   * signal beside the signatures: a count that grew while no new signature
+   * was recognized means the output format escaped the regexes, and the run
+   * is judged inconclusive rather than clean.
+   */
+  failureCount?: number;
   at: number;
   /** Bounded output, for reporting. */
   output: string;
@@ -93,13 +101,28 @@ interface WorktreeInfo {
 /** A check run against its baseline. */
 interface CheckVerdict {
   outcome: CheckOutcome;
-  /** Failures this task introduced. Empty means nothing was made worse. */
+  /**
+   * New failures in files THIS task wrote. These block `done`. When the task
+   * has written nothing yet, every new failure counts here.
+   */
   newFailures: string[];
+  /**
+   * New failures in files this task did not touch. Several tasks may work in
+   * one checkout at once, so these are reported as concurrent work and never
+   * block this task; the round's review sees the combined state.
+   */
+  foreignFailures: string[];
   /** Pre-existing failures still present. Advisory, never blocking. */
   preExisting: number;
   passed: boolean;
   /** Set when there was no baseline to compare against. */
   unbaselined?: boolean;
+  /**
+   * The command failed but nothing in its output was recognized as a failure
+   * line, or its own failure count grew with no new signature to show for it.
+   * The verdict cannot say whose failure it is, so it never passes.
+   */
+  inconclusive?: boolean;
 }
 
 interface TaskExtra {
@@ -118,6 +141,22 @@ interface TaskExtra {
   filesModified: Set<string>;
   /** Pre-edit content, so a mechanical failure can be undone precisely. */
   preImages: Map<string, string>;
+  /**
+   * What this task last wrote to each file. A rollback restores the pre-image
+   * only while the file still holds exactly this; anything else means another
+   * task has edited it since, and overwriting their work to undo ours is the
+   * one thing a rollback must never do.
+   */
+  postImages: Map<string, string>;
+  /**
+   * The verify baseline being captured in the background (see
+   * captureBaseline). `tainted` flips the moment this task writes a file
+   * while the capture is still running: a baseline taken over a tree that was
+   * changing under it cannot say what pre-existed, so it is discarded.
+   */
+  verifyBaseline?: { promise: Promise<void>; tainted: boolean; done: boolean };
+  /** Directories whose own instruction files were already shown this task. */
+  instructionDirsSeen: Set<string>;
   /** Writes and edits since the last passing verify. Drives the gate. */
   mutationsSinceVerify: number;
   lastCheck?: CheckVerdict;
@@ -226,6 +265,12 @@ configuration — same tools, same discipline.
 - Interactive web browsing, and installed skill flows.
 - Work in a directory that is not a registered external project, unless the task
   names the path — I will ask for it to be registered rather than guess.
+
+### Working beside other tasks
+Several of my tasks may work in one project at once; a scrum round stages them
+that way. Each one sees the others and the files they have written, and is judged
+only on failures in files it wrote itself. Partition parallel tasks by area so they
+do not edit the same files.
 
 ### What I promise about verification
 When a project declares a check or verify command, I run it and compare against a
@@ -394,9 +439,19 @@ clean result I did not observe.`;
     const shellId = await this.shell();
     return this.call<{ stdout: string; stderr: string; exitCode: number }>(
       shellId, 'exec',
-      { command: `git ${args}`, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs },
+      { command: `git ${args}`, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
       timeoutMs + 15_000,
     );
+  }
+
+  /**
+   * Trust is a statement about the directory, and it has to reach the object
+   * that actually runs commands. ShellExecutor skips its standing grants for
+   * an untrusted project, so every command there goes to the permission
+   * authority, which knows the project's autonomy is "ask" and prompts.
+   */
+  private isUntrusted(extra: TaskExtra): boolean {
+    return extra.project !== undefined && !extra.project.trusted;
   }
 
   private async gitHead(extra: TaskExtra): Promise<string | undefined> {
@@ -498,9 +553,34 @@ clean result I did not observe.`;
     const shellId = await this.shell();
     return this.call<{ stdout: string; stderr: string; exitCode: number; truncated?: unknown }>(
       shellId, 'exec',
-      { command, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs },
+      { command, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
       timeoutMs + 30_000,
     );
+  }
+
+  /**
+   * The failure count a runner states about itself, when it states one.
+   * Covers the summaries of tsc, vitest/jest, mocha, pytest, cargo test, and
+   * go test. Absent when no summary is recognized; that is not zero.
+   */
+  private static failureCountOf(output: string): number | undefined {
+    const text = ExternalCreator.stripAnsi(output);
+    const counts: number[] = [];
+    const take = (re: RegExp): void => {
+      for (const m of text.matchAll(re)) {
+        const n = parseInt(m[1], 10);
+        if (Number.isFinite(n)) counts.push(n);
+      }
+    };
+    take(/Found (\d+) errors?/g);                          // tsc
+    take(/Tests?:\s+(\d+) failed/g);                       // jest / vitest
+    take(/\b(\d+) failing\b/g);                            // mocha
+    take(/^={3,}.*?\b(\d+) failed\b.*?={3,}$/gm);           // pytest summary line
+    take(/test result: \w+\. \d+ passed; (\d+) failed/g);  // cargo test
+    const goFails = (text.match(/^--- FAIL:/gm) ?? []).length;
+    if (goFails > 0) counts.push(goFails);
+    if (counts.length === 0) return undefined;
+    return Math.max(...counts);
   }
 
   private async captureOutcome(extra: TaskExtra, command: string, timeoutMs: number): Promise<CheckOutcome> {
@@ -510,6 +590,7 @@ clean result I did not observe.`;
       command,
       exitCode: r.exitCode,
       signatures: ExternalCreator.signaturesOf(output, extra.workRoot),
+      failureCount: ExternalCreator.failureCountOf(output),
       at: Date.now(),
       output,
     };
@@ -523,41 +604,92 @@ clean result I did not observe.`;
    * the baseline does not have counts against this task. A baseline that was
    * green makes any failure new by definition.
    */
-  private judge(outcome: CheckOutcome, baseline: CheckOutcome | undefined): CheckVerdict {
+  private judge(outcome: CheckOutcome, baseline: CheckOutcome | undefined, touched: string[] = []): CheckVerdict {
     if (outcome.exitCode === 0) {
-      return { outcome, newFailures: [], preExisting: baseline?.signatures.length ?? 0, passed: true };
+      return { outcome, newFailures: [], foreignFailures: [], preExisting: baseline?.signatures.length ?? 0, passed: true };
     }
     if (!baseline) {
-      return { outcome, newFailures: outcome.signatures, preExisting: 0, passed: false, unbaselined: true };
+      return { outcome, newFailures: outcome.signatures, foreignFailures: [], preExisting: 0, passed: false, unbaselined: true };
     }
     if (baseline.exitCode === 0) {
-      return { outcome, newFailures: outcome.signatures, preExisting: 0, passed: false };
+      const split = ExternalCreator.attribute(outcome.signatures, touched);
+      return { outcome, ...split, preExisting: 0, passed: false, inconclusive: outcome.signatures.length === 0 };
     }
+
     const known = new Set(baseline.signatures);
-    const newFailures = outcome.signatures.filter(s => !known.has(s));
+    const fresh = outcome.signatures.filter(s => !known.has(s));
+    const preExisting = outcome.signatures.length - fresh.length;
+
+    // The command failed and nothing new was recognized. Two readings, both
+    // untrustworthy as a pass: the output format escaped the regexes (no
+    // signatures at all), or the runner's own count grew while its failure
+    // lines look like the old ones. Say so rather than declare it clean.
+    const countGrew = outcome.failureCount !== undefined
+      && baseline.failureCount !== undefined
+      && outcome.failureCount > baseline.failureCount;
+    if (fresh.length === 0 && (outcome.signatures.length === 0 || countGrew)) {
+      return { outcome, newFailures: [], foreignFailures: [], preExisting, passed: false, inconclusive: true };
+    }
+
+    const split = ExternalCreator.attribute(fresh, touched);
     return {
       outcome,
-      newFailures,
-      preExisting: outcome.signatures.length - newFailures.length,
-      passed: newFailures.length === 0,
+      ...split,
+      preExisting,
+      passed: split.newFailures.length === 0,
     };
+  }
+
+  /**
+   * Split new failures into ours and someone else's by file. A signature
+   * naming a file this task wrote is ours; one naming only other files is a
+   * concurrent task's (or a knock-on effect the round's review will see).
+   * With nothing written yet there is no basis to split, and everything is
+   * ours.
+   */
+  private static attribute(fresh: string[], touched: string[]): { newFailures: string[]; foreignFailures: string[] } {
+    if (touched.length === 0 || fresh.length === 0) return { newFailures: fresh, foreignFailures: [] };
+    const names = touched.map(t => t.split(path.sep).join('/'));
+    const newFailures: string[] = [];
+    const foreignFailures: string[] = [];
+    for (const sig of fresh) {
+      const mentionsFile = /[\w./-]+\.[a-z]{1,8}\b/i.test(sig);
+      const ours = names.some(n => sig.includes(n) || sig.includes(path.basename(n)));
+      // A failure that names no file at all (a runner-level error) cannot be
+      // attributed away; it stays ours.
+      if (ours || !mentionsFile) newFailures.push(sig);
+      else foreignFailures.push(sig);
+    }
+    return { newFailures, foreignFailures };
   }
 
   private renderVerdict(v: CheckVerdict): string {
     const head = `\`${v.outcome.command}\` exited ${v.outcome.exitCode}`;
+    const foreign = v.foreignFailures.length > 0
+      ? `\n${v.foreignFailures.length} new failure(s) are in files this task did not write — other tasks are working in this ` +
+        `project, so these are reported as theirs and do not block you (the round's review sees the combined state):\n` +
+        v.foreignFailures.slice(0, 10).map(s => `  ${s}`).join('\n') +
+        (v.foreignFailures.length > 10 ? `\n  … and ${v.foreignFailures.length - 10} more` : '')
+      : '';
     if (v.passed && v.outcome.exitCode === 0) {
       return `${head} — clean.`;
     }
+    if (v.inconclusive) {
+      const tail = (v.outcome.output ?? '').trim().split('\n').slice(-12).join('\n');
+      return `${head} — INCONCLUSIVE: the command failed but no failure line was recognized as new` +
+        (v.outcome.failureCount !== undefined ? ` while its own failure count is ${v.outcome.failureCount}` : '') +
+        `. This does not pass. Read the output and decide what failed; the last lines were:\n${tail}`;
+    }
     if (v.passed) {
       return `${head}, but every failure was already there before this task ` +
-        `(${v.preExisting} pre-existing). Nothing new was introduced.`;
+        `(${v.preExisting} pre-existing). Nothing new was introduced by you.${foreign}`;
     }
     const lines = v.newFailures.slice(0, 25).map(s => `  ${s}`).join('\n');
     const more = v.newFailures.length > 25 ? `\n  … and ${v.newFailures.length - 25} more` : '';
     const caveat = v.unbaselined
       ? ' (no baseline was captured, so these may or may not predate this task)'
       : ` (${v.preExisting} other failures predate this task and are not yours)`;
-    return `${head} — ${v.newFailures.length} failure(s) attributable to this task${caveat}:\n${lines}${more}`;
+    return `${head} — ${v.newFailures.length} failure(s) attributable to this task${caveat}:\n${lines}${more}${foreign}`;
   }
 
   // ─── Baseline ───────────────────────────────────────────────────
@@ -594,18 +726,42 @@ clean result I did not observe.`;
       }
     }
 
-    if (project.verifyCommand && project.verifyCommand !== project.checkCommand) {
-      this.reportProgress(extra, 'observing', `baseline: ${project.verifyCommand}`);
-      try {
-        baseline.verify = await this.captureOutcome(extra, project.verifyCommand, VERIFY_TIMEOUT_MS);
-        this.audit(extra, `baseline verify exit=${baseline.verify.exitCode} (${baseline.verify.signatures.length} known failures)`);
-      } catch (err) {
-        this.audit(extra, `baseline verify could not run: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
     extra.baseline = baseline;
     await this.writeGoalData(extra, BASELINE_KEY, baseline);
+
+    // The verify command can take minutes, and the task should not wait for
+    // it: the agent reads and plans first, and the first `verify` action is
+    // usually well after that. So it runs in the background against the tree
+    // as it stands now. If this task writes a file before the run finishes,
+    // the run was over a changing tree and is discarded (see `taint`); the
+    // check baseline then stands in, as it did before this existed.
+    if (project.verifyCommand && project.verifyCommand !== project.checkCommand) {
+      const state = { tainted: false, done: false, promise: Promise.resolve() };
+      state.promise = (async () => {
+        this.reportProgress(extra, 'observing', `baseline (background): ${project.verifyCommand}`);
+        try {
+          const outcome = await this.captureOutcome(extra, project.verifyCommand!, VERIFY_TIMEOUT_MS);
+          if (state.tainted) {
+            this.audit(extra, 'baseline verify discarded — this task wrote files while it ran');
+          } else if (extra.baseline) {
+            extra.baseline.verify = outcome;
+            this.audit(extra, `baseline verify exit=${outcome.exitCode} (${outcome.signatures.length} known failures)`);
+            await this.writeGoalData(extra, BASELINE_KEY, extra.baseline);
+          }
+        } catch (err) {
+          this.audit(extra, `baseline verify could not run: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          state.done = true;
+        }
+      })();
+      extra.verifyBaseline = state;
+    }
+  }
+
+  /** A write while the background verify baseline is still running spoils it. */
+  private taintVerifyBaseline(extra: TaskExtra): void {
+    const vb = extra.verifyBaseline;
+    if (vb && !vb.done) vb.tainted = true;
   }
 
   private baselineSummary(extra: TaskExtra): string {
@@ -739,7 +895,8 @@ clean result I did not observe.`;
     );
     extra.filesRead.add(abs);
     this.audit(extra, `read ${this.displayPath(extra, abs)} (${r.lines}/${r.totalLines} lines)`);
-    const header = `${this.displayPath(extra, abs)} (${r.totalLines} lines)\n`;
+    const instructions = await this.nestedInstructionsFor(extra, abs);
+    const header = `${instructions}${this.displayPath(extra, abs)} (${r.totalLines} lines)\n`;
     return bulkAwareResult(header + r.content);
   }
 
@@ -749,14 +906,20 @@ clean result I did not observe.`;
     if (typeof content !== 'string') return { success: false, error: 'write requires a "content" string' };
     this.assertWritable(extra, abs);
 
+    const siblingNote = await this.siblingNoteFor(extra, abs);
     await this.rememberPreImage(extra, abs);
+    this.taintVerifyBaseline(extra);
     const fs = await this.hostFs();
     await this.call(fs, 'writeFile', { path: abs, content }, 60_000);
+    extra.postImages.set(abs, content);
 
     extra.filesModified.add(abs);
     extra.mutationsSinceVerify++;
     this.audit(extra, `write ${this.displayPath(extra, abs)} (${content.length} chars)`);
-    return this.afterMutation(extra, action, `Wrote ${this.displayPath(extra, abs)} (${content.split('\n').length} lines).`);
+    this.announceFilesTouched(extra);
+    const instructions = await this.nestedInstructionsFor(extra, abs);
+    return this.afterMutation(extra, action,
+      `${instructions}Wrote ${this.displayPath(extra, abs)} (${content.split('\n').length} lines).${siblingNote}`);
   }
 
   private async opEdit(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -767,7 +930,9 @@ clean result I did not observe.`;
     }
     this.assertWritable(extra, abs);
 
+    const siblingNote = await this.siblingNoteFor(extra, abs);
     await this.rememberPreImage(extra, abs);
+    this.taintVerifyBaseline(extra);
     const fs = await this.hostFs();
     const r = await this.call<{ success: boolean; applied: number; diff?: string; error?: string; changedLines?: number[] }>(
       fs, 'edit', { path: abs, edits: edits as FileEdit[] }, 60_000,
@@ -781,11 +946,111 @@ clean result I did not observe.`;
       };
     }
 
+    // Record what the file holds now, so a later rollback can tell our
+    // version from a sibling task's.
+    try {
+      const after = await this.call<{ content: string }>(fs, 'readFile', { path: abs, maxBytes: 0 }, 60_000);
+      extra.postImages.set(abs, after.content);
+    } catch { /* a missing post-image only disables rollback for this file */ }
+
     extra.filesModified.add(abs);
     extra.mutationsSinceVerify++;
     this.audit(extra, `edit ${this.displayPath(extra, abs)} applied ${r.applied}`);
-    const summary = `Applied ${r.applied} edit(s) to ${this.displayPath(extra, abs)}:\n${r.diff ?? ''}`;
+    this.announceFilesTouched(extra);
+    const instructions = await this.nestedInstructionsFor(extra, abs);
+    const summary = `${instructions}Applied ${r.applied} edit(s) to ${this.displayPath(extra, abs)}:\n${r.diff ?? ''}${siblingNote}`;
     return this.afterMutation(extra, action, summary, abs);
+  }
+
+  // ─── Working beside other tasks ─────────────────────────────────
+
+  private async siblings(extra: TaskExtra): Promise<Array<{ taskId: string; goalId?: string; description?: string; files: string[]; startedAt: number }>> {
+    const reg = await this.projects();
+    if (!reg || !extra.project) return [];
+    try {
+      const all = await this.call<Array<{ taskId: string; goalId?: string; description?: string; files: string[]; startedAt: number }>>(
+        reg, 'activeTasks', { name: extra.project.name }, 10_000,
+      );
+      return (all ?? []).filter(t => t.taskId !== extra.taskId);
+    } catch {
+      return [];
+    }
+  }
+
+  /** One line when another task has already written the file about to change. */
+  private async siblingNoteFor(extra: TaskExtra, abs: string): Promise<string> {
+    const rel = this.displayPath(extra, abs).split(path.sep).join('/');
+    const others = (await this.siblings(extra)).filter(t => t.files.includes(rel));
+    if (others.length === 0) return '';
+    const who = others.map(t => `${t.taskId.slice(0, 8)}${t.description ? ` (${t.description.slice(0, 60)})` : ''}`).join(', ');
+    return `\n\nNote: ${rel} was also written by concurrent task(s) ${who} in this project. Your edit matched the file as it is now, so nothing was lost — but coordinate through the goal scratchpad if you are both changing the same thing.`;
+  }
+
+  private announceTaskStarted(extra: TaskExtra): void {
+    void this.projects().then(reg => {
+      if (!reg || !extra.project) return;
+      this.send(event(this.id, reg, 'taskStarted', {
+        project: extra.project.name,
+        taskId: extra.taskId,
+        goalId: extra.goalId,
+        description: extra.taskText.slice(0, 200),
+      }));
+    }).catch(() => { /* awareness is best effort */ });
+  }
+
+  private announceFilesTouched(extra: TaskExtra): void {
+    void this.projects().then(reg => {
+      if (!reg || !extra.project) return;
+      this.send(event(this.id, reg, 'filesTouched', {
+        project: extra.project.name,
+        taskId: extra.taskId,
+        files: [...extra.filesModified].map(f => this.displayPath(extra, f).split(path.sep).join('/')),
+      }));
+    }).catch(() => { /* best effort */ });
+  }
+
+  private announceTaskFinished(extra: TaskExtra): void {
+    void this.projects().then(reg => {
+      if (!reg || !extra.project) return;
+      this.send(event(this.id, reg, 'taskFinished', { project: extra.project.name, taskId: extra.taskId }));
+    }).catch(() => { /* best effort */ });
+  }
+
+  /**
+   * A subdirectory's own AGENTS.md / CLAUDE.md, shown once, the first time a
+   * file under it is read or written. The root files arrive with the prompt;
+   * a monorepo's per-package conventions live one level down and would
+   * otherwise never be seen. Untrusted projects contribute nothing here, for
+   * the same reason their root files are withheld.
+   */
+  private async nestedInstructionsFor(extra: TaskExtra, abs: string): Promise<string> {
+    const root = extra.workRoot;
+    if (!root || !extra.project?.trusted) return '';
+    const blocks: string[] = [];
+    let dir = path.dirname(abs);
+    while (dir.startsWith(root) && dir !== root) {
+      if (!extra.instructionDirsSeen.has(dir)) {
+        extra.instructionDirsSeen.add(dir);
+        for (const name of ['AGENTS.override.md', 'AGENTS.md', 'CLAUDE.md']) {
+          try {
+            const fs = await this.hostFs();
+            const r = await this.call<{ content: string }>(
+              fs, 'readFile', { path: path.join(dir, name), maxBytes: 32 * 1024 }, 15_000,
+            );
+            if (r.content) {
+              const rel = path.relative(root, path.join(dir, name));
+              blocks.push(`<project_instructions path="${rel}">\n${r.content}\n</project_instructions>`);
+              this.audit(extra, `instructions ${rel}`);
+              if (name === 'AGENTS.override.md') break;
+            }
+          } catch { /* absent, the common case */ }
+        }
+      }
+      dir = path.dirname(dir);
+    }
+    return blocks.length > 0
+      ? `This directory has its own instructions (shown once):\n${blocks.join('\n')}\n\n`
+      : '';
   }
 
   /** Keep the first version of a file this task saw, for a precise undo. */
@@ -835,19 +1100,30 @@ clean result I did not observe.`;
     this.reportProgress(extra, 'acting', `check: ${cmd}`);
     let verdict: CheckVerdict;
     try {
-      verdict = this.judge(await this.captureOutcome(extra, cmd, VERIFY_TIMEOUT_MS), extra.baseline?.check);
+      verdict = this.judge(await this.captureOutcome(extra, cmd, VERIFY_TIMEOUT_MS), extra.baseline?.check, this.touchedFiles(extra));
     } catch (err) {
       return { success: true, data: `${summary}\n\nCheck could not run: ${err instanceof Error ? err.message : String(err)}` };
     }
     extra.lastCheck = verdict;
-    this.audit(extra, `check exit=${verdict.outcome.exitCode} new=${verdict.newFailures.length}`);
+    this.audit(extra, `check exit=${verdict.outcome.exitCode} new=${verdict.newFailures.length} foreign=${verdict.foreignFailures.length}${verdict.inconclusive ? ' inconclusive' : ''}`);
+
+    // When the project's check IS its verification (no separate verify
+    // command, or the same one), a passing check is the verification: the
+    // gate is satisfied here and no `verify` step is owed. A heavier verify
+    // command still has to be run explicitly.
+    const project = extra.project!;
+    const checkIsVerify = !project.verifyCommand || project.verifyCommand === project.checkCommand;
+    if (verdict.passed && checkIsVerify) {
+      extra.lastVerify = verdict;
+      extra.mutationsSinceVerify = 0;
+    }
 
     // A file this task just edited that no longer parses is a mechanical
     // failure with a known cause and a known undo. Restoring it beats leaving
     // source no one authored on disk while the agent works out what happened.
     if (!verdict.passed && editedPath && this.looksLikeParseFailure(verdict, editedPath, extra)) {
       const restored = await this.rollback(extra, editedPath);
-      if (restored) {
+      if (restored === 'restored') {
         return {
           success: false,
           error:
@@ -855,9 +1131,26 @@ clean result I did not observe.`;
             `REVERTED to its state at the start of this task. Nothing is half-written.\n\n${this.renderVerdict(verdict)}`,
         };
       }
+      if (restored === 'changed-by-other') {
+        return {
+          success: false,
+          error:
+            `${summary}\n\nThat edit left ${this.displayPath(extra, editedPath)} unparseable, but the file has since been ` +
+            `changed by another task working in this project, so it was NOT reverted (that would erase their work). ` +
+            `Read it as it stands now and fix the syntax with a fresh edit.\n\n${this.renderVerdict(verdict)}`,
+        };
+      }
     }
 
-    return { success: true, data: `${summary}\n\n${this.renderVerdict(verdict)}` };
+    const verifiedNote = verdict.passed && checkIsVerify && extra.filesModified.size > 0
+      ? '\n\nThis check is the project\'s verification, so the gate is satisfied; no separate verify step is needed.'
+      : '';
+    return { success: true, data: `${summary}\n\n${this.renderVerdict(verdict)}${verifiedNote}` };
+  }
+
+  /** Files this task has written, as project-relative paths (for attribution). */
+  private touchedFiles(extra: TaskExtra): string[] {
+    return [...extra.filesModified].map(f => this.displayPath(extra, f));
   }
 
   /**
@@ -872,18 +1165,35 @@ clean result I did not observe.`;
     return verdict.newFailures.some(s => s.includes(rel) && syntaxish.test(s));
   }
 
-  private async rollback(extra: TaskExtra, abs: string): Promise<boolean> {
+  /**
+   * Restore a file to its state at the start of this task — but only if it
+   * still holds exactly what this task last wrote. Several tasks may be
+   * working in the checkout at once; a file that has moved on since our edit
+   * belongs to whoever moved it, and overwriting that with our pre-image would
+   * erase their work to undo ours.
+   */
+  private async rollback(extra: TaskExtra, abs: string): Promise<'restored' | 'changed-by-other' | 'unavailable'> {
     const pre = extra.preImages.get(abs);
-    if (pre === undefined) return false;
+    const post = extra.postImages.get(abs);
+    if (pre === undefined) return 'unavailable';
     try {
       const fs = await this.hostFs();
+      if (post !== undefined) {
+        const now = await this.call<{ content: string }>(fs, 'readFile', { path: abs, maxBytes: 0 }, 60_000);
+        if (now.content !== post) {
+          this.audit(extra, `rollback of ${this.displayPath(extra, abs)} skipped — changed by another task since our edit`);
+          return 'changed-by-other';
+        }
+      }
       await this.call(fs, 'writeFile', { path: abs, content: pre }, 60_000);
+      extra.postImages.set(abs, pre);
       extra.filesModified.delete(abs);
       extra.mutationsSinceVerify = Math.max(0, extra.mutationsSinceVerify - 1);
       this.audit(extra, `rolled back ${this.displayPath(extra, abs)}`);
-      return true;
+      this.announceFilesTouched(extra);
+      return 'restored';
     } catch {
-      return false;
+      return 'unavailable';
     }
   }
 
@@ -993,14 +1303,21 @@ clean result I did not observe.`;
       };
     }
 
+    // The verify baseline may still be running in the background; a verdict
+    // needs it, so this is the one place that waits for it.
+    if (full && extra.verifyBaseline && !extra.verifyBaseline.done) {
+      this.reportProgress(extra, 'acting', 'waiting for the baseline verify run to finish');
+      await extra.verifyBaseline.promise;
+    }
+
     this.reportProgress(extra, 'acting', `verify: ${command}`);
     const outcome = await this.captureOutcome(extra, command, VERIFY_TIMEOUT_MS);
     const baseline = full ? (extra.baseline?.verify ?? extra.baseline?.check) : extra.baseline?.check;
-    const verdict = this.judge(outcome, baseline);
+    const verdict = this.judge(outcome, baseline, this.touchedFiles(extra));
 
     if (full) extra.lastVerify = verdict; else extra.lastCheck = verdict;
     if (verdict.passed) extra.mutationsSinceVerify = 0;
-    this.audit(extra, `verify(${full ? 'full' : 'check'}) exit=${outcome.exitCode} new=${verdict.newFailures.length}`);
+    this.audit(extra, `verify(${full ? 'full' : 'check'}) exit=${outcome.exitCode} new=${verdict.newFailures.length} foreign=${verdict.foreignFailures.length}${verdict.inconclusive ? ' inconclusive' : ''}`);
 
     return { success: true, data: this.renderVerdict(verdict) };
   }
@@ -1022,7 +1339,18 @@ clean result I did not observe.`;
     await this.setDefaultCwd(extra);
     await this.captureBaseline(extra);
     await this.checkpoint(extra, 'task start');
-    return { success: true, data: `Working in ${project.name} at ${extra.workRoot}.\n${this.baselineSummary(extra)}` };
+    this.announceTaskStarted(extra);
+    const others = await this.siblings(extra);
+    const siblingLine = others.length > 0 ? `\n${this.renderSiblings(others)}` : '';
+    return { success: true, data: `Working in ${project.name} at ${extra.workRoot}.\n${this.baselineSummary(extra)}${siblingLine}` };
+  }
+
+  private renderSiblings(others: Array<{ taskId: string; goalId?: string; description?: string; files: string[] }>): string {
+    const lines = others.map(t => {
+      const files = t.files.length > 0 ? ` — has written: ${t.files.slice(0, 12).join(', ')}${t.files.length > 12 ? ', …' : ''}` : ' — no files written yet';
+      return `- ${t.taskId.slice(0, 8)}${t.goalId ? ` (goal ${t.goalId.slice(0, 8)})` : ''}: ${t.description ?? '(no description)'}${files}`;
+    });
+    return `${others.length} other task(s) are working in this project right now. Stay out of the files they have written unless your task requires it; failures in files you did not write are reported as theirs.\n${lines.join('\n')}`;
   }
 
   private async opCall(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
@@ -1087,6 +1415,17 @@ clean result I did not observe.`;
       };
     }
 
+    if (latest.inconclusive) {
+      return {
+        ok: false,
+        reason:
+          `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and its failures could not be attributed ` +
+          `(no recognized failure line was new${latest.outcome.failureCount !== undefined ? `, yet it reports ${latest.outcome.failureCount} failure(s)` : ''}). ` +
+          `Read its output, fix or explain what failed, and run verify again.`,
+        note: `${changed} file(s) changed, verification inconclusive.`,
+      };
+    }
+
     if (!latest.passed) {
       return {
         ok: false,
@@ -1097,12 +1436,15 @@ clean result I did not observe.`;
       };
     }
 
+    const foreign = latest.foreignFailures.length > 0
+      ? ` ${latest.foreignFailures.length} new failure(s) in files this task did not write are attributed to concurrent work.`
+      : '';
     return {
       ok: true,
       note:
         `${changed} file(s) changed; \`${latest.outcome.command}\` exited ${latest.outcome.exitCode}` +
         (latest.preExisting > 0 ? ` with ${latest.preExisting} pre-existing failure(s) untouched` : '') +
-        `, no new failures.`,
+        `, no new failures in files this task wrote.${foreign}`,
     };
   }
 
@@ -1318,6 +1660,8 @@ clean result I did not observe.`;
       filesRead: new Set(),
       filesModified: new Set(),
       preImages: new Map(),
+      postImages: new Map(),
+      instructionDirsSeen: new Set(),
       mutationsSinceVerify: 0,
       checkpoints: [],
       audit: [],
@@ -1333,6 +1677,7 @@ clean result I did not observe.`;
         await this.setDefaultCwd(extra);
         await this.captureBaseline(extra);
         await this.checkpoint(extra, 'task start');
+        this.announceTaskStarted(extra);
       }
 
       const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
@@ -1349,12 +1694,16 @@ clean result I did not observe.`;
         initialMessages.push({ role: 'assistant', content: `I will proceed as follows: ${args.approach}` });
       }
 
+      // The project block (commands, trust, the project's own instruction
+      // files) is identical for every task in the same project, so it rides
+      // in the system prompt, ahead of the cache breakpoint, and is read once
+      // per project per cache window rather than once per task.
+      const projectBlock = await this.buildProjectBlock(extra);
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId: args.taskId,
           task: args.taskText,
-          systemPrompt: this.buildSystemPrompt(),
-          taskPrompt: await this.buildTaskPrompt(extra),
+          systemPrompt: projectBlock ? `${this.buildSystemPrompt()}\n\n${projectBlock}` : this.buildSystemPrompt(),
           goalId: args.goalId,
           dispatchTupleId: args.tupleId,
           initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
@@ -1373,6 +1722,7 @@ clean result I did not observe.`;
       try { await this.writeSessionSummary(extra, message, { ok: false, note: message }); } catch { /* best effort */ }
       return { success: false, error: message };
     } finally {
+      this.announceTaskFinished(extra);
       try { await this.teardownIsolation(extra); } catch { /* leave the worktree in place */ }
       // Permissions granted "for this task" end with the task. They also time
       // out on their own, but a task that finishes should not leave a standing
@@ -1483,6 +1833,9 @@ clean result I did not observe.`;
 
         const status = extra.project.vcs === 'git' ? await this.gitStatusLine(extra) : undefined;
         if (status) lines.push(status);
+
+        const others = await this.siblings(extra);
+        if (others.length > 0) lines.push(`\n${this.renderSiblings(others)}`);
 
         const prior = await this.readGoalData<{ summary?: string }>(extra, SESSION_KEY);
         if (prior?.summary) {
@@ -1644,10 +1997,11 @@ Emit ONE JSON action per turn in a \`\`\`json code block, and nothing else. Inde
 1. **Find before reading.** grep and find cost one step and point at exact lines; reading whole files to look for something costs many.
 2. **Write the whole change, then let it be checked.** Put every edit to a file in ONE edit call. Across turns, mark every edit but the last with "more": true to keep the set open, then drop it on the last one.
 3. **Checks run themselves.** When an edit set closes, this project's check command runs automatically and its verdict comes back on that same action. Do not spend a step running it yourself.
-4. **You are judged against a baseline.** Failures that existed before you started are not yours and never block you. Failures you introduce do.
-5. **done has to be earned.** A claim of done with unverified changes is rejected and handed back. Run verify first.
+4. **You are judged against a baseline, on the files you wrote.** Failures that existed before you started are not yours and never block you. Failures you introduce in files you wrote do. Other tasks may be working in this project at the same time: your first observation lists them and what they have written, and new failures in files you did not write are reported as theirs.
+5. **done has to be earned.** A claim of done with unverified changes is rejected and handed back. When the project's check is also its verification, a passing check after your last edit already satisfies this; when it declares a heavier verify command, run verify.
 6. **Say what you did not verify.** When a project declares no commands, there is nothing to run — report exactly what you changed and that it was not verified. Never let silence imply a pass.
 7. **Keep oldText small.** Just enough context to be unique, no padding.
+8. **Delegation is a message to any object.** Anything you cannot do yourself, some Abject can — a capability, a service, or another agent, all reached the same way. Ask the Registry what provides it ({"action":"call","target":"Registry","method":"ask","payload":{"question":"which object ...?"}}), ask that object how it wants to be called, then message it with a self-contained task; its report comes back as your call result. Inside a submit_job the same discovery is dep(name) / find(name). Other objects may message your runTask the same way.
 
 Report in your done result: what changed, which command proved it, and anything you could not check.`;
   }
@@ -1658,7 +2012,7 @@ Report in your done result: what changed, which command proved it, and anything 
    * an instruction file is text written by whoever wrote the repository, and
    * injecting it is exactly as consequential as running its code.
    */
-  private async buildTaskPrompt(extra: TaskExtra): Promise<string | undefined> {
+  private async buildProjectBlock(extra: TaskExtra): Promise<string | undefined> {
     const project = extra.project;
     if (!project) return undefined;
 
