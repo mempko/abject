@@ -125,6 +125,26 @@ export interface CapabilityRestriction {
 // Object Manifest
 // =============================================================================
 
+/**
+ * Object lifecycle taxonomy — how far a copy of this object may travel when
+ * its workspace is shared with peers.
+ *
+ *  - 'shared-live'  Catalogued to peers AND reachable live: each peer learns a
+ *                   route to the owner and PeerRouter carries every
+ *                   send/request across the wire to the one live instance.
+ *                   Nothing stands in locally — the id simply resolves to a
+ *                   route rather than a mailbox. One authoritative instance,
+ *                   many callers. The default, so manifests are unchanged.
+ *  - 'replicated'   Catalogued so peers can see and copy it, but deliberately
+ *                   NOT routed: a peer forks a snapshot that then diverges
+ *                   independently, with lineage recording where it came from.
+ *  - 'user-local'   Private. Never enters a catalog, never crosses the wire.
+ */
+export type SharingPolicy = 'shared-live' | 'replicated' | 'user-local';
+
+/** The policy assumed for manifests that declare none. */
+export const DEFAULT_SHARING_POLICY: SharingPolicy = 'shared-live';
+
 export interface AbjectManifest {
   name: string;
   description: string;
@@ -149,7 +169,24 @@ export interface AbjectManifest {
     clonedFrom: string;
     /** 1 for a clone of an original, parent.generation + 1 otherwise. */
     generation: number;
+    /** Peer that owned the ancestor, when the copy crossed a peer boundary. */
+    originPeerId?: string;
+    /** Workspace the ancestor lived in, when known. */
+    originWorkspaceId?: string;
+    /** Display name of that workspace, so UIs can show it without a lookup. */
+    originWorkspaceName?: string;
+    /** Wall-clock time the snapshot fork was taken. */
+    forkedAt?: number;
+    /** True when the copy was forked across peers rather than cloned locally. */
+    forkedFromRemote?: boolean;
   };
+
+  /**
+   * Declarative sharing policy (see SharingPolicy). Absent means
+   * DEFAULT_SHARING_POLICY, so manifests written before this field keep
+   * behaving exactly as they did.
+   */
+  sharing?: SharingPolicy;
 }
 
 // =============================================================================
@@ -210,6 +247,13 @@ export interface ObjectRegistration {
   status: AbjectStatus;
   registeredAt: number;
   owner?: AbjectId;
+  /**
+   * Set when this entry describes an object owned by a REMOTE peer's workspace
+   * (remote-pooled via WorkspaceRegistry.registerRemote). Absent for locally
+   * owned objects and for global-fallback entries. Display layers use it to
+   * tell provenance apart; it does not affect resolution or reachability.
+   */
+  ownerPeerId?: string;
   source?: string;
   data?: Record<string, unknown>;
 }
