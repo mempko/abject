@@ -550,7 +550,7 @@ discovered, the browser rebuilds automatically if it is visible.
     const publicPeers = new Map<string, DiscoveredWorkspace[]>();
     const privatePeers = new Map<string, DiscoveredWorkspace[]>();
     for (const ws of this.cachedWorkspaces) {
-      const target = ws.accessMode === 'private' ? privatePeers : publicPeers;
+      const target = ws.accessMode === 'shared' ? privatePeers : publicPeers;
       const group = target.get(ws.ownerPeerId);
       if (group) group.push(ws);
       else target.set(ws.ownerPeerId, [ws]);

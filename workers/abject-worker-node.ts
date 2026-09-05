@@ -89,6 +89,7 @@ import { HttpServer } from '../src/objects/http-server.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
 import { WebAgent } from '../src/objects/web-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
+import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collaborator-inspector.js';
 import { Organism } from '../src/objects/organism.js';
 import type { OrganismSpec } from '../src/objects/organism.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
@@ -208,6 +209,7 @@ constructors.set('HttpServer', () => new HttpServer());
 constructors.set('SharedState', () => new SharedState());
 constructors.set('WebAgent', () => new WebAgent());
 constructors.set('WorkspaceBrowser', () => new WorkspaceBrowser());
+constructors.set('WorkspaceCollaboratorInspector', () => new WorkspaceCollaboratorInspector());
 constructors.set('ScriptableAbject', (args?: unknown) => {
   const opts = args as {
     manifest: AbjectManifest;

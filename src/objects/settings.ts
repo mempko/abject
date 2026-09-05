@@ -69,12 +69,27 @@ export class Settings extends Abject {
   private accessStatusLabelId?: AbjectId;
   private accessSearchInputId?: AbjectId;
   private accessSearchText = '';
+  private identityId?: AbjectId;
+  private clipboardId?: AbjectId;
+  private shareLinkText = '';
+  private copyShareLinkBtnId?: AbjectId;
+  private invitePeerInputId?: AbjectId;
+  private invitePeerBtnId?: AbjectId;
+  private inviteStatusLabelId?: AbjectId;
+  private invitedPeersRevokeButtons: Map<AbjectId, string> = new Map();
 
   /** Pending access mode from dropdown change (used during tab rebuild). */
   private pendingAccessMode?: string;
 
   /** Delete workspace button in Danger Zone section. */
   private deleteWorkspaceBtnId?: AbjectId;
+
+  /**
+   * Whether the active workspace is one joined from a peer rather than one we
+   * own. Decided while the Danger Zone is built and read by the button's click
+   * handler, so a single button drives either "Leave" or "Delete".
+   */
+  private activeWorkspaceIsJoined = false;
 
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
@@ -149,6 +164,8 @@ export class Settings extends Abject {
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
+    this.identityId = await this.discoverDep('Identity') ?? undefined;
+    this.clipboardId = await this.discoverDep('Clipboard') ?? undefined;
   }
 
   protected override askPrompt(_question: string): string {
@@ -246,6 +263,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.deleteWorkspaceBtnId = undefined;
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
+    this.copyShareLinkBtnId = undefined;
+    this.invitePeerInputId = undefined;
+    this.invitePeerBtnId = undefined;
+    this.inviteStatusLabelId = undefined;
+    this.invitedPeersRevokeButtons.clear();
     this.objectDeleteButtons.clear();
     this.whitelistCheckboxes.clear();
     this.whitelistContainerId = undefined;
@@ -330,8 +352,48 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
         return;
       }
 
+      // Copy share link button
+      if (fromId === this.copyShareLinkBtnId && aspect === 'click') {
+        if (!this.clipboardId) {
+          this.clipboardId = await this.discoverDep('Clipboard') ?? undefined;
+        }
+        if (this.clipboardId && this.shareLinkText) {
+          try {
+            await this.request(
+              request(this.id, this.clipboardId, 'write', { text: this.shareLinkText })
+            );
+            if (this.inviteStatusLabelId) {
+              await this.request(
+                request(this.id, this.inviteStatusLabelId, 'update', {
+                  text: 'Share link copied to clipboard!',
+                  style: { color: this.theme.textHeading },
+                })
+              );
+            }
+          } catch { /* clipboard write failed */ }
+        }
+        return;
+      }
+
+      // Invite peer button
+      if (fromId === this.invitePeerBtnId && aspect === 'click') {
+        await this.handleInvitePeer();
+        return;
+      }
+
+      // Revoke invited peer button
+      if (fromId && this.invitedPeersRevokeButtons.has(fromId) && aspect === 'click') {
+        const peerId = this.invitedPeersRevokeButtons.get(fromId)!;
+        await this.handleRevokePeer(peerId);
+        return;
+      }
+
       // Text input submit triggers save
       if (aspect === 'submit') {
+        if (fromId === this.invitePeerInputId) {
+          await this.handleInvitePeer();
+          return;
+        }
         if (this.activeTab === 'general') {
           await this.saveGeneralSettings();
         } else {
@@ -342,7 +404,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
       // Delete workspace button
       if (fromId === this.deleteWorkspaceBtnId && aspect === 'click') {
-        await this.handleDeleteWorkspace();
+        if (this.activeWorkspaceIsJoined) {
+          await this.handleLeaveWorkspace();
+        } else {
+          await this.handleDeleteWorkspace();
+        }
         return;
       }
 
@@ -364,7 +430,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
       // Access mode dropdown change — rebuild the entire tab for clean layout
       if (fromId === this.accessModeSelectId && aspect === 'change') {
-        const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
+        const modeMap: Record<string, string> = { 'Local': 'local', 'Shared': 'shared', 'Public': 'public' };
         const newMode = modeMap[value as string] ?? 'local';
         // Stash the selected mode so buildAccessTab picks it up
         this.pendingAccessMode = newMode;
@@ -610,16 +676,60 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       } catch { /* default to local */ }
     }
 
+    // P2-3: a public workspace the user never curated publishes nothing beyond
+    // the registry itself. That is a safe default but an invisible one, so the
+    // Access tab has to say it out loud rather than show an empty whitelist
+    // that looks like a rendering failure. WorkspaceManager stamps the flag on
+    // every record it lists (`uncuratedPublic`).
+    let uncuratedPublic = false;
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        const detailed = await this.request<Array<{ workspaceId: string; uncuratedPublic?: boolean }>>(
+          request(this.id, this.workspaceManagerId, 'listWorkspacesDetailed', {})
+        );
+        const mine = Array.isArray(detailed)
+          ? detailed.find((w) => w.workspaceId === this.workspaceId)
+          : undefined;
+        uncuratedPublic = mine?.uncuratedPublic === true;
+      } catch { /* absent flag simply means no notice */ }
+    }
+
     const cId = this.tabContentContainerId!;
 
+    // A joined workspace is a local mirror of one a peer hosts. It deliberately
+    // keeps `accessMode: 'local'` so restart recovery never re-advertises it as
+    // ours (see WorkspaceInfo.joined), which makes the mode alone misleading
+    // here: the editable "Local" select would invite the user to change access
+    // on a workspace they do not own. Present read-only joined status instead.
+    let joinedOwnerPeerId: string | undefined;
+    let isJoinedWorkspace = false;
+    if (this.workspaceManagerId) {
+      try {
+        const active = await this.request<{ id: string; joined?: boolean; ownerPeerId?: string } | null>(
+          request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
+        );
+        // Settings is per-workspace, so only borrow the active record's
+        // `joined` when the active workspace is in fact this tab's workspace.
+        if (active && active.joined === true && (!this.workspaceId || active.id === this.workspaceId)) {
+          isJoinedWorkspace = true;
+          joinedOwnerPeerId = active.ownerPeerId;
+        }
+      } catch { /* fall back to the editable presentation */ }
+    }
+
+    if (isJoinedWorkspace) {
+      await this.buildJoinedAccessSection(cId, joinedOwnerPeerId);
+      return;
+    }
+
     // Batch-create all Access tab header widgets
-    const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
+    const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'shared' ? 1 : 0;
     const { widgetIds: [sectionHeaderId, descLabelId, accessLabelId, accessSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId, text: 'Control who can access this workspace over the network.', style: { color: this.theme.textDescription, fontSize: 12 } },
         { type: 'label', windowId: this.windowId, text: 'Access Mode', style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'select', windowId: this.windowId, options: ['Local', 'Private', 'Public'], selectedIndex: accessModeIndex },
+        { type: 'select', windowId: this.windowId, options: ['Local', 'Shared', 'Public'], selectedIndex: accessModeIndex },
       ] })
     );
     this.trackTabWidget(sectionHeaderId);
@@ -669,23 +779,36 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       sizePolicy: { vertical: 'preferred' },
     }));
 
-    if (currentAccessMode === 'private') {
-      await this.buildWhitelistSection(r0);
-      // Set preferred height based on content: divider(1) + spacing(8) + header(20) + spacing(8) + desc(18) + spacing(8)
-      // plus either "no contacts" label(18) or contact rows(28 each with 8px spacing between)
-      const itemCount = this.whitelistCheckboxes.size;
-      const baseHeight = 1 + 8 + 20 + 8 + 18 + 8;
+    if (currentAccessMode === 'shared') {
+      await this.buildSharedAccessSection(r0);
+      // Set preferred height based on content:
+      // divider(1) + spacing(8) + header(20) + spacing(8) + desc(18) + spacing(8) +
+      // shareRow(32) + spacing(8) + inviteRow(32) + spacing(8) + statusLabel(16) + spacing(8) +
+      // peersHeader(18) + spacing(8) plus either "no peers" label(18) or peer rows(26 each with 8px spacing)
+      const itemCount = this.invitedPeersRevokeButtons.size;
+      const baseHeight = 1 + 8 + 20 + 8 + 18 + 8 + 32 + 8 + 32 + 8 + 16 + 8 + 18 + 8;
       const itemsHeight = itemCount === 0
-        ? 18  // "no contacts" label
-        : (itemCount * 28) + ((itemCount - 1) * 8);
+        ? 18  // "no peers" label
+        : (itemCount * 26) + ((itemCount - 1) * 8);
       await this.request(request(this.id, cId, 'updateLayoutChild', {
         widgetId: this.whitelistContainerId,
         preferredSize: { height: baseHeight + itemsHeight },
       }));
+    } else {
+      await this.request(request(this.id, cId, 'updateLayoutChild', {
+        widgetId: this.whitelistContainerId,
+        preferredSize: { height: 0 },
+      }));
     }
 
-    // ── Search input for exposed objects (hidden in local mode) ──
-    const searchVisible = currentAccessMode !== 'local';
+    // ── Search input for the exposed-objects whitelist ──
+    // Only the modes that still curate an explicit list have a list to search.
+    // A 'shared' workspace exposes everything automatically and shows a notice
+    // in place of the editor, so there are no checkboxes to filter.
+    const searchVisible = currentAccessMode === 'public';
+    // The container itself still holds content in 'shared' (the notice), so its
+    // height must not be tied to the search box's visibility.
+    const exposedVisible = currentAccessMode !== 'local';
     const { widgetIds: [searchId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, placeholder: 'Search objects...', style: { visible: searchVisible } },
@@ -709,16 +832,63 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.exposedContainerId,
-      sizePolicy: { vertical: searchVisible ? 'expanding' : 'fixed', horizontal: 'expanding' },
-      preferredSize: searchVisible ? undefined : { height: 0 },
+      sizePolicy: { vertical: exposedVisible ? 'expanding' : 'fixed', horizontal: 'expanding' },
+      preferredSize: exposedVisible ? undefined : { height: 0 },
     }));
 
-    if (currentAccessMode !== 'local') {
+    // 'public' offers an unauthenticated joiner only what the user explicitly
+    // named, so it keeps the whitelist editor. 'shared' exposes every non-system abject
+    // automatically, so an editable list there would imply a gate that no
+    // longer exists — state the rule instead of offering a control that does
+    // nothing.
+    if (currentAccessMode === 'shared') {
+      await this.buildSharedExposureNotice();
+    } else if (currentAccessMode !== 'local') {
+      // P2-3: public-but-never-curated shares nothing. Say so above the editor.
+      if (currentAccessMode === 'public' && uncuratedPublic) {
+        await this.buildUncuratedPublicNotice();
+      }
       await this.buildExposedObjectsSection(r0);
     }
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'access');
+  }
+
+  /**
+   * Render the Access tab for a workspace we joined rather than host: read-only
+   * shared status in place of the access-mode select. No save row, because
+   * there is nothing here we may write — the owning peer controls this
+   * workspace's access, and `saveAccessSettings` skips the mode/whitelist/
+   * exposed writes entirely while `accessModeSelectId` stays undefined.
+   */
+  private async buildJoinedAccessSection(cId: AbjectId, ownerPeerId?: string): Promise<void> {
+    const ownerText = ownerPeerId
+      ? `Hosted by peer ${ownerPeerId.slice(0, 16)} — access is managed by its owner.`
+      : 'Hosted by another peer — access is managed by its owner.';
+    const { widgetIds: [headerId, descId, statusId, ownerId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'This workspace is shared with you by another peer.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: '\uD83D\uDC65 Joined shared workspace', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: ownerText, style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+
+    const rows: Array<{ widgetId: AbjectId; height: number }> = [
+      { widgetId: headerId, height: 24 },
+      { widgetId: descId, height: 18 },
+      { widgetId: statusId, height: 20 },
+      { widgetId: ownerId, height: 18 },
+    ];
+    for (const { widgetId, height } of rows) {
+      this.trackTabWidget(widgetId);
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height },
+      }));
+    }
   }
 
   /**
@@ -841,11 +1011,358 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     }
     this.whitelistWidgetIds = [];
     this.whitelistCheckboxes.clear();
+    this.invitedPeersRevokeButtons.clear();
+  }
+
+  /**
+   * Build the Share Link & Peer Invite section for Shared access mode.
+   */
+  private async buildSharedAccessSection(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    const containerId = this.whitelistContainerId!;
+    await this.ensureWorkspaceId();
+
+    // Resolve local peer ID
+    let localPeerId = '';
+    if (!this.identityId) {
+      this.identityId = await this.discoverDep('Identity') ?? undefined;
+    }
+    if (this.identityId) {
+      try {
+        const idInfo = await this.request<{ peerId: string; name: string }>(
+          request(this.id, this.identityId, 'getIdentity', {})
+        );
+        if (idInfo?.peerId) localPeerId = idInfo.peerId;
+      } catch { /* identity not ready */ }
+    }
+    if (!localPeerId && this.peerRegistryId) {
+      try {
+        const status = await this.request<{ localPeerId?: string }>(
+          request(this.id, this.peerRegistryId, 'getStatus', {})
+        );
+        if (status?.localPeerId) localPeerId = status.localPeerId;
+      } catch { /* peer registry status failed */ }
+    }
+
+    const wsId = this.workspaceId || 'default';
+    this.shareLinkText = localPeerId ? `abject://${localPeerId}/${wsId}` : `abject://${wsId}`;
+
+    // Header widgets
+    const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: 'Share & Invite', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Share this link with peers or invite them by Peer ID to access this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+    this.whitelistWidgetIds.push(divId, headerLabelId, descId);
+
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: divId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: headerLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Share link row (HBox)
+    const shareRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: containerId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    this.whitelistWidgetIds.push(shareRowId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: shareRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [linkInputId, copyBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, text: this.shareLinkText, placeholder: 'Share link' },
+        { type: 'button', windowId: this.windowId, text: 'Copy Link', style: { background: this.theme.accent, color: '#ffffff' } },
+      ] })
+    );
+    this.whitelistWidgetIds.push(linkInputId, copyBtnId);
+    this.copyShareLinkBtnId = copyBtnId;
+    await this.request(request(this.id, this.copyShareLinkBtnId, 'addDependent', {}));
+
+    await this.request(request(this.id, shareRowId, 'addLayoutChild', {
+      widgetId: linkInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+    await this.request(request(this.id, shareRowId, 'addLayoutChild', {
+      widgetId: copyBtnId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { width: 90, height: 30 },
+    }));
+
+    // Invite peer row (HBox)
+    const inviteRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: containerId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    this.whitelistWidgetIds.push(inviteRowId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: inviteRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [inviteInputId, inviteBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Enter Peer ID or address to invite...' },
+        { type: 'button', windowId: this.windowId, text: 'Invite', style: { background: this.theme.buttonBg, color: this.theme.textHeading } },
+      ] })
+    );
+    this.whitelistWidgetIds.push(inviteInputId, inviteBtnId);
+    this.invitePeerInputId = inviteInputId;
+    this.invitePeerBtnId = inviteBtnId;
+    await this.request(request(this.id, this.invitePeerInputId, 'addDependent', {}));
+    await this.request(request(this.id, this.invitePeerBtnId, 'addDependent', {}));
+
+    await this.request(request(this.id, inviteRowId, 'addLayoutChild', {
+      widgetId: inviteInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+    await this.request(request(this.id, inviteRowId, 'addLayoutChild', {
+      widgetId: inviteBtnId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { width: 70, height: 30 },
+    }));
+
+    // Status label
+    const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 11 } },
+      ] })
+    );
+    this.whitelistWidgetIds.push(statusLabelId);
+    this.inviteStatusLabelId = statusLabelId;
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 16 },
+    }));
+
+    // Whitelisted/Invited Peers list header
+    const { widgetIds: [peersHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Invited Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 12 } },
+      ] })
+    );
+    this.whitelistWidgetIds.push(peersHeaderId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: peersHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Get current whitelist from workspace manager
+    let whitelist: string[] = [];
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        whitelist = await this.request<string[]>(
+          request(this.id, this.workspaceManagerId, 'getWhitelist', { workspaceId: this.workspaceId })
+        );
+      } catch { /* whitelist query failed */ }
+    }
+
+    if (whitelist.length === 0) {
+      const { widgetIds: [noPeersId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'No peers invited yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        ] })
+      );
+      this.whitelistWidgetIds.push(noPeersId);
+      await this.request(request(this.id, containerId, 'addLayoutChild', {
+        widgetId: noPeersId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+    } else {
+      for (const peerId of whitelist) {
+        const displayName = peerId.length > 24 ? peerId.slice(0, 20) + '...' : peerId;
+        const rowId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+            parentLayoutId: containerId,
+            margins: { top: 0, right: 0, bottom: 0, left: 0 },
+            spacing: 8,
+          })
+        );
+        this.whitelistWidgetIds.push(rowId);
+        await this.request(request(this.id, containerId, 'addLayoutChild', {
+          widgetId: rowId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 26 },
+        }));
+
+        const { widgetIds: [peerLabelId, revokeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Revoke', style: { background: this.theme.buttonBg, color: this.theme.destructiveText ?? '#e06c75', fontSize: 11 } },
+          ] })
+        );
+        this.whitelistWidgetIds.push(peerLabelId, revokeBtnId);
+        this.invitedPeersRevokeButtons.set(revokeBtnId, peerId);
+        await this.request(request(this.id, revokeBtnId, 'addDependent', {}));
+
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: peerLabelId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 24 },
+        }));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: revokeBtnId,
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { width: 65, height: 24 },
+        }));
+      }
+    }
+  }
+
+  /**
+   * Handle inviting a peer by ID/address in Shared mode.
+   */
+  private async handleInvitePeer(): Promise<void> {
+    if (!this.invitePeerInputId || !this.workspaceManagerId || !this.workspaceId) return;
+    try {
+      const peerInput = (await this.request<string>(
+        request(this.id, this.invitePeerInputId, 'getValue', {})
+      ) || '').trim();
+      if (!peerInput) return;
+
+      let whitelist = await this.request<string[]>(
+        request(this.id, this.workspaceManagerId, 'getWhitelist', { workspaceId: this.workspaceId })
+      );
+      if (!whitelist.includes(peerInput)) {
+        whitelist = [...whitelist, peerInput];
+        await this.request(
+          request(this.id, this.workspaceManagerId, 'setWhitelist', {
+            workspaceId: this.workspaceId,
+            whitelist,
+          })
+        );
+      }
+
+      await this.clearTabContent();
+      const r0 = { x: 0, y: 0, width: 0, height: 0 };
+      await this.buildAccessTab(r0);
+    } catch { /* invite peer failed */ }
+  }
+
+  /**
+   * Handle revoking an invited peer from the whitelist in Shared mode.
+   */
+  private async handleRevokePeer(peerId: string): Promise<void> {
+    if (!this.workspaceManagerId || !this.workspaceId) return;
+    try {
+      let whitelist = await this.request<string[]>(
+        request(this.id, this.workspaceManagerId, 'getWhitelist', { workspaceId: this.workspaceId })
+      );
+      whitelist = whitelist.filter(id => id !== peerId);
+      await this.request(
+        request(this.id, this.workspaceManagerId, 'setWhitelist', {
+          workspaceId: this.workspaceId,
+          whitelist,
+        })
+      );
+
+      await this.clearTabContent();
+      const r0 = { x: 0, y: 0, width: 0, height: 0 };
+      await this.buildAccessTab(r0);
+    } catch { /* revoke peer failed */ }
   }
 
   /**
    * Build the exposed objects section showing workspace objects as checkboxes.
    */
+  /**
+   * The 'shared' counterpart to the Exposed Objects whitelist.
+   *
+   * A shared workspace is collaborative among invited members, so every
+   * non-system abject in it reaches them automatically and there is no list to
+   * curate. Rendering an editable whitelist here would suggest a gate that the
+   * catalog no longer consults, and every object the user never ticked would
+   * look withheld when in fact it is shared. Explain the rule instead.
+   */
+  private async buildSharedExposureNotice(): Promise<void> {
+    const containerId = this.exposedContainerId!;
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: 'Exposed Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'All workspace abjects are shared automatically with members.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Objects you create here become available to everyone you invite, with', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'no list to maintain. System objects belonging to this desktop (Taskbar,', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Settings, Storage and other infrastructure) always stay local.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Switch to Public to choose individual objects instead.', style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+    this.exposedWidgetIds.push(...widgetIds);
+
+    // divider, heading, then one row per line of body text.
+    const heights = [1, 20, 18, 18, 18, 18, 18];
+    for (let i = 0; i < widgetIds.length; i++) {
+      await this.request(request(this.id, containerId, 'addLayoutChild', {
+        widgetId: widgetIds[i],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: heights[i] ?? 18 },
+      }));
+    }
+  }
+
+  /**
+   * P2-3: notice for a PUBLIC workspace whose exposure list the user has never
+   * curated.
+   *
+   * Such a workspace no longer publishes its whole catalog — it publishes the
+   * registry and nothing else. Without a word here the whitelist below simply
+   * shows every box unticked, which reads as "not saved yet" rather than
+   * "deliberately sharing nothing". Render it directly above the editor that
+   * resolves it. Curated public workspaces and 'shared'/'local' never see this.
+   */
+  private async buildUncuratedPublicNotice(): Promise<void> {
+    const containerId = this.exposedContainerId!;
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: '\u26A0 Nothing is shared yet', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'This workspace is Public but no objects have been chosen, so remote', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'peers can reach its registry and nothing else. Tick the objects below', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'and save to share them.', style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+    this.exposedWidgetIds.push(...widgetIds);
+
+    // divider, heading, then one row per line of body text.
+    const heights = [1, 20, 18, 18, 18];
+    for (let i = 0; i < widgetIds.length; i++) {
+      await this.request(request(this.id, containerId, 'addLayoutChild', {
+        widgetId: widgetIds[i],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: heights[i] ?? 18 },
+      }));
+    }
+  }
+
   private async buildExposedObjectsSection(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
     const containerId = this.exposedContainerId!;
 
@@ -1249,7 +1766,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
         const selectedValue = await this.request<string>(
           request(this.id, this.accessModeSelectId, 'getValue', {})
         );
-        const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
+        const modeMap: Record<string, string> = { 'Local': 'local', 'Shared': 'shared', 'Public': 'public' };
         const accessMode = modeMap[selectedValue] ?? 'local';
         await this.request(
           request(this.id, this.workspaceManagerId, 'setAccessMode', {
@@ -1258,8 +1775,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
           })
         );
 
-        // Save whitelist if in private mode
-        if (accessMode === 'private' && this.whitelistCheckboxes.size > 0) {
+        // Save whitelist if in shared mode
+        if (accessMode === 'shared' && this.whitelistCheckboxes.size > 0) {
           const whitelist: string[] = [];
           for (const [checkboxId, peerId] of this.whitelistCheckboxes) {
             try {
@@ -1307,6 +1824,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       } catch { /* access settings save failed */ }
     }
 
+    this.pendingAccessMode = undefined;
+
     // Show save feedback, then close
     const statusId = this.accessStatusLabelId;
     if (statusId) {
@@ -1343,11 +1862,29 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
     }));
 
+    // A joined workspace is not ours to delete: what we hold is a local mirror
+    // of a workspace hosted by a peer. Deleting it would tear down the mirror
+    // while leaving the share registry's joined entry pointing at it, so offer
+    // "Leave" — which releases our reference — instead.
+    this.activeWorkspaceIsJoined = false;
+    if (this.workspaceManagerId) {
+      try {
+        const active = await this.request<{ id: string; joined?: boolean } | null>(
+          request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
+        );
+        this.activeWorkspaceIsJoined = active?.joined === true;
+      } catch { /* fall back to the delete affordance */ }
+    }
+    const dangerDesc = this.activeWorkspaceIsJoined
+      ? 'Stop participating in this shared workspace and remove your local copy.'
+      : 'Permanently delete this workspace and all its objects.';
+    const dangerBtnText = this.activeWorkspaceIsJoined ? 'Leave shared workspace' : 'Delete Workspace';
+
     // Section header + description
     const { widgetIds: [headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Danger Zone', style: { color: this.theme.destructiveText, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Permanently delete this workspace and all its objects.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: dangerDesc, style: { color: this.theme.textDescription, fontSize: 12 } },
       ] })
     );
     this.trackTabWidget(headerLabelId);
@@ -1382,7 +1919,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     const { widgetIds: [deleteBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Delete Workspace', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
+        { type: 'button', windowId: this.windowId, text: dangerBtnText, style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
       ] })
     );
     this.deleteWorkspaceBtnId = this.trackTabWidget(deleteBtnId);
@@ -1444,6 +1981,67 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
         } catch { /* widget may be gone */ }
       }
       await this.notify(`Delete failed: ${msg.slice(0, 80)}`, 'error');
+      if (this.deleteWorkspaceBtnId) {
+        this.send(event(this.id, this.deleteWorkspaceBtnId, 'update', { busy: false }));
+      }
+    }
+  }
+
+  /**
+   * Handle "Leave shared workspace" click: confirm, then release this
+   * instance's reference to the joined workspace.
+   *
+   * Releasing is not deleting. The workspace is reference-counted across its
+   * participants and lives on with its host; what goes away is our local
+   * mirror, along with the share registry's joined entry for it.
+   */
+  private async handleLeaveWorkspace(): Promise<void> {
+    await this.ensureWorkspaceId();
+    if (!this.workspaceManagerId || !this.workspaceId) return;
+
+    let workspaceName = 'this workspace';
+    try {
+      const active = await this.request<{ id: string; name: string } | null>(
+        request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
+      );
+      if (active) workspaceName = active.name;
+    } catch { /* use fallback */ }
+
+    const confirmed = await this.confirm({
+      title: 'Leave shared workspace',
+      message: `Leave "${workspaceName}"? Your local copy is removed. The workspace itself stays with its host and any other participants.`,
+      confirmLabel: 'Leave',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    if (this.deleteWorkspaceBtnId) {
+      this.send(event(this.id, this.deleteWorkspaceBtnId, 'update', { busy: true }));
+    }
+    try {
+      await this.request(
+        request(this.id, this.workspaceManagerId, 'releaseJoinedWorkspace', {
+          workspaceId: this.workspaceId,
+          destroy: true,
+        })
+      );
+      await this.notify(`Left workspace "${workspaceName}"`, 'success');
+      await this.hide();
+    } catch (err) {
+      // Guard: releasing the workspace may have destroyed us mid-handler.
+      if (this._status === 'stopped') return;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (this.statusLabelId) {
+        try {
+          await this.request(
+            request(this.id, this.statusLabelId, 'update', {
+              text: msg.slice(0, 60),
+              style: { color: this.theme.statusErrorBright },
+            })
+          );
+        } catch { /* widget may be gone */ }
+      }
+      await this.notify(`Leave failed: ${msg.slice(0, 80)}`, 'error');
       if (this.deleteWorkspaceBtnId) {
         this.send(event(this.id, this.deleteWorkspaceBtnId, 'update', { busy: false }));
       }

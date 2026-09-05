@@ -113,6 +113,7 @@ import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 import { ingestAllExtensions } from '../src/sandbox/extensions.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
+import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collaborator-inspector.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
@@ -594,6 +595,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('PeerDiscovery', () => new PeerDiscoveryObject());
   runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
+  runtime.objectFactory.registerConstructor('WorkspaceCollaboratorInspector', () => new WorkspaceCollaboratorInspector());
   runtime.objectFactory.registerConstructor('WebParser', () => new WebParser());
   runtime.objectFactory.registerConstructor('WebBrowser', () => new WebBrowser());
   runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
@@ -664,7 +666,7 @@ async function main(): Promise<void> {
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
       'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
-      'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
+      'WorkspaceBrowser', 'WorkspaceCollaboratorInspector', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
       'WebBrowserViewer',
       // UI shell + workspace infrastructure — the main thread is reserved for
       // the message bus, transports, and PeerRouter (a synchronous bus
@@ -1047,6 +1049,7 @@ async function main(): Promise<void> {
   peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID, systemTypeId('WorkspaceShareRegistry'));
   peerRouterObj.announceRoutesToAll().catch(() => {});
   const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser', 'permanent', systemTypeId('WorkspaceBrowser'));
+  await supervisedSpawn('WorkspaceCollaboratorInspector', 'permanent', systemTypeId('WorkspaceCollaboratorInspector'));
 
   // ObjectCatalog: background service maintaining live cache of all registrations
   const objectCatalogId = await supervisedSpawn('ObjectCatalog', 'permanent', systemTypeId('ObjectCatalog'));

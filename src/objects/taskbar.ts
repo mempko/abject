@@ -564,6 +564,14 @@ can restore windows from the sidebar.
       request(this.id, this.registryId, 'list', {})
     );
     return allObjects.filter((obj) => {
+      // Provenance filter (display layer only). `list` unions local +
+      // remote-pooled + global-fallback entries; a remote peer's objects are
+      // the ones carrying ownerPeerId. They stay registered in this
+      // workspace's registry and remain callable over P2P — they simply are
+      // not this user's launchables, so the sidebar renders no button for
+      // them. Deliberately NOT `listLocal`: global-fallback entries have no
+      // ownerPeerId and must keep rendering.
+      if (obj.ownerPeerId) return false;
       if ((obj.manifest.tags ?? []).includes('system')) return false;
       if (!obj.manifest.interface) return false;
       const names = obj.manifest.interface.methods.map((m) => m.name);

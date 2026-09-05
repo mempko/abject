@@ -91,6 +91,7 @@ export { RemoteRegistry, REMOTE_REGISTRY_ID } from './objects/remote-registry.js
 export { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from './objects/workspace-share-registry.js';
 export type { DiscoveredWorkspace } from './objects/workspace-share-registry.js';
 export { WorkspaceBrowser, WORKSPACE_BROWSER_ID } from './objects/workspace-browser.js';
+export { WorkspaceCollaboratorInspector, WORKSPACE_COLLABORATOR_INSPECTOR_ID } from './objects/workspace-collaborator-inspector.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';

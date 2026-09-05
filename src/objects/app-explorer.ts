@@ -20,6 +20,7 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('AppExplorer');
@@ -47,6 +48,12 @@ const WIN_H = 500;
 export class AppExplorer extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
+  /**
+   * The active workspace's own registry. Peer provenance (`ownerPeerId`) exists
+   * only on WorkspaceRegistry's pooled remote entries; the global Registry's
+   * `list` never carries it, so the Shared tab must read from here.
+   */
+  private workspaceRegistryId?: AbjectId;
   private factoryId?: AbjectId;
   private workspaceManagerId?: AbjectId;
   private windowId?: AbjectId;
@@ -65,9 +72,11 @@ export class AppExplorer extends Abject {
   private kindTabBarId?: AbjectId;
   private userKindListId?: AbjectId;
   private systemKindListId?: AbjectId;
-  private activeKindTab = 0; // 0=user, 1=system
+  private sharedKindListId?: AbjectId;
+  private activeKindTab = 0; // 0=user, 1=system, 2=shared
   private userKindEntries: string[] = [];
   private systemKindEntries: string[] = [];
+  private sharedKindEntries: string[] = [];
 
   // ── Pane 2: Instance list ──
   private instancePaneVBoxId?: AbjectId;
@@ -79,9 +88,15 @@ export class AppExplorer extends Abject {
   private detailWidgetIds: AbjectId[] = [];
   private detailButtonIds: Map<AbjectId, string> = new Map();
 
+  // ── Shared workspace context (drives the optional Shared tab) ──
+  private isSharedWorkspace = false;
+  private exposedObjectIds: Set<AbjectId> = new Set();
+  private sharedOwnerNames: Map<string, string> = new Map();
+  private localOwnerName?: string;
+
   // ── Selection state ──
   private selectedKindName?: string;
-  private selectedKindIsSystem = false;
+  private selectedKindTab = 0; // tab the selected kind came from (0=user, 1=system, 2=shared)
   private selectedInstanceIndex = -1;
 
   // ── Workspace picker modal ──
@@ -148,7 +163,11 @@ export class AppExplorer extends Abject {
   }
 
   private get effectiveRegistryId(): AbjectId | undefined {
-    return this.remoteRegistryId ?? this.registryId;
+    return this.remoteRegistryId ?? this.workspaceRegistryId ?? this.registryId;
+  }
+
+  private get selectedKindIsSystem(): boolean {
+    return this.selectedKindTab === 1;
   }
 
   protected override async onInit(): Promise<void> {
@@ -200,6 +219,7 @@ export class AppExplorer extends Abject {
     this.kindTabBarId = undefined;
     this.userKindListId = undefined;
     this.systemKindListId = undefined;
+    this.sharedKindListId = undefined;
     this.instancePaneVBoxId = undefined;
     this.instanceListId = undefined;
     this.detailPaneId = undefined;
@@ -207,6 +227,7 @@ export class AppExplorer extends Abject {
     this.detailButtonIds.clear();
     this.userKindEntries = [];
     this.systemKindEntries = [];
+    this.sharedKindEntries = [];
     this.instanceEntries = [];
   }
 
@@ -214,9 +235,14 @@ export class AppExplorer extends Abject {
     const user = new Map<string, ObjectRegistration[]>();
     const system = new Map<string, ObjectRegistration[]>();
     for (const obj of this.cachedObjects) {
+      const isSystem = this.isSystemEntry(obj);
+      // Peer-owned USER abjects are the Shared tab's business, not these two.
+      // Peer-owned SYSTEM abjects are a different case: the Shared tab now turns
+      // them away, so if this tab dropped them too they would vanish from the
+      // window entirely — a peer's Registry among them. They stay here.
+      if (!isSystem && !this.isLocalEntry(obj)) continue;
       const name = obj.manifest.name;
-      const tags = obj.manifest.tags ?? [];
-      const target = tags.includes('system') ? system : user;
+      const target = isSystem ? system : user;
       const group = target.get(name);
       if (group) {
         group.push(obj);
@@ -225,6 +251,198 @@ export class AppExplorer extends Abject {
       }
     }
     return { user, system };
+  }
+
+  /**
+   * Collective abjects of a shared workspace: entries synced in from other
+   * peers (they carry `ownerPeerId`) plus the local user's own abjects exposed
+   * into this workspace. This view deliberately INCLUDES `ownerPeerId` entries,
+   * unlike the taskbar's launch-button provenance filter which suppresses them —
+   * the Shared tab is where peer abjects are meant to be visible.
+   */
+  private groupBySharedKind(): Map<string, ObjectRegistration[]> {
+    const shared = new Map<string, ObjectRegistration[]>();
+    for (const obj of this.cachedObjects) {
+      if (!this.isSharedEntry(obj)) continue;
+      const name = obj.manifest.name;
+      const group = shared.get(name);
+      if (group) {
+        group.push(obj);
+      } else {
+        shared.set(name, [obj]);
+      }
+    }
+    return shared;
+  }
+
+  /**
+   * System and infrastructure abjects — the desktop shell, the browsers, the
+   * per-peer singletons. Read from the same host-local set the outbound catalog
+   * uses, so what this window calls shared and what actually leaves this peer
+   * cannot drift apart.
+   */
+  private isSystemEntry(obj: ObjectRegistration): boolean {
+    return (obj.manifest.tags ?? []).includes('system')
+      || isHostLocalObject(obj.manifest.name);
+  }
+
+  /**
+   * A remote peer's entry, or a local abject exposed into this workspace —
+   * never a system or infrastructure one.
+   *
+   * A shared workspace exposes every non-system abject automatically, which
+   * makes `exposedObjectIds` hold the whole workspace: without this gate the
+   * host's own Taskbar, Settings, Storage and ScrumMaster would all show up
+   * under "Shared by Me". They belong on the System tab, which keeps peer-owned
+   * system entries so nothing is hidden by being excluded here.
+   */
+  private isSharedEntry(obj: ObjectRegistration): boolean {
+    if (this.isSystemEntry(obj)) return false;
+    return obj.ownerPeerId !== undefined || this.exposedObjectIds.has(obj.id);
+  }
+  /**
+   * Peer-owned pooled entry (Shared tab): read-only for Edit/Delete, forkable
+   * for scriptable kinds. Unlike isSharedEntry, a locally-owned-but-exposed
+   * object is NOT remote — its owner keeps full Edit/Clone/Delete.
+   */
+  private isRemoteEntry(obj: ObjectRegistration): boolean {
+    return obj.ownerPeerId !== undefined;
+  }
+
+  /**
+   * Provenance gate for the User/System tabs. Those tabs read the active
+   * workspace's registry, whose list merges in pooled entries from other peers
+   * (they carry `ownerPeerId`). Peer abjects belong in the Shared tab and only
+   * there — the same suppression the taskbar applies to its launch buttons.
+   * Remote-browse mode is the deliberate exception: there the peer's objects
+   * ARE the subject of the window, so the filter stands down.
+   */
+  private isLocalEntry(obj: ObjectRegistration): boolean {
+    if (this.remoteRegistryId) return true;
+    return obj.ownerPeerId === undefined;
+  }
+
+  /** Owner column for a Shared row: peer name, short peer id, or the local user. */
+  private ownerLabel(obj: ObjectRegistration): string {
+    if (!obj.ownerPeerId) {
+      return this.localOwnerName ? `${this.localOwnerName} (you)` : 'You';
+    }
+    return this.sharedOwnerNames.get(obj.ownerPeerId)
+      ?? `${obj.ownerPeerId.slice(0, 8)}...`;
+  }
+
+  /**
+   * Decide whether the active workspace gets a Shared tab, and cache what that
+   * tab needs to label its rows. Two shapes count as shared:
+   *   (a) hosted — the workspace is shared out (non-local accessMode, or it
+   *       carries exposed objects / a whitelist);
+   *   (b) joined — a mirror of another peer's workspace. Joined records keep
+   *       accessMode 'local' on purpose, so they are detected through the
+   *       `joined` / `ownerPeerId` metadata that getActiveWorkspace surfaces
+   *       (listWorkspacesDetailed does not carry it).
+   */
+  private async refreshSharedContext(): Promise<void> {
+    type ActiveWorkspaceInfo = {
+      id: string; name: string; registryId?: AbjectId;
+      joined?: boolean; ownerPeerId?: string;
+    };
+    type DetailedWorkspaceInfo = {
+      workspaceId: string; accessMode: string; whitelist: string[]; exposedObjectIds: AbjectId[];
+      registryId?: AbjectId;
+    };
+
+    this.isSharedWorkspace = false;
+    this.workspaceRegistryId = undefined;
+    this.exposedObjectIds = new Set<AbjectId>();
+    this.sharedOwnerNames.clear();
+    this.localOwnerName = undefined;
+
+    // Remote browsing already shows a peer's own registry wholesale.
+    const wmId = this.workspaceManagerId;
+    if (this.isRemote || !wmId) return;
+
+    let active: ActiveWorkspaceInfo | null = null;
+    try {
+      active = await this.request<ActiveWorkspaceInfo | null>(
+        request(this.id, wmId, 'getActiveWorkspace', {})
+      );
+    } catch {
+      // WorkspaceManager unreachable — fall back to no Shared tab
+    }
+    if (!active) return;
+    const activeWs = active;
+
+    // WorkspaceRegistry.list merges local + pooled peer entries + the global
+    // fallback catalog, so this is a superset of the global Registry's list and
+    // the only source where a remote object's `ownerPeerId` survives.
+    this.workspaceRegistryId = activeWs.registryId;
+
+    const joined = activeWs.joined === true || activeWs.ownerPeerId !== undefined;
+
+    let hosted = false;
+    try {
+      const detailed = await this.request<DetailedWorkspaceInfo[]>(
+        request(this.id, wmId, 'listWorkspacesDetailed', {})
+      );
+      const ws = detailed.find(w => w.workspaceId === activeWs.id);
+      if (ws) {
+        this.exposedObjectIds = new Set<AbjectId>(ws.exposedObjectIds ?? []);
+        // effectiveExposedIds always seeds the workspace registry itself, so
+        // the registry entry alone does not mean the user exposed anything.
+        const curatedExposure = (ws.exposedObjectIds ?? []).some(id => id !== ws.registryId);
+        hosted = ws.accessMode !== 'local'
+          || curatedExposure
+          || (ws.whitelist?.length ?? 0) > 0;
+      }
+    } catch {
+      // Detail lookup failed — the joined check still stands
+    }
+
+    this.isSharedWorkspace = joined || hosted;
+    if (this.isSharedWorkspace) {
+      await this.loadOwnerNames(activeWs.id, activeWs.ownerPeerId);
+    }
+  }
+
+  /** Cache peerId → display name for the Shared tab's owner column. */
+  private async loadOwnerNames(workspaceId: string, ownerPeerId?: string): Promise<void> {
+    try {
+      const identityId = await this.discoverDep('Identity');
+      if (identityId) {
+        const me = await this.request<{ peerId: string; name?: string }>(
+          request(this.id, identityId, 'getIdentity', {})
+        );
+        this.localOwnerName = me?.name;
+      }
+    } catch { /* identity unavailable */ }
+
+    const shareRegistryId = await this.discoverDep('WorkspaceShareRegistry');
+    if (!shareRegistryId) return;
+
+    try {
+      const members = await this.request<Array<{ peerId: string; peerName?: string }>>(
+        request(this.id, shareRegistryId, 'getActiveMembers', { workspaceId })
+      );
+      for (const m of members ?? []) {
+        if (m.peerName) this.sharedOwnerNames.set(m.peerId, m.peerName);
+      }
+    } catch { /* no members recorded yet */ }
+
+    // A joined mirror learns its host's name from the discovery cache.
+    try {
+      const discovered = await this.request<Array<{ ownerPeerId: string; ownerName?: string }>>(
+        request(this.id, shareRegistryId, 'getDiscoveredWorkspaces', {})
+      );
+      for (const d of discovered ?? []) {
+        if (d.ownerName && !this.sharedOwnerNames.has(d.ownerPeerId)) {
+          this.sharedOwnerNames.set(d.ownerPeerId, d.ownerName);
+        }
+      }
+    } catch { /* discovery cache unavailable */ }
+
+    if (ownerPeerId && !this.sharedOwnerNames.has(ownerPeerId)) {
+      this.sharedOwnerNames.set(ownerPeerId, `${ownerPeerId.slice(0, 8)}...`);
+    }
   }
 
   private setupHandlers(): void {
@@ -299,8 +517,9 @@ export class AppExplorer extends Abject {
     if (this.windowId) return true;
 
     this.selectedKindName = undefined;
-    this.selectedKindIsSystem = false;
+    this.selectedKindTab = 0;
     this.selectedInstanceIndex = -1;
+    await this.refreshSharedContext();
     this.cachedObjects = await this.registryList();
     await this.buildUI();
     this.changed('visibility', true);
@@ -318,7 +537,7 @@ export class AppExplorer extends Abject {
 
     this.windowId = undefined;
     this.selectedKindName = undefined;
-    this.selectedKindIsSystem = false;
+    this.selectedKindTab = 0;
     this.selectedInstanceIndex = -1;
     this.clearWidgetTracking();
     this.changed('visibility', false);
@@ -387,35 +606,49 @@ export class AppExplorer extends Abject {
     });
 
     // ── Batch create all non-layout widgets ──
+    // The Shared tab exists only for shared/joined workspaces, so its list is
+    // appended last — the earlier indices stay stable either way.
+    const kindTabs = this.isSharedWorkspace ? ['User', 'System', 'Shared'] : ['User', 'System'];
+    if (this.activeKindTab >= kindTabs.length) this.activeKindTab = 0;
+
+    const kindSpecs: Array<Record<string, unknown>> = [
+      // [0] Kind tab bar (User / System [/ Shared])
+      { type: 'tabBar', windowId, rect: r0,
+        tabs: kindTabs, selectedIndex: this.activeKindTab, closable: false },
+      // [1] User kind list (searchable)
+      { type: 'list', windowId, rect: r0, items: [], searchable: true },
+      // [2] System kind list (searchable)
+      { type: 'list', windowId, rect: r0, items: [], searchable: true },
+      // [3] Instance list
+      { type: 'list', windowId, rect: r0, items: [] },
+    ];
+    // [4] Shared kind list (searchable) — shared/joined workspaces only
+    if (this.isSharedWorkspace) {
+      kindSpecs.push({ type: 'list', windowId, rect: r0, items: [], searchable: true });
+    }
+
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          // [0] Kind tab bar (User / System)
-          { type: 'tabBar', windowId, rect: r0,
-            tabs: ['User', 'System'], selectedIndex: this.activeKindTab, closable: false },
-          // [1] User kind list (searchable)
-          { type: 'list', windowId, rect: r0, items: [], searchable: true },
-          // [2] System kind list
-          { type: 'list', windowId, rect: r0, items: [] },
-          // [3] Instance list
-          { type: 'list', windowId, rect: r0, items: [] },
-        ],
-      })
+      request(this.id, this.widgetManagerId!, 'create', { specs: kindSpecs })
     );
 
-    const [kindTabBar, userKindList, systemKindList, instanceList] = widgetIds;
+    const [kindTabBar, userKindList, systemKindList, instanceList, sharedKindList] = widgetIds;
     this.kindTabBarId = kindTabBar;
     this.userKindListId = userKindList;
     this.systemKindListId = systemKindList;
     this.instanceListId = instanceList;
+    this.sharedKindListId = sharedKindList;
 
     // ── Batch add kind-pane widgets to their layout ──
+    const kindPaneChildren: Array<Record<string, unknown>> = [
+      { widgetId: this.kindTabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
+      { widgetId: this.userKindListId, sizePolicy: { vertical: 'expanding' } },
+      { widgetId: this.systemKindListId, sizePolicy: { vertical: 'expanding' } },
+    ];
+    if (this.sharedKindListId) {
+      kindPaneChildren.push({ widgetId: this.sharedKindListId, sizePolicy: { vertical: 'expanding' } });
+    }
     await this.request(request(this.id, this.kindPaneVBoxId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.kindTabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
-        { widgetId: this.userKindListId, sizePolicy: { vertical: 'expanding' } },
-        { widgetId: this.systemKindListId, sizePolicy: { vertical: 'expanding' } },
-      ],
+      children: kindPaneChildren,
     }));
 
     // ── Pane 3: Detail (detached scrollable VBox) ──
@@ -435,6 +668,9 @@ export class AppExplorer extends Abject {
     this.send(request(this.id, this.kindTabBarId, 'addDependent', {}));
     this.send(request(this.id, this.userKindListId, 'addDependent', {}));
     this.send(request(this.id, this.systemKindListId, 'addDependent', {}));
+    if (this.sharedKindListId) {
+      this.send(request(this.id, this.sharedKindListId, 'addDependent', {}));
+    }
     this.send(request(this.id, this.instanceListId, 'addDependent', {}));
 
     // Show only the active tab's list
@@ -461,7 +697,7 @@ export class AppExplorer extends Abject {
       label: name, value: name, secondary: `(${user.get(name)!.length})`,
     }));
     let userSelected = -1;
-    if (this.selectedKindName && !this.selectedKindIsSystem) {
+    if (this.selectedKindName && this.selectedKindTab === 0) {
       userSelected = this.userKindEntries.indexOf(this.selectedKindName);
     }
     await this.request(request(this.id, this.userKindListId, 'update', {
@@ -473,11 +709,26 @@ export class AppExplorer extends Abject {
       label: name, value: name, secondary: `(${system.get(name)!.length})`,
     }));
     let sysSelected = -1;
-    if (this.selectedKindName && this.selectedKindIsSystem) {
+    if (this.selectedKindName && this.selectedKindTab === 1) {
       sysSelected = this.systemKindEntries.indexOf(this.selectedKindName);
     }
     await this.request(request(this.id, this.systemKindListId, 'update', {
       items: sysItems, selectedIndex: sysSelected,
+    }));
+
+    if (!this.sharedKindListId) return;
+
+    const shared = this.groupBySharedKind();
+    this.sharedKindEntries = Array.from(shared.keys()).sort();
+    const sharedItems = this.sharedKindEntries.map(name => ({
+      label: name, value: name, secondary: `(${shared.get(name)!.length})`,
+    }));
+    let sharedSelected = -1;
+    if (this.selectedKindName && this.selectedKindTab === 2) {
+      sharedSelected = this.sharedKindEntries.indexOf(this.selectedKindName);
+    }
+    await this.request(request(this.id, this.sharedKindListId, 'update', {
+      items: sharedItems, selectedIndex: sharedSelected,
     }));
   }
 
@@ -500,10 +751,14 @@ export class AppExplorer extends Abject {
     }
 
     this.instanceEntries = this.cachedObjects.filter(o => {
+      if (o.manifest.name !== this.selectedKindName) return false;
+      // The Shared tab draws from the workspace's collective entries (local
+      // exposed + remote peers), not from the user/system tag split.
+      if (this.selectedKindTab === 2) return this.isSharedEntry(o);
+      if (!this.isLocalEntry(o)) return false;
       const tags = o.manifest.tags ?? [];
       const isSys = tags.includes('system');
-      return o.manifest.name === this.selectedKindName
-        && isSys === this.selectedKindIsSystem;
+      return isSys === this.selectedKindIsSystem;
     });
     // Auto-select if there's exactly one instance
     this.selectedInstanceIndex = this.instanceEntries.length === 1 ? 0 : -1;
@@ -513,7 +768,9 @@ export class AppExplorer extends Abject {
       return {
         label: `${inst.manifest.name}`,
         value: inst.id,
-        secondary: `[${shortId}...]`,
+        secondary: this.selectedKindTab === 2
+          ? `${this.ownerLabel(inst)} · [${shortId}...]`
+          : `[${shortId}...]`,
       };
     });
 
@@ -597,6 +854,13 @@ export class AppExplorer extends Abject {
       text: manifest.name,
       style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' } });
 
+    // Owner (Shared tab only)
+    if (this.selectedKindTab === 2) {
+      specs.push({ type: 'label', windowId, rect: r0,
+        text: `Owner: ${this.ownerLabel(inst)}`,
+        style: { color: this.theme.sectionLabel, fontSize: 11 } });
+    }
+
     // Description
     if (manifest.description) {
       specs.push({ type: 'label', windowId, rect: r0,
@@ -637,10 +901,26 @@ export class AppExplorer extends Abject {
     specs.push({ type: 'button', windowId, rect: r0,
       text: 'Browse', style: { fontSize: 12 }, action: 'browse' });
 
+    // Peer-owned entries (Shared tab) are read-only: Edit Source and Delete are
+    // suppressed — never a permission error on click — while scriptable entries
+    // can still be forked into a local editable copy via WorkspaceRegistry.
+    const remoteEntry = this.isRemoteEntry(inst);
+    const isForkable = tags.includes('scriptable') || hasSource;
+
     if (this.isRemote) {
       if (hasSource) {
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Clone to Local', style: { fontSize: 12 }, action: 'cloneToLocal' });
+      }
+    } else if (remoteEntry) {
+      specs.push({ type: 'label', windowId, rect: r0,
+        text: `Shared from ${this.ownerLabel(inst)} — read-only. Clone to edit your own copy.`,
+        style: { color: this.theme.sectionLabel, fontSize: 11, wordWrap: true } });
+      if (isForkable) {
+        specs.push({ type: 'button', windowId, rect: r0,
+          text: 'Clone to Local',
+          style: { fontSize: 12, tooltip: 'Fork a local editable copy into your workspace' },
+          action: 'cloneShared' });
       }
     } else {
       if (hasSource) {
@@ -652,7 +932,9 @@ export class AppExplorer extends Abject {
             text: 'History', style: { fontSize: 12 }, action: 'history' });
         }
       }
-      if (!this.selectedKindIsSystem) {
+      // Clone/Delete are owner actions: not for system objects, and not for the
+      // Shared tab where an entry may belong to another peer.
+      if (this.selectedKindTab === 0) {
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Clone to...', style: { fontSize: 12 }, action: 'cloneTo' });
         specs.push({ type: 'button', windowId, rect: r0,
@@ -732,6 +1014,13 @@ export class AppExplorer extends Abject {
         }));
       } catch { /* widget gone */ }
     }
+    if (this.sharedKindListId) {
+      try {
+        await this.request(request(this.id, this.sharedKindListId, 'update', {
+          style: { visible: this.activeKindTab === 2 },
+        }));
+      } catch { /* widget gone */ }
+    }
   }
 
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
@@ -746,8 +1035,11 @@ export class AppExplorer extends Abject {
     if (fromId === this.userKindListId && aspect === 'selectionChanged') {
       const sel = JSON.parse(String(value)) as { value: string };
       this.selectedKindName = sel.value;
-      this.selectedKindIsSystem = false;
+      this.selectedKindTab = 0;
       await this.request(request(this.id, this.systemKindListId!, 'update', { selectedIndex: -1 }));
+      if (this.sharedKindListId) {
+        await this.request(request(this.id, this.sharedKindListId, 'update', { selectedIndex: -1 }));
+      }
       await this.rebuildInstanceList();
       return;
     }
@@ -756,8 +1048,22 @@ export class AppExplorer extends Abject {
     if (fromId === this.systemKindListId && aspect === 'selectionChanged') {
       const sel = JSON.parse(String(value)) as { value: string };
       this.selectedKindName = sel.value;
-      this.selectedKindIsSystem = true;
+      this.selectedKindTab = 1;
       await this.request(request(this.id, this.userKindListId!, 'update', { selectedIndex: -1 }));
+      if (this.sharedKindListId) {
+        await this.request(request(this.id, this.sharedKindListId, 'update', { selectedIndex: -1 }));
+      }
+      await this.rebuildInstanceList();
+      return;
+    }
+
+    // Shared kind list selection (shared/joined workspaces only)
+    if (this.sharedKindListId && fromId === this.sharedKindListId && aspect === 'selectionChanged') {
+      const sel = JSON.parse(String(value)) as { value: string };
+      this.selectedKindName = sel.value;
+      this.selectedKindTab = 2;
+      await this.request(request(this.id, this.userKindListId!, 'update', { selectedIndex: -1 }));
+      await this.request(request(this.id, this.systemKindListId!, 'update', { selectedIndex: -1 }));
       await this.rebuildInstanceList();
       return;
     }
@@ -798,15 +1104,30 @@ export class AppExplorer extends Abject {
         await this.browseSelectedKind();
       } else if (action === 'delete') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
-          await this.deleteObject(this.instanceEntries[this.selectedInstanceIndex].id);
+          const target = this.instanceEntries[this.selectedInstanceIndex];
+          if (this.isRemoteEntry(target)) {
+            await this.notify('Shared object is read-only — clone it to get your own copy', 'warning');
+          } else {
+            await this.deleteObject(target.id);
+          }
         }
       } else if (action === 'editSource') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
-          await this.editSource(this.instanceEntries[this.selectedInstanceIndex].id);
+          const target = this.instanceEntries[this.selectedInstanceIndex];
+          if (this.isRemoteEntry(target)) {
+            await this.notify('Shared object is read-only — clone it to edit your own copy', 'warning');
+          } else {
+            await this.editSource(target.id);
+          }
         }
       } else if (action === 'history') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
-          await this.showHistory(this.instanceEntries[this.selectedInstanceIndex].id);
+          const target = this.instanceEntries[this.selectedInstanceIndex];
+          if (this.isRemoteEntry(target)) {
+            await this.notify('Shared object is read-only — clone it to view your own copy', 'warning');
+          } else {
+            await this.showHistory(target.id);
+          }
         }
       } else if (action === 'cloneTo') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
@@ -815,6 +1136,10 @@ export class AppExplorer extends Abject {
       } else if (action === 'cloneToLocal') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.cloneToLocal(this.instanceEntries[this.selectedInstanceIndex]);
+        }
+      } else if (action === 'cloneShared') {
+        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
+          await this.cloneSharedToLocal(this.instanceEntries[this.selectedInstanceIndex]);
         }
       }
       return;
@@ -855,10 +1180,14 @@ export class AppExplorer extends Abject {
     this.cachedObjects = await this.registryList();
 
     if (this.selectedKindName) {
+      // Mirrors rebuildInstanceList's predicate so "is this kind now empty?"
+      // agrees with what the instance pane will actually render.
       const remaining = this.cachedObjects.filter(o => {
+        if (o.manifest.name !== this.selectedKindName) return false;
+        if (this.selectedKindTab === 2) return this.isSharedEntry(o);
+        if (!this.isLocalEntry(o)) return false;
         const tags = o.manifest.tags ?? [];
-        return o.manifest.name === this.selectedKindName
-          && tags.includes('system') === this.selectedKindIsSystem;
+        return tags.includes('system') === this.selectedKindIsSystem;
       });
       if (remaining.length === 0) {
         this.selectedKindName = undefined;
@@ -951,6 +1280,34 @@ export class AppExplorer extends Abject {
       log.info('Cloned to local workspace');
     } catch (err) {
       log.warn('Clone to local error:', err);
+    }
+  }
+
+  /**
+   * Fork a peer-owned shared entry into a local copy via WorkspaceRegistry
+   * forkRemote (server-side snapshot + Factory spawn into our workspace).
+   * Remote pooled entries may carry no `source` in the list, so the local
+   * cloneToLocal path cannot serve them — forkRemote resolves and snapshots
+   * the original itself. Closing/keeping the explorer window never touches
+   * the remote object; only the new local fork is owned here.
+   */
+  private async cloneSharedToLocal(obj: ObjectRegistration): Promise<void> {
+    const registryId = this.workspaceRegistryId ?? this.registryId;
+    if (!registryId) {
+      await this.notify('No local workspace registry — cannot clone', 'error');
+      return;
+    }
+    try {
+      const fork = await this.request<{ ok: boolean; objectId?: AbjectId; reason?: string }>(
+        request(this.id, registryId, 'forkRemote', { objectId: obj.id }));
+      if (fork?.ok) {
+        await this.notify('Cloned to your workspace', 'success');
+        log.info('Cloned shared object to local workspace');        return;
+      }
+      await this.notify(`Clone failed: ${fork?.reason ?? 'not forkable'}`, 'error');
+    } catch (err) {
+      log.warn('Clone shared error:', err);
+      await this.notify('Clone failed', 'error');
     }
   }
 
@@ -1203,6 +1560,7 @@ export class AppExplorer extends Abject {
 ### Actions
 - **Browse** — Open ObjectBrowser for the selected kind.
 - **Clone** / **Delete** — Local mode only.
+- **Clone to Local** — Shared tab (peer-owned, scriptable): forks a local editable copy via WorkspaceRegistry forkRemote. Edit Source/Delete are hidden for peer-owned entries.
 - **Clone to...** — Local mode: clone a user object into a different workspace.
 - **Clone to Local** — Remote mode: copies source into active local workspace.
 
