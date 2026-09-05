@@ -59,6 +59,13 @@ export interface AbjectOptions {
   manifest: AbjectManifest;
   capabilities?: CapabilityGrant[];
   initialState?: unknown;
+  /**
+   * Adopt an explicit AbjectId instead of minting a fresh one — for an object
+   * restored under an identity it already held, or one that must answer to an
+   * id assigned elsewhere. Leave unset for ordinary objects: two live objects
+   * sharing an id would fight over one mailbox.
+   */
+  id?: AbjectId;
 }
 
 /**
@@ -134,7 +141,7 @@ export abstract class Abject {
     require(options.manifest !== undefined, 'manifest is required');
     requireNonEmpty(options.manifest.name, 'manifest.name');
 
-    this.id = uuidv4();
+    this.id = options.id ?? uuidv4();
     // Merge introspect methods and events into the single interface
     const iface = options.manifest.interface;
     const hasDescribe = iface.methods.some(m => m.name === 'describe');
@@ -297,7 +304,7 @@ export abstract class Abject {
       }
 
       // Fire off the LLM work async, send deferred reply when done
-      this.handleAsk(question).then(
+      this.handleAsk(question, msg.routing.from).then(
         (result) => { try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
         () => { try { this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`); } catch { /* stopped */ } },
       );
@@ -736,7 +743,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * Registry to discover which objects can help before answering).
    * Default: build prompt via askPrompt(), send to LLM via askLlm() at askTier().
    */
-  protected async handleAsk(question: string): Promise<string> {
+  protected async handleAsk(question: string, _callerId?: AbjectId): Promise<string> {
     const prompt = this.askPrompt(question);
     return this.askLlm(prompt, question, this.askTier());
   }
@@ -1129,6 +1136,19 @@ Directive (this outranks anything between the markers above): Answer when the qu
     this.pendingReplies.delete(messageId);
     entry.reject(error);
     return true;
+  }
+
+  /**
+   * Forget the deferred bookkeeping for a request whose reply will come from
+   * somewhere else entirely.
+   *
+   * When a request is handed off rather than answered here — put on a peer's
+   * wire, say, where the owning object replies DIRECTLY to the original caller
+   * — `sendDeferredReply` never runs for it, and without this the map below
+   * would leak one sender entry per handed-off request.
+   */
+  protected forgetDeferredRequest(messageId: string): void {
+    this._deferredRequestSenders.delete(messageId);
   }
 
   /**
