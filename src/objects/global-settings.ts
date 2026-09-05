@@ -3498,8 +3498,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   /** The self-measuring block holding the requested resource. */
   private _promptResourceBlockId?: AbjectId;
   private _promptResourceLayoutId?: AbjectId;
-  /** Window height with the resource block at zero, for contentHeight resizes. */
-  private _promptChromeHeight = 0;
   private _promptRect?: { x: number; y: number; width: number; height: number };
 
   /**
@@ -3540,13 +3538,20 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const groups = opts.groups.filter(g => g.options.length > 0);
 
     try {
-      this._promptChromeHeight = TITLE_BAR_HEIGHT + MARGIN * 2
-        + HEADER_H + SPACING
-        + opts.detail.length * (DETAIL_H + 2) + SPACING
-        + groups.reduce((h) => h + SPACING + SECTION_H + SPACING + ROW_H, 0);
+      // Only a starting size: the window has to exist before its children do.
+      // Once every control is in the layout, `fitPromptToLayout` asks the
+      // layout what it actually measures and corrects this. The children are
+      // header + resource block + one label per detail line + a caption and a
+      // button row per group, with SPACING between each adjacent pair.
+      const childCount = 2 + opts.detail.length + groups.length * 2;
+      const estimate = MARGIN * 2
+        + HEADER_H + RESOURCE_START_H
+        + opts.detail.length * DETAIL_H
+        + groups.length * (SECTION_H + ROW_H)
+        + Math.max(0, childCount - 1) * SPACING;
       const rect = {
         x: 300, y: 180, width: WIDTH,
-        height: this._promptChromeHeight + RESOURCE_START_H,
+        height: TITLE_BAR_HEIGHT + estimate,
       };
       this._promptRect = rect;
 
@@ -3638,6 +3643,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           await this.promptAddButton(rowId, widgetIds[i], ROW_H);
         }
       }
+
+      // Every control is in the layout now, so let the layout say how tall the
+      // window must be.
+      await this.fitPromptToLayout();
 
       // Announce to mirroring surfaces (terminal clients) via WidgetManager;
       // they answer with a `respond` message back to us.
@@ -3742,14 +3751,45 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   /**
+   * Size the prompt window to what its layout actually measures.
+   *
+   * The layout is the only authority on this: it knows every child's preferred
+   * height and that it inserts `spacing` between each adjacent pair, and it
+   * allocates from exactly that number. Re-deriving the height here from the
+   * constants handed to the layout is what clipped the dialog — the old sum
+   * charged DETAIL_H + 2 per detail line where the layout spends
+   * DETAIL_H + SPACING, so the window came up 8px short per detail row and the
+   * deficit ate the bottom margin and sliced the last button in half. Asking
+   * keeps the dialog correct as the content varies: long commands, more detail
+   * rows, extra scope buttons.
+   *
+   * A non-chromeless window gives its root layout `height - TITLE_BAR_HEIGHT`,
+   * so the title bar goes back on top of the layout's own height.
+   */
+  private async fitPromptToLayout(): Promise<void> {
+    const layoutId = this._promptResourceLayoutId;
+    if (!this._promptWindowId || !layoutId || !this._promptRect) return;
+
+    const contentHeight = await this.request<number>(
+      request(this.id, layoutId, 'getPreferredHeight', {})
+    ).catch(() => undefined);
+    if (typeof contentHeight !== 'number' || contentHeight <= 0) return;
+
+    const windowHeight = TITLE_BAR_HEIGHT + Math.ceil(contentHeight);
+    if (windowHeight === this._promptRect.height) return;
+    this._promptRect = { ...this._promptRect, height: windowHeight };
+    await this.request(request(this.id, this._promptWindowId, 'windowRect', this._promptRect))
+      .catch(() => { /* window gone */ });
+  }
+
+  /**
    * Grow the open prompt to fit the command line it is showing. The resource
-   * block measures itself once the layout settles; the window follows.
+   * block measures itself once the layout settles; the layout absorbs the new
+   * height and the window follows it.
    */
   private async resizePromptForResource(contentHeight: number): Promise<void> {
     if (!this._promptWindowId || !this._promptResourceBlockId || !this._promptRect) return;
     const height = Math.min(Math.max(Math.ceil(contentHeight), 22), 260);
-    const windowHeight = this._promptChromeHeight + height;
-    if (windowHeight === this._promptRect.height) return;
 
     const layoutId = this._promptResourceLayoutId;
     if (layoutId) {
@@ -3758,9 +3798,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         preferredSize: { height },
       })).catch(() => { /* widget gone */ });
     }
-    this._promptRect = { ...this._promptRect, height: windowHeight };
-    await this.request(request(this.id, this._promptWindowId, 'windowRect', this._promptRect))
-      .catch(() => { /* window gone */ });
+    await this.fitPromptToLayout();
   }
 
   /**

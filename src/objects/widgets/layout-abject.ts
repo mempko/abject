@@ -55,6 +55,12 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
       returns: { kind: 'primitive', primitive: 'boolean' },
     },
     {
+      name: 'getPreferredHeight',
+      description: 'Total height needed to show every child: margins + children + inter-child spacing',
+      parameters: [],
+      returns: { kind: 'primitive', primitive: 'number' },
+    },
+    {
       name: 'addLayoutSpacer',
       description: 'Add a spacer to this layout',
       parameters: [
@@ -390,6 +396,15 @@ export abstract class LayoutAbject extends WidgetAbject {
       // allocating the stale height (e.g. a collapsed sidebar section).
       this.notifyParentOfSizeChange().catch(() => {});
       return true;
+    });
+
+    // The layout is the only thing that knows what its content actually
+    // measures: every child's preferred height, plus the spacing it inserts
+    // between each pair, plus its own margins. An owner sizing a window around
+    // a layout must ask for that number rather than re-deriving it from the
+    // constants it passed in — the two drift, and the content loses.
+    this.on('getPreferredHeight', async () => {
+      return this.computePreferredHeight();
     });
 
     this.on('getFocusableWidgets', async () => {

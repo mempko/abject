@@ -2654,7 +2654,10 @@ async timerFired(msg) {
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
 
-    // Tag the surface with the owner's workspace (if known)
+    // Tag the surface with the OWNER's workspace. Objects with no workspace
+    // (global objects such as prompts and browsers) stay untagged so the
+    // compositor shows them everywhere; objects in a background workspace stay
+    // hidden until that workspace is active.
     const ownerWs = this.objectWorkspaces.get(owner);
     if (ownerWs && win.surface) {
       await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
@@ -2755,7 +2758,10 @@ async timerFired(msg) {
     if (win.surface) this.windowSurfaces.set(win.id, win.surface);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
 
-    // Tag the surface with the owner's workspace (if known)
+    // Tag the surface with the OWNER's workspace. Objects with no workspace
+    // (global objects such as prompts and browsers) stay untagged so the
+    // compositor shows them everywhere; objects in a background workspace stay
+    // hidden until that workspace is active.
     const ownerWs = this.objectWorkspaces.get(owner);
     if (ownerWs && win.surface) {
       await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
