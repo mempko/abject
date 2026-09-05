@@ -67,6 +67,9 @@ export interface GoalNode {
   latestAgent?: string;
   /** Failure reason for failed goals. */
   error?: string;
+  /** Peer that created the goal. When set and flagged remote, rows render a [Remote: <peer>] badge and drop actions. */
+  creatorPeerId?: string;
+  isRemote?: boolean;
 }
 
 /** Normalised task shape (a superset-compatible view of both callers' task rows). */
@@ -159,7 +162,11 @@ export function buildGoalRows(input: {
       || (goal.status === 'failed' && !!goal.error)
       || (!!goal.description && goal.description.trim() !== goal.title.trim());
 
-    const actions: GoalRowAction[] | undefined = !withActions ? undefined
+    // A goal created by another peer is a replica: the owning peer's single
+    // ScrumMaster drives it, so its row carries a [Remote: <peer>] badge and
+    // no pause/resume/stop controls.
+    const remote = goal.isRemote === true;
+    const actions: GoalRowAction[] | undefined = !withActions || remote ? undefined
       : goal.status === 'active' ? ['pause', 'stop']
       : goal.status === 'paused' ? ['resume', 'stop']
       : undefined;
@@ -168,7 +175,7 @@ export function buildGoalRows(input: {
       id: `goal:${goal.id}`,
       kind: 'goal',
       depth,
-      text: goal.title,
+      text: remote ? `[Remote: ${(goal.creatorPeerId ?? 'peer').slice(0, 8)}] ${goal.title}` : goal.title,
       iconName: GOAL_STATUS_ICON_NAMES[goal.status] ?? 'dot',
       iconColorRole: goalStatusRole(goal.status),
       textColorRole: 'primary',
@@ -275,4 +282,15 @@ export function buildGoalRows(input: {
   }
 
   return rows;
+}
+
+/** Short peer tag for the [Remote: <peer>] badge. */
+export function remoteBadge(peerId: string | undefined): string {
+  if (!peerId) return '';
+  return `[Remote: ${peerId.slice(0, 8)}]`;
+}
+
+/** True when the node is a non-owned (remote) goal whose actions must be disabled. */
+export function isRemoteGoalNode(node: GoalNode): boolean {
+  return node.isRemote === true || (node.creatorPeerId !== undefined && node.isRemote !== false && false);
 }

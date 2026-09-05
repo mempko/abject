@@ -34,6 +34,45 @@ export interface ProgressEntry {
   agentName: string;
   message: string;
   phase?: string;
+  /**
+   * Peer that authored this entry. Absent on entries written before
+   * collaborative sync existed and on purely local goals. Each peer
+   * republishes only its own entries, so this doubles as the merge key.
+   */
+  peerId?: string;
+}
+
+/**
+ * Task state reported by another peer working the same goal.
+ *
+ * TupleSpace.put mints its own uuid and accepts no caller-supplied id, so a
+ * remote task cannot be re-inserted into the local TupleSpace without taking
+ * on a second identity (and being claimed a second time). Collaborator task
+ * state therefore lives alongside the tuples rather than inside them,
+ * addressed by the originating peer's taskId.
+ */
+export interface RemoteTaskProgress {
+  taskId: string;
+  goalId: GoalId;
+  peerId: string;
+  agentName?: string;
+  status: string;
+  message?: string;
+  updatedAt: number;
+}
+
+/** A peer present on a shared goal. */
+export interface GoalCollaborator {
+  peerId: string;
+  name?: string;
+  lastSeenAt: number;
+}
+
+/** Envelope for a single scratchpad key published as its own LWW register. */
+interface ScratchRegister {
+  value: unknown;
+  updatedAt: number;
+  peerId: string;
 }
 
 export interface Goal {
@@ -57,6 +96,8 @@ export interface Goal {
   status: 'active' | 'paused' | 'completed' | 'failed' | 'archived';
   createdBy: AbjectId;
   creatorName: string;
+  /** Peer that created this goal. Stamped at createGoal; preserved across sync. Drives single-owner execution. */
+  creatorPeerId?: string;
   progress: ProgressEntry[];
   childIds: GoalId[];
   result?: unknown;
@@ -148,6 +189,328 @@ export class GoalManager extends Abject {
   }
 
   /** Walk up the parent chain to find the top-level goal ID, which is the TupleSpace namespace. */
+  /**
+   * Task progress reported by other peers, keyed `${goalId}::${taskId}`.
+   * Deliberately never merged into the local TupleSpace — see RemoteTaskProgress.
+   */
+  private remoteTasks: Map<string, RemoteTaskProgress> = new Map();
+
+  /** Peers seen on each shared goal: goalId -> peerId -> record. */
+  private collaborators: Map<GoalId, Map<string, GoalCollaborator>> = new Map();
+
+  /** LWW stamps for per-key scratchpad registers, keyed `${goalId}::${key}`. */
+  private scratchStamps: Map<string, { updatedAt: number; peerId: string }> = new Map();
+
+  /** This peer's id, falling back to the object id before Identity resolves. */
+  private get selfPeerId(): string {
+    return this.localPeerId || this.id;
+  }
+
+  /** SharedState namespace carrying a goal's meta blob and its registers. */
+  /** Well-known SharedState namespace carrying the cross-peer goal catalog. */
+  private readonly catalogNamespace = 'goals:catalog';
+
+  /** LWW stamps for catalog registers, keyed by goalId. */
+  private catalogStamps = new Map<string, { updatedAt: number; peerId: string }>();
+
+  /** Goals adopted from a peer's catalog rather than created here. */
+  private remoteGoalIds = new Set<string>();
+
+  private goalNamespace(goalId: GoalId): string {
+    return `goal-${goalId}`;
+  }
+
+  /**
+   * Decide whether an incoming stamped write beats what we hold. Peer clocks
+   * are not synchronised, so an equal timestamp is broken deterministically on
+   * peerId: every replica then picks the same winner and they stop oscillating.
+   */
+  private registerWins(
+    incoming: { updatedAt: number; peerId: string },
+    current?: { updatedAt: number; peerId: string },
+  ): boolean {
+    if (!current) return true;
+    if (incoming.updatedAt !== current.updatedAt) return incoming.updatedAt > current.updatedAt;
+    return incoming.peerId > current.peerId;
+  }
+
+  /** Fire-and-forget write of one collaborative register. */
+  private setRegister(goalId: GoalId, key: string, value: unknown): void {
+    if (!this.sharedStateId) return;
+    this.request(
+      request(this.id, this.sharedStateId, 'set', {
+        name: this.goalNamespace(goalId),
+        key,
+        value,
+        persist: true,
+      })
+    ).catch(err => {
+      log.warn(`register set failed (${key}): ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /** Publish one scratchpad key as its own LWW register. */
+  private syncScratchKeyToSharedState(goal: Goal, key: string, value: unknown): void {
+    const stamp = { updatedAt: Date.now(), peerId: this.selfPeerId };
+    this.scratchStamps.set(`${goal.id}::${key}`, stamp);
+    const reg: ScratchRegister = { value, updatedAt: stamp.updatedAt, peerId: stamp.peerId };
+    this.setRegister(goal.id, `scratch:${key}`, reg);
+  }
+
+  /**
+   * Publish this peer's progress entries. Each peer owns `progress:<peerId>`;
+   * a single shared array would make every collaborator's heartbeat overwrite
+   * everyone else's.
+   */
+  private syncProgressToSharedState(goal: Goal): void {
+    const peerId = this.selfPeerId;
+    const mine = goal.progress.filter(p => (p.peerId ?? peerId) === peerId);
+    const tail = mine.length > 100 ? mine.slice(mine.length - 100) : mine;
+    this.setRegister(goal.id, `progress:${peerId}`, { peerId, entries: tail, updatedAt: Date.now() });
+  }
+
+  /**
+   * Replace everything we hold from one peer with that peer's current log.
+   * Idempotent by construction: replaying a register yields the same array,
+   * which is what makes reconnect-and-resync safe to run repeatedly.
+   */
+  private mergeRemoteProgress(goal: Goal, remotePeerId: string, entries: ProgressEntry[]): void {
+    if (remotePeerId === this.selfPeerId) return;
+    const kept = goal.progress.filter(p => p.peerId !== remotePeerId);
+    for (const e of entries) {
+      if (!e || typeof e.timestamp !== 'number') continue;
+      kept.push({ ...e, peerId: remotePeerId });
+    }
+    kept.sort((a, b) => a.timestamp - b.timestamp);
+    goal.progress = kept.length > 200 ? kept.slice(kept.length - 200) : kept;
+  }
+
+  /**
+   * Fold a remote `meta` blob's scratchpad in without overwriting. Any key we
+   * hold a register stamp for is owned by that register, and a stale meta write
+   * must not undo a newer per-key write from another collaborator. This only
+   * ever fills gaps — it covers keys written before per-key registers existed.
+   */
+  private mergeRemoteScratchpad(goal: Goal, remote: Record<string, unknown> | undefined): void {
+    if (!remote) return;
+    for (const [key, value] of Object.entries(remote)) {
+      if (this.scratchStamps.has(`${goal.id}::${key}`)) continue;
+      if (!(key in goal.scratchpad)) goal.scratchpad[key] = value;
+    }
+  }
+
+  private remoteTaskKey(goalId: GoalId, taskId: string): string {
+    return `${goalId}::${taskId}`;
+  }
+
+  /** Apply one collaborative register received from SharedState. */
+  private applyRemoteRegister(goalId: GoalId, key: string, value: unknown): void {
+    const goal = this.goals.get(goalId);
+    if (!goal) return;
+
+    if (key.startsWith('scratch:')) {
+      const name = key.slice('scratch:'.length);
+      const reg = value as ScratchRegister | undefined;
+      if (!reg || typeof reg !== 'object' || typeof reg.updatedAt !== 'number') return;
+      const stampKey = `${goalId}::${name}`;
+      if (!this.registerWins(reg, this.scratchStamps.get(stampKey))) return;
+      this.scratchStamps.set(stampKey, { updatedAt: reg.updatedAt, peerId: reg.peerId });
+      goal.scratchpad[name] = reg.value;
+      goal.updatedAt = Date.now();
+      this.changed('goalUpdated', { goalId, message: `scratchpad.${name} updated by ${String(reg.peerId).slice(0, 8)}` });
+      return;
+    }
+
+    if (key.startsWith('progress:')) {
+      const reg = value as { peerId?: string; entries?: ProgressEntry[] } | undefined;
+      if (!reg || !Array.isArray(reg.entries)) return;
+      this.mergeRemoteProgress(goal, reg.peerId ?? key.slice('progress:'.length), reg.entries);
+      this.changed('goalUpdated', { goalId, message: 'Collaborator progress', progress: goal.progress });
+      return;
+    }
+
+    if (key.startsWith('task:')) {
+      const rec = value as RemoteTaskProgress | undefined;
+      if (!rec || typeof rec.updatedAt !== 'number') return;
+      const taskId = rec.taskId ?? key.slice('task:'.length);
+      const mapKey = this.remoteTaskKey(goalId, taskId);
+      if (!this.registerWins(rec, this.remoteTasks.get(mapKey))) return;
+      const merged: RemoteTaskProgress = { ...rec, taskId, goalId };
+      this.remoteTasks.set(mapKey, merged);
+      this.changed('taskProgress', merged);
+      return;
+    }
+
+    if (key.startsWith('collaborator:')) {
+      const rec = value as GoalCollaborator | undefined;
+      if (!rec || typeof rec.lastSeenAt !== 'number') return;
+      let roster = this.collaborators.get(goalId);
+      if (!roster) { roster = new Map(); this.collaborators.set(goalId, roster); }
+      const existing = roster.get(rec.peerId);
+      if (existing && existing.lastSeenAt >= rec.lastSeenAt) return;
+      roster.set(rec.peerId, rec);
+      this.changed('collaboratorsChanged', { goalId, collaborators: Array.from(roster.values()) });
+    }
+  }
+
+  /**
+   * Apply every register in a namespace snapshot. This is the reconnect path:
+   * a peer that was offline missed the individual `stateChanged` events, so on
+   * join it reads the namespace whole and replays it.
+   */
+  private applyRemoteRegisters(goalId: GoalId, snapshot: Record<string, unknown> | undefined): void {
+    if (!snapshot) return;
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (key === 'meta') continue;
+      this.applyRemoteRegister(goalId, key, value);
+    }
+  }
+
+  /** Announce this peer on a goal so collaborators can list who is present. */
+  private announceCollaborator(goalId: GoalId): void {
+    const record: GoalCollaborator = { peerId: this.selfPeerId, lastSeenAt: Date.now() };
+    let roster = this.collaborators.get(goalId);
+    if (!roster) { roster = new Map(); this.collaborators.set(goalId, roster); }
+    roster.set(record.peerId, record);
+    this.setRegister(goalId, `collaborator:${record.peerId}`, record);
+  }
+
+  /**
+   * Create and subscribe the shared goal catalog, publish every local goal
+   * into it, and adopt whatever peers have already published.
+   *
+   * The catalog is the discovery bridge. A peer cannot subscribe to a
+   * `goal-<id>` namespace it has never heard of, and SharedState drops sync
+   * requests for namespaces it does not itself hold, so goals stayed invisible
+   * across peers until one well-known namespace advertised them.
+   */
+  private async initGoalCatalog(): Promise<void> {
+    if (!this.sharedStateId) return;
+    try {
+      await this.request(request(this.id, this.sharedStateId, 'create', { name: this.catalogNamespace }));
+      await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: this.catalogNamespace }));
+
+      for (const goal of this.goals.values()) {
+        this.publishCatalogEntry(goal);
+      }
+
+      const all = await this.request<Record<string, unknown>>(
+        request(this.id, this.sharedStateId, 'getAll', { name: this.catalogNamespace })
+      );
+      if (all) {
+        for (const [key, value] of Object.entries(all)) {
+          await this.handleCatalogEntry(key, value);
+        }
+      }
+    } catch { /* best effort */ }
+  }
+
+  /** Advertise one goal in the shared catalog so peers can discover it. */
+  private publishCatalogEntry(goal: Goal): void {
+    if (!this.sharedStateId) return;
+    // Never re-advertise a goal we merely mirror: its owner is the publisher.
+    if (this.remoteGoalIds.has(goal.id)) return;
+    const record = {
+      goalId: goal.id,
+      title: goal.title,
+      status: goal.status,
+      ownerPeerId: goal.creatorPeerId || this.selfPeerId,
+      deleted: false,
+      updatedAt: Date.now(),
+      peerId: this.selfPeerId,
+    };
+    this.catalogStamps.set(goal.id, { updatedAt: record.updatedAt, peerId: record.peerId });
+    void this.request(request(this.id, this.sharedStateId, 'set', {
+      name: this.catalogNamespace,
+      key: `catalog:${goal.id}`,
+      value: record,
+      persist: true,
+    })).catch(() => { /* best effort */ });
+  }
+
+  /** Mark a goal gone in the catalog so peers stop resurrecting it on boot. */
+  private publishCatalogTombstone(goalId: GoalId): void {
+    if (!this.sharedStateId) return;
+    const stamp = { updatedAt: Date.now(), peerId: this.selfPeerId };
+    this.catalogStamps.set(goalId, stamp);
+    this.remoteGoalIds.delete(goalId);
+    void this.request(request(this.id, this.sharedStateId, 'set', {
+      name: this.catalogNamespace,
+      key: `catalog:${goalId}`,
+      value: { goalId, deleted: true, updatedAt: stamp.updatedAt, peerId: stamp.peerId },
+      persist: true,
+    })).catch(() => { /* best effort */ });
+  }
+
+  /** Merge one catalog register, auto-subscribing any newly seen remote goal. */
+  private async handleCatalogEntry(key: string | undefined, value: unknown): Promise<void> {
+    if (!key || !key.startsWith('catalog:')) return;
+    const record = value as {
+      goalId?: string; title?: string; ownerPeerId?: string;
+      deleted?: boolean; updatedAt?: number; peerId?: string;
+    } | undefined;
+    if (!record || typeof record.goalId !== 'string') return;
+
+    const goalId = record.goalId as GoalId;
+    const stamp = {
+      updatedAt: typeof record.updatedAt === 'number' ? record.updatedAt : 0,
+      peerId: typeof record.peerId === 'string' ? record.peerId : '',
+    };
+    if (!this.registerWins(stamp, this.catalogStamps.get(goalId))) return;
+    this.catalogStamps.set(goalId, stamp);
+
+    if (record.deleted === true) {
+      this.remoteGoalIds.delete(goalId);
+      return;
+    }
+
+    const owner = record.ownerPeerId ?? stamp.peerId;
+    if (owner === this.selfPeerId) return;
+    if (this.goals.has(goalId)) return;
+
+    this.remoteGoalIds.add(goalId);
+    await this.joinRemoteGoal(goalId);
+  }
+
+  /**
+   * Subscribe a peer's `goal-<id>` namespace and adopt the goal locally.
+   * Kept separate from the `subscribeGoal` handler so the catalog watcher does
+   * not have to fabricate a request message to reuse it.
+   */
+  private async joinRemoteGoal(goalId: GoalId): Promise<void> {
+    if (!this.sharedStateId) return;
+    const ns = this.goalNamespace(goalId);
+    try {
+      await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+      await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+
+      const all = await this.request<Record<string, unknown>>(
+        request(this.id, this.sharedStateId, 'getAll', { name: ns })
+      );
+      const meta = all?.meta;
+      if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
+        // `meta` never carries `progress` (see syncGoalToSharedState), so fill
+        // the collection fields before anything dereferences them.
+        const remote = meta as Goal;
+        const goalData: Goal = { ...remote, progress: remote.progress ?? [], scratchpad: remote.scratchpad ?? {} };
+        if (!this.goals.has(goalData.id)) {
+          this.goals.set(goalData.id, goalData);
+          if (!this.goalOrder.includes(goalData.id)) this.goalOrder.push(goalData.id);
+          this.saveGoalIndex();
+          this.changed('goalCreated', {
+            goalId: goalData.id,
+            title: goalData.title,
+            description: goalData.description,
+            parentId: goalData.parentId,
+          });
+        }
+        this.applyRemoteRegisters(goalData.id, all);
+      }
+      this.announceCollaborator(goalId);
+      log.info(`Joined remote goal ${goalId} discovered via ${this.catalogNamespace}`);
+    } catch { /* best effort */ }
+  }
+
   private getTupleNamespace(goalId: GoalId): string {
     let current = this.goals.get(goalId);
     while (current?.parentId) {
@@ -431,9 +794,56 @@ export class GoalManager extends Abject {
               ],
               returns: { kind: 'primitive', primitive: 'string' },
             },
+            {
+              name: 'updateTaskProgress',
+              description: 'Publish local status for one task so collaborators on a shared goal see it',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID as minted by the originating peer' },
+                { name: 'status', type: { kind: 'primitive', primitive: 'string' }, description: 'Task status (pending, in_progress, done, failed)' },
+                { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Human-readable detail', optional: true },
+                { name: 'agentName', type: { kind: 'primitive', primitive: 'string' }, description: 'Agent working the task', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'getCollaboratorTasks',
+              description: 'Task progress reported by other peers on a shared goal',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                taskId: { kind: 'primitive', primitive: 'string' },
+                goalId: { kind: 'primitive', primitive: 'string' },
+                peerId: { kind: 'primitive', primitive: 'string' },
+                status: { kind: 'primitive', primitive: 'string' },
+                updatedAt: { kind: 'primitive', primitive: 'number' },
+              } } },
+            },
+            {
+              name: 'getCollaborators',
+              description: 'Peers currently present on a shared goal',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                peerId: { kind: 'primitive', primitive: 'string' },
+                lastSeenAt: { kind: 'primitive', primitive: 'number' },
+              } } },
+            },
+            {
+              name: 'reconcileGoal',
+              description: 'Re-read the whole collaborative namespace of a shared goal and replay it locally, for use after a reconnect',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'object', properties: { reconciled: { kind: 'primitive', primitive: 'number' } } },
+            },
           ],
           events: [
             { name: 'goalCreated', description: 'A new goal was created', payload: { kind: 'reference', reference: 'Goal' } },
+            { name: 'taskProgress', description: 'A peer reported task status on a shared goal', payload: { kind: 'reference', reference: 'RemoteTaskProgress' } },
+            { name: 'collaboratorsChanged', description: 'The set of peers present on a shared goal changed', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'goalUpdated', description: 'A goal received a progress update', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalCompleted', description: 'A goal was completed', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalFailed', description: 'A goal failed', payload: { kind: 'reference', reference: 'Goal' } },
@@ -483,6 +893,7 @@ export class GoalManager extends Abject {
 
     // Load goal index from local Storage and subscribe to each goal's SharedState
     await this.loadGoalIndex();
+    await this.initGoalCatalog();
   }
 
   /** Load the local goal index from Storage and subscribe to each goal's per-goal SharedState. */
@@ -714,6 +1125,7 @@ reviews results and either plans another round or completes/fails the goal.
           if (now - goal.updatedAt >= ARCHIVE_TTL_MS) {
             // Clean up SharedState namespace to prevent sync floods
             if (this.sharedStateId) {
+              this.publishCatalogTombstone(id as GoalId);
               try {
                 await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${id}` }));
               } catch { /* best effort */ }
@@ -739,6 +1151,7 @@ reviews results and either plans another round or completes/fails the goal.
 
       for (const goal of toEvict) {
         if (this.sharedStateId) {
+          this.publishCatalogTombstone(goal.id);
           try {
             await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` }));
           } catch { /* best effort */ }
@@ -828,6 +1241,10 @@ reviews results and either plans another round or completes/fails the goal.
    */
   private async syncGoalToSharedState(goal: Goal): Promise<void> {
     if (!this.sharedStateId) return;
+    // Every goal mutation funnels through here, so advertising the goal in the
+    // shared catalog at this one point keeps the index complete without
+    // touching each of the mutation call sites.
+    this.publishCatalogEntry(goal);
     try {
       await this.request(request(this.id, this.sharedStateId, 'set', {
         name: `goal-${goal.id}`,
@@ -840,6 +1257,7 @@ reviews results and either plans another round or completes/fails the goal.
           status: goal.status,
           createdBy: goal.createdBy,
           creatorName: goal.creatorName,
+          creatorPeerId: goal.creatorPeerId,
           childIds: goal.childIds,
           result: goal.result,
           error: goal.error,
@@ -876,6 +1294,7 @@ reviews results and either plans another round or completes/fails the goal.
         status: 'active',
         createdBy: callerId,
         creatorName: '',
+        creatorPeerId: this.selfPeerId,
         progress: [],
         childIds: [],
         createdAt: Date.now(),
@@ -937,8 +1356,13 @@ reviews results and either plans another round or completes/fails the goal.
           agentName: agentName ?? 'Unknown',
           message,
           phase,
+          peerId: this.selfPeerId,
         });
         if (goal.progress.length > 200) goal.progress.splice(0, goal.progress.length - 200);
+        // Publish only real transitions. Heartbeats arrive at ~1Hz and collapse
+        // into the prior entry above; re-broadcasting them would flood every
+        // collaborator with identical registers.
+        this.syncProgressToSharedState(goal);
       }
       goal.updatedAt = Date.now();
 
@@ -1269,6 +1693,7 @@ reviews results and either plans another round or completes/fails the goal.
 
         // Remove entire SharedState namespace (deletes persisted data + unsubscribes)
         if (this.sharedStateId) {
+          this.publishCatalogTombstone(goal.id);
           try {
             await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` }));
           } catch { /* best effort */ }
@@ -1440,6 +1865,9 @@ reviews results and either plans another round or completes/fails the goal.
           } catch { /* best effort */ }
 
           this.changed('goalUpdated', { goalId, message: `scratchpad.tasks/${taskId.slice(0, 8)}/result written` });
+          // Collaborators only gap-fill scratchpad keys from `meta`; an updated
+          // value for an existing key travels solely through its own register.
+          this.syncScratchKeyToSharedState(goal, `tasks/${taskId}/result`, result);
           this.syncGoalToSharedState(goal);
         }
       }
@@ -1586,6 +2014,10 @@ reviews results and either plans another round or completes/fails the goal.
           }
           this.saveGoalIndex();
           this.changed('goalCreated', { goalId: goal.id, title: goal.title, description: goal.description, parentId: goal.parentId });
+          // Replay every collaborative register we missed while not subscribed,
+          // then announce ourselves to the peers already on this goal.
+          this.applyRemoteRegisters(goal.id, all);
+          this.announceCollaborator(goal.id);
           return goal;
         }
       } catch { /* Goal may not exist yet */ }
@@ -1605,8 +2037,66 @@ reviews results and either plans another round or completes/fails the goal.
       goal.scratchpad[key] = value;
       goal.updatedAt = Date.now();
       this.changed('goalUpdated', { goalId, message: `scratchpad.${key} updated` });
+      // The authoritative value for a single key is its own register. `meta` is
+      // still written below (it carries title/status/childIds), but routing the
+      // key through `meta` alone would let two collaborators writing different
+      // keys concurrently clobber each other.
+      this.syncScratchKeyToSharedState(goal, key, value);
       this.syncGoalToSharedState(goal);
       return { success: true };
+    });
+
+    this.on('updateTaskProgress', async (msg: AbjectMessage) => {
+      const { goalId, taskId, status, message, agentName } = msg.payload as {
+        goalId: GoalId; taskId: string; status: string; message?: string; agentName?: string;
+      };
+      requireNonEmpty(goalId, 'goalId');
+      requireNonEmpty(taskId, 'taskId');
+      requireNonEmpty(status, 'status');
+
+      const record: RemoteTaskProgress = {
+        taskId, goalId, status, message, agentName,
+        peerId: this.selfPeerId,
+        updatedAt: Date.now(),
+      };
+      this.remoteTasks.set(this.remoteTaskKey(goalId, taskId), record);
+      this.setRegister(goalId, `task:${taskId}`, record);
+      this.changed('taskProgress', record);
+      return { success: true };
+    });
+
+    this.on('getCollaboratorTasks', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      requireNonEmpty(goalId, 'goalId');
+      const prefix = `${goalId}::`;
+      return Array.from(this.remoteTasks.entries())
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([, v]) => v);
+    });
+
+    this.on('getCollaborators', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      requireNonEmpty(goalId, 'goalId');
+      return Array.from(this.collaborators.get(goalId)?.values() ?? []);
+    });
+
+    // Pull the whole shared namespace and replay it. Callers use this after a
+    // reconnect, when the individual `stateChanged` events were missed.
+    this.on('reconcileGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      requireNonEmpty(goalId, 'goalId');
+      if (!this.sharedStateId || !this.goals.has(goalId)) return { reconciled: 0 };
+      try {
+        const all = await this.request<Record<string, unknown>>(
+          request(this.id, this.sharedStateId, 'getAll', { name: this.goalNamespace(goalId) })
+        );
+        this.applyRemoteRegisters(goalId, all);
+        this.announceCollaborator(goalId);
+        return { reconciled: Object.keys(all ?? {}).length };
+      } catch (err) {
+        log.warn(`reconcileGoal failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { reconciled: 0 };
+      }
     });
 
     this.on('readGoalData', async (msg: AbjectMessage) => {
@@ -1712,9 +2202,24 @@ reviews results and either plans another round or completes/fails the goal.
       const stateChange = eventValue as { name?: string; key?: string; value?: unknown } | undefined;
       if (!stateChange) return;
       const { name: namespace, key, value } = stateChange;
+
+      // The shared catalog drives discovery of goals owned by other peers.
+      if (namespace === this.catalogNamespace) {
+        void this.handleCatalogEntry(key, value);
+        return;
+      }
       log.info(`SharedState changed: ns=${namespace ?? '?'} key=${key ?? '?'}`);
-      if (!namespace || !key || key !== 'meta') return;
+      if (!namespace || !key) return;
       if (!namespace.startsWith('goal-')) return;
+
+      // ── Collaborative registers (Phase 3) ──
+      // Scratchpad keys, per-peer progress logs, collaborator task state and
+      // presence each own their own register, so concurrent writes by different
+      // collaborators merge instead of overwriting one another.
+      if (key !== 'meta') {
+        this.applyRemoteRegister(namespace.slice('goal-'.length) as GoalId, key, value);
+        return;
+      }
 
       const goalId = namespace.slice('goal-'.length) as GoalId;
       if (!value || typeof value !== 'object' || !('id' in (value as object))) return;
@@ -1745,7 +2250,7 @@ reviews results and either plans another round or completes/fails the goal.
         local.childIds = remote.childIds;
         local.result = remote.result;
         local.error = remote.error;
-        local.scratchpad = remote.scratchpad ?? local.scratchpad;
+        this.mergeRemoteScratchpad(local, remote.scratchpad);
         local.updatedAt = remote.updatedAt;
         this.changed('goalUpdated', { goalId, message: 'Remote update', progress: local.progress });
       }

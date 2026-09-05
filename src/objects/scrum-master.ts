@@ -47,6 +47,7 @@ import { safeStringify } from '../core/format.js';
 import {
   deriveContractEdges, validateDataFlow, transitiveDependentCounts,
 } from '../core/task-graph.js';
+import { looksLikeUngroundedClaim } from '../core/claims.js';
 
 const log = new Log('ScrumMaster');
 
@@ -93,6 +94,45 @@ function compactLine(value: unknown, max = 220): string {
 export class ScrumMaster extends Abject {
   private goalManagerId?: AbjectId;
   private agentAbjectId?: AbjectId;
+  /**
+   * Peer owning this ScrumMaster instance, resolved from Identity exactly as
+   * GoalManager resolves the `creatorPeerId` it stamps on every goal, so both
+   * sides agree on what counts as ours. Remote goals run in passive observer
+   * mode: a single ScrumMaster on the owning peer drives each goal.
+   */
+  private localPeerId = '';
+  /**
+   * Resolve the local peer id from Identity. Idempotent; retried lazily by
+   * `isRemoteGoal` if Identity was not ready at init.
+   */
+  private async resolveLocalPeerId(): Promise<void> {
+    if (this.localPeerId) return;
+    const identityId = await this.discoverDep('Identity');
+    if (!identityId) return;
+    try {
+      const identity = await this.request<{ peerId: string }>(
+        request(this.id, identityId, 'getIdentity', {})
+      );
+      if (identity?.peerId) this.localPeerId = identity.peerId;
+    } catch { /* Identity may not be ready */ }
+  }
+  /**
+   * True when the goal was created by another peer (single-ownership guard).
+   * Unknown/absent provenance defaults to OWNED: if this peer's id cannot be
+   * resolved, comparing against anything else would classify every local goal
+   * as remote and no ScrumMaster would ever pick it up.
+   */
+  private async isRemoteGoal(goalId: string): Promise<boolean> {
+    try {
+      if (!this.goalManagerId) return false;
+      const goal = await this.request<{ creatorPeerId?: string } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+      const creator = (goal as { creatorPeerId?: string } | null)?.creatorPeerId;
+      if (!creator) return false;
+      if (!this.localPeerId) await this.resolveLocalPeerId();
+      if (!this.localPeerId) return false;
+      return creator !== this.localPeerId;
+    } catch { return false; }
+  }
   /** Optional. Used by review_scrum auto-recall, save_knowledge, lookup_knowledge. */
   private knowledgeBaseId?: AbjectId;
   /** Used for fast-tier synthesis calls (complete_goal markdown formatting). */
@@ -177,6 +217,16 @@ export class ScrumMaster extends Abject {
   private forceFullScrum = new Set<string>();
 
   /**
+   * poll_team replies, keyed by agent id, the agent's live registration
+   * description, and the question asked. The description is rebuilt by
+   * agents whenever their capabilities change (skills, MCP servers), so it
+   * is the invalidation key: a changed capability set is a new key, and an
+   * unchanged one answers from here instead of costing a 45-second ask fan-out.
+   */
+  private pollReplyCache = new Map<string, { text: string; at: number }>();
+  private static readonly POLL_CACHE_TTL_MS = 15 * 60_000;
+
+  /**
    * Pending ticket promises. AgentAbject's queue runner sends `executeTask`
    * to bootstrap the OTA loop; we forward to `startTask` and await the
    * resulting `taskResult` event. This map joins the two — same pattern
@@ -245,6 +295,7 @@ export class ScrumMaster extends Abject {
     // "KnowledgeBase not registered". Lazy lookup makes spawn order
     // irrelevant.
     this.llmId = await this.discoverDep('LLM') ?? undefined;
+    await this.resolveLocalPeerId();
 
     // Subscribe to GoalManager events.
     this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
@@ -294,6 +345,7 @@ export class ScrumMaster extends Abject {
       if (aspect === 'goalCreated') {
         const { goalId, parentId } = value as { goalId: string; parentId?: string };
         if (parentId) return; // only top-level goals
+        try { if (await this.isRemoteGoal(goalId)) { log.info(`ignoring remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
         // Defer one tick so the creator (e.g. Chat) has time to settle.
         setTimeout(() => this.enqueueScrumTask(goalId, 0).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
@@ -303,6 +355,7 @@ export class ScrumMaster extends Abject {
           goalId: string; scrumNumber: number; doneTaskIds?: string[];
         };
         // Fast path: a quick_dispatched goal's single task just finished.
+        try { if (await this.isRemoteGoal(goalId)) { log.info(`ignoring review scrum for remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
         const oneShot = this.oneShotGoals.get(goalId);
         if (oneShot) {
           this.oneShotGoals.delete(goalId);
@@ -315,11 +368,18 @@ export class ScrumMaster extends Abject {
               log.info(`quick_dispatch goal ${goalId.slice(0, 8)} has ${pendingNotes} pending user note(s) — upgrading to a review scrum`);
               this.forceFullScrum.add(goalId);
             } else {
-              // Success → complete the goal directly, no review scrum.
-              await this.completeOneShotGoal(goalId, oneShot.taskId).catch(err =>
-                log.warn(`completeOneShotGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
-              );
-              return;
+              // Success → complete the goal directly, no review scrum — unless
+              // the result reads as a claim with nothing behind it. A
+              // quick-dispatched lookup is fine to pass through verbatim; an
+              // "it's now working" with no command, id, or gate note cited is
+              // exactly what a review scrum exists to weigh.
+              const completed = await this.completeOneShotGoal(goalId, oneShot.taskId).catch(err => {
+                log.warn(`completeOneShotGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`);
+                return true;
+              });
+              if (completed) return;
+              log.info(`quick_dispatch goal ${goalId.slice(0, 8)} finished with an ungrounded claim — upgrading to a review scrum`);
+              this.forceFullScrum.add(goalId);
             }
           } else {
             // Failure → let the normal review scrum below see the failed task
@@ -516,8 +576,9 @@ export class ScrumMaster extends Abject {
    * `attempt` > 1 marks a self-healing retry (the caller has already cleared
    * the round guard).
    */
-  private async enqueueScrumTask(goalId: string, priorScrumNumber: number, attempt = 1): Promise<void> {
+  private async enqueueScrumTask(goalId: string, priorScrumNumber: number, attempt = 1, note?: string): Promise<void> {
     if (!this.agentAbjectId) return;
+    try { if (await this.isRemoteGoal(goalId)) { log.info(`enqueueScrumTask skipped for remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
     const roundKey = `${goalId}#${priorScrumNumber}`;
     if (this.scrummedRounds.has(roundKey)) {
       log.info(`Scrum already enqueued for ${goalId.slice(0, 8)} after round ${priorScrumNumber}`);
@@ -525,9 +586,10 @@ export class ScrumMaster extends Abject {
     }
     this.scrummedRounds.add(roundKey);
 
-    const taskDesc = priorScrumNumber === 0
+    const base = priorScrumNumber === 0
       ? `Run the first scrum for goal ${goalId.slice(0, 8)}. No prior round — review the goal description and team roster, plan the initial work.`
       : `Run a scrum for goal ${goalId.slice(0, 8)} after round ${priorScrumNumber}. Review the round's outcomes (completed tasks, scratchpad, failed tasks) and decide: complete_goal, plan more, or fail_goal.`;
+    const taskDesc = note ? `${base}\n\n${note}` : base;
 
     log.info(`Enqueuing scrum task for goal ${goalId.slice(0, 8)} (after round ${priorScrumNumber}${attempt > 1 ? `, retry attempt ${attempt}` : ''})`);
 
@@ -539,6 +601,31 @@ export class ScrumMaster extends Abject {
       }),
     );
     this.scrumAttempts.set(taskId, { goalId, priorScrumNumber, attempt });
+  }
+
+  /**
+   * A committed decision that could not be carried out (a refused round, a
+   * partial addTask) leaves the goal with nothing running and nothing that
+   * would ever fire `goalReadyForCompletion`. The OTA loop that made the
+   * decision has already ended, so the only way forward is another scrum,
+   * opened with the reason in front of it. Without this the goal sat until
+   * GoalObserver's 30-minute staleness backstop failed it.
+   */
+  private async rerunScrumAfterFailedCommit(goalId: string, reason: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    let priorScrumNumber = 0;
+    try {
+      const goal = await this.request<{ currentScrumNumber?: number } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+      );
+      priorScrumNumber = goal?.currentScrumNumber ?? 0;
+    } catch { /* fall back to round 0 */ }
+    this.scrummedRounds.delete(`${goalId}#${priorScrumNumber}`);
+    this.forceFullScrum.add(goalId);
+    await this.enqueueScrumTask(
+      goalId, priorScrumNumber, 1,
+      `The previous scrum's decision could not be committed: ${reason} Plan again with this in view.`,
+    ).catch(err => log.warn(`rerun after failed commit for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /**
@@ -1161,15 +1248,26 @@ export class ScrumMaster extends Abject {
     }
 
     log.info(`poll_team: asking ${targets.length} member(s): ${targets.map(t => t.name).join(', ')}`);
+    const now = Date.now();
     const results = await Promise.all(
       targets.map(async (member) => {
+        // The registration description is live: it is rebuilt when the
+        // agent's capabilities change, so an unchanged description with the
+        // same question is the same answer.
+        const cacheKey = `${member.agentId}|${member.description ?? ''}|${question}`;
+        const cached = this.pollReplyCache.get(cacheKey);
+        if (cached && now - cached.at < ScrumMaster.POLL_CACHE_TTL_MS) {
+          return cached.text ? { agentName: member.name, text: cached.text } : null;
+        }
         try {
           const response = await this.request<string>(
             request(this.id, member.agentId, 'ask', { question }),
             45000,
           );
           const text = (typeof response === 'string' ? response : String(response)).trim();
-          if (!text || /^PASS\b/i.test(text)) return null;
+          const pass = !text || /^PASS\b/i.test(text);
+          this.pollReplyCache.set(cacheKey, { text: pass ? '' : text, at: now });
+          if (pass) return null;
           return { agentName: member.name, text };
         } catch (err) {
           log.warn(`poll_team: ${member.name} ask failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1177,6 +1275,10 @@ export class ScrumMaster extends Abject {
         }
       }),
     );
+    // Bound the cache; entries past TTL are dead weight.
+    for (const [k, v] of this.pollReplyCache) {
+      if (now - v.at >= ScrumMaster.POLL_CACHE_TTL_MS) this.pollReplyCache.delete(k);
+    }
     const contributions = results.filter((c): c is TeamContribution => c !== null);
     log.info(`poll_team: ${contributions.length} contribution(s) gathered`);
     return { success: true, data: { contributions } };
@@ -1277,7 +1379,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       resolvedDeps = [];
     }
 
-    inflight.staged.push({
+    // Validate the round's data contracts as it is staged, so the planner
+    // hears about a consumed key nobody produces on THIS action instead of at
+    // commit time, when its loop has already ended and nothing can answer.
+    const candidate: StagedTask = {
       name: stagedName,
       description,
       assignedAgentName,
@@ -1286,7 +1391,30 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       produces,
       consumes,
       target,
-    });
+    };
+    if ((consumes?.length ?? 0) > 0 || (produces?.length ?? 0) > 0) {
+      let existingKeys = new Set<string>();
+      try {
+        const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+          request(this.id, this.goalManagerId!, 'getGoal', { goalId }), 10000,
+        );
+        existingKeys = new Set(Object.keys(goal?.scratchpad ?? {}));
+      } catch { /* an unreadable scratchpad must not block staging */ }
+      const before = new Set(validateDataFlow(inflight.staged, existingKeys).map(p => p.message));
+      const problems = validateDataFlow([...inflight.staged, candidate], existingKeys)
+        .filter(p => !before.has(p.message));
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error:
+            `Task NOT staged — its data contract does not hold:\n` +
+            problems.map(p => `- ${p.message}`).join('\n') +
+            `\nFix the produces/consumes keys (or stage the producer first) and add_task again.`,
+        };
+      }
+    }
+
+    inflight.staged.push(candidate);
 
     const targetNote = target ? ` →${target}` : '';
     log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
@@ -1722,17 +1850,25 @@ Rules:
     return addResult.taskId;
   }
 
-  /** Complete a one-shot goal directly with its single task's result — no LLM. */
-  private async completeOneShotGoal(goalId: string, taskId: string): Promise<void> {
-    if (!this.goalManagerId) return;
+  /**
+   * Complete a one-shot goal directly with its single task's result — no LLM.
+   * Returns false, completing nothing, when the result is a bare claim (an
+   * action or state asserted with no evidence cited); the caller then runs a
+   * review scrum instead.
+   */
+  private async completeOneShotGoal(goalId: string, taskId: string): Promise<boolean> {
+    if (!this.goalManagerId) return true;
     const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     ).catch(() => null);
     // completeTask mirrors the agent's result to this scratchpad key; use it
     // verbatim as the goal result (the creator composes the user-facing reply).
     const result = goal?.scratchpad?.[`tasks/${taskId}/result`] ?? 'Done.';
+    const text = typeof result === 'string' ? result : safeStringify(result, 4000);
+    if (looksLikeUngroundedClaim(text)) return false;
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result }));
     log.info(`quick_dispatch complete: goal ${goalId.slice(0, 8)} finished in one task (no planning scrum)`);
+    return true;
   }
 
   /**
@@ -1808,6 +1944,10 @@ Rules:
         }), 15000,
       ).catch(() => { /* best effort */ });
       inflight.staged = [];
+      await this.rerunScrumAfterFailedCommit(
+        goalId,
+        `the round was refused for data-flow problems:\n${detail}`,
+      );
       return;
     }
 
@@ -1849,8 +1989,20 @@ Rules:
         }),
       );
       if (!addResult.taskId) {
-        log.warn(`addTask failed for staged task: ${addResult.error ?? 'unknown'} — partial commit may stall sprint`);
-        continue;
+        // A missing id would mis-wire every dependent that names this task,
+        // and a round committed with a hole in it never completes. Undo what
+        // landed and plan again with the error in view.
+        const why = addResult.error ?? 'unknown';
+        log.warn(`addTask failed for staged task "${s.description.slice(0, 60)}": ${why} — aborting the round`);
+        await this.request<{ cancelled: number }>(
+          request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId }), 15000,
+        ).catch(() => ({ cancelled: 0 }));
+        inflight.staged = [];
+        await this.rerunScrumAfterFailedCommit(
+          goalId,
+          `addTask failed for "${s.description.slice(0, 120)}" (${why}).`,
+        );
+        return;
       }
       taskIds.push(addResult.taskId);
       blockerSets.push(depIds);
@@ -2024,8 +2176,9 @@ Append one task to the current scrum's plan. **This does NOT commit** — it sta
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong. **Carry the goal's key requirement phrases through VERBATIM** (quote them): a paraphrase softens the requirement into something weaker that an agent can satisfy with an imitation — "use 3D graphics" rewritten as "a 3D presentation" invites a flat perspective drawing; "delete the old entries" rewritten as "clean up" invites archiving. Outcome wording is yours; the requirement words stay the user's.
 - \`assignedAgentName\`: must match a \`name\` in the \`team\` roster (from the goal state in your opening observation).
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
-- \`dependsOn\`: names (from \`id\`) or indices of THIS scrum's prior add_task calls. This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason.
+- \`dependsOn\`: names (from \`id\`) or indices of THIS scrum's prior add_task calls. This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason. And when a task would depend not on data another staged task writes but on knowledge nobody has yet — \"research X, then build whatever X implies\" — that is not a dependency to encode here: end the round at the research and plan the build next scrum (see **Research-first goals**).
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
+- **Parallel tasks on one external project (files on disk) run in the same checkout at once.** Partition them by area — different files or directories per task — so two tasks never edit the same file; name the area in each description.
 - \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context). **A consumed key is an edge.** If another task in this round produces it, this task automatically waits for that task, whether or not you also list it in \`dependsOn\`. So describing the data a task needs is enough; you do not have to keep the topology right by hand as well. A key nothing in the round produces has to already be on the goal scratchpad from an earlier round, otherwise the whole round is refused and you plan it again.
 - \`id\`: an optional short name for this task (\`"audit-web"\`). Other tasks can then depend on it by name instead of by position, which is worth doing the moment a round has more than two or three tasks: a mistaken index produces a valid graph of the wrong shape and nothing downstream can tell.
 
@@ -2122,7 +2275,8 @@ Returns \`{ id, forgotten: true }\` on success.
 
 **First scrum (currentScrumNumber=0):** the goal state (description, \`team\` roster with capability summaries, cached knowledge) is already in your opening observation. Act directly:
 1. **Is this a single step one agent obviously owns?** If \`quickDispatchAvailable\` is set and one \`team\` description clearly covers the whole request in one action (call a method on an existing object, one lookup, one navigation) → \`quick_dispatch({ agentName, task })\` and you're done. This is the common case for small requests; don't spin up a full sprint for them.
-2. Otherwise decide: do I already know which agent has the right capability?
+2. **Does the plan depend on something nobody has found out yet?** If you cannot write the implementation tasks without guessing — the goal turns on facts that do not exist yet (what an unfamiliar API or codebase actually exposes, which of several approaches is viable, the current state of an external source, how an existing object is really structured) — this is a research+do goal. Stage ONLY the research this round, and plan the implementation next scrum once the findings are on the scratchpad. See **Research-first goals** below.
+3. Otherwise decide: do I already know which agent has the right capability?
    - **YES** (cached lesson in \`relevantKnowledge\` names the agent + tool, or the goal is so generic any agent fits) → \`add_task\` directly, then \`dispatch_scrum\`.
    - **NO** → \`poll_team\` (often restricted via \`members\` to plausible candidates) to learn current capabilities. Read each contribution: which agent reported owning the relevant tool/skill/MCP? \`add_task\` to that agent, then \`dispatch_scrum\`. Save what you learned via \`save_knowledge\` before \`complete_goal\` later so the next sprint skips the poll.
 
@@ -2150,9 +2304,24 @@ Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad c
 - The goal state is delivered up front — read the opening observation, then act. \`review_scrum\` is only an optional mid-scrum refresh, not a required first step.
 - Don't poll the team if you can already decide from the scratchpad. Polling is expensive.
 - Multiple \`add_task\` calls = multiple OTA cycles. Each call stages one task; \`dispatch_scrum\` commits the batch.
-- Prefer 1-3 tasks per scrum unless work is naturally parallelizable. When it is, stage the whole independent set in ONE round with \`dependsOn: []\` on each: a wide parallel round finishes sooner than the same tasks split across sequential rounds, and agents run several at once.
+- Prefer 1-3 tasks per scrum unless work is naturally parallelizable. When it is, stage the whole independent set in ONE round with \`dependsOn: []\` on each: a wide parallel round finishes sooner than the same tasks split across sequential rounds, and agents run several at once. When what makes that set plannable is research nobody has done yet, run the research round FIRST and stage the wide round in the next scrum (see **Research-first goals**).
 - Synthesis in \`complete_goal\` MUST be self-contained text. Pull data from scratchpad and inline it. No "see above".
 - All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.
+
+## Research-first goals: research one round, build the next
+
+Not every goal needs research. Most arrive with everything the plan requires already in the goal description, the scratchpad, or \`relevantKnowledge\` — plan those directly and skip this section.
+
+Some goals have a **research+do shape**: what to build is knowable only after something is found out first. Recognize it by asking whether you could write the implementation tasks RIGHT NOW without guessing. You cannot when the goal turns on facts nobody has yet — what an unfamiliar API or codebase actually exposes, which of several candidate approaches is viable, the current state of an external source, how an existing object is really structured. The tell is that a task description would have to say \"find out X, then do whatever X implies\".
+
+For those goals, put the research and the implementation in SEPARATE ROUNDS:
+
+1. **This scrum plans the research, and nothing else.** Stage the investigation tasks, each writing what it finds to a \`produces\` key. When the question has independent facets — different sources, different subsystems, different candidate approaches — stage one task per facet with \`dependsOn: []\` so they all run at once. Then \`dispatch_scrum\`. Do not stage implementation tasks in this round.
+2. **The next scrum plans the implementation from those findings.** They arrive on the scratchpad in your opening observation. Read them, and only now decompose the actual work — with the research in hand you can see which pieces are genuinely independent, so stage them as a WIDE round: one task per independent piece, each with \`dependsOn: []\` and \`consumes\` on the research keys it needs, several on the same agent where that fits. Use \`dependsOn\` inside that round only where one piece truly needs another's output.
+
+**Do not stage the research task and the implementation task in the same round chained by \`dependsOn\`.** It looks equivalent and is not. A round staged before the findings exist can only be planned blind, so the build collapses into one vague task (\"take the research output and implement the goal\") that runs alone after the research lands — the entire implementation serialized through a single agent, with no chance to fan it out. Planning the build after the findings arrive costs one extra scrum (seconds) and buys a round of concurrent tasks (minutes), against a plan written from what is actually true rather than from what you assumed the research would say.
+
+Prefer the two-round split even when the research looks quick. The one case for chaining research and implementation in a single round is when the implementation is genuinely ONE indivisible task no matter what the research turns up — then there was no concurrency to exploit and the chain costs nothing.
 
 ## Composing UI work: Model and View
 

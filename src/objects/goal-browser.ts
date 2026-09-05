@@ -45,6 +45,18 @@ export class GoalBrowser extends Abject {
   private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
 
+  /** Local peer id; remote goals (creatorPeerId !== local) render a badge and lose sprint actions. */
+  private localPeerId = '';
+  private get selfPeerId(): string { return this.localPeerId || this.id; }
+  /**
+   * A goal is remote when another peer created it. goal-tree renders those rows
+   * with a [Remote: <peer>] badge and without controls: a single ScrumMaster on
+   * the owning peer drives each goal, so pausing or stopping it from here would
+   * race that owner.
+   */
+  private isRemoteGoal(creatorPeerId?: string): boolean {
+    return !!creatorPeerId && creatorPeerId !== this.selfPeerId;
+  }
   /** Track which goals are expanded in the tree. Active goals expand by default. */
   private expandedGoals: Set<GoalId> = new Set();
 
@@ -103,6 +115,20 @@ export class GoalBrowser extends Abject {
     this.goalManagerId = await this.requireDep('GoalManager');
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.goalObserverId = await this.discoverDep('GoalObserver') ?? undefined;
+
+    // Local peer id, resolved exactly as GoalManager resolves it so both sides
+    // agree on what counts as ours. Until Identity answers, selfPeerId falls
+    // back to this object's id, which matches no goal's creatorPeerId -- so
+    // goals read as remote (read-only) rather than briefly controllable.
+    const identityId = await this.discoverDep('Identity');
+    if (identityId) {
+      try {
+        const identity = await this.request<{ peerId: string }>(
+          request(this.id, identityId, 'getIdentity', {})
+        );
+        this.localPeerId = identity.peerId;
+      } catch { /* Identity may not be ready */ }
+    }
   }
 
   private setupHandlers(): void {
@@ -340,6 +366,9 @@ Click the arrow to expand/collapse a goal.
         latestMessage: last?.message,
         latestAgent: last?.agentName,
         error: g.error,
+        // Peer attribution: goal-tree badges these rows and drops their controls.
+        creatorPeerId: g.creatorPeerId,
+        isRemote: this.isRemoteGoal(g.creatorPeerId),
       };
     });
   }
@@ -406,6 +435,14 @@ Click the arrow to expand/collapse a goal.
       const { id: rawId, action } = data as { id: string; action: 'pause' | 'resume' | 'stop' };
       const goalId = (rawId.startsWith('goal:') ? rawId.slice(5) : rawId) as GoalId;
       if (!this.goalManagerId) return;
+
+      // Remote rows render without controls, so this catches a row drawn before
+      // Identity resolved -- the widget's action glyphs outlive one rebuild.
+      const target = this.goals.find(g => g.id === goalId);
+      if (this.isRemoteGoal(target?.creatorPeerId)) {
+        await this.notify('This goal belongs to another peer and is read-only here.', 'info');
+        return;
+      }
 
       if (action === 'stop') {
         const goal = this.goals.find(g => g.id === goalId);
