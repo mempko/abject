@@ -108,10 +108,10 @@ export class SharedState extends Abject {
   private localPeerId = '';
 
   /** Workspace access mode. Local workspaces never sync over P2P. */
-  private _accessMode: 'local' | 'private' | 'public' = 'local';
+  private _accessMode: 'local' | 'shared' | 'public' = 'local';
 
   /**
-   * Peer IDs allowed to sync when the workspace is `private`. Kept in step with
+   * Peer IDs allowed to sync when the workspace is `shared`. Kept in step with
    * WorkspaceManager via setAccessMode/setWhitelist notifications. Ignored in
    * `public` mode (all peers) and `local` mode (no peers).
    */
@@ -425,6 +425,9 @@ export class SharedState extends Abject {
 
       // Send full state back only for namespaces we actually have
       for (const name of names) {
+        // Namespaces outside the shared set never leave this host, even for a
+        // peer that is otherwise whitelisted.
+        if (!this.namespaceAllowedForSync(name)) continue;
         const map = this.stateMaps.get(name);
         if (!map) {
           // Unknown namespace -- drop silently. Bridging should be explicit.
@@ -465,28 +468,58 @@ export class SharedState extends Abject {
     });
 
     this.on('setAccessMode', async (msg: AbjectMessage) => {
-      const { accessMode, whitelist } = msg.payload as {
-        accessMode: 'local' | 'private' | 'public';
+      const { accessMode, whitelist, sharedNamespaces } = msg.payload as {
+        accessMode: 'local' | 'shared' | 'public';
         whitelist?: string[];
+        sharedNamespaces?: string[];
       };
       const prev = this._accessMode;
       this._accessMode = accessMode;
       if (whitelist !== undefined) this._whitelist = whitelist;
+      if (sharedNamespaces !== undefined) this._sharedNamespaces = [...sharedNamespaces];
       log.info(`[${this.id.slice(0, 8)}] accessMode changed: ${prev} → ${accessMode} (whitelist=${this._whitelist.length})`);
       if (accessMode === 'local' && prev !== 'local') {
         // Went local: clear all remote peers, stop syncing
         this.remotePeers.clear();
         this.remotePeerOwners.clear();
         log.info(`[${this.id.slice(0, 8)}] cleared remote peers (workspace is now local)`);
-      } else if (accessMode !== 'local' && prev === 'local') {
-        // Went shared: trigger discovery
+      } else if (accessMode !== 'local') {
+        // Shared, or already shared with a changed peer set: (re)discover.
+        //
+        // Gating this on the local->shared transition alone left a joined
+        // workspace mirror silent forever. A mirror is dispatched its
+        // PARTICIPATION mode (WorkspaceManager.participationAccess) on every
+        // restore, re-join and participant change, so the dispatch that
+        // matters is frequently shared->shared with a WIDENED whitelist --
+        // exactly the case the transition test skipped. scheduleDiscovery is
+        // debounced, so re-arming it on each dispatch is cheap.
         this.scheduleDiscovery();
       }
-      // In private mode, drop any known-owner peers no longer on the whitelist
-      // (mode tightened public→private, or the whitelist shrank) so they stop
+      // In shared mode, drop any known-owner peers no longer on the whitelist
+      // (mode tightened public→shared, or the whitelist shrank) so they stop
       // receiving updates immediately, not just at the next send-time filter.
-      if (accessMode === 'private') this.prunePrivateNonWhitelisted();
+      if (accessMode === 'shared') this.pruneSharedNonWhitelisted();
     });
+  }
+
+  /**
+   * Namespaces this instance may replicate to peers, as exact names or '*'
+   * prefix globs, pushed by WorkspaceManager alongside the access mode.
+   *
+   * An empty list means no policy has been configured and every namespace
+   * syncs -- the behaviour every existing caller relies on. The peer whitelist
+   * gates WHO receives an update; this gates WHAT is allowed to leave at all.
+   */
+  private _sharedNamespaces: string[] = [];
+
+  /** True when `name` may cross the wire under the current namespace policy. */
+  private namespaceAllowedForSync(name: string): boolean {
+    if (this._sharedNamespaces.length === 0) return true;
+    for (const pattern of this._sharedNamespaces) {
+      if (pattern === name) return true;
+      if (pattern.endsWith('*') && name.startsWith(pattern.slice(0, -1))) return true;
+    }
+    return false;
   }
 
   protected override async onInit(): Promise<void> {
@@ -732,18 +765,18 @@ export class SharedState extends Abject {
   }
 
   // ==========================================================================
-  // Private-mode outbound gate — only sync with whitelisted peers
+  // Shared-mode outbound gate — only sync with whitelisted peers
   // ==========================================================================
 
   /**
    * Whether we may sync with a remote SharedState owned by `ownerPeerId`.
-   * Only enforced in `private` mode (public syncs with all; `local` never
+   * Only enforced in `shared` mode (public syncs with all; `local` never
    * reaches sync). Same-peer (self) and unknown owners are allowed — an
    * unknown-owner peer arrived via an inbound link that already passed our
    * PeerRouter whitelist gate, so it is provably whitelisted or same-peer.
    */
   private peerAllowedForSync(ownerPeerId: string | undefined): boolean {
-    if (this._accessMode !== 'private') return true;
+    if (this._accessMode !== 'shared') return true;
     if (!ownerPeerId || ownerPeerId === this.localPeerId) return true;
     return this._whitelist.includes(ownerPeerId);
   }
@@ -751,18 +784,18 @@ export class SharedState extends Abject {
   /** Remote SharedState targets we may sync to under the current access mode. */
   private syncTargets(): AbjectId[] {
     const all = Array.from(this.remotePeers.values());
-    if (this._accessMode !== 'private') return all;
+    if (this._accessMode !== 'shared') return all;
     return all.filter(id => this.peerAllowedForSync(this.remotePeerOwners.get(id as string)));
   }
 
   /**
-   * Drop known-owner remote peers that private mode no longer allows (mode
-   * tightened public→private, or the whitelist shrank). Send-time filtering via
+   * Drop known-owner remote peers that shared mode no longer allows (mode
+   * tightened public→shared, or the whitelist shrank). Send-time filtering via
    * syncTargets() already protects confidentiality; this just stops such peers
    * being counted and picked as anti-entropy targets.
    */
-  private prunePrivateNonWhitelisted(): void {
-    if (this._accessMode !== 'private') return;
+  private pruneSharedNonWhitelisted(): void {
+    if (this._accessMode !== 'shared') return;
     let dropped = 0;
     for (const [key] of [...this.remotePeers]) {
       const owner = this.remotePeerOwners.get(key);
@@ -772,7 +805,7 @@ export class SharedState extends Abject {
         dropped++;
       }
     }
-    if (dropped > 0) log.info(`[${this.id.slice(0, 8)}] pruned ${dropped} non-whitelisted remote peer(s) (private mode)`);
+    if (dropped > 0) log.info(`[${this.id.slice(0, 8)}] pruned ${dropped} non-whitelisted remote peer(s) (shared mode)`);
   }
 
   // ==========================================================================
@@ -865,6 +898,7 @@ export class SharedState extends Abject {
 
   private broadcastEntry(name: string, key: string, entry: LWWEntry): void {
     if (this._accessMode === 'local') return;
+    if (!this.namespaceAllowedForSync(name)) return;
 
     // Only broadcast to peers allowed under the current access mode. In private
     // mode this excludes discovered-but-not-whitelisted peers — the outbound
@@ -883,6 +917,8 @@ export class SharedState extends Abject {
     );
 
     const selected = this.selectRandom(allPeers, fanout);
+
+    if (!this.namespaceAllowedForSync(name)) return;
 
     log.info(`[${this.id.slice(0, 8)}] gossipBroadcast name='${name}' key='${key}' to ${selected.length}/${allPeers.length} peers`);
     for (const remoteSSId of selected) {
@@ -980,7 +1016,8 @@ export class SharedState extends Abject {
     const targetPeer = allPeers[Math.floor(Math.random() * allPeers.length)];
 
     // Send digest of all our state maps
-    const subscribedNames = this.getSubscribedStateNames();
+    const subscribedNames = this.getSubscribedStateNames()
+      .filter(name => this.namespaceAllowedForSync(name));
     if (subscribedNames.length === 0) return;
 
     // Build digest: [{name, key, timestamp}]

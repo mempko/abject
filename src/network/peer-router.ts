@@ -38,6 +38,45 @@ const GOSSIP_FANOUT = 4; // Phase 3: max peers to gossip to
 const GOSSIP_FANOUT_MIN = 2; // Phase 3: always gossip to at least 2 peers
 const MAX_CHANGELOG = 500; // Phase 2: max changelog entries
 const PROPAGATION_EXPIRY = 30_000; // Phase 3: propagation dedup window
+
+/**
+ * P2-2 — minimal signaling/routing surface reachable from remote peers.
+ *
+ * `allowedSystemObjects` is a bypass around workspace curation, so it is no
+ * longer a bare set of ids: each admitted object carries the exact set of
+ * methods a REMOTE peer may invoke on it. Anything else addressed to that
+ * object falls through to the normal curation check, so a permitted system
+ * object cannot be used as a universal proxy.
+ */
+const PEER_ROUTER_REMOTE_METHODS: ReadonlySet<string> = new Set([
+  'registerRoute',
+  'removeRoute',
+  'clearRoutesForPeer',
+  'announceRoutes',
+  'handleRouteAnnouncement',
+  'handleRouteDigest',
+  'resolveRemoteObject',
+  'resolveWorkspaceRegistry',
+  'getRoutes',
+]);
+
+/** Workspace signaling protocol — the only WSR surface a peer may reach. */
+const WORKSPACE_SHARE_REGISTRY_REMOTE_METHODS: ReadonlySet<string> = new Set([
+  'workspace:join_request',
+  'workspace:join_ack',
+  'workspace:peer_joined',
+  'workspace:peer_left',
+  'workspace:catalog_snapshot',
+  'workspace:catalog_delta',
+  'workspace:catalog_sync_request',
+  'handleWorkspaceQuery',
+  'getCatalogSeq',
+]);
+
+/** Well-known id (not ephemeral UUID) → its permitted remote method set. */
+const SIGNALING_SYSTEM_OBJECTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['abjects:workspace-share-registry', WORKSPACE_SHARE_REGISTRY_REMOTE_METHODS],
+]);
 const MAX_GOSSIP_HOPS = 3; // Phase 3: max hops for gossip propagation
 
 // Rate limiting: token bucket per peer
@@ -90,6 +129,9 @@ interface PermissionCacheEntry {
   accessMode: WorkspaceAccessMode;
   whitelist: string[];
   exposedObjectIds: AbjectId[];
+  /** P2-2/P1-2: durable curation selectors — survive AbjectId churn. */
+  exposedTypeIds: string[];
+  exposedNames: string[];
   cachedAt: number;
 }
 
@@ -109,8 +151,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   // Phase 3: Gossip dedup
   private seenPropagations: Map<string, number> = new Map(); // propagationId → expiry
 
-  /** System objects explicitly allowed for remote access */
-  private allowedSystemObjects: Set<AbjectId> = new Set();
+  /**
+   * System objects explicitly allowed for remote access (P2-2: minimised).
+   * objectId → the method names a remote peer may invoke on it. Admission is
+   * restricted to the well-known signaling/routing objects above.
+   */
+  private allowedSystemObjects: Map<AbjectId, ReadonlySet<string>> = new Map();
 
   /** Well-known name → local UUID mapping for inbound message resolution (legacy) */
   private wellKnownAliases: Map<AbjectId, AbjectId> = new Map();
@@ -123,6 +169,40 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /** NAT table: local objectId → Map<peerId, expiryTimestamp> */
   private connTrack: Map<AbjectId, Map<PeerId, number>> = new Map();
+
+  /**
+   * P2-2: precisely scoped NAT table. The coarse connTrack map above is used
+   * only for speculative ROUTING. Inbound PERMISSION reuse keys on the exact
+   * (localObject, peer, remoteObject) triple that actually initiated, and a
+   * hit here never bypasses curation — it is re-checked on every reuse.
+   * Key: `${localObjectId}|${peerId}|${remoteObjectId}` → expiry timestamp.
+   */
+  private connTrackPairs: Map<string, number> = new Map();
+
+  /**
+   * Requests handed to a peer's wire and not yet answered, keyed by the
+   * ORIGINAL messageId — which is exactly the correlationId the peer's reply
+   * will carry, so an inbound reply cancels the timeout below.
+   */
+  private pendingWireRequests: Map<string, {
+    peerId: PeerId;
+    request: AbjectMessage;
+    timer: ReturnType<typeof setTimeout>;
+  }> = new Map();
+
+  /**
+   * Requests that arrived FROM a peer and were delivered locally, keyed by
+   * messageId. The local reply to one of these has to go back out to that peer,
+   * and the recipient id alone cannot say so: the remote caller holds no
+   * mailbox here and usually no announced route either, so a reply addressed to
+   * it would find neither local delivery nor a next hop. Correlation is exact
+   * where the recipient id carries no routing information at all.
+   */
+  private inboundRequestOrigins: Map<string, { peerId: PeerId; expiresAt: number }> = new Map();
+
+  /** Fail just inside the caller's own 30s request timeout, so this error wins. */
+  private readonly wireRequestTimeoutMs = 25_000;
+  private readonly inboundOriginTtlMs = 60_000;
   private rateLimitBuckets: Map<PeerId, TokenBucket> = new Map();
 
   /** Hint map: registryId/objectId → ownerPeerId, populated from workspace route announcements.
@@ -187,14 +267,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
                   { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID' },
                 ],
                 returns: { kind: 'primitive', primitive: 'number' },
-              },
-              {
-                name: 'allowSystemObject',
-                description: 'Mark a system object as accessible to remote peers',
-                parameters: [
-                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Object ID to allow' },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'getRoutes',
@@ -345,6 +417,118 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
   }
 
+  // ==========================================================================
+  // Wire request tracking
+  //
+  // A request handed to a peer's transport is on its own until that peer
+  // answers. If the peer is offline, drops mid-flight, or simply never replies,
+  // the caller would otherwise sit out its full 30s request timeout and then
+  // report a generic failure. Tracking the message here lets us answer the
+  // caller with a specific error the moment we know no reply is coming.
+  // ==========================================================================
+
+  /**
+   * Put a message on a peer's wire verbatim, bypassing the route table. The
+   * caller names the peer, so this is the escape hatch for a delivery the
+   * routing table cannot express. Nothing is re-sent onto the local bus, and
+   * the recipient's own reply travels straight back to the original sender.
+   *
+   * No in-tree caller remains now that remote ids route natively through
+   * `intercept()`; it stays as the bus-reachable `forwardToPeer` method.
+   */
+  private async forwardToPeerImpl(
+    peerId: PeerId, message: AbjectMessage, expectReply: boolean,
+  ): Promise<boolean> {
+    if (!this.isPeerConnected(peerId)) {
+      this.failWireRequest(message, 'PEER_OFFLINE', `Peer ${peerId.slice(0, 16)} is not connected`);
+      return false;
+    }
+
+    if (expectReply) this.trackWireRequest(peerId, message);
+
+    try {
+      await this.sendToPeerTransport(peerId, message);
+      return true;
+    } catch (err) {
+      this.clearWireRequest(message.header.messageId);
+      const reason = err instanceof Error ? err.message : String(err);
+      log.error(`forwardToPeer ${peerId.slice(0, 16)} failed: ${reason}`);
+      this.failWireRequest(message, 'PEER_SEND_FAILED',
+        `Send to peer ${peerId.slice(0, 16)} failed: ${reason}`);
+      return false;
+    }
+  }
+
+  private trackWireRequest(peerId: PeerId, message: AbjectMessage): void {
+    const messageId = message.header.messageId;
+    this.clearWireRequest(messageId);
+
+    const timer = setTimeout(() => {
+      this.pendingWireRequests.delete(messageId);
+      log.warn(`wire request ${messageId.slice(0, 8)} to ${peerId.slice(0, 16)} timed out`);
+      this.failWireRequest(message, 'PEER_REQUEST_TIMEOUT',
+        `No reply from peer ${peerId.slice(0, 16)} within ${this.wireRequestTimeoutMs}ms`);
+    }, this.wireRequestTimeoutMs);
+    // Housekeeping only — must never hold a Node process open on its own.
+    (timer as unknown as { unref?: () => void }).unref?.();
+
+    this.pendingWireRequests.set(messageId, { peerId, request: message, timer });
+  }
+
+  /** Settle a tracked request. True if one really was in flight. */
+  private clearWireRequest(messageId: string): boolean {
+    const entry = this.pendingWireRequests.get(messageId);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    this.pendingWireRequests.delete(messageId);
+    return true;
+  }
+
+  /** Fail every request still in flight to a peer that has gone away. */
+  private failWireRequestsForPeer(peerId: PeerId, code: string, reason: string): number {
+    let failed = 0;
+    for (const [messageId, entry] of Array.from(this.pendingWireRequests.entries())) {
+      if (entry.peerId !== peerId) continue;
+      clearTimeout(entry.timer);
+      this.pendingWireRequests.delete(messageId);
+      this.failWireRequest(entry.request, code, reason);
+      failed++;
+    }
+    return failed;
+  }
+
+  /**
+   * Synthesize the reply the peer will never send. `createError` addresses it
+   * back to the original caller with the original messageId as correlationId,
+   * so the caller's pending promise rejects now instead of at its own timeout.
+   */
+  private failWireRequest(message: AbjectMessage, code: string, text: string): void {
+    if (message.header.type !== 'request') return;
+    try {
+      this._messageBus?.send(createError(message, code, text));
+    } catch (err) {
+      log.error('Failed to deliver synthesized wire error:', err);
+    }
+  }
+
+  /** Correlation id of a reply/error, read defensively — it rides the wire. */
+  private correlationOf(message: AbjectMessage): string | undefined {
+    return (message.header as unknown as { correlationId?: string }).correlationId;
+  }
+
+  /** Note which peer a locally-delivered request came from, so its reply can go home. */
+  private rememberInboundOrigin(messageId: string, peerId: PeerId): void {
+    if (this.inboundRequestOrigins.size > 512) {
+      const now = Date.now();
+      for (const [id, entry] of Array.from(this.inboundRequestOrigins.entries())) {
+        if (entry.expiresAt <= now) this.inboundRequestOrigins.delete(id);
+      }
+    }
+    this.inboundRequestOrigins.set(messageId, {
+      peerId, expiresAt: Date.now() + this.inboundOriginTtlMs,
+    });
+  }
+
   private getConnectedPeersList(): PeerId[] {
     if (this.peerRegistryRef) {
       return this.peerRegistryRef.getConnectedPeers();
@@ -366,9 +550,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /**
    * Mark a system object as accessible to remote peers (direct method, for bootstrap).
+   *
+   * P2-2: only the well-known signaling/routing objects in
+   * SIGNALING_SYSTEM_OBJECTS may be admitted, and only for their declared
+   * method set. Any other object is refused outright — the bypass set is not a
+   * general-purpose escape hatch from workspace curation.
    */
   allowSystemObjectDirect(objectId: AbjectId, wellKnownId?: AbjectId, typeId?: TypeId): void {
-    this.allowedSystemObjects.add(objectId);
+    const methods = wellKnownId ? SIGNALING_SYSTEM_OBJECTS.get(wellKnownId as string) : undefined;
+    if (!methods) {
+      log.info(`REFUSED system-object admission for ${String(wellKnownId ?? objectId)} — not a well-known signaling/routing object`);
+      return;
+    }
+    this.allowedSystemObjects.set(objectId, methods);
     if (wellKnownId) {
       this.wellKnownAliases.set(wellKnownId, objectId);
     }
@@ -399,16 +593,27 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return this.clearRoutesForPeerImpl(peerId);
     });
 
-    this.on('allowSystemObject', async (msg: AbjectMessage) => {
-      const { objectId, wellKnownId, typeId } = msg.payload as { objectId: string; wellKnownId?: string; typeId?: string };
-      this.allowedSystemObjects.add(objectId as AbjectId);
-      if (wellKnownId) {
-        this.wellKnownAliases.set(wellKnownId as AbjectId, objectId as AbjectId);
-      }
-      if (typeId) {
-        this.typeIdToLocal.set(typeId as TypeId, objectId as AbjectId);
-      }
-      return true;
+    // P2-2: the bus-reachable `allowSystemObject` handler is REMOVED. It let
+    // any sender widen the curation bypass to an arbitrary object id and had
+    // zero callers. Bootstrap uses allowSystemObjectDirect(), which admits only
+    // the well-known signaling/routing objects.
+
+    // Explicit hand-off of a message bound for an object on a NAMED peer.
+    // This resolves as soon as the transport accepts the message: the remote
+    // object's own reply travels straight back to the original caller, never
+    // through this reply. Ordinary sends to a remote object do not come
+    // through here — intercept() captures them and routes from the table.
+    this.on('forwardToPeer', async (msg: AbjectMessage) => {
+      const { peerId, message, expectReply } = msg.payload as {
+        peerId: string; message: AbjectMessage; expectReply?: boolean;
+      };
+      precondition(!!peerId, 'peerId is required');
+      precondition(!!message, 'message is required');
+      return this.forwardToPeerImpl(
+        peerId as PeerId,
+        message,
+        expectReply ?? (message.header.type === 'request'),
+      );
     });
 
     this.on('getRoutes', async () => {
@@ -508,7 +713,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     log.info('onInit starting');
 
     // Allow inbound messages addressed to PeerRouter itself (route announcements)
-    this.allowedSystemObjects.add(this.id);
+    this.allowedSystemObjects.set(this.id, PEER_ROUTER_REMOTE_METHODS);
 
     this.peerRegistryId = (await this.discoverDep('PeerRegistry')) ?? undefined;
     this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
@@ -564,6 +769,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   }
 
   protected override async onStop(): Promise<void> {
+    for (const entry of this.pendingWireRequests.values()) clearTimeout(entry.timer);
+    this.pendingWireRequests.clear();
+    this.inboundRequestOrigins.clear();
+
     if (this.announceTimer) {
       clearTimeout(this.announceTimer);
       this.announceTimer = undefined;
@@ -590,8 +799,30 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return 'pass';
     }
 
+    // A reply correlated to a request that arrived from a peer belongs on the
+    // wire back to that peer. The remote caller's id holds no local mailbox
+    // and usually no announced route, so neither check below could place this
+    // reply anywhere. Correlation is what carries it home, and it runs first
+    // so a reply always reaches the peer that asked, whatever the id resolves to.
+    if (message.header.type === 'reply' || message.header.type === 'error') {
+      const correlated = this.correlationOf(message);
+      const origin = correlated ? this.inboundRequestOrigins.get(correlated) : undefined;
+      if (correlated && origin) {
+        this.inboundRequestOrigins.delete(correlated);
+        if (this.isPeerConnected(origin.peerId)) {
+          this.sendToPeerTransport(origin.peerId, this.filterOutboundReply(message)).catch((err) => {
+            log.error(`Failed to return reply to peer ${origin.peerId.slice(0, 16)}:`, err);
+          });
+          return 'drop';
+        }
+      }
+    }
+
     // If the recipient is registered locally, always deliver locally —
-    // never route a local object's messages to a remote peer.
+    // never route a local object's messages to a remote peer. No stand-in is
+    // ever mounted for a peer's object, so this predicate means strictly
+    // "lives here": a pooled remote id matches nothing and falls through to
+    // the route table below, which is how remote sends reach their owner.
     if (this._messageBus?.isRegistered(recipient)) {
       return 'pass';
     }
@@ -617,7 +848,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         const outMsg = this.filterOutboundReply(message);
         // Fire-and-forget: transport send is async but bus must not block
         this.sendToPeerTransport(specPeer, outMsg).catch(() => { /* best-effort */ });
-        this.trackOutboundConnection(message.routing.from as AbjectId, specPeer);
+        this.trackOutboundConnection(
+          message.routing.from as AbjectId, specPeer, message.routing.to as AbjectId,
+        );
         return 'drop';
       }
       return 'pass'; // Local delivery
@@ -625,6 +858,16 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     if (!this.isPeerConnected(route.nextHop)) {
       log.warn(`Cannot route to ${recipient.slice(0, 8)}: peer ${route.nextHop.slice(0, 16)} not connected`);
+      if (message.header.type === 'request') {
+        // We hold the ONLY route to this object and it runs through a peer that
+        // is offline, so no local delivery can succeed either. Fail the caller
+        // now rather than let it hang for its full timeout. Deferred to a
+        // microtask so we never re-enter the bus from inside interception.
+        const offlinePeer = route.nextHop;
+        queueMicrotask(() => this.failWireRequest(message, 'PEER_OFFLINE',
+          `Peer ${offlinePeer.slice(0, 16)} owning ${recipient.slice(0, 8)} is offline`));
+        return 'drop';
+      }
       return 'pass'; // Fall through to normal undeliverable handling
     }
 
@@ -635,7 +878,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       log.error(`Failed to forward message to peer ${route.nextHop.slice(0, 16)}:`, err);
     });
     // NAT-like: record that this local object talked to this peer
-    this.trackOutboundConnection(message.routing.from as AbjectId, route.nextHop);
+    this.trackOutboundConnection(
+      message.routing.from as AbjectId, route.nextHop, message.routing.to as AbjectId,
+    );
     return 'drop'; // We handled delivery
   }
 
@@ -702,13 +947,22 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Record that a local object sent a message to a remote peer.
    * Enables NAT-like return path: the peer can send back to this object.
    */
-  private trackOutboundConnection(localObjectId: AbjectId, remotePeerId: PeerId): void {
+  private trackOutboundConnection(
+    localObjectId: AbjectId, remotePeerId: PeerId, remoteObjectId?: AbjectId,
+  ): void {
     let peers = this.connTrack.get(localObjectId);
     if (!peers) {
       peers = new Map();
       this.connTrack.set(localObjectId, peers);
     }
     peers.set(remotePeerId, Date.now() + ROUTE_TTL);
+    // P2-2: remember the exact pair for the inbound return path.
+    if (remoteObjectId) {
+      this.connTrackPairs.set(
+        `${localObjectId}|${remotePeerId}|${remoteObjectId}`,
+        Date.now() + ROUTE_TTL,
+      );
+    }
   }
 
   // ==========================================================================
@@ -752,6 +1006,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       }
     }
 
+    // A reply/error off the wire settles whatever outbound request it
+    // correlates to, so that request's timeout must not fire afterwards.
+    if (msg.header.type === 'reply' || msg.header.type === 'error') {
+      const correlated = this.correlationOf(msg);
+      if (correlated) this.clearWireRequest(correlated);
+    }
+
     let targetId = msg.routing.to;
     log.info(`inbound: to=${msg.routing.to.slice(0, 20)} from=${msg.routing.from.slice(0, 8)} type=${msg.header.type} method=${msg.routing.method ?? '?'}`);
 
@@ -781,7 +1042,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Check if target is registered locally on the bus
     const isReg = this._messageBus?.isRegistered(targetId) ?? false;
     const isReply = msg.header.type === 'reply' || msg.header.type === 'error';
-    const permOk = isReg ? (isReply || this.checkInboundPermission(targetId, fromPeerId)) : false;
+    const permOk = isReg
+      ? (isReply || this.checkInboundPermission(targetId, fromPeerId, msg.routing.from as AbjectId, msg.routing.method))
+      : false;
     log.info(`isRegistered=${isReg} permissionOk=${permOk}`);
 
     if (this._messageBus && isReg) {
@@ -805,6 +1068,15 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           this.sendToPeerTransport(fromPeerId, errMsg).catch(() => { /* best-effort */ });
         }
         return;
+      }
+
+      // Remember where this request came from. The local reply is addressed
+      // to the caller's AbjectId, which lives on the remote peer's bus; a
+      // caller is not an announced object, so it may have no route entry of
+      // its own. This messageId correlation is the only thing that says the
+      // reply belongs on the wire back to this peer.
+      if (msg.header.type === 'request') {
+        this.rememberInboundOrigin(msg.header.messageId, fromPeerId);
       }
 
       // Inject into local bus
@@ -844,39 +1116,55 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /**
    * Check if an inbound message from a remote peer is allowed to reach the target.
-   * Synchronous — uses cached permission data, falls back to allow if no cache.
+   * Synchronous and FAIL-CLOSED (P2-2): a conntrack hit no longer grants blanket
+   * access — it is scoped to the exact (peer, object) pair that initiated and
+   * curation is re-checked on every reuse. A permission-cache miss returns
+   * false; the caller resolves it and denies unless curation explicitly allows.
    */
-  private checkInboundPermission(targetId: AbjectId, fromPeerId: PeerId): boolean {
-    // System objects explicitly allowed
-    if (this.allowedSystemObjects.has(targetId)) {
+  private checkInboundPermission(
+    targetId: AbjectId, fromPeerId: PeerId, fromObjectId?: AbjectId, method?: string,
+  ): boolean {
+    // System objects explicitly allowed (minimal set: signaling/routing only).
+    // P2-2: the bypass is scoped to that object's declared signaling/routing
+    // methods — any other method to the same object still goes through the
+    // curation check below, so it cannot act as a universal proxy.
+    const allowedMethods = this.allowedSystemObjects.get(targetId);
+    if (allowedMethods && method !== undefined && allowedMethods.has(method)) {
       return true;
     }
 
-    // NAT-like: allow return traffic if this object previously talked to this peer
+    // P2-2: expire the pair entry if stale; a live pair is only a routing hint
+    // and still must pass the curation check below.
+    if (fromObjectId) {
+      const pairKey = `${targetId}|${fromPeerId}|${fromObjectId}`;
+      const pairExpiry = this.connTrackPairs.get(pairKey);
+      if (pairExpiry !== undefined && Date.now() >= pairExpiry) this.connTrackPairs.delete(pairKey);
+    }
+
+    // Prune the coarse (routing-only) table so it does not grow unbounded.
     const trackedPeers = this.connTrack.get(targetId);
     if (trackedPeers) {
       const expiry = trackedPeers.get(fromPeerId);
-      if (expiry && Date.now() < expiry) {
-        return true;
-      }
-      // Clean up expired entry
-      if (expiry) trackedPeers.delete(fromPeerId);
+      if (expiry !== undefined && Date.now() >= expiry) trackedPeers.delete(fromPeerId);
       if (trackedPeers.size === 0) this.connTrack.delete(targetId);
     }
 
-    // Check permission cache
+    // Curation check — required for BOTH fresh and return traffic.
     const cached = this.permissionCache.get(targetId);
     if (cached && Date.now() - cached.cachedAt < PERMISSION_CACHE_TTL) {
       return this.evaluatePermission(cached, fromPeerId, targetId);
     }
 
-    // No cache — caller (handleInboundMessage) will defer the check asynchronously
+    // No usable cache: fail closed. The caller resolves the curation state and
+    // delivers only if it then explicitly allows this peer.
     return false;
   }
 
   /**
-   * Deferred permission check for cache misses.
-   * Refreshes the cache and re-evaluates instead of fail-closed denial.
+   * Cache-miss resolution (P2-2). Resolves the curation state for the target
+   * and delivers ONLY if the freshly resolved curation allows this peer. Any
+   * failure to resolve — WorkspaceManager unreachable, no workspace, empty
+   * curation — denies. Nothing is delivered on an unresolved permission.
    */
   private async deferPermissionCheck(
     msg: AbjectMessage, targetId: AbjectId, fromPeerId: PeerId,
@@ -886,12 +1174,15 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       const cached = this.permissionCache.get(targetId);
       if (cached && this.evaluatePermission(cached, fromPeerId, targetId)) {
         log.info(`deferred permission ALLOWED: ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
+        if (msg.header.type === 'request') {
+          this.rememberInboundOrigin(msg.header.messageId, fromPeerId);
+        }
         this._messageBus?.send(msg);
         return;
       }
-    } catch { /* refresh failed */ }
+    } catch { /* refresh failed — fail closed below */ }
 
-    log.warn(`ACCESS_DENIED (deferred): ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
+    log.warn(`ACCESS_DENIED (unresolved curation): ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
     if (msg.header.type === 'request') {
       const errMsg = createError(msg, 'ACCESS_DENIED', `Access denied to object ${targetId}`);
       this.sendToPeerTransport(fromPeerId, errMsg).catch(() => { /* best-effort */ });
@@ -905,22 +1196,35 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       case 'public':
         accessAllowed = true;
         break;
-      case 'private':
+      case 'shared':
         accessAllowed = entry.whitelist.includes(fromPeerId);
         break;
       case 'local':
+        // Genuinely private, and a hard deny. A joined mirror does NOT reach
+        // this case: it is advertised as 'local' but reports its PARTICIPATION
+        // access through WorkspaceManager.findWorkspaceForObject ('shared' +
+        // owner/participants), so the case above admits exactly the workspace's
+        // own members and nobody else.
         return false;
       default:
         return false;
     }
     if (!accessAllowed) return false;
 
-    // Second gate: exposed objects check
-    if (entry.exposedObjectIds.length === 0) {
-      return false; // No objects exposed — deny remote access
+    // Second gate: curation check, keyed on the durable selectors of P1-2
+    // (id OR typeId OR registered name) so a restart's fresh AbjectIds do not
+    // silently widen or narrow what a peer may reach.
+    const curatedAnything =
+      entry.exposedObjectIds.length > 0 ||
+      entry.exposedTypeIds.length > 0 ||
+      entry.exposedNames.length > 0;
+    if (!curatedAnything) {
+      return false; // Nothing curated — deny remote access (P2-3 default)
     }
     if (targetId) {
-      return entry.exposedObjectIds.includes(targetId);
+      if (entry.exposedObjectIds.includes(targetId)) return true;
+      const key = targetId as unknown as string;
+      return entry.exposedTypeIds.includes(key) || entry.exposedNames.includes(key);
     }
     return true;
   }
@@ -937,6 +1241,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         accessMode: WorkspaceAccessMode;
         whitelist: string[];
         exposedObjectIds: string[];
+        exposedTypeIds?: string[];
+        exposedNames?: string[];
       } | null>(
         createRequest(
           this.id, this.workspaceManagerId,
@@ -950,6 +1256,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           accessMode: result.accessMode,
           whitelist: result.whitelist,
           exposedObjectIds: (result.exposedObjectIds ?? []) as AbjectId[],
+          exposedTypeIds: result.exposedTypeIds ?? [],
+          exposedNames: result.exposedNames ?? [],
           cachedAt: Date.now(),
         });
       } else {
@@ -959,6 +1267,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           accessMode: 'local',
           whitelist: [],
           exposedObjectIds: [],
+          exposedTypeIds: [],
+          exposedNames: [],
           cachedAt: Date.now(),
         });
       }
@@ -996,6 +1306,17 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   }
 
   private clearRoutesForPeerImpl(peerId: PeerId): number {
+    // The peer is gone: nothing we handed to its wire will ever be answered.
+    // Fail those callers now instead of leaving each to its own timeout.
+    const failedInFlight = this.failWireRequestsForPeer(peerId, 'PEER_DISCONNECTED',
+      `Peer ${peerId.slice(0, 16)} disconnected before replying`);
+    if (failedInFlight > 0) {
+      log.warn(`failed ${failedInFlight} in-flight request(s) to ${peerId.slice(0, 16)}`);
+    }
+    for (const [messageId, entry] of Array.from(this.inboundRequestOrigins.entries())) {
+      if (entry.peerId === peerId) this.inboundRequestOrigins.delete(messageId);
+    }
+
     let count = 0;
 
     // Clear system routes
@@ -1425,7 +1746,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   ): Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }> {
     const result: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }> = [];
 
-    for (const objId of this.allowedSystemObjects) {
+    for (const objId of this.allowedSystemObjects.keys()) {
       let wkId: string | undefined;
       let tId: string | undefined;
       for (const [alias, uuid] of this.wellKnownAliases) {
@@ -1471,6 +1792,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           exposedObjectIds?: AbjectId[];
           childIds?: AbjectId[];
           registryId?: AbjectId;
+          /** Mirror of a remote peer's workspace -- never announceable. */
+          joined?: boolean;
         }>>(
           createRequest(
             this.id, this.workspaceManagerId,
@@ -1479,9 +1802,17 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         );
 
         for (const ws of workspaces) {
+          // A joined mirror is never announced. We mirror that workspace, we
+          // do not host it, so advertising it would hand peers a route to a
+          // copy whose real owner is someone else. listWorkspacesDetailed
+          // already reports mirrors as 'local' (participation access is
+          // exposed only through findWorkspaceForObject, for permission), so
+          // this guard is the explicit belt to that braces: hosting and
+          // participation must not be able to drift back together here.
           const shouldInclude =
-            ws.accessMode === 'public' ||
-            (ws.accessMode === 'private' && ws.whitelist?.includes(peerId));
+            !ws.joined &&
+            (ws.accessMode === 'public' ||
+              (ws.accessMode === 'shared' && ws.whitelist?.includes(peerId)));
 
           if (shouldInclude && ws.registryId) {
             const exposed = ws.exposedObjectIds ?? [];
@@ -1585,7 +1916,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       if (existing && existing.hops <= newHops && Date.now() < existing.ttl) {
         continue;
       }
-      // Skip if this object is local
+      // Skip if this object is local. Nothing is mounted here for a peer's
+      // object any more, so this no longer discards the announced routes for
+      // exactly the ids that need them — it only keeps a genuinely local
+      // object from being shadowed by a remote announcement.
       if (this._messageBus?.isRegistered(objectId)) {
         continue;
       }
@@ -1737,6 +2071,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       if (existing && existing.hops <= newHops && Date.now() < existing.ttl) {
         continue;
       }
+      // Same "never shadow a local object" guard as the delta path above, and
+      // the same consequence: with no stand-ins, a peer's announced route is
+      // learned instead of being dropped on arrival.
       if (this._messageBus?.isRegistered(objectId)) {
         continue;
       }
@@ -1915,12 +2252,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 ### Clear all routes for a disconnected peer
 
   await call(await dep('PeerRouter'), 'clearRoutesForPeer', { peerId: 'peer-id' });
-
-### Allow a system object to be routed
-
-  await call(await dep('PeerRouter'), 'allowSystemObject', {
-    objectId: 'local-object-id', wellKnownId: 'abjects:registry'
-  });
 
 ### Get all routes
 

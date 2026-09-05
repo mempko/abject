@@ -19,6 +19,8 @@ import type { ThemeData } from '../core/theme-data.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from './sidebar.js';
+import { namesFromTypeIds, nameFromTypeId } from './exposure-selectors.js';
+import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
@@ -71,7 +73,18 @@ const UI_OBJECTS = [
 /** All per-workspace objects in dependency order. */
 const PER_WORKSPACE_OBJECTS = [...INFRA_OBJECTS, ...UI_OBJECTS];
 
-export type WorkspaceAccessMode = 'local' | 'private' | 'public';
+export type WorkspaceAccessMode = 'local' | 'shared' | 'public';
+
+/**
+ * Coerce a persisted access mode to the current vocabulary. 'private' was
+ * renamed to 'shared' (whitelisted peers only); anything unrecognised becomes
+ * 'local', so a stale record can only narrow access, never widen it.
+ */
+export function normalizeAccessMode(raw: unknown): WorkspaceAccessMode {
+  if (raw === 'local' || raw === 'shared' || raw === 'public') return raw;
+  if (raw === 'private') return 'shared';
+  return 'local';
+}
 
 export interface WorkspaceInfo {
   id: string;
@@ -82,6 +95,14 @@ export interface WorkspaceInfo {
   whitelist: string[];
   exposedObjectIds: AbjectId[];
   exposedTypeIds: TypeId[];
+  /**
+   * True only when the user has explicitly curated the exposure list through
+   * `setExposedObjects`. The registry and SharedState entries that
+   * `setAccessMode` seeds automatically are infrastructure, not a curation
+   * choice, so they leave this false and the workspace keeps offering every
+   * shareable object to joiners.
+   */
+  curated?: boolean;
   childIds: AbjectId[];
   registryId: AbjectId;
   storageId: AbjectId;
@@ -89,6 +110,21 @@ export interface WorkspaceInfo {
   uiObjects: Array<{ id: AbjectId; iface: InterfaceId }>;
   childTypeIds: Map<AbjectId, TypeId>;
   uiSpawned: boolean;
+  /**
+   * True when this record mirrors a workspace hosted by a remote peer. Joined
+   * records are first-class workspaces locally — own registry, own taskbar —
+   * but they stay `accessMode: 'local'` because we mirror them, we do not host
+   * them, and must not re-advertise them as ours.
+   */
+  joined?: boolean;
+  /** Peer hosting this shared workspace (joined records only). */
+  ownerPeerId?: string;
+  /**
+   * Peers (including this instance) known to hold a reference to the shared
+   * workspace. A shared workspace is reference-counted across instances: it
+   * survives until every participant has left or deleted it.
+   */
+  participants?: string[];
 }
 
 export interface SharedWorkspaceInfo {
@@ -101,6 +137,18 @@ export interface SharedWorkspaceInfo {
   accessMode: WorkspaceAccessMode;
   whitelist?: string[];
   exposedObjectIds?: string[];
+  /**
+   * TypeIds of the curated exposure list, carried alongside `exposedObjectIds`.
+   * Consumers honour curation across a restart through these: the AbjectIds of
+   * the previous run no longer resolve, but the types still do.
+   */
+  exposedTypeIds?: string[];
+  /**
+   * True when the exposure list is a deliberate user curation rather than the
+   * automatic registry/SharedState seed. Consumers must not infer curation
+   * from a non-empty exposure list: a shared workspace never has an empty one.
+   */
+  curated?: boolean;
   registryId?: string;
 }
 
@@ -113,11 +161,75 @@ interface PersistedWorkspace {
   whitelist?: string[];
   exposedObjectIds?: string[];
   exposedTypeIds?: string[];
+  /** Whether the user explicitly curated this workspace's exposure list. */
+  curated?: boolean;
   createdAt: number;
+  /** Set for workspaces joined from a peer, so they are restored as such. */
+  joined?: boolean;
+  ownerPeerId?: string;
+  participants?: string[];
+}
+
+/** Route shape both invite-link forms parse into (what WorkspaceShareRegistry consumes). */
+export interface InviteLinkRoute {
+  ownerPeerId: string;
+  workspaceId: string;
+  accessMode: string;
+  registryId: string;
+  name?: string;
+}
+
+/**
+ * Parse an invite link. Two forms are accepted everywhere a link is pasted:
+ *
+ *   abject://<ownerPeerId>/<workspaceId>                      (short form,
+ *                                   what Settings shows as the share link)
+ *   abject://join?peer=<ownerPeerId>&ws=<workspaceId>&mode=…&reg=…&name=…
+ *                                   (full form, from createInviteLink)
+ *
+ * Parsed by hand rather than via `new URL(...)` so a custom scheme, a bare
+ * query string, or a pasted fragment all behave the same. Missing fields in
+ * the short form default to a public route with no registry hint; the join
+ * then relies on discovery for the rest.
+ */
+export function parseInviteLink(link: string): InviteLinkRoute | undefined {
+  const raw = (link ?? '').trim();
+  if (!raw) return undefined;
+
+  const short = raw.match(/^(?:abject:\/\/)?([^/?#\s]+)\/([^/?#\s]+)$/);
+  if (short && short[1] !== 'join') {
+    return { ownerPeerId: short[1], workspaceId: short[2], accessMode: 'public', registryId: '' };
+  }
+
+  const qIndex = raw.indexOf('?');
+  const query = qIndex >= 0 ? raw.slice(qIndex + 1) : raw;
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(query);
+  } catch {
+    return undefined;
+  }
+
+  const ownerPeerId = params.get('peer') ?? '';
+  const workspaceId = params.get('ws') ?? '';
+  if (!ownerPeerId || !workspaceId) return undefined;
+
+  return {
+    ownerPeerId,
+    workspaceId,
+    accessMode: params.get('mode') ?? 'public',
+    registryId: params.get('reg') ?? '',
+    name: params.get('name') ?? undefined,
+  };
 }
 
 export class WorkspaceManager extends Abject {
   private workspaces: Map<string, WorkspaceInfo> = new Map();
+  /**
+   * Last loaded persisted records, indexed by id. restoreWorkspace reads this
+   * to recover fields its call site does not carry (joined/owner/participants).
+   */
+  private persistedById: Map<string, PersistedWorkspace> = new Map();
   private activeWorkspaceId?: string;
   private peerId?: string;
   private globalStorageId?: AbjectId;
@@ -125,6 +237,7 @@ export class WorkspaceManager extends Abject {
   private factoryId?: AbjectId;
   private supervisorId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
+  private workspaceShareRegistryId?: AbjectId;
   private globalToolbarId?: AbjectId;
   private sidebarId?: AbjectId;
   /** Debounce for display-driven sidebar rebuilds (client connect bursts). */
@@ -282,6 +395,12 @@ export class WorkspaceManager extends Abject {
                 returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SharedWorkspaceInfo' } },
               },
               {
+                name: 'listJoinedWorkspaces',
+                description: 'List workspaces joined from a peer, with their owner peer and registry',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'JoinedWorkspaceInfo' } },
+              },
+              {
                 name: 'findWorkspaceForObject',
                 description: 'Find which workspace contains a given object and return its access info',
                 parameters: [
@@ -370,6 +489,22 @@ export class WorkspaceManager extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'createInviteLink',
+                description: 'Create a shareable invite link for a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'joinFromInviteLink',
+                description: 'Join a shared workspace from an invite link',
+                parameters: [
+                  { name: 'link', type: { kind: 'primitive', primitive: 'string' }, description: 'Invite link (abject://join?...)' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -434,6 +569,10 @@ export class WorkspaceManager extends Abject {
       return this.listSharedWorkspaces();
     });
 
+    this.on('listJoinedWorkspaces', async () => {
+      return this.listJoinedWorkspaces();
+    });
+
     this.on('findWorkspaceForObject', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
       return this.findWorkspaceForObject(objectId as AbjectId);
@@ -480,6 +619,35 @@ export class WorkspaceManager extends Abject {
 
     this.on('refreshTaskbar', async () => {
       return this.refreshTaskbar();
+    });
+
+    this.on('materializeJoinedWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId, name, ownerPeerId, participants } = msg.payload as {
+        workspaceId: string; name?: string; ownerPeerId: string; participants?: string[];
+      };
+      return this.materializeJoinedWorkspace(workspaceId, name ?? '', ownerPeerId, participants ?? []);
+    });
+
+    this.on('releaseJoinedWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId, peerId, destroy } = msg.payload as {
+        workspaceId: string; peerId?: string; destroy?: boolean;
+      };
+      return this.releaseJoinedWorkspace(workspaceId, peerId, destroy ?? false);
+    });
+
+    this.on('getWorkspaceRegistryId', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.workspaces.get(workspaceId)?.registryId ?? null;
+    });
+
+    this.on('createInviteLink', async (msg: AbjectMessage) => {
+      const { workspaceId } = (msg.payload ?? {}) as { workspaceId?: string };
+      return this.createInviteLink(workspaceId ?? '');
+    });
+
+    this.on('joinFromInviteLink', async (msg: AbjectMessage) => {
+      const { link } = (msg.payload ?? {}) as { link?: string };
+      return this.joinFromInviteLink(link ?? '');
     });
 
     // UIServer dependency events: a frontend client becoming ready makes
@@ -584,7 +752,7 @@ export class WorkspaceManager extends Abject {
 
       // Restore active workspace first with FULL spawn (infra + UI)
       const activeWs = persisted.find(ws => ws.id === targetId)!;
-      await this.restoreWorkspace(activeWs.id, activeWs.name, activeWs.accessMode ?? 'local',
+      await this.restoreWorkspace(activeWs.id, activeWs.name, normalizeAccessMode(activeWs.accessMode),
         activeWs.whitelist ?? [], activeWs.exposedTypeIds ?? [], activeWs.description ?? '',
         activeWs.tags ?? [], true);
       log.timed(`active workspace '${activeWs.name}' restored`);
@@ -611,7 +779,7 @@ export class WorkspaceManager extends Abject {
   private async restoreRemainingWorkspaces(workspaces: PersistedWorkspace[]): Promise<void> {
     for (const ws of workspaces) {
       try {
-        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? [],
+        await this.restoreWorkspace(ws.id, ws.name, normalizeAccessMode(ws.accessMode), ws.whitelist ?? [],
           ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? [], false);
       } catch (err) {
         wsLog.warn(`Failed to restore workspace '${ws.name}':`, err);
@@ -652,6 +820,16 @@ export class WorkspaceManager extends Abject {
     // next load while the caller was told the delete succeeded.
     this.workspaces.delete(workspaceId);
     await this.persistWorkspaceList();
+
+    // Never leave the active pointer on a workspace that no longer exists.
+    // `workspaces:active` is read back on the next boot, and a dangling id
+    // there is precisely what lands refreshTaskbar with no local record. The
+    // switchWorkspace above normally moves it; this catches the case where it
+    // did not (no other workspace, or the switch failed).
+    if (this.activeWorkspaceId === workspaceId) {
+      this.activeWorkspaceId = [...this.workspaces.keys()][0];
+      await this.persistActiveWorkspaceId();
+    }
 
     // Unregister this workspace's Taskbar from WindowManager
     if (this.windowManagerId) {
@@ -711,6 +889,12 @@ export class WorkspaceManager extends Abject {
       } catch { /* best effort */ }
     }
 
+    // Ask WorkspaceShareRegistry to forget any joined entry for this
+    // workspace. Left behind, it keeps feeding the remote shim:
+    // getJoinedWorkspaces still reports the workspace, so refreshTaskbar
+    // re-appends a switcher button for a workspace that is gone locally.
+    await this.dropShareRegistryEntry(workspaceId);
+
     // Rebuild switcher/taskbar with the updated workspace list (the earlier
     // refreshTaskbar inside switchWorkspace ran before the workspace was removed).
     await this.refreshTaskbar();
@@ -721,7 +905,35 @@ export class WorkspaceManager extends Abject {
 
   async switchWorkspace(workspaceId: string): Promise<boolean> {
     const ws = this.workspaces.get(workspaceId);
-    if (!ws) return false;
+    if (!ws) {
+      // Check if this is a joined remote workspace
+      if (!this.workspaceShareRegistryId) {
+        this.workspaceShareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
+      }
+      if (this.workspaceShareRegistryId) {
+        try {
+          const joined = await this.request<Array<{ workspaceId: string; ownerPeerId: string }>>(
+            request(this.id, this.workspaceShareRegistryId, 'getJoinedWorkspaces', {})
+          );
+          if (joined && joined.some(j => j.workspaceId === workspaceId)) {
+            this.activeWorkspaceId = workspaceId;
+            if (this.uiServerId) {
+              await this.request(request(this.id, this.uiServerId, 'setActiveWorkspace', { workspaceId }));
+            }
+            if (this.widgetManagerId) {
+              try {
+                await this.request(request(this.id, this.widgetManagerId, 'setActiveWorkspace', { workspaceId }));
+              } catch { /* WidgetManager may not be ready */ }
+            }
+            await this.persistActiveWorkspaceId();
+            await this.refreshTaskbar();
+            wsLog.info(`Switched to joined remote workspace (${workspaceId})`);
+            return true;
+          }
+        } catch { /* best effort */ }
+      }
+      return false;
+    }
 
     // Lazy-spawn UI objects on first switch to a deferred workspace
     if (!ws.uiSpawned) {
@@ -761,7 +973,6 @@ export class WorkspaceManager extends Abject {
   private async refreshTaskbar(): Promise<boolean> {
     if (!this.activeWorkspaceId) return false;
     const ws = this.workspaces.get(this.activeWorkspaceId);
-    if (!ws) return false;
 
     // Resolve the active workspace's theme once and push it into the sidebar
     // and each section provider's show() so they rebuild with the correct
@@ -817,11 +1028,47 @@ export class WorkspaceManager extends Abject {
 
     if (this.workspaceSwitcherId) {
       try {
+        if (!this.workspaceShareRegistryId) {
+          this.workspaceShareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
+        }
+        let joinedWorkspaces: Array<{ workspaceId: string; name?: string; ownerPeerId: string; registryId?: string }> = [];
+        if (this.workspaceShareRegistryId) {
+          try {
+            joinedWorkspaces = await this.request<Array<{ workspaceId: string; name?: string; ownerPeerId: string; registryId?: string }>>(
+              request(this.id, this.workspaceShareRegistryId, 'getJoinedWorkspaces', {})
+            ) ?? [];
+          } catch { /* best-effort */ }
+        }
+        // Joined workspaces are materialized as first-class local records
+        // (materializeJoinedWorkspace / restoreWorkspace), so listWorkspaces()
+        // already contains them. Dedupe by workspace id, preferring the local
+        // record so the switcher uses its registryId/taskbarId/ownerPeerId
+        // metadata; only append joined entries that have no local record yet.
+        // Without this, a joined workspace rendered two identical buttons.
+        // `joined` rides along so the switcher can render a joined workspace as
+        // shared even though it keeps `accessMode: 'local'` by invariant.
+        // Annotating this narrower than listWorkspaces() would strip the field.
+        const allWorkspaces: Array<{ id: string; name: string; accessMode: WorkspaceAccessMode; joined?: boolean }> =
+          this.listWorkspaces();
+        const seenWorkspaceIds = new Set(allWorkspaces.map(w => w.id));
+        for (const jw of joinedWorkspaces) {
+          if (seenWorkspaceIds.has(jw.workspaceId)) continue;
+          seenWorkspaceIds.add(jw.workspaceId);
+          // Only workspaces with no local record reach here (see dedupe above),
+          // so every one of these is joined rather than hosted by us.
+          allWorkspaces.push({
+            id: jw.workspaceId,
+            name: jw.name || `Remote: ${jw.workspaceId.slice(0, 8)}`,
+            accessMode: 'shared' as WorkspaceAccessMode,
+            joined: true,
+          });
+        }
+
         // Find the active workspace's Settings ID for the gear button
-        const settingsEntry = ws.uiObjects.find(o => o.iface === SETTINGS_INTERFACE);
+        const settingsEntry = ws?.uiObjects.find(o => o.iface === SETTINGS_INTERFACE);
         await this.request(request(this.id, this.workspaceSwitcherId,
           'show', {
-            workspaces: this.listWorkspaces(),
+            workspaces: allWorkspaces,
             activeWorkspaceId: this.activeWorkspaceId,
             settingsId: settingsEntry?.id,
             theme: activeTheme,
@@ -832,9 +1079,32 @@ export class WorkspaceManager extends Abject {
       } catch { /* use default */ }
     }
 
-    if (ws.taskbarId) {
+    // A joined or newly restored workspace owns its Taskbar, spawned lazily on
+    // first switch. Never borrow another workspace's Taskbar to stand in for
+    // it — that is what rendered the local Default workspace's rows for a
+    // shared workspace. Fall back only when there is no active record at all.
+    let taskbarId: AbjectId | undefined = ws?.taskbarId || undefined;
+    if (!taskbarId) {
+      if (ws) {
+        if (!ws.uiSpawned) {
+          await this.spawnUIObjects(ws.id);
+          taskbarId = this.workspaces.get(ws.id)?.taskbarId || undefined;
+        }
+        if (!taskbarId) {
+          wsLog.warn(`refreshTaskbar: workspace '${ws.name}' (${ws.id}) has no Taskbar of its own; skipping rather than showing another workspace's`);
+        }
+      } else {
+        // No local record for the active workspace at all. Borrowing whichever
+        // workspace happens to own a Taskbar (in practice Default's) is exactly
+        // what rendered Default's rows under a shared workspace: the Abjects
+        // section then lists objects that belong to a different workspace.
+        // Render nothing rather than the wrong workspace's contents.
+        wsLog.warn(`refreshTaskbar: no local record for active workspace '${this.activeWorkspaceId}'; leaving the Abjects section empty rather than borrowing another workspace's Taskbar`);
+      }
+    }
+    if (taskbarId) {
       try {
-        await this.request(request(this.id, ws.taskbarId, 'show', {
+        await this.request(request(this.id, taskbarId, 'show', {
           theme: activeTheme,
           windowId: sections.windowId,
           sectionLayoutId: sections.abjects,
@@ -848,19 +1118,44 @@ export class WorkspaceManager extends Abject {
     return true;
   }
 
-  listWorkspaces(): Array<{ id: string; name: string; accessMode: WorkspaceAccessMode }> {
+  listWorkspaces(): Array<{
+    id: string;
+    name: string;
+    accessMode: WorkspaceAccessMode;
+    joined?: boolean;
+    ownerPeerId?: string;
+  }> {
+    // Joined records deliberately keep `accessMode: 'local'` so restart recovery
+    // never re-advertises a peer's workspace as one we host. That makes access
+    // mode alone misleading for presentation, so carry `joined` through as well:
+    // a caller rendering a workspace has to tell a mirror from one we own.
     return [...this.workspaces.entries()].map(([id, ws]) => ({
       id,
       name: ws.name,
       accessMode: ws.accessMode,
+      joined: ws.joined,
+      ownerPeerId: ws.ownerPeerId,
     }));
   }
 
-  getActiveWorkspace(): { id: string; name: string; registryId: string } | null {
+  getActiveWorkspace(): {
+    id: string; name: string; registryId: string; joined?: boolean; ownerPeerId?: string;
+  } | null {
     if (!this.activeWorkspaceId) return null;
+    // Joined workspaces are materialized into `this.workspaces`, so this
+    // resolves their own dedicated record and registry — never Default's.
     const ws = this.workspaces.get(this.activeWorkspaceId);
-    if (!ws) return null;
-    return { id: this.activeWorkspaceId, name: ws.name, registryId: ws.registryId };
+    if (!ws) {
+      wsLog.warn(`getActiveWorkspace: no local record for active workspace '${this.activeWorkspaceId}'`);
+      return null;
+    }
+    return {
+      id: this.activeWorkspaceId,
+      name: ws.name,
+      registryId: ws.registryId,
+      joined: ws.joined,
+      ownerPeerId: ws.ownerPeerId,
+    };
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
@@ -880,15 +1175,17 @@ export class WorkspaceManager extends Abject {
 
   async setAccessMode(workspaceId: string, accessMode: WorkspaceAccessMode): Promise<boolean> {
     precondition(
-      accessMode === 'local' || accessMode === 'private' || accessMode === 'public',
-      'accessMode must be local, private, or public',
+      accessMode === 'local' || accessMode === 'shared' || accessMode === 'public',
+      'accessMode must be local, shared, or public',
     );
     const ws = this.workspaces.get(workspaceId);
     if (!ws) return false;
     const prevMode = ws.accessMode;
     ws.accessMode = accessMode;
 
-    // Ensure registry and SharedState are always exposed when workspace is shared
+    // Ensure registry and SharedState are always exposed when workspace is shared.
+    // This is an infrastructure seed, not a curation choice: `curated` stays
+    // false here so the workspace goes on offering every shareable object.
     if (accessMode !== 'local' && ws.exposedObjectIds.length === 0) {
       ws.exposedObjectIds = [ws.registryId];
       const regTypeId = ws.childTypeIds.get(ws.registryId);
@@ -902,14 +1199,7 @@ export class WorkspaceManager extends Abject {
     await this.persistWorkspaceList();
 
     // Notify SharedState of the new access mode
-    try {
-      const results = await this.request<Array<{ id: AbjectId }>>(
-        request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
-      );
-      if (results.length > 0) {
-        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode, whitelist: ws.whitelist }));
-      }
-    } catch { /* SharedState not available yet */ }
+    await this.dispatchAccessMode(ws);
 
     // Emit access change event for PeerRouter cache invalidation
     this.changed('workspaceAccessChanged', {
@@ -956,20 +1246,12 @@ export class WorkspaceManager extends Abject {
       exposedObjectIds: ws.exposedObjectIds,
     });
 
-    // Notify SharedState of the new whitelist so private-mode outbound sync
-    // targets stay in step with the whitelist (a change while already private
+    // Notify SharedState of the new whitelist so shared-mode outbound sync
+    // targets stay in step with the whitelist (a change while already shared
     // would otherwise leave SharedState broadcasting to a stale peer set).
-    if (ws.accessMode === 'private') {
-      try {
-        const results = await this.request<Array<{ id: AbjectId }>>(
-          request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
-        );
-        if (results.length > 0) {
-          this.send(event(this.id, results[0].id, 'setAccessMode', {
-            accessMode: ws.accessMode, whitelist: ws.whitelist,
-          }));
-        }
-      } catch { /* SharedState not available yet */ }
+    const access = this.participationAccess(ws);
+    if (access.accessMode === 'shared') {
+      await this.dispatchAccessMode(ws);
     }
 
     return true;
@@ -984,6 +1266,10 @@ export class WorkspaceManager extends Abject {
   async setExposedObjects(workspaceId: string, objectIds: AbjectId[]): Promise<boolean> {
     const ws = this.workspaces.get(workspaceId);
     if (!ws) return false;
+    // An explicit list is what makes a workspace curated; an empty list means
+    // "share everything again" and clears curation. The registry entry added
+    // just below is infrastructure and never counts as curation by itself.
+    ws.curated = objectIds.length > 0;
     // Always include workspace registry when workspace is shared
     if (ws.accessMode !== 'local' && !objectIds.includes(ws.registryId)) {
       objectIds = [ws.registryId, ...objectIds];
@@ -1034,17 +1320,41 @@ export class WorkspaceManager extends Abject {
     return true;
   }
 
+  /**
+   * Workspaces this instance joined from a peer, as first-class local records.
+   *
+   * A joined workspace is materialized as an ordinary local record — we do not
+   * host it, so it is never re-advertised as shared — which means it does not
+   * appear in `listSharedWorkspaces`. WorkspaceShareRegistry needs it after a
+   * restart to re-establish the catalog mirror for a restored workspace.
+   */
+  listJoinedWorkspaces(): Array<{ workspaceId: string; name: string; ownerPeerId?: string; registryId?: string }> {
+    const result: Array<{ workspaceId: string; name: string; ownerPeerId?: string; registryId?: string }> = [];
+    for (const [, ws] of this.workspaces) {
+      if (!ws.joined) continue;
+      result.push({
+        workspaceId: ws.id,
+        name: ws.name,
+        ownerPeerId: ws.ownerPeerId,
+        registryId: ws.registryId,
+      });
+    }
+    return result;
+  }
+
   listSharedWorkspaces(): SharedWorkspaceInfo[] {
     const result: SharedWorkspaceInfo[] = [];
     for (const [, ws] of this.workspaces) {
       if (ws.accessMode !== 'local') {
         result.push({
           workspaceId: ws.id,
+          exposedTypeIds: ws.exposedTypeIds ? [...ws.exposedTypeIds] : undefined,
+          curated: ws.curated === true,
           name: ws.name,
           description: ws.description,
           tags: [...ws.tags],
           accessMode: ws.accessMode,
-          whitelist: ws.accessMode === 'private' ? [...ws.whitelist] : undefined,
+          whitelist: ws.accessMode === 'shared' ? [...ws.whitelist] : undefined,
           exposedObjectIds: [...ws.exposedObjectIds],
           registryId: ws.registryId,
         });
@@ -1062,19 +1372,28 @@ export class WorkspaceManager extends Abject {
     accessMode: WorkspaceAccessMode;
     whitelist: string[];
     exposedObjectIds: AbjectId[];
+    /** P2-3: true when a public workspace has never been curated. */
+    uncuratedPublic?: boolean;
+    /** True for a mirror of a remote peer's workspace (never advertised). */
+    joined?: boolean;
   } | null {
     for (const [, ws] of this.workspaces) {
       if (ws.registryId === objectId || ws.childIds.includes(objectId)) {
-        const exposed = [...ws.exposedObjectIds];
-        if (!exposed.includes(ws.registryId)) {
-          exposed.push(ws.registryId);
-        }
+        const exposed = this.effectiveExposedIds(ws);
+        // PeerRouter gates inbound messages on this, so it reports
+        // PARTICIPATION access: a joined mirror answers 'shared' +
+        // owner/participants here, while still answering 'local' to
+        // listWorkspacesDetailed so it is never announced as a route.
+        const access = this.participationAccess(ws);
         return {
           workspaceId: ws.id,
           name: ws.name,
-          accessMode: ws.accessMode,
-          whitelist: [...ws.whitelist],
+          accessMode: access.accessMode,
+          whitelist: access.whitelist,
           exposedObjectIds: exposed,
+          // P2-3: public but never curated → registry-plus-nothing.
+          uncuratedPublic: ws.accessMode === 'public' && ws.curated !== true,
+          joined: ws.joined === true,
         };
       }
     }
@@ -1106,15 +1425,29 @@ export class WorkspaceManager extends Abject {
     exposedObjectIds: AbjectId[];
     childIds: AbjectId[];
     registryId: AbjectId;
+    /**
+     * P2-3: public workspace the user never curated. Nothing but the registry
+     * is published; the Settings sharing/Access UI shows a notice for this.
+     */
+    uncuratedPublic?: boolean;
+    /**
+     * Mirror of a remote peer's workspace. This view is the ROUTE-ANNOUNCEMENT
+     * view, so it keeps reporting the hosting `accessMode` ('local' for a
+     * mirror); the flag lets PeerRouter refuse to advertise it outright rather
+     * than relying on that mode alone.
+     */
+    joined?: boolean;
   }> {
     return [...this.workspaces.entries()].map(([, ws]) => ({
       workspaceId: ws.id,
       name: ws.name,
       accessMode: ws.accessMode,
       whitelist: [...ws.whitelist],
-      exposedObjectIds: [...ws.exposedObjectIds],
+      exposedObjectIds: this.effectiveExposedIds(ws),
       childIds: [...ws.childIds],
       registryId: ws.registryId,
+      uncuratedPublic: ws.accessMode === 'public' && ws.curated !== true,
+      joined: ws.joined === true,
     }));
   }
 
@@ -1125,6 +1458,122 @@ export class WorkspaceManager extends Abject {
    * created with infra-only objects. Reuses the same per-object post-spawn
    * setup (Taskbar registration, Theme registration, uiObjects tracking).
    */
+  // ═══════════════════════════════════════════════════════════════════
+  // Invite / join link handling
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a shareable invite link for a workspace we host.
+   *
+   * Shape: abject://join?peer=<ownerPeerId>&ws=<workspaceId>&mode=<accessMode>
+   *                     &reg=<registryId>&name=<name>
+   *
+   * The fields mirror exactly what WorkspaceShareRegistry.addWorkspaceFromRoute
+   * consumes. `name` is carried as an extra because a route alone cannot supply
+   * one — addWorkspaceFromRoute falls back to using the workspaceId as the name.
+   */
+  async createInviteLink(workspaceId: string): Promise<string> {
+    precondition(!!workspaceId, 'createInviteLink: workspaceId is required');
+
+    let ownerPeerId = '';
+    try {
+      const identityId = await this.discoverDep('Identity');
+      if (identityId) {
+        const identity = await this.request<Record<string, unknown>>(
+          request(this.id, identityId, 'getIdentity', {})
+        );
+        const pid = identity?.['peerId'] ?? identity?.['id'];
+        if (typeof pid === 'string') ownerPeerId = pid;
+      }
+    } catch {
+      /* Identity not available — link is still usable if the peer is known */
+    }
+
+    let accessMode = 'public';
+    let registryId = '';
+    let name = workspaceId;
+
+    if (!this.workspaceShareRegistryId) {
+      this.workspaceShareRegistryId = (await this.discoverDep('WorkspaceShareRegistry')) ?? undefined;
+    }
+    if (this.workspaceShareRegistryId) {
+      try {
+        const shared = await this.request<Array<Record<string, unknown>>>(
+          request(this.id, this.workspaceShareRegistryId, 'getSharedWorkspaces', {})
+        );
+        const match = (shared ?? []).find(s => s['workspaceId'] === workspaceId);
+        if (match) {
+          if (typeof match['accessMode'] === 'string') accessMode = match['accessMode'] as string;
+          if (typeof match['registryId'] === 'string') registryId = match['registryId'] as string;
+          if (typeof match['name'] === 'string') name = match['name'] as string;
+        }
+      } catch {
+        /* not shared yet — the caller may still want a link */
+      }
+    }
+
+    const params = new URLSearchParams();
+    params.set('peer', ownerPeerId);
+    params.set('ws', workspaceId);
+    params.set('mode', accessMode);
+    if (registryId) params.set('reg', registryId);
+    if (name) params.set('name', name);
+
+    return `abject://join?${params.toString()}`;
+  }
+
+  /**
+   * Join a shared workspace from an invite link: register the route so the
+   * workspace is discoverable, then request the actual join.
+   */
+  async joinFromInviteLink(link: string): Promise<boolean> {
+    const route = parseInviteLink(link);
+    if (!route) return false;
+
+    if (!this.workspaceShareRegistryId) {
+      this.workspaceShareRegistryId = (await this.discoverDep('WorkspaceShareRegistry')) ?? undefined;
+    }
+    if (!this.workspaceShareRegistryId) return false;
+
+    try {
+      await this.request(
+        request(this.id, this.workspaceShareRegistryId, 'addWorkspaceFromRoute', {
+          ownerPeerId: route.ownerPeerId,
+          workspaceId: route.workspaceId,
+          accessMode: route.accessMode,
+          registryId: route.registryId,
+          hops: 0,
+        })
+      );
+    } catch {
+      /* route may already be known via discovery */
+    }
+
+    let accepted = false;
+    try {
+      const ack = await this.request<{ accepted?: boolean }>(
+        request(this.id, this.workspaceShareRegistryId, 'joinWorkspace', {
+          peerId: route.ownerPeerId,
+          workspaceId: route.workspaceId,
+        })
+      );
+      accepted = !!(ack && ack.accepted);
+    } catch {
+      accepted = false;
+    }
+
+    if (accepted) {
+      this.changed('joinedWorkspace', route.workspaceId);
+      try {
+        await this.refreshTaskbar();
+      } catch {
+        /* taskbar refresh is best effort */
+      }
+    }
+
+    return accepted;
+  }
+
   private async spawnUIObjects(workspaceId: string): Promise<void> {
     const ws = this.workspaces.get(workspaceId);
     if (!ws || ws.uiSpawned) return;
@@ -1445,6 +1894,7 @@ export class WorkspaceManager extends Abject {
       taskbarId,
       uiObjects,
       childTypeIds,
+      participants: [],
       uiSpawned: objectsToSpawn.includes('Taskbar'),
     };
   }
@@ -1478,17 +1928,35 @@ export class WorkspaceManager extends Abject {
     }
     info.exposedObjectIds = resolvedIds;
 
+    // Joined shared workspaces persist like any other workspace; recover what
+    // makes them a mirror of a remote host rather than one of ours.
+    const persisted = this.persistedById.get(workspaceId);
+    // Curation is a deliberate user choice and has to survive a cold boot.
+    // Without this, a restored shared workspace would re-read the exposure list
+    // that `setAccessMode` seeded for it as though the user had curated it.
+    info.curated = persisted?.curated === true;
+    if (persisted?.participants?.length) {
+      info.participants = [...persisted.participants];
+    }
+    if (persisted?.joined) {
+      info.joined = true;
+      info.ownerPeerId = persisted.ownerPeerId;
+      this.addParticipants(info, persisted.ownerPeerId ? [persisted.ownerPeerId] : []);
+      wsLog.info(`Restored joined shared workspace '${name}' (${workspaceId}) owner=${persisted.ownerPeerId ?? 'unknown'} registry=${info.registryId} participants=${info.participants?.length ?? 0}`);
+    }
+
     this.workspaces.set(workspaceId, info);
 
-    // Notify SharedState of the workspace access mode so it knows whether to sync P2P
-    try {
-      const results = await this.request<Array<{ id: AbjectId }>>(
-        request(this.id, info.registryId, 'discover', { name: 'SharedState' })
-      );
-      if (results.length > 0) {
-        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode, whitelist }));
-      }
-    } catch { /* SharedState not spawned yet */ }
+    // Notify SharedState of the workspace access mode so it knows whether to
+    // sync P2P. A restored mirror is handled by activateJoinedParticipation
+    // below instead, which dispatches its participation mode -- dispatching the
+    // persisted 'local' here first would only make it clear its remote peers.
+    if (info.joined !== true) {
+      // Routed through participationAccess like every other dispatch site, and
+      // retried: a restore that raced SharedState's spawn used to lose the mode
+      // outright, leaving the workspace silent until the next explicit change.
+      await this.dispatchAccessMode(info);
+    }
 
     if (info.accessMode !== 'local') {
       await this.ensureSharedStateExposed(info);
@@ -1499,6 +1967,11 @@ export class WorkspaceManager extends Abject {
         exposedObjectIds: info.exposedObjectIds,
         registryId: info.registryId,
       });
+    } else if (info.joined === true) {
+      // Restored mirror: re-arm participation (curation + SharedState sync +
+      // PeerRouter cache invalidation) on every boot. Without this the mirror
+      // comes back up with SharedState pinned 'local' and never syncs again.
+      await this.activateJoinedParticipation(info);
     }
     wsLog.info(`Restored workspace '${name}' (${workspaceId})`);
   }
@@ -1551,8 +2024,16 @@ export class WorkspaceManager extends Abject {
       const stored = await this.request<PersistedWorkspace[] | null>(
         request(this.id, this.globalStorageId!, 'get', { key: STORAGE_KEY_LIST })
       );
-      return Array.isArray(stored) ? stored : [];
-    } catch {
+      const list = Array.isArray(stored) ? stored : [];
+      // Index the raw records so restoreWorkspace can recover joined-workspace
+      // fields that its own parameters do not carry.
+      this.persistedById.clear();
+      for (const entry of list) {
+        this.persistedById.set(entry.id, entry);
+      }
+      return list;
+    } catch (err) {
+      wsLog.warn('Failed to load workspace list:', err);
       return [];
     }
   }
@@ -1566,6 +2047,131 @@ export class WorkspaceManager extends Abject {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The access a workspace grants for PARTICIPATION, as distinct from the
+   * `accessMode` that governs HOSTING and advertisement.
+   *
+   * A joined mirror is pinned `accessMode:'local'` on purpose: we mirror the
+   * workspace, we do not host it, so it must never be re-advertised as ours
+   * (see `materializeJoinedWorkspace`). The bug was that this single field was
+   * ALSO gating SharedState replication and PeerRouter's inbound permission,
+   * so a mirror could not exchange anything with the very peers it joined.
+   * P2PChat has no transport of its own -- it rides per-workspace SharedState
+   * under the LWW names `p2pchat:channels` / `p2pchat:channel:*` -- so it went
+   * silent on every joining peer.
+   *
+   * Hosting therefore keeps `accessMode`; participation reads this. A mirror
+   * participates as 'shared' whitelisted to `participants + ownerPeerId`,
+   * which is strictly NARROWER than 'public': only the workspace's own members
+   * are admitted. Every non-mirror workspace is returned unchanged.
+   */
+  private participationAccess(ws: WorkspaceInfo): {
+    accessMode: WorkspaceAccessMode;
+    whitelist: string[];
+  } {
+    if (ws.joined !== true || ws.accessMode !== 'local') {
+      return { accessMode: ws.accessMode, whitelist: [...ws.whitelist] };
+    }
+    const peers = new Set<string>(ws.participants ?? []);
+    if (ws.ownerPeerId) peers.add(ws.ownerPeerId);
+    return { accessMode: 'shared', whitelist: [...peers] };
+  }
+
+  /**
+   * Namespaces SharedState may replicate to peers when this workspace shares.
+   * A trailing '*' is a prefix glob. This is the namespace-level companion to
+   * the peer-level whitelist: peers gate WHO receives, this gates WHAT crosses.
+   * The list names every namespace the system actually replicates today, so
+   * introducing the policy changes no existing sync.
+   */
+  private static readonly SHARED_NAMESPACES: readonly string[] = [
+    'goals:catalog',
+    'goal-*',
+    'ts-*',
+    'knowledge-base',
+    'p2pchat:channels',
+    'p2pchat:channel:*',
+  ];
+
+  private static readonly ACCESS_DISPATCH_ATTEMPTS = 5;
+  private static readonly ACCESS_DISPATCH_BASE_MS = 250;
+
+  /**
+   * Push a workspace's PARTICIPATION access mode (and the shared-namespace
+   * whitelist) to its SharedState.
+   *
+   * Every former call site did discover-then-fire-and-forget inside a
+   * swallowing try/catch, so a dispatch issued before SharedState had spawned
+   * was simply lost -- and because nothing re-sent it, a restored or joined
+   * workspace could stay unsynced indefinitely. Retry with backoff instead.
+   */
+  private async dispatchAccessMode(ws: WorkspaceInfo, attempt = 0): Promise<void> {
+    const access = this.participationAccess(ws);
+    let target: AbjectId | undefined;
+    try {
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
+      );
+      target = results[0]?.id;
+    } catch { /* SharedState not spawned yet -- fall through to retry */ }
+
+    if (target) {
+      this.send(event(this.id, target, 'setAccessMode', {
+        accessMode: access.accessMode,
+        whitelist: access.whitelist,
+        sharedNamespaces: [...WorkspaceManager.SHARED_NAMESPACES],
+      }));
+      return;
+    }
+
+    if (attempt + 1 >= WorkspaceManager.ACCESS_DISPATCH_ATTEMPTS) return;
+    const delay = WorkspaceManager.ACCESS_DISPATCH_BASE_MS * Math.pow(2, attempt);
+    setTimeout(() => { void this.dispatchAccessMode(ws, attempt + 1); }, delay);
+  }
+
+  /**
+   * Wire a joined mirror for participation without advertising it as hosted.
+   *
+   * The record keeps `accessMode:'local'`, so the three things that normally
+   * ride that field have to be done explicitly here:
+   *  1. curate the mirror's SharedState and registry -- without this,
+   *     PeerRouter's second (curation) gate denies every inbound message into
+   *     the mirror, because nothing is exposed to match against;
+   *  2. dispatch the PARTICIPATION mode to SharedState, which is what starts
+   *     discovery/sync and therefore what carries P2PChat between peers;
+   *  3. emit `workspaceAccessChanged` so PeerRouter clears the permission-cache
+   *     entries that still say 'local' -> deny for the mirror's objects.
+   *
+   * Deliberately does NOT emit `workspaceShared`: that announces a workspace we
+   * host, which this is not.
+   */
+  private async activateJoinedParticipation(ws: WorkspaceInfo): Promise<void> {
+    const access = this.participationAccess(ws);
+    if (access.accessMode === 'local') return;
+
+    // Minimal curation: the registry is the peer's entry point, SharedState is
+    // the replication endpoint. Nothing else in the mirror is offered.
+    await this.ensureSharedStateExposed(ws);
+    if (!ws.exposedObjectIds.includes(ws.registryId)) {
+      ws.exposedObjectIds.push(ws.registryId);
+      const regTypeId = ws.childTypeIds.get(ws.registryId);
+      if (regTypeId && !ws.exposedTypeIds.includes(regTypeId)) {
+        ws.exposedTypeIds.push(regTypeId);
+      }
+    }
+    await this.syncExposedToRegistry(ws);
+    await this.persistWorkspaceList();
+
+    await this.dispatchAccessMode(ws);
+
+    this.changed('workspaceAccessChanged', {
+      workspaceId: ws.id,
+      accessMode: access.accessMode,
+      whitelist: access.whitelist,
+      exposedObjectIds: [...ws.exposedObjectIds],
+    });
   }
 
   /**
@@ -1597,16 +2203,201 @@ export class WorkspaceManager extends Abject {
     } catch { /* SharedState not spawned yet */ }
   }
 
+  /**
+   * The set of objects a remote peer may reach in this workspace.
+   *
+   * `exposedObjectIds` serves two masters: it is the host-side catalog filter
+   * AND PeerRouter's permission gate (see the "Second gate: exposed objects
+   * check" in `peer-router.ts`, which denies any target absent from this list).
+   * While a workspace is uncurated the seeded `[registryId, SharedState]` pair
+   * must not narrow that gate, or an object the joiner can see in the catalog
+   * would still be uncallable over P2P. So an uncurated shared workspace
+   * exposes every child; a curated one exposes exactly its curated list plus
+   * the registry the joiner needs as an entry point.
+   *
+   * Local workspaces keep the previous narrow list. A joined mirror also stays
+   * `accessMode:'local'` — it is mirrored, not hosted, so it is never
+   * advertised — but `activateJoinedParticipation` curates its SharedState and
+   * registry into `exposedObjectIds`, so this returns exactly the two objects
+   * the owner and fellow participants must reach for replication, and nothing
+   * else from the mirror.
+   *
+   * Note the residual: an object marked `sharing: 'user-local'` is still kept
+   * out of the catalog by `WorkspaceShareRegistry.isShareable`, so a peer can
+   * never discover its id here, but this gate no longer refuses it on id alone.
+   */
+  private effectiveExposedIds(ws: WorkspaceInfo): AbjectId[] {
+    const uncurated = ws.curated !== true;
+    let ids: AbjectId[];
+    if (uncurated && ws.accessMode === 'shared') {
+      // Uncurated 'shared' (whitelisted peers only): every shareable child.
+      // Host-local infrastructure (stores, schedulers, consoles, agents...)
+      // stays out for the same reason WorkspaceShareRegistry.applyCuration
+      // keeps it out of the catalog: the permission gate and the catalog must
+      // agree on what a member may reach, or a member could invoke objects it
+      // was never shown.
+      ids = ws.childIds.filter(
+        id => id === ws.registryId || !isHostLocalObject(nameFromTypeId(ws.childTypeIds.get(id))),
+      );
+    } else {
+      // P2-3: an uncurated PUBLIC workspace must not mean "share everything".
+      // Anyone on the network can reach it, so until the user curates we
+      // expose only what setAccessMode/ensureSharedStateExposed seeded (the
+      // registry entry point and SharedState, which replication needs in both
+      // directions). Curated and local workspaces expose exactly their list.
+      ids = [...ws.exposedObjectIds];
+    }
+    if (!ids.includes(ws.registryId)) ids.push(ws.registryId);
+    return [...new Set(ids)];
+  }
+
+  /**
+   * The durable half of `effectiveExposedIds` (P1-2).
+   *
+   * AbjectIds rotate on every restart, so a registry curated by id alone shows
+   * a remote caller nothing once the host comes back up. TypeIds and registered
+   * names survive that churn, so we send all three and let the registry's
+   * exposure predicate match on id OR typeId OR name.
+   */
+  private effectiveExposedSelectors(ws: WorkspaceInfo): { ids: AbjectId[]; typeIds: string[]; names: string[] } {
+    const ids = this.effectiveExposedIds(ws);
+    const typeIds = new Set<string>();
+    for (const id of ids) {
+      const t = ws.childTypeIds.get(id);
+      if (t) typeIds.add(t);
+    }
+    // Durable typeIds persisted with the workspace outlive this run's ids.
+    if (ws.curated === true) {
+      for (const t of ws.exposedTypeIds ?? []) typeIds.add(t);
+    }
+    const typeIdList = [...typeIds];
+    return { ids, typeIds: typeIdList, names: namesFromTypeIds(typeIdList) };
+  }
+
   private async syncExposedToRegistry(ws: WorkspaceInfo): Promise<void> {
     try {
       this.send(
-        request(this.id, ws.registryId, 'setExposedObjectIds', {
-          ids: ws.exposedObjectIds,
-        })
+        request(this.id, ws.registryId, 'setExposedObjectIds',
+          this.effectiveExposedSelectors(ws))
       );
     } catch (err) {
       wsLog.warn('Failed to sync exposed objects to registry:', err);
     }
+  }
+
+  /**
+   * Materialize a workspace joined from a remote peer as a first-class local
+   * record: its own WorkspaceRegistry (where the remote proxies land) and its
+   * own UI/Taskbar scaffolding, spawned lazily on first switch exactly like
+   * any other inactive workspace.
+   *
+   * The record deliberately stays `accessMode: 'local'` — we mirror this
+   * workspace, we do not host it, so it must not be re-advertised as ours. Its
+   * shared identity lives in `joined`/`ownerPeerId`/`participants`.
+   *
+   * Idempotent: re-joining returns the existing record and only widens the
+   * participant set.
+   */
+  async materializeJoinedWorkspace(
+    workspaceId: string,
+    name: string,
+    ownerPeerId: string,
+    participants: string[] = [],
+  ): Promise<{ workspaceId: string; registryId: AbjectId; created: boolean }> {
+    precondition(workspaceId !== '', 'workspaceId must not be empty');
+    precondition(ownerPeerId !== '', 'ownerPeerId must not be empty');
+
+    const existing = this.workspaces.get(workspaceId);
+    if (existing) {
+      existing.joined = true;
+      existing.ownerPeerId = ownerPeerId;
+      if (name) existing.name = name;
+      this.addParticipants(existing, [ownerPeerId, ...participants]);
+      await this.persistWorkspaceList();
+      wsLog.info(`Joined workspace '${existing.name}' (${workspaceId}) already materialized; registry=${existing.registryId} participants=${existing.participants?.length ?? 0}`);
+      // Re-join widened the participant set: push the new whitelist through so
+      // SharedState syncs with the arrivals and PeerRouter admits them.
+      await this.activateJoinedParticipation(existing);
+      return { workspaceId, registryId: existing.registryId, created: false };
+    }
+
+    const wsName = name || `Shared ${workspaceId.slice(0, 8)}`;
+    // INFRA_OBJECTS only: the dedicated registry has to exist right now (the
+    // catalog sync targets it), while the UI follows on the first switch.
+    const info = await this.spawnWorkspaceObjects(workspaceId, wsName, INFRA_OBJECTS);
+    info.joined = true;
+    info.ownerPeerId = ownerPeerId;
+    info.description = `Shared workspace hosted by peer ${ownerPeerId}`;
+    this.addParticipants(info, [ownerPeerId, ...participants]);
+    this.workspaces.set(workspaceId, info);
+    await this.persistWorkspaceList();
+
+    wsLog.info(`Materialized joined workspace '${wsName}' (${workspaceId}) owner=${ownerPeerId} registry=${info.registryId} participants=${info.participants?.length ?? 0}`);
+    // The record stays 'local' (not advertised); this opens participation.
+    await this.activateJoinedParticipation(info);
+    this.changed('workspaceJoined', {
+      workspaceId,
+      name: wsName,
+      ownerPeerId,
+      registryId: info.registryId,
+      participants: [...(info.participants ?? [])],
+    });
+    this.checkInvariants();
+    return { workspaceId, registryId: info.registryId, created: true };
+  }
+
+  /**
+   * Release this instance's reference to a shared workspace.
+   *
+   * A shared workspace is a distributed, reference-counted entity: every
+   * participating instance holds one reference and leaving drops only that
+   * one. The workspace lives on wherever another instance still holds it, and
+   * is torn down here once no participant remains — or immediately when this
+   * instance explicitly deletes its own mirror (`destroy`).
+   */
+  async releaseJoinedWorkspace(
+    workspaceId: string,
+    peerId?: string,
+    destroy: boolean = false,
+  ): Promise<{ released: boolean; remaining: string[]; deleted: boolean }> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) {
+      wsLog.warn(`releaseJoinedWorkspace: no local record for workspace '${workspaceId}'`);
+      return { released: false, remaining: [], deleted: false };
+    }
+
+    const leaving = peerId ?? this.peerId ?? '';
+    ws.participants = (ws.participants ?? []).filter((p) => p !== leaving);
+    const remaining = [...ws.participants];
+
+    const deleted = ws.joined === true && (destroy || remaining.length === 0);
+    if (deleted) {
+      try {
+        await this.deleteWorkspace(workspaceId);
+      } catch (err) {
+        wsLog.warn(`releaseJoinedWorkspace: failed to delete workspace '${workspaceId}':`, err);
+      }
+      // deleteWorkspace drops the share-registry entry itself, but it can bail
+      // before getting there (the last workspace cannot be deleted). Ask again
+      // so the joined entry never outlives the reference that justified it.
+      await this.dropShareRegistryEntry(workspaceId);
+    } else {
+      await this.persistWorkspaceList();
+    }
+
+    wsLog.info(`Released workspace '${workspaceId}' for '${leaving || 'local'}': ${remaining.length} participant(s) remain, deleted=${deleted}`);
+    this.changed('workspaceParticipantsChanged', { workspaceId, participants: remaining, deleted });
+    return { released: true, remaining, deleted };
+  }
+
+  /** Union `peerIds` (plus this instance) into a workspace's participant set. */
+  private addParticipants(ws: WorkspaceInfo, peerIds: string[]): void {
+    const set = new Set<string>(ws.participants ?? []);
+    if (this.peerId) set.add(this.peerId);
+    for (const p of peerIds) {
+      if (p) set.add(p);
+    }
+    ws.participants = [...set];
   }
 
   private async persistWorkspaceList(): Promise<void> {
@@ -1620,6 +2411,10 @@ export class WorkspaceManager extends Abject {
         whitelist: ws.whitelist,
         exposedObjectIds: ws.exposedObjectIds,
         exposedTypeIds: ws.exposedTypeIds,
+        curated: ws.curated,
+        joined: ws.joined,
+        ownerPeerId: ws.ownerPeerId,
+        participants: ws.participants ? [...ws.participants] : undefined,
         createdAt: Date.now(),
       };
     });
@@ -1636,16 +2431,40 @@ export class WorkspaceManager extends Abject {
   }
 
   private async persistActiveWorkspaceId(): Promise<void> {
-    if (!this.activeWorkspaceId) return;
+    // Persists `null` when there is no active workspace. Returning early on an
+    // empty id would make a *cleared* active workspace unwritable, leaving the
+    // previous — possibly deleted — id in storage to be restored on next boot.
     try {
       await this.request(
         request(this.id, this.globalStorageId!, 'set', {
           key: STORAGE_KEY_ACTIVE,
-          value: this.activeWorkspaceId,
+          value: this.activeWorkspaceId ?? null,
         })
       );
     } catch (err) {
       wsLog.warn('Failed to persist active workspace:', err);
+    }
+  }
+
+  /**
+   * Ask WorkspaceShareRegistry to forget its joined entry for a workspace.
+   *
+   * Deliberately one-way. WSR's own `leaveWorkspace` already calls back into
+   * `releaseJoinedWorkspace` here, so this targets `dropJoinedWorkspace` — the
+   * local-only entry point that clears WSR's bookkeeping without re-entering
+   * this manager. Best-effort: a missing or unresponsive WSR must not fail a
+   * delete that has already been persisted.
+   */
+  private async dropShareRegistryEntry(workspaceId: string): Promise<void> {
+    if (!this.workspaceShareRegistryId) {
+      this.workspaceShareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
+    }
+    if (!this.workspaceShareRegistryId) return;
+    try {
+      await this.request(request(this.id, this.workspaceShareRegistryId,
+        'dropJoinedWorkspace', { workspaceId }));
+    } catch (err) {
+      wsLog.warn(`dropShareRegistryEntry: WorkspaceShareRegistry did not drop '${workspaceId}':`, err);
     }
   }
 
@@ -1678,6 +2497,9 @@ export class WorkspaceManager extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
     invariant(this.workspaces.size >= 0, 'workspace count must be non-negative');
+    for (const ws of this.workspaces.values()) {
+      invariant(!ws.joined || !!ws.ownerPeerId, 'joined workspace must record its owner peer');
+    }
   }
 }
 

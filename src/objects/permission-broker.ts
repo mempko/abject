@@ -147,7 +147,7 @@ interface CallerContext {
 export function ceilingFor(mode: WorkspaceAccessMode): AutonomyLevel {
   switch (mode) {
     case 'local': return 'full';
-    case 'private': return 'edit';
+    case 'shared': return 'edit';
     case 'public': return 'ask';
     default: return 'ask';
   }

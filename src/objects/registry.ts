@@ -20,6 +20,13 @@ import { require, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import {
+  type ExposureSelectors,
+  type ExposureSelectorsInput,
+  normalizeExposureSelectors,
+  isExposureEmpty,
+  matchesExposureSelectors,
+} from './exposure-selectors.js';
 
 const log = new Log('Registry');
 
@@ -81,7 +88,12 @@ export class Registry extends Abject {
   private byName: Map<string, Set<AbjectId>> = new Map();
   private byTypeId: Map<TypeId, AbjectId> = new Map();
   private subscribers: Set<AbjectId> = new Set();
-  private exposedObjectIds: Set<AbjectId> = new Set();
+  /**
+   * Durable curation selectors (P1-2). Keyed on ephemeral AbjectId OR durable
+   * typeId OR durable registered name, so a whitelist recorded before a
+   * restart still resolves afterwards even though every AbjectId has rotated.
+   */
+  private exposedSelectors: ExposureSelectors = normalizeExposureSelectors(undefined);
   private filteringConfigured = false;
 
   constructor() {
@@ -301,7 +313,13 @@ export class Registry extends Abject {
     'getSource', 'updateSource', 'probe',
   ]);
 
-  protected override askPrompt(_question: string): string {
+  /**
+   * Build the ask prompt for a specific caller. The catalog embedded in the
+   * prompt is scoped exactly like every other query handler: a local caller
+   * sees the whole catalog, a remote caller sees only the curated set. Without
+   * this, `ask` was a hole straight through the exposure filter.
+   */
+  protected askPromptFor(_question: string, callerId?: AbjectId): string {
     let source = `## Registry — How to query me
 
 ### You are asking the Registry directly
@@ -331,7 +349,7 @@ If a caller is asking you ("what is the AbjectId for X?", "which object can do Y
 Each line shows one registered object: id, name, description, and non-meta method names. Use this catalog to answer the caller's question directly whenever possible.
 
 `;
-    for (const [, reg] of this.objects) {
+    for (const reg of this.catalogForCaller(callerId)) {
       const m = reg.manifest;
       const methods = m.interface.methods
         .filter((method) => !Registry.META_METHODS.has(method.name))
@@ -345,14 +363,28 @@ Each line shows one registered object: id, name, description, and non-meta metho
     return super.askPrompt(_question) + '\n\n' + source;
   }
 
+  /**
+   * Catalog entries a caller may see: everything for a local caller (or when
+   * no caller is known, e.g. an internal prompt build), the curated set for a
+   * remote one.
+   */
+  protected catalogForCaller(callerId?: AbjectId): ObjectRegistration[] {
+    const all = this.listObjects();
+    return callerId ? this.filterForCaller(all, callerId) : all;
+  }
+
+  protected override askPrompt(question: string): string {
+    return this.askPromptFor(question);
+  }
+
   // Capability discovery/routing — agents lean on these answers to find the
   // right object to call, so synthesize at balanced rather than fast.
   protected override askTier(): 'smart' | 'balanced' | 'fast' {
     return 'balanced';
   }
 
-  protected override async handleAsk(question: string): Promise<string> {
-    return this.askLlm(this.askPrompt(question), question, this.askTier());
+  protected override async handleAsk(question: string, callerId?: AbjectId): Promise<string> {
+    return this.askLlm(this.askPromptFor(question, callerId), question, this.askTier());
   }
 
   private setupHandlers(): void {
@@ -378,7 +410,10 @@ Each line shows one registered object: id, name, description, and non-meta metho
     this.on('lookup', async (msg: AbjectMessage) => {
       this.reconcileDeadEntries();
       const { objectId } = msg.payload as { objectId: AbjectId };
-      return this.lookupObject(objectId);
+      const reg = this.lookupObject(objectId);
+      // A remote caller may only resolve objects inside the curated set.
+      if (this.isRemoteCaller(msg)) return this.isExposedToRemote(reg) ? reg : null;
+      return reg;
     });
 
     this.on('discover', async (msg: AbjectMessage) => {
@@ -451,8 +486,20 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('setExposedObjectIds', async (msg: AbjectMessage) => {
-      const { ids } = msg.payload as { ids: AbjectId[] };
-      this.setExposedObjectIds(ids);
+      const { ids, typeIds, names } = msg.payload as {
+        ids?: AbjectId[];
+        typeIds?: string[];
+        names?: string[];
+      };
+      // Wire-compatible: an old caller sends `{ ids }` only and gets exactly
+      // the previous behaviour; a P1-2 caller adds durable selectors.
+      this.setExposedSelectors({ ids, typeIds, names });
+      return true;
+    });
+
+    this.on('setExposedSelectors', async (msg: AbjectMessage) => {
+      const { ids, typeIds, names } = msg.payload as ExposureSelectorsInput;
+      this.setExposedSelectors({ ids, typeIds, names });
       return true;
     });
 
@@ -469,12 +516,18 @@ Each line shows one registered object: id, name, description, and non-meta metho
       const { objectId, typeId, name, ref } = msg.payload as {
         objectId?: string; typeId?: string; name?: string; ref?: string;
       };
-      return this.getObjectSource(ref ?? objectId ?? typeId ?? name ?? '');
+      const key = ref ?? objectId ?? typeId ?? name ?? '';
+      if (this.isRemoteCaller(msg)) {
+        const reg = this.resolveRegistration(key);
+        return this.isExposedToRemote(reg) ? (reg?.source ?? null) : null;
+      }
+      return this.getObjectSource(key);
     });
 
     this.on('updateSource', async (msg: AbjectMessage) => {
       // Resolve the same way as getSource so an edit deployed against a stale
       // AbjectId still lands on the live registration.
+      this.denyRemoteWrite(msg, 'updateSource');
       const { objectId, typeId, name, ref, source } = msg.payload as {
         objectId?: string; typeId?: string; name?: string; ref?: string; source: string;
       };
@@ -485,6 +538,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('updateManifest', async (msg: AbjectMessage) => {
+      this.denyRemoteWrite(msg, 'updateManifest');
       const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
       return this.updateManifestRegistration(objectId, manifest);
     });
@@ -834,6 +888,12 @@ Each line shows one registered object: id, name, description, and non-meta metho
     if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
     this.byName.get(reg.name)!.add(objectId);
 
+    // An in-place manifest swap fires neither objectRegistered nor
+    // objectUpdated, so subscribers mirroring this catalog (WorkspaceShareRegistry
+    // relays it to joined peers as a catalog delta) would never learn the
+    // interface changed.
+    this.notifySubscribers('manifestUpdated', reg);
+
     return true;
   }
 
@@ -872,7 +932,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
   /**
    * Notify subscribers of changes.
    */
-  private async notifySubscribers(
+  protected async notifySubscribers(
     eventName: string,
     payload: unknown
   ): Promise<void> {
@@ -892,20 +952,94 @@ Each line shows one registered object: id, name, description, and non-meta metho
    * Empty set means nothing is visible to remote callers.
    */
   setExposedObjectIds(ids: AbjectId[]): void {
-    this.exposedObjectIds = new Set(ids);
+    this.setExposedSelectors({ ids });
+  }
+
+  /**
+   * Set the durable curation selectors for remote callers (P1-2).
+   *
+   * An object is exposed when its id, its typeId, or its registered name is
+   * listed. Names and typeIds survive the AbjectId churn of a restart, which
+   * is what makes curation durable; `ids` remains for within-run precision and
+   * for wire compatibility with `setExposedObjectIds`.
+   */
+  setExposedSelectors(input: ExposureSelectorsInput): void {
+    this.exposedSelectors = normalizeExposureSelectors(input);
     this.filteringConfigured = true;
+  }
+
+  /** The curation currently in force (read-only view, for tests/diagnostics). */
+  getExposedSelectors(): { ids: string[]; typeIds: string[]; names: string[] } {
+    return {
+      ids: [...this.exposedSelectors.ids],
+      typeIds: [...this.exposedSelectors.typeIds],
+      names: [...this.exposedSelectors.names],
+    };
+  }
+
+  /**
+   * Is this caller local to this host? Registered in this registry, or holding
+   * a mailbox on this bus. Overridden by WorkspaceRegistry, where a remote
+   * object's proxy holds a local mailbox under the REMOTE object's own id and
+   * would otherwise read as local.
+   */
+  protected isLocalCaller(callerId: AbjectId): boolean {
+    if (this.objects.has(callerId)) return true;  // Registered in this registry — local
+    try {
+      // Same peer (e.g. a system object querying a workspace registry) — local
+      return this.bus.isRegistered(callerId);
+    } catch {
+      return false;  // not initialized yet — treat as remote (fail closed)
+    }
+  }
+
+  /**
+   * Is this registration part of the curated set a remote caller may see?
+   * Single source of truth for the exposure predicate — filterForCaller and
+   * every per-object side door (lookup / getSource / resolveUri / inspect)
+   * ask this one question so push and pull cannot drift apart.
+   */
+  protected isExposedToRemote(reg: ObjectRegistration | null | undefined): boolean {
+    if (!reg) return false;
+    if (!this.filteringConfigured) return true;   // Global registry: no filtering
+    if (isExposureEmpty(this.exposedSelectors)) return false;
+    // P1-2: id OR typeId OR registered name — the same predicate
+    // WorkspaceShareRegistry.applyCuration uses on the push side.
+    return matchesExposureSelectors(reg, this.exposedSelectors);
+  }
+
+  /**
+   * Is this message from a caller outside this host? Only meaningful on a
+   * filtering (workspace) registry — the global registry never filters.
+   */
+  protected isRemoteCaller(msg: AbjectMessage): boolean {
+    if (!this.filteringConfigured) return false;
+    return !this.isLocalCaller(msg.routing.from);
+  }
+
+  /**
+   * Reject a mutating request from a remote caller outright. Remote peers may
+   * READ the curated slice of a shared workspace; they may never write to this
+   * host's registry (source, manifest, sharing policy, forks).
+   */
+  protected denyRemoteWrite(msg: AbjectMessage, method: string): void {
+    if (this.isRemoteCaller(msg)) {
+      throw new Error(
+        `Registry '${method}' is refused for remote caller ${msg.routing.from}: ` +
+        'remote peers have read-only access to the curated set of a shared workspace.',
+      );
+    }
   }
 
   /**
    * Filter results for a caller: local callers see everything,
    * remote callers only see exposed objects.
    */
-  private filterForCaller(results: ObjectRegistration[], callerId: AbjectId): ObjectRegistration[] {
+  protected filterForCaller(results: ObjectRegistration[], callerId: AbjectId): ObjectRegistration[] {
     if (!this.filteringConfigured) return results;  // Global registry: no filtering
-    if (this.objects.has(callerId)) return results;  // Registered in this registry — local
-    if (this.bus.isRegistered(callerId)) return results;  // Same peer (e.g. system object querying workspace registry) — local
-    if (this.exposedObjectIds.size === 0) return [];  // No exposed objects = nothing visible remotely
-    return results.filter(r => this.exposedObjectIds.has(r.id));
+    if (this.isLocalCaller(callerId)) return results;
+    if (isExposureEmpty(this.exposedSelectors)) return [];  // Nothing curated = nothing visible remotely
+    return results.filter(r => this.isExposedToRemote(r));
   }
 
   /**
