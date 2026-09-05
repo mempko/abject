@@ -24,6 +24,12 @@ import { join } from 'node:path';
 import { flattenConversation, hasImages, runCliIdle } from './cli-process.js';
 import { PtySessionPool } from './pty-session.js';
 import { codexDialect } from './pty-dialects.js';
+import {
+  discoverModels,
+  fetchJsonWithTimeout,
+  openRouterCatalog,
+  peekCachedModels,
+} from './cli-model-discovery.js';
 import type { CliTransport } from './claude-cli.js';
 import {
   BaseLLMProvider,
@@ -43,6 +49,124 @@ import {
  * settings change.
  */
 const AUTO_MODEL = 'auto';
+
+/** Cache key for this provider's discovered list. */
+const MODEL_DISCOVERY_KEY = 'codex-cli';
+
+const AUTO_ENTRY: ModelInfo = { id: AUTO_MODEL, name: 'Auto (recommended)', vision: true };
+
+/** Offered when the catalog is unreachable; also merged in behind it. */
+const KNOWN_CODEX_MODELS: ModelInfo[] = [
+  { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)', vision: true },
+  { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)', vision: true },
+  { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: true },
+  { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: true },
+];
+
+const FALLBACK_MODELS: ModelInfo[] = [AUTO_ENTRY, ...KNOWN_CODEX_MODELS];
+
+/**
+ * Substrings that mark an id as something `codex` cannot be pointed at.
+ *
+ * OpenAI publishes one catalog across every modality, so the same `openai/`
+ * prefix that carries gpt-5.6 also carries image, audio and chat-tuned
+ * entries. Codex drives a terminal coding agent; pointing it at one of
+ * these fails at request time, and an option that cannot work is worse than
+ * an option that is missing. `-image`, `-audio` and `-chat` are in the
+ * catalog today (gpt-5-image, gpt-audio-mini, gpt-5.2-chat); the rest are
+ * the other modality suffixes OpenAI ships under, named here so a new one
+ * does not have to reach a user's dropdown before anybody notices.
+ */
+const NON_DRIVABLE_MARKERS = [
+  '-image', '-audio', '-chat', '-tts', '-realtime', '-transcribe', '-search',
+];
+
+/**
+ * The oldest generation worth offering. Codex is a coding agent: the gpt-4,
+ * o-series and gpt-oss rows in the catalog all predate it, and listing every
+ * model OpenAI ever shipped is how a picker becomes unusable.
+ */
+const MIN_DRIVABLE_MAJOR = 5;
+
+/**
+ * Whether the binary can be pointed at this id.
+ *
+ * The rule used to be `id.includes('codex')`, which is exactly why the
+ * picker could not show gpt-5.6: that generation ships as gpt-5.6-luna,
+ * -sol and -terra (plus their -pro forms) and carries no 'codex' anywhere
+ * in the name, so a filter keyed on the word excluded the newest models by
+ * construction. So the rule is the family rather than the word - every
+ * gpt-5-or-later id, minus the modality variants above - with codex-tuned
+ * ids allowed outright so they survive whatever the numbering does next.
+ * Matching on a parsed major version rather than a literal prefix is what
+ * keeps the next generation from needing an edit here to become visible.
+ *
+ * Dots are kept, unlike the Anthropic ids in claude-cli.ts:
+ * 'gpt-5.1-codex-max' is the form the binary accepts.
+ */
+export function isDrivableCodexModel(id: string): boolean {
+  if (NON_DRIVABLE_MARKERS.some((marker) => id.includes(marker))) return false;
+  if (id.includes('codex')) return true;
+  const generation = /^gpt-(\d+)(?:\.\d+)?(?:-|$)/.exec(id);
+  return generation !== null && Number(generation[1]) >= MIN_DRIVABLE_MAJOR;
+}
+
+/** Auto first, the live catalog next, the built-in names last. */
+function withKnownModels(live: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>([AUTO_ENTRY.id]);
+  const out: ModelInfo[] = [AUTO_ENTRY];
+  for (const model of [...live, ...KNOWN_CODEX_MODELS]) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    out.push(model);
+  }
+  return out;
+}
+
+/**
+ * Tier 1: OpenAI's own catalog. Authoritative, but it needs a key and this
+ * provider authenticates through the binary (`codex login`), so most users
+ * have none for us to borrow. An absent key is a silent skip, not an error.
+ *
+ * Sorted newest-first to match the order the OpenRouter tier already
+ * arrives in: the picker is read top-down, and the newest generation is
+ * what somebody opening it is looking for.
+ */
+async function openAiApiModels(): Promise<ModelInfo[]> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return [];
+  const body = await fetchJsonWithTimeout('https://api.openai.com/v1/models', {
+    Authorization: `Bearer ${key}`,
+  }) as { data?: unknown };
+  const rows = Array.isArray(body?.data) ? body.data as Array<Record<string, unknown>> : [];
+  const drivable = rows.filter((row) => typeof row.id === 'string' && isDrivableCodexModel(row.id));
+  drivable.sort((a, b) => Number(b.created ?? 0) - Number(a.created ?? 0));
+  const live: ModelInfo[] = drivable.map((row) => ({
+    id: row.id as string,
+    name: row.id as string,
+    vision: true,
+  }));
+  return live.length > 0 ? withKnownModels(live) : [];
+}
+
+/**
+ * Tier 2: the public OpenRouter catalog. Needs no key, so in practice this
+ * is the tier that fires and the one that puts gpt-5.6 on screen.
+ *
+ * Codex refreshes its own list from an endpoint it does not expose, and
+ * that endpoint needs the ChatGPT session token, so this is what is
+ * actually reachable without one. OpenRouter returns newest-first, which is
+ * the order the picker wants, so it is preserved rather than re-sorted.
+ */
+async function openRouterCodexModels(): Promise<ModelInfo[]> {
+  const entries = await openRouterCatalog('openai/');
+  const live: ModelInfo[] = [];
+  for (const entry of entries) {
+    if (!isDrivableCodexModel(entry.id)) continue;
+    live.push({ id: entry.id, name: entry.name, vision: true });
+  }
+  return live.length > 0 ? withKnownModels(live) : [];
+}
 
 function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
@@ -142,13 +266,11 @@ export class CodexCliProvider extends BaseLLMProvider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    return [
-      { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: true },
-      { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)', vision: true },
-      { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)', vision: true },
-      { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: true },
-      { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: true },
-    ];
+    return discoverModels(
+      MODEL_DISCOVERY_KEY,
+      [openAiApiModels, openRouterCodexModels],
+      FALLBACK_MODELS,
+    );
   }
 
   override describe(): LLMProviderDescription {
@@ -178,13 +300,10 @@ export class CodexCliProvider extends BaseLLMProvider {
       // API-key-only and are rejected with "model is not supported when
       // using Codex with a ChatGPT account". "Auto" sidesteps both by
       // letting the binary choose what is valid for the current auth.
-      models: [
-        { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: true },
-        { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)', vision: true },
-        { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)', vision: true },
-        { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: true },
-        { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: true },
-      ],
+      // Synchronous, and what the settings panel paints first, so it
+      // reports whatever discovery has already found rather than always
+      // seeding the panel with the built-in names above.
+      models: peekCachedModels(MODEL_DISCOVERY_KEY) ?? FALLBACK_MODELS,
       defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL, code: AUTO_MODEL },
       // One-time migration: codex with a ChatGPT-account login refuses the
       // API-only `gpt-5` / `gpt-5-mini` model names. Rewrite any saved tier

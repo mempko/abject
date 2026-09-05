@@ -30,6 +30,12 @@ import {
 import { PtySessionPool, sessionSandboxDir } from './pty-session.js';
 import { claudeDialect } from './pty-dialects.js';
 import {
+  discoverModels,
+  fetchJsonWithTimeout,
+  openRouterCatalog,
+  peekCachedModels,
+} from './cli-model-discovery.js';
+import {
   BaseLLMProvider,
   LLMCompletionOptions,
   LLMCompletionResult,
@@ -47,6 +53,146 @@ import {
  * flag" when building the session's argv.
  */
 const AUTO_MODEL = 'auto';
+
+/** Cache key for this provider's discovered list. */
+const MODEL_DISCOVERY_KEY = 'claude-cli';
+
+/**
+ * vision: true throughout because image requests take the stream-json
+ * transport, which passes base64 image blocks through to the model. The
+ * warm terminal session cannot carry an image; complete() routes around it.
+ */
+const AUTO_ENTRY: ModelInfo = { id: AUTO_MODEL, name: 'Auto (latest default)', vision: true };
+
+/**
+ * Family aliases the binary resolves for itself.
+ *
+ * These are the only ids guaranteed to keep working across a Claude Code
+ * upgrade, which is what makes them a sound floor - and also what made them
+ * a poor catalog: they name no actual model, so a picker showing only these
+ * never mentions Fable, Opus 5 or anything else by name. They are offered
+ * after the live catalog, not instead of it.
+ */
+const ALIAS_MODELS: ModelInfo[] = [
+  { id: 'opus',   name: 'Claude Opus (alias)', vision: true },
+  { id: 'sonnet', name: 'Claude Sonnet (alias)', vision: true },
+  { id: 'haiku',  name: 'Claude Haiku (alias)', vision: true },
+];
+
+/**
+ * Specific ids the binary accepts, offered when no live source answers.
+ *
+ * The aliases above are a sound floor but name no actual model, so a picker
+ * holding only them mentions neither Fable nor Opus 5 - and the settings
+ * panel paints synchronously from describe() before any discovery has run,
+ * so alias-only here means alias-only on screen for every user whose cache
+ * is cold. These are the newest ids `claude --model` accepts, verified
+ * against the binary; they seed that first paint and are merged in behind
+ * the live catalog once it arrives.
+ */
+const KNOWN_CLAUDE_MODELS: ModelInfo[] = [
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', vision: true },
+  { id: 'claude-opus-5',    name: 'Claude Opus 5', vision: true },
+  { id: 'claude-sonnet-5',  name: 'Claude Sonnet 5', vision: true },
+  { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', vision: true },
+];
+
+/** Shown only when every live source is unreachable. */
+const FALLBACK_MODELS: ModelInfo[] = [AUTO_ENTRY, ...KNOWN_CLAUDE_MODELS, ...ALIAS_MODELS];
+
+/**
+ * The oldest generation the installed binary still runs.
+ *
+ * This is where Claude Code differs from codex and why the catalog cannot
+ * be passed through as-is: codex warns and continues on an id it does not
+ * know, but `claude` validates --model against its bundled catalog before
+ * any network call and exits 1. The public catalog still lists generations
+ * the binary has dropped - claude-opus-4 and claude-sonnet-4 were retired
+ * on 2026-06-15 and fail outright, claude-3-haiku is not in the catalog at
+ * all, and claude-opus-4-1 runs only by being silently remapped to Opus 5.
+ * 4.5 is the line below which every id the catalog offers is one of those.
+ */
+const MIN_DRIVABLE_VERSION = 4.5;
+
+/**
+ * Whether `claude --model <id>` accepts this id.
+ *
+ * Keyed on a parsed version rather than a list of names, so the next
+ * generation becomes visible without an edit here while the retired ones
+ * stay out - the same reason codex-cli.ts matches a major version instead
+ * of the literal word 'codex'. Requiring the family to be alphabetic is
+ * what excludes the older `claude-3-haiku` shape, whose number sits where
+ * the family name goes. The optional 8-digit tail admits the dated
+ * snapshots that only tier 1 returns (claude-haiku-4-5-20251001).
+ */
+export function isDrivableClaudeModel(id: string): boolean {
+  const parsed = /^claude-[a-z]+-(\d+)(?:-(\d+))?(?:-\d{8})?$/.exec(id);
+  if (parsed === null) return false;
+  const version = Number(parsed[1]) + Number(parsed[2] ?? 0) / 10;
+  return version >= MIN_DRIVABLE_VERSION;
+}
+
+/** Auto first, the live catalog next, the durable aliases last. */
+function withAliases(live: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>([AUTO_ENTRY.id]);
+  const out: ModelInfo[] = [AUTO_ENTRY];
+  for (const model of [...live, ...KNOWN_CLAUDE_MODELS, ...ALIAS_MODELS]) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    out.push(model);
+  }
+  return out;
+}
+
+/**
+ * Tier 1: Anthropic's own catalog. Authoritative, and the only source that
+ * carries dated snapshot ids like claude-haiku-4-5-20251001 - but it needs
+ * a key, and this provider authenticates through the binary, so most users
+ * have none for us to borrow. Absent key is a silent skip, not an error.
+ */
+async function anthropicApiModels(): Promise<ModelInfo[]> {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return [];
+  const body = await fetchJsonWithTimeout('https://api.anthropic.com/v1/models?limit=100', {
+    'x-api-key': key,
+    'anthropic-version': '2023-06-01',
+  }) as { data?: unknown };
+  const rows = Array.isArray(body?.data) ? body.data as Array<Record<string, unknown>> : [];
+  const live: ModelInfo[] = [];
+  for (const row of rows) {
+    const id = typeof row.id === 'string' ? row.id : '';
+    if (!isDrivableClaudeModel(id)) continue;
+    const display = typeof row.display_name === 'string' && row.display_name.length > 0
+      ? row.display_name
+      : id;
+    live.push({ id, name: display, vision: true });
+  }
+  return live.length > 0 ? withAliases(live) : [];
+}
+
+/**
+ * Tier 2: the public OpenRouter catalog. Needs no key, so in practice this
+ * is the tier that fires and the one that puts Fable 5.1 on screen.
+ *
+ * OpenRouter writes versions with dots ('claude-fable-5.1'); Claude Code's
+ * own catalog uses dashes ('claude-fable-5-1'), and only the dashed form is
+ * accepted after --model - the binary rejects the dotted form outright, so
+ * the rewrite is load-bearing rather than cosmetic. Undated ids are
+ * deliberate here - the dated snapshots exist only on tier 1, and the
+ * binary accepts undated names. The catalog reaches further back than the
+ * binary does, so what survives the rewrite is filtered for drivability
+ * before it is offered.
+ */
+async function openRouterClaudeModels(): Promise<ModelInfo[]> {
+  const entries = await openRouterCatalog('anthropic/');
+  const live: ModelInfo[] = [];
+  for (const entry of entries) {
+    const id = entry.id.replace(/\./g, '-');
+    if (!isDrivableClaudeModel(id)) continue;
+    live.push({ id, name: entry.name, vision: true });
+  }
+  return live.length > 0 ? withAliases(live) : [];
+}
 
 function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
@@ -263,17 +409,19 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     return options?.model ?? AUTO_MODEL;
   }
 
+  /**
+   * The current catalog, discovered live.
+   *
+   * The binary has no list command, so the names have to come from
+   * elsewhere: Anthropic's API when a key is present, the public OpenRouter
+   * catalog otherwise, and the aliases only when neither answers.
+   */
   async listModels(): Promise<ModelInfo[]> {
-    // The CLI exposes no list endpoint; report the canonical aliases.
-    // vision: true because image requests take the stream-json transport,
-    // which passes base64 image blocks through to the model. The warm
-    // terminal session cannot carry an image; complete() routes around it.
-    return [
-      { id: AUTO_MODEL, name: 'Auto (latest default)', vision: true },
-      { id: 'opus',   name: 'Claude Opus (alias)', vision: true },
-      { id: 'sonnet', name: 'Claude Sonnet (alias)', vision: true },
-      { id: 'haiku',  name: 'Claude Haiku (alias)', vision: true },
-    ];
+    return discoverModels(
+      MODEL_DISCOVERY_KEY,
+      [anthropicApiModels, openRouterClaudeModels],
+      FALLBACK_MODELS,
+    );
   }
 
   override describe(): LLMProviderDescription {
@@ -298,12 +446,11 @@ export class ClaudeCliProvider extends BaseLLMProvider {
             + 'usage and returns the reply verbatim. '
             + 'Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup',
       },
-      models: [
-        { id: AUTO_MODEL, name: 'Auto (latest default)', vision: true },
-        { id: 'opus',     name: 'Claude Opus (alias)', vision: true },
-        { id: 'sonnet',   name: 'Claude Sonnet (alias)', vision: true },
-        { id: 'haiku',    name: 'Claude Haiku (alias)', vision: true },
-      ],
+      // describe() is synchronous and is what the settings panel paints
+      // first, so it reports whatever discovery has already found rather
+      // than always seeding the panel with the aliases and depending on the
+      // async refresh to correct them.
+      models: peekCachedModels(MODEL_DISCOVERY_KEY) ?? FALLBACK_MODELS,
       // CLI providers default to 'auto' - the binary picks its current
       // default for each session. Upgrading the binary auto-rolls these
       // routes onto the new default with no settings changes.

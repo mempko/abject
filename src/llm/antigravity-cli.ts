@@ -54,6 +54,7 @@ import {
   runCliIdleStreaming,
 } from './cli-process.js';
 import { sessionSandboxDir } from './pty-session.js';
+import { discoverModels, peekCachedModels } from './cli-model-discovery.js';
 import {
   BaseLLMProvider,
   EmptyCompletionError,
@@ -105,6 +106,46 @@ const AGY_MODELS = [
  * surprise on the first live call.
  */
 type AgyModelId = (typeof AGY_MODELS)[number]['id'];
+
+/** Cache key for this provider's discovered list. */
+const MODEL_DISCOVERY_KEY = 'antigravity-cli';
+
+/**
+ * The `auto` sentinel row. It is ours rather than the CLI's, so live
+ * discovery prepends it to whatever `agy models` reports.
+ */
+const AGY_AUTO_ENTRY: ModelInfo = AGY_MODELS[0];
+
+/**
+ * Live discovery via `agy models`.
+ *
+ * Alone among the three CLI providers, this binary does publish its own
+ * list - which makes it the most authoritative source of the three: no
+ * network call and no third-party catalog, just the installed CLI
+ * reporting what it actually accepts. The list above went stale exactly as
+ * you would expect a hand-copied one to (it still offered gemini-3.5-*
+ * after the CLI had dropped them, and had never heard of gemini-3.8-*).
+ *
+ * Output is one model per line, `id<TAB>Label`, with no header row and no
+ * `auto` row - that sentinel is ours, so it is prepended here.
+ */
+async function agyModels(bin: string): Promise<ModelInfo[]> {
+  const { code, stdout } = await runCliIdle(bin, ['models'], { idleTimeoutMs: 8_000 });
+  if (code !== 0) return [];
+  const live: ModelInfo[] = [];
+  const seen = new Set<string>([AUTO_MODEL]);
+  for (const line of stdout.split('\n')) {
+    const [rawId, rawLabel] = line.split('\t');
+    const id = (rawId ?? '').trim();
+    // Blank lines, and anything with whitespace inside the id: a banner or
+    // a column header is not a model name.
+    if (id.length === 0 || /\s/.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    const label = (rawLabel ?? '').trim();
+    live.push({ id, name: label.length > 0 ? label : id, vision: false });
+  }
+  return live.length > 0 ? [AGY_AUTO_ENTRY, ...live] : [];
+}
 
 function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
@@ -432,7 +473,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    return [...AGY_MODELS];
+    return discoverModels(MODEL_DISCOVERY_KEY, [() => agyModels(this.bin)], [...AGY_MODELS]);
   }
 
   override describe(): LLMProviderDescription {
@@ -448,7 +489,10 @@ export class AntigravityCliProvider extends BaseLLMProvider {
           + 'tools, so a request can read the filesystem and run commands its settings allow. '
           + 'Install Antigravity CLI: agy install or https://antigravity.google',
       },
-      models: [...AGY_MODELS],
+      // Synchronous, and what the settings panel paints first, so it
+      // reports whatever `agy models` has already reported rather than the
+      // built-in list.
+      models: peekCachedModels(MODEL_DISCOVERY_KEY) ?? [...AGY_MODELS],
       defaultTierModels: AGY_TIER_MODELS,
       // agy sunset the 3.5 flash line (caught live by the models tripwire
       // test); migrate any saved tier routing to the current 3.7 line at
