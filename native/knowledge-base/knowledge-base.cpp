@@ -42,6 +42,9 @@ using namespace abject;
 static const char* LEGACY_STORAGE_KEY = "knowledge-base:entries";
 static const char* ENTRY_KEY_PREFIX = "knowledge-base:entry:";
 static const char* SYNC_NAMESPACE = "knowledge-base";
+/// One CRDT register per entry: `entry:<id>`. A deletion publishes a
+/// tombstone under the same key.
+static const char* ENTRY_REGISTER_PREFIX = "entry:";
 static constexpr int64_t SYNC_THROTTLE_MS = 2000;
 static constexpr int64_t DAY_MS = 24LL * 60 * 60 * 1000;
 static constexpr int64_t DISTILL_INTERVAL_MS = 30LL * 60 * 1000;
@@ -88,6 +91,10 @@ struct Entry {
   std::vector<std::string> tags;
   std::string origin = "agent";  // user | agent | reviewer | scrum
   std::string created_by;
+  /// The peer that authored this entry. UI attribution and the CRDT tie-break
+  /// both read it. Empty means the entry predates provenance; the first
+  /// publish from this peer stamps it.
+  std::string creator_peer_id;
   int64_t created_at = 0;
   int64_t updated_at = 0;
   int64_t access_count = 0;
@@ -115,6 +122,7 @@ struct Entry {
             {"content", content}, {"type", type},
             {"tags", tags},       {"origin", origin},
             {"createdBy", created_by},
+            {"creatorPeerId", creator_peer_id},
             {"createdAt", created_at},
             {"updatedAt", updated_at},
             {"accessCount", access_count},
@@ -141,6 +149,7 @@ struct Entry {
     e.origin = str_or(j, "origin", "agent");
     if (!valid_origin(e.origin)) e.origin = "agent";
     e.created_by = str_or(j, "createdBy", "");
+    e.creator_peer_id = str_or(j, "creatorPeerId", "");
     e.created_at = int_or(j, "createdAt", 0);
     e.updated_at = int_or(j, "updatedAt", 0);
     e.access_count = int_or(j, "accessCount", 0);
@@ -354,8 +363,29 @@ class KnowledgeBase final : public Object {
 
     // Cross-peer sync via SharedState (create is idempotent-ish; failures
     // just mean no sync, never a broken store).
+    object_id_ = info.object_id;
+
+    // Peer identity for provenance and for breaking equal timestamps. Same
+    // source and same fallback as the TS KnowledgeBase, so both sides stamp
+    // ids drawn from ONE identity space -- a peerId tie-break across two
+    // different id spaces would compare incomparable values.
+    request("@Identity", "getIdentity", json::object(), [this](const Result& r) {
+      if (r.ok && r.payload.is_object()) {
+        local_peer_id_ = r.payload.value("peerId", std::string());
+        adopt_self_stamped_entries();
+      }
+    });
+
     request("@SharedState", "create", {{"name", SYNC_NAMESPACE}}, [this](const Result&) {
-      request("@SharedState", "subscribe", {{"name", SYNC_NAMESPACE}}, [](const Result&) {});
+      request("@SharedState", "subscribe", {{"name", SYNC_NAMESPACE}}, [this](const Result&) {
+        // A peer that was offline missed every stateChanged event, and
+        // _syncFull is internal to SharedState -- it is never delivered to a
+        // consumer. Reading the namespace whole is the only reconciliation
+        // route available to us.
+        request("@SharedState", "getAll", {{"name", SYNC_NAMESPACE}}, [this](const Result& r) {
+          if (r.ok && r.payload.is_object()) reconcile_from_snapshot(r.payload);
+        });
+      });
     });
 
     log(LogLevel::Info, "KnowledgeBase (C++) initialized as " + info.object_id);
@@ -364,6 +394,18 @@ class KnowledgeBase final : public Object {
  private:
   std::unordered_map<std::string, Entry> entries_;
   kb::Bm25Index index_;
+  /// This object's id and this peer's id. self_peer_id() prefers the Identity
+  /// peer id and falls back to the object id before Identity resolves.
+  std::string object_id_;
+  std::string local_peer_id_;
+  /// Ids deleted locally or remotely, with the stamp of the deletion. A
+  /// whole-array snapshot cannot express a deletion; without these any peer
+  /// that still holds the entry resurrects it on its next merge.
+  std::unordered_map<std::string, int64_t> tombstones_;
+  /// Entry ids whose register still has to go out, flushed by flush_sync().
+  std::set<std::string> pending_sync_ids_;
+  /// Set by reconciliation: republish the local store once loading finishes.
+  bool needs_republish_ = false;
   bool loaded_ = false;
   int64_t last_distill_ms_ = 0;
   int64_t last_sync_ms_ = 0;
@@ -411,6 +453,7 @@ class KnowledgeBase final : public Object {
 
   void finish_load() {
     loaded_ = true;
+    adopt_self_stamped_entries();
     heal_patterns();
     log(LogLevel::Info, "KnowledgeBase (C++) loaded " +
                             std::to_string(entries_.size()) + " entries from Storage");
@@ -543,6 +586,7 @@ class KnowledgeBase final : public Object {
       index_.remove(id);
       entries_.erase(it);
       unpersist_entry(id);
+      tombstone_entry(id, static_cast<int64_t>(now_ms()));
       request_sync();
       changed("entryRemoved", {{"id", id}});
       log(LogLevel::Info, "Forgot: \"" + title + "\"");
@@ -600,6 +644,7 @@ class KnowledgeBase final : public Object {
         it->second.useful_count++;
         it->second.last_useful_at = now;
         persist_entry(it->second);
+        mark_dirty(it->second.id);
         changed("entryUpdated", it->second.to_json());
         marked++;
       }
@@ -628,32 +673,40 @@ class KnowledgeBase final : public Object {
       req.reply({{"success", true}});
     });
 
-    // SharedState sync: merge remote entries that are new or newer.
+    // SharedState sync: merge per-entry registers published by peers.
+    //
+    // The namespace filter reads `name`, which is the field SharedState
+    // actually emits ({ name, key, value }). It previously read `namespace`,
+    // a field that is never sent, so this handler returned early on every
+    // event and the merge below had never once run.
     on("changed", [this](Request& req) {
       const json& p = req.payload();
       if (p.value("aspect", std::string()) != "stateChanged") return;
       const json change = p.value("value", json::object());
-      if (change.value("namespace", std::string()) != SYNC_NAMESPACE) return;
-      if (change.value("key", std::string()) != "entries") return;
-      const json remote = change.value("value", json());
-      if (!remote.is_array()) return;
+      if (change.value("name", std::string()) != SYNC_NAMESPACE) return;
+      const std::string key = change.value("key", std::string());
+      if (key.empty()) return;
+      const json remote = change.contains("value") ? change["value"] : json();
 
-      int merged = 0;
-      for (const auto& j : remote) {
-        Entry re = Entry::from_json(j);
-        if (re.id.empty()) continue;
-        auto it = entries_.find(re.id);
-        if (it == entries_.end() || re.updated_at > it->second.updated_at) {
-          index_.add(re.id, re.title, index_text(re), re.tags);
-          const std::string rid = re.id;
-          entries_[rid] = std::move(re);
-          persist_entry(entries_[rid]);
-          merged++;
+      // Per-entry register: the authoritative carrier for a single change.
+      if (key.rfind(ENTRY_REGISTER_PREFIX, 0) == 0) {
+        const std::string id = key.substr(std::string(ENTRY_REGISTER_PREFIX).size());
+        if (apply_remote_entry(id, remote)) {
+          log(LogLevel::Info, "Merged remote knowledge entry " + id + ", now " +
+                                  std::to_string(entries_.size()) + " total");
         }
+        return;
       }
-      if (merged > 0) {
-        log(LogLevel::Info, "Merged " + std::to_string(merged) + " remote entries, now " +
-                                std::to_string(entries_.size()) + " total");
+
+      // Legacy whole-array key from a peer that predates per-entry registers.
+      // Still accepted so a mixed-version mesh converges; never published.
+      if (key == "entries" && remote.is_array()) {
+        const int merged = merge_legacy_array(remote);
+        if (merged > 0) {
+          log(LogLevel::Info, "Merged " + std::to_string(merged) +
+                                  " remote entries (legacy array), now " +
+                                  std::to_string(entries_.size()) + " total");
+        }
       }
     });
   }
@@ -1052,28 +1105,212 @@ class KnowledgeBase final : public Object {
     request("@Storage", "delete", {{"key", ENTRY_KEY_PREFIX + id}}, [](const Result&) {});
   }
 
-  /// Cross-peer sync carries the whole array (the SharedState key's value is
-  /// the full entry set, same as the TS version), so it is throttled: at
-  /// most one sync per SYNC_THROTTLE_MS, with a pending flag flushed by the
-  /// next handler activity.
+  /// This peer's id, falling back to the object id before Identity resolves
+  /// -- the same rule the TS KnowledgeBase applies.
+  std::string self_peer_id() const {
+    return local_peer_id_.empty() ? object_id_ : local_peer_id_;
+  }
+
+  /// Entries stamped while self_peer_id() was still the object-id fallback
+  /// (a `remember` that raced the Identity reply) carry an id no browser
+  /// recognises as ours, so they render as another peer's read-only entries
+  /// forever. Once the real peer id is known, re-attribute them and republish.
+  /// Runs from both the Identity reply and finish_load, whichever comes last.
+  void adopt_self_stamped_entries() {
+    if (local_peer_id_.empty() || !loaded_) return;
+    bool adopted = false;
+    for (auto& [id, e] : entries_) {
+      if (e.creator_peer_id != object_id_) continue;
+      e.creator_peer_id = local_peer_id_;
+      persist_entry(e);
+      mark_dirty(id);
+      adopted = true;
+    }
+    if (adopted) request_sync();
+  }
+
+  /// Cross-peer sync publishes ONE REGISTER PER ENTRY (`entry:<id>`) rather
+  /// than the whole array. The array was the wrong carrier for a single
+  /// change: two peers remembering different things concurrently each wrote
+  /// the entire set, and the later write silently dropped the other's entry.
+  ///
+  /// Publishing stays throttled -- the ids that changed accumulate here and
+  /// flush together, at most once per SYNC_THROTTLE_MS -- so every existing
+  /// request_sync()/flush_sync() call site keeps working unchanged.
+  void mark_dirty(const std::string& id) { pending_sync_ids_.insert(id); }
+
+  void tombstone_entry(const std::string& id, int64_t when) {
+    tombstones_[id] = when;
+    pending_sync_ids_.insert(id);
+  }
+
   void request_sync() {
     sync_pending_ = true;
     flush_sync(static_cast<int64_t>(now_ms()));
   }
 
   void flush_sync(int64_t now) {
+    // A republish scheduled by reconciliation waits for the local load to
+    // finish: reconcile and load race, and publishing an empty store would
+    // say nothing at all.
+    if (needs_republish_ && loaded_) {
+      needs_republish_ = false;
+      for (const auto& [id, _] : entries_) pending_sync_ids_.insert(id);
+      sync_pending_ = true;
+    }
     if (!sync_pending_ || now - last_sync_ms_ < SYNC_THROTTLE_MS) return;
     sync_pending_ = false;
     last_sync_ms_ = now;
+
+    std::set<std::string> ids;
+    ids.swap(pending_sync_ids_);
+    for (const auto& id : ids) {
+      auto it = entries_.find(id);
+      if (it != entries_.end()) {
+        publish_entry_register(it->second);
+      } else {
+        auto t = tombstones_.find(id);
+        publish_tombstone_register(id, t == tombstones_.end() ? now : t->second);
+      }
+    }
+  }
+
+  void set_register(const std::string& key, json value) {
     request("@SharedState", "set",
-            {{"name", SYNC_NAMESPACE}, {"key", "entries"},
-             {"value", entries_array()}, {"persist", true}},
+            {{"name", SYNC_NAMESPACE}, {"key", key},
+             {"value", std::move(value)}, {"persist", true}},
             [](const Result&) {});
+  }
+
+  /// Publish one entry as its own register, stamping peer provenance the
+  /// first time it goes out. An entry with no creator was authored here by
+  /// definition: it either predates provenance or was just created locally.
+  void publish_entry_register(Entry& e) {
+    tombstones_.erase(e.id);
+    if (e.creator_peer_id.empty()) {
+      e.creator_peer_id = self_peer_id();
+      persist_entry(e);
+    }
+    set_register(std::string(ENTRY_REGISTER_PREFIX) + e.id,
+                 {{"entry", e.to_json()},
+                  {"updatedAt", e.updated_at},
+                  {"peerId", self_peer_id()}});
+  }
+
+  /// Publish a deletion as a tombstone register.
+  void publish_tombstone_register(const std::string& id, int64_t when) {
+    set_register(std::string(ENTRY_REGISTER_PREFIX) + id,
+                 {{"deleted", true}, {"updatedAt", when}, {"peerId", self_peer_id()}});
+  }
+
+  /// Apply one register received from a peer.
+  ///
+  /// Last-writer-wins on updatedAt. Peer clocks are not synchronised, so an
+  /// equal stamp is broken on peerId: each side compares the remote id
+  /// against its own, exactly one comparison holds, and the replicas converge
+  /// instead of trading the entry back and forth forever.
+  bool apply_remote_entry(const std::string& id, const json& raw) {
+    if (id.empty() || !raw.is_object()) return false;
+    if (!raw.contains("updatedAt") || !raw["updatedAt"].is_number()) return false;
+    const int64_t remote_stamp = raw["updatedAt"].get<int64_t>();
+    const std::string remote_peer = raw.value("peerId", std::string());
+
+    bool have_local_stamp = false;
+    int64_t local_stamp = 0;
+    auto local = entries_.find(id);
+    if (local != entries_.end()) {
+      have_local_stamp = true;
+      local_stamp = local->second.updated_at;
+    } else {
+      auto t = tombstones_.find(id);
+      if (t != tombstones_.end()) { have_local_stamp = true; local_stamp = t->second; }
+    }
+    if (have_local_stamp) {
+      if (remote_stamp < local_stamp) return false;
+      if (remote_stamp == local_stamp && remote_peer <= self_peer_id()) return false;
+    }
+
+    if (raw.value("deleted", false)) {
+      tombstones_[id] = remote_stamp;
+      if (local == entries_.end()) return false;
+      index_.remove(id);
+      entries_.erase(local);
+      unpersist_entry(id);
+      changed("entryRemoved", {{"id", id}});
+      return true;
+    }
+
+    const json& body = raw.contains("entry") ? raw["entry"] : raw;
+    if (!body.is_object()) return false;
+    Entry re = Entry::from_json(body);
+    if (re.id.empty()) re.id = id;
+    if (re.id != id) return false;
+    // A peer that predates provenance sends no creator; the publishing peer
+    // is the best available attribution.
+    if (re.creator_peer_id.empty()) re.creator_peer_id = remote_peer;
+
+    tombstones_.erase(id);
+    if (entries_.count(id)) index_.remove(id);
+    index_.add(re.id, re.title, index_text(re), re.tags);
+    entries_[id] = std::move(re);
+    persist_entry(entries_[id]);
+    changed("entryUpdated", entries_[id].to_json());
+    return true;
+  }
+
+  /// Reconcile the whole namespace. A peer that was offline missed the
+  /// individual stateChanged events, so on init it reads every register and
+  /// applies it, then republishes what it holds so peers that only ever saw
+  /// the legacy array key learn our entries as individual registers.
+  void reconcile_from_snapshot(const json& snapshot) {
+    if (!snapshot.is_object()) return;
+    int merged = 0;
+    const size_t plen = std::string(ENTRY_REGISTER_PREFIX).size();
+    for (const auto& [key, value] : snapshot.items()) {
+      if (key.rfind(ENTRY_REGISTER_PREFIX, 0) == 0) {
+        if (apply_remote_entry(key.substr(plen), value)) merged++;
+      } else if (key == "entries" && value.is_array()) {
+        merged += merge_legacy_array(value);
+      }
+    }
+    if (merged > 0) {
+      log(LogLevel::Info, "Reconciled " + std::to_string(merged) +
+                              " knowledge entries from peers, now " +
+                              std::to_string(entries_.size()) + " total");
+    }
+    needs_republish_ = true;
+    request_sync();
+  }
+
+  /// Legacy whole-array snapshot from a peer that predates per-entry
+  /// registers. Accepted on merge (newer wins, tombstones still respected)
+  /// but never published.
+  int merge_legacy_array(const json& arr) {
+    int merged = 0;
+    for (const auto& j : arr) {
+      if (!j.is_object()) continue;
+      Entry re = Entry::from_json(j);
+      if (re.id.empty()) continue;
+      auto tomb = tombstones_.find(re.id);
+      if (tomb != tombstones_.end() && tomb->second >= re.updated_at) continue;
+      auto it = entries_.find(re.id);
+      if (it == entries_.end() || re.updated_at > it->second.updated_at) {
+        const std::string rid = re.id;
+        if (it != entries_.end()) index_.remove(rid);
+        index_.add(re.id, re.title, index_text(re), re.tags);
+        entries_[rid] = std::move(re);
+        persist_entry(entries_[rid]);
+        changed("entryUpdated", entries_[rid].to_json());
+        merged++;
+      }
+    }
+    return merged;
   }
 
   /// Structural save: durable write of the changed entry + throttled sync.
   void save_entry(const Entry& e) {
     persist_entry(e);
+    mark_dirty(e.id);
     request_sync();
   }
 
@@ -1105,6 +1342,7 @@ class KnowledgeBase final : public Object {
     e.archived = true;
     e.updated_at = static_cast<int64_t>(now_ms());
     persist_entry(e);
+    mark_dirty(e.id);
   }
 
   /// Periodic cleanup: archive stale, low-value entries and cap the active

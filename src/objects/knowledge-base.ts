@@ -77,6 +77,13 @@ export interface KnowledgeEntry {
   lastUsefulAt: number;
   /** Archived entries are hidden from recall/match but restorable. */
   archived: boolean;
+  /**
+   * The peer that authored this entry. Entries arriving over cross-peer sync
+   * keep their origin peer's id, so a browser can attribute them and withhold
+   * edit controls for what this peer does not own. Absent on entries written
+   * before the field existed, which are read as local.
+   */
+  creatorPeerId?: string;
 }
 
 const KNOWLEDGE_ORIGINS: readonly KnowledgeOrigin[] = ['user', 'agent', 'reviewer', 'scrum'];
@@ -283,6 +290,29 @@ export class KnowledgeBase extends Abject {
       try {
         await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
       } catch { /* best effort */ }
+
+      // Peer id, for breaking ties when two peers stamp an entry at the same
+      // instant. Falls back to this object's id until Identity answers.
+      const identityId = await this.discoverDep('Identity');
+      if (identityId) {
+        try {
+          const identity = await this.request<{ peerId: string }>(
+            request(this.id, identityId, 'getIdentity', {})
+          );
+          this.localPeerId = identity.peerId;
+        } catch { /* Identity may not be ready */ }
+      }
+
+      // Late join: replay everything already in the namespace (the individual
+      // stateChanged events were missed while we were offline), then publish
+      // our own entries so peers that were here first can see them.
+      try {
+        const all = await this.request<Record<string, unknown>>(
+          request(this.id, this.sharedStateId, 'getAll', { name: ns })
+        );
+        this.reconcileFromSnapshot(all);
+      } catch { /* best effort */ }
+      this.syncToSharedState();
     }
 
     log.info(`KnowledgeBase initialized with ${this.entries.size} entries`);
@@ -371,7 +401,8 @@ export class KnowledgeBase extends Abject {
         origin TEXT NOT NULL DEFAULT 'agent',
         usefulCount INTEGER NOT NULL DEFAULT 0,
         lastUsefulAt INTEGER NOT NULL DEFAULT 0,
-        archived INTEGER NOT NULL DEFAULT 0
+        archived INTEGER NOT NULL DEFAULT 0,
+        creatorPeerId TEXT NOT NULL DEFAULT ''
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
         title, content, tags,
@@ -400,6 +431,7 @@ export class KnowledgeBase extends Abject {
       `ALTER TABLE entries ADD COLUMN usefulCount INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE entries ADD COLUMN lastUsefulAt INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE entries ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE entries ADD COLUMN creatorPeerId TEXT NOT NULL DEFAULT ''`,
     ];
     for (const sql of migrations) {
       try { db.exec(sql); } catch { /* column already present */ }
@@ -442,7 +474,7 @@ export class KnowledgeBase extends Abject {
   private loadEntriesFromDb(): void {
     if (!this.db) return;
     const rows = this.db.prepare(
-      `SELECT id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived FROM entries`
+      `SELECT id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived, creatorPeerId FROM entries`
     ).all() as Array<Record<string, unknown>>;
     for (const r of rows) {
       const entry = this.rowToEntry(r);
@@ -591,6 +623,7 @@ export class KnowledgeBase extends Abject {
       usefulCount: Number(r.usefulCount ?? 0),
       lastUsefulAt: Number(r.lastUsefulAt ?? 0),
       archived: Boolean(Number(r.archived ?? 0)),
+      creatorPeerId: String(r.creatorPeerId ?? '') || undefined,
     };
   }
 
@@ -611,8 +644,8 @@ export class KnowledgeBase extends Abject {
     if (!this.db) return;
     try {
       this.db.prepare(`
-        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived, creatorPeerId)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           content = excluded.content,
@@ -624,11 +657,13 @@ export class KnowledgeBase extends Abject {
           origin = excluded.origin,
           usefulCount = excluded.usefulCount,
           lastUsefulAt = excluded.lastUsefulAt,
-          archived = excluded.archived
+          archived = excluded.archived,
+          creatorPeerId = excluded.creatorPeerId
       `).run(
         e.id, e.title, e.content, e.type, JSON.stringify(e.tags), e.createdBy,
         e.createdAt, e.updatedAt, e.accessCount, e.lastAccessedAt,
         e.origin, e.usefulCount, e.lastUsefulAt, e.archived ? 1 : 0,
+        e.creatorPeerId ?? '',
       );
     } catch (err) {
       log.warn(`DB write failed for "${e.title}": ${err instanceof Error ? err.message : String(err)}`);
@@ -850,7 +885,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         existing.archived = false;
         existing.updatedAt = Date.now();
         this.writeEntryToDb(existing);
-        this.syncToSharedState();
+        this.syncEntryToSharedState(existing);
         this.changed('entryUpdated', existing);
         log.info(`Updated knowledge: "${title}" (${type})`);
         return { id: existing.id };
@@ -871,11 +906,12 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         usefulCount: 0,
         lastUsefulAt: 0,
         archived: false,
+        creatorPeerId: this.selfPeerId,
       };
 
       this.entries.set(entry.id, entry);
       this.writeEntryToDb(entry);
-      this.syncToSharedState();
+      this.syncEntryToSharedState(entry);
       this.changed('entryAdded', entry);
       log.info(`Remembered: "${entry.title}" (${entry.type}) [${entry.tags.join(', ')}]`);
       return { id: entry.id };
@@ -1061,7 +1097,9 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
       this.entries.delete(id);
       this.deleteEntryFromDb(id);
-      this.syncToSharedState();
+      // A tombstone, not a snapshot: a whole-array write cannot express a
+      // deletion, so peers would resurrect this entry on their next merge.
+      this.syncDeletionToSharedState(id, Date.now());
       this.changed('entryRemoved', { id });
       log.info(`Forgot: "${entry.title}"`);
       return { success: true };
@@ -1094,7 +1132,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       entry.updatedAt = Date.now();
 
       this.writeEntryToDb(entry);
-      this.syncToSharedState();
+      this.syncEntryToSharedState(entry);
       this.changed('entryUpdated', entry);
       log.info(`Updated: "${entry.title}"`);
       return { success: true };
@@ -1156,7 +1194,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       entry.archived = archived ?? true;
       entry.updatedAt = Date.now();
       this.writeEntryToDb(entry);
-      this.syncToSharedState();
+      this.syncEntryToSharedState(entry);
       this.changed('entryUpdated', entry);
       log.info(`${entry.archived ? 'Archived' : 'Restored'}: "${entry.title}"`);
       return { success: true };
@@ -1166,23 +1204,29 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value: unknown };
       if (aspect !== 'stateChanged') return;
-      const change = value as { namespace?: string; key?: string; value?: unknown };
-      if (change.namespace !== 'knowledge-base' || change.key !== 'entries') return;
+      // SharedState emits { name, key, value }. The `namespace` field this
+      // once read does not exist on that payload, so the guard below rejected
+      // every change and the merge was unreachable — cross-peer knowledge sync
+      // has never actually run.
+      const change = value as { name?: string; key?: string; value?: unknown };
+      if (change.name !== 'knowledge-base' || !change.key) return;
 
+      // Per-entry register: the authoritative carrier for a single change.
+      if (change.key.startsWith('entry:')) {
+        const id = change.key.slice('entry:'.length);
+        if (this.applyRemoteEntry(id, change.value)) {
+          log.info(`Merged remote knowledge entry ${id}, now ${this.entries.size} total`);
+        }
+        return;
+      }
+
+      // Whole-array snapshot: still accepted so a peer running the older code
+      // (and our own bulk paths) keep working.
+      if (change.key !== 'entries') return;
       const remote = change.value as KnowledgeEntry[] | undefined;
       if (!Array.isArray(remote)) return;
 
-      // Merge: accept entries we don't have, update entries with newer updatedAt
-      let merged = 0;
-      for (const re of remote) {
-        const local = this.entries.get(re.id);
-        if (!local || re.updatedAt > local.updatedAt) {
-          const normalized = this.normalizeEntry(re);
-          this.entries.set(normalized.id, normalized);
-          this.writeEntryToDb(normalized);
-          merged++;
-        }
-      }
+      const merged = this.mergeRemoteSnapshot(remote);
       if (merged > 0) {
         log.info(`Merged ${merged} remote knowledge entries, now ${this.entries.size} total`);
       }
@@ -1326,6 +1370,139 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       this.syncToSharedState();
       log.info(`Distill: archived ${archivedCount}, purged ${purged}, ${this.entries.size} entries total`);
     }
+  }
+
+  /** This peer's id, used to break ties when two peers stamp the same instant. */
+  private localPeerId = '';
+
+  /**
+   * Ids deleted locally or remotely, with the stamp of the deletion. A
+   * whole-array snapshot cannot express a deletion, so without these a peer
+   * that still holds the entry resurrects it on its next merge.
+   */
+  private tombstones: Map<string, number> = new Map();
+
+  /** This peer's id, falling back to the object id before Identity resolves. */
+  private get selfPeerId(): string {
+    return this.localPeerId || this.id;
+  }
+
+  /** Fire-and-forget write of one register into the shared namespace. */
+  private setSharedRegister(key: string, value: unknown): void {
+    if (!this.sharedStateId) return;
+    this.request(
+      request(this.id, this.sharedStateId, 'set', {
+        name: 'knowledge-base',
+        key,
+        value,
+        persist: true,
+      })
+    ).catch(err => {
+      log.warn(`Failed to sync ${key} to SharedState:`, err instanceof Error ? err.message : String(err));
+    });
+  }
+
+  /**
+   * Publish one entry as its own register. The whole-array write below is kept
+   * as a snapshot channel, but it is the wrong carrier for a single change:
+   * two peers remembering different things concurrently each write the entire
+   * array, and the later write drops the other's entry.
+   */
+  private syncEntryToSharedState(entry: KnowledgeEntry): void {
+    this.tombstones.delete(entry.id);
+    this.setSharedRegister(`entry:${entry.id}`, {
+      entry,
+      updatedAt: entry.updatedAt,
+      peerId: this.selfPeerId,
+    });
+  }
+
+  /** Publish a deletion as a tombstone register. */
+  private syncDeletionToSharedState(id: string, updatedAt: number): void {
+    this.tombstones.set(id, updatedAt);
+    this.setSharedRegister(`entry:${id}`, { deleted: true, updatedAt, peerId: this.selfPeerId });
+  }
+
+  /**
+   * Apply one entry register received from a peer.
+   *
+   * Conflict resolution is last-writer-wins on `updatedAt`. Peer clocks are not
+   * synchronised, so an equal stamp is broken on peerId — each side compares the
+   * remote id against its own, exactly one comparison holds, and the replicas
+   * converge instead of trading the entry back and forth forever.
+   */
+  private applyRemoteEntry(id: string, raw: unknown): boolean {
+    const reg = raw as
+      | { entry?: KnowledgeEntry; deleted?: boolean; updatedAt?: number; peerId?: string }
+      | undefined;
+    if (!reg || typeof reg !== 'object' || typeof reg.updatedAt !== 'number') return false;
+
+    const local = this.entries.get(id);
+    const localStamp = local?.updatedAt ?? this.tombstones.get(id);
+    if (localStamp !== undefined) {
+      if (reg.updatedAt < localStamp) return false;
+      if (reg.updatedAt === localStamp && (reg.peerId ?? '') <= this.selfPeerId) return false;
+    }
+
+    if (reg.deleted) {
+      this.tombstones.set(id, reg.updatedAt);
+      if (!local) return false;
+      this.entries.delete(id);
+      this.deleteEntryFromDb(id);
+      this.changed('entryRemoved', { id });
+      return true;
+    }
+
+    if (!reg.entry || typeof reg.entry !== 'object') return false;
+    // Provenance rides with the entry. A peer that predates the field says
+    // nothing about authorship, so the register's own peer stands in — it is
+    // the closest thing to an author that arrived with the write.
+    const normalized = this.normalizeEntry({
+      ...reg.entry,
+      id,
+      creatorPeerId: reg.entry.creatorPeerId ?? reg.peerId,
+    });
+    this.entries.set(normalized.id, normalized);
+    this.writeEntryToDb(normalized);
+    this.tombstones.delete(id);
+    this.changed(local ? 'entryUpdated' : 'entryAdded', normalized);
+    return true;
+  }
+
+  /** Merge a whole-array snapshot from a peer, honouring local tombstones. */
+  private mergeRemoteSnapshot(remote: KnowledgeEntry[]): number {
+    let merged = 0;
+    for (const re of remote) {
+      if (!re || typeof re.id !== 'string') continue;
+      const tomb = this.tombstones.get(re.id);
+      if (tomb !== undefined && re.updatedAt <= tomb) continue;
+      const local = this.entries.get(re.id);
+      if (!local || re.updatedAt > local.updatedAt) {
+        const normalized = this.normalizeEntry(re);
+        this.entries.set(normalized.id, normalized);
+        this.writeEntryToDb(normalized);
+        merged++;
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * Replay a whole namespace snapshot. This is the late-join path: a peer that
+   * was offline missed the individual `stateChanged` events entirely, so on
+   * init it reads the namespace whole and applies every register in it.
+   */
+  private reconcileFromSnapshot(snapshot: Record<string, unknown> | undefined): void {
+    if (!snapshot) return;
+    let merged = 0;
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (key.startsWith('entry:')) {
+        if (this.applyRemoteEntry(key.slice('entry:'.length), value)) merged++;
+      } else if (key === 'entries' && Array.isArray(value)) {
+        merged += this.mergeRemoteSnapshot(value as KnowledgeEntry[]);
+      }
+    }
+    if (merged > 0) log.info(`Reconciled ${merged} knowledge entries from peers`);
   }
 
   private syncToSharedState(): void {

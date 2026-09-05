@@ -84,6 +84,9 @@ export class KnowledgeBrowser extends Abject {
   private archivedToggleId?: AbjectId;
   private curateBtnId?: AbjectId;
 
+  /** This peer's id, for telling locally authored entries from synced ones. */
+  private localPeerId = '';
+
   private innerSplitId?: AbjectId;
   private graphCanvasId?: AbjectId;
   /** Pattern language map: all workspace patterns + ghost nodes for dangling links. */
@@ -145,6 +148,19 @@ export class KnowledgeBrowser extends Abject {
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.knowledgeBaseId = await this.discoverDep('KnowledgeBase') ?? undefined;
+
+    // Peer id, so entries synced from other peers can be attributed and their
+    // edit controls withheld. Falls back to this object's id until Identity
+    // answers, which reads every entry as local -- the pre-sharing behaviour.
+    const identityId = await this.discoverDep('Identity');
+    if (identityId) {
+      try {
+        const identity = await this.request<{ peerId: string }>(
+          request(this.id, identityId, 'getIdentity', {})
+        );
+        this.localPeerId = identity.peerId;
+      } catch { /* Identity may not be ready */ }
+    }
     this.widgetManagerId = await this.requireDep('WidgetManager');
   }
 
@@ -578,13 +594,35 @@ export class KnowledgeBrowser extends Abject {
     }
   }
 
+  /** This peer's id, falling back to the object id before Identity resolves. */
+  private get selfPeerId(): string {
+    return this.localPeerId || this.id;
+  }
+
+  /**
+   * An entry authored by another peer. These are shown with their origin peer
+   * and are read-only here: forgetting or restoring one would only be undone
+   * by the owning peer's next sync, so the controls are withheld instead.
+   */
+  private isRemoteEntry(entry: KnowledgeEntry): boolean {
+    const creator = entry.creatorPeerId;
+    return !!creator && creator !== this.selfPeerId;
+  }
+
+  /** Short, stable label for a peer id in the UI. */
+  private peerLabel(peerId: string): string {
+    return peerId.slice(0, 8);
+  }
+
   private async rebuildList(): Promise<void> {
     if (!this.listWidgetId) return;
 
     const items: ListItem[] = this.filteredEntries.map(entry => {
       const tagStr = entry.tags.length > 0 ? entry.tags.slice(0, 3).join(', ') : '';
-      // Compact second line: origin badge text + usefulness + tags
+      const remote = this.isRemoteEntry(entry);
+      // Compact second line: origin badge text + peer + usefulness + tags
       const parts: string[] = [entry.origin];
+      if (remote) parts.push(`peer ${this.peerLabel(entry.creatorPeerId!)}`);
       if (entry.usefulCount > 0) parts.push(`useful ×${entry.usefulCount}`);
       if (tagStr) parts.push(tagStr);
       return {
@@ -593,7 +631,9 @@ export class KnowledgeBrowser extends Abject {
         secondary: parts.join('  ·  '),
         badge: entry.archived
           ? { text: 'archived', color: this.theme.textTertiary }
-          : { text: entry.type, color: this.typeColor(entry.type) },
+          : remote
+            ? { text: `remote · ${entry.type}`, color: this.theme.textTertiary }
+            : { text: entry.type, color: this.typeColor(entry.type) },
       };
     });
 
@@ -666,6 +706,9 @@ export class KnowledgeBrowser extends Abject {
     const updated = new Date(entry.updatedAt).toLocaleDateString();
     const tagsStr = entry.tags.length > 0 ? entry.tags.join(', ') : 'none';
     const usefulStr = entry.usefulCount > 0 ? `  |  Useful ×${entry.usefulCount}` : '';
+    // Entries synced from another peer are labelled and left read-only.
+    const remote = this.isRemoteEntry(entry);
+    const peerStr = remote ? `  |  Peer ${this.peerLabel(entry.creatorPeerId!)} (read-only)` : '';
 
     await Promise.all([
       this.request(request(this.id, this.titleLabelId!, 'update', {
@@ -682,11 +725,16 @@ export class KnowledgeBrowser extends Abject {
         style: { visible: true },
       })),
       this.request(request(this.id, this.metaLabelId!, 'update', {
-        text: `Origin: ${entry.origin}  |  Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times${usefulStr}`,
+        text: `Origin: ${entry.origin}${peerStr}  |  Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times${usefulStr}`,
         style: { visible: true },
       })),
       this.request(request(this.id, this.restoreBtnId!, 'update', {
-        style: { visible: entry.archived },
+        style: { visible: entry.archived && !remote },
+      })),
+      // showEmptyState() reveals Forget for every detail render; a remote
+      // entry takes it away again.
+      this.request(request(this.id, this.deleteBtnId!, 'update', {
+        style: { visible: !remote },
       })),
       this.request(request(this.id, this.contentLabelId!, 'update', {
         text: this.displayContent(entry),
@@ -1108,6 +1156,10 @@ export class KnowledgeBrowser extends Abject {
       if (!this.selectedId || !this.knowledgeBaseId) return;
 
       const entry = this.filteredEntries.find(e => e.id === this.selectedId);
+      if (entry && this.isRemoteEntry(entry)) {
+        await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
+        return;
+      }
       this.send(event(this.id, this.restoreBtnId, 'update', { busy: true }));
       try {
         const res = await this.request<{ success?: boolean; error?: string }>(
@@ -1163,6 +1215,10 @@ export class KnowledgeBrowser extends Abject {
       if (!this.selectedId || !this.knowledgeBaseId) return;
 
       const entry = this.filteredEntries.find(e => e.id === this.selectedId);
+      if (entry && this.isRemoteEntry(entry)) {
+        await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
+        return;
+      }
       const confirmed = await this.confirm({
         title: 'Forget this knowledge?',
         message: entry ? `"${entry.title}" will be permanently removed.` : 'This entry will be permanently removed.',
