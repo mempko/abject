@@ -8,6 +8,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { looksLikeClaim } from '../core/claims.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
@@ -2257,8 +2258,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    * model makes the real call there. It is a soft prefilter, not a hard block.
    */
   private mightBeUngroundedClaim(text: string): boolean {
-    return /\b(verified|you'?re now|it'?s now|now on the|nav ?bar reads|on the live (?:window|deck|screen)|i'?ve (?:now|just)?|i have (?:now|just)|navigated|opened it|moved it|switched to|toggled|scrolled to|set it to|changed it to|updated the|refreshed the)\b/i.test(text)
-      || /\bdone\s*[—-]/i.test(text);
+    return looksLikeClaim(text);
   }
 
   /**
