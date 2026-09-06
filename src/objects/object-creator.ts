@@ -499,6 +499,7 @@ export class ObjectCreator extends Abject {
               fail: { type: 'error', resultFields: ['reason'] },
             },
             intermediateActions: [],
+            actions: ObjectCreator.VALID_ACTIONS,
             queueName: `object-creator-${this.id}`,
           },
         }));

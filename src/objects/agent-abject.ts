@@ -255,6 +255,13 @@ export interface AgentConfig {
   skipFirstObservation?: boolean;
   terminalActions?: Record<string, TerminalActionConfig>;
   intermediateActions?: string[];
+  /**
+   * The agent's full action vocabulary, for the per-step reminder placed at
+   * the end of every prompt. Optional: when omitted the runtime derives it
+   * from the agent's prompt (JSON examples and action tables). Never a gate;
+   * the agent's act handler still judges every action it receives.
+   */
+  actions?: string[];
   fallbackActionName?: string;
 }
 
@@ -270,6 +277,7 @@ interface ResolvedAgentConfig {
   skipFirstObservation: boolean;
   terminalActions: Record<string, TerminalActionConfig>;
   intermediateActions: string[];
+  actions?: string[];
   fallbackActionName: string;
 }
 
@@ -330,6 +338,10 @@ interface TaskEntry {
    * about THIS task belongs in `taskPrompt`, where it costs nothing to vary.
    */
   systemPrompt: string;
+  /** Action names documented for this task's agent, computed once per task
+   *  from its prompt plus the runtime's own verbs. Feeds the per-step
+   *  reminder only; it is never a gate. */
+  vocabulary?: string[];
   /** Per-task addendum from the caller, placed after the cache breakpoint. */
   taskPrompt?: string;
   /**
@@ -556,6 +568,7 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
     skipFirstObservation: partial.skipFirstObservation ?? DEFAULT_CONFIG.skipFirstObservation,
     terminalActions: partial.terminalActions ?? { ...DEFAULT_CONFIG.terminalActions },
     intermediateActions: partial.intermediateActions ?? [...DEFAULT_CONFIG.intermediateActions],
+    actions: partial.actions,
     fallbackActionName: partial.fallbackActionName ?? DEFAULT_CONFIG.fallbackActionName,
   };
 }
@@ -626,6 +639,7 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
     skipFirstObservation: override.skipFirstObservation ?? base.skipFirstObservation,
     terminalActions: override.terminalActions ?? base.terminalActions,
     intermediateActions: override.intermediateActions ?? base.intermediateActions,
+    actions: override.actions ?? base.actions,
     fallbackActionName: override.fallbackActionName ?? base.fallbackActionName,
   };
 }
@@ -1943,6 +1957,24 @@ The registered object must implement these handlers to participate in the agent 
     }
   }
 
+  /**
+   * An intermediate action (a progress `reply`) never reaches the agent's
+   * act handler, so on its own it leaves no result behind: the next
+   * observation reads "no previous result" and the loop detector never sees
+   * it. Both let a model narrate for the whole step budget. Record a result
+   * that says what the update did and did not do, and count it like any
+   * other action.
+   */
+  private completeIntermediateAction(entry: TaskEntry, agentName: string): void {
+    const task = entry.state;
+    this.emitIntermediateAction(entry);
+    task.lastResult = {
+      success: true,
+      data: `Progress update "${task.action?.action}" delivered. It does not advance the task; the next action must do concrete work toward it, or finish with a terminal action.`,
+    };
+    this.detectAndSteerOscillation(entry, agentName);
+  }
+
   private emitIntermediateAction(entry: TaskEntry): void {
     this.send(event(this.id, entry.agentId, 'agentIntermediateAction', {
       taskId: entry.state.id,
@@ -2521,7 +2553,7 @@ The registered object must implement these handlers to participate in the agent 
                 // filtered out at parse time, so what remains is intermediate
                 // or plain.
                 if (task.action && this.isIntermediateAction(entry, task.action)) {
-                  this.emitIntermediateAction(entry);
+                  this.completeIntermediateAction(entry, agentName);
                   task.step++;
                   if (task.step >= task.maxSteps) {
                     await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -2826,7 +2858,7 @@ The registered object must implement these handlers to participate in the agent 
 
             // Check intermediate
             if (this.isIntermediateAction(entry, task.action)) {
-              this.emitIntermediateAction(entry);
+              this.completeIntermediateAction(entry, agentName);
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -3029,6 +3061,7 @@ The registered object must implement these handlers to participate in the agent 
 
       const finalRoute = await this.applyVisionTiering(entry, 'smart');
       await this.trimConversation(entry);
+      this.appendVocabularyReminder(entry);
 
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const llmResult = await this.request<{ content: string }>(
@@ -3048,6 +3081,7 @@ The registered object must implement these handlers to participate in the agent 
             // K3 spent ~19K tokens reasoning and the visible answer was cut.
             ...(finalRoute.model ? { model: finalRoute.model } : {}),
             cacheKey: entry.state.id,
+            ...AgentAbject.PLANNING_SAMPLING,
           },
         }),
         60000,
@@ -3308,6 +3342,7 @@ The registered object must implement these handlers to participate in the agent 
 
     // Trim conversation (may do an LLM-compressor pass when over byte budget)
     await this.trimConversation(entry);
+    this.appendVocabularyReminder(entry);
 
     this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
     // Build the request first: its message id is the correlation id the
@@ -3330,6 +3365,7 @@ The registered object must implement these handlers to participate in the agent 
         // K3 spent ~19K tokens reasoning and the visible answer was cut.
         ...(route.model ? { model: route.model } : {}),
         cacheKey: entry.state.id,
+        ...AgentAbject.PLANNING_SAMPLING,
       },
       // The ledger should name the agent whose work this is, not the
       // runtime that happens to run every agent's loop.
@@ -3729,7 +3765,7 @@ Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact ide
 \`\`\`json
 { "action": "submit_job", "description": "what it does", "code": "<javascript>" }
 \`\`\`
-The code runs in a sandboxed job. Inside it you have \`call(id, method, payload)\` to message any object, \`dep(name)\` (resolve an object by name, throws if missing), and \`find(name)\` (resolve or null). \`return\` a value and it comes back as this single action's result.
+The code runs in a sandboxed job. Inside it you have \`call(id, method, payload)\` to message any object, \`dep(name)\` (resolve an object by name, throws if missing), and \`find(name)\` (resolve or null). Inside the job's \`code\`, \`call\`, \`dep\`, and \`find\` are JavaScript functions you invoke from the script, separate from the JSON actions you emit as your response. \`return\` a value and it comes back as this single action's result.
 
 Use it when your next chunk of work is a mechanical multi-step sequence with no judgment needed between steps: fetch N items, transform each, aggregate; poll-then-collect; bulk reads. One job costs one step, however many calls it makes, where doing the same through individual actions costs a step each. Example:
 \`\`\`json
@@ -3800,6 +3836,16 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       : stepsRemaining <= 5
         ? `\n⚠️ WARNING: Only ${stepsRemaining} steps remaining! Wrap up and call "done" soon.`
         : '';
+    // The observation is the last thing the model reads before it decides,
+    // and the task statement sits far above it. Restating the task here keeps
+    // the goal in the model's recency window on every step, and framing the
+    // first step explicitly stops a model from reading an empty "no previous
+    // result" as "no task was given".
+    const taskLine = `Task: ${AgentAbject.summarizeTask(task.task)}`;
+    const firstStep = task.step === 0
+      ? '\nThis is your first step: nothing has been done yet. Choose the first action toward the task.'
+      : '';
+    const header = `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${taskLine}${firstStep}`;
 
     // If agent provided llmContent (e.g. screenshot), use it directly
     if (entry.lastObservationLlmContent) {
@@ -3813,7 +3859,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
             ? this.renderPayloadHandle(
                 this.storePayload(entry, part.text, 'observation'), part.text, 'observation')
             : part.text;
-          return { ...part, text: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${body}` };
+          return { ...part, text: `${header}\n${body}` };
         }
         return part;
       });
@@ -3842,8 +3888,74 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
     task.llmMessages.push({
       role: 'user',
-      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${observation}`,
+      content: `${header}\n${observation}`,
     });
+  }
+
+  /** One-line task statement for per-step reminders. */
+  private static summarizeTask(task: string): string {
+    const flat = task.replace(/\s+/g, ' ').trim();
+    return flat.length > AgentAbject.TASK_REMINDER_CHARS
+      ? flat.slice(0, AgentAbject.TASK_REMINDER_CHARS) + '…'
+      : flat;
+  }
+  private static readonly TASK_REMINDER_CHARS = 400;
+
+  /**
+   * Every action name this task's agent documents, from its prompt (JSON
+   * examples and action tables) plus the runtime verbs and the configured
+   * terminal/intermediate actions. Derived, not declared: it stays in step
+   * with whatever the agent tells the model without any per-agent list.
+   */
+  private vocabularyFor(entry: TaskEntry): string[] {
+    if (entry.vocabulary) return entry.vocabulary;
+    const names = new Set<string>([
+      ...RUNTIME_VERBS,
+      ...Object.keys(entry.config.terminalActions),
+      ...entry.config.intermediateActions,
+      ...(entry.config.actions ?? []),
+    ]);
+    const source = entry.config.actions ? '' : (entry.systemPrompt ?? '');
+    for (const m of source.matchAll(/"action"\s*:\s*"([a-z][a-z0-9_]*)"/g)) names.add(m[1]);
+    for (const m of source.matchAll(/^\|\s*([a-z][a-z0-9_]*)\s*\|/gm)) names.add(m[1]);
+    names.delete('action');
+    entry.vocabulary = [...names].filter((n) => !n.startsWith('_')).sort();
+    return entry.vocabulary;
+  }
+
+  /**
+   * Append a one-line vocabulary reminder to the last user message, so the
+   * legal action names sit at the very end of the prompt where a small
+   * model recalls them best. Runs right before every think call.
+   */
+  private appendVocabularyReminder(entry: TaskEntry): void {
+    const messages = entry.state.llmMessages;
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'user') return;
+    const reminder = `\n\nRespond with exactly one JSON action. Action names: ${this.vocabularyFor(entry).join(', ')}.`;
+    // Only the newest turn carries the reminder: strip last turn's copy so
+    // the history does not grow by one reminder per step.
+    for (const m of messages) {
+      if (m === last || m.role !== 'user') continue;
+      if (typeof m.content === 'string') {
+        if (m.content.endsWith(reminder)) m.content = m.content.slice(0, -reminder.length);
+      } else {
+        const t = m.content[m.content.length - 1];
+        if (t?.type === 'text' && t.text.endsWith(reminder)) t.text = t.text.slice(0, -reminder.length);
+      }
+    }
+    if (typeof last.content === 'string') {
+      if (last.content.endsWith(reminder)) return;
+      last.content += reminder;
+      return;
+    }
+    const tail = last.content[last.content.length - 1];
+    if (tail?.type === 'text') {
+      if (tail.text.endsWith(reminder)) return;
+      tail.text += reminder;
+    } else {
+      last.content.push({ type: 'text', text: reminder.trimStart() });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -4157,6 +4269,15 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    *  summary message. 180k chars ≈ 45k tokens — well under every provider's
    *  context window, leaves headroom for the current observation + response. */
   private static readonly MAX_CONVERSATION_CHARS = 180000;
+  /**
+   * Sampling for the action-decision call. Choosing the next action is a
+   * classification step, not prose: a low temperature keeps small and
+   * quantized models on the JSON envelope, and constrained JSON decoding is
+   * requested wherever the provider can do it natively (others ignore the
+   * flag). Providers drop the temperature themselves where a model does not
+   * accept one (extended thinking, reasoning models).
+   */
+  private static readonly PLANNING_SAMPLING: { temperature: number; jsonMode: boolean } = { temperature: 0.2, jsonMode: true };
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
@@ -4314,6 +4435,33 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * would succeed silently and the user would see nothing. We reject such
    * empty terminals and ask the LLM to fill in at least one field.
    */
+  /**
+   * Normalize common success-terminal aliases into the canonical `result`
+   * field before content validation and downstream result extraction.
+   */
+  private normalizeTerminalResultAlias(entry: TaskEntry, parsed: AgentAction): void {
+    const terminal = entry.config.terminalActions[parsed.action];
+    if (!terminal || terminal.type !== 'success' || !(terminal.resultFields ?? []).includes('result')) return;
+
+    const hasContent = (value: unknown): boolean => {
+      if (value === undefined || value === null) return false;
+      if (typeof value === 'string') return value.trim().length > 0;
+      if (typeof value === 'object') {
+        if (Array.isArray(value)) return value.length > 0;
+        return Object.keys(value as object).length > 0;
+      }
+      return true;
+    };
+
+    if (hasContent(parsed.result)) return;
+    for (const alias of ['text', 'content', 'message'] as const) {
+      if (!hasContent(parsed[alias])) continue;
+      parsed.result = parsed[alias];
+      log.info(`[parse] normalized terminal "${parsed.action}" field "${alias}" to "result"`);
+      return;
+    }
+  }
+
   private validateActionContent(entry: TaskEntry, parsed: AgentAction): AgentAction | null {
     const terminal = entry.config.terminalActions[parsed.action];
     if (!terminal) return null;
@@ -4353,9 +4501,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     entry.parseFailures = (entry.parseFailures ?? 0) + 1;
     if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {
       const fieldList = fields.map(f => `"${f}"`).join(', ');
-      const example: AgentAction = { action: parsed.action };
-      example[fields[0]] = `<your ${fields[0]} here>`;
-      const correction = `[Error] Your "${parsed.action}" action arrived with no content in any of the required fields (${fieldList}). At least one must be a non-empty string (or non-empty object/array). Without it the user sees nothing. Re-emit the action with the field populated, e.g.:\n\`\`\`json\n${JSON.stringify(example)}\n\`\`\``;
+      const example = parsed.action === 'done' && fields.includes('result')
+        ? '{"action":"done","result":"..."}'
+        : JSON.stringify({ action: parsed.action, [fields[0]]: `...` });
+      const correction = `[Error] Your "${parsed.action}" action arrived with no content in any of the required fields (${fieldList}). At least one must be a non-empty string (or non-empty object/array). Without it the user sees nothing. Re-emit the action with the field populated, e.g.:\n\`\`\`json\n${example}\n\`\`\``;
       entry.state.llmMessages.push({ role: 'user', content: correction });
       return { action: '_reparse', reasoning: `Retrying empty "${parsed.action}" terminal (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
     }
@@ -4427,6 +4576,12 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         entry.truncationRetries = 0;
       }
 
+      // Smaller models commonly put successful terminal content in a clear
+      // alias instead of the canonical `result` field. Normalize that shape
+      // before validation so accepted terminals also have the field consumed
+      // by downstream completion/reporting code.
+      this.normalizeTerminalResultAlias(entry, parsed);
+
       // Reject terminal actions that arrive with all required fields missing
       // or empty. Without this, the framework happily promotes e.g.
       // `{"action": "clarify"}` to a success terminal, but downstream renders
@@ -4463,7 +4618,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {
       let correction: string;
       if (hallucinatedTools) {
-        correction = '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Respond with a valid JSON action, for example:\n```json\n{"action": "done", "result": "..."}\n```';
+        correction = '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Respond with a valid JSON action, for example:\n```json\n{"action":"done","result":"..."}\n```';
       } else if (pureProse) {
         // Echo the narration back so the model turns ITS OWN stated plan into
         // the action envelope — a generic "that was invalid" message leaves
@@ -4471,9 +4626,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         const prose = content.trim().replace(/\s+/g, ' ').slice(0, 300);
         correction =
           `[Error] Your previous response was prose with no action block. You wrote: "${prose}${content.trim().length > 300 ? '…' : ''}"\n` +
-          'Convert that plan into a single action NOW. Respond with ONLY a ```json code block, for example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+          'Convert that plan into a single action NOW. Respond with ONLY a ```json code block, for example:\n```json\n{"action":"done","result":"..."}\n```\nor, to abort:\n```json\n{"action":"fail","reason":"why you cannot continue"}\n```';
       } else {
-        correction = '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+        correction = '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action":"done","result":"..."}\n```\nor, to abort:\n```json\n{"action":"fail","reason":"why you cannot continue"}\n```';
       }
       entry.state.llmMessages.push({ role: 'user', content: correction });
       // Log the actual unparseable content (preview) — otherwise a response

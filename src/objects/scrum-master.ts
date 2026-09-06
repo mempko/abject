@@ -92,6 +92,12 @@ function compactLine(value: unknown, max = 220): string {
 }
 
 export class ScrumMaster extends Abject {
+  /** Every action the scrum loop dispatches; feeds the per-step reminder. */
+  private static readonly ACTIONS = [
+    'review_scrum', 'poll_team', 'add_task', 'save_knowledge', 'lookup_knowledge', 'forget_knowledge',
+    'complete_goal', 'fail_goal', 'dispatch_scrum', 'quick_dispatch', 'continue_scrum', 'ask_user',
+  ];
+
   private goalManagerId?: AbjectId;
   private agentAbjectId?: AbjectId;
   /**
@@ -320,6 +326,7 @@ export class ScrumMaster extends Abject {
             ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
           },
           intermediateActions: [],
+          actions: ScrumMaster.ACTIONS,
         },
         systemPrompt: this.buildSystemPrompt(),
       }),
@@ -464,6 +471,7 @@ export class ScrumMaster extends Abject {
                 continue_scrum: { type: 'success' },
                 ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
               },
+              actions: ScrumMaster.ACTIONS,
             },
           }),
         );
