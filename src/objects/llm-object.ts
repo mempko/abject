@@ -105,6 +105,7 @@ import { AntigravityCliProvider } from '../llm/antigravity-cli.js';
 import { OllamaProvider } from '../llm/ollama.js';
 import { OpenRouterProvider } from '../llm/openrouter.js';
 import { DeepSeekProvider } from '../llm/deepseek.js';
+import { PeerLLMProvider } from '../llm/peerllm.js';
 import { GrokProvider } from '../llm/grok.js';
 import { GeminiProvider } from '../llm/google-gemini.js';
 import { KimiProvider } from '../llm/kimi.js';
@@ -1435,6 +1436,7 @@ export class LLMObject extends Abject {
       ['openai',     (apiKey) => new OpenAIProvider({ apiKey, fetchFn })],
       ['openrouter', (apiKey) => new OpenRouterProvider({ apiKey, fetchFn })],
       ['deepseek',   (apiKey) => new DeepSeekProvider({ apiKey, fetchFn })],
+      ['peerllm',    (apiKey) => new PeerLLMProvider({ apiKey, fetchFn })],
       ['grok',       (apiKey) => new GrokProvider({ apiKey, fetchFn })],
       ['gemini',     (apiKey) => new GeminiProvider({ apiKey, fetchFn })],
       ['kimi',       (apiKey) => new KimiProvider({ apiKey, fetchFn })],
@@ -1915,6 +1917,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new OllamaProvider(),
     new OpenRouterProvider({ apiKey: '' }),
     new DeepSeekProvider({ apiKey: '' }),
+    new PeerLLMProvider({ apiKey: '' }),
     new GrokProvider({ apiKey: '' }),
     new GeminiProvider({ apiKey: '' }),
     new KimiProvider({ apiKey: '' }),

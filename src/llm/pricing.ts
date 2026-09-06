@@ -51,7 +51,9 @@ export interface PricingEntry extends ModelPricing {
  * LONGEST prefix, so `anthropic/claude-opus-4` covers every dated snapshot
  * of that family without an entry per date.
  *
- * Anthropic prices verified against the published rate card. Prices for
+ * Anthropic prices are verified against its published rate card. PeerLLM's
+ * public token packages establish one $10-per-million-token acquisition rate;
+ * it publishes no model-specific or input/output-specific rates. Prices for
  * providers whose rate cards are not verified here are deliberately absent:
  * a guessed price silently becomes a number the user reads as fact.
  */
@@ -64,6 +66,9 @@ const BUILTIN_PRICES: Record<string, ModelPricing> = {
   'anthropic/claude-sonnet-5': { inputPerMTok: 3, outputPerMTok: 15 },
   'anthropic/claude-sonnet-4': { inputPerMTok: 3, outputPerMTok: 15 },
   'anthropic/claude-haiku-4': { inputPerMTok: 1, outputPerMTok: 5 },
+
+  // ── PeerLLM: unified public balance-token acquisition rate ───────
+  'peerllm/': { inputPerMTok: 10, outputPerMTok: 10, cacheReadPerMTok: 10, cacheWritePerMTok: 10 },
 
   // ── Local / subscription-billed: no per-token API charge ─────────
   'ollama/': { inputPerMTok: 0, outputPerMTok: 0, cacheReadPerMTok: 0, cacheWritePerMTok: 0 },

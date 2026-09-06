@@ -302,6 +302,9 @@ export class OpenAIProvider extends BaseLLMProvider {
     if (stream) request.stream = true;
     if (options.cacheKey) request.prompt_cache_key = options.cacheKey;
     const { reasoningActive } = this.applyReasoning(request, model, options);
+    // Reasoning models accept only their default sampling; sending a
+    // temperature is a 400 on OpenAI and silently ignored elsewhere.
+    if (reasoningActive) delete request.temperature;
     request.max_completion_tokens = this.resolveMaxTokens(model, options, reasoningActive);
     this.applyRequestExtras(request, model, options, stream);
     return { request, reasoningActive };
@@ -812,7 +815,12 @@ export class OpenAIProvider extends BaseLLMProvider {
       role: m.role,
       content: this.mapContent(m.content),
     }));
-    if (!this.supportsExplicitCacheBreakpoints(model) || mapped.length === 0) return mapped;
+    if (mapped.length === 0) return mapped;
+    // Without explicit cache breakpoints there is nothing to keep the
+    // system prompt split in two, and several OpenAI-compatible chat
+    // templates (local Qwen/Llama servers among them) expect exactly one
+    // system turn: fold the leading system messages into one.
+    if (!this.supportsExplicitCacheBreakpoints(model)) return OpenAIProvider.mergeLeadingSystem(mapped);
 
     const mark = (index: number): void => {
       const msg = mapped[index];
@@ -835,6 +843,15 @@ export class OpenAIProvider extends BaseLLMProvider {
     messages.forEach((m, i) => { if (m.cacheBreakpoint) mark(i); });
     mark(mapped.length - 1);
     return mapped;
+  }
+
+  /** Join consecutive leading text-only system messages into a single one. */
+  protected static mergeLeadingSystem(mapped: OpenAIMessage[]): OpenAIMessage[] {
+    let end = 0;
+    while (end < mapped.length && mapped[end].role === 'system' && typeof mapped[end].content === 'string') end++;
+    if (end < 2) return mapped;
+    const joined = mapped.slice(0, end).map((m) => m.content as string).filter((c) => c.length > 0).join('\n\n');
+    return [{ role: 'system', content: joined }, ...mapped.slice(end)];
   }
 
   protected mapContent(content: string | ContentPart[]): string | OpenAIContentPart[] {

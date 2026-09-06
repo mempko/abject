@@ -256,6 +256,7 @@ export { OpenAIProvider } from './llm/openai.js';
 export { OllamaProvider } from './llm/ollama.js';
 export { OpenRouterProvider } from './llm/openrouter.js';
 export { DeepSeekProvider } from './llm/deepseek.js';
+export { PeerLLMProvider } from './llm/peerllm.js';
 export { GrokProvider } from './llm/grok.js';
 export { GeminiProvider } from './llm/google-gemini.js';
 export { KimiProvider } from './llm/kimi.js';

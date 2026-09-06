@@ -61,6 +61,13 @@ export interface LLMCompletionOptions {
    * don't support routed caching (Anthropic, Ollama) ignore this.
    */
   cacheKey?: string;
+  /**
+   * Ask the provider to constrain decoding to a single JSON object when it
+   * supports that natively (Ollama's `format`). Providers without native
+   * support ignore it; the caller's prompt still has to ask for JSON, and
+   * the caller still parses defensively.
+   */
+  jsonMode?: boolean;
 }
 
 export interface ModelInfo {

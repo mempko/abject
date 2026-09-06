@@ -40,6 +40,8 @@ interface OllamaRequest {
   model: string;
   messages: OllamaMessage[];
   stream: boolean;
+  /** Constrained decoding: 'json' makes the model emit one JSON object. */
+  format?: 'json';
   options?: {
     temperature?: number;
     num_predict?: number;
@@ -123,6 +125,7 @@ export class OllamaProvider extends BaseLLMProvider {
       model: this.resolveModel(options),
       messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
+      ...(options.jsonMode ? { format: 'json' as const } : {}),
       options: {
         temperature: options.temperature,
         // Reasoning-capable local models emit long <think> traces that share
@@ -203,6 +206,7 @@ export class OllamaProvider extends BaseLLMProvider {
       model: this.resolveModel(options),
       messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
+      ...(options.jsonMode ? { format: 'json' as const } : {}),
       options: {
         temperature: options.temperature,
         // Reasoning-capable local models emit long <think> traces that share
