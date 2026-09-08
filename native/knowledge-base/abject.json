@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -277,6 +277,15 @@
               "type": {
                 "kind": "array"
               }
+            },
+            {
+              "description": "Reject stale pattern revisions",
+              "name": "expectedRevision",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
             }
           ],
           "returns": {
@@ -348,6 +357,59 @@
               "type": {
                 "kind": "array"
               }
+            },
+            {
+              "description": "Deduplicate pattern feedback for a review",
+              "name": "operationId",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Record contextual application evidence with an idempotent identity",
+          "name": "recordPatternApplication",
+          "parameters": [
+            {
+              "description": "Pattern entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "id, goalId, context, evidence, verdict and patternRevision",
+              "name": "application",
+              "type": {
+                "kind": "object",
+                "properties": {}
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Inspect pattern revision history and contextual application evidence",
+          "name": "patternHistory",
+          "parameters": [
+            {
+              "description": "Pattern entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
             }
           ],
           "returns": {
@@ -391,6 +453,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.2.0"
+    "version": "3.4.0"
   }
 }

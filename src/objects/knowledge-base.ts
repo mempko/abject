@@ -9,6 +9,7 @@
  * can iterate, which is where BM25 shines.
  */
 
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import { v4 as uuidv4 } from 'uuid';
 import { DatabaseSync } from 'node:sqlite';
 import * as fs from 'fs';
@@ -206,6 +207,7 @@ export class KnowledgeBase extends Abject {
                 { name: 'content', type: { kind: 'primitive', primitive: 'string' }, description: 'New content', optional: true },
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'New title', optional: true },
                 { name: 'tags', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'New tags', optional: true },
+                { name: 'expectedRevision', type: { kind: 'primitive', primitive: 'number' }, description: 'Reject stale pattern revisions', optional: true },
               ],
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
@@ -235,6 +237,7 @@ export class KnowledgeBase extends Abject {
               description: 'Record that entries genuinely helped a task (reviewer feedback). Bumps usefulCount, which protects entries from staleness eviction.',
               parameters: [
                 { name: 'ids', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Entry IDs that proved useful' },
+                { name: 'operationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Deduplicate pattern feedback for a review', optional: true },
               ],
               returns: { kind: 'object', properties: { marked: { kind: 'primitive', primitive: 'number' } } },
             },
@@ -602,7 +605,7 @@ export class KnowledgeBase extends Abject {
     if (entry.type !== 'pattern') return entry;
     const pattern = readStructured(entry.content);
     if (!pattern) return entry;
-    return { ...entry, content: renderPatternText(pattern) };
+    return { ...entry, content: renderPatternText(pattern), pattern } as KnowledgeEntry;
   }
 
   private rowToEntry(r: Record<string, unknown>): KnowledgeEntry {
@@ -703,8 +706,8 @@ export class KnowledgeBase extends Abject {
     return terms.slice(0, 24).map(t => `"${t.replace(/"/g, '')}"`).join(' OR ');
   }
 
-  private ftsSearch(query: string, limit: number): Array<{ id: string; score: number; snippet: string }> {
-    if (!this.db) return this.naiveSearch(query, limit);
+  private ftsSearch(query: string, limit: number, type?: KnowledgeType): Array<{ id: string; score: number; snippet: string }> {
+    if (!this.db) return this.naiveSearch(query, limit, type);
     const match = this.buildFtsQuery(query);
     if (!match) return [];
     try {
@@ -716,10 +719,10 @@ export class KnowledgeBase extends Abject {
                snippet(entries_fts, 1, '[', ']', '…', 12) AS snip
         FROM entries_fts
         JOIN entries e ON e.rowid = entries_fts.rowid
-        WHERE entries_fts MATCH ?
+        WHERE entries_fts MATCH ? AND e.archived = 0 AND (? IS NULL OR e.type = ?)
         ORDER BY bm25(entries_fts, 10.0, 1.0, 5.0)
         LIMIT ?
-      `).all(match, limit) as Array<Record<string, unknown>>;
+      `).all(match, type ?? null, type ?? null, limit) as Array<Record<string, unknown>>;
       return rows.map(r => ({
         id: String(r.id),
         score: Number(r.score ?? 0),
@@ -727,16 +730,17 @@ export class KnowledgeBase extends Abject {
       }));
     } catch (err) {
       log.warn(`FTS search failed: ${err instanceof Error ? err.message : String(err)}`);
-      return this.naiveSearch(query, limit);
+      return this.naiveSearch(query, limit, type);
     }
   }
 
   /** In-memory fallback when the db is unavailable: term-overlap scoring. */
-  private naiveSearch(query: string, limit: number): Array<{ id: string; score: number; snippet: string }> {
+  private naiveSearch(query: string, limit: number, type?: KnowledgeType): Array<{ id: string; score: number; snippet: string }> {
     const terms = (query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []);
     if (terms.length === 0) return [];
     const scored: Array<{ id: string; score: number; snippet: string }> = [];
     for (const e of this.entries.values()) {
+      if (e.archived || (type && e.type !== type)) continue;
       const title = e.title.toLowerCase();
       const content = e.content.toLowerCase();
       let score = 0;
@@ -751,8 +755,8 @@ export class KnowledgeBase extends Abject {
   }
 
   /** Rank entries for recall: BM25 lexical ranking with snippets. */
-  private async rankIds(query: string, poolSize: number): Promise<Array<{ id: string; score: number; snippet?: string }>> {
-    return this.ftsSearch(query, poolSize)
+  private async rankIds(query: string, poolSize: number, type?: KnowledgeType): Promise<Array<{ id: string; score: number; snippet?: string }>> {
+    return this.ftsSearch(query, poolSize, type)
       .map(l => ({ id: l.id, score: l.score, snippet: l.snippet }));
   }
 
@@ -848,7 +852,52 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
   // Handlers
   // ═══════════════════════════════════════════════════════════════════
 
+  private revisePatternContent(title: string, content: string, previous?: string): string {
+    const pattern = readPattern(content, title);
+    if (!pattern) throw new Error('Pattern needs Context, Forces, Therefore and Evidence');
+    const old = previous ? readPattern(previous, title) : undefined;
+    const learning = old?.learning ?? { revision: old ? 1 : 0, applications: [], feedbackIds: [], history: [] };
+    const history = [...learning.history];
+    if (old) {
+      const snapshot = { ...old, learning: undefined };
+      history.push({ revision: learning.revision || 1, content: serializePattern(snapshot) });
+    }
+    pattern.learning = { ...learning, revision: learning.revision + 1, history: history.slice(-20) };
+    return serializePattern(pattern);
+  }
+
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "recordPatternApplication", description: "Record one contextual application with distinct goal evidence and helpful/harmful/inconclusive verdict.", parameters: { "id": protocolText, "application": protocolObject } },
+      { name: "patternHistory", description: "Inspect pattern revisions and supporting or contradicting episodes.", parameters: { "id": protocolText } },
+    ]);
+    this.on('recordPatternApplication', async (msg: AbjectMessage) => {
+      const { id, application } = msg.payload as { id: string; application: import('../core/pattern.js').PatternApplication };
+      const entry = this.entries.get(id);
+      const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
+      if (!entry || !pattern) return { success: false, error: 'Pattern not found' };
+      requireNonEmpty(application.id, 'application.id'); requireNonEmpty(application.goalId, 'application.goalId');
+      requireNonEmpty(application.context, 'application.context'); requireNonEmpty(application.evidence, 'application.evidence');
+      precondition(['applied', 'helpful', 'harmful', 'inconclusive'].includes(application.verdict), 'Invalid application verdict');
+      pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
+      const old = pattern.learning.applications.find(a => a.id === application.id);
+      if (old) {
+        const {at: _oldAt,...oldEvidence}=old, {at: _newAt,...newEvidence}=application;
+        if (JSON.stringify(oldEvidence)!==JSON.stringify(newEvidence))return {success:false,error:'Conflicting evidence for the same application identity'};
+        return { success: true, duplicate: true };
+      }
+      precondition(Number.isSafeInteger(application.patternRevision) && application.patternRevision > 0 && application.patternRevision <= pattern.learning.revision, 'Unknown pattern revision');
+      pattern.learning.applications.push({ ...application, at: Date.now() });
+      entry.content = serializePattern(pattern); entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
+      this.writeEntryToDb(entry); this.syncEntryToSharedState(entry); this.changed('entryUpdated', entry);
+      return { success: true };
+    });
+    this.on('patternHistory', async (msg: AbjectMessage) => {
+      const { id } = msg.payload as { id: string };
+      const e = this.entries.get(id);
+      return e?.type === 'pattern' ? readPattern(e.content, e.title)?.learning ?? null : null;
+    });
+
     this.on('remember', async (msg: AbjectMessage) => {
       const { title, content, type, tags, origin } = msg.payload as {
         title: string; content: string; type: KnowledgeType; tags?: string[]; origin?: KnowledgeOrigin;
@@ -866,7 +915,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       // sends structure already; an agent using the plain `remember` action
       // sends whatever prose it composed, and that is structured here rather
       // than left to drift into a shape nothing can read back.
-      const body = type === 'pattern' ? this.structureOnWrite(title, content) : content;
+      const body = type === 'pattern' ? this.revisePatternContent(title, content) : content;
 
       // Dedup by normalized title+type: update existing if found. A
       // re-remembered archived entry revives; its origin is preserved so a
@@ -880,7 +929,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (existing && existing.origin === 'user' && entryOrigin !== 'user') {
         log.info(`Remember: title collides with user entry "${existing.title}"; creating separate ${entryOrigin} entry`);
       } else if (existing) {
-        existing.content = body;
+        existing.content = type === 'pattern' ? this.revisePatternContent(title, content, existing.content) : body;
         existing.tags = tags ?? existing.tags;
         existing.archived = false;
         existing.updatedAt = Date.now();
@@ -990,17 +1039,25 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         query: string; limit?: number; hops?: number;
       };
       requireNonEmpty(query, 'query');
-      const max = Math.min(limit ?? 5, 20);
-      const maxHops = Math.min(hops ?? 1, 2);
+      const max = Math.max(1, Math.min(limit ?? 5, 20));
+      const maxHops = Math.max(0, Math.min(hops ?? 1, 2));
 
       // Rank over a generous pool, keep only active patterns.
-      const ranked = await this.rankIds(query, 100);
+      const ranked = (await this.rankIds(query, 100, 'pattern')).map(r => {
+        const pattern = readPattern(this.entries.get(r.id)?.content ?? '');
+        const words = new Set(query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+        const relevant = (pattern?.learning?.applications ?? []).filter(a => (a.context.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []).filter(w => words.has(w)).length >= 2);
+        const helpful = new Set(relevant.filter(a => a.verdict === 'helpful').map(a => a.goalId)).size;
+        const harmful = new Set(relevant.filter(a => a.verdict === 'harmful').map(a => a.goalId)).size;
+        const evidenceWeight = Math.max(0.5, Math.min(1.5, 1 + helpful * 0.1 - harmful * 0.2));
+        return { ...r, score: r.score * evidenceWeight, evidenceWeight };
+      }).sort((a,b) => b.score - a.score);
       const selected: WovenPattern[] = [];
       const seen = new Set<string>();
       for (const r of ranked) {
         const entry = this.entries.get(r.id);
         if (!entry || entry.archived || entry.type !== 'pattern') continue;
-        selected.push({ ...this.present(entry), snippet: r.snippet, score: r.score, via: 'matched' });
+        selected.push({ ...this.present(entry), snippet: r.snippet, score: r.score, via: `matched; contextual evidence weight=${r.evidenceWeight.toFixed(2)}` });
         seen.add(entry.id);
         if (selected.length >= max) break;
       }
@@ -1107,7 +1164,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
     this.on('update', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
-        id: string; content?: string; title?: string; tags?: string[];
+        id: string; content?: string; title?: string; tags?: string[]; expectedRevision?: number;
         updates?: { content?: string; title?: string; tags?: string[] };
       };
       const { id } = payload;
@@ -1120,13 +1177,16 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const entry = this.entries.get(id);
       if (!entry) return { success: false, error: `No entry with id "${id}"` };
 
+      const revision = entry.type === 'pattern' ? readPattern(entry.content)?.learning?.revision ?? 1 : entry.updatedAt;
+      if (payload.expectedRevision !== undefined && payload.expectedRevision !== revision) return { success: false, conflict: true, revision, error: 'Knowledge changed; read it and reconcile before updating' };
+
       // Surface a no-op rather than reporting success: a wrong-shaped payload
       // that touches no recognized field must not masquerade as an update.
       if (content === undefined && title === undefined && tags === undefined) {
         return { success: false, error: 'No updatable fields provided (expected content, title, and/or tags)' };
       }
 
-      if (content !== undefined) entry.content = content;
+      if (content !== undefined) entry.content = entry.type === 'pattern' ? this.revisePatternContent(title ?? entry.title, content, entry.content) : content;
       if (title !== undefined) entry.title = title.slice(0, 200);
       if (tags !== undefined) entry.tags = tags;
       entry.updatedAt = Date.now();
@@ -1168,13 +1228,22 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('markUseful', async (msg: AbjectMessage) => {
-      const { ids } = msg.payload as { ids: string[] };
+      const { ids, operationId } = msg.payload as { ids: string[]; operationId?: string };
       precondition(Array.isArray(ids) && ids.length > 0, 'ids must be a non-empty array');
       const now = Date.now();
       let marked = 0;
       for (const id of ids) {
         const entry = this.entries.get(id);
         if (!entry) continue;
+        if (entry.type === 'pattern' && operationId) {
+          const pattern = readPattern(entry.content, entry.title);
+          if (pattern) {
+            pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
+            if (pattern.learning.feedbackIds.includes(operationId)) continue;
+            pattern.learning.feedbackIds.push(operationId);
+            entry.content = serializePattern(pattern);
+          }
+        }
         entry.usefulCount++;
         entry.lastUsefulAt = now;
         this.writeEntryToDb(entry);
@@ -1263,9 +1332,11 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
   /** Resolve a link name to an active pattern entry by normalized title. */
   private findPatternByName(name: string): KnowledgeEntry | undefined {
+    const direct = this.entries.get(name.replace(/^id:/, ''));
+    if (direct?.type === 'pattern' && !direct.archived) return direct;
     const norm = this.normalizeTitle(name);
     for (const entry of this.entries.values()) {
-      if (entry.type === 'pattern' && !entry.archived && this.normalizeTitle(entry.title) === norm) {
+      if (entry.type === 'pattern' && !entry.archived && (this.normalizeTitle(entry.title) === norm || (readPattern(entry.content)?.aliases ?? '').split(/[,;\n]/).some(alias => this.normalizeTitle(alias) === norm))) {
         return entry;
       }
     }

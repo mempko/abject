@@ -112,7 +112,10 @@ struct Entry {
   json to_presented_json() const {
     json j = to_json();
     if (type == "pattern") {
-      if (auto p = kbpat::read_structured(content)) j["content"] = p->render();
+      if (auto p = kbpat::read_structured(content)) {
+        j["content"] = p->render();
+        j["pattern"] = p->to_json();
+      }
     }
     return j;
   }
@@ -249,7 +252,7 @@ class KnowledgeBase final : public Object {
         "generative pattern-language entries with Context/Forces/Therefore "
         "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
-        "3.2.0", "abjects:knowledge-base");
+        "3.4.0", "abjects:knowledge-base");
 
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
@@ -301,6 +304,7 @@ class KnowledgeBase final : public Object {
         .param("content", "string", "New content", true)
         .param("title", "string", "New title", true)
         .param("tags", "array", "New tags", true)
+        .param("expectedRevision", "number", "Reject stale pattern revisions", true)
         .returns("object");
     m.method("list", "List knowledge entries, optionally filtered by type")
         .param("type", "string", "Filter by type", true)
@@ -318,6 +322,14 @@ class KnowledgeBase final : public Object {
              "feedback). Bumps usefulCount, which protects entries from "
              "staleness eviction.")
         .param("ids", "array", "Entry IDs that proved useful")
+        .param("operationId", "string", "Deduplicate pattern feedback for a review", true)
+        .returns("object");
+    m.method("recordPatternApplication", "Record contextual application evidence with an idempotent identity")
+        .param("id", "string", "Pattern entry ID")
+        .param("application", "object", "id, goalId, context, evidence, verdict and patternRevision")
+        .returns("object");
+    m.method("patternHistory", "Inspect pattern revision history and contextual application evidence")
+        .param("id", "string", "Pattern entry ID")
         .returns("object");
     m.method("archive",
              "Archive an entry (hidden from recall/match, restorable) or "
@@ -469,13 +481,77 @@ class KnowledgeBase final : public Object {
   /// a pattern is stored as-is; refusing the write would lose it entirely.
   std::string structure_on_write(const std::string& title, const std::string& content) {
     if (kbpat::is_structured(content)) return content;
-    const auto pattern = kbpat::parse_legacy(content, title);
+    const auto pattern = kbpat::read(content, title);
     if (!pattern) {
       log(LogLevel::Warn,
           "Pattern \"" + title + "\" could not be structured on write; stored as written");
       return content;
     }
     return pattern->to_json().dump();
+  }
+
+  static json initial_learning() {
+    return {{"revision", 1}, {"applications", json::array()}, {"feedbackIds", json::array()}, {"history", json::array()}};
+  }
+
+  std::optional<std::string> revise_pattern(const std::string& title, const std::string& content,
+                                           const std::string& previous = "") {
+    auto pattern = kbpat::read(content, title);
+    if (!pattern) return std::nullopt;
+    const auto old = previous.empty() ? std::optional<kbpat::Pattern>() : kbpat::read(previous, title);
+    json learning = old && old->learning.is_object() ? old->learning : initial_learning();
+    if (old) {
+      auto snapshot = *old;
+      snapshot.learning = nullptr;
+      learning["history"].push_back({{"revision", learning["revision"]}, {"content", snapshot.to_json().dump()}});
+      while (learning["history"].size() > 20) learning["history"].erase(learning["history"].begin());
+      learning["revision"] = learning["revision"].get<int64_t>() + 1;
+    }
+    pattern->learning = learning;
+    return pattern->to_json().dump();
+  }
+
+  void record_pattern_application(Request& req) {
+    const auto& p = req.payload();
+    auto it = entries_.find(str_or(p, "id", ""));
+    auto pattern = it != entries_.end() && it->second.type == "pattern"
+      ? kbpat::read(it->second.content, it->second.title) : std::optional<kbpat::Pattern>();
+    if (!pattern) { req.reply({{"success", false}, {"error", "Pattern not found"}}); return; }
+    if (!p.contains("application") || !p["application"].is_object()) {
+      req.error("CONTRACT_VIOLATION", "application must be an object"); return;
+    }
+    json application = p["application"];
+    for (const auto* key : {"id", "goalId", "context", "evidence"}) {
+      if (kbpat::trim(str_or(application, key, "")).empty()) {
+        req.error("CONTRACT_VIOLATION", std::string("application.") + key + " must not be empty"); return;
+      }
+    }
+    const auto verdict = str_or(application, "verdict", "");
+    if (verdict != "applied" && verdict != "helpful" && verdict != "harmful" && verdict != "inconclusive") {
+      req.error("CONTRACT_VIOLATION", "Invalid application verdict"); return;
+    }
+    if (!pattern->learning.is_object()) pattern->learning = initial_learning();
+    application.erase("at");
+    for (auto old : pattern->learning["applications"]) {
+      if (!old.is_object() || old.value("id", json()) != application["id"]) continue;
+      old.erase("at");
+      if (old != application) req.reply({{"success", false}, {"error", "Conflicting evidence for the same application identity"}});
+      else req.reply({{"success", true}, {"duplicate", true}});
+      return;
+    }
+    if (!application.contains("patternRevision") || !application["patternRevision"].is_number_integer() ||
+        application["patternRevision"] <= 0 || application["patternRevision"] > pattern->learning["revision"]) {
+      req.error("CONTRACT_VIOLATION", "Unknown pattern revision"); return;
+    }
+    application["at"] = now_ms();
+    pattern->learning["applications"].push_back(application);
+    Entry& e = it->second;
+    e.content = pattern->to_json().dump();
+    e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
+    index_.add(e.id, e.title, index_text(e), e.tags);
+    save_entry(e);
+    changed("entryUpdated", e.to_json());
+    req.reply({{"success", true}});
   }
 
   /// Bring every pattern into the structured form, and put back the ones an
@@ -502,7 +578,7 @@ class KnowledgeBase final : public Object {
 
     for (auto& [id, e] : entries_) {
       if (e.type != "pattern" || kbpat::is_structured(e.content)) continue;
-      const auto p = kbpat::parse_legacy(e.content, e.title);
+      const auto p = kbpat::read(e.content, e.title);
       if (!p) {
         unreadable++;
         log(LogLevel::Warn, "Pattern \"" + e.title + "\" could not be structured; left as written");
@@ -564,6 +640,13 @@ class KnowledgeBase final : public Object {
 
   void register_handlers() {
     on("remember", [this](Request& req) { handle_remember(req); });
+    on("recordPatternApplication", [this](Request& req) { record_pattern_application(req); });
+    on("patternHistory", [this](Request& req) {
+      const auto it = entries_.find(str_or(req.payload(), "id", ""));
+      const auto pattern = it != entries_.end() && it->second.type == "pattern"
+        ? kbpat::read(it->second.content, it->second.title) : std::optional<kbpat::Pattern>();
+      req.reply(pattern ? pattern->learning : json());
+    });
     on("recall", [this](Request& req) { handle_recall(req); });
     on("weave", [this](Request& req) { handle_weave(req); });
     on("match", [this](Request& req) { handle_match(req); });
@@ -641,6 +724,17 @@ class KnowledgeBase final : public Object {
         if (!v.is_string()) continue;
         auto it = entries_.find(v.get<std::string>());
         if (it == entries_.end()) continue;
+        const auto operation = str_or(p, "operationId", "");
+        if (it->second.type == "pattern" && !operation.empty()) {
+          auto pattern = kbpat::read(it->second.content, it->second.title);
+          if (pattern) {
+            if (!pattern->learning.is_object()) pattern->learning = initial_learning();
+            auto& ids = pattern->learning["feedbackIds"];
+            if (std::find(ids.begin(), ids.end(), json(operation)) != ids.end()) continue;
+            ids.push_back(operation);
+            it->second.content = pattern->to_json().dump();
+          }
+        }
         it->second.useful_count++;
         it->second.last_useful_at = now;
         persist_entry(it->second);
@@ -733,7 +827,9 @@ class KnowledgeBase final : public Object {
     // sends structure already; an agent using the plain `remember` action
     // sends whatever prose it composed, and that is structured here rather
     // than left to drift into a shape nothing can read back.
-    const std::string body = (type == "pattern") ? structure_on_write(title, content) : content;
+    const auto revised = type == "pattern" ? revise_pattern(title, content) : std::optional<std::string>(content);
+    if (!revised) { req.error("CONTRACT_VIOLATION", "Pattern needs Context, Forces, Therefore and Evidence"); return; }
+    const std::string body = *revised;
 
     const int64_t now = static_cast<int64_t>(now_ms());
 
@@ -751,7 +847,7 @@ class KnowledgeBase final : public Object {
       existing = nullptr;
     }
     if (existing) {
-      existing->content = body;
+      existing->content = type == "pattern" ? *revise_pattern(title, content, existing->content) : body;
       if (p.contains("tags")) existing->tags = tags;
       existing->archived = false;
       existing->updated_at = now;
@@ -864,22 +960,48 @@ class KnowledgeBase final : public Object {
     const json& p = req.payload();
     const std::string query = str_or(p, "query", "");
     if (query.empty()) { req.error("CONTRACT_VIOLATION", "query must not be empty"); return; }
-    const size_t max = static_cast<size_t>(std::min<int64_t>(int_or(p, "limit", 5), 20));
-    const int64_t max_hops = std::min<int64_t>(int_or(p, "hops", 1), 2);
+    const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 5), 1, 20));
+    const int64_t max_hops = std::clamp<int64_t>(int_or(p, "hops", 1), 0, 2);
 
     struct Woven { Entry* entry; std::string snippet; double score; bool scored; std::string via; };
     std::vector<Woven> selected;
     std::set<std::string> seen;
 
     const std::vector<std::string> query_terms = kb::tokenize(query);
-    for (const auto& hit : index_.search(query, 100)) {
+    // Filter by entry type before capping candidates; facts cannot crowd patterns out.
+    for (const auto& hit : index_.search(query, entries_.size())) {
       auto it = entries_.find(hit.id);
       if (it == entries_.end()) continue;
       Entry& e = it->second;
       if (e.archived || e.type != "pattern") continue;
       selected.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true, "matched"});
+      if (selected.size() >= 100) break;
+    }
+    for (auto& row : selected) {
+      std::set<std::string> helpful, harmful;
+      const auto pattern = kbpat::read(row.entry->content, row.entry->title);
+      if (pattern && pattern->learning.is_object()) {
+        for (const auto& application : pattern->learning["applications"]) {
+          if (!application.is_object()) continue;
+          size_t matches = 0;
+          for (const auto& word : kb::tokenize(str_or(application, "context", ""))) {
+            if (word.size() >= 3 && std::find(query_terms.begin(), query_terms.end(), word) != query_terms.end()) matches++;
+          }
+          if (matches < 2) continue;
+          const auto verdict = str_or(application, "verdict", ""), goal = str_or(application, "goalId", "");
+          if (verdict == "helpful") helpful.insert(goal);
+          if (verdict == "harmful") harmful.insert(goal);
+        }
+      }
+      const double weight = std::clamp(1.0 + helpful.size() * 0.1 - harmful.size() * 0.2, 0.5, 1.5);
+      row.score *= weight;
+      row.via = "matched; contextual evidence weight=" + std::to_string(weight);
+    }
+    std::stable_sort(selected.begin(), selected.end(), [](const Woven& a, const Woven& b) { return a.score > b.score; });
+    if (selected.size() > max) selected.resize(max);
+    for (const auto& row : selected) {
+      const auto& e = *row.entry;
       seen.insert(e.id);
-      if (selected.size() >= max) break;
     }
 
     // Breadth-first link expansion: a matched pattern pulls in the patterns
@@ -1011,7 +1133,18 @@ class KnowledgeBase final : public Object {
     }
 
     Entry& e = it->second;
-    if (content.is_string()) e.content = content.get<std::string>();
+    const auto old_pattern = e.type == "pattern" ? kbpat::read(e.content, e.title) : std::optional<kbpat::Pattern>();
+    const int64_t revision = e.type == "pattern"
+      ? (old_pattern && old_pattern->learning.is_object() ? old_pattern->learning["revision"].get<int64_t>() : 1) : e.updated_at;
+    if (p.contains("expectedRevision") && p["expectedRevision"] != json(revision)) {
+      req.reply({{"success", false}, {"conflict", true}, {"revision", revision}, {"error", "Knowledge changed; read it and reconcile before updating"}}); return;
+    }
+    if (content.is_string()) {
+      const auto body = e.type == "pattern" ? revise_pattern(title.is_string() ? title.get<std::string>() : e.title, content.get<std::string>(), e.content)
+                                            : std::optional<std::string>(content.get<std::string>());
+      if (!body) { req.error("CONTRACT_VIOLATION", "Pattern needs Context, Forces, Therefore and Evidence"); return; }
+      e.content = *body;
+    }
     if (title.is_string()) e.title = clip_utf8(title.get<std::string>(), 200);
     if (tags.is_array()) {
       e.tags.clear();

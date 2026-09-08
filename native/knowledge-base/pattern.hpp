@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,7 @@ struct Pattern {
   std::string applies_to;
   std::vector<std::string> links;
   std::vector<Note> notes;
+  json learning = nullptr;
 
   bool complete() const {
     return !name.empty() && !context.empty() && !forces.empty() && !therefore.empty() &&
@@ -73,6 +75,7 @@ struct Pattern {
       for (const Note& n : notes) arr.push_back({{"heading", n.heading}, {"body", n.body}});
       j["notes"] = arr;
     }
+    if (learning.is_object()) j["learning"] = learning;
     return j;
   }
 
@@ -95,6 +98,19 @@ struct Pattern {
     section("Evidence", evidence);
     section("Applies-to", applies_to);
     for (const Note& n : notes) section(n.heading.c_str(), n.body);
+    if (learning.is_object()) {
+      std::set<std::string> helpful, harmful;
+      for (const auto& application : learning["applications"]) {
+        if (!application.is_object()) continue;
+        const auto goal = application.find("goalId"), verdict = application.find("verdict");
+        if (goal == application.end() || !goal->is_string() || verdict == application.end()) continue;
+        if (*verdict == "helpful") helpful.insert(goal->get<std::string>());
+        if (*verdict == "harmful") harmful.insert(goal->get<std::string>());
+      }
+      section("Recorded evidence", "Revision " + learning["revision"].dump() + "; helpful in " +
+        std::to_string(helpful.size()) + " distinct goals; counterexamples in " + std::to_string(harmful.size()) +
+        " goals. " + (helpful.size() < 2 ? "Candidate: recurrence is not established." : "Recurrence recorded; applicability still depends on context."));
+    }
     if (!links.empty()) {
       out += "\n\n## Links";
       for (const std::string& l : links) out += "\n-> " + l;
@@ -184,6 +200,14 @@ inline std::optional<Pattern> read_structured(const std::string& content) {
   p.consequences = str_field(j, "consequences");
   p.evidence = str_field(j, "evidence");
   p.applies_to = str_field(j, "appliesTo");
+  if (j.contains("learning") && j["learning"].is_object()) {
+    const auto& l = j["learning"];
+    if (l.contains("revision") && l["revision"].is_number_integer() && l["revision"] > 0 &&
+        l.contains("applications") && l["applications"].is_array() && l.contains("history") && l["history"].is_array()) {
+      p.learning = l;
+      if (!p.learning.contains("feedbackIds") || !p.learning["feedbackIds"].is_array()) p.learning["feedbackIds"] = json::array();
+    }
+  }
 
   std::vector<std::string> raw_links;
   if (j.contains("links") && j["links"].is_array()) {
