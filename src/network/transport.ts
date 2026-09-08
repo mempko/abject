@@ -18,10 +18,17 @@ export interface TransportConfig {
   heartbeatInterval?: number;
 }
 
+export interface AuthenticatedSessionMetadata {
+  /** Identity verified at the transport connection boundary. */
+  authenticatedPeerId: string;
+  /** Receiver-local, monotonically increasing authenticated-session epoch. */
+  sessionEpoch: number;
+}
+
 export interface TransportEvents {
-  onConnect?: () => void;
-  onDisconnect?: (reason?: string) => void;
-  onMessage?: (message: AbjectMessage) => void;
+  onConnect?: (session?: AuthenticatedSessionMetadata) => void;
+  onDisconnect?: (reason?: string, session?: AuthenticatedSessionMetadata) => void;
+  onMessage?: (message: AbjectMessage, session?: AuthenticatedSessionMetadata) => void;
   onError?: (error: Error) => void;
   onStateChange?: (state: ConnectionState) => void;
 }
@@ -109,17 +116,17 @@ export abstract class Transport {
   /**
    * Handle connection established.
    */
-  protected handleConnect(): void {
+  protected handleConnect(session?: AuthenticatedSessionMetadata): void {
     this.setState('connected');
-    this.events.onConnect?.();
+    this.events.onConnect?.(session);
   }
 
   /**
    * Handle disconnection.
    */
-  protected handleDisconnect(reason?: string): void {
+  protected handleDisconnect(reason?: string, session?: AuthenticatedSessionMetadata): void {
     this.setState('disconnected');
-    this.events.onDisconnect?.(reason);
+    this.events.onDisconnect?.(reason, session);
   }
 
   /**

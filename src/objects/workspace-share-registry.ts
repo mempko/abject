@@ -396,11 +396,23 @@ export class WorkspaceShareRegistry extends Abject {
     // ── Catalog delta wire protocol ──
 
     this.on('workspace:catalog_delta', async (msg: AbjectMessage) => {
-      return this.handleCatalogDelta(msg.payload as WorkspaceCatalogDeltaPayload);
+      const payload = msg.payload as WorkspaceCatalogDeltaPayload;
+      const authenticatedPeerId = (msg.routing as typeof msg.routing & { authenticatedPeerId?: string }).authenticatedPeerId;
+      if (!authenticatedPeerId || payload.ownerPeerId !== authenticatedPeerId) {
+        log.warn(`AUTHENTICATED_SENDER_MISMATCH: catalog delta claimed=${payload.ownerPeerId} authenticated=${authenticatedPeerId ?? 'none'}`);
+        throw new Error('Catalog delta sender does not match authenticated transport peer');
+      }
+      return this.handleCatalogDelta({ ...payload, ownerPeerId: authenticatedPeerId });
     });
 
     this.on('workspace:catalog_sync_request', async (msg: AbjectMessage) => {
-      return this.handleCatalogSyncRequest(msg.payload as WorkspaceCatalogSyncRequestPayload);
+      const payload = msg.payload as WorkspaceCatalogSyncRequestPayload;
+      const authenticatedPeerId = (msg.routing as typeof msg.routing & { authenticatedPeerId?: string }).authenticatedPeerId;
+      if (!authenticatedPeerId || payload.peerId !== authenticatedPeerId) {
+        log.warn(`AUTHENTICATED_SENDER_MISMATCH: catalog sync claimed=${payload.peerId} authenticated=${authenticatedPeerId ?? 'none'}`);
+        throw new Error('Catalog sync requester does not match authenticated transport peer');
+      }
+      return this.handleCatalogSyncRequest({ ...payload, peerId: authenticatedPeerId });
     });
 
     this.on('reconcileCatalog', async (msg: AbjectMessage) => {
@@ -1856,7 +1868,8 @@ export class WorkspaceShareRegistry extends Abject {
     // 'public' keeps the strict whitelist below: an unauthenticated joiner is
     // told only what the user named, never everything the workspace happens to
     // hold.
-    if (ws.accessMode === 'shared') {
+    const curated = await this.readCuratedExposure(ws);
+    if (ws.accessMode === 'shared' && !curated.curated) {
       const kept = entries.filter(
         (reg) => reg.id === ws.registryId || !isHostLocalObject(reg?.manifest?.name)
       );
@@ -1866,7 +1879,6 @@ export class WorkspaceShareRegistry extends Abject {
       return kept;
     }
 
-    const curated = await this.readCuratedExposure(ws);
     // P1-2: the SAME predicate the registry's `isExposedToRemote` uses on the
     // pull side — id OR durable typeId OR durable registered name — imported
     // from one module so push and pull agree by construction rather than by
@@ -1876,13 +1888,14 @@ export class WorkspaceShareRegistry extends Abject {
       typeIds: curated.typeIds,
       names: curated.names,
     });
-    // Uncurated, or curated down to nothing: share everything, as before.
-    if (!curated.curated || isExposureEmpty(selectors)) return entries;
+    // An explicit empty set is deny-all, while retaining only the workspace
+    // registry required to resolve and communicate with the shared workspace.
+    // An absent curation decision preserves the historical share-all behavior.
+    if (!curated.curated) return entries;
     const kept = entries.filter((reg) =>
-      // The workspace registry is the joiner's entry point into the workspace;
-      // curation must never strip it or the mirror has nothing to talk to.
+      // The workspace registry is infrastructure rather than exposed content.
       reg.id === ws.registryId ||
-      matchesExposureSelectors(reg, selectors)
+      (!isExposureEmpty(selectors) && matchesExposureSelectors(reg, selectors))
     );
     log.info(`applyCuration: workspace=${ws.workspaceId} curated ${entries.length} -> ${kept.length} object(s)`);
     return kept;

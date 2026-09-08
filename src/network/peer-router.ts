@@ -650,7 +650,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         // System routes always included
         systemRoutes?: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }>;
       };
-      return this.handleRouteAnnouncementImpl(payload);
+      const authenticatedPeerId = (msg.routing as typeof msg.routing & { authenticatedPeerId?: PeerId }).authenticatedPeerId;
+      if (!authenticatedPeerId || payload.fromPeerId !== authenticatedPeerId) {
+        log.warn(`AUTHENTICATED_SENDER_MISMATCH: route announcement claimed=${payload.fromPeerId} authenticated=${authenticatedPeerId ?? 'none'}`);
+        return false;
+      }
+      return this.handleRouteAnnouncementImpl({ ...payload, fromPeerId: authenticatedPeerId });
     });
 
     this.on('resolveRemoteObject', async (msg: AbjectMessage) => {
@@ -677,7 +682,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         digest: Array<{ workspaceKey: string; version: number }>;
         fromPeerId: string;
       };
-      return this.handleRouteDigest(digest, fromPeerId as PeerId);
+      const authenticatedPeerId = (msg.routing as typeof msg.routing & { authenticatedPeerId?: PeerId }).authenticatedPeerId;
+      if (!authenticatedPeerId || fromPeerId !== authenticatedPeerId) {
+        log.warn(`AUTHENTICATED_SENDER_MISMATCH: route digest claimed=${fromPeerId} authenticated=${authenticatedPeerId ?? 'none'}`);
+        return false;
+      }
+      return this.handleRouteDigest(digest, authenticatedPeerId);
     });
 
     // Listen for events from PeerRegistry and WorkspaceManager
@@ -974,6 +984,28 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Called by PeerRegistry when a message arrives via transport.
    */
   handleIncomingMessage(msg: AbjectMessage, fromPeerId: PeerId): void {
+    // Stamp receiver-local transport provenance. This field is never trusted
+    // from the wire: overwriting it here binds downstream protocol handlers to
+    // the peer authenticated by the transport while preserving routing.from as
+    // the remote caller's AbjectId for replies.
+    msg = {
+      ...msg,
+      routing: { ...msg.routing, authenticatedPeerId: fromPeerId },
+    };
+
+    // A known remote object may only speak through the peer route that owns it.
+    // Previously a body could claim another object's routing.from and poison
+    // the reply route before any protocol-level validation ran.
+    const claimedSender = msg.routing.from as AbjectId;
+    const knownSystemRoute = this.systemRoutes.get(claimedSender);
+    const workspaceKey = this.objectToWorkspace.get(claimedSender);
+    const knownWorkspaceRoute = workspaceKey ? this.workspaceRoutes.get(workspaceKey) : undefined;
+    const expectedPeerId = knownSystemRoute?.nextHop ?? knownWorkspaceRoute?.nextHop;
+    if (expectedPeerId && expectedPeerId !== fromPeerId) {
+      log.warn(`AUTHENTICATED_SENDER_MISMATCH: object=${claimedSender.slice(0, 16)} expected=${expectedPeerId.slice(0, 16)} authenticated=${fromPeerId.slice(0, 16)}`);
+      return;
+    }
+
     // Rate limit: drop messages from peers that exceed the token bucket
     if (!this.consumeRateLimitToken(fromPeerId)) {
       log.warn(`RATE_LIMITED: dropping message from ${fromPeerId.slice(0, 16)}`);

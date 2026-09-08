@@ -14,6 +14,7 @@ import type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from '../
 import { SignalingClient } from '../network/signaling.js';
 import type { SignalingRelay } from '../network/signaling.js';
 import { PeerTransport, PeerTransportConfig } from '../network/peer-transport.js';
+import type { AuthenticatedSessionMetadata } from '../network/transport.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('PeerRegistry');
@@ -59,6 +60,8 @@ export class PeerRegistry extends Abject {
   private contacts: Map<PeerId, PeerContact> = new Map();
   private blockedPeers: Set<PeerId> = new Set();
   private transports: Map<PeerId, PeerTransport> = new Map();
+  /** Authenticated heartbeat-lease session currently accepted for each peer. */
+  private authenticatedSessions: Map<PeerId, Readonly<AuthenticatedSessionMetadata>> = new Map();
   private signalingClients: Map<string, SignalingClient> = new Map();
   /** Per-URL throttle for disconnect/error log lines (a down server repeats them forever). */
   private signalingIssueLogAt: Map<string, number> = new Map();
@@ -512,7 +515,7 @@ export class PeerRegistry extends Abject {
     this.on('getMediaPeerConnection', async (msg: AbjectMessage) => {
       const { peerId } = msg.payload as { peerId: string };
       const transport = this.transports.get(peerId);
-      if (!transport?.isConnected) return null;
+      if (!transport?.isConnected || !this.hasActiveAuthenticatedSession(peerId, transport)) return null;
       const pc = transport.rtcPeerConnection;
       return pc ? { peerConnection: pc } : null;
     });
@@ -609,6 +612,7 @@ export class PeerRegistry extends Abject {
     // Drain rather than iterate once: a handler suspended mid-connect can
     // still add a transport while these disconnects are awaited. The bound is
     // a backstop; the flag above means the second pass is normally empty.
+    this.authenticatedSessions.clear();
     for (let sweep = 0; this.transports.size > 0 && sweep < 5; sweep++) {
       const pending = [...this.transports.values()];
       this.transports.clear();
@@ -662,7 +666,7 @@ export class PeerRegistry extends Abject {
     // If there's already a connected transport for this peer (e.g. they connected
     // to us before we added them as a contact), sync the contact state immediately.
     const existingTransport = this.transports.get(peerId);
-    if (existingTransport?.isConnected) {
+    if (existingTransport?.isConnected && this.hasActiveAuthenticatedSession(peerId, existingTransport)) {
       contact.state = 'connected';
       contact.lastSeen = Date.now();
       this.changed('contactConnected', { peerId });
@@ -829,7 +833,8 @@ export class PeerRegistry extends Abject {
    */
   getConnectedPeers(): PeerId[] {
     return Array.from(this.transports.entries())
-      .filter(([, t]) => t.isConnected)
+      .filter(([peerId, transport]) =>
+        transport.isConnected && this.hasActiveAuthenticatedSession(peerId, transport))
       .map(([peerId]) => peerId);
   }
 
@@ -1302,10 +1307,25 @@ export class PeerRegistry extends Abject {
 
   private setupTransportEvents(transport: PeerTransport, peerId: string): void {
     transport.on({
-      onConnect: () => {
+      onConnect: (session) => {
         // Only process if this transport is still the active one for this peer
-        // (ICE glare can replace the transport before async events fire)
+        // (ICE glare can replace the transport before async events fire).
         if (this.transports.get(peerId) !== transport) return;
+        if (!session || session.authenticatedPeerId !== peerId ||
+            !Number.isSafeInteger(session.sessionEpoch) || session.sessionEpoch <= 0) {
+          log.warn(`rejecting unauthenticated or mismatched session for ${peerId.slice(0, 16)}`);
+          void transport.disconnect();
+          return;
+        }
+
+        // PeerTransport renews and expires the heartbeat lease. PeerRegistry
+        // binds its authenticated identity and epoch to the currently active
+        // transport so stale callbacks from a replaced session cannot escape.
+        const acceptedSession = Object.freeze({
+          authenticatedPeerId: session.authenticatedPeerId,
+          sessionEpoch: session.sessionEpoch,
+        });
+        this.authenticatedSessions.set(peerId, acceptedSession);
         this.offerTimestamps.delete(peerId);
 
         // Record signaling URL on contact or gossip peer
@@ -1341,12 +1361,17 @@ export class PeerRegistry extends Abject {
             }
           }
         }
-        this.peerConnectedHandler?.(peerId);
+        this.peerConnectedHandler?.(peerId, acceptedSession);
       },
-      onDisconnect: () => {
-        // Only clean up if this transport is still the active one for this peer
-        // (ICE glare can replace the transport before async events fire)
+      onDisconnect: (_reason, session) => {
+        // Only clean up if this transport and authenticated epoch are still
+        // active. A late disconnect from a superseded heartbeat lease must not
+        // tear down a newer session.
         if (this.transports.get(peerId) !== transport) return;
+        const activeSession = this.authenticatedSessions.get(peerId);
+        if (session && (!activeSession || !this.sessionsMatch(activeSession, session))) return;
+        if (!session && activeSession) return;
+        this.authenticatedSessions.delete(peerId);
         this.offerTimestamps.delete(peerId);
 
         if (this.contacts.has(peerId)) {
@@ -1371,7 +1396,13 @@ export class PeerRegistry extends Abject {
           }, 2_000);
         }
       },
-      onMessage: (message) => {
+      onMessage: (message, session) => {
+        if (!session || !this.hasActiveAuthenticatedSession(peerId, transport, session)) {
+          log.warn(`dropping message outside active authenticated session from ${peerId.slice(0, 16)}`);
+          return;
+        }
+        const activeSession = this.authenticatedSessions.get(peerId)!;
+
         // Intercept introduction messages before forwarding
         if (message.routing.method === '_introduction' &&
             message.routing.to === PEER_REGISTRY_ID) {
@@ -1382,7 +1413,7 @@ export class PeerRegistry extends Abject {
         // Intercept signaling relay messages
         if (message.routing.method === '_signalingRelay' &&
             message.routing.to === PEER_REGISTRY_ID) {
-          this.signalingRelayHandler?.(message, peerId);
+          this.signalingRelayHandler?.(message, peerId, activeSession);
           return;
         }
 
@@ -1391,14 +1422,14 @@ export class PeerRegistry extends Abject {
              message.routing.method === '_findPeer' ||
              message.routing.method === '_peerFound') &&
             message.routing.to === PEER_REGISTRY_ID) {
-          this.peerDiscoveryHandler?.(message, peerId);
+          this.peerDiscoveryHandler?.(message, peerId, activeSession);
           return;
         }
 
         log.info(`inbound message from ${peerId.slice(0, 16)} to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         // Messages from peers are forwarded to the local message bus
         // by the PeerRouter interceptor
-        this.events.onMessage?.(message, peerId);
+        this.events.onMessage?.(message, peerId, activeSession);
       },
       onError: (error) => {
         log.error(`Transport error with ${peerId.slice(0, 16)}:`, error);
@@ -1406,32 +1437,70 @@ export class PeerRegistry extends Abject {
     });
   }
 
-  // Event callback for incoming messages (used by PeerRouter)
-  private events: { onMessage?: (msg: AbjectMessage, fromPeerId: PeerId) => void } = {};
+  private sessionsMatch(
+    left: Readonly<AuthenticatedSessionMetadata>,
+    right: AuthenticatedSessionMetadata,
+  ): boolean {
+    return left.authenticatedPeerId === right.authenticatedPeerId &&
+      left.sessionEpoch === right.sessionEpoch;
+  }
+
+  private hasActiveAuthenticatedSession(
+    peerId: PeerId,
+    transport: PeerTransport,
+    session?: AuthenticatedSessionMetadata,
+  ): boolean {
+    if (this.transports.get(peerId) !== transport || !transport.isConnected) return false;
+    const activeSession = this.authenticatedSessions.get(peerId);
+    if (!activeSession || activeSession.authenticatedPeerId !== peerId) return false;
+    return session === undefined || this.sessionsMatch(activeSession, session);
+  }
+
+  // Event callback for incoming messages (used by PeerRouter). The trailing
+  // metadata keeps existing two-argument consumers source-compatible.
+  private events: {
+    onMessage?: (
+      msg: AbjectMessage,
+      fromPeerId: PeerId,
+      session?: Readonly<AuthenticatedSessionMetadata>,
+    ) => void;
+  } = {};
 
   // Handler callbacks for SignalingRelay and PeerDiscovery objects
-  private signalingRelayHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
-  private peerDiscoveryHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
-  private peerConnectedHandler?: (peerId: string) => void;
+  private signalingRelayHandler?: (msg: AbjectMessage, fromPeerId: PeerId, session?: Readonly<AuthenticatedSessionMetadata>) => void;
+  private peerDiscoveryHandler?: (msg: AbjectMessage, fromPeerId: PeerId, session?: Readonly<AuthenticatedSessionMetadata>) => void;
+  private peerConnectedHandler?: (peerId: string, session?: Readonly<AuthenticatedSessionMetadata>) => void;
 
   /**
    * Set a handler for messages received from remote peers.
    */
-  onRemoteMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
+  onRemoteMessage(handler: (
+    msg: AbjectMessage,
+    fromPeerId: PeerId,
+    session?: Readonly<AuthenticatedSessionMetadata>,
+  ) => void): void {
     this.events.onMessage = handler;
   }
 
   /**
    * Set a handler for signaling relay messages received from remote peers.
    */
-  onSignalingRelayMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
+  onSignalingRelayMessage(handler: (
+    msg: AbjectMessage,
+    fromPeerId: PeerId,
+    session?: Readonly<AuthenticatedSessionMetadata>,
+  ) => void): void {
     this.signalingRelayHandler = handler;
   }
 
   /**
    * Set a handler for peer discovery/gossip messages received from remote peers.
    */
-  onPeerDiscoveryMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
+  onPeerDiscoveryMessage(handler: (
+    msg: AbjectMessage,
+    fromPeerId: PeerId,
+    session?: Readonly<AuthenticatedSessionMetadata>,
+  ) => void): void {
     this.peerDiscoveryHandler = handler;
   }
 
@@ -1439,7 +1508,10 @@ export class PeerRegistry extends Abject {
    * Set a direct callback for when any peer connects (contact or network).
    * Bypasses the MessageBus to avoid bootstrap race conditions.
    */
-  onPeerConnected(handler: (peerId: string) => void): void {
+  onPeerConnected(handler: (
+    peerId: string,
+    session?: Readonly<AuthenticatedSessionMetadata>,
+  ) => void): void {
     this.peerConnectedHandler = handler;
   }
 
@@ -1449,7 +1521,7 @@ export class PeerRegistry extends Abject {
    */
   async sendToPeer(peerId: PeerId, message: AbjectMessage): Promise<boolean> {
     const transport = this.transports.get(peerId);
-    if (!transport?.isConnected) return false;
+    if (!transport?.isConnected || !this.hasActiveAuthenticatedSession(peerId, transport)) return false;
     await transport.send(message);
     return true;
   }
@@ -1459,7 +1531,7 @@ export class PeerRegistry extends Abject {
    */
   hasTransportTo(peerId: PeerId): boolean {
     const transport = this.transports.get(peerId);
-    return !!transport?.isConnected;
+    return !!transport?.isConnected && this.hasActiveAuthenticatedSession(peerId, transport);
   }
 
   /**
@@ -1935,6 +2007,14 @@ export class PeerRegistry extends Abject {
 
   protected override checkInvariants(): void {
     super.checkInvariants();
+    for (const [peerId, session] of this.authenticatedSessions) {
+      invariant(session.authenticatedPeerId === peerId,
+        `Authenticated session identity must match peer ${peerId}`);
+      invariant(this.transports.has(peerId),
+        `Authenticated session for ${peerId} must have an active transport`);
+      invariant(Number.isSafeInteger(session.sessionEpoch) && session.sessionEpoch > 0,
+        `Authenticated session for ${peerId} must have a positive epoch`);
+    }
   }
 
   protected override askPrompt(_question: string): string {

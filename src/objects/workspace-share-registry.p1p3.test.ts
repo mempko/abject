@@ -102,6 +102,7 @@ const sharedWs = () => ({
   exposedObjectIds: [],
   exposedTypeIds: [],
   curated: false,
+  whitelist: ['joiner-peer'],
 });
 
 const publicCuratedWs = () => ({
@@ -253,6 +254,63 @@ test('P0: a boot-time sinceSeq=0 sync gets the whole catalog, not an empty delta
     ['SeattleWeather', 'WorkspaceRegistry'],
     `a joiner with nothing mirrored must receive the whole catalog, got: ${JSON.stringify(res)}`,
   );
+});
+
+test('P0: a peer reconnecting through catalog sync receives a later exposed-object delta', async () => {
+  const { wsr, sync } = syncSubject(sharedWs(), []);
+  const anyWsr = wsr as unknown as Record<string, unknown>;
+  // syncSubject inherits subject()'s curation-only recorder. Remove that
+  // instance stub so this regression exercises the real delta broadcaster.
+  delete anyWsr.emitCatalogDelta;
+  const remoteWsrId = 'remote-workspace-share-registry' as AbjectId;
+  const delivered: Array<{ to: AbjectId; method: string; payload: unknown }> = [];
+
+  anyWsr.localPeerId = 'host-peer';
+  anyWsr.peerRegistryId = undefined;
+  anyWsr.resolveRemoteWsr = async (peerId: string) => {
+    assert.equal(peerId, 'joiner-peer');
+    return remoteWsrId;
+  };
+  anyWsr.request = async (msg: {
+    routing: { to: AbjectId; method?: string };
+    payload: unknown;
+  }) => {
+    delivered.push({ to: msg.routing.to, method: msg.routing.method ?? '', payload: msg.payload });
+    return undefined;
+  };
+
+  // Reconnect/hydration uses catalog sync without another join_request.
+  await sync(0);
+  assert.deepEqual(
+    wsr.getActiveMembers(WS_ID).map((member) => member.peerId),
+    ['joiner-peer'],
+    'an authorised catalog sync must restore active mesh membership',
+  );
+
+  const newlyExposed = mkReg('LaterNotes', 'id-later');
+  const emit = anyWsr.emitCuratedCatalogDelta as (
+    workspaceId: string,
+    kind: string,
+    objectId: string,
+    object: ObjectRegistration,
+  ) => Promise<void>;
+  await emit.call(wsr, WS_ID, 'abject_spawned', newlyExposed.id, newlyExposed);
+
+  // emitCatalogDelta intentionally starts mesh delivery in the background.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(delivered.length, 1, 'the later catalog delta must reach the synced peer');
+  assert.equal(delivered[0]?.to, remoteWsrId);
+  assert.equal(delivered[0]?.method, 'workspace:catalog_delta');
+  assert.deepEqual(delivered[0]?.payload, {
+    workspaceId: WS_ID,
+    ownerPeerId: 'host-peer',
+    kind: 'abject_spawned',
+    seq: 1,
+    timestamp: (delivered[0]?.payload as { timestamp: number }).timestamp,
+    objectId: newlyExposed.id,
+    object: newlyExposed,
+  });
 });
 
 test('P0: a caught-up joiner (sinceSeq === currentSeq > 0) is still sent no deltas', async () => {

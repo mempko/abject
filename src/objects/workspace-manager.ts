@@ -52,21 +52,21 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 /** Infrastructure objects — always spawned for every workspace (no UI). */
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
-  'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  'GoalManager', 'JobManager', 'TaskSession', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   // ExternalProjectRegistry precedes ExternalCreator: the agent resolves it at init.
-  'ExternalProjectRegistry', 'ExternalCreator',
+  'ExternalProjectRegistry', 'ExternalCreator', 'ObjectCreator',
   // TaskReviewer discovers KnowledgeBase, so it spawns after it.
-  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'ChatManager',
+  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'AgentEvaluation', 'ChatManager',
   'Console', 'CollectionStore', 'TriggerManager',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ExternalProjectBrowser', 'ChatBrowser', 'ObjectCreator',
+  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ExternalProjectBrowser', 'ChatBrowser',
   // Taskbar resolves its optional browsers at init, so every object it offers a
   // row for has to be spawned before it.
-  'AbjectEditor', 'Taskbar',
+  'AbjectEditor', 'PeersViewer', 'Taskbar',
   'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
 ] as const;
 
@@ -664,25 +664,45 @@ export class WorkspaceManager extends Abject {
       }
     });
 
-    // Handle objectRegistered events from workspace registries
+    // Keep workspace membership and exposure in sync when Factory registers a
+    // newly spawned, cloned, or restored child with its WorkspaceRegistry.
     this.on('objectRegistered', async (msg: AbjectMessage) => {
       const registryId = msg.routing.from;
       const { id: objectId, typeId } = msg.payload as { id: string; typeId?: string };
       for (const ws of this.workspaces.values()) {
-        if (ws.registryId === registryId) {
-          if (!ws.childIds.includes(objectId as AbjectId)) {
-            ws.childIds.push(objectId as AbjectId);
-            if (typeId) {
-              ws.childTypeIds.set(objectId as AbjectId, typeId as TypeId);
-            }
-            if (ws.accessMode !== 'local') {
-              this.changed('workspaceObjectsChanged', {
-                workspaceId: ws.id, objectId,
-              });
-            }
-          }
-          break;
+        if (ws.registryId !== registryId) continue;
+
+        const childId = objectId as AbjectId;
+        let workspaceChanged = false;
+        if (!ws.childIds.includes(childId)) {
+          ws.childIds.push(childId);
+          workspaceChanged = true;
         }
+        if (typeId && ws.childTypeIds.get(childId) !== typeId) {
+          ws.childTypeIds.set(childId, typeId as TypeId);
+          workspaceChanged = true;
+        }
+
+        // Uncurated shared workspaces and joined mirrors expose newly
+        // registered children automatically. Public workspaces retain their
+        // deliberately narrow default until explicitly curated.
+        const autoExpose = ws.curated !== true
+          && (ws.accessMode === 'shared' || ws.joined === true);
+        if (autoExpose && !ws.exposedObjectIds.includes(childId)) {
+          ws.exposedObjectIds.push(childId);
+          workspaceChanged = true;
+        }
+
+        if (workspaceChanged) {
+          await this.syncExposedToRegistry(ws);
+          await this.persistWorkspaceList();
+          if (ws.accessMode !== 'local') {
+            this.changed('workspaceObjectsChanged', {
+              workspaceId: ws.id, objectId,
+            });
+          }
+        }
+        break;
       }
     });
 
@@ -1139,7 +1159,14 @@ export class WorkspaceManager extends Abject {
   }
 
   getActiveWorkspace(): {
-    id: string; name: string; registryId: string; joined?: boolean; ownerPeerId?: string;
+    id: string;
+    name: string;
+    registryId: string;
+    accessMode: WorkspaceAccessMode;
+    whitelist: string[];
+    participants: string[];
+    joined?: boolean;
+    ownerPeerId?: string;
   } | null {
     if (!this.activeWorkspaceId) return null;
     // Joined workspaces are materialized into `this.workspaces`, so this
@@ -1153,6 +1180,9 @@ export class WorkspaceManager extends Abject {
       id: this.activeWorkspaceId,
       name: ws.name,
       registryId: ws.registryId,
+      accessMode: ws.accessMode,
+      whitelist: [...ws.whitelist],
+      participants: [...(ws.participants ?? [])],
       joined: ws.joined,
       ownerPeerId: ws.ownerPeerId,
     };
@@ -1946,6 +1976,37 @@ export class WorkspaceManager extends Abject {
     }
 
     this.workspaces.set(workspaceId, info);
+
+    // AbjectStore restores persisted children before this workspace record is
+    // installed, so their objectRegistered events can be missed. Reconcile
+    // against the WorkspaceRegistry's local-only catalog after persisted policy
+    // (especially curated/joined) has been restored.
+    try {
+      const registrations = await this.request<Array<{ id: string; typeId?: string }>>(
+        request(this.id, info.registryId, 'listLocal', {})
+      );
+      let reconciled = false;
+      const autoExpose = info.curated !== true
+        && (info.accessMode === 'shared' || info.joined === true);
+      for (const registration of registrations) {
+        const childId = registration.id as AbjectId;
+        if (!info.childIds.includes(childId)) {
+          info.childIds.push(childId);
+          reconciled = true;
+        }
+        if (registration.typeId && info.childTypeIds.get(childId) !== registration.typeId) {
+          info.childTypeIds.set(childId, registration.typeId as TypeId);
+          reconciled = true;
+        }
+        if (autoExpose && !info.exposedObjectIds.includes(childId)) {
+          info.exposedObjectIds.push(childId);
+          reconciled = true;
+        }
+      }
+      if (reconciled) await this.persistWorkspaceList();
+    } catch (err) {
+      wsLog.warn(`Failed to reconcile restored children for workspace '${name}':`, err);
+    }
 
     // Notify SharedState of the workspace access mode so it knows whether to
     // sync P2P. A restored mirror is handled by activateJoinedParticipation

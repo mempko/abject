@@ -45,6 +45,63 @@ function cloneSourceData(obj: ObjectRegistration): Record<string, unknown> | und
 const WIN_W = 820;
 const WIN_H = 500;
 
+type AppExplorerProvenancedRegistration = ObjectRegistration & {
+  workspaceId?: string;
+  workspaceName?: string;
+};
+
+export interface AppExplorerPeerAttribution {
+  ownerPeerId: string;
+  peerName: string;
+  originWorkspace: string;
+}
+
+/** Preserve complete registrations while attaching direct remote-browse provenance. */
+export function normalizeAppExplorerEntries(
+  entries: ObjectRegistration[],
+  provenance: { ownerPeerId?: string; workspaceId?: string; workspaceName?: string },
+): ObjectRegistration[] {
+  if (!provenance.ownerPeerId) return entries;
+  return entries.map(entry => {
+    const attributed = entry as AppExplorerProvenancedRegistration;
+    if (attributed.ownerPeerId) return entry;
+    return {
+      ...entry,
+      ownerPeerId: provenance.ownerPeerId,
+      workspaceId: attributed.workspaceId ?? provenance.workspaceId,
+      workspaceName: attributed.workspaceName ?? provenance.workspaceName,
+    } as AppExplorerProvenancedRegistration;
+  });
+}
+
+/** Resolve attribution only when the registration itself carries peer provenance. */
+export function resolveAppExplorerPeerAttribution(
+  obj: ObjectRegistration,
+  peerNames: ReadonlyMap<string, string>,
+): AppExplorerPeerAttribution | undefined {
+  const attributed = obj as AppExplorerProvenancedRegistration;
+  const ownerPeerId = attributed.ownerPeerId;
+  if (!ownerPeerId) return undefined;
+  return {
+    ownerPeerId,
+    peerName: peerNames.get(ownerPeerId) ?? `${ownerPeerId.slice(0, 8)}...`,
+    originWorkspace: attributed.workspaceName ?? attributed.workspaceId ?? 'Unknown workspace',
+  };
+}
+
+export function appExplorerPeerAttributionLabels(
+  obj: ObjectRegistration,
+  peerNames: ReadonlyMap<string, string>,
+): string[] {
+  const attribution = resolveAppExplorerPeerAttribution(obj, peerNames);
+  if (!attribution) return [];
+  return [
+    `Owner peer ID: ${attribution.ownerPeerId}`,
+    `Peer name: ${attribution.peerName}`,
+    `Origin workspace: ${attribution.originWorkspace}`,
+  ];
+}
+
 export class AppExplorer extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
@@ -65,6 +122,7 @@ export class AppExplorer extends Abject {
   // ── Remote mode ──
   private isRemote = false;
   private remoteLabel?: string;
+  private remotePeerId?: string;
   private remoteRegistryId?: AbjectId;
 
   // ── Pane 1: Kind lists with User/System tabs ──
@@ -186,9 +244,23 @@ export class AppExplorer extends Abject {
     const regId = this.effectiveRegistryId;
     if (!regId) return [];
     try {
-      return await this.request<ObjectRegistration[]>(
+      const entries = await this.request<ObjectRegistration[]>(
         request(this.id, regId, 'list', {})
       );
+      const remotePeerId = this.remotePeerId;
+      if (!remotePeerId) return entries;
+
+      // A peer's own Registry lists its entries as local. Normalize that direct
+      // remote-browse path onto the same established provenance fields used by
+      // WorkspaceRegistry pooled entries, retaining each full registration.
+      const remoteLabelParts = this.remoteLabel?.match(/^(.*?)\s+\(([^()]*)\)$/);
+      if (remoteLabelParts?.[2]) {
+        this.sharedOwnerNames.set(remotePeerId, remoteLabelParts[2]);
+      }
+      return normalizeAppExplorerEntries(entries, {
+        ownerPeerId: remotePeerId,
+        workspaceName: remoteLabelParts?.[1] ?? this.remoteLabel,
+      });
     } catch {
       // Remote registry may be unreachable (route expired, peer disconnected)
       return [];
@@ -322,13 +394,17 @@ export class AppExplorer extends Abject {
     return obj.ownerPeerId === undefined;
   }
 
+  /** Resolve peer and workspace provenance independently of the active explorer tab. */
+  private peerAttribution(obj: ObjectRegistration): AppExplorerPeerAttribution | undefined {
+    return resolveAppExplorerPeerAttribution(obj, this.sharedOwnerNames);
+  }
+
   /** Owner column for a Shared row: peer name, short peer id, or the local user. */
   private ownerLabel(obj: ObjectRegistration): string {
     if (!obj.ownerPeerId) {
       return this.localOwnerName ? `${this.localOwnerName} (you)` : 'You';
     }
-    return this.sharedOwnerNames.get(obj.ownerPeerId)
-      ?? `${obj.ownerPeerId.slice(0, 8)}...`;
+    return this.peerAttribution(obj)?.peerName ?? `${obj.ownerPeerId.slice(0, 8)}...`;
   }
 
   /**
@@ -399,9 +475,9 @@ export class AppExplorer extends Abject {
     }
 
     this.isSharedWorkspace = joined || hosted;
-    if (this.isSharedWorkspace) {
-      await this.loadOwnerNames(activeWs.id, activeWs.ownerPeerId);
-    }
+    // Attribution is shown in every tab, so identity and peer names are loaded
+    // even when the active workspace does not need a Shared tab.
+    await this.loadOwnerNames(activeWs.id, activeWs.ownerPeerId);
   }
 
   /** Cache peerId → display name for the Shared tab's owner column. */
@@ -461,13 +537,14 @@ export class AppExplorer extends Abject {
     });
 
     this.on('browseRemote', async (msg: AbjectMessage) => {
-      const { registryId, label } = msg.payload as {
+      const { registryId, peerId, label } = msg.payload as {
         registryId: AbjectId;
         peerId: string;
         label: string;
       };
       this.isRemote = true;
       this.remoteLabel = label;
+      this.remotePeerId = peerId;
       this.remoteRegistryId = registryId;
 
       try {
@@ -854,11 +931,12 @@ export class AppExplorer extends Abject {
       text: manifest.name,
       style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' } });
 
-    // Owner (Shared tab only)
-    if (this.selectedKindTab === 2) {
+    // Render entry-derived peer provenance in every tab and mode. Local entries
+    // have no attribution labels; direct remote entries were normalized on read.
+    for (const text of appExplorerPeerAttributionLabels(inst, this.sharedOwnerNames)) {
       specs.push({ type: 'label', windowId, rect: r0,
-        text: `Owner: ${this.ownerLabel(inst)}`,
-        style: { color: this.theme.sectionLabel, fontSize: 11 } });
+        text,
+        style: { color: this.theme.sectionLabel, fontSize: 11, selectable: true } });
     }
 
     // Description

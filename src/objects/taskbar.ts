@@ -28,6 +28,7 @@ export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
   private appExplorerId?: AbjectId;
   private chatBrowserId?: AbjectId;
+  private peersViewerId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private webBrowserViewerId?: AbjectId;
   private goalBrowserId?: AbjectId;
@@ -37,6 +38,7 @@ export class Taskbar extends Abject {
   private fileManagerId?: AbjectId;
   private externalProjectBrowserId?: AbjectId;
   private registryId?: AbjectId;
+  private workspaceManagerId?: AbjectId;
   private windowManagerId?: AbjectId;
 
   /** Sidebar dock window + this rail's section layout (pushed via show()). */
@@ -139,6 +141,7 @@ can restore windows from the sidebar.
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.appExplorerId = await this.requireDep('AppExplorer');
     this.chatBrowserId = await this.requireDep('ChatBrowser');
+    this.peersViewerId = await this.requireDep('PeersViewer');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
     this.goalBrowserId = await this.discoverDep('GoalBrowser') ?? undefined;
@@ -148,6 +151,7 @@ can restore windows from the sidebar.
     this.fileManagerId = await this.discoverDep('FileManager') ?? undefined;
     this.externalProjectBrowserId = await this.discoverDep('ExternalProjectBrowser') ?? undefined;
     this.registryId = await this.requireDep('Registry');
+    this.workspaceManagerId = await this.requireDep('WorkspaceManager');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
     if (this.registryId) {
@@ -183,6 +187,10 @@ can restore windows from the sidebar.
         // Update single button style in-place (no rebuild)
         const fromId = msg.routing.from;
         await this.updateButtonStyle(fromId, !!value);
+        return;
+      }
+      if (aspect === 'workspaceAccessChanged') {
+        this.scheduleRebuild();
         return;
       }
       if (aspect !== 'click') return;
@@ -311,6 +319,15 @@ can restore windows from the sidebar.
   private async populateContent(): Promise<void> {
     const collapsed = this.collapsed;
     const showableObjects = collapsed ? [] : await this.discoverShowableObjects();
+    const activeWorkspace = await this.request<{
+      accessMode: 'local' | 'shared' | 'public';
+      joined?: boolean;
+    } | null>(request(this.id, this.workspaceManagerId!, 'getActiveWorkspace', {}));
+    // Joined workspace records intentionally persist as local so they are never
+    // advertised as hosted here, but they are shared workspaces in the UI.
+    const showPeers = activeWorkspace?.joined === true
+      || activeWorkspace?.accessMode === 'shared'
+      || activeWorkspace?.accessMode === 'public';
 
     // No blocking getState queries. Buttons render unstyled immediately.
     // Visibility events from system objects update styles via updateButtonStyle().
@@ -365,6 +382,10 @@ can restore windows from the sidebar.
     if (!collapsed) {
       // Chat (opens ChatBrowser overview)
       specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCAC', 'Chat'), style: rowStyle('Chat') });
+      // Peers is meaningful only for shared/public (including joined) workspaces.
+      if (showPeers) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDC65', 'Peers'), style: rowStyle('Peers') });
+      }
       // Goals (optional)
       if (this.goalBrowserId) {
         specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83C\uDFAF', 'Goals'), style: rowStyle('Goals') });
@@ -430,6 +451,7 @@ can restore windows from the sidebar.
     if (!collapsed) {
       let idx = sysRowStartIdx;
       this.systemButtons.set(widgetIds[idx++], this.chatBrowserId!);
+      if (showPeers) this.systemButtons.set(widgetIds[idx++], this.peersViewerId!);
       if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
       this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
       if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);

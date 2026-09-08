@@ -12,7 +12,7 @@ import { AbjectMessage } from '../core/types.js';
 import { require as precondition, ContractViolation } from '../core/contracts.js';
 import { serialize, deserialize, validateMessageShape } from '../core/message.js';
 import { WireEncoder, WireDecoder } from './wire-codec.js';
-import { Transport, TransportConfig } from './transport.js';
+import { Transport, TransportConfig, type AuthenticatedSessionMetadata } from './transport.js';
 import type { PeerId } from '../core/identity.js';
 import {
   importExchangePublicKey,
@@ -62,6 +62,17 @@ const CHUNK_REASSEMBLY_TIMEOUT = 30_000; // 30s to receive all chunks
 const CHUNK_REASSEMBLY_WARN_AT = 8_000;  // warn after 8s if still waiting
 const CONNECTION_TIMEOUT = 20_000; // 20s max to establish DataChannel
 
+// Epochs are receiver-local and peer-scoped rather than transport-instance
+// scoped: PeerRegistry may replace a PeerTransport object during reconnect.
+const sessionEpochs = new Map<string, number>();
+
+function nextSessionEpoch(localPeerId: PeerId, remotePeerId: PeerId): number {
+  const key = `${localPeerId}\0${remotePeerId}`;
+  const next = (sessionEpochs.get(key) ?? 0) + 1;
+  sessionEpochs.set(key, next);
+  return next;
+}
+
 export interface PeerTransportConfig extends TransportConfig {
   localPeerId: PeerId;
   remotePeerId: PeerId;
@@ -94,7 +105,11 @@ export class PeerTransport extends Transport {
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private offerGeneration = 0;  // incremented on each new SDP offer/answer cycle
   private pingInterval?: ReturnType<typeof setInterval>;
-  private lastPongReceived: number = 0;
+  private authenticatedSession?: AuthenticatedSessionMetadata;
+  private authenticatedChannel?: RTCDataChannel;
+  private lastAuthenticatedTrafficAt = 0;
+  private leaseDisconnectEpoch?: number;
+  private lastDisconnectedSessionEpoch = 0;
   private chunkCounter = 0;
   private pendingChunks: Map<string, { total: number; parts: Map<number, Uint8Array>; size: number; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
   private connectionTimer?: ReturnType<typeof setTimeout>;
@@ -286,6 +301,9 @@ export class PeerTransport extends Transport {
     if (this.connectionTimer) { clearTimeout(this.connectionTimer); this.connectionTimer = undefined; }
     this.sessionKey = undefined;
     this.handshakeState = 'none';
+    this.authenticatedSession = undefined;
+    this.authenticatedChannel = undefined;
+    this.leaseDisconnectEpoch = undefined;
     // Clear stale candidates from previous negotiation context.
     // Old candidates have ufrag/pwd that won't match the new offer,
     // causing libdatachannel to reject the SDP with "Invalid ICE settings".
@@ -294,28 +312,34 @@ export class PeerTransport extends Transport {
   }
 
   async disconnect(): Promise<void> {
+    this.disconnectCurrentSession('Client disconnect');
+  }
+
+  /** Close the current connection and funnel cleanup/events through handleDisconnect. */
+  private disconnectCurrentSession(reason: string): void {
+    const session = this.authenticatedSession;
     this.stopPing();
     if (this.connectionTimer) { clearTimeout(this.connectionTimer); this.connectionTimer = undefined; }
-    this.sessionKey = undefined;
-    this.handshakeState = 'none';
     this.pendingCandidates = [];
     if (this.dataChannel) {
-      this.dataChannel.onopen = null;
-      this.dataChannel.onclose = null;
-      this.dataChannel.onerror = null;
-      this.dataChannel.onmessage = null;
-      this.dataChannel.close();
+      const dc = this.dataChannel;
       this.dataChannel = undefined;
+      dc.onopen = null;
+      dc.onclose = null;
+      dc.onerror = null;
+      dc.onmessage = null;
+      dc.close();
     }
     if (this.peerConnection) {
-      this.peerConnection.oniceconnectionstatechange = null;
-      this.peerConnection.ondatachannel = null;
-      this.peerConnection.onicecandidate = null;
-      this.peerConnection.ontrack = null;
-      this.peerConnection.close();
+      const pc = this.peerConnection;
       this.peerConnection = undefined;
+      pc.oniceconnectionstatechange = null;
+      pc.ondatachannel = null;
+      pc.onicecandidate = null;
+      pc.ontrack = null;
+      pc.close();
     }
-    this.handleDisconnect('Client disconnect');
+    this.handleDisconnect(reason, session);
   }
 
   /**
@@ -522,9 +546,10 @@ export class PeerTransport extends Transport {
   // ==========================================================================
 
   private createPeerConnection(): void {
-    this.peerConnection = new RTCPeerConnection({
+    const pc = new RTCPeerConnection({
       iceServers: this.iceServers,
     });
+    this.peerConnection = pc;
 
     // [ICE-DIAG] Log the ICE servers actually applied to this connection so we
     // can confirm TURN creds reached the transport.
@@ -568,10 +593,11 @@ export class PeerTransport extends Transport {
     };
 
     // Handle ICE connection state changes
-    this.peerConnection.oniceconnectionstatechange = () => {
-      const state = this.peerConnection?.iceConnectionState;
+    pc.oniceconnectionstatechange = () => {
+      if (this.peerConnection !== pc) return;
+      const state = pc.iceConnectionState;
       if (state === 'failed' || state === 'closed') {
-        this.handleDisconnect(`ICE ${state}`);
+        this.handleDisconnect(`ICE ${state}`, this.authenticatedSession);
       } else if (state === 'disconnected') {
         // Temporary disconnection (network blip, laptop sleep/wake).
         // Wait 3s, then disconnect if still not recovered.
@@ -580,17 +606,18 @@ export class PeerTransport extends Transport {
         // a timed disconnect that triggers fast reconnect in PeerRegistry.
         log.info(`ICE disconnected for ${this.remotePeerId.slice(0, 16)}, waiting 3s for recovery...`);
         setTimeout(() => {
-          if (this.peerConnection?.iceConnectionState === 'disconnected') {
-            this.handleDisconnect('ICE disconnected (no recovery)');
+          if (this.peerConnection === pc && pc.iceConnectionState === 'disconnected') {
+            this.handleDisconnect('ICE disconnected (no recovery)', this.authenticatedSession);
           }
         }, 3_000);
       }
     };
 
     // Callee side: handle incoming DataChannel
-    this.peerConnection.ondatachannel = (event) => {
+    pc.ondatachannel = (event) => {
+      if (this.peerConnection !== pc) return;
       this.dataChannel = event.channel;
-      this.setupDataChannel(this.dataChannel);
+      this.setupDataChannel(event.channel);
     };
 
     // Handle incoming media tracks (for MediaStream capability)
@@ -606,7 +633,7 @@ export class PeerTransport extends Transport {
 
     let opened = false;
     const onOpen = () => {
-      if (opened) return;
+      if (opened || this.dataChannel !== dc) return;
       opened = true;
       // Clear connection timeout — DataChannel is open
       if (this.connectionTimer) {
@@ -616,34 +643,44 @@ export class PeerTransport extends Transport {
       log.info(`DataChannel open with ${this.remotePeerId.slice(0, 16)}`);
       // Don't call handleConnect() here — defer until handshake completes
       // so PeerRouter knows about the connection before messages arrive.
-      this.startHandshake();
+      this.startHandshake(dc);
     };
 
     dc.onopen = onOpen;
 
     dc.onclose = () => {
-      this.handleDisconnect('DataChannel closed');
+      if (this.dataChannel !== dc) return;
+      this.handleDisconnect('DataChannel closed', this.currentSessionFor(dc));
     };
 
     dc.onerror = (event) => {
+      if (this.dataChannel !== dc) return;
       this.handleError(new Error(`DataChannel error: ${event}`));
     };
 
     dc.onmessage = (event) => {
+      // Reject a superseded channel synchronously, before Blob conversion,
+      // chunk assembly, crypto, codec state, or higher-level dispatch.
+      if (this.dataChannel !== dc) return;
       const d = event.data as unknown;
       // onmessage fires in channel order, but handling is async (AES-GCM
       // decrypt has no cross-call ordering guarantee). The wire codec is
       // stateful, so decode must happen in arrival order — serialize handling
       // through the receive chain, mirroring enqueueSend on the send side.
       if (typeof d === 'string') {
-        this.enqueueRecv(() => this.handleIncomingString(d));
+        this.enqueueRecv(() => this.handleIncomingString(d, dc));
       } else if (d instanceof ArrayBuffer) {
-        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array(d)));
+        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array(d), dc));
       } else if (ArrayBuffer.isView(d)) {
-        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength)));
+        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength), dc));
       } else if (d && typeof (d as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer === 'function') {
         // Blob fallback (some WebRTC stacks deliver binary as Blob)
-        this.enqueueRecv(async () => this.handleIncomingBinary(new Uint8Array(await (d as Blob).arrayBuffer())));
+        this.enqueueRecv(async () => {
+          if (this.dataChannel !== dc) return;
+          const bytes = new Uint8Array(await (d as Blob).arrayBuffer());
+          if (this.dataChannel !== dc) return;
+          await this.handleIncomingBinary(bytes, dc);
+        });
       } else {
         log.warn(`unexpected DataChannel message type: ${typeof d}`);
       }
@@ -659,7 +696,8 @@ export class PeerTransport extends Transport {
   /**
    * Start the identity handshake by sending our public keys.
    */
-  private startHandshake(): void {
+  private startHandshake(dc: RTCDataChannel): void {
+    if (this.dataChannel !== dc) return;
     this.handshakeState = 'awaiting-keys';
     const handshakeMsg = JSON.stringify({
       handshake: true,
@@ -705,29 +743,37 @@ export class PeerTransport extends Transport {
    * or (during handshake) an unencrypted AbjectMessage. All encrypted payloads
    * arrive as binary frames via handleIncomingBinary().
    */
-  private async handleIncomingString(data: string): Promise<void> {
+  private async handleIncomingString(data: string, dc: RTCDataChannel): Promise<void> {
     try {
+      if (this.dataChannel !== dc) return;
       const parsed = JSON.parse(data);
 
+      if (parsed.handshake) {
+        await this.handleHandshakeMessage(parsed, dc);
+        return;
+      }
+
+      const session = this.currentSessionFor(dc);
+      if (!session) {
+        log.warn(`dropping unauthenticated DataChannel traffic from ${this.remotePeerId.slice(0, 16)}`);
+        return;
+      }
+
       if (parsed.ping) {
+        this.refreshAuthenticatedLease(dc, session);
         this.trySend(JSON.stringify({ pong: true, ts: parsed.ts }));
         return;
       }
       if (parsed.pong) {
-        this.lastPongReceived = Date.now();
+        this.refreshAuthenticatedLease(dc, session);
         return;
       }
 
-      if (parsed.handshake) {
-        await this.handleHandshakeMessage(parsed);
-        return;
-      }
-
-      // Pre-handshake unencrypted AbjectMessage
       const message = deserialize(data);
+      if (!this.refreshAuthenticatedLease(dc, session)) return;
       this.logRecv('unencrypted', message);
       if (this.events.onMessage) {
-        this.events.onMessage(message);
+        this.events.onMessage(message, session);
       } else {
         this.logDroppedNoConsumer(message);
       }
@@ -742,15 +788,17 @@ export class PeerTransport extends Transport {
    * top of this file. Reassembles chunks, decrypts, decompresses, and
    * dispatches via onMessage (AbjectMessage) or onRawMessage (UI bytes).
    */
-  private async handleIncomingBinary(frame: Uint8Array): Promise<void> {
+  private async handleIncomingBinary(frame: Uint8Array, dc: RTCDataChannel): Promise<void> {
     try {
+      const session = this.currentSessionFor(dc);
+      if (!session) return;
       if (frame.byteLength === 0) return;
       const type = frame[0];
 
       if (type === FRAME_CHUNK) {
         const reassembled = this.handleChunk(frame);
         if (!reassembled) return;
-        await this.handleIncomingBinary(reassembled);
+        await this.handleIncomingBinary(reassembled, dc);
         return;
       }
 
@@ -760,14 +808,19 @@ export class PeerTransport extends Transport {
         return;
       }
 
-      if (!this.sessionKey) {
+      const sessionKey = this.sessionKey;
+      if (!sessionKey) {
         log.warn(`recv encrypted binary from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
         return;
       }
 
       const iv = frame.subarray(1, 13);
       const ciphertext = frame.subarray(13);
-      let plaintext = await aesDecryptBytes(this.sessionKey, iv, ciphertext);
+      let plaintext = await aesDecryptBytes(sessionKey, iv, ciphertext);
+      // Authentication/decryption is asynchronous. Re-check before any codec,
+      // decompression, lease, or dispatch mutation in case reconnect won.
+      if (!this.isCurrentSession(dc, session)) return;
+      this.refreshAuthenticatedLease(dc, session);
       if (type === FRAME_ENC_MSG_GZ || type === FRAME_ENC_RAW_GZ) {
         plaintext = inflateSync(plaintext);
       }
@@ -780,7 +833,7 @@ export class PeerTransport extends Transport {
       const message = validateMessageShape(this.wireDec.decodeFrame(plaintext));
       this.logRecv('encrypted', message);
       if (this.events.onMessage) {
-        this.events.onMessage(message);
+        this.events.onMessage(message, session);
       } else {
         this.logDroppedNoConsumer(message);
       }
@@ -852,9 +905,11 @@ export class PeerTransport extends Transport {
     peerId: string;
     publicSigningKey: string;
     publicExchangeKey: string;
-  }): Promise<void> {
+  }, dc: RTCDataChannel): Promise<void> {
+    if (this.dataChannel !== dc || this.authenticatedChannel === dc) return;
     // Verify the peer's identity
     const computedPeerId = await derivePeerIdFromJwk(msg.publicSigningKey);
+    if (this.dataChannel !== dc) return;
     if (computedPeerId !== msg.peerId) {
       log.error(`PeerId verification failed for ${msg.peerId.slice(0, 16)}`);
       await this.disconnect();
@@ -869,7 +924,9 @@ export class PeerTransport extends Transport {
 
     // Import remote exchange key and derive session key
     const remoteExchangeKey = await importExchangePublicKey(msg.publicExchangeKey);
-    this.sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
+    const sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
+    if (this.dataChannel !== dc) return;
+    this.sessionKey = sessionKey;
 
     // Reset the wire codec pair for this session. The codec is stateful and the
     // two peers share a growing intern table that must start empty together.
@@ -885,31 +942,62 @@ export class PeerTransport extends Transport {
     this.wireDec = new WireDecoder();
 
     this.handshakeState = 'encrypted';
-    log.info(`Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
+    const session: AuthenticatedSessionMetadata = {
+      authenticatedPeerId: this.remotePeerId,
+      sessionEpoch: nextSessionEpoch(this.localPeerId, this.remotePeerId),
+    };
+    this.authenticatedSession = session;
+    this.authenticatedChannel = dc;
+    this.leaseDisconnectEpoch = undefined;
+    this.lastAuthenticatedTrafficAt = Date.now();
+    log.info(`Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established (epoch ${session.sessionEpoch})`);
 
     // NOW signal connected — after identity is verified and encryption
     // is established. This ensures PeerRouter learns about the connection
     // (via contactConnected) before any application-level messages arrive.
-    this.handleConnect();
-    this.startPing();
+    this.handleConnect(session);
+    this.startPing(session, dc);
   }
 
   /**
    * Start periodic ping to detect dead connections.
    */
-  private startPing(): void {
+  private startPing(session: AuthenticatedSessionMetadata, dc: RTCDataChannel): void {
     this.stopPing();
-    this.lastPongReceived = Date.now();
+    this.lastAuthenticatedTrafficAt = Date.now();
 
     this.pingInterval = setInterval(() => {
-      if (Date.now() - this.lastPongReceived > this.config.heartbeatInterval * PONG_MISS_LIMIT) {
-        log.warn(`No pong from ${this.remotePeerId.slice(0, 16)} in ${PONG_MISS_LIMIT} intervals, disconnecting`);
-        this.disconnect().catch(console.error);
+      if (!this.isCurrentSession(dc, session)) {
+        this.stopPing();
+        return;
+      }
+      if (Date.now() - this.lastAuthenticatedTrafficAt > this.config.heartbeatInterval * PONG_MISS_LIMIT) {
+        if (this.leaseDisconnectEpoch === session.sessionEpoch) return;
+        this.leaseDisconnectEpoch = session.sessionEpoch;
+        log.warn(`Authenticated traffic lease expired for ${this.remotePeerId.slice(0, 16)} at epoch ${session.sessionEpoch}, disconnecting`);
+        this.disconnectCurrentSession('Authenticated traffic lease expired');
         return;
       }
 
       this.trySend(JSON.stringify({ ping: true, ts: Date.now() }));
     }, this.config.heartbeatInterval);
+  }
+
+  private currentSessionFor(dc: RTCDataChannel): AuthenticatedSessionMetadata | undefined {
+    if (this.dataChannel !== dc || this.authenticatedChannel !== dc) return undefined;
+    return this.authenticatedSession;
+  }
+
+  private isCurrentSession(dc: RTCDataChannel, session: AuthenticatedSessionMetadata): boolean {
+    const current = this.currentSessionFor(dc);
+    return current?.sessionEpoch === session.sessionEpoch
+      && current.authenticatedPeerId === session.authenticatedPeerId;
+  }
+
+  private refreshAuthenticatedLease(dc: RTCDataChannel, session: AuthenticatedSessionMetadata): boolean {
+    if (!this.isCurrentSession(dc, session)) return false;
+    this.lastAuthenticatedTrafficAt = Date.now();
+    return true;
   }
 
   /**
@@ -925,13 +1013,26 @@ export class PeerTransport extends Transport {
   /**
    * Override to clean up ping timer on any disconnection path.
    */
-  protected override handleDisconnect(reason?: string): void {
+  protected override handleDisconnect(reason?: string, session?: AuthenticatedSessionMetadata): void {
+    if (session) {
+      if (this.authenticatedSession && this.authenticatedSession.sessionEpoch !== session.sessionEpoch) return;
+      if (session.sessionEpoch <= this.lastDisconnectedSessionEpoch) return;
+      this.lastDisconnectedSessionEpoch = session.sessionEpoch;
+    } else if (this.state === 'disconnected') {
+      return;
+    }
     this.stopPing();
     for (const [, entry] of this.pendingChunks) {
       clearTimeout(entry.timer);
       clearTimeout(entry.warnTimer);
     }
     this.pendingChunks.clear();
-    super.handleDisconnect(reason);
+    this.sessionKey = undefined;
+    this.handshakeState = 'none';
+    if (!session || this.authenticatedSession?.sessionEpoch === session.sessionEpoch) {
+      this.authenticatedSession = undefined;
+      this.authenticatedChannel = undefined;
+    }
+    super.handleDisconnect(reason, session);
   }
 }
