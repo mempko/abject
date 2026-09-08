@@ -205,7 +205,7 @@ decisions belong to ScrumMaster.
   private async sweep(): Promise<void> {
     if (!this.goalManagerId) return;
 
-    let goals: Array<{ id: string; status: string; updatedAt: number }>;
+    let goals: Array<{ id: string; status: string; updatedAt: number; createdAt?:number; lastMeaningfulProgressAt?:number }>;
     try {
       goals = await this.request<Array<{ id: string; status: string; updatedAt: number }>>(
         request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
@@ -220,8 +220,14 @@ decisions belong to ScrumMaster.
 
     for (const goal of goals) {
       // Stale check
-      const age = now - goal.updatedAt;
+      const age = now - (goal.lastMeaningfulProgressAt ?? goal.createdAt ?? goal.updatedAt);
       if (age >= this.staleFailMs) {
+        const runtime=await this.discoverDep('AgentAbject');
+        const health=runtime?await this.request<{ownedWorkActive:boolean}>(request(this.id,runtime,'getGoalExecutionHealth',{goalId:goal.id})).catch(()=>null):null;
+        if (health?.ownedWorkActive) {
+          if(!this.warningsIssued.has(goal.id)){this.warningsIssued.add(goal.id);this.changed('goalWarning',{goalId:goal.id,reason:'No recent accepted evidence; runtime still owns active work',health});}
+          continue;
+        }
         log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min — auto-failing`);
         await this.autoFailGoal(goal.id, `Goal stale for ${Math.round(age / 60000)} minutes with no progress`);
         continue;

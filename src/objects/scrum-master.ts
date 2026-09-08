@@ -40,6 +40,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { withKeyedLock } from '../core/keyed-lock.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
@@ -173,6 +174,7 @@ export class ScrumMaster extends Abject {
     agentId: AbjectId;
     description: string;
     blockers: Set<string>;
+    priority: number;
     /** Concrete target object, threaded to executeTask when finally enqueued. */
     target?: string;
   }>();
@@ -184,6 +186,9 @@ export class ScrumMaster extends Abject {
    * cleanly abandoned (nothing was written to TupleSpace).
    * Keyed by the OTA task id.
    */
+  private recoveryTimer?: ReturnType<typeof setInterval>;
+  private recoveringDispatches = false;
+  private recoveredEnqueues = new Set<string>();
   private scrumInFlight = new Map<string, {
     goalId: string;
     staged: StagedTask[];
@@ -194,6 +199,7 @@ export class ScrumMaster extends Abject {
      * the next decision point.
      */
     interjectionsUpTo?: number;
+    planRevision?: number;
   }>();
 
   /**
@@ -316,6 +322,7 @@ export class ScrumMaster extends Abject {
         description: 'Scrum facilitator. Runs scrum meetings for goal-driven sprints.',
         canExecute: false,
         config: {
+          snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
           maxSteps: 12,
           timeout: 300000,
           terminalActions: {
@@ -332,10 +339,13 @@ export class ScrumMaster extends Abject {
       }),
     ).catch(err => log.warn(`registerAgent failed: ${err instanceof Error ? err.message : String(err)}`));
 
+    this.recoveryTimer = setInterval(() => { void this.recoverDispatches().catch(err => log.warn(`Dispatch recovery: ${String(err)}`)); }, 10000);
+    this.recoveryTimer.unref?.();
     log.info('Initialized; registered as Agent and subscribed to GoalManager events');
   }
 
   protected override async onStop(): Promise<void> {
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
     for (const timer of this.scrumRetryTimers) clearTimeout(timer);
     this.scrumRetryTimers.clear();
     for (const timer of this.interjectionTimers.values()) clearTimeout(timer);
@@ -344,6 +354,16 @@ export class ScrumMaster extends Abject {
   }
 
   private setupHandlers(): void {
+    this.on('snapshotTask', msg => {
+      const { taskId } = msg.payload as { taskId: string };
+      return { inflight: this.scrumInFlight.get(taskId) };
+    });
+    this.on('restoreTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore Scrum state');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: { inflight?: { goalId: string; staged: StagedTask[]; planRevision?: number; interjectionsUpTo?: number } } };
+      if (snapshot?.inflight) this.scrumInFlight.set(taskId, structuredClone(snapshot.inflight));
+      return { success: true };
+    });
     // GoalManager event subscription. Two triggers enqueue a fresh scrum task;
     // taskCompleted/taskPermanentlyFailed drive dep tracking.
     this.on('changed', async (msg: AbjectMessage) => {
@@ -398,6 +418,9 @@ export class ScrumMaster extends Abject {
         await this.enqueueScrumTask(goalId, scrumNumber).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         );
+      } else if (aspect === 'observationRecorded') {
+        const { goalId, observation } = value as { goalId: string; observation: { material?: boolean } };
+        if (observation?.material) this.scheduleInterjectionCheck(goalId);
       } else if (aspect === 'goalInterjection') {
         // The user typed something while the goal ran. Debounce, then — if
         // no scrum for this goal is about to weigh it anyway — run a
@@ -439,8 +462,8 @@ export class ScrumMaster extends Abject {
     // Without this, the queue stalls — the runner pops the task, sends
     // `executeTask`, gets nothing back, and the OTA loop never starts.
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, taskId: explicitTaskId, goalId, description } = msg.payload as {
-        tupleId: string; taskId?: string; goalId?: string; description: string;
+      const { tupleId, dispatchTupleId, taskId: explicitTaskId, goalId, description } = msg.payload as {
+        tupleId?: string; dispatchTupleId?: string; taskId?: string; goalId?: string; description: string;
       };
       const taskId = explicitTaskId ?? tupleId ?? `scrum-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -459,7 +482,7 @@ export class ScrumMaster extends Abject {
             taskId,
             task: description,
             goalId,
-            dispatchTupleId: tupleId,
+            dispatchTupleId,
             config: {
               maxSteps: 12,
               timeout: 300000,
@@ -485,8 +508,8 @@ export class ScrumMaster extends Abject {
 
     // Agent-callback handlers. AgentAbject's runStateMachine calls these
     // for tasks queued under our agentId.
-    this.on('agentObserve', async (msg: AbjectMessage) => this.handleObserve(msg));
-    this.on('agentAct', async (msg: AbjectMessage) => this.handleAct(msg));
+    this.on('agentObserve', async (msg: AbjectMessage) => { await this.requireTaskRuntime(msg,this.agentAbjectId); return this.handleObserve(msg); });
+    this.on('agentAct', async (msg: AbjectMessage) => { await this.requireTaskRuntime(msg,this.agentAbjectId); return this.handleAct(msg); });
 
     // taskResult fires when our own scrum task terminates. Terminal actions
     // (complete_goal / fail_goal / dispatch_scrum) skip AgentAbject's
@@ -495,7 +518,8 @@ export class ScrumMaster extends Abject {
     // (addTask + enqueue for dispatch, completeGoal for done, failGoal for
     // fail) have to happen HERE, gated on `lastAction.action`. This listener
     // is the canonical "scrum cycle terminated, do the commit step" hook.
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
       const payload = msg.payload as {
         ticketId: string;
         success?: boolean;
@@ -503,12 +527,17 @@ export class ScrumMaster extends Abject {
         lastAction?: { action: string; [k: string]: unknown };
       };
 
-      // Run the terminal action's side effect before resolving the ticket.
-      try {
-        await this.executeTerminalAction(payload.ticketId, payload.lastAction);
-      } catch (err) {
-        log.warn(`executeTerminalAction failed for ${payload.ticketId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      // A failed commit must reject delivery so the durable outbox retries it.
+      await withKeyedLock(`${this.id}:scrum-commit`, async () => {
+        const goalId = await this.lookupGoalIdForOTATask(payload.ticketId);
+        if (goalId && this.goalManagerId) {
+          const goal = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+          if (goal?.scratchpad?.[`learning/commit/${payload.ticketId}`]) return;
+          await this.executeTerminalAction(payload.ticketId, payload.lastAction);
+          await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId }));
+        } else await this.executeTerminalAction(payload.ticketId, payload.lastAction);
+      });
+      this.retainTaskResult(payload);
 
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) pending.resolve(payload);
@@ -532,8 +561,11 @@ export class ScrumMaster extends Abject {
     });
 
     // Forward progress events to reset our pending-ticket inactivity timers.
-    this.on('progress', () => {
-      for (const [, entry] of this.pendingTickets) {
+    this.on('progress', msg => {
+      const taskId=(msg.payload as {taskId?:string})?.taskId;
+      if(!taskId)return;
+      const pending=this.pendingTickets.get(taskId);
+      for (const entry of pending?[pending]:[]) {
         clearTimeout(entry.timer);
         entry.timer = setTimeout(() => {
           // Re-arm timeout — only fires if NO further progress lands.
@@ -548,6 +580,8 @@ export class ScrumMaster extends Abject {
     ticketId: string,
     timeout: number,
   ): Promise<{ success: boolean; result?: unknown; error?: string }> {
+    const early=this.takeTaskResult<any>(ticketId);
+    if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -601,14 +635,17 @@ export class ScrumMaster extends Abject {
 
     log.info(`Enqueuing scrum task for goal ${goalId.slice(0, 8)} (after round ${priorScrumNumber}${attempt > 1 ? `, retry attempt ${attempt}` : ''})`);
 
-    const { taskId } = await this.request<{ taskId: string }>(
-      request(this.id, this.agentAbjectId, 'enqueueTask', {
-        agentId: this.id,
-        task: taskDesc,
-        goalId,
-      }),
-    );
+    const taskId = `scrum-${crypto.randomUUID()}`;
     this.scrumAttempts.set(taskId, { goalId, priorScrumNumber, attempt });
+    try {
+      await this.request<{ taskId: string }>(request(this.id, this.agentAbjectId, 'enqueueTask', {
+        agentId: this.id, taskId, task: taskDesc, goalId,
+      }));
+    } catch (err) {
+      this.scrumAttempts.delete(taskId);
+      this.scrummedRounds.delete(roundKey);
+      throw err;
+    }
   }
 
   /**
@@ -649,8 +686,8 @@ export class ScrumMaster extends Abject {
         this.send(event(this.id, this.goalManagerId, 'failGoal', {
           goalId,
           error: `Scrum review failed ${attempt} times in a row (last error: ${(error ?? 'unknown').slice(0, 200)}). ` +
-            `The goal cannot advance without a working scrum — this usually means the LLM provider is down or misconfigured. ` +
-            `Fix the provider (Settings → AI) and re-ask.`,
+            `The goal cannot advance without a working scrum. ` +
+            `Resolve the reported error in the model provider or runtime service, then retry the goal.`,
         }));
       }
       return;
@@ -748,7 +785,11 @@ export class ScrumMaster extends Abject {
     if (!this.goalManagerId || !this.agentAbjectId) return;
 
     const pending = await this.pendingInterjections(goalId);
-    if (pending === 0) return; // already weighed by a boundary scrum
+    const observationGoal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+    const observations = Object.entries(observationGoal?.scratchpad ?? {}).filter(([k, v]) => k.startsWith('learning/observation/') && (v as { material?: boolean })?.material);
+    const lastPlan = ((observationGoal?.scratchpad?.['learning/plans'] as Array<{ at: number }>) ?? []).at(-1);
+    const hasDiscovery = observations.some(([, v]) => ((v as { at?: number }).at ?? 0) > (lastPlan?.at ?? 0));
+    if (pending === 0 && !hasDiscovery) return;
 
     const goal = await this.request<{ status?: string; currentScrumNumber?: number } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
@@ -767,8 +808,8 @@ export class ScrumMaster extends Abject {
       request(this.id, this.agentAbjectId, 'enqueueTask', {
         agentId: this.id,
         task:
-          `Interjection check for goal ${goalId.slice(0, 8)}: the user sent new message(s) while agents are working. ` +
-          `Weigh the pending userInterjections in the goal state against the plan and in-flight work. ` +
+          `Interjection check for goal ${goalId.slice(0, 8)}: new steering or material discoveries arrived while agents are working. ` +
+          `Weigh pending userInterjections and material observations against the plan and in-flight work. Ask affected collaborators what changed and what experiment would distinguish explanations. ` +
           `If the current work already covers them, continue_scrum. If they change the plan, stage tasks and dispatch_scrum ` +
           `(outstanding tasks are cancelled automatically). If they mean stop, fail_goal with a friendly explanation. ` +
           `If they are ambiguous, ask_user.`,
@@ -808,6 +849,7 @@ export class ScrumMaster extends Abject {
         const notes = snap.data.userInterjections as Array<{ at: number; status: string }> | undefined;
         const pendingNotes = (notes ?? []).filter(n => n.status === 'pending');
         const inFlightEntry = this.scrumInFlight.get(taskId);
+        if (inFlightEntry) inFlightEntry.planRevision = Number(snap.data.planRevision ?? 0);
         if (inFlightEntry && pendingNotes.length > 0) {
           inFlightEntry.interjectionsUpTo = Math.max(...pendingNotes.map(n => n.at));
         }
@@ -868,7 +910,7 @@ export class ScrumMaster extends Abject {
     try {
       switch (action.action) {
         case 'review_scrum':
-          return await this.actReviewScrum(goalId);
+          return await this.actReviewScrum(goalId, taskId);
         case 'poll_team':
           return await this.actPollTeam(goalId, action);
         case 'add_task':
@@ -953,11 +995,11 @@ export class ScrumMaster extends Abject {
         return;
       case 'dispatch_scrum':
         await markIncorporated();
-        await this.commitDispatchScrum(otaTaskId, goalId);
+        await this.commitDispatchScrum(otaTaskId, goalId, normalized);
         return;
       case 'quick_dispatch':
         await markIncorporated();
-        await this.commitQuickDispatch(goalId, normalized);
+        await this.commitQuickDispatch(goalId, normalized, otaTaskId);
         return;
       case 'continue_scrum':
         await this.commitContinueScrum(goalId);
@@ -1036,10 +1078,12 @@ export class ScrumMaster extends Abject {
    * needs to call this — it stays available as an explicit mid-scrum refresh.
    */
   private async actReviewScrum(
-    goalId: string,
+    goalId: string, taskId?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const snap = await this.buildReviewSnapshot(goalId);
     if ('error' in snap) return { success: false, error: snap.error };
+    const inflight = taskId ? this.scrumInFlight.get(taskId) : undefined;
+    if (inflight) inflight.planRevision = Number(snap.data.planRevision ?? 0);
     return { success: true, data: snap.data };
   }
 
@@ -1108,9 +1152,12 @@ export class ScrumMaster extends Abject {
     // Alongside it, weave the pattern language: patterns whose contexts
     // match this goal (plus their linked patterns) shape task decomposition
     // and ordering. Pattern entries surface only through the weave.
+    const observations = Object.entries(scratchpad).filter(([k]) => k.startsWith('learning/observation/')).slice(-12).map(([,v]) => v);
+    const planHistory = (scratchpad['learning/plans'] as Array<{ revision: number; plan: unknown }>) ?? [];
+    const evolvingContext = `${goal.description}\n${safeStringify(observations, 6000)}\n${safeStringify(planHistory.slice(-2), 4000)}`;
     const [recalled, applicablePatterns] = await Promise.all([
       this.recallKnowledge(goal.description),
-      this.weavePatterns(goal.description),
+      this.weavePatterns(evolvingContext),
     ]);
     const relevantKnowledge = recalled.filter(e => e.type !== 'pattern');
 
@@ -1160,6 +1207,9 @@ export class ScrumMaster extends Abject {
           assignedAgentId: (t.fields.assignedAgentId as string ?? '').slice(0, 8),
         })),
         scratchpad: scratchpadSummary,
+        observations,
+        planRevision: planHistory.at(-1)?.revision ?? 0,
+        recentPlans: planHistory.slice(-3),
         team: teamRoster,
         ...(quickDispatchAvailable ? { quickDispatchAvailable: true } : {}),
         relevantKnowledge,
@@ -1236,12 +1286,13 @@ export class ScrumMaster extends Abject {
   // ─── Action: poll_team ────────────────────────────────────────────
 
   private async actPollTeam(
-    _goalId: string,
+    goalId: string,
     action: Record<string, unknown>,
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     if (!this.agentAbjectId) return { success: false, error: 'AgentAbject unavailable' };
     const requestedMembers = action.members as string[] | undefined;
-    const question = (action.question as string | undefined) ?? this.defaultPollQuestion();
+    const context = this.goalManagerId ? await this.request<unknown>(request(this.id, this.goalManagerId, 'getGoal', { goalId })) : null;
+    const question = `Goal ${goalId} and current planning context:\n${safeStringify(context, 12000)}\n\n` + ((action.question as string | undefined) ?? this.defaultPollQuestion());
 
     const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
@@ -1328,10 +1379,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     }
 
     // Resolve agent at stage time so the LLM gets immediate feedback on bad names.
-    const team = await this.request<Array<{ agentId: AbjectId; name: string }>>(
+    const team = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
-    const agent = team.find(a => a.name === assignedAgentName && a.name !== 'ScrumMaster' && a.name !== 'Chat');
+    const agent = team.find(a => a.name === assignedAgentName && a.canExecute !== false && a.name !== 'ScrumMaster' && a.name !== 'Chat');
     if (!agent) {
       const validNames = team.filter(a => a.name !== 'ScrumMaster' && a.name !== 'Chat').map(a => a.name).join(', ');
       return { success: false, error: `Unknown agent "${assignedAgentName}". Valid: ${validNames}` };
@@ -1466,12 +1517,8 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     }
 
     log.info(`complete_goal: ${goalId.slice(0, 8)} → DONE (${synthesis.slice(0, 80)})`);
-    await this.request(
-      request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }),
-    );
-    await this.recordCompletionPlan(goalId, synthesis).catch((err) => {
-      log.warn(`recordCompletionPlan failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    await this.recordCompletionPlan(goalId, synthesis);
+    await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }));
     this.changed('sprintCompleted', { goalId });
   }
 
@@ -1505,10 +1552,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
 
     const agentNames = new Map<string, string>();
     if (this.agentAbjectId) {
-      const team = await this.request<Array<{ agentId: AbjectId; name: string }>>(
+      const team = await this.request<Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>>(
         request(this.id, this.agentAbjectId, 'listAgents', {}),
         5000,
-      ).catch(() => [] as Array<{ agentId: AbjectId; name: string }>);
+      ).catch(() => [] as Array<{ agentId: AbjectId; name: string; canExecute?: boolean }>);
       for (const member of team) agentNames.set(member.agentId, member.name);
     }
 
@@ -1669,6 +1716,7 @@ Rules:
     if (!this.goalManagerId) return;
     const reason = (lastAction.reason as string | undefined) ?? 'Sprint declared unreachable';
 
+    await this.recordCompletionPlan(goalId, `Failed: ${reason}`);
     log.info(`fail_goal: ${goalId.slice(0, 8)} → FAILED (${reason.slice(0, 80)})`);
     await this.request(
       request(this.id, this.goalManagerId, 'failGoal', { goalId, error: reason }),
@@ -1789,7 +1837,7 @@ Rules:
    * quick_dispatch offer suppressed, so a bad shortcut degrades to planning
    * rather than dead-ending.
    */
-  private async commitQuickDispatch(goalId: string, action: Record<string, unknown>): Promise<void> {
+  private async commitQuickDispatch(goalId: string, action: Record<string, unknown>, operationId?: string): Promise<void> {
     if (!this.goalManagerId || !this.agentAbjectId) return;
 
     const agentName = action.agentName as string | undefined;
@@ -1813,9 +1861,9 @@ Rules:
     }
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
-      request(this.id, this.goalManagerId, 'startNextScrum', { goalId }),
+      request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId }),
     );
-    const taskId = await this.dispatchSingleTask(goalId, agent.agentId, task, scrumNumber, target);
+    const taskId = await this.dispatchSingleTask(goalId, agent.agentId, task, scrumNumber, target, operationId);
     if (!taskId) {
       await this.fallBackToFullScrum(goalId);
       return;
@@ -1834,11 +1882,11 @@ Rules:
    * same accounting the normal dispatch path relies on.
    */
   private async dispatchSingleTask(
-    goalId: string, agentId: AbjectId, description: string, scrumNumber: number, target?: string,
+    goalId: string, agentId: AbjectId, description: string, scrumNumber: number, target?: string, operationId?: string,
   ): Promise<string | undefined> {
     const addResult = await this.request<{ taskId?: string; error?: string }>(
       request(this.id, this.goalManagerId!, 'addTask', {
-        goalId, description, assignedAgentId: agentId, scrumNumber,
+        goalId, description, assignedAgentId: agentId, scrumNumber, operationId, data: { target, planOperationId: operationId },
       }),
     );
     if (!addResult.taskId) {
@@ -1874,6 +1922,7 @@ Rules:
     const result = goal?.scratchpad?.[`tasks/${taskId}/result`] ?? 'Done.';
     const text = typeof result === 'string' ? result : safeStringify(result, 4000);
     if (looksLikeUngroundedClaim(text)) return false;
+    await this.recordCompletionPlan(goalId, text);
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result }));
     log.info(`quick_dispatch complete: goal ${goalId.slice(0, 8)} finished in one task (no planning scrum)`);
     return true;
@@ -1893,7 +1942,7 @@ Rules:
     );
   }
 
-  private async commitDispatchScrum(otaTaskId: string, goalId: string): Promise<void> {
+  private async commitDispatchScrum(otaTaskId: string, goalId: string, decision: Record<string, unknown> = {}): Promise<void> {
     if (!this.goalManagerId || !this.agentAbjectId) return;
 
     const inflight = this.scrumInFlight.get(otaTaskId);
@@ -1959,16 +2008,29 @@ Rules:
       return;
     }
 
-    // Clear the way: a dispatch committed while the previous round is still
-    // running (an interjection check re-planning around new user input)
-    // cancels the outstanding tasks first so the old plan and the new one
-    // never race. At a normal round boundary this is a no-op.
-    await this.request<{ cancelled: number }>(
-      request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId }), 15000,
-    ).catch(() => ({ cancelled: 0 }));
+    const goalState = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+    const plans = (goalState?.scratchpad?.['learning/plans'] as Array<{ revision: number; operationId: string }>) ?? [];
+    const replay = plans.find(p => p.operationId === otaTaskId);
+    const expectedRevision = decision.planRevision ?? inflight.planRevision ?? 0;
+    if (!replay && expectedRevision !== (plans.at(-1)?.revision ?? 0)) throw new Error('Plan changed during planning; refresh the Scrum observation');
+    // A replay must preserve work already admitted by this very plan.
+    if (!replay) {
+      const stopped = await this.request<{ safe: boolean; pending?: unknown; error?: string }>(
+        request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId, preserveTaskIds: decision.keepTaskIds ?? [] }), 20000,
+      );
+      if (!stopped.safe) throw new Error(`Replacement work awaits reconciliation: ${JSON.stringify(stopped)}`);
+    }
+
+    const recorded = await this.request<{ success: boolean; error?: string }>(request(this.id, this.goalManagerId, 'recordPlan', {
+      goalId, operationId: otaTaskId, expectedRevision,
+      plan: { reason: decision.reasoning ?? decision.reason, assumptions: decision.assumptions,
+        patterns: decision.patterns, expectedObservations: decision.expectedObservations,
+        change: decision.change, tasks: inflight.staged },
+    }));
+    if (!recorded.success) throw new Error(recorded.error ?? 'Plan changed during planning; refresh the scrum before dispatch');
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
-      request(this.id, this.goalManagerId, 'startNextScrum', { goalId }),
+      request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId: otaTaskId, preserveTaskIds: decision.keepTaskIds ?? [] }),
     );
 
     // How much work sits behind each task, so the scheduler can start the one
@@ -1987,7 +2049,8 @@ Rules:
       const depIds = s.dependsOnIdx.map(idx => taskIds[idx]);
       const addResult = await this.request<{ taskId?: string; error?: string }>(
         request(this.id, this.goalManagerId, 'addTask', {
-          goalId,
+          goalId, operationId: `${otaTaskId}:task:${taskIds.length}`,
+          data: { planOperationId: otaTaskId, target: s.target, priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
           description: s.description,
           dependsOn: depIds.length > 0 ? depIds : undefined,
           produces: s.produces,
@@ -2024,6 +2087,7 @@ Rules:
           agentId: inflight.staged[i].assignedAgentId,
           description: inflight.staged[i].description,
           blockers: new Set(blockerSets[i]),
+          priority: weights.get(String(i)) ?? 0,
           target: inflight.staged[i].target,
         });
         log.info(`dispatch: task ${taskIds[i].slice(0, 8)} deferred on ${blockerSets[i].length} dep(s): ${blockerSets[i].map(d => d.slice(0, 8)).join(', ')}`);
@@ -2059,15 +2123,52 @@ Rules:
   // Dependency machinery
   // ═══════════════════════════════════════════════════════════════════
 
+  /** Rebuild scheduling from receiver-owned tuples after restart or a lost event. */
+  private async recoverDispatches(): Promise<void> {
+    if (this.recoveringDispatches || !this.goalManagerId || !this.agentAbjectId) return;
+    this.recoveringDispatches = true;
+    try {
+      const goals = await this.request<Array<{ id: string; scratchpad?: Record<string, unknown> }>>(request(this.id, this.goalManagerId, 'listGoals', { status: 'active' }));
+      const sessions = await this.request<Array<{ id: string }>>(request(this.id, this.agentAbjectId, 'getSessions', {}));
+      const sessionsById = new Set(sessions.map(s => s.id));
+      const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(request(this.id, this.agentAbjectId, 'listAgents', {}));
+      for (const goal of goals) {
+        if (await this.isRemoteGoal(goal.id)) continue;
+        const tuples = await this.request<Array<{ id: string; fields: Record<string, any> }>>(request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId: goal.id }));
+        const byId = new Map(tuples.map(t => [t.id, t]));
+        for (const tuple of tuples) {
+          if (tuple.fields.status !== 'pending' || sessionsById.has(tuple.id) || this.recoveredEnqueues.has(tuple.id)) continue;
+          const data = tuple.fields.data ?? {};
+          if (data.planOperationId && !goal.scratchpad?.[`learning/commit/${data.planOperationId}`]) continue;
+          const agent = agents.find(a => a.name === data.assignedAgentName) ?? agents.find(a => a.agentId === tuple.fields.assignedAgentId);
+          if (!agent || agent.name === 'ScrumMaster') continue;
+          const blockers = (tuple.fields.dependsOn ?? []) as string[];
+          if (blockers.some(id => ['failed', 'permanently_failed', 'superseded', 'cancelled'].includes(byId.get(id)?.fields.status))) {
+            await this.request(request(this.id, this.goalManagerId, 'failTask', { goalId: goal.id, taskId: tuple.id, error: 'Upstream work is no longer available', agentName: 'ScrumMaster' }));
+            continue;
+          }
+          const waiting = blockers.filter(id => byId.get(id)?.fields.status !== 'done');
+          if (waiting.length) {
+            this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target });
+            continue;
+          }
+          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: data.target ? { target: data.target } : undefined }));
+          this.recoveredEnqueues.add(tuple.id);
+          this.pendingDeps.delete(tuple.id);
+        }
+      }
+    } finally { this.recoveringDispatches = false; }
+  }
+
   private async unblockDependents(completedTaskId: string): Promise<void> {
     if (!this.agentAbjectId) return;
-    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string }> = [];
+    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string; priority: number }> = [];
     for (const [pendingId, info] of this.pendingDeps) {
       if (!info.blockers.has(completedTaskId)) continue;
       info.blockers.delete(completedTaskId);
       if (info.blockers.size === 0) {
         this.pendingDeps.delete(pendingId);
-        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target });
+        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target, priority: info.priority });
       }
     }
     for (const t of newlyReady) {
@@ -2079,6 +2180,7 @@ Rules:
           taskId: t.taskId,
           goalId: t.goalId,
           dispatchTupleId: t.taskId,
+          priority: t.priority,
           data: t.target ? { target: t.target } : undefined,
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -2136,7 +2238,7 @@ Some scrum tasks are **interjection checks** (the task description says so): the
 
 ## Your first action
 
-The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
+The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. Compare observations with the assumptions in recentPlans. State what changed in your understanding, ask affected collaborators for interpretation, and plan a small discriminating experiment when uncertain. dispatch_scrum should include planRevision from the observation, reasoning, assumptions, patterns (ids/revisions and why they fit), expectedObservations, keepTaskIds (unaffected work to preserve), and change (what stays or changes). Never repeat a failed approach without new evidence. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
 
 ## Action vocabulary
 

@@ -32,6 +32,8 @@ interface WebTaskOptions {
 
 /** Per-task extra state (page IDs, startUrl, screenshots). */
 interface WebTaskExtra {
+  generation?: number;
+  cancelled?: boolean;
   startUrl?: string;
   pageId?: string;
   pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string; headful?: boolean; channel?: string };
@@ -60,6 +62,7 @@ export class WebAgent extends Abject {
   private _currentGoalId?: string;
 
   /** Per-task extra state (page IDs, startUrl, etc.). */
+  private pageTasks = new Map<string, string>();
   private taskExtras = new Map<string, WebTaskExtra>();
 
   /** Kept-open pages: pageId → idle timeout handle. */
@@ -407,6 +410,17 @@ Set keepPageOpen: false to explicitly close the page when done.
 - WebAgent can receive tasks via LLM semantic fallback even for task types it doesn't explicitly declare.`;
   }
 
+  private claimTaskPage(taskId: string, pageId: string): void {
+    const owner = this.pageTasks.get(pageId);
+    if (owner && owner !== taskId) throw new Error(`Page is in use by task ${owner}; wait or use another page`);
+    if (this.taskExtras.get(taskId)?.cancelled) throw new Error('Task cancelled');
+    this.pageTasks.set(pageId, taskId);
+  }
+  private releaseTaskPage(taskId: string): void {
+    for (const [page, owner] of this.pageTasks) if (owner === taskId) this.pageTasks.delete(page);
+    this.taskExtras.delete(taskId);
+  }
+
   protected override async handleAsk(question: string): Promise<string> {
     return this.askLlm(this.askPrompt(question), question, 'fast');
   }
@@ -424,6 +438,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       name: 'WebAgent',
       description: 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Best for interactive browser navigation on real external sites. Object source authoring goes to a creation agent; plain HTTP data fetches (JSON APIs, RSS feeds) run faster via HttpClient directly; installed skill flows go to a skill-execution agent.',
       config: {
+        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
           done: { type: 'success', resultFields: ['result'] },
           fail: { type: 'error', resultFields: ['reason'] },
@@ -434,8 +449,43 @@ Set keepPageOpen: false to explicitly close the page when done.
   }
 
   private setupHandlers(): void {
+    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('restoreTask', async msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore browser work');
+      const { taskId, snapshot, terminalDelivery } = msg.payload as { taskId: string; snapshot: WebTaskExtra; terminalDelivery?: boolean };
+      if (!snapshot) throw new Error('Missing browser checkpoint');
+      const extra: WebTaskExtra = { ...structuredClone(snapshot), cancelled: false, generation: undefined, lastScreenshot: undefined };
+      if (!terminalDelivery) {
+        if (extra.pageId) {
+          const live = await this.request(request(this.id, this.webBrowserId!, 'getUrl', { pageId: extra.pageId })).catch(() => null);
+          if (!live) extra.pageId = undefined;
+        }
+        if (!extra.pageId) {
+          const opened = await this.request<{ pageId: string }>(request(this.id, this.webBrowserId!, 'openPage', { options: extra.pageOptions }));
+          extra.pageId = opened.pageId; extra.pageOpenedByThisTask = true;
+          try { if (extra.startUrl) await this.request(request(this.id, this.webBrowserId!, 'navigateTo', { pageId: extra.pageId, url: extra.startUrl })); }
+          catch (err) { await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })).catch(() => {}); throw err; }
+        }
+        this.claimTaskPage(taskId, extra.pageId);
+      }
+      this.taskExtras.set(taskId, extra);
+      return { success: true };
+    });
     // ── Ticket result handler ──
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.on('taskCancelled', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) return;
+      const { taskId } = msg.payload as { taskId: string };
+      const extra = this.taskExtras.get(taskId);
+      if (!extra) return;
+      extra.cancelled = true;
+      if (extra.pageId && this.pageTasks.get(extra.pageId) === taskId && extra.pageOpenedByThisTask) {
+        await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })).catch(() => {});
+      }
+    });
+
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
@@ -457,6 +507,7 @@ Set keepPageOpen: false to explicitly close the page when done.
         responseSchema: options?.responseSchema,
         keepPageOpen: options?.keepPageOpen ?? true,
       };
+      if (extra.pageId) this.claimTaskPage(taskId, extra.pageId);
       this.taskExtras.set(taskId, extra);
 
       // If reusing a kept-open page, clear its idle timeout
@@ -476,6 +527,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       contractRequire(typeof instruction === 'string', 'instruction required');
 
       const taskId = `web-step-${Date.now()}`;
+      this.claimTaskPage(taskId, pageId);
       this.taskExtras.set(taskId, { pageId });
 
       // For single steps, use directExecution to avoid queue deadlocks
@@ -493,7 +545,7 @@ Set keepPageOpen: false to explicitly close the page when done.
           },
         }),
       );
-      const result = await this.waitForTaskResult(ticketId, 130000);
+      const result = await this.waitForTaskResult(ticketId, 130000).finally(() => this.releaseTaskPage(taskId));
 
       return { success: result.success, result: result.result, error: result.error };
     });
@@ -565,12 +617,15 @@ Set keepPageOpen: false to explicitly close the page when done.
         log.info(`executeTask using profile="${profile}" (${profileFromData ? 'data' : 'description'})`);
       }
 
+      try {
       // Open page
       const pageResult = await this.request<{ pageId: string }>(
         request(this.id, this.webBrowserId!, 'openPage', pageOptions ? { options: pageOptions } : {})
       );
       extra.pageId = pageResult.pageId;
       extra.pageOpenedByThisTask = true;
+      if (extra.cancelled) { await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })); throw new Error('Task cancelled during page setup'); }
+      this.claimTaskPage(taskId, extra.pageId);
 
       if (startUrl) {
         await this.request(
@@ -578,7 +633,6 @@ Set keepPageOpen: false to explicitly close the page when done.
         );
       }
 
-      try {
         // Seed conversation with failure context from previous attempts
         const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
         if (failureHistory && failureHistory.length > 0) {
@@ -632,23 +686,25 @@ Set keepPageOpen: false to explicitly close the page when done.
       } finally {
         // Only clear if it's still ours — the queue runner may have started
         // the next task (which set its own goal) while we were unwinding
+        this.releaseTaskPage(taskId);
         if (this._currentGoalId === goalId) this._currentGoalId = undefined;
       }
     });
 
     // Forward progress to GoalManager so Chat's timeout resets during long operations.
     this.on('progress', (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       // Progress arrives untagged, so it cannot be attributed to one task by
       // inspection. With several running, every live goal is genuinely being
       // worked on and each needs its timer reset, so all of them hear about it
       // — but the message itself belongs to whichever task emitted it, so it
       // is only quoted when there is no ambiguity about whose it is.
       if (this.goalManagerId) {
-        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        const payload = msg.payload as { taskId?: string; phase?: string; message?: string } | undefined;
         const goals = new Set<string>();
-        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
-        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const task = payload?.taskId ? this.taskExtras.get(payload.taskId) : undefined;
+        if (task?.goalId) goals.add(task.goalId);
+
         const attributable = goals.size === 1;
         for (const goalId of goals) {
           this.send(event(this.id, this.goalManagerId, 'updateProgress', {
@@ -665,13 +721,15 @@ Set keepPageOpen: false to explicitly close the page when done.
 
     // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       // Heartbeat: a single browse step (large page navigate, screenshot,
       // structured extraction, human handoff) can run minutes without a phase
@@ -680,7 +738,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       // bubbles it to every ancestor's stall timer — otherwise the caller's
       // submitJob times out while this step is still legitimately running.
       const heartbeat = setInterval(() => {
-        this.resetPendingTicketTimeouts();
+        this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
         if (this.jobManagerId) {
           this.send(event(this.id, this.jobManagerId, 'progress', { phase: 'acting' }));
         }
@@ -693,7 +751,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, step, newPhase, action } =
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
 
@@ -706,8 +764,8 @@ Set keepPageOpen: false to explicitly close the page when done.
       }
     });
 
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentIntermediateAction', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
+    this.on('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
   }
 
   /**
@@ -740,6 +798,10 @@ Set keepPageOpen: false to explicitly close the page when done.
     const { pageId: newPageId } = await this.request<{ pageId: string }>(
       request(this.id, webId, 'openPage', { options: newOptions })
     );
+    const taskId = this.pageTasks.get(oldPageId);
+    this.pageTasks.delete(oldPageId);
+    if (extra.cancelled || !taskId) { await this.request(request(this.id, webId, 'closePage', { pageId: newPageId })); throw new Error('Task no longer owns this browser transition'); }
+    this.claimTaskPage(taskId, newPageId);
     extra.pageId = newPageId;
     extra.pageOptions = newOptions;
     if (currentUrl) {
@@ -788,8 +850,10 @@ Set keepPageOpen: false to explicitly close the page when done.
     this.pendingTickets.clear();
   }
 
-  private resetPendingTicketTimeouts(): void {
+  private resetPendingTicketTimeouts(taskId?: string): void {
+    if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
+      if (ticketId !== taskId) continue;
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -807,6 +871,8 @@ Set keepPageOpen: false to explicitly close the page when done.
     lastAction?: Record<string, unknown>;
   }> {
     type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[]; lastAction?: Record<string, unknown> };
+    const early=this.takeTaskResult<any>(ticketId);
+    if(early)return Promise.resolve(early);
     return new Promise<TaskResult>((resolve, reject) => {
       const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -850,6 +916,8 @@ Set keepPageOpen: false to explicitly close the page when done.
         );
         extra.pageId = pageResult.pageId;
         extra.pageOpenedByThisTask = true;
+        if (extra.cancelled) throw new Error('Task cancelled during page setup');
+        this.claimTaskPage(taskId, extra.pageId);
 
         if (extra.startUrl) {
           log.info(`Navigating to ${extra.startUrl}`);
@@ -934,6 +1002,7 @@ Set keepPageOpen: false to explicitly close the page when done.
         ...(replyPageId ? { pageId: replyPageId } : {}),
       });
     } catch { /* caller may be gone */ }
+    this.releaseTaskPage(taskId);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -989,10 +1058,12 @@ Set keepPageOpen: false to explicitly close the page when done.
 
     try {
       // Get ARIA snapshot (includes URL, title, and ref-annotated accessibility tree)
-      const { snapshot, url, title } = await this.request<{ snapshot: string; url: string; title: string }>(
+      const { snapshot, url, title, generation } = await this.request<{ snapshot: string; url: string; title: string; generation: number }>(
         request(this.id, this.webBrowserId!, 'getAriaSnapshot', { pageId: extra.pageId })
       );
 
+      extra.generation = generation;
+      if (url && url !== 'about:blank') extra.startUrl = url;
       const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
 
       // Pick the think tier by INTERACTION complexity, not payload size.
@@ -1093,12 +1164,14 @@ Set keepPageOpen: false to explicitly close the page when done.
   private async handleAct(taskId: string, action: AgentAction): Promise<AgentActionResult> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { success: false, error: 'No page open' };
+    if (extra.cancelled) return { success: false, error: 'Task cancelled' };
+    this.claimTaskPage(taskId, extra.pageId);
 
     const webId = this.webBrowserId!;
     const pageId = extra.pageId;
     const ref = action.ref as string | undefined;
     // Per-task goal context; the shared field is only a legacy fallback
-    const goalId = extra.goalId ?? this._currentGoalId;
+    const goalId = extra.goalId;
 
     // Log the action with its key parameter
     const actionParam = ref ?? action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
@@ -1114,7 +1187,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'click':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'click' }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'click' }));
           } else {
             await this.request(request(this.id, webId, 'click', { pageId, selector: action.selector as string }));
           }
@@ -1122,7 +1195,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'fill':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'fill', value: action.value as string }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'fill', value: action.value as string }));
           } else {
             await this.request(request(this.id, webId, 'fill', { pageId, selector: action.selector as string, value: action.value as string }));
           }
@@ -1130,7 +1203,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'type':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'type', value: action.text as string }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'type', value: action.text as string }));
           } else {
             await this.request(request(this.id, webId, 'type', { pageId, selector: action.selector as string, text: action.text as string }));
           }
@@ -1138,7 +1211,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'press':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'press', value: action.key as string }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'press', value: action.key as string }));
           } else {
             await this.request(request(this.id, webId, 'press', { pageId, key: action.key as string }));
           }
@@ -1146,7 +1219,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'select':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'selectOption', value: (action.values as string[])?.[0] }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'selectOption', value: (action.values as string[])?.[0] }));
           } else {
             await this.request(request(this.id, webId, 'select', { pageId, selector: action.selector as string, values: action.values as string[] }));
           }
@@ -1154,7 +1227,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'hover':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'hover' }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'hover' }));
           } else {
             await this.request(request(this.id, webId, 'hover', { pageId, selector: action.selector as string }));
           }
@@ -1162,7 +1235,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'check':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'check' }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'check' }));
           } else {
             await this.request(request(this.id, webId, 'check', { pageId, selector: action.selector as string }));
           }
@@ -1170,7 +1243,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
         case 'uncheck':
           if (ref) {
-            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'uncheck' }));
+            await this.request(request(this.id, webId, 'refAction', { pageId, expectedGeneration: extra.generation, ref, action: 'uncheck' }));
           } else {
             await this.request(request(this.id, webId, 'uncheck', { pageId, selector: action.selector as string }));
           }

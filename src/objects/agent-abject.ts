@@ -11,8 +11,12 @@
  * to implement agentObserve and agentAct message handlers.
  */
 
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
+import { encodeAgentState, decodeAgentState } from '../core/agent-session-codec.js';
+import type { SessionRecord } from './task-session.js';
 import Ajv from 'ajv';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { withKeyedLock } from '../core/keyed-lock.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
@@ -39,6 +43,8 @@ export interface AgentAction {
    * turns each step into a check on the agent's model of the system.
    */
   expect?: string;
+  /** Optional machine-checkable expectation, separate from domain success. */
+  expectOutcome?: 'success' | 'failure';
   [key: string]: unknown;
 }
 
@@ -187,6 +193,8 @@ export interface PredictionRecord {
   action: string;
   expect: string;
   outcome: 'success' | 'failure';
+  verdict?: 'supported' | 'contradicted' | 'unresolved';
+  actualRef?: string;
   /** True when the action failed, which contradicts any expectation of it working. */
   missed?: boolean;
   /** Short rendering of the actual result, so the reviewer sees both sides. */
@@ -250,6 +258,8 @@ export interface AgentConfig {
   timeout?: number;
   pinnedMessageCount?: number;
   maxConversationMessages?: number;
+  /** Charge retrospective or other follow-up reasoning to its originating goal. */
+  budgetGoalId?: string;
   queueName?: string;
   directExecution?: boolean;
   skipFirstObservation?: boolean;
@@ -263,6 +273,10 @@ export interface AgentConfig {
    */
   actions?: string[];
   fallbackActionName?: string;
+  /** Receiver-owned completion check, run before any success is published. */
+  completionMethod?: string;
+  snapshotMethod?: string;
+  restoreMethod?: string;
 }
 
 /** Resolved config with all defaults filled in. */
@@ -272,6 +286,8 @@ interface ResolvedAgentConfig {
   timeout: number;
   pinnedMessageCount: number;
   maxConversationMessages: number;
+  /** Charge retrospective or other follow-up reasoning to its originating goal. */
+  budgetGoalId?: string;
   queueName?: string;
   directExecution: boolean;
   skipFirstObservation: boolean;
@@ -279,6 +295,9 @@ interface ResolvedAgentConfig {
   intermediateActions: string[];
   actions?: string[];
   fallbackActionName: string;
+  completionMethod?: string;
+  snapshotMethod?: string;
+  restoreMethod?: string;
 }
 
 // ─── Registration State ──────────────────────────────────────────────
@@ -328,6 +347,15 @@ interface QueuedTask {
 }
 
 interface TaskEntry {
+  parentTaskId?: string;
+  delivery?: SessionRecord['outbox'][number];
+  sessionId?: string;
+  sessionRevision?: number;
+  outstandingOperation?: unknown;
+  admissionKey?: string;
+  candidateAccepted?: boolean;
+  settling?: boolean;
+  acceptanceEvidence?: unknown;
   state: AgentTaskState;
   agentId: AbjectId;
   callerId: AbjectId;
@@ -563,12 +591,16 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
     timeout: partial.timeout ?? DEFAULT_CONFIG.timeout,
     pinnedMessageCount: partial.pinnedMessageCount ?? DEFAULT_CONFIG.pinnedMessageCount,
     maxConversationMessages: partial.maxConversationMessages ?? DEFAULT_CONFIG.maxConversationMessages,
+    budgetGoalId: partial.budgetGoalId,
     queueName: partial.queueName ?? DEFAULT_CONFIG.queueName,
     directExecution: partial.directExecution ?? DEFAULT_CONFIG.directExecution,
     skipFirstObservation: partial.skipFirstObservation ?? DEFAULT_CONFIG.skipFirstObservation,
     terminalActions: partial.terminalActions ?? { ...DEFAULT_CONFIG.terminalActions },
     intermediateActions: partial.intermediateActions ?? [...DEFAULT_CONFIG.intermediateActions],
     actions: partial.actions,
+    completionMethod: partial.completionMethod,
+    snapshotMethod: partial.snapshotMethod,
+    restoreMethod: partial.restoreMethod,
     fallbackActionName: partial.fallbackActionName ?? DEFAULT_CONFIG.fallbackActionName,
   };
 }
@@ -627,13 +659,14 @@ function flattenTranscript(messages: AgentMessage[]): string {
 
 /** Merge per-task overrides into resolved registration config. */
 function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>): ResolvedAgentConfig {
-  if (!override) return base;
+  if (!override) return { ...base };
   return {
     maxSteps: override.maxSteps ?? base.maxSteps,
     maxConcurrentTasks: override.maxConcurrentTasks ?? base.maxConcurrentTasks,
     timeout: override.timeout ?? base.timeout,
     pinnedMessageCount: override.pinnedMessageCount ?? base.pinnedMessageCount,
     maxConversationMessages: override.maxConversationMessages ?? base.maxConversationMessages,
+    budgetGoalId: override.budgetGoalId ?? base.budgetGoalId,
     queueName: override.queueName ?? base.queueName,
     directExecution: override.directExecution ?? base.directExecution,
     skipFirstObservation: override.skipFirstObservation ?? base.skipFirstObservation,
@@ -1212,7 +1245,81 @@ The registered object must implement these handlers to participate in the agent 
     return this.askLlm(prompt, question, 'balanced');
   }
 
+  private delegations = new Map<string, { parentTaskId:string; taskId:string; agentId:AbjectId; task:string; status:'starting'|'running'|'done'|'error'; result?:unknown; error?:string }>();
+  private cancelDescendants(parentTaskId:string):void {
+    for (const child of this.delegations.values()) {
+      if (child.parentTaskId!==parentTaskId || child.status==='done' || child.status==='error') continue;
+      child.status='error'; child.error='Parent task cancelled';
+      this.cancelledBeforeStart.set(child.taskId,Date.now());
+      const entry=this.taskEntries.get(child.taskId);
+      if (entry && !entry.finished) { entry.state.phase='error'; entry.state.error=child.error; this.notifyAgentCancelled(entry,child.error); }
+      this.cancelDescendants(child.taskId);
+    }
+  }
+
+  private deliveryTimer?: ReturnType<typeof setInterval>;
+  private sessionStoreId?: AbjectId;
+
+  private async checkpointSession(entry: TaskEntry, outstandingOperation: unknown = entry.outstandingOperation): Promise<void> {
+    if (!this.sessionStoreId) return;
+    const usage=this.llmId?await this.request<SessionRecord['usage']>(request(this.id,this.llmId,'getTaskUsage',{taskId:entry.state.id,sessionId:entry.sessionId})).catch(()=>undefined):undefined;
+    const specialist = entry.config.snapshotMethod ? await this.request(request(this.id, entry.agentId, entry.config.snapshotMethod, { taskId: entry.state.id })) : undefined;
+    const result = await this.request<{ success: boolean; session?: SessionRecord }>(request(this.id, this.sessionStoreId, 'checkpoint', {
+      id: entry.sessionId ?? entry.state.id, expectedRevision: entry.sessionRevision ?? 0,
+      agentName: this.registeredAgents.get(entry.agentId)?.name, agentId: entry.agentId, intent: entry.state.task, goalId: entry.goalId, parentId: entry.parentTaskId,
+      status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
+      snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
+        taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
+        injectedKnowledge: entry.injectedKnowledge, payloads: entry.payloads, specialist,
+        children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
+      outstandingOperation, ...(usage?{usage}:{}),
+      ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
+      outcome: { result: entry.state.result, error: entry.state.error },
+    }));
+    if (!result.success || !result.session) throw new Error('Session revision conflict; this attempt cannot continue');
+    entry.sessionId = result.session.id; entry.sessionRevision = result.session.revision;
+  }
+
+  private deliveringOutbox = false;
+
+  /** Names describe roles, not identities: many independent conversations are Chat. */
+  private resolveSessionAgent(agentId: string | undefined, name?: string) {
+    const exact = agentId ? this.registeredAgents.get(agentId as AbjectId) : undefined;
+    if (exact && (!name || exact.name === name)) return exact;
+    // Conversation identity cannot be recovered by choosing another Chat.
+    if (!name || name === 'Chat') return undefined;
+    const matches = [...this.registeredAgents.values()].filter(a => a.name === name);
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  private async deliverSessionOutbox(): Promise<void> {
+    if (!this.sessionStoreId || this.deliveringOutbox) return;
+    this.deliveringOutbox = true;
+    try {
+      const items = await this.request<Array<SessionRecord['outbox'][number] & { sessionId: string }>>(request(this.id, this.sessionStoreId, 'pendingDeliveries', {}));
+      for (const item of items) {
+        try {
+          const destination = this.resolveSessionAgent(item.destination, item.destinationName)?.agentId ?? item.destination;
+          // Rehydrate a restarted specialist before replaying its terminal commit.
+          if (!this.taskEntries.has((item.payload as { ticketId: string }).ticketId)) {
+            const session = await this.request<SessionRecord>(request(this.id, this.sessionStoreId, 'get', { id: item.sessionId }));
+            const collaborator = this.registeredAgents.get(destination as AbjectId);
+            if (collaborator?.name === session.agentName && collaborator.config.restoreMethod) {
+              const saved = decodeAgentState<any>(session.snapshot);
+              await this.request(request(this.id, destination as AbjectId, collaborator.config.restoreMethod, { taskId: (item.payload as { ticketId: string }).ticketId, snapshot: saved?.specialist, terminalDelivery: true }));
+            }
+          }
+          await this.request(request(this.id, destination as AbjectId, 'taskResult', item.payload), 10000);
+          await this.request(request(this.id, this.sessionStoreId, 'ackDelivery', { sessionId: item.sessionId, deliveryId: item.id }));
+        } catch { /* Retry the same delivery identity after reconnection. */ }
+      }
+    } finally { this.deliveringOutbox = false; }
+  }
+
   protected override async onInit(): Promise<void> {
+    this.sessionStoreId = await this.discoverDep('TaskSession') ?? undefined;
+    this.deliveryTimer=setInterval(()=>{void this.deliverSessionOutbox().catch(()=>{});},3000);
+    this.deliveryTimer.unref?.();
     this.llmId = await this.discoverDep('LLM') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
@@ -1225,12 +1332,13 @@ The registered object must implement these handlers to participate in the agent 
     // The one thing worth sweeping is the queues themselves — see
     // sweepStaleQueueSlots.
     this.queueSweepTimer = setInterval(
-      () => { void this.sweepStaleQueueSlots(); },
+      () => { void this.sweepStaleQueueSlots(); void this.deliverSessionOutbox().catch(err => log.warn('Session delivery deferred:', err)); },
       AgentAbject.QUEUE_SWEEP_INTERVAL_MS,
     );
   }
 
   protected override async onStop(): Promise<void> {
+    if(this.deliveryTimer)clearInterval(this.deliveryTimer);
     if (this.queueSweepTimer) {
       clearInterval(this.queueSweepTimer);
       this.queueSweepTimer = undefined;
@@ -1261,6 +1369,14 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "getSessions", description: "Inspect durable sessions, outcomes and unknown operations.", parameters: {  } },
+      { name: "delegateTask", description: "Ask and execute a bounded child task, including on the same agent. Stable operationId prevents duplicate delegation; parent cancellation and goal budget propagate. Poll getDelegations for evidence.", parameters: { parentTaskId: protocolText, agentId: protocolText, task: protocolText, operationId: protocolText } },
+      { name: "getDelegations", description: "Inspect child tasks and their results or interruptions.", parameters: { taskId: protocolText } },
+      { name: "resumeTask", description: "Resume from a durable checkpoint after reconciling unknown effects.", parameters: { "id": protocolText, "expectedRevision": protocolNumber } },
+      { name: "forkTask", description: "Fork conversation and evidence; external changes are not undone.", parameters: { "id": protocolText, "newId": protocolText } },
+      { name: "reconcileTask", description: "Record receiver evidence for an unresolved operation before resumption.", parameters: { "id": protocolText, "expectedRevision": protocolNumber, "evidence": protocolText, "outcome": protocolObject } },
+    ]);
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
       const { name, description, systemPrompt, config, canExecute } =
@@ -1314,6 +1430,91 @@ The registered object must implement these handlers to participate in the agent 
       });
     });
 
+    this.on('getDelegations', msg => {
+      const { taskId }=msg.payload as { taskId:string };
+      return [...this.delegations.values()].filter(d=>d.parentTaskId===taskId).map(d=>structuredClone(d));
+    });
+    this.on('delegateTask', async msg => {
+      const p=msg.payload as { parentTaskId:string; agentId:AbjectId; task:string; operationId:string };
+      const parent=this.taskEntries.get(p.parentTaskId);
+      if (!parent || parent.finished || parent.state.phase==='error' || parent.agentId!==msg.routing.from) throw new Error('Delegation requires the caller’s active parent task');
+      if (!p.operationId || !p.task?.trim()) throw new Error('Delegation requires intent and a stable operationId');
+      const key=`${p.parentTaskId}:child:${p.operationId}`;
+      const existing=this.delegations.get(key);
+      if (existing) {
+        if (existing.task!==p.task || existing.agentId!==p.agentId) throw new Error('Conflicting delegation operation');
+        return structuredClone(existing);
+      }
+      if ([...this.delegations.values()].filter(d=>d.parentTaskId===p.parentTaskId).length>=8) throw new Error('Parent child-task limit reached');
+      let depth=0,cursor:TaskEntry|undefined=parent;
+      while(cursor?.parentTaskId){if(++depth>=4)throw new Error('Delegation depth limit reached');cursor=this.taskEntries.get(cursor.parentTaskId);}
+      const target=this.registeredAgents.get(p.agentId);
+      if (!target?.canExecute) throw new Error('Collaborator does not execute tasks; Ask for its direct protocol');
+      const child={parentTaskId:p.parentTaskId,taskId:key,agentId:p.agentId,task:p.task,status:'starting' as const};
+      this.delegations.set(key,child);
+      await this.checkpointSession(parent);
+      let agreement: unknown;
+      try { agreement=await this.request(request(this.id,p.agentId,'ask',{question:`Can you execute this bounded child task using executeTask? ${p.task}. Return constraints, expected evidence, and failure semantics. It shares its parent's goal budget and cancellation.`}),30000); }
+      catch (err) { const d=this.delegations.get(key)!; d.status='error'; d.error=String(err); await this.checkpointSession(parent); throw err; }
+      if (parent.finished || String(parent.state.phase)==='error' || this.cancelledBeforeStart.has(key)) throw new Error('Parent was cancelled during collaborator negotiation');
+      this.delegations.get(key)!.status='running';
+      parent.state.llmMessages.push({role:'user',content:`Child agreement ${key}: ${JSON.stringify(agreement)}`});
+      // Direct receiver execution gives a same-agent child its own task context and
+      // queue; it cannot wait behind its parent in the runtime dispatch queue.
+      void this.request(request(this.id,p.agentId,'executeTask',{taskId:key,tupleId:key,
+        description:p.task,goalId:parent.goalId ?? parent.incomingGoalId,
+        data:{parentTaskId:p.parentTaskId},config:{directExecution:true,maxSteps:Math.min(15,parent.state.maxSteps-parent.state.step)}}),600000).then(result=>{
+          const d=this.delegations.get(key)!; if(d.status==='error')return;
+          d.status=(result && typeof result==='object' && 'success' in result && result.success===false)?'error':'done';d.result=result;
+          parent.state.llmMessages.push({role:'user',content:`Child ${key} reported: ${JSON.stringify(result)}`});
+          this.changed('childTaskCompleted',{parentTaskId:p.parentTaskId,taskId:key,result});
+        },err=>{const d=this.delegations.get(key)!;d.status='error';d.error=String(err);});
+      return structuredClone(child);
+    });
+
+    this.on('getSessions', async () => this.sessionStoreId
+      ? this.request(request(this.id, this.sessionStoreId, 'list', {})) : []);
+    this.on('forkTask', async (msg: AbjectMessage) => {
+      if (!this.sessionStoreId) throw new Error('TaskSession unavailable');
+      return this.request(request(this.id, this.sessionStoreId, 'fork', msg.payload));
+    });
+    this.on('reconcileTask', async (msg: AbjectMessage) => {
+      if (!this.sessionStoreId) throw new Error('TaskSession unavailable');
+      return this.request(request(this.id, this.sessionStoreId, 'reconcile', msg.payload));
+    });
+    this.on('resumeTask', async (msg: AbjectMessage) => {
+      if (!this.sessionStoreId) throw new Error('TaskSession unavailable');
+      const p = msg.payload as { id: string; expectedRevision: number };
+      const current = await this.request<SessionRecord>(request(this.id, this.sessionStoreId, 'get', { id: p.id }));
+      const agent = this.resolveSessionAgent(current?.agentId, current?.agentName);
+      if (!agent) throw new Error('Session agent is unavailable; Ask for a compatible collaborator');
+      const stored = decodeAgentState<any>(current?.snapshot);
+      if (!stored?.state) throw new Error('Session has no resumable conversation');
+      if (stored.dispatchTupleId && this.goalManagerId) {
+        const admission = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'admitTask', { taskId: stored.dispatchTupleId, goalId: current.goalId }));
+        if (!admission.accepted) throw new Error(admission.reason ?? 'This plan no longer owns the interrupted task; fork to reconsider it');
+      }
+      const resumed = await this.request<{ success: boolean; session: SessionRecord }>(request(this.id, this.sessionStoreId, 'resume', p));
+      if (!resumed.success) return resumed;
+      const taskId = `${p.id}:attempt-${resumed.session.attempt}`;
+      try {
+        if (agent.config.restoreMethod) await this.request(request(this.id, agent.agentId, agent.config.restoreMethod, { taskId, snapshot: stored.specialist }));
+      } catch (err) {
+        await this.request(request(this.id, this.sessionStoreId, 'checkpoint', { id: p.id, expectedRevision: resumed.session.revision, status: 'partial', outcome: { error: String(err) } }));
+        throw err;
+      }
+      const state: AgentTaskState = { ...stored.state, id: taskId, phase: 'observing', step: 0, error: undefined, result: undefined };
+      state.llmMessages.push({ role: 'user', content: 'Resumed from a durable checkpoint. Re-observe current collaborators and artifacts through Ask; previously verified state may have changed. Continue the plan from the retained evidence.' });
+      const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
+        systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
+        goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge,
+        payloads: stored.payloads, sessionId: p.id, sessionRevision: resumed.session.revision };
+      for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
+      this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
+      void this.runTaskAsync(entry);
+      return { ticketId: taskId, sessionId: p.id };
+    });
+
     // ── Task Management ──
     this.on('startTask', async (msg: AbjectMessage) => {
       const {
@@ -1326,7 +1527,7 @@ The registered object must implement these handlers to participate in the agent 
         config: taskConfig,
         responseSchema,
         goalId: incomingGoalId,
-        dispatchTupleId,
+        dispatchTupleId: requestedDispatchTupleId,
       } = msg.payload as {
         agentId?: AbjectId;
         taskId?: string;
@@ -1356,12 +1557,45 @@ The registered object must implement these handlers to participate in the agent 
       if (!agent) throw new Error(`Agent "${agentId}" is not registered`);
 
       const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Queue identity and TupleSpace identity are independent. The runtime's
+      // own admission record is authoritative, including an absent tuple for
+      // internal planning tasks and direct work sharing a goal.
+      const queued = this.agentTaskQueues.get(agentId)?.inFlight.get(taskId)?.queued;
+      const dispatchTupleId = queued ? queued.dispatchTupleId : requestedDispatchTupleId;
+      return withKeyedLock(`${this.id}:admission:${taskId}`, async () => {
       // Cancelled while the agent was still setting up. Starting now would run
       // work the caller already withdrew, in a slot that has been given away.
-      if (this.cancelledBeforeStart.delete(taskId)) {
+      if (this.cancelledBeforeStart.has(taskId)) {
         throw new Error(`Task ${taskId} was cancelled before it started`);
       }
+      const admissionKey = JSON.stringify({ agentId, callerId, task, systemPrompt, taskPrompt, initialMessages, taskConfig, responseSchema, incomingGoalId, dispatchTupleId });
+      const existing = this.taskEntries.get(taskId);
+      if (existing) {
+        if (existing.admissionKey !== admissionKey) throw new Error(`Conflicting duplicate task ${taskId}`);
+        return { ticketId: taskId, duplicate: true, finished: !!existing.finished };
+      }
+      if (dispatchTupleId && incomingGoalId && this.goalManagerId && !this.delegations.has(taskId)) {
+        const admission = await this.request<{accepted:boolean;reason?:string}>(request(this.id,this.goalManagerId,'admitTask',{taskId:dispatchTupleId,goalId:incomingGoalId}));
+        if (!admission.accepted) throw new Error(admission.reason ?? 'Task no longer belongs to the active plan');
+        if (this.cancelledBeforeStart.has(taskId)) throw new Error('Task cancelled during admission');
+      }
+      if (this.sessionStoreId) {
+        const persisted = await this.request<SessionRecord|null>(request(this.id,this.sessionStoreId,'get',{id:taskId}));
+        if (persisted) throw new Error('Task id already has a durable session; inspect or resume it instead of replaying setup');
+      }
+      if (responseSchema) this.ajv.compile(responseSchema); // reject invalid schemas before admission
       const config = mergeConfig(agent.config, taskConfig);
+      const delegation = this.delegations.get(taskId);
+      if (delegation) {
+        const parent = this.taskEntries.get(delegation.parentTaskId);
+        if (!parent || parent.finished || parent.state.phase === 'error') throw new Error('Delegating parent is no longer active');
+        const remaining = parent.state.maxSteps - parent.state.step;
+        if (remaining <= 0) throw new Error('Parent has no remaining step budget');
+        config.maxSteps = Math.min(config.maxSteps, remaining, 15);
+      }
+      config.completionMethod = agent.config.completionMethod;
+      config.snapshotMethod = agent.config.snapshotMethod;
+      config.restoreMethod = agent.config.restoreMethod;
       const prompt = systemPrompt ?? agent.systemPrompt ?? '';
 
       const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
@@ -1371,6 +1605,8 @@ The registered object must implement these handlers to participate in the agent 
       const goalId = incomingGoalId;
 
       const entry: TaskEntry = {
+        admissionKey,
+        parentTaskId: this.delegations.get(taskId)?.parentTaskId,
         state: taskState,
         agentId,
         callerId,
@@ -1380,7 +1616,7 @@ The registered object must implement these handlers to participate in the agent 
         initialMessages,
         responseSchema,
         goalId,
-        dispatchTupleId,
+        dispatchTupleId: this.delegations.has(taskId) ? undefined : dispatchTupleId,
       };
 
       this.taskEntries.set(taskId, entry);
@@ -1393,6 +1629,7 @@ The registered object must implement these handlers to participate in the agent 
         this.releaseQueueSlot(entry.agentId, taskId);
       });
       return { ticketId: taskId };
+      });
     });
 
     /**
@@ -1441,6 +1678,7 @@ The registered object must implement these handlers to participate in the agent 
       const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const callerId = explicitCaller ?? msg.routing.from;
 
+      return withKeyedLock(`${this.id}:queue-admission:${taskId}`, async () => {
       let q = this.agentTaskQueues.get(targetAgentId);
       if (!q) {
         q = { inFlight: new Map(), pending: [] };
@@ -1461,6 +1699,26 @@ The registered object must implement these handlers to participate in the agent 
         data,
         priority: (msg.payload as { priority?: number }).priority,
       };
+      for(const [queuedAgent,queue] of this.agentTaskQueues){
+        const old=queue.pending.find(t=>t.taskId===taskId) ?? queue.inFlight.get(taskId)?.queued;
+        if(old){
+          if(queuedAgent!==targetAgentId || old.task!==task || old.goalId!==goalId)throw new Error('Conflicting queued task identity');
+          return {taskId,duplicate:true,queuePosition:0};
+        }
+      }
+      const terminal=this.taskEntries.get(taskId);
+      if(terminal){
+        if(terminal.agentId!==targetAgentId || terminal.state.task!==task)throw new Error('Conflicting task identity');
+        return {taskId,duplicate:true,finished:!!terminal.finished,queuePosition:0};
+      }
+      if (this.sessionStoreId) {
+        const stored = await this.request<SessionRecord | null>(request(this.id, this.sessionStoreId, 'get', { id: taskId }));
+        if (stored) {
+          if (stored.agentName !== agent.name || stored.intent !== task || stored.goalId !== goalId) throw new Error('Conflicting durable task identity');
+          return { taskId, duplicate: true, queuePosition: 0, status: stored.status, needsResume: stored.status !== 'accepted' };
+        }
+      }
+      if(this.cancelledBeforeStart.has(taskId))throw new Error('Task was cancelled before dispatch');
       q.pending.push(queued);
       const limit = agent.config.maxConcurrentTasks;
       const queuePosition = q.pending.length - 1 + q.inFlight.size;
@@ -1468,6 +1726,7 @@ The registered object must implement these handlers to participate in the agent 
       // Kick the queue runner — no-op if inFlight is already set.
       this.processNextInQueue(targetAgentId);
       return { taskId, queuePosition };
+      });
     });
 
     /**
@@ -1640,6 +1899,7 @@ The registered object must implement these handlers to participate in the agent 
      */
     this.on('cancelTask', async (msg: AbjectMessage) => {
       const { taskId, agentId: hintedAgent } = msg.payload as { taskId: string; agentId?: AbjectId };
+      this.cancelDescendants(taskId);
       // First check in-flight tasks
       const entry = this.taskEntries.get(taskId);
       if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
@@ -1681,18 +1941,35 @@ The registered object must implement these handlers to participate in the agent 
       return { success: false };
     });
 
+    this.on('getGoalExecutionHealth', msg => {
+      const {goalId}=msg.payload as {goalId:string};
+      const tasks=[...this.taskEntries.values()].filter(e=>(e.goalId===goalId||e.incomingGoalId===goalId)&&!e.finished);
+      return {ownedWorkActive:tasks.length>0,tasks:tasks.map(e=>({taskId:e.state.id,phase:e.state.phase,step:e.state.step,operation:e.outstandingOperation}))};
+    });
+
+    this.on('awaitGoalQuiescence', async msg => {
+      const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: string; preserveTaskIds?: string[] };
+      const affected = () => [...this.taskEntries.values()].filter(e => (e.goalId === goalId || e.incomingGoalId === goalId)
+        && !preserveTaskIds.includes(e.state.id) && this.registeredAgents.get(e.agentId)?.name !== 'ScrumMaster');
+      const deadline = Date.now() + 10000;
+      while (affected().some(e => !e.finished) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      const pending = affected().filter(e => !e.finished || e.outstandingOperation).map(e => ({ taskId:e.state.id, operation:e.outstandingOperation, finished:!!e.finished }));
+      return { safe:pending.length === 0, pending };
+    });
+
     this.on('cancelTasksByGoal', async (msg: AbjectMessage) => {
-      const { goalId } = msg.payload as { goalId: string };
+      const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: string; preserveTaskIds?: string[] };
       let cancelled = 0;
       // Cancel in-flight tasks (set phase=error so the OTA loop bails at the
       // next observe/think boundary; runTaskAsync's tail will pop the next
       // queued task as usual).
       for (const [taskId, entry] of this.taskEntries) {
-        if ((entry.goalId === goalId || entry.incomingGoalId === goalId)
+        if (!preserveTaskIds.includes(taskId) && (entry.goalId === goalId || entry.incomingGoalId === goalId)
             && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
           entry.state.phase = 'error';
           entry.state.error = 'Cancelled';
           cancelled++;
+          this.cancelDescendants(taskId);
           this.notifyAgentCancelled(entry, 'goal stopped');
           log.info(`cancelTasksByGoal: cancelled in-flight task ${taskId} for goal ${goalId}`);
         }
@@ -1704,7 +1981,7 @@ The registered object must implement these handlers to participate in the agent 
       // until the stale sweep and every other goal queues behind them.
       for (const [agentId, q] of this.agentTaskQueues) {
         const before = q.pending.length;
-        q.pending = q.pending.filter(t => t.goalId !== goalId);
+        q.pending = q.pending.filter(t => t.goalId !== goalId || preserveTaskIds.includes(t.taskId));
         const dropped = before - q.pending.length;
         if (dropped > 0) {
           log.info(`cancelTasksByGoal: dropped ${dropped} pending task(s) from agent ${agentId.slice(0, 8)} for goal ${goalId}`);
@@ -1713,7 +1990,7 @@ The registered object must implement these handlers to participate in the agent 
 
         let freed = 0;
         for (const [taskId, f] of [...q.inFlight]) {
-          if (f.goalId !== goalId) continue;
+          if (f.goalId !== goalId || preserveTaskIds.includes(taskId)) continue;
           const entry = this.taskEntries.get(taskId);
           if (entry && !entry.finished) continue; // live loop; its tail owns the slot
           q.inFlight.delete(taskId);
@@ -2039,7 +2316,24 @@ The registered object must implement these handlers to participate in the agent 
 
   private async runTaskAsync(entry: TaskEntry): Promise<void> {
     try {
-      await this.runStateMachine(entry);
+      await this.checkpointSession(entry);
+      for (;;) {
+        await this.runStateMachine(entry);
+        if (entry.state.phase !== 'done') break;
+        entry.settling = true;
+        const rejection = await this.assessCandidate(entry);
+        entry.settling = false;
+        if (!rejection) break;
+        entry.state.step++;
+        entry.pendingActions = undefined;
+        entry.state.llmMessages.push({ role: 'user', content: `[Completion needs correction] ${rejection}. Continue from existing artifacts; the task has not been accepted.` });
+        if ((entry.state.phase as AgentPhase) === 'error' || entry.state.step >= entry.state.maxSteps) {
+          entry.state.phase = 'error';
+          entry.state.error = entry.state.error ?? rejection;
+          break;
+        }
+        entry.state.result = undefined;
+      }
     } catch (err) {
       entry.state.phase = 'error';
       entry.state.error = err instanceof Error ? err.message : String(err);
@@ -2068,6 +2362,39 @@ The registered object must implement these handlers to participate in the agent 
    * holder, and the dependents. Every step is independently guarded — a
    * failure to reach one listener must not cost the others their signal.
    */
+  private async assessCandidate(entry: TaskEntry): Promise<string | undefined> {
+    if (entry.candidateAccepted) return;
+    try {
+      const children = [...this.delegations.values()].filter(d => d.parentTaskId === entry.state.id && (d.status === 'starting' || d.status === 'running'));
+      if (children.length) return `Child tasks are still active: ${children.map(d => d.taskId).join(', ')}. Inspect their evidence before completing.`;
+      if (entry.responseSchema) {
+        if (typeof entry.state.result === 'string') {
+          try { entry.state.result = JSON.parse(entry.state.result); } catch { /* report schema mismatch */ }
+        }
+        const validate = this.ajv.compile(entry.responseSchema);
+        if (!validate(entry.state.result)) return `Result schema mismatch: ${this.ajv.errorsText(validate.errors)}`;
+      }
+      if (entry.config.completionMethod) {
+        const decision = await this.request<{ accepted: boolean; reason?: string; evidence?: unknown }>(
+          request(this.id, entry.agentId, entry.config.completionMethod, {
+            taskId: entry.state.id, goalId: entry.goalId, result: entry.state.result,
+          }), 30000,
+        );
+        if (entry.state.phase === 'error' || entry.finished) return 'Task was cancelled or superseded during verification';
+        if (decision?.accepted !== true) return decision?.reason ?? 'Completion check did not accept the candidate';
+        entry.acceptanceEvidence = decision.evidence;
+      }
+      if (entry.dispatchTupleId && this.goalManagerId) {
+        const decision = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'assessTask', {
+          taskId: entry.dispatchTupleId, goalId: entry.goalId ?? entry.incomingGoalId,
+        }));
+        if (decision?.accepted !== true) return decision?.reason ?? 'Required task outputs are not ready';
+      }
+      entry.candidateAccepted = true;
+      return;
+    } catch (err) { return `Completion check unavailable: ${err instanceof Error ? err.message : String(err)}`; }
+  }
+
   private async finalizeTask(entry: TaskEntry): Promise<void> {
     // Already settled — the stale-slot sweep reached this task first (it only
     // does that for a machine that looked finished) and has told everyone how
@@ -2077,38 +2404,31 @@ The registered object must implement these handlers to participate in the agent 
       return;
     }
 
-    // Send deferred reply to startTask caller
-    const success = entry.state.phase === 'done';
-
-    // Validate result against responseSchema if present (soft validation — warn only)
-    let validationErrors: string[] | undefined;
-    if (success && entry.responseSchema && entry.state.result !== undefined) {
-      // Parse result if it's a string (LLM may return JSON as string)
-      if (typeof entry.state.result === 'string') {
-        try { entry.state.result = JSON.parse(entry.state.result); } catch { /* keep as string */ }
-      }
-      const validate = this.ajv.compile(entry.responseSchema);
-      if (!validate(entry.state.result)) {
-        validationErrors = validate.errors?.map(e => `${e.instancePath} ${e.message}`) ?? [];
-        log.warn(`Schema validation failed for task ${entry.state.id}:`, validationErrors);
-      }
+    entry.settling = true;
+    if (entry.state.phase === 'done') {
+      const rejection = await this.assessCandidate(entry);
+      if (rejection) { entry.state.phase = 'error'; entry.state.error = rejection; }
     }
+    let success = entry.state.phase === 'done';
+    const validationErrors = success ? undefined : entry.state.error ? [entry.state.error] : undefined;
 
-    // Solo agent run with goalId set but no dispatchTupleId: the caller owns
-    // the goal end-to-end, so completeGoal/failGoal is correct here. Tasks
-    // queued via enqueueTask carry dispatchTupleId; ScrumMaster owns goal
-    // lifecycle for those, so we don't compete with it.
-    if (entry.goalId && this.goalManagerId && !entry.dispatchTupleId) {
-      if (success) {
-        this.safeSend(event(this.id, this.goalManagerId, 'completeGoal', {
-          goalId: entry.goalId,
-          result: entry.state.result,
-        }), 'completeGoal');
-      } else {
-        this.safeSend(event(this.id, this.goalManagerId, 'failGoal', {
-          goalId: entry.goalId,
-          error: entry.state.error,
-        }), 'failGoal');
+    // A task sharing a goal never owns the parent goal's completion. ScrumMaster
+    // decides that after reviewing the task evidence, including direct calls.
+
+    const evidenceGoal = entry.goalId ?? entry.incomingGoalId;
+    if (evidenceGoal && this.goalManagerId) {
+      try {
+        await this.request(request(this.id, this.goalManagerId, 'recordTaskEvidence', {
+          goalId: evidenceGoal, taskId: entry.state.id,
+          record: { taskId: entry.state.id, agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
+            task: entry.state.task, phase: entry.state.phase, steps: entry.state.step,
+            goalId: evidenceGoal, result: entry.state.result, error: entry.state.error,
+            injectedKnowledge: entry.injectedKnowledge ?? [], predictions: entry.predictions ?? [],
+            transcript: flattenTranscript(entry.state.llmMessages), evidence: entry.acceptanceEvidence },
+        }));
+      } catch (err) {
+        success = false; entry.state.phase = 'error';
+        entry.state.error = `Could not preserve task evidence: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
@@ -2119,12 +2439,20 @@ The registered object must implement these handlers to participate in the agent 
     if (entry.dispatchTupleId && this.goalManagerId) {
       const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
       try {
+        // Preserve the settlement intent before changing the receiver. A lost
+        // reply remains an inspectable unknown outcome, never an automatic replay.
+        entry.outstandingOperation = { kind: 'taskSettlement', taskId: entry.dispatchTupleId, goalId: evidenceGoal, success, result: entry.state.result, evidence: entry.acceptanceEvidence };
+        await this.checkpointSession(entry);
         if (success) {
-          await this.request(request(this.id, this.goalManagerId, 'completeTask', {
+          const receipt = await this.request(request(this.id, this.goalManagerId, 'completeTask', {
             taskId: entry.dispatchTupleId,
             goalId: entry.incomingGoalId ?? entry.goalId,
             result: entry.state.result,
+            evidence: entry.acceptanceEvidence,
           }));
+          if (receipt === false || (receipt && typeof receipt === 'object' && 'accepted' in receipt && receipt.accepted === false)) {
+            throw new Error(`GoalManager rejected completion: ${JSON.stringify(receipt)}`);
+          }
           log.info(`[${agentName}] Task ${entry.state.id.slice(0, 8)} done; tuple ${entry.dispatchTupleId.slice(0, 8)} marked done`);
         } else {
           await this.request(request(this.id, this.goalManagerId, 'failTask', {
@@ -2136,24 +2464,33 @@ The registered object must implement these handlers to participate in the agent 
           }));
           log.info(`[${agentName}] Task ${entry.state.id.slice(0, 8)} failed; tuple ${entry.dispatchTupleId.slice(0, 8)} marked failed`);
         }
+        entry.outstandingOperation = undefined;
       } catch (err) {
+        success = false;
+        entry.state.phase = 'error';
+        entry.state.error = `Task settlement failed: ${err instanceof Error ? err.message : String(err)}`;
         log.warn(`completeTask/failTask for tuple ${entry.dispatchTupleId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
-    // Send taskResult event to the ticket holder (caller). This is the only
-    // notice the caller gets that its ticket is settled — ScrumMaster runs
-    // its terminal action from here — so it is never allowed to be skipped.
-    this.safeSend(event(this.id, entry.callerId, 'taskResult', {
-      ticketId: entry.state.id,
-      success,
-      result: entry.state.result,
-      error: entry.state.error,
-      steps: entry.state.step,
-      maxStepsReached: entry.state.step >= entry.state.maxSteps,
-      validationErrors,
-      lastAction: entry.state.action,
-    }), 'taskResult');
+    const resultPayload = {
+      deliveryId: `${entry.sessionId ?? entry.state.id}:${entry.state.id}:result`,
+      ticketId: entry.state.id, success, result: entry.state.result, error: entry.state.error,
+      steps: entry.state.step, maxStepsReached: entry.state.step >= entry.state.maxSteps,
+      validationErrors, evidence: entry.acceptanceEvidence, lastAction: entry.state.action,
+    };
+    entry.delivery = { id: resultPayload.deliveryId, destination: entry.callerId,
+      destinationName: this.registeredAgents.get(entry.callerId)?.name,
+      payload: resultPayload, delivered: false };
+    if (this.sessionStoreId) {
+      try {
+        await this.checkpointSession(entry);
+        void this.deliverSessionOutbox().catch(err => log.warn('Session delivery deferred:', err));
+      } catch (err) {
+        success = false; entry.state.phase = 'error'; entry.state.error = `Session settlement failed: ${String(err)}`;
+        this.safeSend(event(this.id, entry.callerId, 'taskResult', { ...resultPayload, success: false, error: entry.state.error }), 'taskResult');
+      }
+    } else this.safeSend(event(this.id, entry.callerId, 'taskResult', resultPayload), 'taskResult');
 
     entry.finished = true;
 
@@ -2269,7 +2606,7 @@ The registered object must implement these handlers to participate in the agent 
         needed = 5;
       } else if (entry.finished) {
         reason = 'task already torn down';
-      } else if (entry.state.phase === 'done' || entry.state.phase === 'error') {
+      } else if (!entry.settling && (entry.state.phase === 'done' || entry.state.phase === 'error')) {
         reason = `state machine ended in phase '${entry.state.phase}' without releasing the slot`;
       }
 
@@ -2315,7 +2652,9 @@ The registered object must implement these handlers to participate in the agent 
       // forever on a result that is never coming.
       const entry = this.taskEntries.get(taskId);
       const detail = `Task abandoned: ${reason}`;
-      const tupleId = entry?.dispatchTupleId ?? queued?.dispatchTupleId ?? queued?.taskId;
+      this.cancelledBeforeStart.set(taskId, Date.now());
+      if (entry) { entry.state.phase = 'error'; entry.state.error = detail; this.notifyAgentCancelled(entry, detail); }
+      const tupleId = entry?.dispatchTupleId ?? queued?.dispatchTupleId;
       const goalId = entry?.incomingGoalId ?? entry?.goalId ?? queued?.goalId;
       const callerId = entry?.callerId ?? queued?.callerId;
 
@@ -2400,24 +2739,41 @@ The registered object must implement these handlers to participate in the agent 
       return;
     }
     log.info(`Queue runner: starting task ${queued.taskId.slice(0, 8)} on agent ${agent.name}`);
-    // Fire-and-forget. The agent's executeTask handler returns DEFERRED_REPLY;
-    // we don't await its response. AgentAbject's runTaskAsync runs the state
-    // machine synchronously (within the async event loop) and its tail clears
-    // the queue's inFlight slot.
-    this.send(request(this.id, agentId, 'executeTask', {
-      tupleId: queued.taskId,
-      taskId: queued.taskId,
-      goalId: queued.goalId,
-      description: queued.task,
-      callerId: queued.callerId,
-      systemPrompt: queued.systemPrompt,
-      taskPrompt: queued.taskPrompt,
-      initialMessages: queued.initialMessages,
-      config: queued.config,
-      responseSchema: queued.responseSchema,
-      dispatchTupleId: queued.dispatchTupleId ?? queued.taskId,
-      data: queued.data,
-    }));
+    // The runner starts this asynchronously, so awaiting its reply does not
+    // occupy another queue. Observe setup failures before startTask as well as
+    // normal deferred completion; otherwise a rejected bootstrap silently stalls.
+    try {
+      const result = await this.request<{ success?: boolean; error?: string }>(request(this.id, agentId, 'executeTask', {
+        tupleId: queued.taskId,
+        taskId: queued.taskId,
+        goalId: queued.goalId,
+        description: queued.task,
+        callerId: queued.callerId,
+        systemPrompt: queued.systemPrompt,
+        taskPrompt: queued.taskPrompt,
+        initialMessages: queued.initialMessages,
+        config: queued.config,
+        responseSchema: queued.responseSchema,
+        dispatchTupleId: queued.dispatchTupleId,
+        data: queued.data,
+      }), 600000);
+      if (!this.taskEntries.has(queued.taskId) && this.agentTaskQueues.get(agentId)?.inFlight.has(queued.taskId)) {
+        throw new Error(result?.error ?? 'Agent returned without starting the queued task');
+      }
+    } catch (err) {
+      // Once admitted, the task runtime owns its outcome. A caller timeout
+      // must not replace the result of work that is still running.
+      if (this.taskEntries.has(queued.taskId)) return;
+      this.cancelledBeforeStart.set(queued.taskId, Date.now());
+      const state = this.createTask(queued.taskId, queued.task, { maxSteps: agent.config.maxSteps, timeout: agent.config.timeout });
+      state.phase = 'error'; state.error = `Task setup failed: ${err instanceof Error ? err.message : String(err)}`;
+      const entry: TaskEntry = { state, agentId, callerId: queued.callerId, goalId: queued.goalId,
+        dispatchTupleId: queued.dispatchTupleId, systemPrompt: queued.systemPrompt ?? agent.systemPrompt ?? '',
+        config: { ...agent.config, snapshotMethod: undefined } };
+      this.taskEntries.set(queued.taskId, entry);
+      try { await this.finalizeTask(entry); }
+      finally { this.releaseQueueSlot(agentId, queued.taskId); }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2612,6 +2968,11 @@ The registered object must implement these handlers to participate in the agent 
             // the Scrum model — ScrumMaster splits work across scrums.
             if (task.action.action === 'replan') {
               const reason = (task.action.reason as string) ?? 'Agent requested replan';
+              const goalId = entry.goalId ?? entry.incomingGoalId;
+              if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
+                goalId, operationId: `${task.id}:replan:${task.step}`,
+                observation: { taskId: task.id, material: true, reason, hypotheses: task.action.hypotheses, nextExperiment: task.action.nextExperiment },
+              }));
               log.info(`[${agentName}] Replan requested: ${reason.slice(0, 80)}`);
 
               let reflection = `[Replan] Reason: ${reason}\n`;
@@ -2873,6 +3234,8 @@ The registered object must implement these handlers to participate in the agent 
           }
 
           case 'acting': {
+            entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
+            await this.checkpointSession(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${(task.action?.reasoning ?? '').toString().slice(0, 60)})`);
             const desc = (task.action?.reasoning ?? task.action?.action ?? 'act').toString().slice(0, 80);
             // Job calls agent directly (not through _act handler) to avoid
@@ -2899,7 +3262,9 @@ The registered object must implement these handlers to participate in the agent 
             };
             // Before emitActionResult forwards it anywhere.
             this.absorbResultPayload(entry);
-            this.recordPrediction(entry);
+            await this.recordPrediction(entry);
+            entry.outstandingOperation = undefined;
+            await this.checkpointSession(entry);
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
 
@@ -2949,7 +3314,7 @@ The registered object must implement these handlers to participate in the agent 
     // read_draft / replace_handler / add_handler) so editing several different
     // handlers in a row isn't mistaken for repeating one — a real loop repeats
     // the SAME subject and still collapses to one signature.
-    const subject = String(a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.key ?? '');
+    const subject = String(a.path ?? a.command ?? a.url ?? a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.key ?? '');
     let outcome: string;
     if (task.lastResult?.success) {
       outcome = 'ok';
@@ -3056,7 +3421,7 @@ The registered object must implement these handlers to participate in the agent 
     try {
       task.llmMessages.push({
         role: 'user',
-        content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nIf you have extracted ANY useful data during this task, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
+        content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nOnly if the requested work is complete and its checks hold, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise preserve useful partial artifacts in your report and respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
       });
 
       const finalRoute = await this.applyVisionTiering(entry, 'smart');
@@ -3068,6 +3433,7 @@ The registered object must implement these handlers to participate in the agent 
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
+          goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
           // Thinking / action decisions run on 'smart' regardless of the observe
           // hint (fast-tier models drop the JSON action envelope under load,
           // producing prose that the parser can't accept), adjusted for vision
@@ -3081,7 +3447,7 @@ The registered object must implement these handlers to participate in the agent 
             // K3 spent ~19K tokens reasoning and the visible answer was cut.
             ...(finalRoute.model ? { model: finalRoute.model } : {}),
             cacheKey: entry.state.id,
-            ...AgentAbject.PLANNING_SAMPLING,
+            jsonMode: true,
           },
         }),
         60000,
@@ -3112,8 +3478,8 @@ The registered object must implement these handlers to participate in the agent 
     // Fallback: salvage last successful action result
     if (task.lastResult?.success && task.lastResult.data != null && task.lastResult.data !== '') {
       task.result = task.lastResult.data;
-      task.error = `Max steps (${task.maxSteps}) reached — returning last successful result`;
-      setPhase('done');
+      task.error = `Max steps (${task.maxSteps}) reached — incomplete; partial result preserved`;
+      setPhase('error');
       log.info(`[${agentName}] Max steps reached — salvaging last successful result`);
     } else {
       setPhase('error');
@@ -3187,10 +3553,10 @@ The registered object must implement these handlers to participate in the agent 
 
       const jobMgrId = await this.cachedDepOrThrow('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
-        description,
+        description, taskId: entry.state.id,
         code: fullCode,
-        ...(jobContext ? { context: jobContext } : {}),
-        ...(entry.config.queueName ? { queue: entry.config.queueName } : {}),
+        context: { ...(jobContext ?? {}), taskId: entry.state.id },
+        queue: `${entry.config.queueName ?? 'agent'}:${entry.state.id}`,
       });
       const jobResult = await this.request<JobResult>(submitMsg, entry.state.timeout);
       if (jobResult.status === 'completed') {
@@ -3345,6 +3711,7 @@ The registered object must implement these handlers to participate in the agent 
     this.appendVocabularyReminder(entry);
 
     this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
+    const outputAgreement = await this.request<{selected?:string}>(request(this.id,this.llmId,'negotiateOutput',{tier:route.tier,provider:route.provider,model:route.model}));
     // Build the request first: its message id is the correlation id the
     // chunk events come back with, which is how a chunk finds its own task.
     const streamRequest = request(this.id, this.llmId, 'stream', {
@@ -3365,11 +3732,12 @@ The registered object must implement these handlers to participate in the agent 
         // K3 spent ~19K tokens reasoning and the visible answer was cut.
         ...(route.model ? { model: route.model } : {}),
         cacheKey: entry.state.id,
-        ...AgentAbject.PLANNING_SAMPLING,
+        jsonMode: outputAgreement.selected === 'json_object',
       },
       // The ledger should name the agent whose work this is, not the
       // runtime that happens to run every agent's loop.
       onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
+          goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
         });
 
     this.streamingEntries.set(streamRequest.header.messageId, entry);
@@ -3589,7 +3957,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept and reviewed after the task, where the misses are the most valuable thing in the record.', true);
+    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
@@ -4191,26 +4559,31 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * hand. Actions that stated nothing are skipped entirely: an empty ledger
    * means the agent never committed to a claim, which is itself worth seeing.
    */
-  private recordPrediction(entry: TaskEntry): void {
+  private async recordPrediction(entry: TaskEntry): Promise<void> {
     const task = entry.state;
     const expect = typeof task.action?.expect === 'string' ? task.action.expect.trim() : '';
     if (!expect || !task.lastResult) return;
 
-    const success = task.lastResult.success;
-    const actual = success
-      ? JSON.stringify(task.lastResult.data)?.slice(0, 400)
-      : String(task.lastResult.error ?? 'unknown error').slice(0, 400);
-
+    const outcome = task.lastResult.success ? 'success' : 'failure';
+    const expected = task.action?.expectOutcome;
+    const verdict = expected === 'success' || expected === 'failure'
+      ? expected === outcome ? 'supported' : 'contradicted'
+      : 'unresolved';
+    const actual = JSON.stringify({ outcome, data: task.lastResult.data, error: task.lastResult.error, payloadId: task.lastResult.payloadId });
+    const stored = this.storePayload(entry, actual, 'prediction-observation');
     (entry.predictions ??= []).push({
-      step: task.step + 1,
-      action: String(task.action?.action ?? 'unknown'),
-      expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS),
-      outcome: success ? 'success' : 'failure',
-      // A failed action contradicts every expectation of it working, so this
-      // one direction is provable without judging natural language.
-      ...(success ? {} : { missed: true }),
-      ...(actual ? { actual } : {}),
+      step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
+      expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS), outcome, verdict,
+      ...(verdict === 'contradicted' ? { missed: true } : {}),
+      actual: actual.slice(0, 2000), actualRef: stored,
     });
+    const goalId = entry.goalId ?? entry.incomingGoalId;
+    if (goalId && this.goalManagerId) {
+      await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
+        goalId, operationId: `${task.id}:${task.step + 1}`,
+        observation: { taskId: task.id, ...entry.predictions!.at(-1), actual },
+      }));
+    }
   }
 
   private addActionResultToConversation(entry: TaskEntry): void {
@@ -4258,7 +4631,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const stated = expect.slice(0, AgentAbject.MAX_EXPECT_CHARS);
       resultStr += task.lastResult.success
         ? `\n\nYou predicted: "${stated}"\nCompare that against the result above. When it holds, continue. When it diverges, say what actually happened and what it teaches you about this system in your next action's reasoning, then act on the corrected understanding.`
-        : `\n\nYou predicted: "${stated}"\nThe action failed, so the prediction missed. The gap is information about how this system really works: name what you now believe instead, and let it choose your next action rather than repeating this one.`;
+        : `\n\nYou predicted: "${stated}"\nThe action failed. If rejection was expected, that may support the prediction. Compare the actual evidence with your expectation, state what remains uncertain, and let the corrected understanding choose your next action.`;
     }
 
     task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });
@@ -4269,15 +4642,6 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    *  summary message. 180k chars ≈ 45k tokens — well under every provider's
    *  context window, leaves headroom for the current observation + response. */
   private static readonly MAX_CONVERSATION_CHARS = 180000;
-  /**
-   * Sampling for the action-decision call. Choosing the next action is a
-   * classification step, not prose: a low temperature keeps small and
-   * quantized models on the JSON envelope, and constrained JSON decoding is
-   * requested wherever the provider can do it natively (others ignore the
-   * flag). Providers drop the temperature themselves where a model does not
-   * accept one (extended thinking, reasoning models).
-   */
-  private static readonly PLANNING_SAMPLING: { temperature: number; jsonMode: boolean } = { temperature: 0.2, jsonMode: true };
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
@@ -4322,6 +4686,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         request(this.id, this.llmId, 'compress', {
           messages: task.llmMessages,
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
+          goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
           options: {
             targetChars: AgentAbject.MAX_CONVERSATION_CHARS,
             pinnedCount,
@@ -4856,6 +5221,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   }
 
   protected override onProgressBubble(_msg: AbjectMessage): void {
+    const taskId=(_msg.payload as {taskId?:string})?.taskId;
+    if(!taskId)return;
     if (!this.goalManagerId) return;
     const now = Date.now();
     for (const entry of this.taskEntries.values()) {
@@ -4865,6 +5232,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // at every stale dependent (e.g. Chat instances from previous workspace
       // sessions). Terminal entries are bounded by pruneTerminalEntries and
       // released early by the reviewer, so this loop stays small.
+      if (entry.state.id!==taskId)continue;
       if (entry.state.phase === 'done' || entry.state.phase === 'error') continue;
       const goalId = entry.goalId ?? entry.incomingGoalId;
       if (!goalId) continue;

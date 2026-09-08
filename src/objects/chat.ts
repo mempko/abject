@@ -293,7 +293,14 @@ export class Chat extends Abject {
 
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
-  private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
+  private pendingGoalCompletions = new Map<string, {
+    resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+    paused?: boolean;
+    caller: { id: AbjectId; taskId: string };
+  }>();
 
   constructor(args?: ChatConstructorArgs) {
     super({
@@ -809,10 +816,6 @@ export class Chat extends Abject {
 
           if (aspect === 'goalUpdated') {
             const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
-            // Reset pending timeouts on any goal progress
-            this.resetTaskCompletionTimeouts();
-            this.resetPendingTicketTimeouts();
-
             // Lazily seed the goal entry if we missed its creation event
             // (e.g. it was created before our subscription took effect).
             if (!this.liveGoals.has(data.goalId)
@@ -830,6 +833,7 @@ export class Chat extends Abject {
 
             const entry = this.liveGoals.get(data.goalId);
             if (entry) {
+              this.forwardGoalProgress(data.goalId, data.message);
               if (data.message) entry.latestMessage = data.message;
               if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
               // Refetch tasks on any progress so we always show current state
@@ -975,8 +979,8 @@ export class Chat extends Abject {
     });
 
     this.on('agentAct', (msg: AbjectMessage) => {
-      const { action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      this.handleAgentAct(action).then(
+      const { action, taskId } = msg.payload as { taskId: string; step: number; action: AgentAction };
+      this.handleAgentAct(action, { id: msg.routing.from, taskId }).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => this.sendDeferredReply(msg, {
           success: false,
@@ -1250,6 +1254,41 @@ export class Chat extends Abject {
     });
   }
 
+  /**
+   * A goal's agents have different task IDs from the Chat task awaiting it.
+   * Bridge observed goal progress to that task's caller so JobManager and
+   * AgentAbject can refresh their scoped request timers as well as our wait.
+   * Only GoalManager events for this goal (or a tracked descendant) reach here.
+   */
+  private forwardGoalProgress(goalId: string, message?: string): void {
+    const visited = new Set<string>();
+    let ancestorId: string | undefined = goalId;
+    while (ancestorId && !visited.has(ancestorId)) {
+      visited.add(ancestorId);
+      const pending = this.pendingGoalCompletions.get(ancestorId);
+      if (pending && !pending.paused) {
+        this.resetGoalCompletionTimeout(ancestorId);
+        this.send(event(this.id, pending.caller.id, 'progress', {
+          taskId: pending.caller.taskId,
+          goalId,
+          message: message ?? 'Goal is making progress',
+        }));
+      }
+      ancestorId = this.liveGoals.get(ancestorId)?.parentId;
+    }
+  }
+
+  private resetGoalCompletionTimeout(goalId: string): void {
+    const entry = this.pendingGoalCompletions.get(goalId);
+    if (!entry || entry.paused) return;
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      this.pendingGoalCompletions.delete(goalId);
+      log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
+      entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
+    }, entry.timeoutMs);
+  }
+
   /** Reset all pending task completion timeouts (called on progress events). */
   private resetTaskCompletionTimeouts(): void {
     for (const [taskId, entry] of this.pendingTaskCompletions) {
@@ -1260,15 +1299,7 @@ export class Chat extends Abject {
         entry.reject(new Error(`Task ${taskId} timed out after ${entry.timeoutMs}ms`));
       }, entry.timeoutMs);
     }
-    for (const [goalId, entry] of this.pendingGoalCompletions) {
-      if (entry.paused) continue; // suspended while its goal is paused
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        this.pendingGoalCompletions.delete(goalId);
-        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
-        entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
-      }, entry.timeoutMs);
-    }
+    for (const goalId of this.pendingGoalCompletions.keys()) this.resetGoalCompletionTimeout(goalId);
   }
 
   /**
@@ -1276,11 +1307,11 @@ export class Chat extends Abject {
    * makes the completion decision under the Scrum model; Chat awaits it
    * here and surfaces the synthesized result to the user.
    *
-   * The timer resets on goal-level progress events (see
-   * resetTaskCompletionTimeouts), so a goal that is making progress through
-   * multiple scrums won't time out from inactivity.
+   * Goal-level progress refreshes this timer and is forwarded to the waiting
+   * task's caller, so multiple scrums won't exhaust an outer request timer
+   * while the goal is still making progress.
    */
-  private waitForGoalCompletion(goalId: string, timeoutMs: number): Promise<{ result?: unknown; error?: string; status: 'completed' | 'failed' }> {
+  private waitForGoalCompletion(goalId: string, timeoutMs: number, caller: { id: AbjectId; taskId: string }): Promise<{ result?: unknown; error?: string; status: 'completed' | 'failed' }> {
     log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} timeout=${timeoutMs}ms`);
     return new Promise((resolve, reject) => {
       const makeTimer = () => setTimeout(() => {
@@ -1291,6 +1322,7 @@ export class Chat extends Abject {
       const entry = {
         timer: makeTimer(),
         timeoutMs,
+        caller,
         resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => {
           clearTimeout(entry.timer);
           log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — RESOLVED (${v.status})`);
@@ -1311,7 +1343,7 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
 
-  private async handleAgentAct(action: AgentAction): Promise<unknown> {
+  private async handleAgentAct(action: AgentAction, caller: { id: AbjectId; taskId: string }): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action}`);
 
     // Handle remember action directly (no agent dispatch needed)
@@ -1386,11 +1418,10 @@ export class Chat extends Abject {
       // is still bounded.
       this.pauseTicketTimeout(this._currentTicketId);
       try {
-        // Wait for ScrumMaster's DONE decision. The timer resets on every
-        // goal-level progress event (scrumPlanned, goalUpdated, etc.) via
-        // resetTaskCompletionTimeouts, so multi-scrum goals don't time out
-        // from inactivity — only from actually being stuck.
-        const completion = await this.waitForGoalCompletion(goalId, 600000);
+        // Wait for ScrumMaster's DONE decision. Progress on this goal tree
+        // refreshes this wait and the caller's request chain, so multiple
+        // scrums can run without being mistaken for an inactive Chat task.
+        const completion = await this.waitForGoalCompletion(goalId, 600000, caller);
 
         // Always pull the goal scratchpad alongside the result so Chat's
         // next think-step has access to per-task outputs ScrumMaster

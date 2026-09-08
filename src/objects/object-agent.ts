@@ -1,3 +1,4 @@
+import { domainFailure, type ResultContract } from '../core/result-contract.js';
 /**
  * ObjectAgent -- an agent that discovers and calls objects via message passing.
  *
@@ -166,6 +167,15 @@ When asked about a task, describe which objects you would message and what you w
   }
 
   private setupHandlers(): void {
+    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('restoreTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: TaskExtra };
+      if (!snapshot) throw new Error('Missing specialist checkpoint');
+      this.taskExtras.set(taskId, structuredClone(snapshot));
+      return { success: true };
+    });
+
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
       const { tupleId, taskId: explicitTaskId, goalId, description, data, approach, failureHistory } = msg.payload as {
@@ -257,7 +267,9 @@ When asked about a task, describe which objects you would message and what you w
     });
 
     // ── Ticket result handler ──
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
@@ -270,17 +282,18 @@ When asked about a task, describe which objects you would message and what you w
     // The base Abject handler only bubbles to _handlingRequestSenders which dies
     // at JobManager (no upstream during job execution).
     this.on('progress', (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       // Progress arrives untagged, so it cannot be attributed to one task by
       // inspection. With several running, every live goal is genuinely being
       // worked on and each needs its timer reset, so all of them hear about it
       // — but the message itself belongs to whichever task emitted it, so it
       // is only quoted when there is no ambiguity about whose it is.
       if (this.goalManagerId) {
-        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        const payload = msg.payload as { taskId?: string; phase?: string; message?: string } | undefined;
         const goals = new Set<string>();
-        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
-        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const task = payload?.taskId ? this.taskExtras.get(payload.taskId) : undefined;
+        if (task?.goalId) goals.add(task.goalId);
+
         const attributable = goals.size === 1;
         for (const goalId of goals) {
           this.send(event(this.id, this.goalManagerId, 'updateProgress', {
@@ -296,20 +309,22 @@ When asked about a task, describe which objects you would message and what you w
     // ── AgentAbject callback handlers ──
     // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       // Action handlers can await sub-calls that run for minutes (e.g. an
       // ObjectCreator.create authoring loop). While we're awaiting, no other
       // agentObserve / agentAct event fires, so the inactivity timer would
       // reject our pending tickets even though work is genuinely happening.
       // Heartbeat the timeouts every 60s while the action is in flight.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 60000);
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
       try {
         return await this.handleAct(taskId, action);
       } finally {
@@ -318,15 +333,15 @@ When asked about a task, describe which objects you would message and what you w
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentIntermediateAction', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
+    this.on('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -344,6 +359,7 @@ When asked about a task, describe which objects you would message and what you w
         'Handles data fetching, object queries, and orchestrating existing objects at runtime. ' +
         'Best for runtime message passing over the bus. Object source authoring goes to a creation agent; interactive web browsing goes to a web-browsing agent; installed skill flows go to a skill-execution agent.',
       config: {
+        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },
           fail: { type: 'error' as const, resultFields: ['reason'] },
@@ -404,7 +420,7 @@ When asked about a task, describe which objects you would message and what you w
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
     // Per-task goal context; the shared field is only a legacy fallback
-    const goalId = extra.goalId ?? this._currentGoalId;
+    const goalId = extra.goalId;
 
     try {
       let result: string;
@@ -455,6 +471,10 @@ When asked about a task, describe which objects you would message and what you w
             request(this.id, objectId, method, action.payload ?? {}),
             timeout,
           );
+
+          const contract = await this.request<ResultContract|null>(request(this.id,objectId,'getResultContract',{method})).catch(()=>null);
+          const rejected=domainFailure(callResult,contract);
+          if(rejected)return {success:false,data:callResult,error:rejected};
 
           // Detect screenshot results and store image data for LLM vision
           if (callResult && typeof callResult === 'object' && 'imageBase64' in (callResult as Record<string, unknown>)) {
@@ -682,8 +702,10 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
   }>();
 
   /** Reset all pending ticket timeouts on progress (agent is still working). */
-  private resetPendingTicketTimeouts(): void {
+  private resetPendingTicketTimeouts(taskId?: string): void {
+    if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
+      if (ticketId !== taskId) continue;
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -698,6 +720,8 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
   }
 
   private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
+    const early=this.takeTaskResult<any>(ticketId);
+    if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
       const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);

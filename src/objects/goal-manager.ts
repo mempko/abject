@@ -7,7 +7,9 @@
  * update. Subscribers (GoalBrowser, Chat) receive `changed` events for real-time UI.
  */
 
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import { v4 as uuidv4 } from 'uuid';
+import { withKeyedLock } from '../core/keyed-lock.js';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -104,6 +106,7 @@ export interface Goal {
   error?: string;
   createdAt: number;
   updatedAt: number;
+  lastMeaningfulProgressAt?: number;
   scratchpad: Record<string, unknown>;
   /**
    * Messages the user sent while the goal was running (typed into the chat
@@ -139,6 +142,12 @@ export class GoalManager extends Abject {
    *  gets one emission. Cleared per-key when a new task is added at that scrum number. */
   private readyForCompletionEmitted: Set<string> = new Set();
 
+  /** GoalManager is spawned before the runtime; retry a missing dependency on use. */
+  private async taskRuntime(): Promise<AbjectId | undefined> {
+    this.agentAbjectId ??= await this.discoverDep('AgentAbject') ?? undefined;
+    return this.agentAbjectId;
+  }
+
   /**
    * Cancel every task of a goal: release + remove its tuples, abort running
    * agent tasks, clean the per-goal SharedState namespace. Shared by the
@@ -168,9 +177,10 @@ export class GoalManager extends Abject {
     }
 
     // Cancel running agent tasks for this goal
-    if (this.agentAbjectId) {
+    const runtimeId = await this.taskRuntime();
+    if (runtimeId) {
       try {
-        await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
+        await this.request(request(this.id, runtimeId, 'cancelTasksByGoal', { goalId }));
       } catch { /* best effort */ }
     }
 
@@ -568,6 +578,8 @@ export class GoalManager extends Abject {
               description: 'Increment the goal\'s currentScrumNumber. Called by ScrumMaster after a scrum plans more tasks so they land at the new scrum number.',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'operationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Replay identity for this round', optional: true },
+                { name: 'preserveTaskIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Earlier tasks retained in the new backlog', optional: true },
               ],
               returns: { kind: 'object', properties: { scrumNumber: { kind: 'primitive', primitive: 'number' } } },
             },
@@ -934,6 +946,22 @@ export class GoalManager extends Abject {
               // from title so the field invariant holds.
               description: goalData.description ?? goalData.title,
             };
+            if (this.storageId) {
+              const local = await this.request<Record<string, unknown> | null>(request(this.id, this.storageId, 'get', { key: `goals:learning:${goal.id}` })).catch(() => null);
+              if (local?.version === 2) {
+                const state = local.goalState as Partial<Goal> | undefined;
+                // Legacy checkpoints have no ordering information. They must
+                // not undo a newer pause, stop or completion from SharedState.
+                const useLocal = typeof state?.updatedAt === 'number' && state.updatedAt >= goal.updatedAt;
+                if (useLocal) Object.assign(goal, state);
+                const scratchpad = (local.scratchpad ?? {}) as Record<string, unknown>;
+                goal.scratchpad = useLocal
+                  ? { ...goal.scratchpad, ...scratchpad }
+                  : { ...scratchpad, ...goal.scratchpad };
+                goal.lastMeaningfulProgressAt = Math.max(goal.lastMeaningfulProgressAt ?? 0, state?.lastMeaningfulProgressAt ?? 0) || undefined;
+              }
+              else if (local) goal.scratchpad = { ...goal.scratchpad, ...local };
+            }
             this.goals.set(goal.id, goal);
             if (!this.goalOrder.includes(goal.id)) {
               this.goalOrder.push(goal.id);
@@ -1083,19 +1111,29 @@ reviews results and either plans another round or completes/fails the goal.
     return this.askLlm(prompt, question, 'balanced');
   }
 
+  private budgetOwner(goalId: string): Goal {
+    let goal = this.goals.get(goalId);
+    if (!goal) throw new Error('Unknown goal');
+    const visited = new Set<string>();
+    while (goal.parentId) {
+      if (visited.has(goal.id)) throw new Error('Cyclic goal ancestry');
+      visited.add(goal.id);
+      const parent = this.goals.get(goal.parentId);
+      if (!parent) throw new Error('Parent goal unavailable');
+      goal = parent;
+    }
+    return goal;
+  }
+
   private async sweepGoals(): Promise<void> {
     const now = Date.now();
     let changed = false;
 
     for (const [id, goal] of this.goals) {
+      if (goal.scratchpad['learning/review'] === 'pending') continue;
       switch (goal.status) {
         case 'active':
-          if (now - goal.updatedAt >= STALE_TTL_MS) {
-            goal.status = 'failed';
-            goal.error = 'abandoned';
-            goal.updatedAt = now;
-            changed = true;
-          }
+          // GoalObserver owns liveness decisions; a read must not abandon running work.
           break;
         case 'completed':
           if (now - goal.updatedAt >= COMPLETED_TTL_MS) {
@@ -1142,7 +1180,7 @@ reviews results and either plans another round or completes/fails the goal.
     // Enforce MAX_ARCHIVED cap — evict oldest first
     const archived = this.goalOrder
       .map(id => this.goals.get(id))
-      .filter((g): g is Goal => g !== undefined && g.status === 'archived');
+      .filter((g): g is Goal => g !== undefined && g.status === 'archived' && g.scratchpad['learning/review'] !== 'pending');
 
     if (archived.length > MAX_ARCHIVED) {
       const toEvict = archived
@@ -1175,9 +1213,8 @@ reviews results and either plans another round or completes/fails the goal.
    * decides whether to declare the sprint done or plan more tasks. The goal
    * stays `active` until ScrumMaster acts.
    *
-   * Scoped by scrum number: tasks from earlier rounds (already terminal) do
-   * not block emission for the current round, and tasks from a later round
-   * (added when a scrum plans more work) re-arm the check.
+     * Scoped by scrum number and explicitly retained task IDs: preserved work
+     * keeps its original round for attribution, but still gates this review.
    *
    * Idempotent per (goalId, scrumNumber): each scrum gets one emission.
    * `addTask` clears the matching key so the next scrum gets its own.
@@ -1200,9 +1237,9 @@ reviews results and either plans another round or completes/fails the goal.
       return;
     }
     if (tasks.length === 0) return;
-    // Filter to tasks at the goal's current scrum number — that's the
-    // sprint backlog whose terminality controls the review trigger.
-    const scrumTasks = tasks.filter(t => (t.fields.scrumNumber as number | undefined) === goal.currentScrumNumber);
+    // The receiver owns backlog membership, including retained earlier work.
+    const retained = new Set((goal.scratchpad[`learning/backlog/${goal.currentScrumNumber}`] as string[] | undefined) ?? []);
+    const scrumTasks = tasks.filter(t => (t.fields.scrumNumber as number | undefined) === goal.currentScrumNumber || retained.has(t.id));
     if (scrumTasks.length === 0) return;
     const doneTaskIds: string[] = [];
     const failedTaskIds: string[] = [];
@@ -1272,7 +1309,147 @@ reviews results and either plans another round or completes/fails the goal.
     } catch { /* best effort */ }
   }
 
+  /** Snapshot learning records before publication; SharedState distributes the same owner state. */
+  private async persistLearning(goal: Goal): Promise<void> {
+    return withKeyedLock(`${this.id}:learning-persist:${goal.id}`, async () => {
+    if (this.storageId) await this.request(request(this.id, this.storageId, 'set', {
+      key: `goals:learning:${goal.id}`, value: {version:2,goalState:{status:goal.status,result:goal.result,error:goal.error,updatedAt:goal.updatedAt,lastMeaningfulProgressAt:goal.lastMeaningfulProgressAt},scratchpad:goal.scratchpad},
+    }));
+    await this.syncGoalToSharedState(goal);
+    });
+  }
+
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "recordTaskEvidence", description: "Preserve a task record before terminal notification.", parameters: { "goalId": protocolText, "taskId": protocolText, "record": protocolObject } },
+      { name: "recordObservation", description: "Idempotently record an observation for the next scrum.", parameters: { "goalId": protocolText, "operationId": protocolText, "observation": protocolObject } },
+      { name: "recordPlan", description: "Record an evidence-backed plan revision; stale revisions conflict.", parameters: { "goalId": protocolText, "operationId": protocolText, "expectedRevision": protocolNumber, "plan": protocolObject } },
+      { name: "getBudget", description: "Inspect attributable tokens, cost, time and outstanding reservations across this goal and its children.", parameters: { goalId: protocolText } },
+      { name: "configureBudget", description: "Goal creator sets maxTokens/maxCostUsd. Concurrent model calls reserve spend before execution; exhaustion preserves partial sessions.", parameters: { goalId: protocolText, maxTokens: protocolNumber, maxCostUsd: protocolNumber } },
+      { name: "pendingReviews", description: "List goal retrospectives awaiting acknowledgement.", parameters: {  } },
+      { name: "ackReview", description: "Acknowledge a completed retrospective.", parameters: { "goalId": protocolText } },
+      { name: "assessTask", description: "Check required outputs and active task state before completion.", parameters: { "goalId": protocolText, "taskId": protocolText } },
+    ]);
+    this.on('recordTaskEvidence', async (msg: AbjectMessage) => {
+      const { goalId, taskId, record } = msg.payload as { goalId: string; taskId: string; record: unknown };
+      const goal = this.goals.get(goalId);
+      if (!goal) return { success: false };
+      requireNonEmpty(taskId, 'taskId');
+      goal.scratchpad[`learning/task/${taskId}`] = record;
+      goal.lastMeaningfulProgressAt = Date.now();
+      await this.persistLearning(goal);
+      return { success: true };
+    });
+    this.on('recordObservation', async (msg: AbjectMessage) => {
+      const { goalId, operationId, observation } = msg.payload as { goalId: string; operationId: string; observation: unknown };
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'active') return { success: false };
+      requireNonEmpty(operationId, 'operationId');
+      const key = `learning/observation/${operationId}`;
+      if (key in goal.scratchpad) { await this.persistLearning(goal); return { success: true, duplicate: true }; }
+      goal.scratchpad[key] = { ...(observation as Record<string, unknown>), at: Date.now() };
+      goal.lastMeaningfulProgressAt=Date.now();
+      await this.persistLearning(goal);
+      this.changed('observationRecorded', { goalId, operationId, observation });
+      return { success: true };
+    });
+    this.on('recordScrumCommit', async msg => {
+      if (msg.routing.from !== await this.discoverDep('ScrumMaster')) throw new Error('Scrum commits belong to ScrumMaster');
+      const { goalId, operationId } = msg.payload as { goalId: string; operationId: string };
+      const goal = this.goals.get(goalId);
+      if (!goal || !operationId) throw new Error('Unknown goal or missing commit identity');
+      goal.scratchpad[`learning/commit/${operationId}`] = true;
+      await this.persistLearning(goal);
+      return { success: true };
+    });
+    this.on('recordPlan', async (msg: AbjectMessage) => {
+      const { goalId, operationId, expectedRevision, plan } = msg.payload as { goalId: string; operationId: string; expectedRevision: number; plan: Record<string, unknown> };
+      return withKeyedLock(`${this.id}:plan:${goalId}`, async () => {
+        const goal = this.goals.get(goalId);
+        if (!goal || goal.status !== 'active') return { success: false, error: 'Goal is not active' };
+        const history = (goal.scratchpad['learning/plans'] as Array<{ revision: number; operationId: string; plan: unknown; at: number }>) ?? [];
+        const duplicate = history.find(p => p.operationId === operationId);
+        if (duplicate) { await this.persistLearning(goal); return { success: true, revision: duplicate.revision, duplicate: true }; }
+        const current = history.at(-1)?.revision ?? 0;
+        if (current !== expectedRevision) return { success: false, conflict: true, revision: current };
+        history.push({ revision: current + 1, operationId, plan, at: Date.now() });
+        goal.scratchpad['learning/plans'] = history;
+        goal.lastMeaningfulProgressAt = Date.now();
+        await this.persistLearning(goal);
+        this.changed('planRevised', { goalId, revision: current + 1, plan });
+        return { success: true, revision: current + 1 };
+      });
+    });
+    this.on('pendingReviews', async () => [...this.goals.values()]
+      .filter(g => g.scratchpad['learning/review'] === 'pending')
+      .map(g => ({ goalId: g.id, outcome: g.error ? 'failed' : 'completed', detail: g.error })));
+    this.on('ackReview', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      const goal = this.goals.get(goalId);
+      if (!goal) return { success: false };
+      goal.scratchpad['learning/review'] = 'reviewed';
+      await this.persistLearning(goal);
+      return { success: true };
+    });
+
+    this.on('getBudget', async msg => {
+      const { goalId } = msg.payload as { goalId: string };
+      const goal = this.budgetOwner(goalId);
+      return structuredClone(goal.scratchpad['resources'] ?? { usedTokens: 0, usedCostUsd: 0, reservations: {} });
+    });
+    this.on('configureBudget', async msg => {
+      const { goalId, maxTokens, maxCostUsd } = msg.payload as { goalId: string; maxTokens?: number; maxCostUsd?: number };
+      const goal = this.budgetOwner(goalId);
+      if (msg.routing.from !== goal.createdBy) throw new Error('Only the goal creator may change its budget');
+      for (const value of [maxTokens, maxCostUsd]) if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error('Budget limits must be nonnegative finite numbers');
+      return withKeyedLock(`${this.id}:budget:${goal.id}`, async () => {
+        const resources = (goal.scratchpad['resources'] ?? {}) as Record<string, unknown>;
+        goal.scratchpad['resources'] = { ...resources, maxTokens, maxCostUsd };
+        await this.persistLearning(goal);
+        return { success: true };
+      });
+    });
+    this.on('reserveUsage', async msg => {
+      if (msg.routing.from !== await this.discoverDep('LLM')) throw new Error('Only LLM may reserve model usage');
+      const p = msg.payload as { goalId: string; operationId: string; taskId?: string; tokens: number; costUsd?: number };
+      const goal = this.budgetOwner(p.goalId);
+      if (!p.operationId || !Number.isFinite(p.tokens) || p.tokens < 0 || (p.costUsd !== undefined && (!Number.isFinite(p.costUsd) || p.costUsd < 0))) throw new Error('Invalid usage reservation');
+      return withKeyedLock(`${this.id}:budget:${goal.id}`, async () => {
+        const r: any = structuredClone(goal.scratchpad['resources'] ?? { usedTokens: 0, usedCostUsd: 0, reservations: {}, receipts: {} });
+        r.reservations ??= {}; r.receipts ??= {};
+        if (r.reservations[p.operationId] || r.receipts[p.operationId]) return { accepted: false, reason: 'Operation already reserved or settled' };
+        const reserved = Object.values(r.reservations) as Array<{tokens: number; costUsd?: number}>;
+        const tokens = (r.usedTokens ?? 0) + reserved.reduce((sum,v) => sum + v.tokens, 0) + p.tokens;
+        const cost = (r.usedCostUsd ?? 0) + reserved.reduce((sum,v) => sum + (v.costUsd ?? 0), 0) + (p.costUsd ?? 0);
+        if (r.maxTokens !== undefined && tokens > r.maxTokens) return { accepted: false, reason: 'Goal token budget exhausted', remaining: r.maxTokens - (r.usedTokens ?? 0) };
+        if (r.maxCostUsd !== undefined && (p.costUsd === undefined || cost > r.maxCostUsd)) return { accepted: false, reason: 'Goal cost budget exhausted or model price unknown' };
+        r.reservations[p.operationId] = { ...p, startedAt: Date.now() };
+        goal.scratchpad['resources'] = r; await this.persistLearning(goal);
+        return { accepted: true, goalId: goal.id };
+      });
+    });
+    this.on('settleUsage', async msg => {
+      if (msg.routing.from !== await this.discoverDep('LLM')) throw new Error('Only LLM may reconcile model usage');
+      const p = msg.payload as { goalId: string; operationId: string; tokens?: number; costUsd?: number; error?: string };
+      if ([p.tokens, p.costUsd].some(v => v !== undefined && (!Number.isFinite(v) || v < 0))) throw new Error('Invalid usage settlement');
+      const goal = this.budgetOwner(p.goalId);
+      return withKeyedLock(`${this.id}:budget:${goal.id}`, async () => {
+        const r: any = structuredClone(goal.scratchpad['resources']);
+        if (r?.receipts?.[p.operationId]) { await this.persistLearning(goal); return { success: true, duplicate: true }; }
+        const reservation = r?.reservations?.[p.operationId];
+        if (!reservation) throw new Error('Unknown reservation');
+        const receipt = { ...p, taskId: reservation.taskId, tokens: p.tokens ?? reservation.tokens,
+          costUsd: p.costUsd ?? reservation.costUsd, estimated: p.tokens === undefined || p.costUsd === undefined,
+          elapsedMs: Date.now() - reservation.startedAt };
+        delete r.reservations[p.operationId]; r.receipts[p.operationId] = receipt;
+        r.usedTokens = (r.usedTokens ?? 0) + receipt.tokens;
+        r.usedCostUsd = (r.usedCostUsd ?? 0) + (receipt.costUsd ?? 0);
+        goal.scratchpad['resources'] = r; await this.persistLearning(goal);
+        this.changed('goalBudgetUpdated', { goalId: goal.id, ...r });
+        return { success: true };
+      });
+    });
+
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       const { title, parentId, description } = msg.payload as {
@@ -1385,6 +1562,8 @@ reviews results and either plans another round or completes/fails the goal.
       goal.result = result;
       goal.updatedAt = Date.now();
 
+      goal.scratchpad['learning/review'] = 'pending';
+      await this.persistLearning(goal);
       log.info(`Goal completed: "${goal.title}" (${goalId})`);
       this.changed('goalCompleted', { goalId, result });
       this.syncGoalToSharedState(goal);
@@ -1395,21 +1574,30 @@ reviews results and either plans another round or completes/fails the goal.
      * decides to plan more work. New tasks added at the incremented number
      * gate the next round's `goalReadyForCompletion` emission.
      */
-    this.on('startNextScrum', async (msg: AbjectMessage) => {
-      const { goalId } = msg.payload as { goalId: GoalId };
-      const goal = this.goals.get(goalId);
-      if (!goal) return { error: 'Goal not found' };
-      goal.currentScrumNumber += 1;
-      goal.updatedAt = Date.now();
-      log.info(`Goal ${goalId.slice(0, 8)} entering scrum ${goal.currentScrumNumber}`);
-      this.changed('goalUpdated', {
-        goalId,
-        parentId: goal.parentId,
-        message: `Scrum ${goal.currentScrumNumber} planned`,
-        phase: 'planning',
+    this.on('startNextScrum', async msg => {
+      const {goalId,operationId,preserveTaskIds=[]}=msg.payload as {goalId:GoalId;operationId?:string;preserveTaskIds?:string[]};
+      return withKeyedLock(`${this.id}:round:${goalId}`,async()=>{
+        const goal=this.goals.get(goalId);
+        if(!goal || goal.status!=='active')throw new Error('Goal is not active');
+        const key=operationId?`learning/round/${operationId}`:undefined;
+        if(key && goal.scratchpad[key]!==undefined){await this.persistLearning(goal);return {scrumNumber:goal.scratchpad[key],duplicate:true};}
+        if (!Array.isArray(preserveTaskIds) || preserveTaskIds.some(id => typeof id !== 'string')) throw new Error('preserveTaskIds must be an array of task IDs');
+        if (preserveTaskIds.length) {
+          if (!this.tupleSpaceId) throw new Error('TupleSpace unavailable');
+          const tasks = await this.request<Array<{ id: string; fields: { status: string } }>>(request(this.id, this.tupleSpaceId, 'scan', {
+            namespace: this.getTupleNamespace(goalId), pattern: { goalId },
+          }));
+          if (preserveTaskIds.some(id => !tasks.some(t => t.id === id && !['superseded', 'cancelled'].includes(t.fields.status)))) {
+            throw new Error('Preserved tasks must belong to this goal and must not be cancelled or superseded');
+          }
+        }
+        goal.currentScrumNumber=(goal.currentScrumNumber??0)+1;goal.updatedAt=Date.now();
+        goal.scratchpad[`learning/backlog/${goal.currentScrumNumber}`] = [...new Set(preserveTaskIds)];
+        if(key)goal.scratchpad[key]=goal.currentScrumNumber;
+        await this.persistLearning(goal);
+        this.changed('goalUpdated',{goalId,parentId:goal.parentId,message:`Scrum ${goal.currentScrumNumber} planned`,phase:'planning'});
+        return {scrumNumber:goal.currentScrumNumber};
       });
-      this.syncGoalToSharedState(goal);
-      return { scrumNumber: goal.currentScrumNumber };
     });
 
     this.on('failGoal', async (msg: AbjectMessage) => {
@@ -1422,6 +1610,8 @@ reviews results and either plans another round or completes/fails the goal.
       goal.error = error;
       goal.updatedAt = Date.now();
 
+      goal.scratchpad['learning/review'] = 'pending';
+      await this.persistLearning(goal);
       log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
       this.changed('goalFailed', { goalId, error });
       this.syncGoalToSharedState(goal);
@@ -1441,15 +1631,16 @@ reviews results and either plans another round or completes/fails the goal.
       goal.status = 'paused';
       goal.updatedAt = Date.now();
 
-      if (this.agentAbjectId) {
+      const runtimeId = await this.taskRuntime();
+      if (runtimeId) {
         try {
-          await this.request(request(this.id, this.agentAbjectId, 'pauseTasksByGoal', { goalId }));
+          await this.request(request(this.id, runtimeId, 'pauseTasksByGoal', { goalId }));
         } catch { /* best effort — the claimTask/scrum gates still hold */ }
       }
 
       log.info(`Goal paused: "${goal.title}" (${goalId})`);
+      await this.persistLearning(goal);
       this.changed('goalPaused', { goalId });
-      this.syncGoalToSharedState(goal);
       return true;
     });
 
@@ -1461,15 +1652,16 @@ reviews results and either plans another round or completes/fails the goal.
       goal.status = 'active';
       goal.updatedAt = Date.now();
 
-      if (this.agentAbjectId) {
+      const runtimeId = await this.taskRuntime();
+      if (runtimeId) {
         try {
-          await this.request(request(this.id, this.agentAbjectId, 'resumeTasksByGoal', { goalId }));
+          await this.request(request(this.id, runtimeId, 'resumeTasksByGoal', { goalId }));
         } catch { /* best effort */ }
       }
 
       log.info(`Goal resumed: "${goal.title}" (${goalId})`);
+      await this.persistLearning(goal);
       this.changed('goalResumed', { goalId });
-      this.syncGoalToSharedState(goal);
       // The round may have reached all-terminal right as the user paused —
       // re-check so the next scrum isn't lost.
       this.maybeEmitGoalReadyForCompletion(goalId).catch(() => { /* best effort */ });
@@ -1492,8 +1684,9 @@ reviews results and either plans another round or completes/fails the goal.
       goal.updatedAt = Date.now();
 
       log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
+      goal.scratchpad['learning/review'] = 'pending';
+      await this.persistLearning(goal);
       this.changed('goalFailed', { goalId, error: 'Stopped by user' });
-      this.syncGoalToSharedState(goal);
       return true;
     });
 
@@ -1553,16 +1746,17 @@ reviews results and either plans another round or completes/fails the goal.
 
       goal.status = 'paused';
       goal.updatedAt = Date.now();
-      if (this.agentAbjectId) {
+      const runtimeId = await this.taskRuntime();
+      if (runtimeId) {
         try {
-          await this.request(request(this.id, this.agentAbjectId, 'pauseTasksByGoal', { goalId }));
+          await this.request(request(this.id, runtimeId, 'pauseTasksByGoal', { goalId }));
         } catch { /* best effort — the claimTask/scrum gates still hold */ }
       }
 
       log.info(`Clarification requested for "${goal.title}" (${goalId}): ${question.slice(0, 80)}`);
+      await this.persistLearning(goal);
       this.changed('goalPaused', { goalId });
       this.changed('goalClarificationRequested', { goalId, parentId: goal.parentId, question });
-      this.syncGoalToSharedState(goal);
       return true;
     });
 
@@ -1598,9 +1792,12 @@ reviews results and either plans another round or completes/fails the goal.
      * a fresh round immediately.
      */
     this.on('cancelOutstandingTasks', async (msg: AbjectMessage) => {
-      const { goalId } = msg.payload as { goalId: GoalId };
+      const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: GoalId; preserveTaskIds?: string[] };
       const goal = this.goals.get(goalId);
       if (!goal || goal.status !== 'active' || !this.tupleSpaceId) return { cancelled: 0 };
+
+      const runtimeId = await this.taskRuntime();
+      if (!runtimeId) return { cancelled: 0, safe: false, error: 'Task runtime unavailable' };
 
       const ns = this.getTupleNamespace(goalId);
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
@@ -1610,24 +1807,22 @@ reviews results and either plans another round or completes/fails the goal.
       let cancelled = 0;
       for (const task of tasks) {
         const status = String(task.fields?.status ?? 'pending');
-        if (status === 'done' || status === 'failed') continue;
+        if (preserveTaskIds.includes(task.id) || ['done','failed','permanently_failed','cancelled','superseded'].includes(status)) continue;
         try {
           if (task.claimedBy) {
             try {
               await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
             } catch { /* best effort */ }
           }
-          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
+          await this.request(request(this.id, this.tupleSpaceId!, 'update', { tupleId: task.id, namespace: ns, expectedFields: { status }, fields: { status: 'superseded' } }));
           this.emittedTerminalTasks.delete(task.id);
           cancelled++;
         } catch { /* tuple may already be gone */ }
       }
 
-      if (this.agentAbjectId) {
-        try {
-          await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
-        } catch { /* best effort */ }
-      }
+      try {
+        await this.request(request(this.id, runtimeId, 'cancelTasksByGoal', { goalId, preserveTaskIds }));
+      } catch (err) { return { cancelled, safe: false, error: String(err) }; }
 
       if (cancelled > 0) {
         goal.updatedAt = Date.now();
@@ -1636,13 +1831,14 @@ reviews results and either plans another round or completes/fails the goal.
           message: `Re-planning: ${cancelled} outstanding task(s) cancelled to make way for the new plan`,
         });
       }
-      return { cancelled };
+      const receipt = await this.request<{ safe: boolean; pending: unknown }>(request(this.id, runtimeId, 'awaitGoalQuiescence', { goalId, preserveTaskIds }), 15000);
+      return { cancelled, ...receipt };
     });
 
     this.on('getGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       const { goalId } = msg.payload as { goalId: GoalId };
-      return this.goals.get(goalId) ?? null;
+      return structuredClone(this.goals.get(goalId) ?? null);
     });
 
     this.on('listGoals', async (msg: AbjectMessage) => {
@@ -1666,7 +1862,7 @@ reviews results and either plans another round or completes/fails the goal.
       const now = Date.now();
 
       for (const [, goal] of this.goals) {
-        if (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived') {
+        if (goal.scratchpad['learning/review'] !== 'pending' && (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived')) {
           goalsToClear.push(goal);
         }
       }
@@ -1727,14 +1923,14 @@ reviews results and either plans another round or completes/fails the goal.
     // ── Task convenience methods (delegate to TupleSpace) ──
 
     this.on('addTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, dependsOn, produces, consumes, assignedAgentId, scrumNumber } = msg.payload as {
+      const { goalId, description, data, dependsOn, produces, consumes, assignedAgentId, scrumNumber, operationId } = msg.payload as {
         goalId: string; description: string; data?: unknown; dependsOn?: string[];
         produces?: Array<{ key: string; description: string }>;
         consumes?: string[];
         /** Direct assignment from ScrumMaster — the agent that will run this task. */
         assignedAgentId?: string;
         /** Scrum round this task belongs to. `goalReadyForCompletion` fires when every task at the goal's currentScrumNumber is terminal. */
-        scrumNumber?: number;
+        scrumNumber?: number; operationId?:string;
       };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(description, 'description');
@@ -1769,7 +1965,7 @@ reviews results and either plans another round or completes/fails the goal.
       const ns = this.getTupleNamespace(goalId as GoalId);
       const result = await this.request<{ tupleId: string }>(
         request(this.id, this.tupleSpaceId, 'put', {
-          namespace: ns,
+          namespace: ns, operationId,
           fields: {
             goalId, status: 'pending', description, data,
             attempts: 0, maxAttempts: 3, failureHistory: [],
@@ -1823,66 +2019,72 @@ reviews results and either plans another round or completes/fails the goal.
       }));
     });
 
+    this.on('admitTask', async msg => {
+      const { taskId, goalId } = msg.payload as { taskId:string; goalId:string };
+      const goal=this.goals.get(goalId);
+      if (!goal || goal.status!=='active' || !this.tupleSpaceId) return { accepted:false, reason:'Goal is not active' };
+      const tasks=await this.request<Array<{id:string;fields:Record<string,unknown>}>>(request(this.id,this.tupleSpaceId,'scan',{namespace:this.getTupleNamespace(goalId as GoalId),pattern:{goalId}}));
+      const task=tasks.find(t=>t.id===taskId);
+      return task && !['done','failed','permanently_failed','cancelled','superseded'].includes(String(task.fields.status))
+        ? {accepted:true} : {accepted:false,reason:'Task was removed, settled or superseded'};
+    });
+
+    this.on('assessTask', async (msg: AbjectMessage) => {
+      const { taskId, goalId } = msg.payload as { taskId: string; goalId: string };
+      const goal = this.goals.get(goalId);
+      if (!goal || goal.status !== 'active' || !this.tupleSpaceId) return { accepted: false, reason: 'Goal is not active' };
+      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(request(this.id, this.tupleSpaceId, 'scan', {
+        namespace: this.getTupleNamespace(goalId), pattern: { goalId },
+      }));
+      const tuple = tuples.find(t => t.id === taskId);
+      if (!tuple || ['cancelled', 'superseded', 'permanently_failed'].includes(String(tuple.fields.status))) return { accepted: false, reason: 'Task attempt is no longer active' };
+      const missing = ((tuple.fields.produces as Array<{ key: string }>) ?? []).filter(p => !(p.key in goal.scratchpad) && p.key !== `tasks/${taskId}/result`);
+      return { accepted: missing.length === 0, reason: missing.length ? `Missing required outputs: ${missing.map(p => p.key).join(', ')}` : undefined };
+    });
+
     this.on('completeTask', async (msg: AbjectMessage) => {
-      const { taskId, result, goalId } = msg.payload as { taskId: string; result?: unknown; goalId?: string };
+      const { taskId, result, goalId, evidence } = msg.payload as { taskId: string; result?: unknown; goalId?: string; evidence?: unknown };
       requireNonEmpty(taskId, 'taskId');
-      if (!this.tupleSpaceId) return false;
-
-      log.info(`completeTask ${taskId.slice(0, 8)} goalId=${goalId?.slice(0, 8) ?? '?'} from=${msg.routing.from.slice(0, 8)}`);
-      const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
-      const updateResult = await this.request(
-        request(this.id, this.tupleSpaceId, 'update', {
-          tupleId: taskId,
-          fields: { status: 'done', result },
-          ...(ns ? { namespace: ns } : {}),
-        })
-      );
-
-      // Auto-mirror the result into the goal's scratchpad under a well-known path
-      // so downstream tasks have an untruncated, addressable copy. Also check the
-      // task's declared `produces` keys and warn if any are missing from the
-      // scratchpad (advisory only, never blocks completion).
-      if (goalId) {
-        const goal = this.goals.get(goalId as GoalId);
-        if (goal) {
-          if (!goal.scratchpad) goal.scratchpad = {};
-          goal.scratchpad[`tasks/${taskId}/result`] = result;
-          goal.updatedAt = Date.now();
-
-          try {
-            const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-              request(this.id, this.tupleSpaceId, 'scan', {
-                namespace: this.getTupleNamespace(goalId as GoalId),
-                pattern: { goalId },
-              }),
-            );
-            const tuple = tuples?.find(t => t.id === taskId);
-            const produces = (tuple?.fields.produces as Array<{ key: string; description: string }> | undefined) ?? [];
-            const missing = produces.filter(p => !(p.key in goal.scratchpad));
-            if (missing.length > 0) {
-              log.info(`completeTask ${taskId.slice(0, 8)} — warning: declared produces missing from scratchpad: ${missing.map(m => m.key).join(', ')}. Auto-mirror at tasks/${taskId}/result still available.`);
-            }
-          } catch { /* best effort */ }
-
-          this.changed('goalUpdated', { goalId, message: `scratchpad.tasks/${taskId.slice(0, 8)}/result written` });
-          // Collaborators only gap-fill scratchpad keys from `meta`; an updated
-          // value for an existing key travels solely through its own register.
-          this.syncScratchKeyToSharedState(goal, `tasks/${taskId}/result`, result);
-          this.syncGoalToSharedState(goal);
+      if (!this.tupleSpaceId || !goalId) return { accepted: false, reason: 'Task settlement requires a goal and TupleSpace' };
+      return withKeyedLock(`${this.id}:settle:${taskId}`, async () => {
+        const goal = this.goals.get(goalId);
+        if (!goal || goal.status !== 'active') return { accepted: false, reason: 'Goal is not active' };
+        const ns = this.getTupleNamespace(goalId);
+        const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+          request(this.id, this.tupleSpaceId!, 'scan', { namespace: ns, pattern: { goalId } }),
+        );
+        const tuple = tuples?.find(t => t.id === taskId);
+        if (!tuple) return { accepted: false, reason: 'Task does not belong to this goal' };
+        if (tuple.fields.status === 'done') {
+          goal.scratchpad[`tasks/${taskId}/result`] = tuple.fields.result;
+          goal.scratchpad[`tasks/${taskId}/acceptance`] = { evidence: tuple.fields.evidence, at: tuple.fields.acceptedAt };
+          await this.persistLearning(goal);
+          return { accepted: true, duplicate: true };
         }
-      }
-
-      log.info(`completeTask ${taskId.slice(0, 8)} — emitting taskCompleted`);
-      this.emittedTerminalTasks.add(taskId);
-      this.changed('taskCompleted', { taskId, goalId, result });
-
-      // Signal that dependent tasks may now be unblocked
-      if (goalId) {
+        if (['failed', 'permanently_failed', 'cancelled', 'superseded'].includes(String(tuple.fields.status))) return { accepted: false, reason: 'Task attempt is no longer active' };
+        const produces = (tuple.fields.produces as Array<{ key: string }>) ?? [];
+        const missing = produces.filter(p => !(p.key in (goal.scratchpad ?? {})) && p.key !== `tasks/${taskId}/result`);
+        if (missing.length) return { accepted: false, reason: `Missing required outputs: ${missing.map(p => p.key).join(', ')}` };
+        // TupleSpace compares at the receiver, in the same mutation queue as
+        // failure/cancellation updates. A late acceptance cannot revive them.
+        const updated = await this.request(request(this.id, this.tupleSpaceId!, 'update', {
+          namespace: ns, tupleId: taskId, expectedFields: { status: tuple.fields.status },
+          fields: { status: 'done', result, evidence, acceptedAt: Date.now() },
+        }));
+        if (!updated) return { accepted: false, reason: 'Task changed during settlement' };
+        goal.scratchpad ??= {};
+        goal.scratchpad[`tasks/${taskId}/result`] = result;
+        goal.scratchpad[`tasks/${taskId}/acceptance`] = { evidence, at: Date.now() };
+        goal.updatedAt = Date.now();
+        await this.syncScratchKeyToSharedState(goal, `tasks/${taskId}/result`, result);
+        await this.syncGoalToSharedState(goal);
+        await this.persistLearning(goal);
+        this.emittedTerminalTasks.add(taskId);
+        this.changed('taskCompleted', { taskId, goalId, result, evidence });
         this.changed('taskUnblocked', { goalId, completedTaskId: taskId });
-        this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
-      }
-
-      return updateResult;
+        this.maybeEmitGoalReadyForCompletion(goalId).catch(() => {});
+        return { accepted: true };
+      });
     });
 
     this.on('failTask', async (msg: AbjectMessage) => {
@@ -1908,6 +2110,7 @@ reviews results and either plans another round or completes/fails the goal.
         log.warn(`failTask ${taskId.slice(0, 8)} scan failed:`, err instanceof Error ? err.message : String(err));
       }
 
+      if (['done', 'cancelled', 'superseded', 'permanently_failed'].includes(String(currentFields.status))) return false;
       const failureHistory = (currentFields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
       const attempts = ((currentFields.attempts as number) ?? 0) + 1;
 
@@ -1929,10 +2132,12 @@ reviews results and either plans another round or completes/fails the goal.
       const updateResult = await this.request(
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
+          expectedFields: { status: currentFields.status },
           fields: { status: 'permanently_failed', error, attempts, failureHistory },
           ...(ns ? { namespace: ns } : {}),
         })
       );
+      if (!updateResult) return false;
       try {
         await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
       } catch { /* best effort */ }

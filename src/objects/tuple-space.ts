@@ -10,13 +10,14 @@
  * The active namespace list is persisted to Storage so it survives restarts.
  */
 
+import { withKeyedLock } from '../core/keyed-lock.js';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 
 const log = new Log('TupleSpace');
 
@@ -31,6 +32,7 @@ function stateName(namespace: string): string {
 // ─── Data Model ──────────────────────────────────────────────────────
 
 export interface TupleEntry {
+  admissionFingerprint?: string;
   id: string;
   fields: Record<string, unknown>;
   createdAt: number;
@@ -322,7 +324,7 @@ namespace; peers see its tuples after subscribing to the same name.
   }
 
   private async writeTuple(tuple: TupleEntry, namespace: string): Promise<void> {
-    if (!this.sharedStateId) return;
+    if (!this.sharedStateId) throw new Error('SharedState unavailable; tuple write not acknowledged');
     const ns = stateName(namespace);
     await this.doEnsureNamespace(namespace);
     await this.request(request(this.id, this.sharedStateId, 'set', {
@@ -337,23 +339,20 @@ namespace; peers see its tuples after subscribing to the same name.
 
   private setupHandlers(): void {
     this.on('put', async (msg: AbjectMessage) => {
-      const { namespace, fields } = msg.payload as { namespace: string; fields: Record<string, unknown> };
-      requireNonEmpty(namespace, 'namespace');
-      precondition(fields && typeof fields === 'object', 'fields must be an object');
-
-      const tuple: TupleEntry = {
-        id: uuidv4(),
-        fields,
-        createdAt: Date.now(),
-        createdBy: this.localPeerId || this.id,
-      };
-
-      await this.writeTuple(tuple, namespace);
-      const tupleCount = (await this.getAllTuples(namespace)).size;
-      log.info(`PUT ${tuple.id} ns=${namespace.slice(0, 8)} type=${fields.type ?? '?'} status=${fields.status ?? '?'} goalId=${(fields.goalId as string)?.slice(0, 8) ?? '?'} (${tupleCount} total)`);
-      this.changed('tuplePut', tuple);
-
-      return { tupleId: tuple.id };
+      const {namespace,fields,operationId}=msg.payload as {namespace:string;fields:Record<string,unknown>;operationId?:string};
+      requireNonEmpty(namespace,'namespace');precondition(fields&&typeof fields==='object','fields must be an object');
+      const id=operationId?uuidv5(`${namespace}:${operationId}`,uuidv5.URL):uuidv4();
+      return withKeyedLock(`${this.id}:${namespace}:${id}`,async()=>{
+        const fingerprint=JSON.stringify(fields);
+        const existing=(await this.getAllTuples(namespace)).get(id);
+        if(existing){
+          if(existing.admissionFingerprint!==fingerprint)throw new Error('Conflicting tuple operation identity');
+          return {tupleId:id,duplicate:true};
+        }
+        const tuple:TupleEntry={id,fields,admissionFingerprint:fingerprint,createdAt:Date.now(),createdBy:this.localPeerId||this.id};
+        await this.writeTuple(tuple,namespace);this.changed('tuplePut',tuple);
+        return {tupleId:id};
+      });
     });
 
     this.on('read', async (msg: AbjectMessage) => {
@@ -380,24 +379,19 @@ namespace; peers see its tuples after subscribing to the same name.
       return results;
     });
 
-    this.on('claim', async (msg: AbjectMessage) => {
-      const { namespace, pattern } = msg.payload as { namespace: string; pattern: TuplePattern };
-      requireNonEmpty(namespace, 'namespace');
-      const tuples = await this.getAllTuples(namespace);
-      log.info(`CLAIM scanning ${tuples.size} tuples in ns=${namespace.slice(0, 8)}, pattern=${JSON.stringify(pattern)}`);
-
-      for (const tuple of tuples.values()) {
-        if (this.matchesPattern(tuple, pattern) && this.isUnclaimed(tuple)) {
-          // Optimistic claim via LWW
-          tuple.claimedBy = this.localPeerId || this.id;
-          tuple.claimedAt = Date.now();
-          await this.writeTuple(tuple, namespace);
-          log.info(`CLAIMED ${tuple.id} type=${tuple.fields.type ?? '?'} attempts=${tuple.fields.attempts ?? 0}`);
-          this.changed('tupleClaimed', tuple);
-          return { tuple, claimed: true };
-        }
+    this.on('claim', async msg => {
+      const {namespace,pattern}=msg.payload as {namespace:string;pattern:TuplePattern};
+      requireNonEmpty(namespace,'namespace');
+      for(const candidate of (await this.getAllTuples(namespace)).values()){
+        const result=await withKeyedLock(`${this.id}:${namespace}:${candidate.id}`,async()=>{
+          const tuple=(await this.getAllTuples(namespace)).get(candidate.id);
+          if(!tuple || !this.matchesPattern(tuple,pattern) || !this.isUnclaimed(tuple))return null;
+          tuple.claimedBy=this.localPeerId||this.id;tuple.claimedAt=Date.now();
+          await this.writeTuple(tuple,namespace);this.changed('tupleClaimed',tuple);
+          return {tuple,claimed:true};
+        });
+        if(result)return result;
       }
-      log.info(`CLAIM no match found`);
       return null;
     });
 
@@ -405,6 +399,7 @@ namespace; peers see its tuples after subscribing to the same name.
       const { namespace, tupleId } = msg.payload as { namespace: string; tupleId: string };
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
+      return withKeyedLock(`${this.id}:${namespace}:${tupleId}`,async()=>{
 
       const tuples = await this.getAllTuples(namespace);
       const tuple = tuples.get(tupleId);
@@ -426,12 +421,14 @@ namespace; peers see its tuples after subscribing to the same name.
       // Emit tupleUpdated so watchers (AgentAbject) can re-dispatch retried tasks
       this.changed('tupleUpdated', tuple);
       return true;
+      });
     });
 
     this.on('remove', async (msg: AbjectMessage) => {
       const { namespace, tupleId } = msg.payload as { namespace: string; tupleId: string };
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
+      return withKeyedLock(`${this.id}:${namespace}:${tupleId}`,async()=>{
 
       if (!this.sharedStateId) return false;
       const ns = stateName(namespace);
@@ -442,14 +439,16 @@ namespace; peers see its tuples after subscribing to the same name.
       log.info(`REMOVED ${tupleId} (${tupleCount} remaining in ns=${namespace.slice(0, 8)})`);
       this.changed('tupleRemoved', { tupleId });
       return true;
+      });
     });
 
     this.on('update', async (msg: AbjectMessage) => {
-      const { namespace, tupleId, fields } = msg.payload as { namespace: string; tupleId: string; fields: Record<string, unknown> };
+      const { namespace, tupleId, fields, expectedFields } = msg.payload as { namespace: string; tupleId: string; fields: Record<string, unknown>; expectedFields?: Record<string, unknown> };
       requireNonEmpty(namespace, 'namespace');
       requireNonEmpty(tupleId, 'tupleId');
       precondition(fields && typeof fields === 'object', 'fields must be an object');
 
+      return withKeyedLock(`${this.id}:${namespace}:${tupleId}`, async () => {
       const tuples = await this.getAllTuples(namespace);
       const tuple = tuples.get(tupleId);
       if (!tuple) {
@@ -457,11 +456,13 @@ namespace; peers see its tuples after subscribing to the same name.
         return false;
       }
 
+      if (expectedFields && Object.entries(expectedFields).some(([key, value]) => JSON.stringify(tuple.fields[key]) !== JSON.stringify(value))) return false;
       Object.assign(tuple.fields, fields);
       await this.writeTuple(tuple, namespace);
       log.info(`UPDATED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0} claimedBy=${tuple.claimedBy ?? 'none'}`);
       this.changed('tupleUpdated', tuple);
       return true;
+      });
     });
 
     this.on('ensureNamespace', async (msg: AbjectMessage) => {

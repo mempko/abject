@@ -13,6 +13,7 @@
  * updates. Schedules are managed by the separate SchedulerBrowser.
  */
 
+import type { SessionRecord } from './task-session.js';
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -27,7 +28,7 @@ const AGENT_BROWSER_INTERFACE: InterfaceId = 'abjects:agent-browser';
 const WIN_W = 620;
 const WIN_H = 420;
 
-const TAB_LABELS = ['Agents', 'Watchers'];
+const TAB_LABELS = ['Agents', 'Watchers', 'Sessions'];
 
 const AGENT_STATUS_ICONS: Record<string, string> = {
   idle: '\u25CB',     // ○
@@ -76,6 +77,8 @@ export class AgentBrowser extends Abject {
 
   private activeTab = 0;
   private agents: AgentInfo[] = [];
+  private sessions: SessionRecord[] = [];
+  private sessionStoreId?: AbjectId;
   private watches: WatchInfo[] = [];
   private selectedIndex = -1;
 
@@ -157,8 +160,9 @@ export class AgentBrowser extends Abject {
 - \`hide()\` -- Close the agent browser window.
 - \`getState()\` -- Returns { visible, agentCount, watchCount }.
 
-### Two-Tab View
+### Tabs
 - **Agents**: Lists all registered agents with live status (idle/busy), active task count.
+- **Sessions**: Inspect durable outcomes, usage and unknown operations; pause, resume or fork work.
 - **Watchers**: Merges TriggerManager rules (toggle, delete) with watcher-tagged objects and their event watch entries. Schedules live in the separate SchedulerBrowser.
 
 ### Real-Time Updates
@@ -419,9 +423,22 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     switch (this.activeTab) {
       case 0: await this.loadAgents(); break;
       case 1: await this.loadWatches(); break;
+      case 2: await this.loadSessions(); break;
+    }
+    for (const [id, text] of [[this.editBtnId, this.activeTab === 2 ? 'Inspect' : 'Edit'], [this.toggleBtnId, this.activeTab === 2 ? 'Resume' : 'Toggle'], [this.deleteBtnId, this.activeTab === 2 ? 'Fork' : 'Delete']] as const) {
+      if (id) await this.request(request(this.id, id, 'update', { text, disabled: false }));
     }
     await this.rebuildList();
     await this.clearDetail();
+  }
+
+  private async loadSessions(): Promise<void> {
+    if (!this.sessionStoreId) {
+      this.sessionStoreId = await this.discoverDep('TaskSession') ?? undefined;
+      if (this.sessionStoreId) this.send(request(this.id, this.sessionStoreId, 'addDependent', {}));
+    }
+    this.sessions = this.agentAbjectId ? await this.request<SessionRecord[]>(request(this.id, this.agentAbjectId, 'getSessions', {})) : [];
+    this.sessions.sort((a,b) => b.updatedAt - a.updatedAt);
   }
 
   private async loadAgents(): Promise<void> {
@@ -524,6 +541,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
           const fires = w.lastError ? `${w.triggerCount} fires, error` : `${w.triggerCount} fires`;
           return { label: `${icon} ${w.targetName}${filter}`, value: String(i), secondary: fires };
         });
+      case 2: return this.sessions.map(s => ({ label: s.intent.slice(0, 100), value: s.id, secondary: `${s.agentName} · ${s.status} · attempt ${s.attempt}` }));
       default:
         return [];
     }
@@ -555,6 +573,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   }
 
   private async showDetailForSelection(): Promise<void> {
+    if (this.activeTab === 2) {
+      const s = this.sessions[this.selectedIndex];
+      if (!s) return this.clearDetail();
+      await this.updateDetail(s.intent, `**Agent:** ${s.agentName}\n**State:** ${s.status}\n**Usage:** ${s.usage.tokens} reported tokens, $${s.usage.cost.toFixed(4)}${s.usage.unpricedCalls ? ` (${s.usage.unpricedCalls} unpriced calls)` : ''}\n**Outstanding operation:** ${s.outstandingOperation ? JSON.stringify(s.outstandingOperation) : 'None'}\n\n**Outcome:** ${JSON.stringify(s.outcome ?? 'In progress')}`, `Attempt ${s.attempt} · revision ${s.revision} · session ${s.id}`);
+      if (this.toggleBtnId) await this.request(request(this.id, this.toggleBtnId, 'update', { text: s.status === 'running' ? 'Pause' : 'Resume', disabled: s.status === 'accepted' || (s.status !== 'running' && !!s.outstandingOperation) }));
+      return;
+    }
     switch (this.activeTab) {
       case 0: {
         const agent = this.agents[this.selectedIndex];
@@ -584,6 +609,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   // -- Event handling --
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
+    if (fromId === this.sessionStoreId && aspect === 'sessionUpdated' && this.activeTab === 2) {
+      const selected = this.sessions[this.selectedIndex]?.id;
+      await this.loadSessions(); await this.rebuildList();
+      this.selectedIndex = this.sessions.findIndex(s => s.id === selected);
+      if (this.selectedIndex >= 0) await this.showDetailForSelection();
+      return;
+    }
     // Tab bar change
     if (fromId === this.tabBarId && aspect === 'tabSelected') {
       const data = value as { index: number } | undefined;
@@ -662,6 +694,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   }
 
   private async handleEdit(): Promise<void> {
+    if (this.activeTab === 2) { await this.showDetailForSelection(); return; }
     if (this.selectedIndex < 0) return;
 
     let objectId: string | undefined;
@@ -688,6 +721,16 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   }
 
   private async handleToggle(): Promise<void> {
+    if (this.activeTab === 2 && this.agentAbjectId) {
+      const s = this.sessions[this.selectedIndex];
+      if (!s) return;
+      try {
+        if (s.status === 'running') await this.request(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: s.attempt === 1 ? s.id : `${s.id}:attempt-${s.attempt}` }));
+        else await this.request(request(this.id, this.agentAbjectId, 'resumeTask', { id: s.id, expectedRevision: s.revision }));
+        await this.loadSessions(); await this.rebuildList();
+      } catch (err) { await this.notify(String(err), 'error'); }
+      return;
+    }
     if (this.selectedIndex < 0) return;
 
     switch (this.activeTab) {
@@ -722,6 +765,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   }
 
   private async handleDelete(): Promise<void> {
+    if (this.activeTab === 2 && this.agentAbjectId) {
+      const s = this.sessions[this.selectedIndex];
+      if (!s) return;
+      await this.request(request(this.id, this.agentAbjectId, 'forkTask', { id: s.id, newId: `${s.id}:fork-${Date.now()}` }));
+      await this.loadSessions(); await this.rebuildList();
+      return;
+    }
     if (this.selectedIndex < 0) return;
 
     // Watchers tab: TriggerManager rules can be removed directly.

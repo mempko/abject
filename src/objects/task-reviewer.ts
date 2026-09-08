@@ -90,6 +90,8 @@ interface TranscriptResponse {
     expect: string;
     outcome: 'success' | 'failure';
     missed?: boolean;
+    verdict?: 'supported' | 'contradicted' | 'unresolved';
+    actualRef?: string;
     actual?: string;
   }>;
   transcript: string;
@@ -100,6 +102,7 @@ interface ReviewTaskExtra {
   /** The reviewed tasks to release from AgentAbject once this review ends. */
   reviewedTaskIds?: string[];
   kind: 'review' | 'curation';
+  goalId?: string;
 }
 
 interface PendingGoalReview {
@@ -124,6 +127,21 @@ export class TaskReviewer extends Abject {
   private taskExtras = new Map<string, ReviewTaskExtra>();
   /** Goal reviews that arrived while a review was in flight. */
   private pendingGoalReviews: PendingGoalReview[] = [];
+  private preparingReview = false;
+  private reviewPoll?: ReturnType<typeof setInterval>;
+
+  protected override async onStop(): Promise<void> {
+    if (this.reviewPoll) clearInterval(this.reviewPoll);
+  }
+
+  private async drainDurableReviews(): Promise<void> {
+    if (!this.goalManagerId || this.inFlight || this.preparingReview || !this.underDailyCap()) return;
+    const pending = await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {}));
+    for (const review of pending) {
+      await this.onGoalTerminal(review);
+      if (this.inFlight) break;
+    }
+  }
 
   constructor() {
     super({
@@ -190,6 +208,7 @@ export class TaskReviewer extends Abject {
       description: 'Internal post-task reviewer. Reviews finished transcripts to grow the knowledge base; it does not take on user goals.',
       canExecute: false,
       config: {
+        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         maxSteps: 10,
         timeout: 180000,
         terminalActions: {
@@ -207,6 +226,9 @@ export class TaskReviewer extends Abject {
       this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
     }
 
+    this.reviewPoll = setInterval(() => { void this.drainDurableReviews().catch(err => log.warn(String(err))); }, 30000);
+    this.reviewPoll.unref?.();
+    void this.drainDurableReviews().catch(err => log.warn(String(err)));
     log.info('TaskReviewer registered; reviewing on goal completion + standalone-task cadence');
   }
 
@@ -226,6 +248,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   // ═══════════════════════════════════════════════════════════════════
 
   private setupHandlers(): void {
+    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('restoreTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: ReviewTaskExtra };
+      if (!snapshot) throw new Error('Missing specialist checkpoint');
+      if (this.inFlight && this.inFlight.ticketId !== taskId) throw new Error('Another review is running; retry when it settles');
+      this.inFlight = { ticketId: taskId, startedAt: Date.now() };
+      this.taskExtras.set(taskId, structuredClone(snapshot));
+      return { success: true };
+    });
+
     // Aspect-named event from AgentAbject.changed('taskCompleted', ...).
     // The sender guard matters twice over: it keeps this to the single
     // handler style (not the generic 'changed' one), and GoalManager emits
@@ -260,13 +293,18 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     });
 
     // Terminal result of a review/curation task this object started.
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const { ticketId } = msg.payload as { ticketId: string };
       if (this.inFlight?.ticketId !== ticketId) return;
-      this.inFlight = undefined;
       const extra = this.taskExtras.get(ticketId);
-      this.taskExtras.delete(ticketId);
-      for (const taskId of extra?.reviewedTaskIds ?? []) {
+      const succeeded = (msg.payload as { success?: boolean }).success === true;
+      if (succeeded && extra?.goalId && this.goalManagerId) {
+        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId }));
+      }
+      this.inFlight = undefined; this.taskExtras.delete(ticketId);
+      for (const taskId of succeeded ? extra?.reviewedTaskIds ?? [] : []) {
         // The transcripts have served their purpose; free them.
         this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId }));
       }
@@ -297,18 +335,21 @@ My work is internal maintenance of this workspace's memory. When invited to cont
 
     this.on('getReviewStatus', async () => ({
       reviewsToday: this.reviewsToday,
-      busy: !!this.inFlight,
+      busy: !!this.inFlight || this.preparingReview,
+      pending: this.pendingGoalReviews.length,
       counters: Object.fromEntries(this.taskCounters),
     }));
 
     // ── OTA callbacks ──
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId } = msg.payload as { taskId: string };
       const extra = this.taskExtras.get(taskId);
       return { observation: extra?.lastResult ?? 'Begin. The material to review is in the conversation above.', tier: 'balanced' };
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
       return this.handleAct(taskId, action);
     });
@@ -324,6 +365,19 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       this.knowledgeBaseId = await this.discoverDep('KnowledgeBase') ?? undefined;
     }
     return this.knowledgeBaseId;
+  }
+
+  /** Ask the actual receiver before relying on learning semantics a replacement may lack. */
+  private async requireLearningProtocol(): Promise<void> {
+    const description = await this.request<{ manifest: { interface: { methods: Array<{ name: string; parameters: Array<{ name: string }> }> } } }>(
+      request(this.id, this.knowledgeBaseId!, 'describe', {}), 10000,
+    );
+    const methods = description.manifest.interface.methods;
+    if (!['recordPatternApplication', 'patternHistory'].every(name => methods.some(m => m.name === name)) ||
+        !methods.find(m => m.name === 'update')?.parameters.some(p => p.name === 'expectedRevision') ||
+        !methods.find(m => m.name === 'markUseful')?.parameters.some(p => p.name === 'operationId')) {
+      throw new Error('KnowledgeBase does not support the learning protocol; upgrade the receiver before recording evidence or revising patterns');
+    }
   }
 
   /** Lazy SkillRegistry discovery: retried on every use until it appears. */
@@ -398,6 +452,12 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * "done" that led nowhere is read as the dead end it was.
    */
   private async onGoalTerminal(review: PendingGoalReview): Promise<void> {
+    if (this.preparingReview) return; // GoalManager retains the durable pending request.
+    this.preparingReview = true;
+    try { await this.prepareGoalReview(review); } finally { this.preparingReview = false; }
+  }
+
+  private async prepareGoalReview(review: PendingGoalReview): Promise<void> {
     if (!(await this.getKbId())) return;
     this.clearStuckReview();
     if (this.inFlight) {
@@ -433,16 +493,33 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       .map(t => t.id)
       .reverse();                       // listTasks is newest-first; review in run order
 
-    const selected = goalTaskIds.slice(0, MAX_TASKS_PER_GOAL_REVIEW);
-    const records: TranscriptResponse[] = [];
-    for (const taskId of selected) {
-      const record = await this.fetchTranscript(taskId);
-      if (record) records.push(record);
+    const available = new Map<string, TranscriptResponse>();
+    for (const [key, value] of Object.entries(goal?.scratchpad ?? {})) {
+      if (key.startsWith('learning/task/') && value && typeof value === 'object') {
+        const record = value as TranscriptResponse;
+        if (record.taskId && record.agentName !== 'TaskReviewer') available.set(record.taskId, record);
+      }
     }
-    if (records.length === 0) return;
+    for (const taskId of goalTaskIds) {
+      if (available.has(taskId)) continue;
+      const record = await this.fetchTranscript(taskId);
+      if (record) available.set(taskId, record);
+    }
+    // Newest recovery/final check first, then surprising/failing episodes.
+    const all = [...available.values()].reverse();
+    const priority = (r: TranscriptResponse, i: number) => (i === 0 ? 1000 : 0)
+      + (r.predictions?.some(p => p.verdict === 'contradicted') ? 100 : 0)
+      + (r.phase === 'error' ? 50 : 0) - i;
+    const records = all.map((r, i) => ({ r, score: priority(r, i) }))
+      .sort((a, b) => b.score - a.score).slice(0, MAX_TASKS_PER_GOAL_REVIEW).map(x => x.r);
+    if (records.length === 0) {
+      if (this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason: 'No execution evidence; no pattern claims made' }));
+      return;
+    }
 
     const combined = records.reduce((sum, r) => sum + r.transcript.length, 0);
-    if (combined < MIN_TRANSCRIPT_CHARS) {
+    if (combined < MIN_TRANSCRIPT_CHARS && records.every(r => !r.predictions?.length)) {
+      if (this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId, reason: 'Compact evidence retained; insufficient material for a durable lesson' }));
       for (const id of goalTaskIds) {
         this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId: id }));
       }
@@ -457,6 +534,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       `Description: ${(goal?.description ?? '').slice(0, 1500)}\n` +
       `Outcome: ${review.outcome}${review.detail ? ` (${review.detail.slice(0, 500)})` : ''}\n` +
       `Tasks reviewed: ${records.length}${goalTaskIds.length > records.length ? ` of ${goalTaskIds.length}` : ''}\n`;
+    material += `\n### Plan revisions and observations\n${JSON.stringify(Object.fromEntries(Object.entries(goal?.scratchpad ?? {}).filter(([k]) => k === 'learning/plans' || k.startsWith('learning/observation/')))).slice(0, 16000)}\n`;
+    material += `\nAll task outcomes (including tasks omitted from detailed transcripts):\n${all.map(r => `${r.taskId}: ${r.agentName}, ${r.phase}, ${r.error ?? ''}`).join('\n')}\n`;
     if (executionRecord) {
       material += `\n### Execution record (ScrumMaster's account of how the goal actually ran)\n${executionRecord.slice(0, 4000)}\n`;
     }
@@ -471,7 +550,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     await this.launchReview(
       `Review the ${review.outcome} goal "${(goal?.title ?? review.goalId).slice(0, 60)}" and capture durable learnings.`,
       material,
-      goalTaskIds,   // release everything held for this goal, reviewed or not
+      goalTaskIds,   // durable records retain evidence after transcript release
+      review.goalId,
     );
   }
 
@@ -497,16 +577,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const predictions = record.predictions ?? [];
     if (predictions.length === 0) return '';
     const lines = predictions.map(p => {
-      const verdict = p.missed ? 'MISSED (the action failed)' : 'action succeeded, judge the match yourself';
-      const actual = p.actual ? `\n  actual: ${p.actual.slice(0, 300)}` : '';
+      const verdict = p.verdict ?? 'unresolved (legacy action outcome is not a prediction verdict)';
+      const actual = p.actual ? `\n  actual: ${(typeof p.actual==='string'?p.actual:JSON.stringify(p.actual)).slice(0, 2000)}` : '';
       return `- step ${p.step} (${p.action}) [${verdict}]\n  expected: ${p.expect}${actual}`;
     });
     return `\n\n### Prediction ledger\n${lines.join('\n')}`;
   }
 
   private formatTaskSection(record: TranscriptResponse, transcript: string): string {
-    const injected = record.injectedKnowledge.length > 0
-      ? record.injectedKnowledge.map(k => `- ${k.id}: ${k.title}`).join('\n')
+    const injected = (record.injectedKnowledge ?? []).length > 0
+      ? (record.injectedKnowledge ?? []).map(k => `- ${k.id}: ${k.title}`).join('\n')
       : '(none)';
     return (
       `Agent: ${record.agentName}\n` +
@@ -518,22 +598,24 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     );
   }
 
-  private async launchReview(task: string, material: string, reviewedTaskIds: string[]): Promise<void> {
+  private async launchReview(task: string, material: string, reviewedTaskIds: string[], goalId?: string): Promise<void> {
+    const taskId = `review-${goalId ?? 'standalone'}-${Date.now()}`;
+    this.inFlight = { ticketId: taskId, startedAt: Date.now() };
+    this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId });
     try {
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
-          task,
+          taskId, task,
           systemPrompt: this.reviewSystemPrompt(),
           initialMessages: [{ role: 'user', content: material }],
-          config: { maxSteps: 8, timeout: 180000 },
+          config: { maxSteps: 8, timeout: 180000, budgetGoalId: goalId },
         }),
         15000,
       );
-      this.inFlight = { ticketId, startedAt: Date.now() };
-      this.taskExtras.set(ticketId, { kind: 'review', reviewedTaskIds });
       this.reviewsToday++;
       log.info(`Review started: "${task.slice(0, 80)}" over ${reviewedTaskIds.length} task(s) (${this.reviewsToday}/${MAX_REVIEWS_PER_DAY} today)`);
     } catch (err) {
+      this.inFlight = undefined; this.taskExtras.delete(taskId);
       log.warn(`launchReview failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -585,6 +667,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
 
     try {
+      if (['record_pattern_application', 'update_pattern', 'mark_useful'].includes(action.action)) await this.requireLearningProtocol();
       let result: string;
       switch (action.action) {
         case 'recall_knowledge': {
@@ -664,10 +747,22 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           const ids = action.ids as string[];
           if (!Array.isArray(ids) || ids.length === 0) return { success: false, error: 'mark_useful requires non-empty "ids"' };
           const res = await this.request<{ marked: number }>(
-            request(this.id, this.knowledgeBaseId!, 'markUseful', { ids }),
+            request(this.id, this.knowledgeBaseId!, 'markUseful', { ids, operationId: `review:${[...(this.taskExtras.get(taskId)?.reviewedTaskIds ?? [taskId])].sort().join(',')}` }),
             10000,
           );
           result = `Marked ${res.marked} entries useful`;
+          break;
+        }
+
+        case 'record_pattern_application': {
+          const extra = this.taskExtras.get(taskId);
+          const application = action.application as Record<string, unknown>;
+          if (!extra?.goalId || !application) return { success: false, error: 'Application evidence requires a goal review and an application object' };
+          const res = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'recordPatternApplication', {
+            id: action.id, application: { ...application, id: `${extra.goalId}:${action.id}`, goalId: extra.goalId },
+          }));
+          if (!res.success) return { success: false, error: res.error };
+          result = 'Recorded contextual application evidence';
           break;
         }
 
@@ -777,7 +872,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const guard = await this.guardCuratable(id, 'update');
     if (guard) throw new Error(guard);
 
-    const entry = await this.request<{ id: string; title: string; type: string; content: string } | null>(
+    const entry = await this.request<{ id: string; title: string; type: string; content: string; pattern?: import('../core/pattern.js').PatternBody } | null>(
       request(this.id, this.knowledgeBaseId!, 'get', { id }),
       10000,
     ).catch(() => null);
@@ -786,7 +881,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       throw new Error(`Entry ${id} is type '${entry.type}', not a pattern; use update_entry`);
     }
 
-    const stored = readPattern(entry.content, entry.title);
+    const stored = entry.pattern ?? readPattern(entry.content, entry.title);
     if (!stored) throw new Error(`Pattern ${id} ("${entry.title}") could not be read (nothing was changed)`);
 
     const merged: Record<string, unknown> = { ...stored, name: entry.title };
@@ -811,6 +906,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       request(this.id, this.knowledgeBaseId!, 'update', {
         id,
         content: serializePattern(built.pattern),
+        expectedRevision: stored.learning?.revision ?? 1,
       }),
       10000,
     );
@@ -934,6 +1030,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
 | forget_entry | id | Remove an entry this transcript proves wrong |
+| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and patternRevision for this goal; repeated delivery is deduplicated |
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
@@ -941,8 +1038,8 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | fail | reason | The material was unreviewable |
 
 ## How to review
-1. **Credit first.** Compare the injected knowledge list against the transcript: entries the agent visibly relied on get one mark_useful call with their ids. When none were used, skip straight to lessons.
-2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Entries marked MISSED are proven wrong; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. When every prediction held, that is evidence the agent's model was sound and there is likely nothing durable to save.
+1. **Credit first.** Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, skip straight to lessons.
+2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Only structured predictions assessed as contradicted have a mechanical mismatch; a failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. When every prediction held, that is evidence the agent's model was sound and there is likely nothing durable to save.
 3. **Distill sparingly.** Most tasks teach nothing durable; finishing with done and "no learnings" is a good review. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 4. **Recall before saving.** Search with recall_knowledge first; when a close entry exists, update_entry it rather than adding a sibling.
 5. **Record capabilities, skip grievances.** Write what worked and what things are for. Leave transient failures (timeouts, one-off errors, flaky runs) unrecorded: a "this tool is broken" entry outlives the outage and talks future agents out of a working tool. Record a limitation only when the transcript proves it is permanent and structural, and phrase it as what to do instead.
@@ -953,9 +1050,10 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 The workspace's memory includes a generative pattern language in the Alexander/Coplien tradition: write patterns the way Christopher Alexander and James Coplien do, where each pattern names a recurring context, lays out forces genuinely in tension, and resolves them, and the patterns link into a language that generates good solutions piecemeal. The anatomy of an entry of type 'pattern' is Context (when the pattern applies), Forces (the tensions that make the naive approach fail), Therefore (the resolution of those forces, not a mere tip), optional Contract (checkable obligations), optional Program (a worked example), Resulting context (what holds afterwards, and which patterns apply next), Evidence (how proven it is, Alexander's confidence stars in prose), and Links to related patterns. Goal reviews may include the goal's execution record; that record is your ore for pattern mining.
 
 - **Weave before writing.** recall_knowledge with the goal's context terms surfaces existing patterns and 'candidate-pattern'-tagged lessons. When an existing pattern's context covers this goal, update_pattern it: refine its Forces with what this goal revealed, refresh its Evidence line (for example "proven in 3 goals"), and addLinks to related patterns.
+- **Record applications.** For patterns actually used, record_pattern_application with the observed context, evidence, patternRevision, and a verdict. Distinguish following a pattern from benefiting; include counterexamples and competing causes.
 - **Patterns are earned.** A shape seen once becomes a save_entry lesson tagged 'candidate-pattern'. Promote it with save_pattern when the shape recurs; the recall step surfaces the candidate. Most goals teach no pattern, and a language that grows slowly stays trustworthy.
 - **Generalize.** A pattern names a recurring CONTEXT, never this goal: keep goal titles and agent names out. Name patterns as short capitalized noun phrases (like DATA THEN JUDGMENT), and let the name be evocative enough to use in conversation.
-- **Failed goals teach too.** When an injected pattern was followed and the goal still failed, its Forces were incomplete: update_pattern with what was missing.
+- **Failed goals teach too.** When a followed pattern contributed to failure, record the counterexample and refine its Context or Forces. Consider alternative causes: a transient outage does not refute a design pattern. Preserve inconclusive cases as uncertain.
 - **Link the language.** Patterns gain power from their links. When a new pattern completes, refines, or sets up another, name it in links; a link to a pattern nobody has written yet marks work for a future review.
 
 Work in at most a handful of actions, then done.`;
@@ -973,6 +1071,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | recall_knowledge | query | Inspect entries on a topic more closely |
 | merge_entries | title, content, type?, tags?, absorbedIds | Replace 2+ narrow near-duplicates with one umbrella entry; the absorbed entries are archived (restorable) |
 | update_entry | id, content?, title?, tags? | Sharpen a single entry's wording or tags |
+| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and patternRevision for this goal; repeated delivery is deduplicated |
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Write a pattern (e.g. promote ripe candidate-pattern lessons, or fulfill a dangling link) |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Revise a pattern's sections or extend its links |
 | archive_entry | id | Archive an entry that is stale or too narrow to help future tasks |

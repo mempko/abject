@@ -198,6 +198,15 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   }
 
   private setupHandlers(): void {
+    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('restoreTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: TaskExtra };
+      if (!snapshot) throw new Error('Missing specialist checkpoint');
+      this.taskExtras.set(taskId, structuredClone(snapshot));
+      return { success: true };
+    });
+
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
       const { tupleId, taskId: explicitTaskId, goalId, description, approach, failureHistory } = msg.payload as {
@@ -282,7 +291,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     });
 
     // ── Ticket result handler ──
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
@@ -292,17 +303,18 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
 
     // Forward progress to GoalManager so Chat's timeout resets during long operations.
     this.on('progress', (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       // Progress arrives untagged, so it cannot be attributed to one task by
       // inspection. With several running, every live goal is genuinely being
       // worked on and each needs its timer reset, so all of them hear about it
       // — but the message itself belongs to whichever task emitted it, so it
       // is only quoted when there is no ambiguity about whose it is.
       if (this.goalManagerId) {
-        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        const payload = msg.payload as { taskId?: string; phase?: string; message?: string } | undefined;
         const goals = new Set<string>();
-        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
-        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const task = payload?.taskId ? this.taskExtras.get(payload.taskId) : undefined;
+        if (task?.goalId) goals.add(task.goalId);
+
         const attributable = goals.size === 1;
         for (const goalId of goals) {
           this.send(event(this.id, this.goalManagerId, 'updateProgress', {
@@ -318,17 +330,19 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     // ── AgentAbject callback handlers ──
     // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       // Heartbeat: long sub-calls (e.g. MCP tool that takes minutes) shouldn't
       // let the parent's inactivity timer fire while we're genuinely working.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 60000);
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
       try {
         return await this.handleAct(taskId, action);
       } finally {
@@ -337,15 +351,15 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentIntermediateAction', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
+    this.on('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
 
     // ── SkillRegistry change handler ──
     this.on('changed', async (msg: AbjectMessage) => {
@@ -392,6 +406,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       name: 'SkillAgent',
       description,
       config: {
+        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },
           fail: { type: 'error' as const, resultFields: ['reason'] },
@@ -460,7 +475,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
     // Per-task goal context; the shared field is only a legacy fallback
-    const goalId = extra.goalId ?? this._currentGoalId;
+    const goalId = extra.goalId;
 
     try {
       let result: string;
@@ -702,6 +717,15 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           break;
         }
 
+        case 'load_skill': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry unavailable' };
+          const enabled = await this.request<EnabledSkillSummary[]>(request(this.id, this.skillRegistryId, 'getEnabledSkills', {}));
+          const skill = enabled.find(s => s.name === action.name);
+          if (!skill) return { success: false, error: 'Skill is not enabled; Ask SkillRegistry about availability' };
+          result = `Skill ${skill.name}: ${skill.description}\n${skill.instructions ?? '(no instructions)'}`;
+          break;
+        }
+
         case 'list_skills': {
           if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
 
@@ -729,7 +753,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           );
 
           if (toolResult.isError) {
-            result = `MCP tool error: ${toolResult.content}`;
+            return { success: false, error: `MCP tool error: ${toolResult.content}` };
           } else {
             result = toolResult.content;
           }
@@ -913,6 +937,7 @@ Example response:
 | install_mcp_server | name | Install an MCP server by its registry name (e.g. the result of search_catalog). Fetches the package details, synthesises a SKILL.md, installs, and enables. |
 | install_clawhub_skill | slug | Install a skill from ClawHub by slug (result of search_catalog). Downloads the ZIP bundle and writes it under the local skills directory. Does NOT auto-enable — the user reviews first. |
 | disable_skill | name | Disable a skill |
+| load_skill | name | Load the current instructions for an enabled skill before using it |
 | list_skills | | List all installed skills and their status |
 | write_scratchpad | key, value | Write a value to the goal's shared scratchpad under the given key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings. |
 | read_scratchpad | key? | Read a value from the goal's scratchpad. Omit key to read the full scratchpad. Consumed keys are already shown in the injected context; use this action only when you need to fetch something extra. |
@@ -1064,7 +1089,7 @@ When using curl, use -s (silent) and pipe JSON through jq.
           prompt += '\n## Enabled Skills\n\n';
           for (const skill of skills) {
             prompt += `### ${skill.name}\n${skill.description}\n`;
-            if (skill.instructions) prompt += skill.instructions + '\n\n';
+            prompt += `Load instructions when needed: {"action":"load_skill","name":${JSON.stringify(skill.name)}}\n\n`;
 
             // Show configured env vars (masked)
             if (skill.env) {
@@ -1125,8 +1150,10 @@ When using curl, use -s (silent) and pipe JSON through jq.
     timeoutMs: number;
   }>();
 
-  private resetPendingTicketTimeouts(): void {
+  private resetPendingTicketTimeouts(taskId?: string): void {
+    if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
+      if (ticketId !== taskId) continue;
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -1139,6 +1166,8 @@ When using curl, use -s (silent) and pipe JSON through jq.
   }
 
   private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
+    const early=this.takeTaskResult<any>(ticketId);
+    if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
       const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
