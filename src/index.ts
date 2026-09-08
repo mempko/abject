@@ -29,6 +29,7 @@ export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
+export { PeersViewer, PEERS_VIEWER_ID } from './objects/peers-viewer.js';
 export { AppExplorer, APP_EXPLORER_ID } from './objects/app-explorer.js';
 export { ObjectBrowser, OBJECT_BROWSER_ID } from './objects/object-browser.js';
 export { MethodInspector, METHOD_INSPECTOR_ID } from './objects/method-inspector.js';
@@ -277,3 +278,7 @@ export { PeerRouter, PEER_ROUTER_ID } from './network/peer-router.js';
 // Export compositor
 export { Compositor } from './ui/compositor.js';
 
+
+export { TaskSession } from './objects/task-session.js';
+
+export { AgentEvaluation } from './objects/agent-evaluation.js';

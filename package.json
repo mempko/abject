@@ -32,7 +32,10 @@
     "incarnate:win": "pnpm incarnate && node download-playwright-browser.mjs win-x64 && electron-builder --win",
     "incarnate:mac": "pnpm incarnate && node download-playwright-browser.mjs mac-x64 mac-arm64 && electron-builder --mac",
     "incarnate:all": "pnpm incarnate:linux && pnpm incarnate:win && pnpm incarnate:mac",
-    "release": "node release.mjs"
+    "release": "node release.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:agents": "node --import tsx --test --test-isolation=none src/objects/agent-system.*.test.ts",
+    "test": "node --import tsx --test --test-isolation=none src/objects/*.test.ts src/network/*.test.ts src/llm/*.test.ts src/protocol/*.test.ts"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.15",

@@ -1,3 +1,5 @@
+import { AgentEvaluation } from '../src/objects/agent-evaluation.js';
+import { TaskSession } from '../src/objects/task-session.js';
 /**
  * Node.js worker_threads entry point for Abject parallelism.
  *
@@ -54,6 +56,7 @@ import { ChatManager } from '../src/objects/chat-manager.js';
 import { ChatBrowser } from '../src/objects/chat-browser.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { Taskbar } from '../src/objects/taskbar.js';
+import { PeersViewer } from '../src/objects/peers-viewer.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { LLMMonitor } from '../src/objects/llm-monitor.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
@@ -173,12 +176,15 @@ constructors.set('ChatBrowser', () => new ChatBrowser());
 constructors.set('AbjectStore', () => new AbjectStore());
 constructors.set('Theme', () => new ThemeAbject());
 constructors.set('Taskbar', () => new Taskbar());
+constructors.set('PeersViewer', () => new PeersViewer());
 constructors.set('ProcessExplorer', () => new ProcessExplorer());
 constructors.set('LLMMonitor', () => new LLMMonitor());
 constructors.set('GlobalSettings', () => new GlobalSettings());
 constructors.set('PermissionBroker', () => new PermissionBroker());
 constructors.set('PeerNetwork', () => new PeerNetwork());
 constructors.set('GoalObserver', () => new GoalObserver());
+constructors.set('TaskSession', () => new TaskSession());
+constructors.set('AgentEvaluation', () => new AgentEvaluation());
 constructors.set('TaskReviewer', () => new TaskReviewer());
 constructors.set('AgentAbject', () => new AgentAbject());
 constructors.set('ScrumMaster', () => new ScrumMaster());

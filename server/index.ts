@@ -1,3 +1,5 @@
+import { AgentEvaluation } from '../src/objects/agent-evaluation.js';
+import { TaskSession } from '../src/objects/task-session.js';
 /**
  * Abjects Node.js Backend Entry Point
  *
@@ -29,6 +31,7 @@ import { CommandPaletteAbject } from '../src/objects/command-palette.js';
 import { NotificationCenter } from '../src/objects/notification-center.js';
 import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
 import { Taskbar } from '../src/objects/taskbar.js';
+import { PeersViewer } from '../src/objects/peers-viewer.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
 import { MethodInspector } from '../src/objects/method-inspector.js';
@@ -573,10 +576,13 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('ScrumMaster', () => new ScrumMaster());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());
+  runtime.objectFactory.registerConstructor('TaskSession', () => new TaskSession());
+runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEvaluation());
   runtime.objectFactory.registerConstructor('TaskReviewer', () => new TaskReviewer());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
+  runtime.objectFactory.registerConstructor('PeersViewer', () => new PeersViewer());
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
@@ -655,7 +661,7 @@ async function main(): Promise<void> {
       // Per-workspace objects
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace', 'SharedState',
-      'GoalManager', 'GoalBrowser', 'GoalObserver', 'TaskReviewer',
+      'GoalManager', 'GoalBrowser', 'GoalObserver', 'TaskSession', 'AgentEvaluation', 'TaskReviewer',
       'JobManager', 'JobBrowser',
       'KnowledgeBase', 'KnowledgeBrowser',
       'FileManager', 'FileViewer',
@@ -663,7 +669,7 @@ async function main(): Promise<void> {
       'ObjectAgent', 'SkillAgent', 'WebAgent', 'ExternalProjectRegistry', 'ExternalCreator', 'ExternalProjectBrowser',
       'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
-      'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
+      'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'PeersViewer', 'Taskbar',
       'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
       'WorkspaceBrowser', 'WorkspaceCollaboratorInspector', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
