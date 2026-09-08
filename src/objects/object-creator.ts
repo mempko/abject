@@ -1,3 +1,4 @@
+import { domainFailure, type ResultContract } from '../core/result-contract.js';
 /**
  * ObjectCreator — LLM-driven agent for creating and modifying Abjects.
  *
@@ -18,8 +19,10 @@
  *                         system prompt, task lifecycle, finalization.
  */
 
+import { encodeAgentState } from '../core/agent-session-codec.js';
 import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, SpawnRequest, SpawnResult } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { Capabilities } from '../core/capability.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
@@ -494,6 +497,8 @@ export class ObjectCreator extends Abject {
           canExecute: true,
           config: {
             maxSteps: 30,
+            completionMethod: 'candidateComplete',
+            snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
             terminalActions: {
               done: { type: 'success', resultFields: ['result'] },
               fail: { type: 'error', resultFields: ['reason'] },
@@ -1481,7 +1486,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     // Persist so the clone survives a restart (same as deploy_spawn).
     if (this.abjectStoreId) {
-      this.sendRequest<unknown>(
+      await this.sendRequest<unknown>(
         this.abjectStoreId,
         'save',
         { objectId: result.objectId, manifest, source, owner: this.id },
@@ -1970,6 +1975,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
     if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
 
+    if (state.spawnedObjectId) return this.opDeployUpdate(state, { action: 'deploy_update', objectId: state.spawnedObjectId });
     const refusal = this.gateDeploy(state, 'deploy_spawn');
     if (refusal) return refusal;
 
@@ -1998,7 +2004,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // Persist to AbjectStore so the spawned object survives a restart.
     // Use request+catch so save failures show up in logs instead of vanishing.
     if (this.abjectStoreId) {
-      this.sendRequest<unknown>(
+      await this.sendRequest<unknown>(
         this.abjectStoreId,
         'save',
         {
@@ -2008,9 +2014,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           owner: this.id,
         },
         15000,
-      ).catch(err => log.warn('deploy_spawn: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+      );
     }
 
+    if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.lastDeployedSource = state.draftSource;
 
     // Detect a live name collision. Registry uniquifies duplicate registration
@@ -2103,6 +2110,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // Captured before the closure: the guard above proved it is a string, and
     // a later staging op must not change what this deploy writes.
     const draftSource = state.draftSource;
+    const previousLive = state.targetSource;
     return withKeyedLock(`abject-source:${targetId}`, async () => {
       const conflict = await this.detectSourceConflict(state, targetId!);
       if (conflict) return conflict;
@@ -2112,7 +2120,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const updateRes = await this.sendRequest<{ success: boolean; error?: string }>(
         targetId,
         'updateSource',
-        { source: draftSource },
+        { source: draftSource, expectedSource: state.targetSource },
         60000,
       );
       if (updateRes && updateRes.success === false) {
@@ -2123,6 +2131,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { ok: false, summary: `deploy_update: live updateSource failed: ${msg.slice(0, 120)}`, error: msg };
     }
 
+    // The live swap happened. Retain that base even if a later participant fails,
+    // so a retry reconciles this same object instead of creating a duplicate.
+    state.targetSource = draftSource;
+    state.targetObjectId = targetId;
+
     // 2. Update Registry's cached source.
     try {
       await this.sendRequest<unknown>(this.registryId!, 'updateSource', {
@@ -2131,7 +2144,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }, 30000);
     } catch (err) {
       log.warn('deploy_update: Registry.updateSource failed:', err instanceof Error ? err.message : String(err));
-      // Non-fatal — the live object already swapped.
+      return { ok: false, summary: 'Live source changed; registry reconciliation failed', error: String(err) };
     }
 
     // 3. If we have a manifest draft, update Registry's cached manifest too.
@@ -2142,7 +2155,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           manifest: state.draftManifest,
         }, 30000);
       } catch (err) {
-        log.warn('deploy_update: Registry.updateManifest failed:', err instanceof Error ? err.message : String(err));
+        return { ok: false, summary: 'Live source changed; manifest reconciliation failed', error: String(err) };
       }
     }
 
@@ -2174,7 +2187,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         }
       }
       if (manifestForPersist) {
-        this.sendRequest<unknown>(
+        await this.sendRequest<unknown>(
           this.abjectStoreId,
           'save',
           {
@@ -2184,13 +2197,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
             owner: this.id,
           },
           15000,
-        ).catch(err => log.warn('deploy_update: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+        );
       } else {
-        log.warn(`deploy_update: no manifest available for AbjectStore.save (targetId=${targetId.slice(0, 8)}); modification will not survive restart`);
+        return { ok: false, summary: 'Live source changed, but persistence is incomplete', error: 'Cannot persist without a manifest; ask Registry for the target manifest and retry' };
       }
     }
 
-    const previousLive = state.targetSource;
+    if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.deployedViaUpdateSource = true;
     state.lastDeployedSource = draftSource;
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
@@ -2395,12 +2408,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     state.spawnedObjectId = result.objectId;
     // The staged membrane drafts are now live inside the organism.
+    if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.lastDeployedSource = state.draftSource;
 
     // Persist so the organism survives a restart (same path deploy_spawn uses;
     // Factory re-detects the organism tag + JSON spec on restore).
     if (this.abjectStoreId) {
-      this.sendRequest<unknown>(
+      await this.sendRequest<unknown>(
         this.abjectStoreId,
         'save',
         { objectId: result.objectId, manifest, source: organismSource, owner: this.id },
@@ -2466,7 +2480,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     state.spawnedObjectId = result.objectId;
 
     if (this.abjectStoreId) {
-      this.sendRequest<unknown>(
+      await this.sendRequest<unknown>(
         this.abjectStoreId,
         'save',
         { objectId: result.objectId, manifest: payload.manifest, source: payload.source, owner: this.id },
@@ -2754,6 +2768,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       };
     }
 
+    const contract = await this.sendRequest<ResultContract|null>(resolvedId,'getResultContract',{method},10000).catch(()=>null);
+    const rejected=domainFailure(response,contract);
+    if(rejected)return {ok:false,data:response,error:rejected,summary:`call ${target}.${method}: rejected`};
+
     // Merge discovery results into state.deps so validators and the
     // observation renderer see what's been learned.
     const summary = this.mergeDiscoveryIntoDeps(state, target, resolvedId, method, response);
@@ -2777,8 +2795,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // those do not count; an `input` event to one of its widgets does.
     if (state.deployTurn !== undefined) {
       const live = state.spawnedObjectId ?? state.targetObjectId;
-      const readOnly = new Set(['describe', 'ask', 'getSource', 'probe', 'getState']);
-      if ((resolvedId === live && !readOnly.has(method)) || method === 'input') {
+      const readOnly = new Set(['describe', 'ask', 'getSource', 'probe', 'getState', 'getData', 'saveData', 'show', 'hide']);
+      let ownedWidget = false;
+      if (method === 'input' && live && resolvedId !== live) {
+        const manager = await this.discoverDep('WidgetManager');
+        if (manager) {
+          const ownership = await this.sendRequest<{ownerId?:string}|null>(manager,'getOwnership',{objectId:resolvedId},10000);
+          ownedWidget = ownership?.ownerId === live;
+        }
+      }
+      if ((resolvedId === live || ownedWidget) && !readOnly.has(method) && !(response && typeof response === 'object' && (response as { success?: unknown }).success === false)) {
         state.exercisedSinceDeploy = true;
       }
     }
@@ -2807,7 +2833,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (!res.ok) return;
     const method = String(action.method ?? '');
     const img = (res.data && typeof res.data === 'object')
-      ? res.data as { imageBase64?: string; width?: number; height?: number; error?: string }
+      ? res.data as { imageBase64?: string; width?: number; height?: number; error?: string; ownerId?: string }
       : undefined;
 
     if (img && typeof img.imageBase64 === 'string' && img.imageBase64.length > 0) {
@@ -2824,7 +2850,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
 
       extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
-      if (extra.state.deployTurn !== undefined) extra.state.visualSinceDeploy = true;
+      const screenshotService = await this.discoverDep('Screenshot');
+      const target = extra.state.spawnedObjectId ?? extra.state.targetObjectId;
+      if (extra.state.deployTurn !== undefined && method === 'captureWindow' &&
+          (action.target === 'Screenshot' || action.target === screenshotService) && img.ownerId === target) extra.state.visualSinceDeploy = true;
       res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
       res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
       return;
@@ -3055,11 +3084,53 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     // ── AgentAbject callbacks ──
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
+    this.on('snapshotTask', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      const extra = this.tasks.get((msg.payload as { taskId: string }).taskId);
+      return extra ? encodeAgentState(extra) : null;
+    });
+    this.on('restoreTask', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can restore this task');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: unknown };
+      // AgentAbject decodes the session before sending this message.
+      const extra = structuredClone(snapshot) as TaskExtra;
+      if (!extra) throw new Error('No specialist checkpoint');
+      extra.taskId = taskId;
+      extra.ticketId = taskId; extra.deferredMsg = undefined;
+      extra.state.exercisedSinceDeploy = false;
+      this.taskIdByTicket.set(taskId, taskId);
+      this.tasks.set(taskId, extra);
+      return { success: true };
+    });
+
+    this.on('candidateComplete', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can settle this candidate');
+      const { taskId } = msg.payload as { taskId: string };
+      const extra = this.tasks.get(taskId);
+      if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
+      const gate = this.gateVerdict(extra.state);
+      const target = extra.state.spawnedObjectId ?? extra.state.targetObjectId;
+      const visualAvailable = await this.refreshVisionCapability();
+      const authorsUI = extra.state.kind !== 'investigate' && !!extra.state.draftSource && extra.state.draftManifest?.requiredCapabilities?.some(c => c.capability === Capabilities.UI_SURFACE);
+      if (gate.ok && authorsUI && visualAvailable === true && !extra.state.visualSinceDeploy) return { accepted: false, reason: 'Capture and inspect this application through Screenshot.captureWindow after the last deployment; unrelated windows cannot verify it' };
+      if (gate.ok && target && extra.state.draftSource) {
+        if (!this.abjectStoreId) return {accepted:false,reason:'Durable snapshot service unavailable'};
+        const persisted = await this.sendRequest<{ success: boolean; error?: string }>(target, 'persistSnapshot', { expectedSource: extra.state.lastDeployedSource }, 15000);
+        if (!persisted.success) return { accepted: false, reason: persisted.error ?? 'Current application state could not be persisted' };
+        const live = await this.sendRequest<string>(target,'getSource',{},10000);
+        const saved = await this.sendRequest<{source:string}|null>(this.abjectStoreId,'getDurableSnapshot',{objectId:target},10000);
+        if (live!==extra.state.lastDeployedSource || saved?.source!==live) return {accepted:false,reason:'Live and durable source revisions do not match the verified deployment; reconcile before completion'};
+      }
+      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, target, source: extra.state.lastDeployedSource, visualInspection: extra.state.visualSinceDeploy ? 'captured-for-review' : visualAvailable === false ? 'unavailable' : 'not-recorded', note: gate.note } };
+    });
+
     this.on('agentAct', async (msg: AbjectMessage) => {
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId, action, batchRemaining } = msg.payload as {
         taskId: string; step: number; action: AgentAction; batchRemaining?: number;
       };
@@ -3071,7 +3142,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     this.on('agentActionResult', async () => { /* no-op */ });
 
     // ── Receive task results from AgentAbject ──
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const { ticketId, success, result, error } = msg.payload as {
         ticketId: string;
         success: boolean;
@@ -3098,10 +3171,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         if (undeployed) {
           const saved = await this.persistDraftToGoal(extra);
           if (saved && !finalResult.success) {
-            finalResult.error = `${finalResult.error ?? 'Task failed'} [The staged draft (manifest + source) is preserved in the goal scratchpad under '${GOAL_DRAFT_KEY}'; the next ObjectCreator task in this goal adopts it automatically — plan a finish-and-deploy task, not a rewrite.]`;
+            finalResult.error = `${finalResult.error ?? 'Task failed'} [The staged draft (manifest + source) is preserved in the goal scratchpad under '${GOAL_DRAFT_KEY}/${extra.taskId}'; reference that draft explicitly in the continuation task — plan a finish-and-deploy task, not a rewrite.]`;
           }
         } else {
-          void this.clearPersistedDraft(extra.goalId);
+          void this.clearPersistedDraft(extra.goalId, extra.taskId);
         }
       }
 
@@ -3199,7 +3272,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // persisted draft means a previous loop ended before deploying, and
     // adopting it turns "re-author from failure prose" into "finish and ship".
     if (args.goalId && args.kind !== 'investigate') {
-      await this.loadPersistedDraft(args.goalId, state);
+      const draftKey = args.prompt.match(/objectcreator:staged-draft\/[\w-]+/)?.[0];
+      if (draftKey) await this.loadPersistedDraft(args.goalId, state, draftKey);
     }
 
     const taskId = args.explicitTaskId ?? `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3233,7 +3307,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
             // additionally grants progress-aware extensions at the cap.
             maxSteps: 45,
             timeout: 600000,
-            queueName: `object-creator-${this.id}`,
+            queueName: `object-creator-${taskId}`,
           },
         },
         15000,
@@ -3270,7 +3344,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         source: s.draftSource,
       };
       await this.sendRequest(this.goalManagerId, 'writeGoalData', {
-        goalId: extra.goalId, key: GOAL_DRAFT_KEY, value: JSON.stringify(payload),
+        goalId: extra.goalId, key: `${GOAL_DRAFT_KEY}/${extra.taskId}`, value: JSON.stringify(payload),
       }, 10000);
       log.info(`Preserved undeployed draft (${s.draftSource.split('\n').length} lines) in goal ${extra.goalId.slice(0, 8)} scratchpad`);
       return true;
@@ -3281,11 +3355,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /** A successful (deployed) result makes any persisted draft stale — clear it. */
-  private async clearPersistedDraft(goalId: string): Promise<void> {
+  private async clearPersistedDraft(goalId: string, taskId: string): Promise<void> {
     if (!this.goalManagerId) return;
     try {
       await this.sendRequest(this.goalManagerId, 'writeGoalData', {
-        goalId, key: GOAL_DRAFT_KEY, value: '',
+        goalId, key: `${GOAL_DRAFT_KEY}/${taskId}`, value: '',
       }, 10000);
     } catch { /* best effort */ }
   }
@@ -3295,18 +3369,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * DRAFTS section then shows it (flagged as not yet deployed) and a turn-log
    * entry steers the loop to finish + deploy rather than re-author.
    */
-  private async loadPersistedDraft(goalId: string, state: LoopState): Promise<void> {
-    if (!this.goalManagerId) return;
+  private async loadPersistedDraft(goalId: string, state: LoopState, draftKey?: string): Promise<void> {
+    if (!this.goalManagerId || !draftKey) return;
     try {
       const raw = await this.sendRequest<string | null>(this.goalManagerId, 'readGoalData', {
-        goalId, key: GOAL_DRAFT_KEY,
+        goalId, key: draftKey,
       }, 10000);
       if (!raw || typeof raw !== 'string') return;
       const payload = JSON.parse(raw) as {
-        taskId?: string; kind?: string; targetName?: string;
+        taskId?: string; kind?: string; targetName?: string; targetObjectId?: string;
         manifest?: AbjectManifest; source?: string;
       };
       if (!payload.source) return;
+      if (state.targetObjectId && payload.targetObjectId !== state.targetObjectId) return;
       // A draft authored for a DIFFERENT named target is not ours to adopt.
       if (payload.targetName && state.targetName && payload.targetName !== state.targetName) return;
       state.draftSource = payload.source;
@@ -3719,9 +3794,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   /**
    * Whether this loop may honestly claim to be done.
    *
-   * The runtime finishes a task the instant it parses a terminal action, so
-   * this is not an interception; it is the check applied to the claim before
-   * it leaves this object (the same shape ExternalCreator uses). Two things
+   * AgentAbject invokes this through candidateComplete before settlement.
+   * A rejected candidate returns to the same execution conversation. Two things
    * are refused: staged source that never shipped, and a deploy nothing has
    * exercised since. A diagnostic loop authors nothing and passes.
    */

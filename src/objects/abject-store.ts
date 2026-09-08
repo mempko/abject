@@ -1,3 +1,4 @@
+import { describeMessages, protocolText } from '../core/protocol-description.js';
 /**
  * AbjectStore - persists user-created scriptable abject snapshots to Storage
  * and restores them on startup.
@@ -215,6 +216,7 @@ export class AbjectStore extends Abject {
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [{name:'getDurableSnapshot',description:'Read a source/data snapshot directly from Storage after durable acknowledgement.',parameters:{objectId:protocolText}}]);
     this.on('save', async (msg: AbjectMessage) => {
       const { objectId, manifest, source, owner, data } = msg.payload as {
         objectId: string;
@@ -229,6 +231,13 @@ export class AbjectStore extends Abject {
     this.on('remove', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
       return this.removeSnapshot(objectId);
+    });
+
+    this.on('getDurableSnapshot', async msg => {
+      if (!this.storageId) throw new Error('Storage unavailable');
+      const { objectId } = msg.payload as { objectId:string };
+      const snapshots = await this.request<AbjectSnapshot[]|null>(request(this.id,this.storageId,'get',{key:STORAGE_KEY}));
+      return snapshots?.find(s=>s.objectId===objectId || s.typeId===objectId) ?? null;
     });
 
     this.on('list', async () => {
@@ -433,15 +442,17 @@ export class AbjectStore extends Abject {
    * Persist the current snapshots map to Storage.
    */
   private async persistToStorage(): Promise<void> {
+    if (!this.storageId) throw new Error('Storage unavailable; snapshot is not durable');
     try {
       await this.request(
-        request(this.id, this.storageId!, 'set', {
+        request(this.id, this.storageId, 'set', {
           key: STORAGE_KEY,
           value: Array.from(this.snapshots.values()),
         })
       );
     } catch (err) {
       log.warn('Failed to persist to storage:', err);
+      throw err;
     }
   }
 
@@ -456,7 +467,7 @@ export class AbjectStore extends Abject {
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = undefined;
-      void this.flushPersist();
+      void this.flushPersist().catch(err => log.warn('Deferred snapshot persistence failed:', err));
     }, AbjectStore.PERSIST_DEBOUNCE_MS);
   }
 
@@ -467,6 +478,9 @@ export class AbjectStore extends Abject {
     this.persistInFlight = this.persistToStorage();
     try {
       await this.persistInFlight;
+    } catch (err) {
+      this.persistDirty = true;
+      throw err;
     } finally {
       this.persistInFlight = undefined;
     }
@@ -560,6 +574,7 @@ export class AbjectStore extends Abject {
     // Key by typeId for durable identity (survives restart with new objectId)
     this.snapshots.set(typeId, snapshot);
     this.schedulePersist();
+    await this.flushPersist();
 
     // Register the object in the workspace registry so it appears in AppExplorer/Taskbar
     if (this.registryId) {

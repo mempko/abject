@@ -14,6 +14,7 @@
  * and this.observe() without exposing the real Abject instance or Node.js APIs.
  */
 
+import { withKeyedLock } from '../core/keyed-lock.js';
 import {
   AbjectId,
   AbjectManifest,
@@ -44,6 +45,12 @@ const EDITABLE_METHODS: MethodDeclaration[] = [
     description: 'Get a deep copy of this object\'s internal data (the same record source code mutates as this.data).',
     parameters: [],
     returns: { kind: 'object' as const, properties: {} },
+  },
+  {
+    name: 'persistSnapshot',
+    description: 'Persist the current source and internal data, then read back the durable receipt. expectedSource rejects a stale deployment.',
+    parameters: [{ name: 'expectedSource', description: 'Expected live source', optional: true, type: { kind: 'primitive' as const, primitive: 'string' as const } }],
+    returns: { kind: 'object' as const, properties: { success: { kind: 'primitive' as const, primitive: 'boolean' as const } } },
   },
   {
     name: 'updateSource',
@@ -124,6 +131,9 @@ export class ScriptableAbject extends Abject {
   private _source: string;
   private _owner: AbjectId;
   private _data: Record<string, unknown>;
+  private activeUserCalls = 0;
+  private activating = false;
+  private sourceHandlers?: Record<string, unknown>;
   private _userMethods: Set<string> = new Set();
   private _userProps: Set<string> = new Set();
   private _depCache: Record<string, AbjectId> = {};
@@ -280,7 +290,33 @@ export class ScriptableAbject extends Abject {
     return null;
   }
 
+  /** Keep synchronous UI handlers synchronous while tracking async work for activation. */
+  private invokeUserHandler(handler: MessageHandlerFn, msg: AbjectMessage): unknown {
+    if (this.activating) throw new Error('Source activation in progress; retry against the committed revision');
+    this.activeUserCalls++;
+    try {
+      const result = handler(msg);
+      // Sandboxed Promises belong to another realm; instanceof Promise misses them.
+      if (result != null && typeof (result as { then?: unknown }).then === 'function') {
+        return Promise.resolve(result).finally(() => { this.activeUserCalls--; });
+      }
+      this.activeUserCalls--;
+      return result;
+    } catch (err) {
+      this.activeUserCalls--;
+      throw err;
+    }
+  }
+
   private setupEditableHandlers(): void {
+    this.on('persistSnapshot', async msg => withKeyedLock(`${this.id}:source-activation`, async () => {
+      const { expectedSource } = msg.payload as { expectedSource?: string };
+      if (expectedSource !== undefined && expectedSource !== this._source) return { success: false, conflict: true, error: 'Source changed before persistence' };
+      await this.saveData();
+      const saved = await this.request<{ source: string; data?: Record<string, unknown> } | null>(request(this.id, this._storeId!, 'getDurableSnapshot', { objectId: this.id }));
+      if (!saved || saved.source !== this._source) throw new Error('Durable source does not match the live deployment');
+      return { success: true, source: saved.source, data: saved.data ?? {} };
+    }));
     this.on('getSource', () => {
       return this._source;
     });
@@ -385,7 +421,7 @@ export class ScriptableAbject extends Abject {
     });
 
     this.on('updateSource', async (msg: AbjectMessage) => {
-      const { source } = msg.payload as { source: string };
+      const { source, expectedSource } = msg.payload as { source: string; expectedSource?: string };
       if (msg.routing.from !== this._owner) {
         // Ownership may be stale after restart (ObjectCreator gets new ID each session).
         // Resolve the current ObjectCreator, AbjectEditor, and AbjectStore via
@@ -414,31 +450,47 @@ export class ScriptableAbject extends Abject {
         }
       }
 
-      // Hot-reload: tear down current UI via old hide() handler
-      const currentHide = this.handlers.get('hide');
-      if (currentHide) {
+      return withKeyedLock(`${this.id}:source-activation`, async () => {
+        if (expectedSource !== undefined && expectedSource !== this._source) return { success: false, conflict: true, error: 'Source changed since the expected base; read it and reconcile' };
+        this.activating = true;
         try {
-          await currentHide(msg);
-        } catch (err) {
-          log.warn(`${this.manifest.name} hide() during reload failed:`, err);
+          const deadline = Date.now()+10000;
+          while (this.activeUserCalls > 0 && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,25));
+          if (this.activeUserCalls > 0) return {success:false,error:'Live handlers are still running; reconcile their effects before activation'};
+        let prepared: Record<string, MessageHandlerFn> | undefined;
+        try { prepared = compileSandboxed(source, this.buildHandlerProxy(), { filename: `scriptable-${this.manifest.name}.js` }) as Record<string, MessageHandlerFn>; }
+        catch (err) { return { success: false, error: err instanceof Error ? err.message : String(err) }; }
+        const previousSource = this._source;
+        const previousData = structuredClone(this._data);
+        const currentHide = this.sourceHandlers?.hide as MessageHandlerFn | undefined;
+        try { if (currentHide) await currentHide(msg); }
+        catch (err) {
+          this._data = previousData;
+          let rollbackError: string | undefined;
+          try { const restored = this.applySource(previousSource); if (!restored.success) throw new Error(restored.error); await (this.sourceHandlers?.show as MessageHandlerFn | undefined)?.(msg); } catch (restore) { rollbackError = String(restore); }
+          return { success: false, error: `Previous lifecycle could not deactivate: ${String(err)}`, rolledBack: !rollbackError, rollbackError };
         }
-      }
+        const result = this.applySource(source, prepared);
+        if (!result.success) { this._data = previousData; return result; }
 
-      // Swap source (removes old handlers, installs new ones)
-      const result = this.applySource(source);
-      if (!result.success) return result;
-
-      // Hot-reload: re-show via new show() handler
-      const newShow = this.handlers.get('show');
-      if (newShow) {
-        try {
-          await newShow(msg);
-        } catch (err) {
-          log.warn(`${this.manifest.name} show() during reload failed:`, err);
+        const newShow = this.sourceHandlers?.show as MessageHandlerFn | undefined;
+        if (newShow) {
+          try { await newShow(msg); }
+          catch (err) {
+            let rollbackError: string | undefined;
+            try {
+              await (this.sourceHandlers?.hide as MessageHandlerFn | undefined)?.(msg);
+              this._data = previousData;
+              const restored = this.applySource(previousSource);
+              if (!restored.success) throw new Error(restored.error);
+              await (this.sourceHandlers?.show as MessageHandlerFn | undefined)?.(msg);
+            } catch (restore) { rollbackError = String(restore); }
+            return { success: false, error: `Activation failed: ${String(err)}`, rolledBack: !rollbackError, rollbackError };
+          }
         }
-      }
-
-      return result;
+        return result;
+        } finally { this.activating = false; }
+      });
     });
 
     this.installDefaultCloseHandler();
@@ -545,7 +597,7 @@ export class ScriptableAbject extends Abject {
   // default would fire for every window the object owns — closing the wrong
   // window (e.g. a manager's main window when an editor's X is clicked).
   static readonly PROTECTED_HANDLERS = new Set([
-    'getSource', 'getData', 'updateSource', 'probe',
+    'getSource', 'getData', 'updateSource', 'persistSnapshot', 'probe',
     'describe', 'ask', 'getRegistry',
     'ping', 'addDependent', 'removeDependent',
   ]);
@@ -713,8 +765,7 @@ export class ScriptableAbject extends Abject {
         this._storeId = await this.discoverDep('AbjectStore') ?? undefined;
       }
       if (!this._storeId) {
-        log.warn(`saveData: AbjectStore not available for '${this.manifest.name}' (${this.id}); data not persisted`);
-        return;
+        throw new Error('AbjectStore unavailable; data is not persisted');
       }
       await this.request(
         request(this.id, this._storeId, 'save', {
@@ -760,20 +811,18 @@ export class ScriptableAbject extends Abject {
     // Build the this-proxy with safe helpers
     const handlerThis = this.buildHandlerProxy();
 
-    // Compile in sandboxed vm context. No access to require, process, fs, etc.
-    // Security comes from both the vm sandbox (isolates Node.js globals) and the
-    // this-proxy (restricts what handlers can access via `this`).
-    // Performance: ScriptableAbject is worker-eligible, so cross-realm overhead
-    // is contained within worker threads and does not block the main thread.
+    // Compile in the existing in-process vm context with caller-provided helpers.
     const handlerMap = compileSandboxed(source, handlerThis, {
       filename: `scriptable-${this.manifest.name}.js`,
     }) as Record<string, MessageHandlerFn>;
 
+    this.sourceHandlers = handlerMap;
     const baseProps = new Set(Object.keys(this));
     const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(handlerThis);
+        this.sourceHandlers![key] = bound;
         // Don't overwrite base class methods or properties
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
@@ -785,7 +834,7 @@ export class ScriptableAbject extends Abject {
         }
         if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
           // Message handler -- also registered on bus
-          this.on(key, bound);
+          this.on(key, msg => this.invokeUserHandler(bound, msg));
           this._userMethods.add(key);
         }
       } else {
@@ -810,12 +859,12 @@ export class ScriptableAbject extends Abject {
    * Apply new source at runtime. Returns success/error.
    * On failure, old handlers remain — the object never enters a broken state.
    */
-  applySource(source: string): { success: boolean; error?: string; errorLine?: number } {
+  applySource(source: string, prepared?: Record<string, MessageHandlerFn>): { success: boolean; error?: string; errorLine?: number } {
     // Build a fresh this-proxy and compile in sandbox
     const handlerThis = this.buildHandlerProxy();
     let handlerMap: Record<string, MessageHandlerFn>;
     try {
-      handlerMap = compileSandboxed(source, handlerThis, {
+      handlerMap = prepared ?? compileSandboxed(source, handlerThis, {
         filename: `scriptable-${this.manifest.name}.js`,
       }) as Record<string, MessageHandlerFn>;
     } catch (err) {
@@ -833,6 +882,7 @@ export class ScriptableAbject extends Abject {
       };
     }
 
+    this.sourceHandlers = handlerMap;
     // Remove old user handlers and properties
     for (const method of this._userMethods) {
       this.off(method);
@@ -849,6 +899,7 @@ export class ScriptableAbject extends Abject {
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(handlerThis);
+        this.sourceHandlers![key] = bound;
         // Don't overwrite base class methods or properties
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
@@ -860,7 +911,7 @@ export class ScriptableAbject extends Abject {
         }
         if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
           // Message handler -- also registered on bus
-          this.on(key, bound);
+          this.on(key, msg => this.invokeUserHandler(bound, msg));
           this._userMethods.add(key);
         }
       } else {

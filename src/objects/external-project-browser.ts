@@ -25,14 +25,18 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './external-project-registry.js';
+import type { Rule, RuleScope } from './permission-broker.js';
+import { isInside } from '../core/path-scope.js';
 import type { ListItem } from './widgets/list-widget.js';
+
+type ManagedRule = { index: number } & Rule;
 
 const log = new Log('ExternalProjectBrowser');
 
 const BROWSER_INTERFACE: InterfaceId = 'abjects:external-project-browser';
 
-const WIN_W = 640;
-const WIN_H = 420;
+const WIN_W = 1040;
+const WIN_H = 620;
 const BUTTON_ROW_H = 36;
 
 export class ExternalProjectBrowser extends Abject {
@@ -41,26 +45,33 @@ export class ExternalProjectBrowser extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
+  private detailsWidgetId?: AbjectId;
+  private grantsWidgetId?: AbjectId;
   private addBtnId?: AbjectId;
+  private settingsBtnId?: AbjectId;
   private editBtnId?: AbjectId;
   private trustBtnId?: AbjectId;
   private autonomyBtnId?: AbjectId;
   private removeBtnId?: AbjectId;
+  private addGrantBtnId?: AbjectId;
+  private editGrantBtnId?: AbjectId;
+  private removeGrantBtnId?: AbjectId;
 
   private projects: ExternalProject[] = [];
   /** Level actually in force per project, and what capped it. */
   private effective = new Map<string, { effective: AutonomyLevel; cappedBy: string }>();
   private brokerId?: AbjectId;
+  private permissionRules: ManagedRule[] = [];
   private selected?: string;
+  private selectedRuleIndex?: number;
 
   constructor() {
     super({
       manifest: {
         name: 'ExternalProjectBrowser',
         description:
-          'Browse and manage external projects: the named directories on disk that ExternalCreator ' +
-          'works in. Add a project, set the commands that check and verify it, mark it trusted, ' +
-          'or remove it from the list. Nothing here deletes anything on disk.',
+          'Browse and manage external projects, their configuration, and the standing permission ' +
+          'grants that apply to them. Nothing here deletes project files from disk.',
         version: '1.0.0',
         icon: '📁',
         interface: {
@@ -167,15 +178,76 @@ someone else wrote, so it is a button here rather than something granted on add.
       }),
     );
 
-    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const splitId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 10,
+      }),
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: splitId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    const leftPaneId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: splitId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 6,
+      }),
+    );
+    const rightPaneId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: splitId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 6,
+      }),
+    );
+    await this.request(request(this.id, splitId, 'updateLayoutChild', {
+      widgetId: leftPaneId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'fixed' },
+      preferredSize: { width: 380 },
+    }));
+    await this.request(request(this.id, splitId, 'updateLayoutChild', {
+      widgetId: rightPaneId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    const { widgetIds: [listId, detailsId, grantsId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'list', windowId: this.windowId, items: [], searchable: true }],
+        specs: [
+          { type: 'list', windowId: this.windowId, items: [], searchable: true },
+          { type: 'list', windowId: this.windowId, items: [] },
+          { type: 'list', windowId: this.windowId, items: [] },
+        ],
       }),
     );
     this.listWidgetId = listId;
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+    this.detailsWidgetId = detailsId;
+    this.grantsWidgetId = grantsId;
+    await this.request(request(this.id, leftPaneId, 'addLayoutChild', {
       widgetId: this.listWidgetId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    await this.request(request(this.id, rightPaneId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.detailsWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.grantsWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+      ],
+    }));
+
+    const grantRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: rightPaneId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      }),
+    );
+    await this.request(request(this.id, rightPaneId, 'updateLayoutChild', {
+      widgetId: grantRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: BUTTON_ROW_H },
     }));
 
     const buttonRowId = await this.request<AbjectId>(
@@ -194,20 +266,29 @@ someone else wrote, so it is a button here rather than something granted on add.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: 'Add…' },
+          { type: 'button', windowId: this.windowId, text: 'Add project…' },
+          { type: 'button', windowId: this.windowId, text: 'Settings…' },
           { type: 'button', windowId: this.windowId, text: 'Commands…' },
           { type: 'button', windowId: this.windowId, text: 'Trust' },
           { type: 'button', windowId: this.windowId, text: 'Autonomy…' },
-          { type: 'button', windowId: this.windowId, text: 'Remove' },
+          { type: 'button', windowId: this.windowId, text: 'Remove project' },
+          { type: 'button', windowId: this.windowId, text: 'Add grant…' },
+          { type: 'button', windowId: this.windowId, text: 'Edit grant…' },
+          { type: 'button', windowId: this.windowId, text: 'Remove grant' },
         ],
       }),
     );
-    [this.addBtnId, this.editBtnId, this.trustBtnId, this.autonomyBtnId, this.removeBtnId] = widgetIds;
+    [
+      this.addBtnId, this.settingsBtnId, this.editBtnId, this.trustBtnId,
+      this.autonomyBtnId, this.removeBtnId, this.addGrantBtnId,
+      this.editGrantBtnId, this.removeGrantBtnId,
+    ] = widgetIds;
 
     await this.request(request(this.id, buttonRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: BUTTON_ROW_H } },
-        { widgetId: this.editBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: BUTTON_ROW_H } },
+        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
+        { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: BUTTON_ROW_H } },
+        { widgetId: this.editBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
         { widgetId: this.trustBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 90, height: BUTTON_ROW_H } },
         { widgetId: this.autonomyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
       ],
@@ -215,13 +296,22 @@ someone else wrote, so it is a button here rather than something granted on add.
     await this.request(request(this.id, buttonRowId, 'addLayoutSpacer', {}));
     await this.request(request(this.id, buttonRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.removeBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 90, height: BUTTON_ROW_H } },
+        { widgetId: this.removeBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 130, height: BUTTON_ROW_H } },
+      ],
+    }));
+    await this.request(request(this.id, grantRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.addGrantBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
+        { widgetId: this.editGrantBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
+        { widgetId: this.removeGrantBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: BUTTON_ROW_H } },
       ],
     }));
 
     for (const id of widgetIds) this.send(request(this.id, id, 'addDependent', {}));
     if (this.listWidgetId) this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
     if (this.registryObjId) this.send(request(this.id, this.registryObjId, 'addDependent', {}));
+    this.brokerId = await this.resolveDep('PermissionBroker', this.brokerId);
+    if (this.brokerId) this.send(request(this.id, this.brokerId, 'addDependent', {}));
 
     await this.load();
 
@@ -232,19 +322,28 @@ someone else wrote, so it is a button here rather than something granted on add.
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
     if (this.registryObjId) this.send(request(this.id, this.registryObjId, 'removeDependent', {}));
+    if (this.brokerId) this.send(request(this.id, this.brokerId, 'removeDependent', {}));
 
     await this.request(request(this.id, this.widgetManagerId!, 'destroyWindowAbject', { windowId: this.windowId }));
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.listWidgetId = undefined;
+    this.detailsWidgetId = undefined;
+    this.grantsWidgetId = undefined;
     this.addBtnId = undefined;
+    this.settingsBtnId = undefined;
     this.editBtnId = undefined;
     this.trustBtnId = undefined;
     this.autonomyBtnId = undefined;
     this.removeBtnId = undefined;
+    this.addGrantBtnId = undefined;
+    this.editGrantBtnId = undefined;
+    this.removeGrantBtnId = undefined;
     this.projects = [];
+    this.permissionRules = [];
     this.selected = undefined;
+    this.selectedRuleIndex = undefined;
     this.changed('visibility', false);
     return true;
   }
@@ -267,8 +366,11 @@ someone else wrote, so it is a button here rather than something granted on add.
       log.warn(`could not list projects: ${err instanceof Error ? err.message : String(err)}`);
       this.projects = [];
     }
+    if (this.selected && !this.projects.some(p => p.name === this.selected)) this.selected = undefined;
     await this.refreshEffective();
+    await this.loadRules();
     await this.rebuildList();
+    await this.rebuildDetails();
   }
 
   private formatItem(p: ExternalProject): ListItem {
@@ -324,6 +426,16 @@ someone else wrote, so it is a button here rather than something granted on add.
     }
   }
 
+  private async loadRules(): Promise<void> {
+    if (!this.brokerId) return;
+    try {
+      this.permissionRules = await this.request<ManagedRule[]>(
+        request(this.id, this.brokerId, 'listRules', {}), 10_000);
+    } catch {
+      this.permissionRules = [];
+    }
+  }
+
   private async rebuildList(): Promise<void> {
     if (!this.listWidgetId) return;
     try {
@@ -331,6 +443,59 @@ someone else wrote, so it is a button here rather than something granted on add.
         items: this.projects.map(p => this.formatItem(p)),
       }));
     } catch { /* widget may be gone */ }
+  }
+
+  private applicableRules(project: ExternalProject): ManagedRule[] {
+    return this.permissionRules.filter(rule => {
+      if (rule.kind === 'exact') return true;
+      if (rule.scope.kind === 'anywhere') return true;
+      if (rule.scope.kind === 'project') return rule.scope.name === project.name;
+      return isInside(project.root, rule.scope.root) || isInside(rule.scope.root, project.root);
+    });
+  }
+
+  private scopeLabel(rule: Rule, project: ExternalProject): string {
+    if (rule.kind === 'exact') return 'Broader · exact command (not project-scoped)';
+    if (rule.scope.kind === 'project') return `Project-scoped · ${rule.scope.name}`;
+    if (rule.scope.kind === 'anywhere') return 'Broader · applies anywhere';
+    if (isInside(project.root, rule.scope.root)) return `Broader path · ${rule.scope.root}`;
+    return `Project subpath · ${rule.scope.root}`;
+  }
+
+  private ruleLabel(rule: Rule): string {
+    const subject = rule.kind === 'class' ? `class ${rule.effect}`
+      : rule.kind === 'program' ? `program ${rule.program}` : `command ${rule.command}`;
+    return `${rule.allow ? 'Allow' : 'Deny'} ${subject} for ${rule.caller}`;
+  }
+
+  private async rebuildDetails(): Promise<void> {
+    if (!this.detailsWidgetId || !this.grantsWidgetId) return;
+    const project = this.current();
+    const details: ListItem[] = project ? [
+      { label: `Configuration — ${project.name}`, value: 'heading', secondary: project.description || 'No description' },
+      { label: 'Root', value: 'root', secondary: project.root },
+      { label: 'Check command', value: 'check', secondary: project.checkCommand || 'Not configured' },
+      { label: 'Verify command', value: 'verify', secondary: project.verifyCommand || 'Not configured' },
+      { label: 'Format / setup', value: 'aux', secondary: `${project.formatCommand || 'none'} / ${project.setupCommand || 'none'}` },
+      { label: 'Trust and autonomy', value: 'security', secondary: `${project.trusted ? 'Trusted' : 'Untrusted'} · requested ${project.autonomy} · effective ${this.effective.get(project.name)?.effective ?? 'ask'}` },
+      { label: 'Isolation / VCS', value: 'isolation', secondary: `${project.isolation} / ${project.vcs}` },
+      { label: 'Shared paths', value: 'shared', secondary: (project.sharedPaths ?? []).length ? (project.sharedPaths ?? []).join(', ') : 'None' },
+      { label: 'Protected paths', value: 'protected', secondary: (project.protectedPaths ?? []).length ? (project.protectedPaths ?? []).join(', ') : 'None' },
+    ] : [{ label: 'Select a project', value: 'empty', secondary: 'Configuration and applicable permission grants appear here.' }];
+
+    const grants: ListItem[] = project
+      ? this.applicableRules(project).map(rule => ({
+          label: this.ruleLabel(rule),
+          value: `rule:${rule.index}`,
+          secondary: this.scopeLabel(rule, project),
+          badge: { text: rule.allow ? 'ALLOW' : 'DENY', color: rule.allow ? this.theme.statusSuccess : this.theme.statusError },
+        }))
+      : [];
+    if (project && grants.length === 0) grants.push({ label: 'Applicable permission grants', value: 'none', secondary: 'No standing grants affect this project.' });
+    try {
+      await this.request(request(this.id, this.detailsWidgetId, 'update', { items: details }));
+      await this.request(request(this.id, this.grantsWidgetId, 'update', { items: grants }));
+    } catch { /* widgets may have been closed */ }
   }
 
   private current(): ExternalProject | undefined {
@@ -344,20 +509,37 @@ someone else wrote, so it is a button here rather than something granted on add.
       await this.load();
       return;
     }
+    if (fromId === this.brokerId && aspect === 'rulesChanged') {
+      await this.loadRules();
+      await this.rebuildDetails();
+      return;
+    }
 
     if (fromId === this.listWidgetId && (aspect === 'select' || aspect === 'selectionChanged')) {
       const v = value as { value?: string } | string | undefined;
       this.selected = typeof v === 'string' ? v : v?.value;
+      this.selectedRuleIndex = undefined;
+      await this.rebuildDetails();
+      return;
+    }
+    if (fromId === this.grantsWidgetId && (aspect === 'select' || aspect === 'selectionChanged')) {
+      const v = value as { value?: string } | string | undefined;
+      const raw = typeof v === 'string' ? v : v?.value;
+      this.selectedRuleIndex = raw?.startsWith('rule:') ? Number(raw.slice(5)) : undefined;
       return;
     }
 
     if (aspect !== 'click') return;
 
     if (fromId === this.addBtnId) return this.addProject();
+    if (fromId === this.settingsBtnId) return this.editProjectSettings();
     if (fromId === this.editBtnId) return this.editCommands();
     if (fromId === this.trustBtnId) return this.toggleTrust();
     if (fromId === this.autonomyBtnId) return this.cycleAutonomy();
     if (fromId === this.removeBtnId) return this.removeProject();
+    if (fromId === this.addGrantBtnId) return this.addGrant();
+    if (fromId === this.editGrantBtnId) return this.editGrant();
+    if (fromId === this.removeGrantBtnId) return this.removeGrant();
   }
 
   private async addProject(): Promise<void> {
@@ -421,6 +603,110 @@ someone else wrote, so it is a button here rather than something granted on add.
       await this.notify(`Could not add project: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
+  }
+
+  private async editProjectSettings(): Promise<void> {
+    const reg = await this.registry();
+    const project = this.current();
+    if (!reg || !project) return void await this.notify('Select a project first', 'warning');
+    const description = await this.prompt({ title: `Settings — ${project.name}`, message: 'Project description', defaultValue: project.description ?? '' });
+    if (description === null) return;
+    const formatCommand = await this.prompt({ title: `Format Command — ${project.name}`, message: 'Optional formatting command', defaultValue: project.formatCommand ?? '' });
+    if (formatCommand === null) return;
+    const setupCommand = await this.prompt({ title: `Setup Command — ${project.name}`, message: 'Optional setup command', defaultValue: project.setupCommand ?? '' });
+    if (setupCommand === null) return;
+    const shared = await this.prompt({ title: `Shared Paths — ${project.name}`, message: 'Comma-separated paths that isolation may share', defaultValue: (project.sharedPaths ?? []).join(', ') });
+    if (shared === null) return;
+    const protectedValue = await this.prompt({ title: `Protected Paths — ${project.name}`, message: 'Comma-separated paths that always require confirmation before writes', defaultValue: (project.protectedPaths ?? []).join(', ') });
+    if (protectedValue === null) return;
+    const protectedPaths = protectedValue.split(',').map(v => v.trim()).filter(Boolean);
+    if ((project.protectedPaths ?? []).length > 0 && protectedPaths.length < (project.protectedPaths ?? []).length) {
+      const ok = await this.confirm({ title: 'Reduce protected paths?', message: 'Removing protected paths permits more writes without an explicit prompt. Continue?', confirmLabel: 'Save changes', destructive: true });
+      if (!ok) return;
+    }
+    try {
+      await this.request(request(this.id, reg, 'updateProject', { name: project.name, changes: {
+        description,
+        formatCommand: formatCommand || undefined,
+        setupCommand: setupCommand || undefined,
+        sharedPaths: shared.split(',').map(v => v.trim()).filter(Boolean),
+        protectedPaths,
+      }}));
+    } catch (err) {
+      await this.notify(`Could not update settings: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+    await this.load();
+  }
+
+  private async collectRule(existing?: ManagedRule): Promise<Rule | undefined> {
+    const project = this.current();
+    if (!project) return undefined;
+    const caller = await this.prompt({ title: 'Grant caller', message: 'Object name this rule applies to', defaultValue: existing?.caller ?? 'ExternalCreator' });
+    if (!caller) return undefined;
+    const kind = await this.prompt({ title: 'Grant type', message: 'Enter program, class, or exact', defaultValue: existing?.kind ?? 'program' });
+    if (!kind || !['program', 'class', 'exact'].includes(kind)) {
+      await this.notify('Grant type must be program, class, or exact', 'warning');
+      return undefined;
+    }
+    const previousSubject = existing?.kind === 'program' ? existing.program : existing?.kind === 'class' ? existing.effect : existing?.kind === 'exact' ? existing.command : '';
+    const subject = await this.prompt({ title: 'Grant subject', message: kind === 'class' ? 'read, write, exec, network, or dangerous' : kind === 'program' ? 'Program name, for example grep' : 'Exact command', defaultValue: previousSubject });
+    if (!subject) return undefined;
+    const allow = await this.confirm({ title: 'Rule decision', message: `Should this rule allow ${subject}? Choose Deny to create a blocking rule.`, confirmLabel: 'Allow', cancelLabel: 'Deny' });
+    if (kind === 'exact') return { kind: 'exact', caller, command: subject, allow };
+    const oldScope = existing && existing.kind !== 'exact' ? existing.scope : undefined;
+    const defaultScope = oldScope?.kind === 'project' ? 'project' : oldScope?.kind === 'path' ? 'path' : oldScope?.kind === 'anywhere' ? 'anywhere' : 'project';
+    const scopeKind = await this.prompt({ title: 'Grant scope', message: 'Enter project, path, or anywhere. Project is the narrowest and safest.', defaultValue: defaultScope });
+    if (!scopeKind || !['project', 'path', 'anywhere'].includes(scopeKind)) return undefined;
+    let scope: RuleScope = { kind: 'project', name: project.name };
+    if (scopeKind === 'anywhere') scope = { kind: 'anywhere' };
+    if (scopeKind === 'path') {
+      const root = await this.prompt({ title: 'Path scope', message: 'Absolute path this grant covers', defaultValue: oldScope?.kind === 'path' ? oldScope.root : project.root });
+      if (!root) return undefined;
+      scope = { kind: 'path', root };
+    }
+    if (kind === 'class') {
+      if (!['read', 'write', 'exec', 'network', 'dangerous'].includes(subject)) {
+        await this.notify('Unknown effect class', 'warning');
+        return undefined;
+      }
+      return { kind: 'class', caller, effect: subject as 'read' | 'write' | 'exec' | 'network' | 'dangerous', scope, allow };
+    }
+    return { kind: 'program', caller, program: subject, scope, allow };
+  }
+
+  private async addGrant(): Promise<void> {
+    if (!this.brokerId || !this.current()) return void await this.notify('Select a project first', 'warning');
+    const rule = await this.collectRule();
+    if (!rule) return;
+    // The broker owns the final approval, including calls that bypass this UI.
+    const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'addRule', { rule }), 31 * 60 * 1000);
+    if (!result.success) await this.notify(result.error ?? 'Could not add grant', 'error');
+    await this.loadRules();
+    await this.rebuildDetails();
+  }
+
+  private async editGrant(): Promise<void> {
+    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.notify('Select a grant first', 'warning');
+    const existing = this.permissionRules.find(rule => rule.index === this.selectedRuleIndex);
+    if (!existing) return void await this.notify('That grant no longer exists', 'warning');
+    const rule = await this.collectRule(existing);
+    if (!rule) return;
+    const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'updateRule', { index: existing.index, rule }), 31 * 60 * 1000);
+    if (!result.success) await this.notify(result.error ?? 'Could not edit grant', 'error');
+    this.selectedRuleIndex = undefined;
+    await this.loadRules();
+    await this.rebuildDetails();
+  }
+
+  private async removeGrant(): Promise<void> {
+    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.notify('Select a grant first', 'warning');
+    const existing = this.permissionRules.find(rule => rule.index === this.selectedRuleIndex);
+    if (!existing) return;
+    const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'removeRule', { index: existing.index }), 31 * 60 * 1000);
+    if (!result.success) await this.notify(result.error ?? 'Could not remove grant', 'error');
+    this.selectedRuleIndex = undefined;
+    await this.loadRules();
+    await this.rebuildDetails();
   }
 
   private async editCommands(): Promise<void> {

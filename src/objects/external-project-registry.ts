@@ -25,6 +25,7 @@
  * deliberate act by the user, recorded here.
  */
 
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -385,7 +386,35 @@ with the files each has written so far; agents report through \`taskStarted\`,
 - "can I use X's conventions?" → only when trusted is true.`;
   }
 
+  private projectSessions = new Map<string, { owner: AbjectId; project: string; root: string; revision?: string; files?: Record<string, string> }>();
+
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "openSession", description: "Open a task-owned project session; returns commands to check and verify.", parameters: { "project": protocolText, "taskId": protocolText, "root?": protocolText } },
+      { name: "captureRevision", description: "Hash project contents via HostFileSystem; returns revision, coverage, and changed files.", parameters: { "taskId": protocolText } },
+    ]);
+    this.on('openSession', async (msg: AbjectMessage) => {
+      const { project, taskId, root } = msg.payload as { project: string; taskId: string; root?: string };
+      const configured = this.projects.get(project);
+      if (!configured || !taskId) throw new Error('Registered project and taskId required');
+      const previous = this.projectSessions.get(taskId);
+      if (previous && previous.owner !== msg.routing.from) throw new Error('Project session belongs to another caller');
+      // The caller may use a worktree, but all file access still passes through HostFileSystem's path authority.
+      this.projectSessions.set(taskId, { owner: msg.routing.from, project, root: root ?? configured.root });
+      return { taskId, project, root: root ?? configured.root, commands: { check: configured.checkCommand, verify: configured.verifyCommand } };
+    });
+    this.on('captureRevision', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string };
+      const session = this.projectSessions.get(taskId);
+      if (!session || session.owner !== msg.routing.from) throw new Error('Project session unavailable or owned by another caller');
+      const fsId = await this.discoverDep('HostFileSystem');
+      if (!fsId) throw new Error('HostFileSystem unavailable');
+      const current = await this.request<{ revision: string; files: Record<string, string>; complete: boolean }>(request(this.id, fsId, 'snapshotTree', { root: session.root }), 120000);
+      const changed = session.files ? [...new Set([...Object.keys(session.files), ...Object.keys(current.files)])].filter(p => session.files![p] !== current.files[p]) : [];
+      session.revision = current.revision; session.files = current.files;
+      return { revision: current.revision, complete: current.complete, changed, project: session.project, root: session.root };
+    });
+
     this.on('addProject', async (msg: AbjectMessage) => {
       const raw = msg.payload as Record<string, unknown>;
       // `path` is what a caller reaches for first, so accept it as an alias for

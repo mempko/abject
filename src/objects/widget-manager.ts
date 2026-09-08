@@ -1,3 +1,4 @@
+import { describeMessages, protocolText } from '../core/protocol-description.js';
 /**
  * Widget Manager — factory that spawns WindowAbject and WidgetAbject instances.
  *
@@ -588,6 +589,12 @@ export class WidgetManager extends Abject {
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [{name:'getOwnership',description:'Resolve a live widget or window to its owning application.',parameters:{objectId:protocolText}}]);
+    this.on('getOwnership', msg => {
+      const { objectId } = msg.payload as { objectId:AbjectId };
+      const windowId = this.widgetToWindow.get(objectId) ?? (this.windowOwners.has(objectId) ? objectId : undefined);
+      return windowId ? { windowId, ownerId:this.windowOwners.get(windowId) } : null;
+    });
     this.on('createWindow', async (msg: AbjectMessage) => {
       const { title, rect, zIndex, chromeless, resizable } = msg.payload as {
         title: string;

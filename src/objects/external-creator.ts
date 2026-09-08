@@ -1,3 +1,4 @@
+import { domainFailure, type ResultContract } from '../core/result-contract.js';
 /**
  * ExternalCreator — an on-disk authoring agent.
  *
@@ -27,6 +28,7 @@
  *   3. AGENT SHELL      — registration, observe/act, prompt, task lifecycle.
  */
 
+import { encodeAgentState } from '../core/agent-session-codec.js';
 import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
@@ -59,6 +61,8 @@ const VERIFY_TIMEOUT_MS = 900_000;
 
 /** One run of a project-declared command, reduced to something comparable. */
 interface CheckOutcome {
+  revision?: string;
+  stable?: boolean;
   command: string;
   exitCode: number;
   /**
@@ -159,6 +163,8 @@ interface TaskExtra {
   instructionDirsSeen: Set<string>;
   /** Writes and edits since the last passing verify. Drives the gate. */
   mutationsSinceVerify: number;
+  unknownEffects?: boolean;
+  projectSession?: boolean;
   lastCheck?: CheckVerdict;
   lastVerify?: CheckVerdict;
   checkpoints: Array<{ ref: string; at: number; note: string }>;
@@ -553,7 +559,7 @@ clean result I did not observe.`;
     const shellId = await this.shell();
     return this.call<{ stdout: string; stderr: string; exitCode: number; truncated?: unknown }>(
       shellId, 'exec',
-      { command, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
+      { command, taskId: extra.taskId, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
       timeoutMs + 30_000,
     );
   }
@@ -583,11 +589,26 @@ clean result I did not observe.`;
     return Math.max(...counts);
   }
 
+  private async projectRevision(extra: TaskExtra): Promise<{ revision?: string; complete: boolean }> {
+    const registry = await this.projects();
+    if (!registry || !extra.project) return { complete: false };
+    if (!extra.projectSession) {
+      await this.call(registry, 'openSession', { project: extra.project.name, taskId: extra.taskId, root: extra.workRoot });
+      extra.projectSession = true;
+    }
+    const revision = await this.call<{ revision: string; complete: boolean; changed: string[] }>(registry, 'captureRevision', { taskId: extra.taskId }, 120000);
+    for (const rel of revision.changed) extra.filesModified.add(path.resolve(extra.workRoot!, rel));
+    return revision;
+  }
+
   private async captureOutcome(extra: TaskExtra, command: string, timeoutMs: number): Promise<CheckOutcome> {
+    const before = await this.projectRevision(extra);
     const r = await this.runCommand(extra, command, timeoutMs);
+    const after = await this.projectRevision(extra);
     const output = [r.stdout, r.stderr].filter(s => s && s.length > 0).join('\n');
     return {
       command,
+      revision: after.revision, stable: before.complete && after.complete && before.revision === after.revision,
       exitCode: r.exitCode,
       signatures: ExternalCreator.signaturesOf(output, extra.workRoot),
       failureCount: ExternalCreator.failureCountOf(output),
@@ -605,10 +626,11 @@ clean result I did not observe.`;
    * green makes any failure new by definition.
    */
   private judge(outcome: CheckOutcome, baseline: CheckOutcome | undefined, touched: string[] = []): CheckVerdict {
+    if (outcome.stable === false) return { outcome, newFailures: [], foreignFailures: [], preExisting: 0, passed: false, inconclusive: true };
     if (outcome.exitCode === 0) {
       return { outcome, newFailures: [], foreignFailures: [], preExisting: baseline?.signatures.length ?? 0, passed: true };
     }
-    if (!baseline) {
+    if (!baseline || baseline.stable === false || baseline.command !== outcome.command) {
       return { outcome, newFailures: outcome.signatures, foreignFailures: [], preExisting: 0, passed: false, unbaselined: true };
     }
     if (baseline.exitCode === 0) {
@@ -636,7 +658,7 @@ clean result I did not observe.`;
       outcome,
       ...split,
       preExisting,
-      passed: split.newFailures.length === 0,
+      passed: fresh.length === 0,
     };
   }
 
@@ -667,7 +689,7 @@ clean result I did not observe.`;
     const head = `\`${v.outcome.command}\` exited ${v.outcome.exitCode}`;
     const foreign = v.foreignFailures.length > 0
       ? `\n${v.foreignFailures.length} new failure(s) are in files this task did not write — other tasks are working in this ` +
-        `project, so these are reported as theirs and do not block you (the round's review sees the combined state):\n` +
+        `project, so these are unexplained and block completion until their cause is established:\n` +
         v.foreignFailures.slice(0, 10).map(s => `  ${s}`).join('\n') +
         (v.foreignFailures.length > 10 ? `\n  … and ${v.foreignFailures.length - 10} more` : '')
       : '';
@@ -708,7 +730,10 @@ clean result I did not observe.`;
 
     const head = await this.gitHead(extra);
     const cached = await this.readGoalData<Baseline>(extra, BASELINE_KEY);
-    if (cached && cached.project === project.name && cached.head === head) {
+    const revision = await this.projectRevision(extra);
+    if (cached && revision.complete && cached.project === project.name && cached.head === head
+        && (!project.checkCommand || (cached.check?.command === project.checkCommand && cached.check.revision === revision.revision))
+        && (!project.verifyCommand || (cached.verify?.command === project.verifyCommand && cached.verify.revision === revision.revision))) {
       extra.baseline = cached;
       this.audit(extra, `baseline reused from goal (head ${head?.slice(0, 8) ?? 'n/a'})`);
       return;
@@ -905,19 +930,21 @@ clean result I did not observe.`;
     const content = action.content;
     if (typeof content !== 'string') return { success: false, error: 'write requires a "content" string' };
     this.assertWritable(extra, abs);
+    const instructions = await this.nestedInstructionsFor(extra, abs);
+    if (instructions) return { success: false, error: `Read these instructions before resubmitting the mutation. No file was changed.\n${instructions}` };
 
     const siblingNote = await this.siblingNoteFor(extra, abs);
     await this.rememberPreImage(extra, abs);
     this.taintVerifyBaseline(extra);
     const fs = await this.hostFs();
-    await this.call(fs, 'writeFile', { path: abs, content }, 60_000);
+    const written = await this.call<{ success: boolean; error?: string }>(fs, 'conditionalWrite', { path: abs, content, expectedContent: extra.postImages.get(abs) ?? extra.preImages.get(abs) ?? null }, 60_000);
+    if (!written.success) return { success: false, error: written.error ?? 'File changed; read it again before editing' };
     extra.postImages.set(abs, content);
 
     extra.filesModified.add(abs);
     extra.mutationsSinceVerify++;
     this.audit(extra, `write ${this.displayPath(extra, abs)} (${content.length} chars)`);
     this.announceFilesTouched(extra);
-    const instructions = await this.nestedInstructionsFor(extra, abs);
     return this.afterMutation(extra, action,
       `${instructions}Wrote ${this.displayPath(extra, abs)} (${content.split('\n').length} lines).${siblingNote}`);
   }
@@ -929,6 +956,8 @@ clean result I did not observe.`;
       return { success: false, error: 'edit requires a non-empty "edits" array of { oldText, newText }' };
     }
     this.assertWritable(extra, abs);
+    const instructions = await this.nestedInstructionsFor(extra, abs);
+    if (instructions) return { success: false, error: `Read these instructions before resubmitting the mutation. No file was changed.\n${instructions}` };
 
     const siblingNote = await this.siblingNoteFor(extra, abs);
     await this.rememberPreImage(extra, abs);
@@ -957,7 +986,6 @@ clean result I did not observe.`;
     extra.mutationsSinceVerify++;
     this.audit(extra, `edit ${this.displayPath(extra, abs)} applied ${r.applied}`);
     this.announceFilesTouched(extra);
-    const instructions = await this.nestedInstructionsFor(extra, abs);
     const summary = `${instructions}Applied ${r.applied} edit(s) to ${this.displayPath(extra, abs)}:\n${r.diff ?? ''}${siblingNote}`;
     return this.afterMutation(extra, action, summary, abs);
   }
@@ -1175,20 +1203,17 @@ clean result I did not observe.`;
   private async rollback(extra: TaskExtra, abs: string): Promise<'restored' | 'changed-by-other' | 'unavailable'> {
     const pre = extra.preImages.get(abs);
     const post = extra.postImages.get(abs);
-    if (pre === undefined) return 'unavailable';
+    if (pre === undefined || post === undefined) return 'unavailable';
     try {
       const fs = await this.hostFs();
-      if (post !== undefined) {
-        const now = await this.call<{ content: string }>(fs, 'readFile', { path: abs, maxBytes: 0 }, 60_000);
-        if (now.content !== post) {
-          this.audit(extra, `rollback of ${this.displayPath(extra, abs)} skipped — changed by another task since our edit`);
-          return 'changed-by-other';
-        }
-      }
-      await this.call(fs, 'writeFile', { path: abs, content: pre }, 60_000);
+      const restored = await this.call<{ success: boolean }>(fs, 'conditionalWrite', {
+        path: abs, expectedContent: post, content: pre,
+      }, 60_000);
+      if (!restored.success) return 'changed-by-other';
       extra.postImages.set(abs, pre);
       extra.filesModified.delete(abs);
-      extra.mutationsSinceVerify = Math.max(0, extra.mutationsSinceVerify - 1);
+      extra.mutationsSinceVerify++;
+      extra.lastVerify = undefined;
       this.audit(extra, `rolled back ${this.displayPath(extra, abs)}`);
       this.announceFilesTouched(extra);
       return 'restored';
@@ -1204,6 +1229,10 @@ clean result I did not observe.`;
     const cwd = action.cwd ? this.resolveWorkPath(extra, String(action.cwd)) : extra.workRoot;
 
     this.reportProgress(extra, 'acting', command.slice(0, 80));
+    this.taintVerifyBaseline(extra);
+    extra.unknownEffects = true;
+    extra.mutationsSinceVerify++;
+    extra.lastVerify = undefined;
     const r = await this.runCommand(extra, command, timeout, cwd);
     this.audit(extra, `bash exit=${r.exitCode}: ${command.slice(0, 160)}`);
 
@@ -1216,7 +1245,7 @@ clean result I did not observe.`;
     // A non-zero exit is information, not a failure of the action: the agent
     // asked what happens and now knows. Reporting it as an error would put it
     // in the failure path and skew loop-detection.
-    return bulkAwareResult(body);
+    return r.exitCode === 0 ? bulkAwareResult(body) : { success: false, error: body };
   }
 
   private async opGrep(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
@@ -1312,11 +1341,12 @@ clean result I did not observe.`;
 
     this.reportProgress(extra, 'acting', `verify: ${command}`);
     const outcome = await this.captureOutcome(extra, command, VERIFY_TIMEOUT_MS);
-    const baseline = full ? (extra.baseline?.verify ?? extra.baseline?.check) : extra.baseline?.check;
+    const baseline = command === extra.baseline?.verify?.command ? extra.baseline.verify
+      : command === extra.baseline?.check?.command ? extra.baseline.check : undefined;
     const verdict = this.judge(outcome, baseline, this.touchedFiles(extra));
 
     if (full) extra.lastVerify = verdict; else extra.lastCheck = verdict;
-    if (verdict.passed) extra.mutationsSinceVerify = 0;
+    if (verdict.passed && command === (project.verifyCommand ?? project.checkCommand)) extra.mutationsSinceVerify = 0;
     this.audit(extra, `verify(${full ? 'full' : 'check'}) exit=${outcome.exitCode} new=${verdict.newFailures.length} foreign=${verdict.foreignFailures.length}${verdict.inconclusive ? ' inconclusive' : ''}`);
 
     return { success: true, data: this.renderVerdict(verdict) };
@@ -1334,6 +1364,18 @@ clean result I did not observe.`;
           `A directory has to be registered before I work in it — ask the user to add it.`,
       };
     }
+    if (extra.project?.name === project.name) return { success: true, data: await this.buildProjectBlock(extra) };
+    if (extra.project && !this.gateVerdict(extra).ok) return { success: false, error: 'Finish verification in the current project before switching projects.' };
+    if (extra.project) {
+      await this.writeSessionSummary(extra, 'Project session suspended for switch', this.gateVerdict(extra));
+      this.announceTaskFinished(extra);
+    }
+    extra.filesRead.clear(); extra.filesModified.clear(); extra.preImages.clear(); extra.postImages.clear();
+    extra.instructionDirsSeen.clear(); extra.mutationsSinceVerify = 0; extra.unknownEffects = false;
+    extra.lastCheck = undefined; extra.lastVerify = undefined; extra.baseline = undefined;
+    extra.verifyBaseline = undefined; extra.workRoot = undefined; extra.worktree = undefined;
+    extra.checkpoints = []; extra.editSetOpen = false;
+    extra.projectSession = false;
     extra.project = project;
     await this.setupIsolation(extra);
     await this.setDefaultCwd(extra);
@@ -1341,8 +1383,9 @@ clean result I did not observe.`;
     await this.checkpoint(extra, 'task start');
     this.announceTaskStarted(extra);
     const others = await this.siblings(extra);
+    const projectInstructions = await this.buildProjectBlock(extra);
     const siblingLine = others.length > 0 ? `\n${this.renderSiblings(others)}` : '';
-    return { success: true, data: `Working in ${project.name} at ${extra.workRoot}.\n${this.baselineSummary(extra)}${siblingLine}` };
+    return { success: true, data: `Working in ${project.name} at ${extra.workRoot}.\n${projectInstructions}\n${this.baselineSummary(extra)}${siblingLine}` };
   }
 
   private renderSiblings(others: Array<{ taskId: string; goalId?: string; description?: string; files: string[] }>): string {
@@ -1350,7 +1393,7 @@ clean result I did not observe.`;
       const files = t.files.length > 0 ? ` — has written: ${t.files.slice(0, 12).join(', ')}${t.files.length > 12 ? ', …' : ''}` : ' — no files written yet';
       return `- ${t.taskId.slice(0, 8)}${t.goalId ? ` (goal ${t.goalId.slice(0, 8)})` : ''}: ${t.description ?? '(no description)'}${files}`;
     });
-    return `${others.length} other task(s) are working in this project right now. Stay out of the files they have written unless your task requires it; failures in files you did not write are reported as theirs.\n${lines.join('\n')}`;
+    return `${others.length} other task(s) are working in this project right now. Stay out of the files they have written unless your task requires it; diagnostic location alone does not establish which task caused a failure.\n${lines.join('\n')}`;
   }
 
   private async opCall(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
@@ -1365,7 +1408,13 @@ clean result I did not observe.`;
       targetId = found;
     }
     const timeout = typeof action.timeout === 'number' ? action.timeout : 30_000;
-    const response = await this.call<unknown>(targetId, method, action.payload ?? {}, timeout);
+    const supplied = (action.payload ?? {}) as Record<string, unknown>;
+    const shellId = await this.discoverDep('ShellExecutor');
+    const payload = targetId === shellId ? { ...supplied, taskId: extra.taskId, cwd: extra.workRoot, untrusted: this.isUntrusted(extra) } : supplied;
+    const response = await this.call<unknown>(targetId, method, payload, timeout);
+    const contract = await this.call<ResultContract|null>(targetId,'getResultContract',{method},10000).catch(()=>null);
+    const rejected=domainFailure(response,contract);
+    if(rejected)return {success:false,data:response,error:rejected};
     this.audit(extra, `call ${target}.${method}`);
     const text = typeof response === 'string' ? response : JSON.stringify(response, null, 2);
     return bulkAwareResult(text ?? 'null');
@@ -1387,7 +1436,7 @@ clean result I did not observe.`;
     if (!project) return { ok: true, note: 'No project was selected, so nothing was changed on disk.' };
 
     const changed = extra.filesModified.size;
-    if (changed === 0) {
+    if (changed === 0 && !extra.unknownEffects) {
       return { ok: true, note: 'No files were changed.' };
     }
 
@@ -1403,7 +1452,10 @@ clean result I did not observe.`;
       };
     }
 
-    const latest = extra.lastVerify ?? extra.lastCheck;
+    const requiredCommand = project.verifyCommand ?? project.checkCommand;
+    const latest = [extra.lastVerify, extra.lastCheck]
+      .filter((v): v is CheckVerdict => !!v && v.outcome.command === requiredCommand)
+      .sort((a, b) => b.outcome.at - a.outcome.at)[0];
     if (!latest || extra.mutationsSinceVerify > 0) {
       return {
         ok: false,
@@ -1546,6 +1598,8 @@ clean result I did not observe.`;
         'notes, and data alike. Changing Abjects inside this system belongs to an object-authoring ' +
         'agent; interactive web browsing and installed skill flows belong elsewhere.',
       config: {
+        completionMethod: 'candidateComplete',
+            snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result', 'report'] },
           fail: { type: 'error' as const, resultFields: ['reason'] },
@@ -1580,23 +1634,26 @@ clean result I did not observe.`;
       });
     });
 
-    this.on('taskResult', async (msg: AbjectMessage) => {
+    this.onDelivery('taskResult', async (msg: AbjectMessage) => {
+      if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
+      this.retainTaskResult(msg.payload);
       const payload = msg.payload as { ticketId: string };
       this.pendingTickets.get(payload.ticketId)?.resolve(payload);
     });
 
     this.on('progress', (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       // Progress arrives untagged, so it cannot be attributed to one task by
       // inspection. With several running, every live goal is genuinely being
       // worked on and each needs its timer reset, so all of them hear about it
       // — but the message itself belongs to whichever task emitted it, so it
       // is only quoted when there is no ambiguity about whose it is.
       if (this.goalManagerId) {
-        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        const payload = msg.payload as { taskId?: string; phase?: string; message?: string } | undefined;
         const goals = new Set<string>();
-        for (const e of this.taskExtras.values()) if (e.goalId) goals.add(e.goalId);
-        if (goals.size === 0 && this._currentGoalId) goals.add(this._currentGoalId);
+        const task = payload?.taskId ? this.taskExtras.get(payload.taskId) : undefined;
+        if (task?.goalId) goals.add(task.goalId);
+
         const attributable = goals.size === 1;
         for (const goalId of goals) {
           this.send(event(this.id, this.goalManagerId, 'updateProgress', {
@@ -1611,17 +1668,60 @@ clean result I did not observe.`;
 
     // ── AgentAbject callbacks ──
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId } = msg.payload as { taskId: string };
       return this.handleObserve(taskId);
     });
 
+    this.on('snapshotTask', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      const extra = this.taskExtras.get((msg.payload as { taskId: string }).taskId);
+      return extra ? encodeAgentState(extra) : null;
+    });
+    this.on('restoreTask', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can restore this task');
+      const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: unknown };
+      // AgentAbject decodes the session before sending this message.
+      const extra = structuredClone(snapshot) as TaskExtra;
+      if (!extra) throw new Error('No specialist checkpoint');
+      extra.taskId = taskId;
+      extra.projectSession = false;
+      extra.lastVerify = undefined; extra.lastCheck = undefined; extra.verifyBaseline = undefined;
+      extra.mutationsSinceVerify++;
+      this.taskExtras.set(taskId, extra);
+      return { success: true };
+    });
+
+    this.on('candidateComplete', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can settle this candidate');
+      const { taskId } = msg.payload as { taskId: string };
+      const extra = this.taskExtras.get(taskId);
+      if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
+      if (extra.project) {
+        const current = await this.projectRevision(extra);
+        const required = extra.project.verifyCommand ?? extra.project.checkCommand;
+        const evidence = [extra.lastVerify, extra.lastCheck].find(v => v?.outcome.command === required && v?.outcome.revision === current.revision && v?.passed);
+        if (required && (extra.filesModified.size > 0 || extra.unknownEffects) && (!current.complete || !evidence)) return { accepted: false, reason: 'Project changed since verification, or snapshot coverage is incomplete. Reconcile changes and verify the current revision.' };
+      }
+      const gate = this.gateVerdict(extra);
+      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, note: gate.note } };
+    });
+
+    this.on('taskCancelled', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.agentAbjectId) return;
+      const { taskId } = msg.payload as { taskId: string };
+      const shell = await this.shell();
+      await this.request(request(this.id, shell, 'stopTaskProcesses', { taskId }));
+    });
+
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      await this.requireTaskRuntime(msg,this.agentAbjectId);
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
       // A verify can legitimately run for many minutes; without a heartbeat the
       // pending ticket would time out while real work is happening.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 30_000);
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 30_000);
       try {
         return await this.handleAct(taskId, action);
       } finally {
@@ -1630,15 +1730,15 @@ clean result I did not observe.`;
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
+      this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { newPhase } = msg.payload as { newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentIntermediateAction', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
+    this.on('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
   }
 
   // ─── Task lifecycle ─────────────────────────────────────────────
@@ -1675,6 +1775,7 @@ clean result I did not observe.`;
       if (extra.project) {
         await this.setupIsolation(extra);
         await this.setDefaultCwd(extra);
+        await this.projectRevision(extra);
         await this.captureBaseline(extra);
         await this.checkpoint(extra, 'task start');
         this.announceTaskStarted(extra);
@@ -1729,7 +1830,7 @@ clean result I did not observe.`;
       // grant behind for the next one to inherit.
       try {
         const brokerId = await this.discoverDep('PermissionBroker');
-        if (brokerId) this.send(request(this.id, brokerId, 'clearSessionGrants', {}));
+        if (brokerId) this.send(request(this.id, brokerId, 'clearSessionGrants', { taskId: args.taskId }));
       } catch { /* best effort */ }
       this.taskExtras.delete(args.taskId);
       if (this._currentGoalId === args.goalId) this._currentGoalId = undefined;
@@ -1997,7 +2098,7 @@ Emit ONE JSON action per turn in a \`\`\`json code block, and nothing else. Inde
 1. **Find before reading.** grep and find cost one step and point at exact lines; reading whole files to look for something costs many.
 2. **Write the whole change, then let it be checked.** Put every edit to a file in ONE edit call. Across turns, mark every edit but the last with "more": true to keep the set open, then drop it on the last one.
 3. **Checks run themselves.** When an edit set closes, this project's check command runs automatically and its verdict comes back on that same action. Do not spend a step running it yourself.
-4. **You are judged against a baseline, on the files you wrote.** Failures that existed before you started are not yours and never block you. Failures you introduce in files you wrote do. Other tasks may be working in this project at the same time: your first observation lists them and what they have written, and new failures in files you did not write are reported as theirs.
+4. **You are judged against a baseline, on the files you wrote.** Failures that existed before you started are not yours and never block you. Failures you introduce in files you wrote do. Other tasks may be working in this project at the same time: your first observation lists them and what they have written, and new diagnostic location alone does not establish which task caused a failure.
 5. **done has to be earned.** A claim of done with unverified changes is rejected and handed back. When the project's check is also its verification, a passing check after your last edit already satisfies this; when it declares a heavier verify command, run verify.
 6. **Say what you did not verify.** When a project declares no commands, there is nothing to run — report exactly what you changed and that it was not verified. Never let silence imply a pass.
 7. **Keep oldText small.** Just enough context to be unique, no padding.
@@ -2081,8 +2182,10 @@ Report in your done result: what changed, which command proved it, and anything 
     timeoutMs: number;
   }>();
 
-  private resetPendingTicketTimeouts(): void {
+  private resetPendingTicketTimeouts(taskId?: string): void {
+    if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
+      if (ticketId !== taskId) continue;
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -2098,6 +2201,8 @@ Report in your done result: what changed, which command proved it, and anything 
     ticketId: string,
     timeout: number,
   ): Promise<{ success: boolean; result?: unknown; error?: string }> {
+    const early=this.takeTaskResult<any>(ticketId);
+    if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
       const entry = {
         timer: setTimeout(() => {
