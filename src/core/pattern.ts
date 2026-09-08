@@ -36,6 +36,23 @@ export interface PatternNote {
  * what make an entry a pattern rather than a tip, so they are required; the
  * rest sharpen it.
  */
+export interface PatternApplication {
+  id: string;
+  goalId: string;
+  context: string;
+  verdict: 'applied' | 'helpful' | 'harmful' | 'inconclusive';
+  evidence: string;
+  patternRevision: number;
+  at: number;
+}
+
+export interface PatternLearning {
+  revision: number;
+  applications: PatternApplication[];
+  feedbackIds: string[];
+  history: Array<{ revision: number; content: string }>;
+}
+
 export interface PatternBody {
   format: typeof PATTERN_FORMAT;
   name: string;
@@ -65,6 +82,8 @@ export interface PatternBody {
   links: string[];
   /** Sections carried over from a hand-written pattern, kept rather than dropped. */
   notes?: PatternNote[];
+  /** Receiver-maintained revision and episode provenance, independent of prose confidence. */
+  learning?: PatternLearning;
 }
 
 /** The prose sections, in the order a pattern reads. */
@@ -134,6 +153,12 @@ export function makePattern(
   const notes = normalizeNotes(fields.notes);
   if (notes.length > 0) pattern.notes = notes;
 
+  if (fields.learning && typeof fields.learning === 'object') {
+    const value = fields.learning as PatternLearning;
+    if (Number.isSafeInteger(value.revision) && value.revision > 0 && Array.isArray(value.applications) && Array.isArray(value.history)) {
+      pattern.learning = { revision: value.revision, applications: value.applications, history: value.history, feedbackIds: value.feedbackIds ?? [] };
+    }
+  }
   return { ok: true, pattern };
 }
 
@@ -236,6 +261,11 @@ export function renderPatternText(pattern: PatternBody): string {
   }
   if (pattern.links.length > 0) {
     blocks.push(`## Links\n${pattern.links.map(l => `-> ${l}`).join('\n')}`);
+  }
+  if (pattern.learning) {
+    const helpful = new Set(pattern.learning.applications.filter(a => a.verdict === 'helpful').map(a => a.goalId)).size;
+    const harmful = new Set(pattern.learning.applications.filter(a => a.verdict === 'harmful').map(a => a.goalId)).size;
+    blocks.push(`## Recorded evidence\nRevision ${pattern.learning.revision}; helpful in ${helpful} distinct goals; counterexamples in ${harmful} goals. ${helpful < 2 ? 'Candidate: recurrence is not established.' : 'Recurrence recorded; applicability still depends on context.'}`);
   }
   const rendered = blocks.join('\n\n');
   ensure(rendered.length > 0, 'a rendered pattern is never empty');

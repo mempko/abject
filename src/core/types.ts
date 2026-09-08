@@ -32,6 +32,8 @@ export interface MessageRouting {
   from: AbjectId;
   to: AbjectId;
   method?: string;
+  /** Receiver-local peer identity authenticated by the inbound transport. Never trust a wire-supplied value. */
+  authenticatedPeerId?: PeerId;
 }
 
 export interface MessageProtocol {
@@ -64,6 +66,7 @@ export type ErrorMessage = AbjectMessage<AbjectError>;
 // =============================================================================
 
 export interface MethodDeclaration {
+  resultContract?: import('./result-contract.js').ResultContract;
   name: string;
   description: string;
   parameters: ParameterDeclaration[];

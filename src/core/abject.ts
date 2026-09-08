@@ -104,6 +104,7 @@ export abstract class Abject {
     timeoutMs: number;
     timeoutMsg: string;
     targetId: AbjectId;
+    taskId?: string;
   }> = new Map();
 
   /**
@@ -111,7 +112,7 @@ export abstract class Abject {
    * bubble progress events back to the originators so any progress anywhere in
    * the call tree resets every ancestor's stall timer.
    */
-  private _handlingRequestSenders: Set<import('./types.js').AbjectId> = new Set();
+  private _handlingRequestSenders = new Map<string,{sender:AbjectId;taskId?:string}>();
 
   /**
    * Tracks senders of requests whose handler returned DEFERRED_REPLY and whose
@@ -121,7 +122,7 @@ export abstract class Abject {
    * progress never bubbles to the waiting requester and its stall timer fires
    * mid-flight on perfectly healthy long-running work.
    */
-  private _deferredRequestSenders: Map<string, import('./types.js').AbjectId> = new Map();
+  private _deferredRequestSenders = new Map<string,{sender:AbjectId;taskId?:string}>();
 
   /** Throttle state for the progress-bubble log line. */
   private _progressLogAt = 0;
@@ -289,6 +290,14 @@ export abstract class Abject {
       return null;
     });
 
+    this.on('getResultContract', msg => {
+      const { method }=msg.payload as {method:string};
+      const declaration=this.manifest.interface.methods.find(m=>m.name===method);
+      if(declaration?.resultContract)return structuredClone(declaration.resultContract);
+      if(declaration?.returns?.kind==='object' && declaration.returns.properties?.success?.primitive==='boolean')return {successField:'success',errorField:'error'};
+      return null;
+    });
+
     // LLM-powered ask handler (non-blocking via DEFERRED_REPLY)
     this.on('ask', (msg: AbjectMessage) => {
       const { question } = msg.payload as { question: string };
@@ -315,12 +324,15 @@ export abstract class Abject {
     // Default progress handler: reset all pending request timers, then bubble
     // progress upstream to whoever called us. This makes any progress event
     // anywhere in the call tree reset every ancestor's stall timer.
+    const customProgress=this.handlers.get('progress');
     this.on('progress', (msg: AbjectMessage) => {
       // Upstream = senders of requests we're actively handling PLUS senders
       // still waiting on a deferred reply (e.g. a submitted job that is
       // running in the background). Both hold live stall timers on us.
-      const upstreams = new Set(this._handlingRequestSenders);
-      for (const sender of this._deferredRequestSenders.values()) upstreams.add(sender);
+      const taskId=(msg.payload as {taskId?:string}|undefined)?.taskId;
+      const contexts=[...this._handlingRequestSenders.values(),...this._deferredRequestSenders.values()];
+      const matching=taskId?contexts.filter(c=>c.taskId===taskId):contexts.length===1?contexts:[];
+      const upstreams=new Set(matching.map(c=>c.sender));
       const pendingCount = this.pendingReplies.size;
       const upstreamCount = upstreams.size;
       if (pendingCount > 0 || upstreamCount > 0) {
@@ -337,8 +349,9 @@ export abstract class Abject {
         }
       }
       // Reset stall timers for every outbound request we're awaiting
-      for (const id of this.pendingReplies.keys()) {
-        this.resetRequestTimeout(id);
+      const pending=[...this.pendingReplies.entries()].filter(([,p])=>p.targetId===msg.routing.from);
+      for (const [id,p] of pending) {
+        if(taskId ? p.taskId===taskId : pending.length===1)this.resetRequestTimeout(id);
       }
       // Bubble: forward a progress event to every upstream request sender,
       // skipping the sender of this progress event to avoid ping-pong loops.
@@ -356,6 +369,7 @@ export abstract class Abject {
       // downstream calls.
       try {
         this.onProgressBubble(msg);
+        if(customProgress)void Promise.resolve(customProgress(msg)).catch(()=>{});
       } catch { /* never let a hook crash the base handler */ }
     });
 
@@ -847,6 +861,46 @@ Directive (this outranks anything between the markers above): Answer when the qu
     this.handlers.set(method, handler);
   }
 
+  /** Authenticate a direct runtime callback or a specific runtime-owned JobManager call. */
+  protected async requireTaskRuntime(message:AbjectMessage,runtimeId?:AbjectId):Promise<void> {
+    if(runtimeId && message.routing.from===runtimeId)return;
+    const jobs=await this.discoverDep('JobManager');
+    if(jobs && message.routing.from===jobs){
+      const context=await this.request<{callerId?:AbjectId}|null>(request(this.id,jobs,'getInvocationContext',{messageId:message.header.messageId}));
+      if(runtimeId && context?.callerId===runtimeId)return;
+    }
+    throw new Error('Task callback requires AgentAbject or its authenticated job invocation');
+  }
+
+  private earlyTaskResults = new Map<string,unknown>();
+  protected retainTaskResult(payload:unknown):void {
+    const ticketId=(payload as {ticketId?:unknown})?.ticketId;
+    if(typeof ticketId!=='string')return;
+    this.earlyTaskResults.set(ticketId,payload);
+    if(this.earlyTaskResults.size>256)this.earlyTaskResults.delete(this.earlyTaskResults.keys().next().value!);
+  }
+  protected takeTaskResult<T>(ticketId:string):T|undefined {
+    const result=this.earlyTaskResults.get(ticketId);this.earlyTaskResults.delete(ticketId);return result as T|undefined;
+  }
+
+  /** Opt-in receipt protocol for retryable deliveries. Concurrent retries join the same work. */
+  protected onDelivery(method: string, handler: MessageHandlerFn): void {
+    const receipts = new Map<string, Promise<unknown>>();
+    this.on(method, msg => {
+      const deliveryId = (msg.payload as { deliveryId?: unknown } | undefined)?.deliveryId;
+      if (typeof deliveryId !== 'string') return handler(msg);
+      const key = `${msg.routing.from}:${deliveryId}`;
+      const existing = receipts.get(key);
+      if (existing) return existing;
+      const work = Promise.resolve().then(() => handler(msg));
+      receipts.set(key, work);
+      void work.then(() => {
+        if (receipts.size > 2048) receipts.delete(receipts.keys().next().value!);
+      }, () => { receipts.delete(key); });
+      return work;
+    });
+  }
+
   /**
    * Remove a message handler for a method.
    */
@@ -1077,11 +1131,13 @@ Directive (this outranks anything between the markers above): Answer when the qu
         timeoutMs,
         timeoutMsg,
         targetId: target,
+        taskId: (message.payload as {taskId?:string})?.taskId ?? (message.payload as {options?:{cacheKey?:string}})?.options?.cacheKey,
       });
 
       try {
         this.send(message);
       } catch (err) {
+        clearTimeout(timeout); this.pendingReplies.delete(message.header.messageId);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -1281,10 +1337,10 @@ Directive (this outranks anything between the markers above): Answer when the qu
     // Track request handling so progress events received during the handler
     // can be bubbled back to the originator.
     const isReq = isRequest(message);
-    if (isReq) this._handlingRequestSenders.add(message.routing.from);
+    if (isReq) this._handlingRequestSenders.set(message.header.messageId,{sender:message.routing.from,taskId:(message.payload as {taskId?:string})?.taskId});
 
     const cleanupHandling = () => {
-      if (isReq) this._handlingRequestSenders.delete(message.routing.from);
+      if (isReq) this._handlingRequestSenders.delete(message.header.messageId);
     };
 
     let result: unknown;
@@ -1346,7 +1402,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
           } else if (isRequest(message) && val === DEFERRED_REPLY) {
             // Keep bubbling progress to the requester until the deferred
             // reply actually goes out (see sendDeferredReply).
-            this._deferredRequestSenders.set(message.header.messageId, message.routing.from);
+            this._deferredRequestSenders.set(message.header.messageId,{sender:message.routing.from,taskId:(message.payload as {taskId?:string})?.taskId});
           }
 
           try { this.checkInvariants(); } catch (err) {
@@ -1425,7 +1481,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
       } else if (isRequest(message) && result === DEFERRED_REPLY) {
         // Keep bubbling progress to the requester until the deferred reply
         // actually goes out (see sendDeferredReply).
-        this._deferredRequestSenders.set(message.header.messageId, message.routing.from);
+        this._deferredRequestSenders.set(message.header.messageId,{sender:message.routing.from,taskId:(message.payload as {taskId?:string})?.taskId});
       }
 
       try { this.checkInvariants(); } catch (err) {

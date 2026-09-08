@@ -22,6 +22,7 @@ export interface IntrospectResult {
  * Introspect methods merged into every Abject's single interface.
  */
 export const INTROSPECT_METHODS: MethodDeclaration[] = [
+  {name:'getResultContract',description:'Negotiate receiver-owned result semantics for a method. Null means no mechanical domain outcome contract.',parameters:[{name:'method',description:'Method to inspect',type:{kind:'primitive',primitive:'string'}}],returns:{kind:'object',properties:{}}},
   {
     name: 'describe',
     description: 'Describe this object\'s capabilities in natural language',
