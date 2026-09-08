@@ -145,12 +145,16 @@ export class Screenshot extends Abject {
    */
   private async captureForOwner(
     objectId: AbjectId,
-  ): Promise<{ imageBase64: string; width: number; height: number } | null> {
+  ): Promise<{ imageBase64: string; width: number; height: number; ownerId: AbjectId; windowId?: AbjectId } | null> {
     const direct = await this.request<{ imageBase64: string; width: number; height: number } | null>(
       request(this.id, this.uiServerId!, 'captureScreenshot', { objectId }),
       15000,
     );
-    if (direct?.imageBase64) return direct;
+    if (direct?.imageBase64) {
+      const manager = await this.discoverDep('WidgetManager');
+      const owner = manager ? await this.request<{ ownerId: AbjectId; windowId: AbjectId } | null>(request(this.id, manager, 'getOwnership', { objectId })).catch(() => null) : null;
+      return { ...direct, ownerId: owner?.ownerId ?? objectId, windowId: owner?.windowId };
+    }
 
     // Window surfaces are registered under the WindowAbject's id, so a
     // capture by the OWNING object's id never matches directly — and the
@@ -169,7 +173,7 @@ export class Screenshot extends Abject {
             request(this.id, this.uiServerId!, 'captureScreenshot', { objectId: w.windowId }),
             15000,
           );
-          if (shot?.imageBase64) return shot;
+          if (shot?.imageBase64) return { ...shot, ownerId: w.ownerId, windowId: w.windowId };
         }
       }
     } catch { /* fall through */ }

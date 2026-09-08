@@ -5,7 +5,8 @@
  * `system.run`. Most developer skills require command execution.
  */
 
-import { execFile, spawn as nodeSpawn } from 'child_process';
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../../core/protocol-description.js';
+import { RunningProcess } from './running-process.js';
 import os from 'node:os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
@@ -54,8 +55,8 @@ const PERMISSION_WAIT_MS = 31 * 60 * 1000;
  * fails the diagnostics are on stderr and the 40,000 lines of progress chatter
  * on stdout are what you can afford to lose.
  */
-function boundOutput(stdout: string, stderr: string, exitCode: number): ExecResult {
-  const totalBytes = Buffer.byteLength(stdout, 'utf-8') + Buffer.byteLength(stderr, 'utf-8');
+function boundOutput(stdout: string, stderr: string, exitCode: number, retained?: { outputBytes: number; truncatedStreams: string[]; droppedLines: number }): ExecResult {
+  const totalBytes = retained?.outputBytes ?? Buffer.byteLength(stdout, 'utf-8') + Buffer.byteLength(stderr, 'utf-8');
 
   const errT = truncateTail(stderr, {
     maxLines: DEFAULT_MAX_LINES,
@@ -70,12 +71,14 @@ function boundOutput(stdout: string, stderr: string, exitCode: number): ExecResu
     maxBytes: Math.max(8 * 1024, remainingBytes),
   });
 
-  if (!errT.truncated && !outT.truncated) {
+  const errTruncated = errT.truncated || retained?.truncatedStreams.includes('stderr');
+  const outTruncated = outT.truncated || retained?.truncatedStreams.includes('stdout');
+  if (!errTruncated && !outTruncated) {
     return { stdout, stderr, exitCode };
   }
 
   const stream: 'stdout' | 'stderr' | 'both' =
-    errT.truncated && outT.truncated ? 'both' : errT.truncated ? 'stderr' : 'stdout';
+    errTruncated && outTruncated ? 'both' : errTruncated ? 'stderr' : 'stdout';
 
   return {
     stdout: outT.truncated ? droppedNotice(outT) + outT.content : outT.content,
@@ -83,7 +86,7 @@ function boundOutput(stdout: string, stderr: string, exitCode: number): ExecResu
     exitCode,
     truncated: {
       stream,
-      droppedLines: (outT.totalLines - outT.outputLines) + (errT.totalLines - errT.outputLines),
+      droppedLines: (retained?.droppedLines ?? 0) + (outT.totalLines - outT.outputLines) + (errT.totalLines - errT.outputLines),
       totalBytes,
     },
   };
@@ -91,6 +94,7 @@ function boundOutput(stdout: string, stderr: string, exitCode: number): ExecResu
 const SHELL_INTERFACE: InterfaceId = 'abjects:shell';
 
 export interface ExecRequest {
+  taskId?: string;
   command: string;
   args?: string[];
   cwd?: string;
@@ -254,6 +258,10 @@ export class ShellExecutor extends Abject {
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "start", description: "Start an approved command and return a RunningProcess Abject. Ask it how to read output, send input, wait, or stop.", parameters: { "command": protocolText, "cwd?": protocolText, "taskId?": protocolText, "timeout?": protocolNumber } },
+      { name: "stopTaskProcesses", description: "Stop only the calling object\u2019s processes belonging to taskId.", parameters: { "taskId": protocolText } },
+    ]);
     this.on('getPlatformInfo', async () => {
       return platformInfo;
     });
@@ -338,6 +346,21 @@ export class ShellExecutor extends Abject {
       return { success: true };
     });
 
+    this.on('start', async (msg: AbjectMessage) => {
+      const child = await this.startProcess(msg.payload as ExecRequest, msg.routing.from);
+      return { processId: child.id };
+    });
+    this.on('stopTaskProcesses', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string };
+      let stopped = 0;
+      for (const [id, spec] of this.running) {
+        if (spec.owner === msg.routing.from && spec.taskId === taskId) {
+          await this.request(request(this.id, id, 'stop', {})); stopped++;
+        }
+      }
+      return { stopped };
+    });
+
     this.on('exec', (msg: AbjectMessage) => {
       const req = msg.payload as ExecRequest;
       this.executeCommand(req, msg.routing.from).then(
@@ -355,7 +378,19 @@ export class ShellExecutor extends Abject {
     });
   }
 
+  private running = new Map<AbjectId, { owner: AbjectId; taskId?: string; child: RunningProcess }>();
+  protected override async onStop(): Promise<void> {
+    await Promise.allSettled([...this.running.values()].map(p=>p.child.stop()));
+    this.running.clear();
+  }
+
   private async executeCommand(req: ExecRequest, callerId?: AbjectId): Promise<ExecResult> {
+    const child = await this.startProcess(req, callerId ?? this.id);
+    const result = await this.request<{ stdout: string; stderr: string; exitCode: number; outputBytes: number; truncatedStreams: string[]; droppedLines: number }>(request(this.id, child.id, 'wait', {}), (req.timeout ?? this.defaultTimeout) + 30000);
+    return { ...boundOutput(result.stdout, result.stderr, result.exitCode, result), outputObjectId: child.id } as ExecResult;
+  }
+
+  private async startProcess(req: ExecRequest, callerId: AbjectId): Promise<RunningProcess> {
     if (this.shellDisabled) throw new Error('Shell execution is disabled. Enable it in Settings > Permissions.');
     contractRequire(typeof req.command === 'string' && req.command.length > 0, 'command must be a non-empty string');
     log.info(`exec: ${req.command.slice(0, 120)}${req.command.length > 120 ? '...' : ''} (shell=${!!req.shell}, cwd=${req.cwd ?? 'default'})`);
@@ -372,7 +407,7 @@ export class ShellExecutor extends Abject {
       await this.validateSkillCommand(req.skillName, fullCommand);
     } else {
       ({ restrictEnv } = await this.validateCommand(
-        fullCommand, { callerId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true }));
+        fullCommand, { callerId, taskId: req.taskId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true }));
     }
 
     // Validate working directory (may prompt user). A default set earlier by
@@ -394,52 +429,20 @@ export class ShellExecutor extends Abject {
       : process.env;
     const env = { ...baseEnv, ...this.skillEnv, ...req.env };
 
-    return new Promise<ExecResult>((resolve, reject) => {
-      if (req.shell) {
-        // Shell mode: combine command + args into a single string
-        const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
-        const child = nodeSpawn(fullCommand, {
-          shell: true,
-          cwd,
-          env,
-          timeout,
-        });
-
-        let stdout = '';
-        let stderr = '';
-
-        child.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
-        child.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
-
-        child.on('error', (err) => reject(err));
-        child.on('close', (code) => {
-          resolve(boundOutput(stdout, stderr, code ?? 1));
-        });
-      } else {
-        // No shell: safer, uses execFile
-        execFile(command, args, {
-          cwd,
-          env,
-          timeout,
-          maxBuffer: 10 * 1024 * 1024, // 10MB
-        }, (err, stdout, stderr) => {
-          if (err && 'code' in err && typeof err.code === 'number') {
-            // Process exited with non-zero code -- not an error, just a non-zero exit
-            resolve(boundOutput(stdout ?? '', stderr ?? '', err.code));
-          } else if (err) {
-            // Some other error (e.g. command not found, timeout)
-            reject(err);
-          } else {
-            resolve(boundOutput(stdout ?? '', stderr ?? '', 0));
-          }
-        });
-      }
-    });
+    const child = new RunningProcess({ command, args, shell: req.shell, cwd, env, timeout, owner: callerId, supervisor: this.id, taskId: req.taskId });
+    await child.init(this.bus, this.id);
+    this.running.set(child.id, { owner: callerId, taskId: req.taskId, child });
+    // Output remains inspectable after completion; retire it after an hour.
+    void this.request(request(this.id, child.id, 'wait', {}), timeout + 30000).finally(() => {
+      const retention = setTimeout(() => { this.running.delete(child.id); void child.stop(); }, 3600000);
+      retention.unref?.();
+    }).catch(() => {});
+    return child;
   }
 
   private async validateCommand(
     fullCommand: string,
-    opts: { callerId?: AbjectId; usesShell: boolean; cwd?: string; untrusted?: boolean },
+    opts: { callerId?: AbjectId; taskId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean },
   ): Promise<{ restrictEnv: boolean }> {
     const trimmed = fullCommand.trim();
 
@@ -494,6 +497,7 @@ export class ShellExecutor extends Abject {
           objectName: callerName,
           commandName: analysis.principalProgram,
           callerId: opts.callerId,
+          taskId: opts.taskId,
           cwd: opts.cwd,
           usesShell: opts.usesShell,
           // Granting a program is only meaningful when the line reduces to a

@@ -6,8 +6,10 @@
  * the actual host filesystem.
  */
 
-import * as fs from 'fs/promises';
-import * as fsSync from 'fs';
+import { describeMessages, protocolText, protocolNumber, protocolObject } from '../../core/protocol-description.js';
+import { createHash } from 'node:crypto';
+import * as nodeFs from 'node:fs';
+import { createRequire } from 'node:module';
 import * as path from 'path';
 import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
@@ -26,6 +28,15 @@ import { Log } from '../../core/timed-log.js';
 import { isInsideAny } from '../../core/path-scope.js';
 
 const log = new Log('HostFileSystem');
+
+// This capability accesses host files, including packaged build artifacts.
+// Electron's patched fs treats .asar paths as virtual directories; original-fs
+// keeps reads, stats and path checks on the same physical filesystem. Do not
+// toggle process.noAsar, which would also change unrelated application reads.
+const fsSync: typeof nodeFs = process.versions.electron
+  ? createRequire(import.meta.url)('original-fs')
+  : nodeFs;
+const fs = fsSync.promises;
 
 const HOSTFS_INTERFACE: InterfaceId = 'abjects:hostfs';
 
@@ -73,6 +84,16 @@ export class HostFileSystem extends Abject {
                 content: { kind: 'primitive', primitive: 'string' },
                 lines: { kind: 'primitive', primitive: 'number' },
               }},
+            },
+            {
+              name: 'conditionalWrite',
+              description: 'Replace only if current contents equal expectedContent; null requires a missing file. Conflicts do not modify the file.',
+              parameters: [
+                { name: 'path', type: { kind: 'primitive', primitive: 'string' }, description: 'File path' },
+                { name: 'expectedContent', type: { kind: 'union', variants: [{ kind: 'primitive', primitive: 'string' }, { kind: 'primitive', primitive: 'null' }] }, description: 'Expected contents, or null for a new file' },
+                { name: 'content', type: { kind: 'primitive', primitive: 'string' }, description: 'Replacement text' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
               name: 'writeFile',
@@ -240,6 +261,9 @@ export class HostFileSystem extends Abject {
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: "snapshotTree", description: "Compute a content revision of project files and symlink targets, excluding .git. Incomplete coverage is explicit.", parameters: { "root": protocolText, "maxFiles?": protocolNumber } },
+    ]);
     this.on('readFile', (msg: AbjectMessage) => {
       const { path: filePath, offset, limit, maxBytes } =
         msg.payload as { path: string; offset?: number; limit?: number; maxBytes?: number };
@@ -248,6 +272,50 @@ export class HostFileSystem extends Abject {
         (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
       );
       return DEFERRED_REPLY;
+    });
+
+    this.on('snapshotTree', async (msg: AbjectMessage) => {
+      const { root, maxFiles = 50000 } = msg.payload as { root: string; maxFiles?: number };
+      const base = await this.validateAndResolve(root);
+      const files: Record<string, string> = {};
+      let complete = true, count = 0;
+      const walk = async (dir: string): Promise<void> => {
+        for (const item of (await fs.readdir(dir, { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name))) {
+          if (item.name === '.git') continue; // version-control internals, not project contents
+          if (count >= maxFiles) { complete = false; return; }
+          const abs = path.join(dir, item.name), rel = path.relative(base, abs);
+          if (item.isSymbolicLink()) { count++; files[rel] = `symlink:${await fs.readlink(abs)}`; continue; }
+          if (item.isDirectory()) { await walk(abs); continue; }
+          if (!item.isFile()) continue;
+          count++;
+          const before = await fs.stat(abs);
+          const hash = createHash('sha256');
+          for await (const chunk of fsSync.createReadStream(abs)) hash.update(chunk);
+          const after = await fs.stat(abs);
+          if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) complete = false;
+          files[rel] = hash.digest('hex');
+        }
+      };
+      await walk(base);
+      const revision = createHash('sha256').update(JSON.stringify(files)).digest('hex');
+      return { revision, files, complete, root: base, excludes: ['.git'] };
+    });
+
+    this.on('conditionalWrite', async (msg: AbjectMessage) => {
+      const { path: filePath, expectedContent, content } = msg.payload as { path: string; expectedContent: string | null; content: string };
+      contractRequire(expectedContent === null || typeof expectedContent === 'string', 'expectedContent must be text or null for a new file');
+      contractRequire(typeof content === 'string', 'content must be text');
+      this.requireWrite();
+      const resolved = await this.validateAndResolve(filePath);
+      return withFileMutationQueue(resolved, async () => {
+        let current: string | null;
+        try { current = await fs.readFile(resolved, 'utf-8'); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; current = null; }
+        if (current !== expectedContent) return { success: false, conflict: true, error: 'File changed since the expected revision' };
+        await fs.mkdir(path.dirname(resolved), { recursive: true });
+        await this.atomicWrite(resolved, content);
+        return { success: true, path: resolved };
+      });
     });
 
     this.on('writeFile', (msg: AbjectMessage) => {

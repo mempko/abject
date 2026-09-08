@@ -97,7 +97,44 @@ export type Rule =
   | { kind: 'program'; caller: string; program: string; scope: RuleScope; allow: boolean }
   | { kind: 'exact'; caller: string; command: string; allow: boolean };
 
+const EFFECT_CLASSES: EffectClass[] = ['read', 'write', 'exec', 'network', 'dangerous'];
+
+/** Validate untrusted rule-editor input before it reaches persisted policy. */
+function parseRule(value: unknown): Rule | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const input = value as Record<string, unknown>;
+  const caller = typeof input.caller === 'string' ? input.caller.trim() : '';
+  if (!caller || typeof input.allow !== 'boolean') return undefined;
+
+  if (input.kind === 'exact') {
+    const command = typeof input.command === 'string' ? input.command.trim() : '';
+    return command ? { kind: 'exact', caller, command, allow: input.allow } : undefined;
+  }
+
+  const rawScope = input.scope;
+  if (!rawScope || typeof rawScope !== 'object') return undefined;
+  const scopeInput = rawScope as Record<string, unknown>;
+  let scope: RuleScope;
+  if (scopeInput.kind === 'anywhere') scope = { kind: 'anywhere' };
+  else if (scopeInput.kind === 'project' && typeof scopeInput.name === 'string' && scopeInput.name.trim()) {
+    scope = { kind: 'project', name: scopeInput.name.trim() };
+  } else if (scopeInput.kind === 'path' && typeof scopeInput.root === 'string' && path.isAbsolute(scopeInput.root)) {
+    scope = { kind: 'path', root: path.resolve(scopeInput.root) };
+  } else return undefined;
+
+  if (input.kind === 'program') {
+    const program = typeof input.program === 'string' ? input.program.trim() : '';
+    return program ? { kind: 'program', caller, program, scope, allow: input.allow } : undefined;
+  }
+  if (input.kind === 'class' && EFFECT_CLASSES.includes(input.effect as EffectClass)) {
+    return { kind: 'class', caller, effect: input.effect as EffectClass, scope, allow: input.allow };
+  }
+  return undefined;
+}
+
 interface SessionGrant {
+  taskId?: string;
+  callerId?: AbjectId;
   caller: string;
   effect: EffectClass;
   /** Territories this grant covers. `null` means unbounded. */
@@ -226,8 +263,25 @@ export class PermissionBroker extends Abject {
               returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
             },
             {
+              name: 'addRule',
+              description: 'Propose a standing permission rule; requires user approval through the broker dialog',
+              parameters: [
+                { name: 'rule', type: { kind: 'object', properties: {} }, description: 'Class, program, or exact rule' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'updateRule',
+              description: 'Propose replacing a standing rule; requires user approval through the broker dialog',
+              parameters: [
+                { name: 'index', type: { kind: 'primitive', primitive: 'number' }, description: 'Index from listRules' },
+                { name: 'rule', type: { kind: 'object', properties: {} }, description: 'Replacement rule' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
               name: 'removeRule',
-              description: 'Drop a standing rule by its index in listRules',
+              description: 'Propose removing a standing rule by index; requires user approval through the broker dialog',
               parameters: [
                 { name: 'index', type: { kind: 'primitive', primitive: 'number' }, description: 'Index from listRules' },
               ],
@@ -369,11 +423,38 @@ export class PermissionBroker extends Abject {
 
     this.on('listRules', async () => this.rules.map((r, index) => ({ index, ...r })));
 
+    this.on('addRule', async (msg: AbjectMessage) => {
+      const rule = parseRule((msg.payload as { rule?: unknown }).rule);
+      if (!rule) return { success: false, error: 'Invalid permission rule' };
+      if (!await this.authorizeRuleChange('Add', rule)) return { success: false, error: 'Permission rule change denied' };
+      await this.addRule(rule);
+      return { success: true };
+    });
+
+    this.on('updateRule', async (msg: AbjectMessage) => {
+      const { index, rule: input } = msg.payload as { index: number; rule?: unknown };
+      if (!Number.isInteger(index) || index < 0 || index >= this.rules.length) {
+        return { success: false, error: 'No such rule' };
+      }
+      const rule = parseRule(input);
+      if (!rule) return { success: false, error: 'Invalid permission rule' };
+      const previous = this.rules[index];
+      if (!await this.authorizeRuleChange('Replace', rule, previous)) return { success: false, error: 'Permission rule change denied' };
+      if (this.rules[index] !== previous) return { success: false, error: 'Rule changed while awaiting approval; refresh and retry' };
+      this.rules[index] = rule;
+      await this.persistRules();
+      this.changed('rulesChanged', { rules: this.rules.length });
+      return { success: true };
+    });
+
     this.on('removeRule', async (msg: AbjectMessage) => {
       const { index } = msg.payload as { index: number };
       if (!Number.isInteger(index) || index < 0 || index >= this.rules.length) {
         return { success: false, error: 'No such rule' };
       }
+      const previous = this.rules[index];
+      if (!await this.authorizeRuleChange('Remove', previous)) return { success: false, error: 'Permission rule change denied' };
+      if (this.rules[index] !== previous) return { success: false, error: 'Rule changed while awaiting approval; refresh and retry' };
       this.rules.splice(index, 1);
       await this.persistRules();
       this.changed('rulesChanged', { rules: this.rules.length });
@@ -389,9 +470,8 @@ export class PermissionBroker extends Abject {
     this.on('clearSessionGrants', async (msg: AbjectMessage) => {
       const caller = await this.resolveCallerName(msg.routing.from);
       const before = this.sessionGrants.length;
-      this.sessionGrants = caller
-        ? this.sessionGrants.filter(g => g.caller !== caller)
-        : [];
+      const { taskId } = (msg.payload ?? {}) as { taskId?: string };
+      this.sessionGrants = this.sessionGrants.filter(g => !(g.callerId === msg.routing.from && g.taskId === taskId));
       this.autoCount.delete(caller ?? '');
       return { cleared: before - this.sessionGrants.length };
     });
@@ -473,7 +553,7 @@ export class PermissionBroker extends Abject {
 
     // 2. A standing allow rule, or a grant made for this task.
     const allowed = this.matchingRule(analysis, command, ctx.name, project, true)
-      ?? this.matchingSessionGrant(analysis, ctx.name);
+      ?? this.matchingSessionGrant(analysis, ctx.name, req.taskId, req.callerId);
     if (allowed) {
       this.record(req, ctx, 'accept_once', false,
         'kind' in allowed ? `rule: ${describeRule(allowed)}` : `granted for this task: ${allowed.label}`,
@@ -746,12 +826,14 @@ export class PermissionBroker extends Abject {
   private matchingSessionGrant(
     analysis: CommandAnalysis,
     caller: string,
+    taskId?: string,
+    callerId?: AbjectId,
   ): SessionGrant | undefined {
     const now = Date.now();
     this.sessionGrants = this.sessionGrants.filter(g => g.expiresAt > now);
     if (analysis.opaque || analysis.effect === 'dangerous') return undefined;
     return this.sessionGrants.find(g =>
-      g.caller === caller
+      g.caller === caller && !!taskId && g.taskId === taskId && g.callerId === callerId
       && effectRank(analysis.effect) <= effectRank(g.effect)
       && (g.roots === null
         || (g.roots.length > 0 && checkContainment(analysis, g.roots).contained)));
@@ -931,9 +1013,9 @@ export class PermissionBroker extends Abject {
     // Everything scoped to the project answers only for a command that stays
     // inside it, so these appear only when the line does.
     if (project && canGrantBroadly && escapes.length === 0) {
-      const options: PromptOption[] = [
+      const options: PromptOption[] = req.taskId && req.callerId ? [
         { id: 'accept_session', label: 'Allow for this task', tone: 'good' },
-      ];
+      ] : [];
       if (analysis.effect === 'read') {
         options.push({ id: 'accept_class', label: `Allow read-only commands in ${project.name}`, tone: 'good' });
       } else if (analysis.effect === 'write') {
@@ -952,7 +1034,7 @@ export class PermissionBroker extends Abject {
       const options: PromptOption[] = [
         { id: 'accept_path', label: `Allow ${grantName} under ${displayPath(escapeRoot)}`, tone: 'good' },
       ];
-      if (project) options.push({ id: 'accept_session', label: 'Allow for this task', tone: 'good' });
+      if (project && req.taskId && req.callerId) options.push({ id: 'accept_session', label: 'Allow for this task', tone: 'good' });
       groups.push({
         label: project ? `Outside ${project.name}` : `Under ${displayPath(escapeRoot)}`,
         options,
@@ -992,9 +1074,10 @@ export class PermissionBroker extends Abject {
 
     switch (decision) {
       case 'accept_session':
-        if (analysis && project) {
+        if (analysis && project && req.taskId && req.callerId) {
           this.sessionGrants.push({
             caller: ctx.name,
+            taskId: req.taskId, callerId: req.callerId,
             effect: analysis.effect,
             // A task grant that did not cover the path which raised the prompt
             // would be answered by the same prompt a second later.
@@ -1170,6 +1253,27 @@ export class PermissionBroker extends Abject {
     return this.projectFor(ctx, name);
   }
 
+  /** A bus caller can propose a rule, but only the permission dialog can approve it. */
+  private async authorizeRuleChange(operation: 'Add' | 'Replace' | 'Remove', rule: Rule, previous?: Rule): Promise<boolean> {
+    await this.enterPromptQueue();
+    try {
+      const settingsId = await this.settings();
+      if (!settingsId) return false;
+      const reply = await this.request<{ decision: string }>(request(this.id, settingsId, 'showPermissionPrompt', {
+        type: 'permission_rule', title: `${operation} permission rule?`,
+        description: `This changes standing permissions for ${rule.caller === '*' ? 'all callers' : rule.caller}.`,
+        resource: describeRule(rule),
+        detail: previous ? [`Replaces: ${describeRule(previous)}`] : [],
+        groups: [{ label: 'Standing permission', options: [
+          { id: 'approve_rule_change', label: `${operation} rule`, tone: 'bad' },
+          { id: 'deny', label: 'Cancel', tone: 'default' },
+        ] }],
+      }), PROMPT_WAIT_MS);
+      return reply?.decision === 'approve_rule_change';
+    } catch { return false; }
+    finally { this.leavePromptQueue(); }
+  }
+
   private async settings(): Promise<AbjectId | undefined> {
     this.settingsId = await this.resolveDep('GlobalSettings', this.settingsId) ?? undefined;
     return this.settingsId;
@@ -1234,6 +1338,7 @@ interface Outcome {
 }
 
 interface PermissionRequest {
+  taskId?: string;
   type: 'shell' | 'directory' | 'domain' | 'skill_shell';
   resource: string;
   description?: string;
@@ -1326,7 +1431,7 @@ function commonAncestor(a: string, b: string): string | undefined {
 
 function describeRule(r: Rule): string {
   const scope = (s: RuleScope) => s.kind === 'anywhere' ? 'anywhere' : s.kind === 'project' ? `in ${s.name}` : `under ${s.root}`;
-  if (r.kind === 'class') return `${r.caller} may run ${r.effect} commands ${scope(r.scope)}`;
+  if (r.kind === 'class') return `${r.caller} ${r.allow ? 'may run' : 'is blocked from'} ${r.effect} commands ${scope(r.scope)}`;
   if (r.kind === 'program') return `${r.caller} ${r.allow ? 'may run' : 'is blocked from'} ${r.program} ${scope(r.scope)}`;
   // A standing path or domain decision is stored as `type:resource`; read it
   // back in those terms rather than as a command line.

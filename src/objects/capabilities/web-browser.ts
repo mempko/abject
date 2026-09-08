@@ -112,6 +112,7 @@ type PlaywrightLocator = {
 };
 
 interface TrackedPage {
+  generation: number;
   page: PlaywrightPage;
   owner: AbjectId;
   createdAt: number;
@@ -1236,15 +1237,18 @@ export class WebBrowser extends Abject {
     // -- getAriaSnapshot --
     this.deferredPageHandler('getAriaSnapshot', async (tracked) => {
       const t0 = Date.now();
+      const generation = tracked.generation;
       const url = tracked.page.url();
       const title = await this.safeTitle(tracked.page, url);
       const result = await tracked.page._snapshotForAI({ track: 'response' });
+      if (generation !== tracked.generation) throw new Error('Page navigated while observing; request a fresh snapshot');
       log.info(`getAriaSnapshot (url=${url}) [${Date.now() - t0}ms]`);
-      return { snapshot: result.full, url, title };
+      return { snapshot: result.full, url, title, generation: tracked.generation };
     });
 
     // -- refAction --
     this.deferredPageHandler('refAction', async (tracked, payload) => {
+      if (payload.expectedGeneration !== undefined && payload.expectedGeneration !== tracked.generation) throw new Error('Page navigated since observation; get a fresh snapshot before acting');
       const ref = payload.ref as string;
       const action = payload.action as string;
       const value = payload.value as string | undefined;
@@ -1495,6 +1499,7 @@ export class WebBrowser extends Abject {
     const pageId = this.generatePageId();
 
     const tracked: TrackedPage = {
+      generation: 0,
       page,
       owner,
       createdAt: Date.now(),
@@ -1503,6 +1508,7 @@ export class WebBrowser extends Abject {
     };
 
     this.pages.set(pageId, tracked);
+    page.on('framenavigated', () => { tracked.generation++; });
     if (profileKey) {
       const ctx = this.profileContexts.get(profileKey);
       if (ctx) ctx.openPages++;
