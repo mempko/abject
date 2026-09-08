@@ -10,7 +10,7 @@ Abstract interface and shared utilities.
 
 - **`LLMProvider`** interface: `name`, `isAvailable()`, `complete(messages, options)`, `stream?(messages, options)`
 - **`LLMMessage`**: `{ role: 'system' | 'user' | 'assistant', content: string }`
-- **`LLMCompletionOptions`**: `temperature`, `maxTokens`, `stopSequences`, `stream`
+- **`LLMCompletionOptions`**: `maxTokens`, `stopSequences`, `stream`. Sampling uses provider defaults; temperature overrides are not sent.
 - **`LLMCompletionResult`**: `content`, `finishReason` (`'stop'` | `'length'` | `'error'`), `usage`
 - **`BaseLLMProvider`**: abstract base with shared `fetch()` and `buildHeaders()`
 - **`LLMProviderRegistry`**: `register()`, `get()`, `getDefault()`, `findAvailable()`

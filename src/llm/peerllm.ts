@@ -83,8 +83,7 @@ export class PeerLLMProvider extends OpenAIProvider {
     if (maxTokens !== undefined) request.max_tokens = maxTokens;
     request.stream = stream;
 
-    // PeerLLM documents only model, messages, stream, temperature, and
-    // max_tokens for chat completions.
+    // Send the supported chat fields: model, messages, stream and max_tokens.
     delete request.stop;
     delete request.prompt_cache_key;
     delete request.reasoning_effort;

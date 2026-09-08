@@ -42,7 +42,6 @@ export type ModelTier = 'smart' | 'balanced' | 'fast' | 'code';
 export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface LLMCompletionOptions {
-  temperature?: number;
   maxTokens?: number;
   stopSequences?: string[];
   stream?: boolean;
@@ -394,6 +393,8 @@ export function cliIsRetryable(err: unknown): boolean {
  * Abstract LLM provider interface.
  */
 export interface LLMProvider {
+  /** Native decoding formats this adapter actually implements; omission means text only. */
+  outputFormats?(model?: string): Array<'text' | 'json_object'>;
   /**
    * Provider name for identification.
    */

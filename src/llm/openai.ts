@@ -63,7 +63,6 @@ export interface OpenAIRequest {
   model: string;
   messages: OpenAIMessage[];
   max_completion_tokens?: number;
-  temperature?: number;
   stop?: string[];
   stream?: boolean;
   /**
@@ -296,15 +295,11 @@ export class OpenAIProvider extends BaseLLMProvider {
     const request: OpenAIRequest = {
       model,
       messages: this.mapMessages(messages, model),
-      temperature: options.temperature,
       stop: options.stopSequences,
     };
     if (stream) request.stream = true;
     if (options.cacheKey) request.prompt_cache_key = options.cacheKey;
     const { reasoningActive } = this.applyReasoning(request, model, options);
-    // Reasoning models accept only their default sampling; sending a
-    // temperature is a 400 on OpenAI and silently ignored elsewhere.
-    if (reasoningActive) delete request.temperature;
     request.max_completion_tokens = this.resolveMaxTokens(model, options, reasoningActive);
     this.applyRequestExtras(request, model, options, stream);
     return { request, reasoningActive };

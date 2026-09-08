@@ -79,7 +79,7 @@ test('PeerLLM sends compatible chat completions and translates max tokens', asyn
 
   const completion = await provider.complete(
     [{ role: 'user', content: 'hello' }],
-    { maxTokens: 256, temperature: 0.4 },
+    { maxTokens: 256 },
   );
   assert.equal(completion.content, 'peer response');
   assert.equal(capturedUrl, 'https://api.peerllm.com/v1/chat/completions');
@@ -89,11 +89,10 @@ test('PeerLLM sends compatible chat completions and translates max tokens', asyn
   const body = JSON.parse(request.body ?? '{}') as Record<string, unknown>;
   assert.equal(body.model, 'LLooMA1.0');
   assert.equal(body.stream, false);
-  assert.equal(body.temperature, 0.4);
   assert.equal(body.max_tokens, 256);
   for (const unsupported of [
     'max_completion_tokens', 'stop', 'prompt_cache_key', 'reasoning_effort',
-    'verbosity', 'usage', 'provider',
+    'verbosity', 'usage', 'provider', 'temperature',
   ]) {
     assert.equal(unsupported in body, false, `${unsupported} must not be sent to PeerLLM`);
   }

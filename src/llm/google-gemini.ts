@@ -48,7 +48,6 @@ interface GeminiRequest {
   systemInstruction?: { parts: Array<{ text: string }> };
   contents: GeminiContent[];
   generationConfig?: {
-    temperature?: number;
     maxOutputTokens?: number;
     stopSequences?: string[];
     thinkingConfig?: { thinkingLevel?: string };
@@ -394,7 +393,6 @@ export class GeminiProvider extends BaseLLMProvider {
     }
 
     const gc: GeminiRequest['generationConfig'] = {};
-    if (options.temperature !== undefined) gc.temperature = options.temperature;
     if (options.stopSequences) gc.stopSequences = options.stopSequences;
     const tier = options.tier;
     // Effort maps onto Gemini's thinkingLevel; an explicit effort wins over

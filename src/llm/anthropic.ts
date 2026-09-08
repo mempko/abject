@@ -68,7 +68,6 @@ interface AnthropicRequest {
   max_tokens: number;
   messages: AnthropicMessage[];
   system?: string | AnthropicSystemBlock[];
-  temperature?: number;
   stop_sequences?: string[];
   stream?: boolean;
   thinking?: AnthropicThinking;
@@ -296,13 +295,10 @@ export class AnthropicProvider extends BaseLLMProvider {
       model,
       max_tokens: cfg.maxTokens,
       messages: anthropicMessages,
-      temperature: options.temperature,
       stop_sequences: options.stopSequences,
     };
     if (stream) request.stream = true;
-    // Extended thinking only accepts the default temperature; a caller's
-    // low-temperature preference for planning is dropped rather than 400'd.
-    if (cfg.thinking) { request.thinking = cfg.thinking; delete request.temperature; }
+    if (cfg.thinking) request.thinking = cfg.thinking;
     if (cfg.effort) request.output_config = { effort: cfg.effort };
 
     const systemBlocks = this.buildSystem(systemMsgs);

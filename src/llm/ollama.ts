@@ -43,7 +43,6 @@ interface OllamaRequest {
   /** Constrained decoding: 'json' makes the model emit one JSON object. */
   format?: 'json';
   options?: {
-    temperature?: number;
     num_predict?: number;
     stop?: string[];
   };
@@ -67,6 +66,7 @@ interface OllamaResponse {
  * Ollama local LLM provider.
  */
 export class OllamaProvider extends BaseLLMProvider {
+  outputFormats(): Array<'text' | 'json_object'> { return ['text','json_object']; }
   readonly name = 'ollama';
   private model: string | undefined;
   private tierModels: Partial<Record<ModelTier, string>> = {};
@@ -127,7 +127,6 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       ...(options.jsonMode ? { format: 'json' as const } : {}),
       options: {
-        temperature: options.temperature,
         // Reasoning-capable local models emit long <think> traces that share
         // num_predict with the answer; floor a specified cap so it can't be
         // starved, and leave it unset (Ollama's unbounded default) otherwise.
@@ -208,7 +207,6 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       ...(options.jsonMode ? { format: 'json' as const } : {}),
       options: {
-        temperature: options.temperature,
         // Reasoning-capable local models emit long <think> traces that share
         // num_predict with the answer; floor a specified cap so it can't be
         // starved, and leave it unset (Ollama's unbounded default) otherwise.

@@ -1,7 +1,9 @@
+import { describeMessages, protocolText } from '../core/protocol-description.js';
 /**
  * LLM Service object - provides LLM capabilities to other objects.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
@@ -180,6 +182,8 @@ export interface LLMUsage {
  * would read as "the model said nothing".
  */
 export interface LLMLedgerEntry {
+  taskId?: string;
+  goalId?: string;
   id: string;
   callerId: AbjectId;
   /**
@@ -927,8 +931,78 @@ export class LLMObject extends Abject {
     );
   }
 
+  private usageContext = new AsyncLocalStorage<{ callerId: AbjectId; goalId?: string; taskId?: string }>();
+  private onMetered(method: string, handler: (m: AbjectMessage) => Promise<unknown>): void {
+    this.on(method, m => { const p=m.payload as {goalId?:string;taskId?:string;options?:{cacheKey?:string}}; return this.usageContext.run({callerId:m.routing.from,goalId:p.goalId,taskId:p.taskId??p.options?.cacheKey}, () => handler(m)); });
+  }
+
+  private async usageManagerFor(callerId: AbjectId): Promise<AbjectId | null> {
+    // LLM is global; GoalManager belongs to the requesting workspace. Resolve
+    // ownership through WorkspaceManager, never through a payload's claimed
+    // caller/onBehalfOf identity or a globally cached first GoalManager.
+    const workspaceManager = await this.discoverDep('WorkspaceManager');
+    if (workspaceManager) {
+      const workspaces = await this.request<Array<{ registryId: AbjectId; childIds: AbjectId[] }>>(
+        msg.request(this.id, workspaceManager, 'listWorkspacesDetailed', {}),
+      );
+      const owner = workspaces.find(workspace => workspace.childIds.includes(callerId));
+      if (owner) {
+        const managers = await this.request<Array<{ id: AbjectId }>>(
+          msg.request(this.id, owner.registryId, 'discover', { name: 'GoalManager' }),
+        );
+        return managers[0]?.id ?? null;
+      }
+    }
+    // Standalone deployments may keep caller, LLM and goals in one registry.
+    return this.discoverDep('GoalManager');
+  }
+  private async reserveModelUsage(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): Promise<(() => Promise<void>) & { usage?: LLMCompletionResult['usage']; failure?: string }> {
+    const scope = this.usageContext.getStore();
+    const finish: (() => Promise<void>) & { usage?: LLMCompletionResult['usage']; failure?: string } = async () => {};
+    if (!scope?.goalId) return finish;
+    const manager = await this.usageManagerFor(scope.callerId);
+    if (!manager) throw new Error('GoalManager unavailable in the requesting workspace for resource accounting');
+    const operationId = `llm-${crypto.randomUUID()}`;
+    const tokens = Math.ceil(Buffer.byteLength(JSON.stringify(messages))) + (options?.maxTokens ?? 32768);
+    const estimate = estimateCostUsd(provider.name, this.modelFor(provider, options), { inputTokens: tokens, outputTokens: options?.maxTokens ?? 32768 });
+    const receipt = await this.request<{ accepted: boolean; reason?: string }>(msg.request(this.id, manager, 'reserveUsage', { ...scope, operationId, tokens, costUsd: estimate }));
+    if (!receipt.accepted) throw new Error(receipt.reason ?? 'Goal budget unavailable');
+    const settle: typeof finish = async () => {
+      const usage = settle.usage;
+      await this.request(msg.request(this.id, manager, 'settleUsage', { ...scope, operationId,
+        tokens: usage ? usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) : undefined,
+        costUsd: usage?.costUsd ?? (usage ? estimateCostUsd(provider.name, this.modelFor(provider, options), usage) : undefined), error: settle.failure }));
+    };
+    return settle;
+  }
+  private async meteredComplete(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
+    const settle = await this.reserveModelUsage(provider, messages, options);
+    try { const result = await provider.complete(messages, options); settle.usage = result.usage; return result; }
+    catch (err) { settle.failure = String(err); throw err; }
+    finally { await settle(); }
+  }
+  private async *meteredStream(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk> {
+    const settle = await this.reserveModelUsage(provider, messages, options);
+    try { for await (const chunk of provider.stream!(messages, options)) { if (chunk.usage) settle.usage = chunk.usage; yield chunk; } }
+    catch (err) { settle.failure = String(err); throw err; }
+    finally { await settle(); }
+  }
+
   private setupHandlers(): void {
-    this.on('complete', async (m: AbjectMessage) => {
+    this.on('getTaskUsage', msg=>{
+      const {taskId,sessionId}=msg.payload as {taskId:string;sessionId?:string};
+      const rows=this._ledger.filter(r=>r.taskId===taskId || (sessionId && (r.taskId===sessionId || r.taskId?.startsWith(`${sessionId}:attempt-`))));
+      return {tokens:rows.reduce((n,r)=>n+(r.usage?.inputTokens??0)+(r.usage?.outputTokens??0),0),cost:rows.reduce((n,r)=>n+(r.costUsd??0),0),
+        elapsedMs:rows.reduce((n,r)=>n+r.elapsedMs,0),unpricedCalls:rows.filter(r=>r.costUsd===undefined).length,unreportedCalls:rows.filter(r=>!r.usage).length};
+    });
+    describeMessages(this.manifest, [{name:'negotiateOutput',description:'Negotiate native JSON or text decoding with the selected provider/tier/model. Always validate the reply.',parameters:{tier:protocolText}}]);
+    this.on('negotiateOutput', m => {
+      const {provider: providerName, tier, model} = m.payload as {provider?:string;tier?:ModelTier;model?:string};
+      const route=this.resolveProviderAndModel(providerName,tier);
+      const formats=route.provider.outputFormats?.(model ?? route.modelOverride) ?? ['text'];
+      return {provider:route.provider.name,model:model ?? route.modelOverride,formats,selected:formats.includes('json_object')?'json_object':'text',validation:'Caller must still validate the action and completion schema'};
+    });
+    this.onMetered('complete', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider, onBehalfOf } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
@@ -949,7 +1023,7 @@ export class LLMObject extends Abject {
       return this.analyze(content, task, m.routing.from, m.header.messageId);
     });
 
-    this.on('compress', async (m: AbjectMessage) => {
+    this.onMetered('compress', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, onBehalfOf } = m.payload as {
         messages: LLMMessage[];
@@ -959,7 +1033,7 @@ export class LLMObject extends Abject {
       return this.compressMessages(messages, options ?? {}, m.routing.from, m.header.messageId, onBehalfOf);
     });
 
-    this.on('stream', async (m: AbjectMessage) => {
+    this.onMetered('stream', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider: providerName, onBehalfOf } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
@@ -1009,7 +1083,7 @@ export class LLMObject extends Abject {
         if (sinceChunk < KEEPALIVE_MS) return;
         this.send(
           event(this.id, callerId, 'progress', {
-            phase: 'llm-waiting',
+            phase: 'llm-waiting', taskId: options?.cacheKey,
             message: `Waiting for LLM (${Math.round((Date.now() - start) / 1000)}s)`,
           })
         );
@@ -1019,7 +1093,7 @@ export class LLMObject extends Abject {
       let stopReason: string | undefined;
       let usage: LLMStreamChunk['usage'];
       try {
-        for await (const chunk of provider.stream(messages, effectiveOptions)) {
+        for await (const chunk of this.meteredStream(provider, messages, effectiveOptions)) {
           if (activeReq.killed) {
             log.info(`Request ${correlationId} killed during streaming`);
             break;
@@ -1520,7 +1594,7 @@ export class LLMObject extends Abject {
       keepaliveTimer = setInterval(() => {
         this.send(
           event(this.id, callerId, 'progress', {
-            phase: 'llm-waiting',
+            phase: 'llm-waiting', taskId: options?.cacheKey,
             message: `LLM request in progress (${Math.round((Date.now() - start) / 1000)}s)`,
           })
         );
@@ -1528,7 +1602,7 @@ export class LLMObject extends Abject {
     }
 
     try {
-      const result = await provider.complete(messages, effectiveOptions);
+      const result = await this.meteredComplete(provider, messages, effectiveOptions);
       const elapsed = Date.now() - start;
       log.info(`← ${provider.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
       if (callerId) this.trackRequestEnd(trackId, result.content, result.usage, result.finishReason);
@@ -1997,6 +2071,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     const callerName = onBehalfOf ?? senderName;
     const entry: LLMLedgerEntry = {
       id: requestId,
+      taskId:this.usageContext.getStore()?.taskId, goalId:this.usageContext.getStore()?.goalId,
       callerId,
       callerName,
       ...(onBehalfOf && senderName && senderName !== onBehalfOf ? { via: senderName } : {}),
@@ -3117,7 +3192,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     log.info(`cache-warm: ping ${entry.id} (${entry.providerName}/${entry.model}, ${entry.prefixTokens} tok, ping ${pingNo}/${entry.policy.maxPings}, ${Math.round((entry.policy.iMaxMs - sinceUse) / 60000)}min to break-even)`);
     let failed = false;
     try {
-      const result = await provider.complete(entry.messages, {
+      const result = await this.meteredComplete(provider,entry.messages, {
         model: entry.model,
         maxTokens: LLMObject.WARM_PING_MAX_TOKENS,
         effort: 'none',
@@ -3292,7 +3367,6 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
 The \`options\` object in \`complete\` accepts:
 - tier: 'smart' | 'balanced' | 'fast' | 'code' — model quality tier (default: 'balanced'). 'code' is the code-generation tier; when unrouted it rides the smart tier's routing.
-- temperature: number — controls randomness (0-1)
 - maxTokens: number — limit response length
 - stopSequences: string[] — stop generation at these strings
 
