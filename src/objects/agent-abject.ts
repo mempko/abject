@@ -200,7 +200,7 @@ export interface PredictionRecord {
   /** Runtime verdict compares operation status only, never the free-text claim. */
   verdictScope?: 'operation-status';
   semanticVerdict?: 'unresolved';
-  patterns?: Array<{ id: string; revision?: number; why: string }>;
+  patterns?: Array<{ id: string; revision?: number; applicationRef?: string; provenanceError?: string; why: string }>;
   /** True when the action failed, which contradicts any expectation of it working. */
   missed?: boolean;
   /** Short rendering of the actual result, so the reviewer sees both sides. */
@@ -407,6 +407,8 @@ interface TaskEntry {
    * helped (markUseful), closing the usefulness feedback loop.
    */
   injectedKnowledge?: Array<{ id: string; title: string }>;
+  /** Receipts for pattern content actually delivered, never model-authored. */
+  patternSelections?: Record<string, string>;
   /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
   knownTagsLine?: string;
   /**
@@ -1277,7 +1279,7 @@ The registered object must implement these handlers to participate in the agent 
       status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
       snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
         taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
-        injectedKnowledge: entry.injectedKnowledge, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
+        injectedKnowledge: entry.injectedKnowledge, patternSelections: entry.patternSelections, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
         children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
       outstandingOperation, ...(usage?{usage}:{}),
       ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
@@ -1524,7 +1526,7 @@ The registered object must implement these handlers to participate in the agent 
       state.llmMessages.push({ role: 'user', content: 'Resumed from a durable checkpoint. Re-observe current collaborators and artifacts through Ask; previously verified state may have changed. Continue the plan from the retained evidence.' });
       const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
         systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
-        goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge,
+        goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge, patternSelections: stored.patternSelections,
         payloads: stored.payloads, payloadSeq: stored.payloadSeq, pendingPrediction: stored.pendingPrediction, sessionId: p.id, sessionRevision: resumed.session.revision };
       for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
       this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
@@ -3095,8 +3097,9 @@ The registered object must implement these handlers to participate in the agent 
 
                   let rendered: string;
                   if (id) {
-                    const e = await this.request<{ title?: string; type?: string; content?: string } | null>(
+                    const e = await this.request<{ title?: string; type?: string; content?: string; patternRef?: string } | null>(
                       request(this.id, kbId, 'get', { id }), 10000);
+                    if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
                     rendered = e
                       ? `**${e.title}** (${e.type}): ${(e.content ?? '').slice(0, 4000)}`
                       : `No entry with id "${id}".`;
@@ -4019,7 +4022,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions are recorded before execution; observations are recorded afterwards. For consequential actions include patterns: [{id, revision, why}] for patterns you actually apply. Merely seeing a pattern is not using it. Operation success does not establish that your free-text prediction was correct. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
+    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions are recorded before execution; observations are recorded afterwards. For consequential actions include patterns: [{id, why}] for patterns you actually apply. The runtime tracks the version automatically; do not supply revision numbers. Merely seeing a pattern is not using it. Operation success does not establish that your free-text prediction was correct. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
@@ -4048,7 +4051,7 @@ The preview often answers the question on its own — when it does, just act.`, 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; pattern?: { learning?: { revision?: number } } };
+        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; patternRef?: string; pattern?: { learning?: { revision?: number } } };
         const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
@@ -4124,13 +4127,15 @@ The preview often answers the question on its own — when it does, just act.`, 
           let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern. Apply the patterns whose context holds for this task.\n';
           for (const e of patterns) {
             const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
-            block += `\n### PATTERN: ${e.title}${via} [id=${e.id}, revision=${e.pattern?.learning?.revision ?? 'unknown'}]\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
+            block += `\n### PATTERN: ${e.title}${via} [id=${e.id}]\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
           }
           add('patterns', block, false);
         }
 
         // Record what was injected so the post-task reviewer can judge which
         // entries actually helped (KnowledgeBase.markUseful).
+        entry.patternSelections ??= {};
+        for (const e of [...profile, ...patterns]) if (e.patternRef) entry.patternSelections[e.id] = e.patternRef;
         entry.injectedKnowledge = [...(profile ?? []), ...relevant, ...patterns]
           .filter(e => e.id)
           .map(e => ({ id: e.id, title: e.title }));
@@ -4628,11 +4633,34 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const task = entry.state;
     entry.pendingPrediction = { step: task.step + 1, action: structuredClone(task.action!), at: Date.now() };
     const goalId = entry.goalId ?? entry.incomingGoalId;
+    const action = entry.pendingPrediction.action;
+    const declared = Array.isArray(action.patterns) ? action.patterns : [];
+    const applications: NonNullable<PredictionRecord['patterns']> = [];
+    action.patterns = applications; // Discard model-supplied provenance before any await or cancellation.
+    for (const p of declared) {
+      if (!p || typeof p.id !== 'string' || typeof p.why !== 'string') continue;
+      if (applications.some(a => a.id === p.id)) continue;
+      const applied: NonNullable<PredictionRecord['patterns']>[number] = { id: p.id, why: p.why.slice(0, 1000) };
+      applications.push(applied);
+      try {
+        const receipt = entry.patternSelections?.[p.id];
+        if (!receipt || !goalId) throw new Error('No captured selection or goal; application provenance is unresolved');
+        const kbId = await this.discoverDep('KnowledgeBase');
+        if (!kbId) throw new Error('KnowledgeBase unavailable');
+        const result = await this.request<{ success: boolean; applicationRef?: string; error?: string }>(request(this.id, kbId, 'beginPatternApplication', {
+          id: p.id, patternRef: receipt, applicationId: `${task.id}:${task.step + 1}:${p.id}`,
+          goalId, context: applied.why,
+        }), 5000);
+        if (!result.success || !result.applicationRef) throw new Error(result.error ?? 'Application receipt unavailable');
+        applied.applicationRef = result.applicationRef;
+      } catch (err) { applied.provenanceError = err instanceof Error ? err.message : String(err); }
+    }
+    action.patterns = applications;
     if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
       goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
       observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
         expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
-        patterns: task.action?.patterns ?? [], predictedAt: entry.pendingPrediction.at },
+        patterns: action.patterns ?? [], predictedAt: entry.pendingPrediction.at },
     }));
   }
 
@@ -4651,7 +4679,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const actual = JSON.stringify({ outcome, data: task.lastResult.data, error: task.lastResult.error, payloadId: task.lastResult.payloadId });
     const stored = `${task.id}:step:${task.step + 1}`;
     // Observations live in the goal evidence ledger, not the five-slot bulk cache.
-    const patterns = Array.isArray(action?.patterns) ? action.patterns.filter((p: any) => p && typeof p.id === 'string' && typeof p.why === 'string').map((p: any) => ({ id: p.id, revision: Number.isSafeInteger(p.revision) ? p.revision : undefined, why: p.why.slice(0, 1000) })) : [];
+    const patterns = Array.isArray(action?.patterns) ? action.patterns.filter((p: any) => p && typeof p.id === 'string' && typeof p.why === 'string').map((p: any) => ({ id: p.id, applicationRef: predicted ? p.applicationRef : undefined, provenanceError: predicted ? p.provenanceError : 'No pre-action provenance captured', why: p.why.slice(0, 1000) })) : [];
     (entry.predictions ??= []).push({
       step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
       expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS), outcome, verdict,

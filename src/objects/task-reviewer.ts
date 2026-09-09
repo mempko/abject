@@ -88,7 +88,18 @@ interface TranscriptResponse {
   transcript: string;
 }
 
+interface LearningUpdate {
+  key: string;
+  action: AgentAction;
+  status: 'saved' | 'rejected' | 'unresolved';
+  result?: unknown;
+  error?: string;
+}
+
 interface ReviewTaskExtra {
+  updates?: LearningUpdate[];
+  assessments?: Record<string, { verdict: string; explanation?: string }>;
+  applicationAssessments?: Record<string, string>;
   lastResult?: string;
   /** The reviewed tasks to release from AgentAbject once this review ends. */
   reviewedTaskIds?: string[];
@@ -201,7 +212,7 @@ export class TaskReviewer extends Abject {
       description: 'Internal post-task reviewer. Reviews finished transcripts to grow the knowledge base; it does not take on user goals.',
       canExecute: false,
       config: {
-        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
+        snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask', completionMethod: 'completeReview',
         maxSteps: 10,
         timeout: 180000,
         terminalActions: {
@@ -241,6 +252,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   // ═══════════════════════════════════════════════════════════════════
 
   private setupHandlers(): void {
+    this.on('completeReview', async msg => {
+      await this.requireTaskRuntime(msg, this.agentAbjectId);
+      const extra = this.taskExtras.get((msg.payload as { taskId: string }).taskId);
+      // Settlement reports uncertainty; it never forces another LLM turn merely
+      // to satisfy learning bookkeeping.
+      const report = this.learningReport(extra);
+      return { accepted: true, result: report, evidence: report };
+    });
     this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
@@ -294,8 +313,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (this.inFlight?.ticketId !== ticketId) return;
       const extra = this.taskExtras.get(ticketId);
       const succeeded = (msg.payload as { success?: boolean }).success === true;
-      if (succeeded && extra?.goalId && this.goalManagerId) {
-        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId }));
+      if (extra?.goalId && this.goalManagerId) {
+        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report: this.learningReport(extra, !succeeded) }));
       }
       this.inFlight = undefined; this.taskExtras.delete(ticketId);
       for (const taskId of succeeded ? extra?.reviewedTaskIds ?? [] : []) {
@@ -345,8 +364,44 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.on('agentAct', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
-      return this.handleAct(taskId, action);
+      let result: { success: boolean; data?: unknown; error?: string };
+      try { result = await this.handleAct(taskId, action); }
+      catch (err) { result = { success: false, error: err instanceof Error ? err.message : String(err) }; }
+      const extra = this.taskExtras.get(taskId);
+      if (extra && ['assess_prediction', 'record_pattern_application', 'save_entry', 'update_entry', 'archive_entry', 'forget_entry', 'mark_useful', 'save_pattern', 'update_pattern', 'merge_entries', 'author_skill'].includes(action.action)) {
+        const app = action.application as Record<string, unknown> | undefined;
+        const key = JSON.stringify([action.action, action.id ?? action.title ?? action.name ?? action.ids ?? '', action.taskId ?? app?.taskId ?? '', action.step ?? app?.step ?? '']);
+        const updates = extra.updates ??= [];
+        const update: LearningUpdate = { key, action: structuredClone(action), status: result.success ? 'saved' : /unresolved|provenance|reference/i.test(result.error ?? '') ? 'unresolved' : 'rejected', result: result.data, error: result.error };
+        updates.push(update);
+        return { ...result, learningStatus: update.status };
+      }
+      return result;
     });
+  }
+
+  private learningReport(extra?: ReviewTaskExtra, interrupted = false) {
+    const updates = extra?.updates ?? [];
+    const assessments = extra?.assessments ?? {};
+    const episodes = new Map<string, PredictionRecord>((extra?.records ?? []).flatMap(r => (r.predictions ?? []).map(p => [`${r.taskId}:${p.step}`, p] as const)));
+    const unassessed = [...episodes].filter(([key]) => !assessments[key]).map(([key]) => key);
+    const counts = { supported: 0, contradicted: 0, unresolved: unassessed.length };
+    for (const [key, a] of Object.entries(assessments)) if (episodes.has(key) && a.verdict in counts) counts[a.verdict as keyof typeof counts]++;
+    const latest = new Map(updates.map(u => [u.key, u]));
+    const saved = [...new Map(updates.filter(u => u.status === 'saved').map(u => [u.key, u])).values()];
+    const pending = [...latest.values()].filter(u => u.status !== 'saved');
+    const patternCounts = { helpful: 0, harmful: 0, inconclusive: 0, unresolved: 0 };
+    const unassessedApplications: Array<{ taskId: string; step: number; id: string; applicationRef?: string }> = [];
+    for (const r of extra?.records ?? []) for (const p of r.predictions ?? []) for (const applied of p.patterns ?? []) {
+      const verdict = extra?.applicationAssessments?.[`${r.taskId}:${p.step}:${applied.id}`];
+      if (verdict === 'helpful' || verdict === 'harmful' || verdict === 'inconclusive') patternCounts[verdict]++;
+      else { patternCounts.unresolved++; unassessedApplications.push({ taskId: r.taskId, step: p.step, id: applied.id, applicationRef: applied.applicationRef }); }
+    }
+    const status = interrupted || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
+    return { status, interrupted, saved, pending, attempts: updates,
+      predictions: { total: episodes.size, ...counts, unassessed },
+      patterns: { ...patternCounts, unassessed: unassessedApplications },
+      summary: `Learning review ${status}: ${saved.length} updates saved, ${pending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -702,17 +757,18 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         case 'assess_prediction': {
           if (!extra.goalId || !this.goalManagerId) throw new Error('A goal review is required to record an assessment');
           if (!extra.records?.some(r => r.taskId === action.taskId && r.predictions?.some(p => p.step === action.step))) throw new Error('Assessment is outside this review evidence');
-          const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.goalManagerId, 'recordPredictionAssessment', {
+          const decision = await this.request<{ success: boolean; error?: string; assessment?: { verdict: string; explanation?: string } }>(request(this.id, this.goalManagerId, 'recordPredictionAssessment', {
             goalId: extra.goalId, taskId: action.taskId, step: action.step, verdict: action.verdict, explanation: action.explanation,
           }));
           if (!decision.success) throw new Error(decision.error ?? 'Assessment rejected');
+          if (decision.assessment) (extra.assessments ??= {})[`${action.taskId}:${action.step}`] = decision.assessment;
           result = JSON.stringify(decision);
           break;
         }
         case 'read_evidence': {
           let text = extra.fullMaterial ?? '';
           if (typeof action.key === 'string') {
-            if (!extra.goalId || !this.goalManagerId || !(action.key === 'learning/plans' || action.key === 'scrum/plan' || action.key.startsWith('learning/observation/') || action.key.startsWith('learning/assessment/'))) throw new Error('Key is outside the review learning evidence');
+            if (!extra.goalId || !this.goalManagerId || !(action.key === 'learning/plans' || action.key === 'learning/reviewOutcome' || action.key === 'scrum/plan' || action.key.startsWith('learning/observation/') || action.key.startsWith('learning/assessment/'))) throw new Error('Key is outside the review learning evidence');
             text = JSON.stringify(await this.request(request(this.id, this.goalManagerId, 'readGoalData', { goalId: extra.goalId, key: action.key }))) ?? 'null';
           }
           if (typeof action.taskId === 'string') {
@@ -761,6 +817,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
             }),
             10000,
           );
+          if (!res?.id) throw new Error('KnowledgeBase did not acknowledge the saved entry');
           result = `Saved "${title}" (${res.id})`;
           break;
         }
@@ -789,7 +846,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!id) return { success: false, error: 'forget_entry requires "id"' };
           const guard = await this.guardCuratable(id, 'forget');
           if (guard) return { success: false, error: guard };
-          await this.request(request(this.id, this.knowledgeBaseId!, 'forget', { id }), 10000);
+          const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'forget', { id }), 10000);
+          if (!decision?.success) throw new Error(decision?.error ?? 'forget failed');
           result = `Forgot ${id}`;
           break;
         }
@@ -799,7 +857,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!id) return { success: false, error: 'archive_entry requires "id"' };
           const guard = await this.guardCuratable(id, 'archive');
           if (guard) return { success: false, error: guard };
-          await this.request(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000);
+          const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000);
+          if (!decision?.success) throw new Error(decision?.error ?? 'archive failed');
           result = `Archived ${id}`;
           break;
         }
@@ -811,6 +870,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
             request(this.id, this.knowledgeBaseId!, 'markUseful', { ids, operationId: `review:${[...(this.taskExtras.get(taskId)?.reviewedTaskIds ?? [taskId])].sort().join(',')}` }),
             10000,
           );
+          if (!Number.isSafeInteger(res?.marked)) throw new Error('KnowledgeBase did not acknowledge usefulness feedback');
           result = `Marked ${res.marked} entries useful`;
           break;
         }
@@ -819,13 +879,28 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           const extra = this.taskExtras.get(taskId);
           const application = action.application as Record<string, unknown>;
           if (!extra?.goalId || !application) return { success: false, error: 'Application evidence requires a goal review and an application object' };
-          if (application.taskId !== undefined && !extra.records?.some(r => r.taskId === application.taskId && r.predictions?.some(p => p.step === application.step))) throw new Error('Pattern application must reference an observed episode in this review');
-          const applied = extra.records?.find(r => r.taskId === application.taskId)?.predictions?.find(p => p.step === application.step)?.patterns?.find(p => p.id === action.id);
-          if (applied?.revision !== undefined && application.patternRevision !== applied.revision) throw new Error('Use the pattern revision applied in this episode, not its current revision');
-          const res = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'recordPatternApplication', {
-            id: action.id, application: { ...application, id: application.taskId !== undefined ? `${extra.goalId}:${action.id}:${application.taskId}:${application.step}` : `${extra.goalId}:${action.id}`, goalId: extra.goalId },
-          }));
+          const episodes = (extra.records ?? []).flatMap(r => (r.predictions ?? []).flatMap(p =>
+            (p.patterns ?? []).filter(a => a.id === action.id && (application.taskId === undefined || (r.taskId === application.taskId && p.step === application.step)))
+              .map(applied => ({ taskId: r.taskId, step: p.step, outcome: p.outcome, applied }))));
+          if (episodes.length !== 1) throw new Error('Unresolved application: identify one observed taskId and step using read_evidence');
+          const { applied, taskId: observedTaskId, step, outcome } = episodes[0];
+          if (outcome === 'unknown' && application.verdict !== 'inconclusive') throw new Error('Unobserved application effects remain inconclusive');
+          let res: { success: boolean; error?: string };
+          if (applied.applicationRef) {
+            res = await this.request(request(this.id, this.knowledgeBaseId!, 'assessPatternApplication', {
+              id: action.id, applicationRef: applied.applicationRef, goalId: extra.goalId,
+              verdict: application.verdict, evidence: application.evidence,
+            }));
+          } else if (Number.isSafeInteger(applied.revision) && applied.revision! > 0) {
+            // Historical evidence can contain an explicit captured revision.
+            // Never substitute today's revision for missing provenance.
+            res = await this.request(request(this.id, this.knowledgeBaseId!, 'recordPatternApplication', {
+              id: action.id, application: { id: `${extra.goalId}:${action.id}:${observedTaskId}:${step}`, goalId: extra.goalId,
+                context: application.context, evidence: application.evidence, verdict: application.verdict, patternRevision: applied.revision },
+            }));
+          } else throw new Error('Unresolved application provenance; retain this evidence for a later review, without guessing a revision');
           if (!res.success) return { success: false, error: res.error };
+          (extra.applicationAssessments ??= {})[`${observedTaskId}:${step}:${action.id}`] = String(application.verdict);
           result = 'Recorded contextual application evidence';
           break;
         }
@@ -922,6 +997,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }),
       10000,
     );
+    if (!res?.id) throw new Error('KnowledgeBase did not acknowledge the saved pattern');
     return `Saved pattern "${built.pattern.name}" (${res.id})`;
   }
 
@@ -1012,11 +1088,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       10000,
     );
 
+    if (!umbrellaId) throw new Error('KnowledgeBase did not acknowledge the merged entry');
+    const failures: string[] = [];
     for (const id of absorbedIds) {
       if (id === umbrellaId) continue;   // dedup revived an absorbed entry as the umbrella
-      await this.request(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000)
-        .catch(err => log.warn(`archive of absorbed ${id} failed: ${err instanceof Error ? err.message : String(err)}`));
+      try {
+        const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000);
+        if (!decision?.success) throw new Error(decision?.error ?? 'archive rejected');
+      } catch (err) { failures.push(`${id}: ${err instanceof Error ? err.message : String(err)}`); }
     }
+    if (failures.length) throw new Error(`Merged content saved as ${umbrellaId}; pending archives: ${failures.join('; ')}`);
     return `Merged ${absorbedIds.length} entries into "${title}" (${umbrellaId}); absorbed entries archived`;
   }
 
@@ -1096,7 +1177,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
 | forget_entry | id | Remove an entry this transcript proves wrong |
-| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and patternRevision for this goal; repeated delivery is deduplicated |
+| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
@@ -1105,7 +1186,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 
 ## How to review
 1. **Credit first.** Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, skip straight to lessons.
-2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Only structured predictions assessed as contradicted have a mechanical mismatch; a failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. When every prediction held, that is evidence the agent's model was sound and there is likely nothing durable to save.
+2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Only structured predictions assessed as contradicted have a mechanical mismatch; a failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
 3. **Distill sparingly.** Most tasks teach nothing durable; finishing with done and "no learnings" is a good review. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 4. **Consult existing knowledge before saving.** Prefetched entries satisfy recall for the entries shown. Use recall_knowledge or the runtime recall-by-id action when additional context is needed; when a close entry exists, update_entry it rather than adding a sibling.
 5. **Preserve evidence without overstating conclusions.** Expected failures, transient outages, and recoveries can test the world model. Record relevant contextual evidence and competing explanations in pattern applications. Do not turn a single timeout into a permanent claim that a capability is broken; keep uncertainty explicit and propose discriminating observations when the cause is unknown.
@@ -1116,7 +1197,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 The workspace's memory includes a generative pattern language in the Alexander/Coplien tradition: write patterns the way Christopher Alexander and James Coplien do, where each pattern names a recurring context, lays out forces genuinely in tension, and resolves them, and the patterns link into a language that generates good solutions piecemeal. The anatomy of an entry of type 'pattern' is Context (when the pattern applies), Forces (the tensions that make the naive approach fail), Therefore (the resolution of those forces, not a mere tip), optional Contract (checkable obligations), optional Program (a worked example), Resulting context (what holds afterwards, and which patterns apply next), Evidence (how proven it is, Alexander's confidence stars in prose), and Links to related patterns. Goal reviews may include the goal's execution record; that record is your ore for pattern mining.
 
 - **Weave before writing.** recall_knowledge with the goal's context terms surfaces existing patterns and 'candidate-pattern'-tagged lessons. When an existing pattern's context covers this goal, update_pattern it: refine its Forces with what this goal revealed, refresh its Evidence line (for example "proven in 3 goals"), and addLinks to related patterns.
-- **Record applications.** For patterns actually used, record_pattern_application with the observed context, evidence, patternRevision, and a verdict. Distinguish following a pattern from benefiting; include counterexamples and competing causes.
+- **Record applications.** For patterns actually used, record_pattern_application with the observed context, evidence, taskId, step, and a verdict. Distinguish following a pattern from benefiting; include counterexamples and competing causes.
 - **Patterns are earned.** A shape seen once becomes a save_entry lesson tagged 'candidate-pattern'. Promote it with save_pattern when the shape recurs; the recall step surfaces the candidate. Most goals teach no pattern, and a language that grows slowly stays trustworthy.
 - **Generalize.** A pattern names a recurring CONTEXT, never this goal: keep goal titles and agent names out. Name patterns as short capitalized noun phrases (like DATA THEN JUDGMENT), and let the name be evocative enough to use in conversation.
 - **Failed goals teach too.** When a followed pattern contributed to failure, record the counterexample and refine its Context or Forces. Consider alternative causes: a transient outage does not refute a design pattern. Preserve inconclusive cases as uncertain.
@@ -1124,7 +1205,7 @@ The workspace's memory includes a generative pattern language in the Alexander/C
 
 The knowledge base is a world model. Compare predictions made before actions with feedback from the world. A successful task can contain false predictions; an expected rejection can support a narrow operation expectation. Runtime verdicts compare operation status only, not the meaning of a free-text prediction. Use assess_prediction to record material semantic confirmations, contradictions, or unresolved expectations with an evidence-grounded explanation. Review semantic agreement from the evidence, preserve uncertainty, and distinguish observations from agent explanations. Missing predictions remain unknown.
 
-Assess patterns actually applied (id, applied revision, reason), not merely injected knowledge. Record helpful, harmful, and inconclusive applications with evidence and competing explanations. When a pattern was used several times, name taskId and step in each application so distinct episodes survive replay deduplication. Do not substitute a current pattern revision for the one applied. Inspect read_evidence when a briefing excerpt is insufficient; preserve contradictions even when the overall goal succeeded. Develop candidate patterns from new explanations and strengthen them only with recurring evidence. Learn from transient failures without turning a single outage into a permanent limitation.
+Assess patterns actually applied (id, applied revision, reason), not merely injected knowledge. Record helpful, harmful, and inconclusive applications with evidence and competing explanations. When a pattern was used several times, name taskId and step in each application so distinct episodes survive replay deduplication. Revision numbers are managed automatically. Do not supply them. If provenance is unresolved, inspect read_evidence once; retain unresolved evidence and finish a partial review if it cannot be recovered. Inspect read_evidence when a briefing excerpt is insufficient; preserve contradictions even when the overall goal succeeded. Develop candidate patterns from new explanations and strengthen them only with recurring evidence. Learn from transient failures without turning a single outage into a permanent limitation.
 
 Finish when the evidence supports the learning updates; do not invent an update just to make one.`;
   }
@@ -1141,7 +1222,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | recall_knowledge | query | Inspect entries on a topic more closely |
 | merge_entries | title, content, type?, tags?, absorbedIds | Replace 2+ narrow near-duplicates with one umbrella entry; the absorbed entries are archived (restorable) |
 | update_entry | id, content?, title?, tags? | Sharpen a single entry's wording or tags |
-| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and patternRevision for this goal; repeated delivery is deduplicated |
+| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Write a pattern (e.g. promote ripe candidate-pattern lessons, or fulfill a dangling link) |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Revise a pattern's sections or extend its links |
 | archive_entry | id | Archive an entry that is stale or too narrow to help future tasks |
@@ -1157,7 +1238,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 
 The knowledge base is a world model. Compare predictions made before actions with feedback from the world. A successful task can contain false predictions; an expected rejection can support a narrow operation expectation. Runtime verdicts compare operation status only, not the meaning of a free-text prediction. Use assess_prediction to record material semantic confirmations, contradictions, or unresolved expectations with an evidence-grounded explanation. Review semantic agreement from the evidence, preserve uncertainty, and distinguish observations from agent explanations. Missing predictions remain unknown.
 
-Assess patterns actually applied (id, applied revision, reason), not merely injected knowledge. Record helpful, harmful, and inconclusive applications with evidence and competing explanations. When a pattern was used several times, name taskId and step in each application so distinct episodes survive replay deduplication. Do not substitute a current pattern revision for the one applied. Inspect read_evidence when a briefing excerpt is insufficient; preserve contradictions even when the overall goal succeeded. Develop candidate patterns from new explanations and strengthen them only with recurring evidence. Learn from transient failures without turning a single outage into a permanent limitation.
+Assess patterns actually applied (id, applied revision, reason), not merely injected knowledge. Record helpful, harmful, and inconclusive applications with evidence and competing explanations. When a pattern was used several times, name taskId and step in each application so distinct episodes survive replay deduplication. Revision numbers are managed automatically. Do not supply them. If provenance is unresolved, inspect read_evidence once; retain unresolved evidence and finish a partial review if it cannot be recovered. Inspect read_evidence when a briefing excerpt is insufficient; preserve contradictions even when the overall goal succeeded. Develop candidate patterns from new explanations and strengthen them only with recurring evidence. Learn from transient failures without turning a single outage into a permanent limitation.
 
 Finish when the evidence supports the learning updates; do not invent an update just to make one.`;
   }

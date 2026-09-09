@@ -112,7 +112,9 @@ struct Entry {
   json to_presented_json() const {
     json j = to_json();
     if (type == "pattern") {
-      if (auto p = kbpat::read_structured(content)) {
+      if (auto p = kbpat::read(content, title)) {
+        if (!p->learning.is_object()) p->learning = {{"revision", 1}, {"applications", json::array()}, {"feedbackIds", json::array()}, {"history", json::array()}};
+        j["patternRef"] = json::array({id, p->learning["revision"]}).dump();
         j["content"] = p->render();
         j["pattern"] = p->to_json();
       }
@@ -252,7 +254,7 @@ class KnowledgeBase final : public Object {
         "generative pattern-language entries with Context/Forces/Therefore "
         "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
-        "3.4.0", "abjects:knowledge-base");
+        "3.5.0", "abjects:knowledge-base");
 
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
@@ -324,6 +326,14 @@ class KnowledgeBase final : public Object {
         .param("ids", "array", "Entry IDs that proved useful")
         .param("operationId", "string", "Deduplicate pattern feedback for a review", true)
         .returns("object");
+    m.method("beginPatternApplication", "Capture an application before execution using an opaque selection receipt")
+        .param("id", "string", "Pattern ID").param("patternRef", "string", "Selection receipt")
+        .param("applicationId", "string", "Stable episode identity").param("goalId", "string", "Goal ID")
+        .param("context", "string", "Reason for applying").returns("object");
+    m.method("assessPatternApplication", "Attach feedback to a captured application without supplying a revision")
+        .param("id", "string", "Pattern ID").param("applicationRef", "string", "Application receipt")
+        .param("goalId", "string", "Goal ID").param("verdict", "string", "helpful, harmful, inconclusive")
+        .param("evidence", "string", "Observed evidence").returns("object");
     m.method("recordPatternApplication", "Record contextual application evidence with an idempotent identity")
         .param("id", "string", "Pattern entry ID")
         .param("application", "object", "id, goalId, context, evidence, verdict and patternRevision")
@@ -511,6 +521,59 @@ class KnowledgeBase final : public Object {
     return pattern->to_json().dump();
   }
 
+  void application_receipt(Request& req, bool assess) {
+    const auto& payload = req.payload();
+    const auto id = str_or(payload, "id", "");
+    auto it = entries_.find(id);
+    auto pattern = it != entries_.end() && it->second.type == "pattern"
+      ? kbpat::read(it->second.content, it->second.title) : std::optional<kbpat::Pattern>();
+    auto reject = [&](const std::string& error) { req.reply({{"success", false}, {"error", error}}); };
+    if (!pattern) { reject("Pattern not found"); return; }
+    if (!pattern->learning.is_object()) pattern->learning = initial_learning();
+    const auto goal = str_or(payload, "goalId", "");
+    const auto ref = str_or(payload, assess ? "applicationRef" : "applicationId", "");
+    if (goal.empty() || ref.empty()) { reject("Missing goal or application identity"); return; }
+    auto& applications = pattern->learning["applications"];
+    auto old = std::find_if(applications.begin(), applications.end(), [&](const json& a) { return str_or(a, "id", "") == ref; });
+    if (assess) {
+      if (old == applications.end() || str_or(*old, "goalId", "") != goal || str_or(*old, "declaredContext", "").empty()) {
+        reject("Unresolved application reference"); return;
+      }
+      const auto verdict = str_or(payload, "verdict", ""), evidence = str_or(payload, "evidence", "");
+      if ((verdict != "helpful" && verdict != "harmful" && verdict != "inconclusive") || kbpat::trim(evidence).empty()) {
+        reject("Invalid feedback verdict or evidence"); return;
+      }
+      if ((*old)["verdict"] != "applied") {
+        if ((*old)["verdict"] == verdict && (*old)["evidence"] == evidence) req.reply({{"success", true}, {"duplicate", true}, {"applicationRef", ref}});
+        else reject("Conflicting application feedback");
+        return;
+      }
+      (*old)["verdict"] = verdict; (*old)["evidence"] = evidence;
+    } else {
+      const auto context = str_or(payload, "context", "");
+      const auto receipt = json::parse(str_or(payload, "patternRef", ""), nullptr, false);
+      if (kbpat::trim(context).empty() || !receipt.is_array() || receipt.size() != 2 || receipt[0] != id || !receipt[1].is_number_integer() || receipt[1] < 1) {
+        reject("Unknown pattern selection; retrieve the pattern before applying it"); return;
+      }
+      if (old != applications.end()) {
+        if ((*old)["patternRevision"] == receipt[1] && str_or(*old, "goalId", "") == goal && str_or(*old, "declaredContext", "") == context)
+          req.reply({{"success", true}, {"duplicate", true}, {"applicationRef", ref}});
+        else reject("Conflicting application identity");
+        return;
+      }
+      bool known = receipt[1] == pattern->learning["revision"];
+      for (const auto& h : pattern->learning["history"]) if (h["revision"] == receipt[1]) known = true;
+      if (!known) { reject("Selected pattern revision is no longer available"); return; }
+      applications.push_back({{"id", ref}, {"goalId", goal}, {"context", context}, {"declaredContext", context},
+        {"verdict", "applied"}, {"evidence", "Declared before execution; effect not yet assessed"}, {"patternRevision", receipt[1]}, {"at", now_ms()}});
+    }
+    Entry& e = it->second;
+    e.content = pattern->to_json().dump();
+    e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
+    index_.add(e.id, e.title, index_text(e), e.tags); save_entry(e); changed("entryUpdated", e.to_json());
+    req.reply({{"success", true}, {"applicationRef", ref}});
+  }
+
   void record_pattern_application(Request& req) {
     const auto& p = req.payload();
     auto it = entries_.find(str_or(p, "id", ""));
@@ -577,13 +640,15 @@ class KnowledgeBase final : public Object {
     std::vector<std::string> flattened;
 
     for (auto& [id, e] : entries_) {
-      if (e.type != "pattern" || kbpat::is_structured(e.content)) continue;
-      const auto p = kbpat::read(e.content, e.title);
+      if (e.type != "pattern") continue;
+      auto p = kbpat::read(e.content, e.title);
+      if (kbpat::is_structured(e.content) && p && p->learning.is_object()) continue;
       if (!p) {
         unreadable++;
         log(LogLevel::Warn, "Pattern \"" + e.title + "\" could not be structured; left as written");
         continue;
       }
+      if (!p->learning.is_object()) p->learning = initial_learning();
       e.content = p->to_json().dump();
       e.updated_at = static_cast<int64_t>(now_ms());
       index_.add(e.id, e.title, p->search_text(), e.tags);
@@ -620,12 +685,13 @@ class KnowledgeBase final : public Object {
                                         "\" was flattened and no snapshot still holds it");
                 return;
               }
-              const auto p = kbpat::read(prev["content"].get<std::string>(), e.title);
+              auto p = kbpat::read(prev["content"].get<std::string>(), e.title);
               if (!p || kbpat::is_flattened(*p)) {
                 log(LogLevel::Warn, "Pattern \"" + e.title +
                                         "\" was flattened before every surviving snapshot");
                 return;
               }
+              if (!p->learning.is_object()) p->learning = initial_learning();
               e.content = p->to_json().dump();
               e.updated_at = static_cast<int64_t>(now_ms());
               index_.add(e.id, e.title, p->search_text(), e.tags);
@@ -640,6 +706,8 @@ class KnowledgeBase final : public Object {
 
   void register_handlers() {
     on("remember", [this](Request& req) { handle_remember(req); });
+    on("beginPatternApplication", [this](Request& req) { application_receipt(req, false); });
+    on("assessPatternApplication", [this](Request& req) { application_receipt(req, true); });
     on("recordPatternApplication", [this](Request& req) { record_pattern_application(req); });
     on("patternHistory", [this](Request& req) {
       const auto it = entries_.find(str_or(req.payload(), "id", ""));

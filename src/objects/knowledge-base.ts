@@ -512,7 +512,7 @@ export class KnowledgeBase extends Abject {
     let lost = 0;
 
     for (const entry of this.entries.values()) {
-      if (entry.type !== 'pattern' || isStructuredPattern(entry.content)) continue;
+      if (entry.type !== 'pattern' || readStructured(entry.content)?.learning) continue;
       let pattern = readPattern(entry.content, entry.title);
       if (!pattern) {
         unreadable++;
@@ -532,6 +532,7 @@ export class KnowledgeBase extends Abject {
         }
       }
 
+      pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
       entry.content = serializePattern(pattern);
       entry.updatedAt = Date.now();
       this.writeEntryToDb(entry);
@@ -603,9 +604,10 @@ export class KnowledgeBase extends Abject {
 
   private present(entry: KnowledgeEntry): KnowledgeEntry {
     if (entry.type !== 'pattern') return entry;
-    const pattern = readStructured(entry.content);
+    const pattern = readPattern(entry.content, entry.title);
     if (!pattern) return entry;
-    return { ...entry, content: renderPatternText(pattern), pattern } as KnowledgeEntry;
+    pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
+    return { ...entry, content: renderPatternText(pattern), pattern, patternRef: JSON.stringify([entry.id, pattern.learning.revision]) } as KnowledgeEntry;
   }
 
   private rowToEntry(r: Record<string, unknown>): KnowledgeEntry {
@@ -868,9 +870,54 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
   private setupHandlers(): void {
     describeMessages(this.manifest, [
+      { name: "beginPatternApplication", description: "Capture an application before execution using an opaque selection receipt.", parameters: { id: protocolText, patternRef: protocolText, applicationId: protocolText, goalId: protocolText, context: protocolText } },
+      { name: "assessPatternApplication", description: "Attach feedback to a captured application without supplying a revision.", parameters: { id: protocolText, applicationRef: protocolText, goalId: protocolText, verdict: protocolText, evidence: protocolText } },
       { name: "recordPatternApplication", description: "Record one contextual application with distinct goal evidence and helpful/harmful/inconclusive verdict.", parameters: { "id": protocolText, "application": protocolObject } },
       { name: "patternHistory", description: "Inspect pattern revisions and supporting or contradicting episodes.", parameters: { "id": protocolText } },
     ]);
+    // Receipts describe the version actually presented. Callers carry opaque
+    // references; KnowledgeBase alone interprets and assigns revision numbers.
+    this.on('beginPatternApplication', async (msg: AbjectMessage) => {
+      const { id, patternRef, applicationId, goalId, context } = msg.payload as Record<string, string>;
+      const entry = this.entries.get(id);
+      const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
+      if (!entry || !pattern) return { success: false, error: 'Pattern not found' };
+      requireNonEmpty(applicationId, 'applicationId'); requireNonEmpty(goalId, 'goalId'); requireNonEmpty(context, 'context');
+      pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
+      let receipt: unknown;
+      try { receipt = JSON.parse(patternRef); } catch { /* unresolved below */ }
+      if (!Array.isArray(receipt) || receipt.length !== 2 || receipt[0] !== id || !Number.isSafeInteger(receipt[1]) || receipt[1] < 1)
+        return { success: false, error: 'Unknown pattern selection; retrieve the pattern before applying it' };
+      const revision = receipt[1] as number;
+      const old = pattern.learning.applications.find(a => a.id === applicationId);
+      if (old) return old.patternRevision === revision && old.goalId === goalId && old.declaredContext === context
+        ? { success: true, duplicate: true, applicationRef: old.id }
+        : { success: false, error: 'Conflicting application identity' };
+      if (revision !== pattern.learning.revision && !pattern.learning.history.some(h => h.revision === revision))
+        return { success: false, error: 'Selected pattern revision is no longer available' };
+      pattern.learning.applications.push({ id: applicationId, goalId, context, declaredContext: context,
+        verdict: 'applied', evidence: 'Declared before execution; effect not yet assessed', patternRevision: revision, at: Date.now() });
+      entry.content = serializePattern(pattern); entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
+      this.writeEntryToDb(entry); this.syncEntryToSharedState(entry); this.changed('entryUpdated', entry);
+      return { success: true, applicationRef: applicationId };
+    });
+    this.on('assessPatternApplication', async (msg: AbjectMessage) => {
+      const { id, applicationRef, goalId, verdict, evidence } = msg.payload as Record<string, string>;
+      const entry = this.entries.get(id);
+      const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
+      const application = pattern?.learning?.applications.find(a => a.id === applicationRef);
+      if (!entry || !pattern || !application || application.goalId !== goalId || !application.declaredContext)
+        return { success: false, error: 'Unresolved application reference' };
+      requireNonEmpty(evidence, 'evidence');
+      precondition(['helpful', 'harmful', 'inconclusive'].includes(verdict), 'Invalid feedback verdict');
+      if (application.verdict !== 'applied') return application.verdict === verdict && application.evidence === evidence
+        ? { success: true, duplicate: true, applicationRef }
+        : { success: false, error: 'Conflicting application feedback' };
+      application.verdict = verdict as typeof application.verdict; application.evidence = evidence;
+      entry.content = serializePattern(pattern); entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
+      this.writeEntryToDb(entry); this.syncEntryToSharedState(entry); this.changed('entryUpdated', entry);
+      return { success: true, applicationRef };
+    });
     this.on('recordPatternApplication', async (msg: AbjectMessage) => {
       const { id, application } = msg.payload as { id: string; application: import('../core/pattern.js').PatternApplication };
       const entry = this.entries.get(id);
@@ -883,7 +930,9 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const old = pattern.learning.applications.find(a => a.id === application.id);
       if (old) {
         const {at: _oldAt,...oldEvidence}=old, {at: _newAt,...newEvidence}=application;
-        if (JSON.stringify(oldEvidence)!==JSON.stringify(newEvidence))return {success:false,error:'Conflicting evidence for the same application identity'};
+        const keys = [...new Set([...Object.keys(oldEvidence), ...Object.keys(newEvidence)])] as Array<keyof typeof oldEvidence>;
+        if (keys.some(key => JSON.stringify(oldEvidence[key]) !== JSON.stringify(newEvidence[key])))
+          return { success: false, error: 'Conflicting evidence for the same application identity' };
         return { success: true, duplicate: true };
       }
       precondition(Number.isSafeInteger(application.patternRevision) && application.patternRevision > 0 && application.patternRevision <= pattern.learning.revision, 'Unknown pattern revision');

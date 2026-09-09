@@ -183,15 +183,57 @@ for (const implementation of ['typescript', 'wasm'] as const) {
         const metadata = JSON.parse(await readFile(new URL('../../native/knowledge-base/abject.json', import.meta.url), 'utf8'));
         assert.deepEqual(metadata.manifest, manifest, 'shipped metadata describes the compiled receiver');
       }
+      const legacy = { id: 'legacy-pattern', title: 'LEGACY RESTORATION', type: 'pattern',
+        content: 'Context: persistent settings\nForces: live success can conceal failed restoration\nTherefore: restore before acceptance\nEvidence: candidate',
+        tags: ['pattern'], origin: 'agent', createdBy: 'fixture', createdAt: 1, updatedAt: 1, accessCount: 0, lastAccessedAt: 0 };
+      storage.values.set(':knowledge-base:entry:legacy-pattern', legacy);
+      storage.values.set(':knowledge-base:entry:structured-legacy', { ...legacy, id: 'structured-legacy', title: 'STRUCTURED LEGACY', content: pattern });
       const kb = await f.add(source ? new WasmAbject({ manifest, source }) : new HeadlessKnowledge());
+      if (!source) {
+        (kb as any).entries.set(legacy.id, { ...legacy });
+        (kb as any).entries.set('structured-legacy', { ...legacy, id: 'structured-legacy', content: pattern });
+        await (kb as any).healPatterns();
+      }
+      for (const legacyId of ['legacy-pattern', 'structured-legacy']) {
+        let selected: any;
+        for (let tries = 0; tries < 50; tries++) {
+          selected = await caller.call(kb.id, 'get', { id: legacyId });
+          if (selected) break;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert.equal(selected.pattern.learning.revision, 1);
+        const begin = { id: legacyId, patternRef: selected.patternRef, applicationId: `episode:${legacyId}`, goalId: 'receipt-goal', context: 'Validate restoration' };
+        assert.equal((await caller.call(kb.id, 'update', { id: legacyId, content: pattern, expectedRevision: 1 })).success, true);
+        const receipt = await caller.call(kb.id, 'beginPatternApplication', begin);
+        assert.equal(receipt.success, true, JSON.stringify(receipt));
+        assert.equal((await caller.call(kb.id, 'beginPatternApplication', begin)).duplicate, true);
+        assert.equal((await caller.call(kb.id, 'beginPatternApplication', { ...begin, context: 'conflicting intent' })).success, false);
+        // Updating after selection and before feedback must not relabel the episode.
+        for (let revision = 2; revision <= 22; revision++) {
+          assert.equal((await caller.call(kb.id, 'update', { id: legacyId, content: pattern, expectedRevision: revision })).success, true);
+        }
+        const feedback = { id: legacyId, applicationRef: receipt.applicationRef, goalId: 'receipt-goal', verdict: 'harmful', evidence: 'Restore overwrote a newer value' };
+        assert.equal((await caller.call(kb.id, 'assessPatternApplication', { ...feedback, goalId: 'unrelated-goal' })).success, false);
+        assert.equal((await caller.call(kb.id, 'assessPatternApplication', feedback)).success, true);
+        assert.equal((await caller.call(kb.id, 'assessPatternApplication', feedback)).duplicate, true);
+        assert.equal((await caller.call(kb.id, 'assessPatternApplication', { ...feedback, verdict: 'helpful' })).success, false);
+        assert.equal((await caller.call(kb.id, 'beginPatternApplication', begin)).duplicate, true, 'retry survives feedback and history pruning');
+        assert.equal((await caller.call(kb.id, 'beginPatternApplication', { ...begin, applicationId: 'new-episode' })).success, false, 'expired selection remains unresolved');
+        const history = await caller.call(kb.id, 'patternHistory', { id: legacyId });
+        assert.equal(history.revision, 23); assert.equal(history.history.length, 20);
+        assert.equal(history.applications.length, 1); assert.equal(history.applications[0].patternRevision, 1);
+        assert.equal(history.applications[0].declaredContext, begin.context); assert.equal(history.applications[0].verdict, 'harmful');
+        await caller.call(kb.id, 'archive', { id: legacyId });
+      }
       const reviewer: any = await f.add(new HeadlessReviewer());
       reviewer.knowledgeBaseId = kb.id; reviewer.agentAbjectId = caller.id;
       reviewer.taskExtras.set('review', { kind: 'review', goalId: 'goal-a', reviewedTaskIds: ['task-a'] });
       const { id } = await caller.call(kb.id, 'remember', { title: 'VERIFY RESTORATION', content: pattern, type: 'pattern' });
       const application = { id: 'goal-a', goalId: 'goal-a', context: 'persistent settings', verdict: 'helpful', evidence: 'restored value matches saved value', patternRevision: 1 };
+      reviewer.taskExtras.get('review').records = [{ taskId: 'task-a', predictions: [{ step: 1, patterns: [{ id, revision: 1, why: 'restore validation' }] }] }];
       const action = await caller.call(reviewer.id, 'agentAct', { taskId: 'review', action: { action: 'record_pattern_application', id, application } });
       assert.equal(action.success, true, JSON.stringify(action));
-      const storedApplication = { ...application, id: `goal-a:${id}` };
+      const storedApplication = { ...application, id: `goal-a:${id}:task-a:1` };
       assert.equal((await caller.call(kb.id, 'recordPatternApplication', { id, application: storedApplication })).duplicate, true);
       assert.equal((await caller.call(kb.id, 'recordPatternApplication', { id, application: { ...storedApplication, evidence: 'conflicting observation' } })).success, false);
       await assert.rejects(caller.call(kb.id, 'recordPatternApplication', { id, application: { ...application, id: 'future', patternRevision: 99 } }), /Unknown pattern revision/);

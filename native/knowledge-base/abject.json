@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -374,6 +374,106 @@
           }
         },
         {
+          "description": "Capture an application before execution using an opaque selection receipt",
+          "name": "beginPatternApplication",
+          "parameters": [
+            {
+              "description": "Pattern ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Selection receipt",
+              "name": "patternRef",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Stable episode identity",
+              "name": "applicationId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Goal ID",
+              "name": "goalId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Reason for applying",
+              "name": "context",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Attach feedback to a captured application without supplying a revision",
+          "name": "assessPatternApplication",
+          "parameters": [
+            {
+              "description": "Pattern ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Application receipt",
+              "name": "applicationRef",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Goal ID",
+              "name": "goalId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "helpful, harmful, inconclusive",
+              "name": "verdict",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Observed evidence",
+              "name": "evidence",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
           "description": "Record contextual application evidence with an idempotent identity",
           "name": "recordPatternApplication",
           "parameters": [
@@ -453,6 +553,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.4.0"
+    "version": "3.5.0"
   }
 }

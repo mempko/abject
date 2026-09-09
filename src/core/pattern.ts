@@ -43,6 +43,8 @@ export interface PatternApplication {
   verdict: 'applied' | 'helpful' | 'harmful' | 'inconclusive';
   evidence: string;
   patternRevision: number;
+  /** Immutable pre-action reason, retained when feedback is attached. */
+  declaredContext?: string;
   at: number;
 }
 

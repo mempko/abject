@@ -1293,8 +1293,9 @@ clean result I did not observe.`;
 
     // Preserve the real command outcome and its output reference on both paths.
     const summary = { exitCode: r.exitCode, outputObjectId: r.outputObjectId, truncated: r.truncated,
+      continuation: r.truncated && r.outputObjectId ? 'The command preview omitted output. Read retained output from offset 0 before rerunning a diff or inspection command; continue at nextOffset until totalBytes.' : undefined,
       stdoutTail: r.stdout.slice(-2000), stderrTail: r.stderr.slice(-2000),
-      readOutput: r.outputObjectId ? { action: 'read_output', id: r.outputObjectId } : undefined };
+      readOutput: r.outputObjectId ? { action: 'read_output', id: r.outputObjectId, offset: 0, length: 30000 } : undefined };
     return { ...bulkAwareResult(body), success: r.exitCode === 0,
       data: body.length > 8000 ? summary : { ...summary, output: body },
       ...(r.exitCode !== 0 ? { error: `Command exited ${r.exitCode}; inspect output and truncation metadata.` } : {}) };
@@ -1412,13 +1413,19 @@ clean result I did not observe.`;
     return { success: true, data: { verification: this.renderVerdict(verdict), command, exitCode: outcome.exitCode,
       reused: !!reusable, testSummary: outcome.testSummary, revision: outcome.revision, snapshotNote: outcome.snapshotNote,
       outputObjectId: outcome.outputObjectId, outputTruncated: outcome.outputTruncated,
-      readOutput: outcome.outputObjectId ? { action: 'read_output', id: outcome.outputObjectId } : undefined } };
+      readOutput: outcome.outputObjectId ? { action: 'read_output', id: outcome.outputObjectId, offset: 0, length: 30000 } : undefined } };
   }
 
   private async opReadOutput(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown }> {
     const id = String(action.id ?? '') as AbjectId;
     if (!extra.commandOutputs?.has(id)) throw new Error('Output does not belong to this task, or its process has expired');
-    return { success: true, data: await this.call(id, 'readOutput', { offset: action.offset, length: action.length }, 30000) };
+    const output = await this.call<{ text: string; offset: number; nextOffset: number; totalBytes: number }>(id, 'readOutput', { offset: action.offset, length: action.length ?? 30000 }, 30000);
+    // Keep continuation coordinates beside the bulk handle. Otherwise a large
+    // page becomes another clipped preview with its next offset hidden inside.
+    return { ...bulkAwareResult(output.text), data: { outputObjectId: id, offset: output.offset, nextOffset: output.nextOffset, totalBytes: output.totalBytes,
+      ...(output.text.length <= 8000 ? { text: output.text } : {}),
+      readOutput: output.nextOffset < output.totalBytes ? { action: 'read_output', id, offset: output.nextOffset, length: 30000 } : undefined } };
+
   }
 
   private async opSetProject(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -1433,7 +1440,7 @@ clean result I did not observe.`;
           `A directory has to be registered before I work in it — ask the user to add it.`,
       };
     }
-    if (extra.project?.name === project.name) return { success: true, data: await this.buildProjectBlock(extra) };
+    if (extra.project?.name === project.name) return { success: true, data: `Already working in ${project.name} at ${extra.workRoot}. Project instructions and baseline evidence are unchanged; continue from the existing context.` };
     if (extra.project && !this.gateVerdict(extra).ok) return { success: false, error: 'Finish verification in the current project before switching projects.' };
     if (extra.project) {
       await this.writeSessionSummary(extra, 'Project session suspended for switch', this.gateVerdict(extra));
@@ -2161,7 +2168,7 @@ Emit ONE JSON action per turn in a \`\`\`json code block, and nothing else. Inde
 
 # Actions
 
-- {"action":"read_output","id":"<outputObjectId>","offset":0,"length":30000} — inspect retained command output through its owner (expires after an hour or restart).
+- {"action":"read_output","id":"<outputObjectId>","offset":0,"length":30000} — inspect retained command output through its owner (expires after an hour or restart). A truncated command preview omits earlier bytes: start at offset 0 and continue at nextOffset up to totalBytes. Read these pages before rerunning an inspection command; payload previews alone do not cover the original output.
 - {"action":"read","path":"src/x.ts","offset":1,"limit":200} — read a file. Paths are relative to the project root. A truncated read tells you the offset to continue from.
 - {"action":"write","path":"src/x.ts","content":"..."} — create a file or replace one wholesale.
 - {"action":"edit","path":"src/x.ts","edits":[{"oldText":"...","newText":"..."}],"more":false} — the normal way to change a file. Every oldText is matched against the file as it is now, must be unique, and must not overlap another edit in the same call. If any fails, NOTHING is written and you get every failure at once.

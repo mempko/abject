@@ -1404,10 +1404,11 @@ reviews results and either plans another round or completes/fails the goal.
       .filter(g => g.scratchpad['learning/review'] === 'pending')
       .map(g => ({ goalId: g.id, outcome: g.error ? 'failed' : 'completed', detail: g.error })));
     this.on('ackReview', async (msg: AbjectMessage) => {
-      const { goalId } = msg.payload as { goalId: string };
+      const { goalId, report } = msg.payload as { goalId: string; report?: { status?: string } };
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
-      goal.scratchpad['learning/review'] = 'reviewed';
+      goal.scratchpad['learning/review'] = report?.status === 'partial' ? 'partial' : 'reviewed';
+      if (report) goal.scratchpad['learning/reviewOutcome'] = structuredClone(report);
       await this.persistLearning(goal);
       return { success: true };
     });
