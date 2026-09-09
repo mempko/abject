@@ -55,6 +55,11 @@ export function applicable(entry: { archived: boolean; learning?: KnowledgeLearn
   return !entry.archived && (!scope || !entry.learning?.scope || entry.learning.scope === scope)
     && !entry.learning?.supersessions.some(s => !s.scope || s.scope === scope);
 }
+/** A replacement changed in this decision must still be at the acknowledged revision. */
+export function replacementEffect(decision: LearningDecision, effect: LearningEffect): LearningEffect | undefined {
+  return decision.effects.filter(e => e !== effect && e.input.id === effect.input.replacementId
+    && ['save_entry', 'update_entry', 'confirm_entry'].includes(String(e.input.action))).at(-1);
+}
 export function validateLearningEffect(decision: LearningDecision, effect: LearningEffect): string | undefined {
   if (decision.paused) return 'Learning paused; explicit resumption required';
   if (effect.dependsOn?.some(id => decision.effects.find(e => e.id === id)?.state !== 'applied')) return 'Waiting for acknowledged replacement effects';
@@ -81,4 +86,12 @@ export function validateLearningEffect(decision: LearningDecision, effect: Learn
   if (p.scope !== undefined && typeof p.scope !== 'string') return 'Scope must be a string identity';
   if (p.action === 'narrow_entry' && !p.scope) return 'Narrowing requires an explicit scope';
   if (p.action === 'supersede_entry' && (typeof p.replacementId !== 'string' || !p.replacementId || p.replacementId === p.id)) return 'Supersession requires a distinct replacement';
+  if (p.action === 'supersede_entry') {
+    const replacement = replacementEffect(decision, effect);
+    if (replacement) {
+      if (replacement.state !== 'applied') return 'Waiting for acknowledged replacement effects';
+    } else if (typeof p.replacementRef !== 'string' || typeof p.replacementEvidence !== 'string' || !p.replacementEvidence.trim()) {
+      return 'Read the full replacement and explain how its claims agree with episode evidence using replacementEvidence, or revise/confirm it in this decision';
+    }
+  }
 }

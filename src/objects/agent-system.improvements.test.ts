@@ -15,6 +15,7 @@ import { AgentAbject } from './agent-abject.js';
 import { GoalManager } from './goal-manager.js';
 import { TaskReviewer } from './task-reviewer.js';
 import { KnowledgeBase } from './knowledge-base.js';
+import { ScrumMaster } from './scrum-master.js';
 
 class Endpoint extends Abject {
   constructor(name: string) {
@@ -29,6 +30,7 @@ class Projects extends ExternalProjectRegistry { protected override async onInit
 class Knowledge extends KnowledgeBase { protected override async onInit(): Promise<void> {} }
 class Runtime extends AgentAbject { protected override async onInit(): Promise<void> {} }
 class Reviewer extends TaskReviewer { protected override async onInit(): Promise<void> {} }
+class Scrum extends ScrumMaster { protected override async onInit(): Promise<void> {} }
 
 async function fixture() {
   const bus = new MessageBus(), registry = new Registry(), objects: Abject[] = [registry];
@@ -733,4 +735,85 @@ test('requested pages preserve escaped text verbatim, including small pages and 
   runtime.absorbResultPayload(oversized); runtime.addActionResultToConversation(oversized);
   const shown = (oversized.state.llmMessages.at(-1) as any).content;
   assert(!shown.includes('NOT_YET_SHOWN')); assert.match(shown, /characters remain/);
+});
+
+test('long reviews expose final predictions and request one correction for partial assessment batches', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), goals = await f.add(new GoalManager());
+    const reviewer: any = await f.add(new Reviewer()); Object.assign(reviewer, { agentAbjectId: caller.id, goalManagerId: goals.id });
+    const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Review changes', description: 'Verify and commit' });
+    const predictions = Array.from({ length: 25 }, (_, i) => ({ step: i + 1, action: 'verify', expect: i === 23 ? '218 tests will pass' : `Expectation ${i + 1}: ${'context '.repeat(500)}`, actual: i === 23 ? '231 tests passed' : `Observation ${i + 1}: ${'evidence '.repeat(250)}`, outcome: 'success' }));
+    const record = { taskId: 'worker', agentName: 'Worker', phase: 'done', predictions, injectedKnowledge: [], transcript: 'context'.repeat(10000) };
+    await caller.call(goals.id, 'recordTaskEvidence', { goalId, taskId: 'worker', record });
+    reviewer.taskExtras.set('review', { kind: 'review', goalId, records: [record] });
+    const dossier = await reviewer.buildLearningDossier('Review', record.transcript, [record]);
+    assert(dossier.length <= 40000);
+    for (const p of predictions) assert(dossier.includes(`worker step ${p.step}:`), `step ${p.step} must have an index row`);
+    assert.match(dossier, /218 tests will pass/); assert.match(dossier, /231 tests passed/);
+    const first = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: { assessments: predictions.slice(0, 22).map(p => ({ taskId: 'worker', step: p.step, verdict: 'supported', explanation: 'Observed result agrees with this expectation' })) } });
+    assert.equal(first.accepted, false); assert.match(first.reason, /3 predictions/);
+    for (const step of [23, 24, 25]) assert(first.reason.includes(`worker step ${step}:`));
+    assert(!first.reason.includes('worker step 1:'));
+    const done = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: { assessments: predictions.slice(22).map(p => ({ taskId: 'worker', step: p.step, verdict: p.step === 24 ? 'contradicted' : 'unresolved', explanation: p.step === 24 ? 'Expected 218 but observed 231 passing tests' : 'The excerpt does not establish all details' })) } });
+    assert.equal(done.accepted, true); assert.equal(done.result.predictions.total, 25);
+    assert.equal(done.result.predictions.contradicted, 1); assert.equal(done.result.predictions.unresolved, 2);
+    assert.equal(done.result.predictions.unassessed.length, 0);
+  } finally { await f.stop(); }
+});
+
+test('older observed output pages become retrievable references without compression calls', async () => {
+  const f = await fixture();
+  try {
+    const llm = await f.add(new Endpoint('LLM')); let compressions = 0;
+    llm.on('compress', () => { compressions++; throw new Error('Unexpected compression'); });
+    const runtime: any = await f.add(new Runtime());
+    const entry: any = { state: { llmMessages: [{ role: 'system', content: 'Review every page' }] }, config: { maxConversationMessages: 200, pinnedMessageCount: 1 } };
+    for (let i = 0; i < 15; i++) {
+      const text = `PAGE-${i}\n${'diff details\n'.repeat(2200)}`;
+      entry.state.action = { action: 'read_output', id: 'source-output', offset: i * 30000, expect: 'The requested page is visible' };
+      entry.state.lastResult = { success: true, data: { nextOffset: (i + 1) * 30000 }, payload: text, payloadMode: 'page' };
+      runtime.absorbResultPayload(entry); runtime.addActionResultToConversation(entry);
+      await runtime.trimConversation(entry);
+      assert(entry.state.llmMessages.at(-1).content.includes(text), 'newly requested pages reach the model whole');
+      runtime.markConversationObserved(entry);
+      entry.state.llmMessages.push({ role: 'assistant', content: `Reviewed page ${i}; finding: preserve this reasoning` });
+    }
+    assert.equal(compressions, 0);
+    assert(entry.state.llmMessages.some((m: any) => m.content.includes('[Page body omitted from active context.]')));
+    assert(entry.state.llmMessages.some((m: any) => m.content.includes('Reviewed page 0; finding: preserve this reasoning')));
+    const held = entry.payloads[0]; assert.match(runtime.readChunk(entry, { id: held.id }), /diff details/);
+    assert(entry.state.llmMessages.reduce((n: number, m: any) => n + m.content.length, 0) < 140000);
+  } finally { await f.stop(); }
+});
+
+test('registered project scope follows task switches and goal evidence without accepting foreign updates', async () => {
+  const f = await fixture();
+  try {
+    const owner = await f.add(new Endpoint('ExternalCreator')), outsider = await f.add(new Endpoint('Unrelated'));
+    const projects: any = await f.add(new Projects());
+    projects.projects.set('first', { name: 'first', root: '/tmp/first' }); projects.projects.set('second', { name: 'second', root: '/tmp/second' });
+    const runtime: any = await f.add(new Runtime());
+    const entry: any = { agentId: owner.id, state: { id: 'work', task: 'Review repository', llmMessages: [] }, config: { knowledgeScope: 'project:first', terminalActions: {}, intermediateActions: [] } };
+    runtime.taskEntries.set('work', entry);
+    await assert.rejects(outsider.call(runtime.id, 'setTaskProject', { taskId: 'work', name: 'second' }), /Only the active task agent/);
+    await assert.rejects(owner.call(runtime.id, 'setTaskProject', { taskId: 'work', name: 'missing' }), /Registered project unavailable/);
+    const switched = await owner.call(runtime.id, 'setTaskProject', { taskId: 'work', name: 'second', systemPrompt: 'Second project instructions' });
+    assert.equal(switched.knowledgeScope, 'project:second'); assert.equal(entry.refreshKnowledgePrompt, true);
+    assert.deepEqual(entry.knowledgeScopes, ['project:first', 'project:second']);
+    const kb = await f.add(new Endpoint('KnowledgeBase')); const scopes: string[] = [];
+    kb.on('recall', msg => { scopes.push((msg.payload as any).scope); return []; }); kb.on('weave', msg => { scopes.push((msg.payload as any).scope); return { patterns: [] }; }); kb.on('listTags', () => []);
+    await runtime.initializeConversation(entry);
+    assert.deepEqual(scopes, ['project:second', 'project:second', 'project:second']);
+    const reviewer: any = await f.add(new Reviewer());
+    assert.equal(reviewer.reviewScope([{ knowledgeScope: 'project:second' }]), 'project:second');
+    assert.equal(reviewer.reviewScope([{ knowledgeScopes: entry.knowledgeScopes }]), undefined, 'multi-project evidence has no guessed common scope');
+    const goals = await f.add(new Endpoint('GoalManager')), scrum: any = await f.add(new Scrum()); scrum.goalManagerId = goals.id;
+    let goal: any = { title: 'Review first', description: 'Commit changes', scratchpad: {} }; goals.on('getGoal', () => goal);
+    assert.equal(await scrum.knowledgeScopeForGoal('goal'), 'project:first');
+    goal = { title: 'Review work', scratchpad: { 'learning/task/work': { knowledgeScope: 'project:second' } } };
+    assert.equal(await scrum.knowledgeScopeForGoal('goal'), 'project:second');
+    goal.scratchpad['learning/task/work'].knowledgeScopes = ['project:first', 'project:second'];
+    assert.equal(await scrum.knowledgeScopeForGoal('goal'), undefined);
+  } finally { await f.stop(); }
 });

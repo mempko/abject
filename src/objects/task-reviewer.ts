@@ -76,6 +76,8 @@ interface TaskCompletedEvent {
 }
 
 interface TranscriptResponse {
+  knowledgeScope?: string;
+  knowledgeScopes?: string[];
   taskId: string;
   agentName: string;
   task: string;
@@ -98,6 +100,8 @@ interface LearningUpdate {
 }
 
 interface ReviewTaskExtra {
+  knowledgeScope?: string;
+  fullKnowledgeRefs?: Record<string, string>;
   decisions?: LearningDecision[];
   knowledgeRefs?: Record<string, string>;
   repairDecisionId?: string;
@@ -266,9 +270,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private setupHandlers(): void {
     this.on('recordKnowledgeSelection', async msg => {
       await this.requireTaskRuntime(msg, this.agentAbjectId);
-      const { taskId, selection } = msg.payload as { taskId: string; selection: { id: string; knowledgeRef?: string } };
+      const { taskId, selection } = msg.payload as { taskId: string; selection: { id: string; knowledgeRef?: string; complete?: boolean } };
       const extra = this.taskExtras.get(taskId);
       if (extra && selection.knowledgeRef) (extra.knowledgeRefs ??= {})[selection.id] = selection.knowledgeRef;
+      if (extra && selection.knowledgeRef && selection.complete) (extra.fullKnowledgeRefs ??= {})[selection.id] = selection.knowledgeRef;
       return { success: !!extra };
     });
     this.on('completeReview', async msg => {
@@ -422,6 +427,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   /** Every proposal is durable before lookup/validation. Both action forms use this path. */
   private async proposeLearning(taskId: string, effects: unknown[], context: Record<string, unknown>): Promise<LearningDecision> {
     const extra = this.taskExtras.get(taskId)!;
+    context = { ...context, scope: context.scope ?? extra.knowledgeScope };
     if (!extra.goalId || !this.goalManagerId) throw new Error('Episode-linked learning requires a goal');
     const r = await this.request<{ success: boolean; decision: LearningDecision }>(request(this.id, this.goalManagerId, 'recordLearningDecision', {
       goalId: extra.goalId, reviewTaskId: taskId, operationId: `${taskId}:${await learningFingerprint({ effects, context })}`, context, effects,
@@ -455,6 +461,12 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       const ref = extra.knowledgeRefs?.[String(effect.input.id)];
       if (!effect.attempts && !effect.input.knowledgeRef && ref) decision = await this.changeEffect(decision, effect, { prepare: { knowledgeRef: ref } });
+      if (!effect.attempts && effect.input.action === 'supersede_entry') {
+        // Only a complete, model-visible read can select an unchanged replacement.
+        // A replacement revised in this decision is instead bound to its receipt.
+        const replacementRef = extra.fullKnowledgeRefs?.[String(effect.input.replacementId)];
+        decision = await this.changeEffect(decision, effect, { prepare: { replacementRef: replacementRef ?? null } });
+      }
     }
     decision = await this.applyDecision(decision, extra);
     for (const e of decision.effects) if (e.state === 'applied' && e.input.action === 'record_pattern_application') (extra.applicationAssessments ??= {})[`${e.input.taskId}:${e.input.step}:${e.input.id}`] = String(e.input.verdict);
@@ -508,19 +520,22 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         const taskId = `learning-repair-${decision.id}-${Date.now()}`;
         const refs: Record<string, string> = {};
         const claims = [];
-        for (const e of claim.decision.effects.filter(e => e.state === 'waiting' && e.repairClaimed)) {
-          const entry = await this.request<{ id: string; knowledgeRef?: string } | null>(request(this.id, this.knowledgeBaseId!, 'get', { id: e.input.id })).catch(() => null);
+        const targets = [...new Set(claim.decision.effects.filter(e => e.state === 'waiting' && e.repairClaimed).flatMap(e => [e.input.id, e.input.replacementId]).filter(id => typeof id === 'string'))];
+        for (const id of targets) {
+          const entry = await this.request<{ id: string; knowledgeRef?: string } | null>(request(this.id, this.knowledgeBaseId!, 'get', { id })).catch(() => null);
           if (entry?.knowledgeRef) refs[entry.id] = entry.knowledgeRef;
           claims.push(entry);
         }
-        this.taskExtras.set(taskId, { kind: 'repair', goalId: decision.goalId, repairDecisionId: decision.id, decisions: [claim.decision], knowledgeRefs: refs, fullMaterial: JSON.stringify(claim.decision), records: Object.entries(claim.decision.evidence).filter(([key]) => key.startsWith('learning/task/')).map(([,r]) => r as TranscriptResponse) });
+        const records = Object.entries(claim.decision.evidence).filter(([key]) => key.startsWith('learning/task/')).map(([,r]) => r as TranscriptResponse);
+        const knowledgeScope = typeof decision.context.scope === 'string' ? decision.context.scope : this.reviewScope(records);
+        this.taskExtras.set(taskId, { kind: 'repair', goalId: decision.goalId, repairDecisionId: decision.id, decisions: [claim.decision], knowledgeRefs: refs, fullMaterial: JSON.stringify(claim.decision), records, knowledgeScope });
         this.inFlight = { ticketId: taskId, startedAt: Date.now() };
         try {
           await this.request(request(this.id, this.agentAbjectId!, 'startTask', { taskId,
             task: 'Repair only the unfinished learning effects. Preserve uncertainty and unaffected claims.',
             systemPrompt: this.reviewSystemPrompt() + '\nThis is one focused repair, not a new retrospective. Return done with result.repairs:[{effectId, input:{action,id,evidence,...}}]. Use evidenceRefs already recorded in the decision. If evidence does not justify a change, use no_change with a reason or leave the item waiting. Do not repeat completed effects or assessments. No additional repair turn will be scheduled automatically.',
             initialMessages: [{ role: 'user', content: JSON.stringify({ decisionId: decision.id, goalId: decision.goalId, context: { evidence: decision.context.evidence, scope: decision.context.scope, recoveredFrom: decision.context.recoveredFrom }, effects: claim.decision.effects.filter(e => e.state === 'waiting' && e.repairClaimed).slice(0,20).map(e => ({ id:e.id, input:{...e.input,content:typeof e.input.content === 'string' ? e.input.content.slice(0,1200) : undefined}, error:e.error })), evidence: Object.entries(decision.evidence).slice(0,12).map(([key,value]) => ({ key, preview:JSON.stringify(value).slice(0,1200), length:JSON.stringify(value).length })), currentClaims: claims.slice(0,20).map(e => e ? {...e,learning:undefined,pattern:undefined,content:String((e as any).content ?? '').slice(0,1200)} : null), readMore:'read_evidence with offset/length returns the complete original decision; taskId or key reads complete recorded evidence. Previews may omit important context.' }) }],
-            config: { maxSteps: 3, timeout: 90000, budgetGoalId: decision.goalId },
+            config: { maxSteps: 3, timeout: 90000, budgetGoalId: decision.goalId, knowledgeScope },
           }), 15000);
           this.reviewsToday++;
         } catch (err) { this.inFlight = undefined; this.taskExtras.delete(taskId); log.warn(`Focused learning repair could not start: ${String(err)}`); }
@@ -540,6 +555,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         if (!d || !effect || (d.reviewTaskId !== taskId && extra.repairDecisionId !== d.id)) throw new Error('Repair is outside this review');
         const input = action.input && typeof action.input === 'object' ? { ...action.input as Record<string,unknown> } : {};
         const ref = extra.knowledgeRefs?.[String(input.id)]; if (ref) input.knowledgeRef = ref;
+        if (input.action === 'supersede_entry') input.replacementRef = extra.fullKnowledgeRefs?.[String(input.replacementId)] ?? null;
         const changed = await this.changeEffect(d,effect,{repair:input});
         const settled = await this.applyDecision(changed,extra);
         extra.decisions = [...(extra.decisions ?? []).filter(v => v.id !== d.id),settled];
@@ -604,6 +620,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         if (!effect || !repair.input || typeof repair.input !== 'object' || extra.cancelled) continue;
         const input = { ...repair.input };
         if (input.id && extra.knowledgeRefs?.[input.id]) input.knowledgeRef = extra.knowledgeRefs[input.id];
+        if (input.action === 'supersede_entry') input.replacementRef = extra.fullKnowledgeRefs?.[input.replacementId] ?? null;
         decision = await this.changeEffect(decision, effect, { repair: input });
       }
       extra.decisions = [await this.applyDecision(decision, extra)];
@@ -618,11 +635,13 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       else extra.completionIssues.push('Invalid standalone correction');
     }
     if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
-    const hasObservedPredictions = extra.records?.some(r => r.predictions?.some(p => p.expect?.trim() && p.outcome !== 'unknown'));
-    const hasAssessmentAttempt = extra.updates?.some(u => u.action.action === 'assess_prediction');
-    if (!extra.cancelled && extra.kind === 'review' && hasObservedPredictions && !hasAssessmentAttempt && !extra.completionIssues.length && !extra.completionCorrectionSent) {
+    const missing = (extra.records ?? []).flatMap(r => (r.predictions ?? [])
+      .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
+    if (!extra.cancelled && extra.kind === 'review' && missing.length && !extra.completionIssues.length && !extra.completionCorrectionSent) {
       extra.completionCorrectionSent = true;
-      return { accepted: false, reason: 'The review contains observed predictions but no semantic assessments. In your next done action, put assessments in result: {assessments:[{taskId,step,verdict,explanation}],applications:[]}. Compare expected and actual evidence; a successful command does not establish the prediction. Use unresolved with a specific evidence gap when necessary. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason. This correction is requested once; remaining gaps will settle as partial.' };
+      const budget = Math.max(0, Math.floor(12000 / missing.length) - 160);
+      const gaps = missing.map(({ taskId, p }) => `${taskId} step ${p.step}: expected=${p.expect.slice(0, budget / 2)}; actual=${String(p.actual ?? '').slice(0, budget / 2)}`).join('\n');
+      return { accepted: false, reason: `${missing.length} predictions still lack semantic assessments:\n${gaps}\nIn your next done action, include only missing assessments in result: {assessments:[{taskId,step,verdict,explanation}]}. Compare expected and actual evidence; successful operation status does not establish the prediction. Use read_evidence with taskId and step for full observations, or unresolved with a specific evidence gap. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason. This correction is requested once; remaining gaps settle as partial.` };
     }
     const report = this.learningReport(extra, extra.cancelled);
     return { accepted: true, result: report, evidence: report };
@@ -647,11 +666,13 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       else { patternCounts.unresolved++; unassessedApplications.push({ taskId: r.taskId, step: p.step, id: applied.id, applicationRef: applied.applicationRef }); }
     }
     const learningEffects = (extra?.decisions ?? []).flatMap(d => d.effects.map(e => ({ decisionId: d.id, ...e })));
+    const allSaved = [...saved, ...learningEffects.filter(e => e.state === 'applied')];
+    const allPending = [...pending, ...learningEffects.filter(e => e.state !== 'applied' && e.state !== 'abandoned')];
     const status = interrupted || learningEffects.some(e => e.state !== 'applied' && e.state !== 'abandoned') || extra?.completionIssues?.length || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
-    return { status, interrupted, saved: [...saved, ...learningEffects.filter(e => e.state === 'applied')], pending: [...pending, ...learningEffects.filter(e => e.state !== 'applied' && e.state !== 'abandoned')], decisions: extra?.decisions ?? [], attempts: updates, limitations: extra?.completionIssues ?? [],
+    return { status, interrupted, saved: allSaved, pending: allPending, decisions: extra?.decisions ?? [], attempts: updates, limitations: extra?.completionIssues ?? [],
       predictions: { total: episodes.size, ...counts, unassessed },
       patterns: { ...patternCounts, unassessed: unassessedApplications },
-      summary: `Learning review ${status}: ${saved.length} updates saved, ${pending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
+      summary: `Learning review ${status}: ${allSaved.length} updates saved, ${allPending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -913,7 +934,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       pieces.push(part); remaining -= part.length + 2;
     };
     append(`Learning dossier: ${records.length} task records. Task success is not prediction accuracy. Missing predictions are unknown, not confirmations.\nUse read_evidence with taskId and optional step for observations, key for learning/plans or learning/observation/<operationId>, or offset/length for complete material.`, 1000);
-    append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; ${r.predictions?.length ?? 0} observations, ${r.predictions?.filter(p => p.verdict === 'contradicted').length ?? 0} operation contradictions`).join('\n'), 4000);
+    append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; scopes=${JSON.stringify(r.knowledgeScopes ?? (r.knowledgeScope ? [r.knowledgeScope] : []))}; observation steps=[${(r.predictions ?? []).map(p => p.step).join(',')}]. Every listed step needs an assessment or an explicit evidence gap.`).join('\n'), 6000);
     // Owner-provided completion evidence includes checks that ran before the
     // first model action. They can disprove recalled claims about capabilities.
     const outcomeBudget = Math.floor(3600 / Math.max(1, records.length));
@@ -925,12 +946,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }).join('\n'), 4200);
     // Index surprises across ALL tasks, including tasks omitted from transcript excerpts.
     const predictions = records.flatMap(r => (r.predictions ?? []).map(p => ({ r, p })));
+    append('Declared pattern applications (seeing a pattern does not establish its usefulness):\n' + predictions.flatMap(({ r, p }) =>
+      (p.patterns ?? []).map(pattern => `${r.taskId} step ${p.step}: ${pattern.id}; ${pattern.why ?? ''}`)).join('\n'), 2500);
     predictions.sort((a, b) => Number(b.p.verdict === 'contradicted') - Number(a.p.verdict === 'contradicted'));
-    append(`Prediction/feedback index (${predictions.length} observations):\n` + predictions.map(({ r, p }) =>
-      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, semantic=unresolved; expected=${p.expect || '(missing)'}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, 700)}; patterns=${JSON.stringify(p.patterns ?? [])}`).join('\n'), 16000);
+    const rowBudget = Math.floor(15500 / Math.max(1, predictions.length));
+    const detailsBudget = Math.max(0, rowBudget - 180);
+    append(`Prediction/feedback index (${predictions.length} observations; excerpts are not complete evidence):\n` + predictions.map(({ r, p }) =>
+      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}; expected=${(p.expect || '(missing)').slice(0, detailsBudget / 2)}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, detailsBudget / 2)}`).join('\n'), 16000);
     const kb = await this.getKbId();
     if (kb) {
-      const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: task, limit: 6, previews: true })).catch(() => []);
+      const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: task, limit: 6, previews: true, scope: this.reviewScope(records) })).catch(() => []);
       const injected = records.flatMap(r => (r.injectedKnowledge ?? []).map(k => ({ ...k, taskId: r.taskId })));
       // Relevant claims and declared applications precede always-injected
       // profile facts. Legacy snapshots have no source; rank their recalled
@@ -953,7 +978,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         append(JSON.stringify({ id: ids[i], title: current?.title ?? selected[0]?.title,
           injectedIn: selected.map(k => k.taskId), selectedRefs: selected.map(k => k.knowledgeRef ?? null), knowledgeRef: current?.knowledgeRef,
           shownClaim: selected[0]?.content?.slice(0, claimBudget) ?? '(legacy snapshot: claim text not captured)',
-          currentClaim: current?.content?.slice(0, claimBudget) ?? '(unavailable)', type: current?.type,
+          currentClaim: current?.content?.slice(0, claimBudget) ?? '(unavailable)', claimLength: current?.content?.length, excerpt: (current?.content?.length ?? 0) > claimBudget, type: current?.type,
         }), perEntry);
       }
     }
@@ -962,10 +987,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return pieces.join('\n\n');
   }
 
+  private reviewScope(records: TranscriptResponse[]): string | undefined {
+    const scopes = [...new Set(records.flatMap(r => r.knowledgeScopes ?? (r.knowledgeScope ? [r.knowledgeScope] : [])))];
+    return scopes.length === 1 ? scopes[0] : undefined;
+  }
+
   private async launchReview(task: string, material: string, reviewedTaskIds: string[], goalId?: string, records: TranscriptResponse[] = []): Promise<void> {
     const taskId = `review-${goalId ?? 'standalone'}-${Date.now()}`;
     this.inFlight = { ticketId: taskId, startedAt: Date.now() };
-    this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material });
+    const knowledgeScope = this.reviewScope(records);
+    this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material, knowledgeScope });
     const refs: Record<string, string> = {};
     const dossier = await this.buildLearningDossier(task, material, records, refs);
     this.taskExtras.get(taskId)!.knowledgeRefs = refs;
@@ -975,7 +1006,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           taskId, task,
           systemPrompt: this.reviewSystemPrompt(),
           initialMessages: [{ role: 'user', content: dossier }],
-          config: { maxSteps: 8, timeout: 180000, budgetGoalId: goalId },
+          config: { maxSteps: 8, timeout: 180000, budgetGoalId: goalId, knowledgeScope },
         }),
         15000,
       );
@@ -1029,7 +1060,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const extra = this.taskExtras.get(taskId) ?? { kind: 'review' as const };
     this.taskExtras.set(taskId, extra);
 
-    if (!(await this.getKbId())) {
+    if (!['assess_prediction', 'read_evidence'].includes(action.action) && !(await this.getKbId())) {
       return { success: false, error: 'KnowledgeBase not available' };
     }
     if (extra.cancelled) return { success: false, error: 'Review cancelled' };
@@ -1075,7 +1106,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           const query = action.query as string;
           if (!query) return { success: false, error: 'recall_knowledge requires "query"' };
           const hits = await this.request<Array<{ id: string; title: string; type: string; snippet: string }>>(
-            request(this.id, this.knowledgeBaseId!, 'recall', { query, limit: 6, previews: true }),
+            request(this.id, this.knowledgeBaseId!, 'recall', { query, limit: 6, previews: true, scope: extra.knowledgeScope }),
             10000,
           );
           result = hits.length > 0
@@ -1450,6 +1481,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return `You are a post-task reviewer. Work in this workspace just finished: either a goal (with the transcripts of every task that ran under it, across one or more agents) or a single standalone task. The conversation above contains the material: the outcome, each task's transcript, and the knowledge entries that were injected into each agent's prompt. Your job is to grow the workspace's long-term memory from this experience, then finish. The doing is over; you only distill.
 
 Assess each prediction and pattern against its observed episode. A failed goal can contain useful approaches, and a successful goal can contain false predictions. Separate local evidence from the overall outcome.
+
+The observation-step manifest lists the complete assessment coverage. Do not infer agreement from a truncated excerpt. Read full evidence when an excerpt cannot establish the comparison, especially final verification and commit outcomes. Record supported, contradicted, or unresolved with an explanation for every listed step. The runtime may request one targeted correction for omissions.
+
+Before superseding a claim, reconcile the replacement too. A promising title or excerpt is insufficient: recall by id to read its complete current content. If it is stale, update it in the same learning decision before supersession. If it is already accurate, provide replacementEvidence explaining how its current claims agree with recorded episode evidence; the runtime captures its selected version. Alternatively, confirm_entry in the same decision records this evidence-backed confirmation. Do not invent version numbers. A no_change with a reason or an explicit dispute is valid when replacement accuracy remains uncertain. Use the recorded project scope; multi-project evidence must not be assigned a guessed common scope.
 
 ## Output Format
 Respond with ONE JSON action object inside \`\`\`json fenced code markers. Output ONLY the JSON block; put any brief note in the action's "reasoning" field.

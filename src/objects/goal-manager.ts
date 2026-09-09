@@ -1425,7 +1425,7 @@ reviews results and either plans another round or completes/fails the goal.
                   return { id: uuidv4(), input, original, state: 'proposed', attempts: 0, nextAttemptAt: 0, history: [] };
                 }) };
               for (const e of decision.effects) if (['archive_entry','supersede_entry'].includes(String(e.input.action))) {
-                e.dependsOn = decision.effects.filter(other => other !== e && ['save_entry','save_pattern','update_entry','update_pattern','narrow_entry'].includes(String(other.input.action))
+                e.dependsOn = decision.effects.filter(other => other !== e && ['save_entry','save_pattern','update_entry','update_pattern','narrow_entry','confirm_entry'].includes(String(other.input.action))
                   && (!e.input.replacementId || e.input.replacementId === other.input.id)).map(other => other.id);
                 if (e.dependsOn.length) e.error = 'Waiting for acknowledged replacement effects';
               }

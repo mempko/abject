@@ -1460,6 +1460,7 @@ clean result I did not observe.`;
     this.announceTaskStarted(extra);
     const others = await this.siblings(extra);
     const projectInstructions = await this.buildProjectBlock(extra);
+    await this.request(request(this.id, this.agentAbjectId!, 'setTaskProject', { taskId: extra.taskId, name: project.name, systemPrompt: `${this.buildSystemPrompt()}\n\n${projectInstructions}` }));
     const siblingLine = others.length > 0 ? `\n${this.renderSiblings(others)}` : '';
     return { success: true, data: `Working in ${project.name} at ${extra.workRoot}.\n${projectInstructions}\n${this.baselineSummary(extra)}${siblingLine}` };
   }
@@ -1914,6 +1915,7 @@ clean result I did not observe.`;
           initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
           config: {
             maxSteps: 50,
+            knowledgeScope: extra.project ? `project:${extra.project.name}` : undefined,
             timeout: 1_800_000,
             queueName: `external-creator-${args.taskId}`,
           },

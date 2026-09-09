@@ -773,9 +773,20 @@ class KnowledgeBase final : public Object {
       if (!creating && it->second.origin == "user" && action != "dispute_entry" && action != "confirm_entry" && action != "record_pattern_application") { reject("User-authored knowledge is protected; record a supported dispute instead"); return; }
       const std::string scope = str_or(input, "scope", "");
       if (action == "archive_entry" && !scope.empty()) { reject("Scoped retirement requires supersede_entry and an applicable replacement"); return; }
+      json replacement_snapshot;
       if (action == "supersede_entry") {
         auto replacement = entries_.find(str_or(input, "replacementId", ""));
         if (replacement == entries_.end() || !replacement->second.applicable(scope) || (replacement->second.learning.is_object() && !str_or(replacement->second.learning,"scope","").empty() && str_or(replacement->second.learning,"scope","") != scope)) { reject("Replacement must be saved and applicable before supersession"); return; }
+        std::string revised_id;
+        for (const auto& candidate : decision["effects"]) {
+          const auto& proposal = candidate["input"];
+          const auto disposition = str_or(proposal, "action", "");
+          if (str_or(proposal, "id", "") == replacement->second.id && (disposition == "save_entry" || disposition == "update_entry" || disposition == "confirm_entry")) revised_id = str_or(candidate, "id", "");
+        }
+        const auto history = replacement->second.learning.is_object() ? replacement->second.learning.value("history", json::array()) : json::array();
+        const auto expected_ref = revised_id.empty() ? str_or(input, "replacementRef", "") : !history.empty() && str_or(history.back(), "effectId", "") == revised_id ? json::array({replacement->second.id, history.back()["at"], history.back()["revision"]}).dump() : "";
+        if (replacement->second.knowledge_ref() != expected_ref) { reject("Replacement version changed; reread and reconcile its claims"); return; }
+        replacement_snapshot = {{"id", replacement->second.id}, {"knowledgeRef", replacement->second.knowledge_ref()}, {"title", replacement->second.title}, {"content", replacement->second.content}};
       }
       Entry next = creating ? Entry() : it->second;
       json before = creating ? json(nullptr) : next.to_json();
@@ -810,6 +821,7 @@ class KnowledgeBase final : public Object {
       next.learning["revision"] = int_or(next.learning,"revision",0) + 1;
       next.updated_at = now;
       json receipt = {{"effectId",effect_id},{"decisionId",decision["id"]},{"goalId",decision["goalId"]},{"revision",next.learning["revision"]},{"at",now},{"before",before},{"input",input},{"evidence",decision["evidence"]}};
+      if (!replacement_snapshot.is_null()) receipt["replacement"] = replacement_snapshot;
       next.learning["history"].push_back(receipt);
       pending_learning_.insert(id);
       request("@Storage", "set", {{"key",ENTRY_KEY_PREFIX + id},{"value",next.to_json()}}, [this, correlation, next, receipt, creating](const Result& saved) {

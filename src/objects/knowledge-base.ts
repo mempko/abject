@@ -10,7 +10,7 @@
  */
 
 import { withKeyedLock } from '../core/keyed-lock.js';
-import { knowledgeRef, applicable, preservesLearning, validateLearningEffect, type KnowledgeLearning, type LearningDecision } from '../core/learning.js';
+import { knowledgeRef, applicable, preservesLearning, replacementEffect, validateLearningEffect, type KnowledgeLearning, type LearningDecision } from '../core/learning.js';
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import { v4 as uuidv4 } from 'uuid';
 import { DatabaseSync } from 'node:sqlite';
@@ -907,9 +907,15 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (creating ? !!existing : !existing) return { success: false, conflict: true, error: creating ? 'Target already exists' : 'Knowledge target unavailable' };
       if (existing && input.action !== 'record_pattern_application' && knowledgeRef(existing) !== input.knowledgeRef) return { success: false, conflict: true, error: 'Selected knowledge version changed', currentRef: knowledgeRef(existing) };
       if (existing?.origin === 'user' && !['dispute_entry','confirm_entry','record_pattern_application'].includes(String(input.action))) return { success: false, protected: true, error: 'User-authored knowledge is protected; record a supported dispute instead' };
+      let replacementSnapshot: unknown;
       if (input.action === 'supersede_entry') {
         const replacement = this.entries.get(String(input.replacementId));
         if (!replacement || !applicable(replacement, String(input.scope ?? '')) || (replacement.learning?.scope && replacement.learning.scope !== input.scope)) return { success: false, error: 'Replacement must be saved and applicable before supersession' };
+        const revised = replacementEffect(decision, effect);
+        const acknowledged = replacement.learning?.history.at(-1);
+        const expectedRef = revised && acknowledged?.effectId === revised.id ? JSON.stringify([replacement.id, acknowledged.at, acknowledged.revision]) : revised ? undefined : input.replacementRef;
+        if (knowledgeRef(replacement) !== expectedRef) return { success: false, conflict: true, error: 'Replacement version changed; reread and reconcile its claims' };
+        replacementSnapshot = { id: replacement.id, knowledgeRef: knowledgeRef(replacement), title: replacement.title, content: replacement.content };
       }
       const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
       const entry: KnowledgeEntry = existing ? structuredClone(existing) : { id: String(input.id), title: String(input.title), content: String(input.content), type: (input.type as KnowledgeType) ?? 'learned', tags: (input.tags as string[]) ?? [], origin: 'reviewer', createdBy: this.id, createdAt: now, updatedAt: now, archived: false, accessCount: 0, lastAccessedAt: 0, usefulCount: 0, lastUsefulAt: 0 };
@@ -936,7 +942,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (input.action === 'narrow_entry' || creating && input.scope) learning.scope = String(input.scope);
       learning.revision++;
       const before = existing ? { ...existing, learning: undefined } : null;
-      const accepted = { effectId: effect.id, decisionId: decision.id, goalId: decision.goalId, revision: learning.revision, at: now, before, input: structuredClone(input), evidence: structuredClone(decision.evidence) };
+      const accepted = { effectId: effect.id, decisionId: decision.id, goalId: decision.goalId, revision: learning.revision, at: now, before, input: structuredClone(input), evidence: structuredClone(decision.evidence), ...(replacementSnapshot ? { replacement: replacementSnapshot } : {}) };
       learning.history.push(accepted); entry.updatedAt = now;
       // A successful response is a durable receipt, never an optimistic map update.
       if (creating && entry.type === 'pattern') entry.content = this.revisePatternContent(entry.title, entry.content);

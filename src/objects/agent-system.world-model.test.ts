@@ -74,6 +74,27 @@ async function fixture(native = false) {
 }
 
 for(const native of [false,true]) {
+  test(`${native ? 'native' : 'typescript'}: supersession requires a reconciled replacement and preserves its selected claim`, async () => {
+    const f = await fixture(native);
+    try {
+      const old = await f.seed('No test runner', 'No test runner exists');
+      const replacement = await f.seed('Corrected tests', 'There are standalone tests but no package test script');
+      const base = { action: 'supersede_entry', id: old.id, knowledgeRef: old.knowledgeRef, replacementId: replacement.id, scope: 'project:abject' };
+      const unchecked = await f.decision([base]);
+      assert.equal((await f.apply(unchecked)).success, false, 'an existing replacement alone is insufficient');
+      const stale = await f.decision([{ ...base, replacementRef: replacement.knowledgeRef, replacementEvidence: 'This version was reviewed against the episode' }]);
+      const revision = await f.decision([{ action: 'update_entry', id: replacement.id, knowledgeRef: replacement.knowledgeRef, content: 'The package test script ran 198 tests successfully' }]);
+      assert.equal((await f.apply(revision)).success, true);
+      assert.equal((await f.apply(stale)).success, false, 'replacement revisions invalidate an earlier review');
+      const current = await f.runtime.call(f.kb.id, 'get', { id: replacement.id });
+      const confirmed = await f.decision([{ ...base, replacementRef: current.knowledgeRef, replacementEvidence: 'The full replacement states that the package test script ran 198 tests, matching owner verification' }]);
+      const applied = await f.apply(confirmed); assert.equal(applied.success, true, JSON.stringify(applied));
+      assert.equal(applied.receipt.replacement.content, current.content);
+      assert.equal(applied.receipt.replacement.knowledgeRef, current.knowledgeRef);
+      const recalled = await f.runtime.call(f.kb.id, 'recall', { scope: 'project:abject' });
+      assert(!recalled.some((e: any) => e.id === old.id));
+    } finally { await f.stop(); }
+  });
   const implementation=native?'wasm':'typescript';
   test(`${implementation}: a correction bundle inherits explicit evidence, survives lost ack/restart, and changes subsequent recall`,async()=>{
     const f=await fixture(native);
@@ -146,6 +167,27 @@ for(const native of [false,true]) {
     }finally{await f.stop();}
   });
 }
+
+test('reviewer captures replacement versions from full reads and repairs the original decision', async () => {
+  const f = await fixture();
+  try {
+    const old = await f.seed('Tests unavailable', 'No test script');
+    const replacement = await f.seed('Current verification', 'The package test script passed 198 tests');
+    const act = (action: unknown) => f.runtime.call(f.reviewer.id, 'agentAct', { taskId: 'review', action });
+    const input = { action: 'supersede_entry', id: old.id, replacementId: replacement.id, scope: 'project:abject', replacementRef: replacement.knowledgeRef, replacementEvidence: 'The replacement matches owner verification of 198 passing tests' };
+    const first = await act({ action: 'learn', context: { evidence: 'Owner verified the test script', evidenceRefs: ['learning/task/worker'] }, effects: [input] });
+    let decision = first.data;
+    assert.equal(decision.effects[0].state, 'needs_repair', 'a model-supplied reference cannot claim the replacement was fully read');
+    await f.runtime.call(f.reviewer.id, 'recordKnowledgeSelection', { taskId: 'review', selection: { id: replacement.id, knowledgeRef: replacement.knowledgeRef, complete: false } });
+    const partial = await act({ action: 'repair_learning', decisionId: decision.id, effectId: decision.effects[0].id, input });
+    decision = partial.data;
+    assert.equal(decision.effects[0].state, 'needs_repair');
+    await f.runtime.call(f.reviewer.id, 'recordKnowledgeSelection', { taskId: 'review', selection: { id: replacement.id, knowledgeRef: replacement.knowledgeRef, complete: true } });
+    const repaired = await act({ action: 'repair_learning', decisionId: decision.id, effectId: decision.effects[0].id, input });
+    assert.equal(repaired.data.id, decision.id); assert.equal(repaired.data.effects[0].state, 'applied');
+    assert.equal(repaired.data.effects[0].receipt.replacement.knowledgeRef, replacement.knowledgeRef);
+  } finally { await f.stop(); }
+});
 
 test('review completion retains malformed effects, links assessments, and does not queue another retrospective',async()=>{
   const f=await fixture();

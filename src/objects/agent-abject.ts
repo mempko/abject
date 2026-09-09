@@ -82,6 +82,8 @@ export interface AgentMessage {
   content: string | ContentPart[];
   /** Set on the stable system message; see LLMMessage.cacheBreakpoint. */
   cacheBreakpoint?: boolean;
+  /** Runtime-owned replacement for an already-observed page, never an LLM summary. */
+  retainedPage?: { payloadId: string; compact: string; seen?: boolean };
 }
 
 /**
@@ -361,6 +363,8 @@ interface QueuedTask {
 }
 
 interface TaskEntry {
+  knowledgeScopes?: string[];
+  refreshKnowledgePrompt?: boolean;
   parentTaskId?: string;
   delivery?: SessionRecord['outbox'][number];
   sessionId?: string;
@@ -914,6 +918,16 @@ export class AgentAbject extends Abject {
               } } },
             },
             {
+              name: 'setTaskProject',
+              description: 'The active task agent selects a registered project and refreshes scoped knowledge.',
+              parameters: [
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owned active task' },
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Registered project name' },
+                { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Updated agent instructions for this project', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, knowledgeScope: { kind: 'primitive', primitive: 'string' } } },
+            },
+            {
               name: 'getTaskTranscript',
               description: 'Fetch a finished task\'s full record for post-task review: the flattened LLM conversation, outcome, which knowledge entries were injected at init, and the prediction ledger (what the agent said it expected before each action, paired with what happened). Only terminal (done/error) tasks have a stable transcript.',
               parameters: [
@@ -1289,7 +1303,7 @@ The registered object must implement these handlers to participate in the agent 
       status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
       snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
         taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
-        injectedKnowledge: entry.injectedKnowledge, patternSelections: entry.patternSelections, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
+        injectedKnowledge: entry.injectedKnowledge, knowledgeScopes: entry.knowledgeScopes, refreshKnowledgePrompt: entry.refreshKnowledgePrompt, patternSelections: entry.patternSelections, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
         children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
       outstandingOperation, ...(usage?{usage}:{}),
       ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
@@ -1564,6 +1578,7 @@ The registered object must implement these handlers to participate in the agent 
       const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
         systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
         goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge, patternSelections: stored.patternSelections,
+        knowledgeScopes: stored.knowledgeScopes, refreshKnowledgePrompt: stored.refreshKnowledgePrompt,
         payloads: stored.payloads, payloadSeq: stored.payloadSeq, pendingPrediction: stored.pendingPrediction, sessionId: p.id, sessionRevision: resumed.session.revision };
       for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
       this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
@@ -1821,6 +1836,23 @@ The registered object must implement these handlers to participate in the agent 
       return { drained };
     });
 
+    this.on('setTaskProject', async msg => {
+      const { taskId, name, systemPrompt } = msg.payload as { taskId: string; name: string; systemPrompt?: string };
+      const entry = this.taskEntries.get(taskId);
+      if (!entry || entry.finished || msg.routing.from !== entry.agentId) throw new Error('Only the active task agent may select its project');
+      const registry = await this.discoverDep('ExternalProjectRegistry');
+      const project = registry ? await this.request<{ name: string } | null>(request(this.id, registry, 'resolveProject', { nameOrPath: name })) : null;
+      if (!project) throw new Error('Registered project unavailable');
+      if (typeof systemPrompt === 'string') entry.systemPrompt = systemPrompt;
+      const scope = `project:${project.name}`;
+      if (entry.config.knowledgeScope !== scope) {
+        entry.knowledgeScopes = [...new Set([...(entry.knowledgeScopes ?? []), ...(entry.config.knowledgeScope ? [entry.config.knowledgeScope] : []), scope])];
+        entry.config.knowledgeScope = scope;
+        entry.refreshKnowledgePrompt = true;
+      }
+      return { success: true, knowledgeScope: scope };
+    });
+
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
       const entry = this.taskEntries.get(taskId);
@@ -1867,6 +1899,8 @@ The registered object must implement these handlers to participate in the agent 
         result: entry.state.result,
         error: entry.state.error,
         goalId: entry.goalId ?? entry.incomingGoalId ?? null,
+        knowledgeScope: entry.config.knowledgeScope,
+        knowledgeScopes: entry.knowledgeScopes,
         injectedKnowledge: entry.injectedKnowledge ?? [],
         predictions: entry.predictions ?? [],
         transcript: flattenTranscript(entry.state.llmMessages),
@@ -2503,6 +2537,7 @@ The registered object must implement these handlers to participate in the agent 
           record: { taskId: entry.state.id, agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
             task: entry.state.task, phase: entry.state.phase, steps: entry.state.step,
             goalId: evidenceGoal, result: entry.state.result, error: entry.state.error,
+            knowledgeScope: entry.config.knowledgeScope, knowledgeScopes: entry.knowledgeScopes,
             injectedKnowledge: entry.injectedKnowledge ?? [], predictions: entry.predictions ?? [],
             transcript: flattenTranscript(entry.state.llmMessages), evidence: entry.acceptanceEvidence },
         }));
@@ -3422,7 +3457,7 @@ The registered object must implement these handlers to participate in the agent 
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
-          messages: task.llmMessages,
+          messages: task.llmMessages.map(({ retainedPage: _page, ...message }) => message),
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
           // Thinking / action decisions run on 'smart' regardless of the observe
@@ -3444,6 +3479,7 @@ The registered object must implement these handlers to participate in the agent 
         60000,
       );
 
+      this.markConversationObserved(entry);
       task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
       const parsed = this.parseAction(entry, llmResult.content);
@@ -3685,6 +3721,14 @@ The registered object must implement these handlers to participate in the agent 
   private async think(entry: TaskEntry): Promise<AgentAction> {
     const task = entry.state;
 
+    if (entry.refreshKnowledgePrompt && task.llmMessages.length) {
+      const history = task.llmMessages.filter(m => m.role !== 'system');
+      const refreshed = await this.initializeConversation(entry);
+      task.llmMessages = [...refreshed.filter(m => m.role === 'system'), ...history,
+        { role: 'user', content: `Active knowledge scope is now ${entry.config.knowledgeScope}. Earlier project observations remain historical; use the refreshed project knowledge for current decisions.` }];
+      entry.refreshKnowledgePrompt = false;
+    }
+
     // Initialize conversation if empty
     if (task.llmMessages.length === 0) {
       task.llmMessages = await this.initializeConversation(entry);
@@ -3709,7 +3753,7 @@ The registered object must implement these handlers to participate in the agent 
     // Build the request first: its message id is the correlation id the
     // chunk events come back with, which is how a chunk finds its own task.
     const streamRequest = request(this.id, this.llmId, 'stream', {
-      messages: task.llmMessages,
+      messages: task.llmMessages.map(({ retainedPage: _page, ...message }) => message),
       // Thinking is the JSON-action-decision step. Tier comes from the
       // agent's per-state observe hint, floored at 'balanced' (never 'fast'
       // — haiku drops the action envelope under load), then adjusted for
@@ -3738,6 +3782,7 @@ The registered object must implement these handlers to participate in the agent 
     let llmResult: { content: string; stopReason?: string };
     try {
       llmResult = await this.request<{ content: string; stopReason?: string }>(streamRequest, 120000);
+      this.markConversationObserved(entry);
     } finally {
       this.streamingEntries.delete(streamRequest.header.messageId);
     }
@@ -3912,14 +3957,15 @@ The registered object must implement these handlers to participate in the agent 
   // Conversation Management
   // ═══════════════════════════════════════════════════════════════════
 
-  private async recordKnowledgeSelection(entry: TaskEntry, selected: { id: string; title?: string; content?: string; knowledgeRef?: string }): Promise<void> {
+  private async recordKnowledgeSelection(entry: TaskEntry, selected: { id: string; title?: string; content?: string; knowledgeRef?: string }, complete = false): Promise<void> {
     const receipt = { id: selected.id, title: selected.title ?? '', content: selected.content?.slice(0, 4000), knowledgeRef: selected.knowledgeRef, source: 'relevant' as const };
     (entry.injectedKnowledge ??= []).push(receipt);
-    if (this.registeredAgents.get(entry.agentId)?.name === 'TaskReviewer') await this.request(request(this.id, entry.agentId, 'recordKnowledgeSelection', { taskId: entry.state.id, selection: receipt }));
+    if (this.registeredAgents.get(entry.agentId)?.name === 'TaskReviewer') await this.request(request(this.id, entry.agentId, 'recordKnowledgeSelection', { taskId: entry.state.id, selection: { ...receipt, complete } }));
   }
 
   private async initializeConversation(entry: TaskEntry): Promise<AgentMessage[]> {
     const messages: AgentMessage[] = [];
+    if (entry.config.knowledgeScope) entry.knowledgeScopes = [...new Set([...(entry.knowledgeScopes ?? []), entry.config.knowledgeScope])];
 
     // Blocks accumulate in reading order and are partitioned at the end:
     // stable first as one cacheable prefix, volatile after the breakpoint.
@@ -3991,7 +4037,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } } };
         const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
-            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
+            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50, scope: entry.config.knowledgeScope }),
             5000,
           ).catch(() => null),
           this.request<KEntry[] | null>(
@@ -4541,7 +4587,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     entry.outstandingOperation = undefined;
     if (cancelled()) return;
     log.info(`[${agentName}] ${task.action?.action} ${result.success ? 'succeeded' : 'failed'}`);
-    task.llmMessages.push({ role: 'user', content: message });
+    const pageId = task.action?.action === 'read_chunk' && typeof task.action.id === 'string' ? task.action.id : undefined;
+    task.llmMessages.push({ role: 'user', content: message, ...(pageId && result.success && message.length > 4000 ? {
+      retainedPage: { payloadId: pageId, compact: `[Previously read page]\n${JSON.stringify(task.action)}\n${message.slice(0, 600)}\n[Page body omitted from active context; use the recorded read_chunk action to reread it.]` },
+    } : {}) });
     this.detectAndSteerOscillation(entry, agentName);
     // The message already contains this result. Do not append it again or
     // evict a retained command payload by storing the observation as bulk.
@@ -4597,9 +4646,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const e = await this.request<{ title?: string; type?: string; content?: string; knowledgeRef?: string; patternRef?: string } | null>(
         request(this.id, kbId, 'get', { id }), 10000);
       if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
-      if (e) await this.recordKnowledgeSelection(entry, { ...e, id });
+      if (e) await this.recordKnowledgeSelection(entry, { ...e, id }, (e.content?.length ?? 0) <= AgentAbject.MAX_CHUNK_CHARS);
       rendered = e
-        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${(e.content ?? '').slice(0, 4000)}`
+        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}; ${(e.content ?? '').length} chars): ${(e.content ?? '').slice(0, AgentAbject.MAX_CHUNK_CHARS)}${(e.content?.length ?? 0) > AgentAbject.MAX_CHUNK_CHARS ? '\n[Incomplete claim: content exceeds the recall display limit.]' : ''}`
         : `No entry with id "${id}".`;
     } else if (pattern) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; knowledgeRef?: string; patternRef?: string }>>(
@@ -4811,7 +4860,11 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         : `\n\nYou predicted: "${stated}"\nThe action failed. If rejection was expected, that may support the prediction. Compare the actual evidence with your expectation, state what remains uncertain, and let the corrected understanding choose your next action.`;
     }
 
-    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });
+    const pageId = task.lastResult.payloadMode === 'page' ? task.lastResult.payloadId : undefined;
+    const page = pageId ? this.renderResultPayload(entry, task.lastResult) : undefined;
+    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}`, ...(pageId && page ? {
+      retainedPage: { payloadId: pageId, compact: `[Action Result]\n${resultStr.replace(page, `[Previously read page retained as ${pageId}; reread with read_chunk id=${pageId}. Original request: ${JSON.stringify(action)}]\n${page.slice(0, 600)}\n[Page body omitted from active context.]`)}` },
+    } : {}) });
   }
 
   /** Whole-conversation byte budget. Above this, the middle block is
@@ -4830,6 +4883,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    *  is a handful of messages and 4k each is far under the budget. */
   private static readonly TRUNCATION_FLOOR_CHARS = 4000;
 
+  private markConversationObserved(entry: TaskEntry): void {
+    for (const message of entry.state.llmMessages) if (message.retainedPage) message.retainedPage.seen = true;
+  }
+
   private async trimConversation(entry: TaskEntry): Promise<void> {
     const task = entry.state;
     const maxMsgs = entry.config.maxConversationMessages;
@@ -4840,6 +4897,17 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const systemCount = entry.systemMessageCount ?? 1;
     const pinnedTurns = Math.max(0, entry.config.pinnedMessageCount - 1);
     const pinnedCount = systemCount + pinnedTurns;
+
+    // Pages have already reached the model before entering this older window.
+    // Keep decisions and predictions, and only replace bodies still retrievable
+    // from their runtime-owned payloads. This avoids repeatedly summarizing diffs.
+    for (let i = pinnedCount; i < task.llmMessages.length - AgentAbject.KEEP_RECENT_MESSAGES; i++) {
+      const message = task.llmMessages[i];
+      if (message.retainedPage?.seen && entry.payloads?.some(p => p.id === message.retainedPage!.payloadId)) {
+        message.content = message.retainedPage.compact;
+        delete message.retainedPage;
+      }
+    }
 
     // 1. Count cap — cheap, always apply first.
     if (task.llmMessages.length > maxMsgs) {

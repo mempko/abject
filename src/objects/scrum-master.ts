@@ -487,6 +487,7 @@ export class ScrumMaster extends Abject {
             dispatchTupleId,
             config: {
               maxSteps: 12,
+              knowledgeScope: goalId ? await this.knowledgeScopeForGoal(goalId) : undefined,
               timeout: 300000,
               terminalActions: {
                 complete_goal: { type: 'success' },
@@ -970,7 +971,7 @@ export class ScrumMaster extends Abject {
         case 'save_knowledge':
           return await this.actSaveKnowledge(action);
         case 'lookup_knowledge':
-          return await this.actLookupKnowledge(action);
+          return await this.actLookupKnowledge(action, await this.knowledgeScopeForGoal(goalId));
         case 'forget_knowledge':
           return await this.actForgetKnowledge(action);
         case 'dispatch_scrum':
@@ -1221,9 +1222,10 @@ export class ScrumMaster extends Abject {
     const observations = Object.entries(scratchpad).filter(([k]) => k.startsWith('learning/observation/')).slice(-12).map(([,v]) => v);
     const planHistory = (scratchpad['learning/plans'] as Array<{ revision: number; plan: unknown }>) ?? [];
     const evolvingContext = `${goal.description}\n${safeStringify(observations, 6000)}\n${safeStringify(planHistory.slice(-2), 4000)}`;
+    const knowledgeScope = await this.knowledgeScopeForGoal(goalId);
     const [recalled, applicablePatterns] = await Promise.all([
-      this.recallKnowledge(goal.description),
-      this.weavePatterns(evolvingContext),
+      this.recallKnowledge(goal.description, 5, knowledgeScope),
+      this.weavePatterns(evolvingContext, 3, knowledgeScope),
     ]);
     const relevantKnowledge = recalled.filter(e => e.type !== 'pattern');
 
@@ -1302,15 +1304,34 @@ export class ScrumMaster extends Abject {
    * shape (id, title, type, content) so the LLM can reference entries by
    * id later (e.g. for forget_knowledge).
    */
+  private async knowledgeScopeForGoal(goalId: string): Promise<string | undefined> {
+    const registry = await this.discoverDep('ExternalProjectRegistry');
+    if (!registry || !this.goalManagerId) return undefined;
+    const [projects, goal] = await Promise.all([
+      this.request<Array<{ name: string }>>(request(this.id, registry, 'listProjects', {})).catch(() => []),
+      this.request<{ title?: string; description?: string; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId })).catch(() => null),
+    ]);
+    if (!goal) return undefined;
+    const scopes = [...new Set(Object.entries(goal.scratchpad ?? {}).filter(([key]) => key.startsWith('learning/task/')).flatMap(([, value]) => {
+      const record = value as { knowledgeScope?: string; knowledgeScopes?: string[] } | null;
+      return record?.knowledgeScopes ?? (record?.knowledgeScope ? [record.knowledgeScope] : []);
+    }))];
+    if (scopes.length) return scopes.length === 1 && projects.some(p => `project:${p.name}` === scopes[0]) ? scopes[0] : undefined;
+    const text = `${goal.title ?? ''}\n${goal.description ?? ''}`;
+    const named = projects.filter(p => new RegExp(`\\b${p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text));
+    return named.length === 1 ? `project:${named[0].name}` : undefined;
+  }
+
   private async recallKnowledge(
     query: string,
     limit = 5,
+    scope?: string,
   ): Promise<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return [];
     try {
       const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>>(
-        request(this.id, kbId, 'recall', { query, limit }),
+        request(this.id, kbId, 'recall', { query, limit, scope }),
         5000,
       );
       return Array.isArray(entries) ? entries : [];
@@ -1328,12 +1349,13 @@ export class ScrumMaster extends Abject {
   private async weavePatterns(
     query: string,
     limit = 3,
+    scope?: string,
   ): Promise<Array<{ id: string; title: string; content: string; via?: string }>> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return [];
     try {
       const woven = await this.request<{ patterns?: Array<{ id: string; title: string; content: string; via?: string }> } | null>(
-        request(this.id, kbId, 'weave', { query, limit }),
+        request(this.id, kbId, 'weave', { query, limit, scope }),
         5000,
       );
       if (!woven || !Array.isArray(woven.patterns)) return [];
@@ -1829,6 +1851,7 @@ Rules:
    */
   private async actLookupKnowledge(
     action: Record<string, unknown>,
+    scope?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return { success: false, error: 'KnowledgeBase not registered in this workspace' };
@@ -1838,7 +1861,7 @@ Rules:
     const limit = (action.limit as number | undefined) ?? 5;
     if (!query) return { success: false, error: 'lookup_knowledge requires a query string' };
     const entries = await this.request<Array<{ id: string; title: string; type: string; tags?: string[]; content: string }>>(
-      request(this.id, kbId, 'recall', { query, type, tags, limit }),
+      request(this.id, kbId, 'recall', { query, type, tags, limit, scope }),
       5000,
     ).catch(() => []);
     log.info(`lookup_knowledge: "${query.slice(0, 60)}" → ${entries.length} entries`);
