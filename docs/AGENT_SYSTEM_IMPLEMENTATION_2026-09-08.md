@@ -158,9 +158,24 @@ Reports include acceptance, false success, failures by task family, p50/p95 elap
 
 ## Practical limits
 
+### Completion and cancellation after the commit/push retry
+
+The live commit/push run finished its repository work but kept invoking the model because snapshots included the application's own changing logs and runtime state. Successful commands were reported as failures when these snapshots changed. The following corrections are in the working tree:
+
+- Project revision snapshots now respect the existing ignore rules, with explicit edited paths retained even when ignored. The HostFileSystem Abject returns exclusions and coverage issues through ExternalProjectRegistry. A read-only check of this repository covered 419 files in 72 ms and excluded the live log, runtime databases, dependencies, and build output.
+- Check exit status and snapshot confidence are separate. Successful checks can finish with a receiver-authored coverage limitation in their report. Known subsequent input changes and actual failed checks still require attention. Exact declared commands count whether invoked through `verify` or `bash`; unchanged input snapshots preserve evidence across read-only commands and commits.
+- Completion permits one correction attempt before preserving the candidate as an unresolved partial outcome. It does not spend the rest of the task budget repeating the gate.
+- Cancellation is checked after awaited observation/thinking and before dispatch, including runtime verbs and completion validation. A late model response cannot start a new job or publish success. User-stopped goals retain evidence without automatically starting a learning review.
+- Stale Scrum results for completed, failed, or removed goals are acknowledged without executing their terminal action. Transient outbox delivery failures back off rather than replaying every three seconds.
+- ExternalCreator no longer repeats the preceding tool result in each observation. Its instructions use receiver `describe` messages for exact schemas and reserve Ask for interpretation and agreement.
+
+Regression coverage is in `src/objects/agent-system.verification.test.ts`; the full suite has 176 passing tests. Typecheck and server build pass. These tests use fixed decisions and real bus paths without paid model calls; they do not establish a model's live judgment quality.
+
+### Scope of guarantees
+
 - Conditional mutations serialize at the owning receiver. SharedState remains the existing replication system; local compare-and-set is not distributed consensus or a proof of stale-owner exclusion across partitions.
 - Source activation restores prior source and internal data on tested lifecycle failures. Arbitrary external effects performed by lifecycle helpers cannot be rolled back as one transaction. Registry, object and persistence failures remain explicit reconciliation cases.
-- Project snapshots hash the tree, excluding `.git`, and declare incomplete coverage. Large dependency trees are expensive; concurrent generation during verification can invalidate the result and require another check.
+- Project snapshots cover inputs selected by ignore rules plus explicit edited paths. They report exclusions and incomplete coverage. A passing check is evidence of that command's outcome; incomplete coverage or generation during the run is reported as a limitation, not relabeled as a test failure.
 - Goal budgets reserve estimates before model calls and reconcile usage afterward. Provider billing can differ from estimates; this is not a hard billing guarantee. Unpriced models cannot satisfy a configured cost ceiling, and an interrupted request retains conservative accounting.
 - Session usage is based on available LLM ledger records; goal resource receipts are the durable accounting source. A resumed task re-observes current resources and re-verifies authored changes.
 - Automated learning tests use scripted decisions and observations. They prove that evidence reaches planning and subsequent retrieval, not that a particular model will generalize correctly. Published comparisons and repeated live dogfooding remain empirical work.
