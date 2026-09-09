@@ -391,7 +391,7 @@ with the files each has written so far; agents report through \`taskStarted\`,
   private setupHandlers(): void {
     describeMessages(this.manifest, [
       { name: "openSession", description: "Open a task-owned project session; returns commands to check and verify.", parameters: { "project": protocolText, "taskId": protocolText, "root?": protocolText } },
-      { name: "captureRevision", description: "Hash project contents via HostFileSystem; returns revision, coverage, and changed files.", parameters: { "taskId": protocolText } },
+      { name: "captureRevision", description: "Snapshot project inputs via HostFileSystem, respecting ignore rules plus explicit edits. Returns {revision, complete, changed, excludes, issues, scope, project, root}.", parameters: { "taskId": protocolText, "includePaths?": { kind: 'array', elementType: protocolText } } },
     ]);
     this.on('openSession', async (msg: AbjectMessage) => {
       const { project, taskId, root } = msg.payload as { project: string; taskId: string; root?: string };
@@ -404,15 +404,15 @@ with the files each has written so far; agents report through \`taskStarted\`,
       return { taskId, project, root: root ?? configured.root, commands: { check: configured.checkCommand, verify: configured.verifyCommand } };
     });
     this.on('captureRevision', async (msg: AbjectMessage) => {
-      const { taskId } = msg.payload as { taskId: string };
+      const { taskId, includePaths = [] } = msg.payload as { taskId: string; includePaths?: string[] };
       const session = this.projectSessions.get(taskId);
       if (!session || session.owner !== msg.routing.from) throw new Error('Project session unavailable or owned by another caller');
       const fsId = await this.discoverDep('HostFileSystem');
       if (!fsId) throw new Error('HostFileSystem unavailable');
-      const current = await this.request<{ revision: string; files: Record<string, string>; complete: boolean }>(request(this.id, fsId, 'snapshotTree', { root: session.root }), 120000);
+      const current = await this.request<{ revision: string; files: Record<string, string>; complete: boolean; excludes?: string[]; issues?: string[]; scope?: string }>(request(this.id, fsId, 'snapshotTree', { root: session.root, scope: 'project', includePaths }), 120000);
       const changed = session.files ? [...new Set([...Object.keys(session.files), ...Object.keys(current.files)])].filter(p => session.files![p] !== current.files[p]) : [];
       session.revision = current.revision; session.files = current.files;
-      return { revision: current.revision, complete: current.complete, changed, project: session.project, root: session.root };
+      return { revision: current.revision, complete: current.complete, changed, excludes: current.excludes, issues: current.issues, scope: current.scope, project: session.project, root: session.root };
     });
 
     this.on('addProject', async (msg: AbjectMessage) => {

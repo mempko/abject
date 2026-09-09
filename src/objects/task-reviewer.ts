@@ -288,6 +288,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (msg.routing.from !== this.goalManagerId) return;
       const { goalId, error } = msg.payload as { goalId: string; error?: string };
       if (!goalId) return;
+      if (error === 'Stopped by user') return;
       this.onGoalTerminal({ goalId, outcome: 'failed', detail: error })
         .catch(err => log.warn(`goal review failed: ${err instanceof Error ? err.message : String(err)}`));
     });
@@ -452,6 +453,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * "done" that led nowhere is read as the dead end it was.
    */
   private async onGoalTerminal(review: PendingGoalReview): Promise<void> {
+    if (review.detail === 'Stopped by user') {
+      // Older checkpoints may still have this review pending; settle it without another model call.
+      if (this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: review.goalId }));
+      return;
+    }
     if (this.preparingReview) return; // GoalManager retains the durable pending request.
     this.preparingReview = true;
     try { await this.prepareGoalReview(review); } finally { this.preparingReview = false; }

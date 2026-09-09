@@ -1292,12 +1292,18 @@ The registered object must implement these handlers to participate in the agent 
     return matches.length === 1 ? matches[0] : undefined;
   }
 
+  private deliveryRetries = new Map<string, { attempts: number; after: number }>();
+
   private async deliverSessionOutbox(): Promise<void> {
     if (!this.sessionStoreId || this.deliveringOutbox) return;
     this.deliveringOutbox = true;
     try {
       const items = await this.request<Array<SessionRecord['outbox'][number] & { sessionId: string }>>(request(this.id, this.sessionStoreId, 'pendingDeliveries', {}));
+      const pending = new Set(items.map(item => `${item.sessionId}:${item.id}`));
+      for (const key of this.deliveryRetries.keys()) if (!pending.has(key)) this.deliveryRetries.delete(key);
       for (const item of items) {
+        const retryKey = `${item.sessionId}:${item.id}`;
+        if ((this.deliveryRetries.get(retryKey)?.after ?? 0) > Date.now()) continue;
         try {
           const destination = this.resolveSessionAgent(item.destination, item.destinationName)?.agentId ?? item.destination;
           // Rehydrate a restarted specialist before replaying its terminal commit.
@@ -1311,7 +1317,11 @@ The registered object must implement these handlers to participate in the agent 
           }
           await this.request(request(this.id, destination as AbjectId, 'taskResult', item.payload), 10000);
           await this.request(request(this.id, this.sessionStoreId, 'ackDelivery', { sessionId: item.sessionId, deliveryId: item.id }));
-        } catch { /* Retry the same delivery identity after reconnection. */ }
+          this.deliveryRetries.delete(retryKey);
+        } catch {
+          const attempts = (this.deliveryRetries.get(retryKey)?.attempts ?? 0) + 1;
+          this.deliveryRetries.set(retryKey, { attempts, after: Date.now() + Math.min(60000, 3000 * 2 ** Math.min(attempts, 5)) });
+        }
       }
     } finally { this.deliveringOutbox = false; }
   }
@@ -1902,7 +1912,7 @@ The registered object must implement these handlers to participate in the agent 
       this.cancelDescendants(taskId);
       // First check in-flight tasks
       const entry = this.taskEntries.get(taskId);
-      if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+      if (entry && (entry.state.phase !== 'done' || entry.settling) && entry.state.phase !== 'error') {
         entry.state.phase = 'error';
         entry.state.error = 'Cancelled';
         this.notifyAgentCancelled(entry, 'task cancelled');
@@ -1965,7 +1975,7 @@ The registered object must implement these handlers to participate in the agent 
       // queued task as usual).
       for (const [taskId, entry] of this.taskEntries) {
         if (!preserveTaskIds.includes(taskId) && (entry.goalId === goalId || entry.incomingGoalId === goalId)
-            && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+            && (entry.state.phase !== 'done' || entry.settling) && entry.state.phase !== 'error') {
           entry.state.phase = 'error';
           entry.state.error = 'Cancelled';
           cancelled++;
@@ -2317,6 +2327,7 @@ The registered object must implement these handlers to participate in the agent 
   private async runTaskAsync(entry: TaskEntry): Promise<void> {
     try {
       await this.checkpointSession(entry);
+      let completionCorrections = 0;
       for (;;) {
         await this.runStateMachine(entry);
         if (entry.state.phase !== 'done') break;
@@ -2324,6 +2335,12 @@ The registered object must implement these handlers to participate in the agent 
         const rejection = await this.assessCandidate(entry);
         entry.settling = false;
         if (!rejection) break;
+        if ((entry.state.phase as AgentPhase) === 'error') break;
+        if (completionCorrections++ >= 1) {
+          entry.state.phase = 'error';
+          entry.state.error = `Completion needs review after one correction: ${rejection}. Existing work and verification evidence are retained; do not repeat it without new evidence.`;
+          break;
+        }
         entry.state.step++;
         entry.pendingActions = undefined;
         entry.state.llmMessages.push({ role: 'user', content: `[Completion needs correction] ${rejection}. Continue from existing artifacts; the task has not been accepted.` });
@@ -2375,7 +2392,7 @@ The registered object must implement these handlers to participate in the agent 
         if (!validate(entry.state.result)) return `Result schema mismatch: ${this.ajv.errorsText(validate.errors)}`;
       }
       if (entry.config.completionMethod) {
-        const decision = await this.request<{ accepted: boolean; reason?: string; evidence?: unknown }>(
+        const decision = await this.request<{ accepted: boolean; reason?: string; evidence?: unknown; result?: unknown }>(
           request(this.id, entry.agentId, entry.config.completionMethod, {
             taskId: entry.state.id, goalId: entry.goalId, result: entry.state.result,
           }), 30000,
@@ -2383,6 +2400,8 @@ The registered object must implement these handlers to participate in the agent 
         if (entry.state.phase === 'error' || entry.finished) return 'Task was cancelled or superseded during verification';
         if (decision?.accepted !== true) return decision?.reason ?? 'Completion check did not accept the candidate';
         entry.acceptanceEvidence = decision.evidence;
+        // The owning receiver may attach verification limitations to the report.
+        if (decision.result !== undefined && !entry.responseSchema) entry.state.result = decision.result;
       }
       if (entry.dispatchTupleId && this.goalManagerId) {
         const decision = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'assessTask', {
@@ -2782,6 +2801,7 @@ The registered object must implement these handlers to participate in the agent 
 
   private async runStateMachine(entry: TaskEntry): Promise<void> {
     const task = entry.state;
+    if (task.phase === 'error' || entry.finished) return;
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
     log.info(`[${agentName}] Task started: "${task.task.slice(0, 80)}" (${task.id}, max ${task.maxSteps} steps)`);
 
@@ -2790,6 +2810,7 @@ The registered object must implement these handlers to participate in the agent 
     this.emitPhaseChanged(entry, 'idle', phase);
 
     const setPhase = (newPhase: AgentPhase): void => {
+      if (task.phase === 'error' && newPhase !== 'error') { phase = 'error'; return; }
       const old = phase;
       phase = newPhase;
       task.phase = newPhase;
@@ -2857,6 +2878,7 @@ The registered object must implement these handlers to participate in the agent 
               `return await call('${entry.agentId}', 'agentObserve', { taskId: '${task.id}', step: ${task.step} })`,
               () => this.observeStep(entry),
             );
+            if (cancelledExternally()) break;
             if (!obsResult.success) {
               setPhase('error');
               task.error = obsResult.error;
@@ -2930,6 +2952,7 @@ The registered object must implement these handlers to participate in the agent 
               `return await call('${this.id}', '_think', { taskId: '${task.id}' })`,
               () => this.think(entry),
             );
+            if (cancelledExternally()) break;
             if (!thinkResult.success) {
               setPhase('error');
               task.error = thinkResult.error;
@@ -3002,6 +3025,7 @@ The registered object must implement these handlers to participate in the agent 
             if (task.action.action === 'remember') {
               try {
                 const kbId = await this.discoverDep('KnowledgeBase');
+                if (cancelledExternally()) break;
                 if (kbId) {
                   await this.request(
                     request(this.id, kbId, 'remember', {
@@ -3128,6 +3152,7 @@ The registered object must implement these handlers to participate in the agent 
               } else {
                 try {
                   const jmId = this.jobManagerId ?? await this.discoverDep('JobManager') ?? undefined;
+                  if (cancelledExternally()) break;
                   if (jmId) {
                     // submit_job runs inside the thinking phase, so without
                     // this the goal tree shows "thinking" for the whole
@@ -3236,6 +3261,7 @@ The registered object must implement these handlers to participate in the agent 
           case 'acting': {
             entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
             await this.checkpointSession(entry);
+            if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
             log.info(`[${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${(task.action?.reasoning ?? '').toString().slice(0, 60)})`);
             const desc = (task.action?.reasoning ?? task.action?.action ?? 'act').toString().slice(0, 80);
             // Job calls agent directly (not through _act handler) to avoid
@@ -3254,6 +3280,7 @@ The registered object must implement these handlers to participate in the agent 
               async () => this.actStep(entry),
               { __agentAction: task.action },
             );
+            if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
             task.lastResult = {
               success: actResult.success,
               data: actResult.data,
@@ -3498,6 +3525,7 @@ The registered object must implement these handlers to participate in the agent 
     directFn: () => Promise<unknown>,
     jobContext?: Record<string, unknown>,
   ): Promise<AgentActionResult> {
+    if (entry.state.phase === 'error' || entry.finished) return { success: false, error: entry.state.error ?? 'Task cancelled' };
     if (entry.config.directExecution) {
       try {
         const data = await directFn();

@@ -1684,7 +1684,7 @@ reviews results and either plans another round or completes/fails the goal.
       goal.updatedAt = Date.now();
 
       log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
-      goal.scratchpad['learning/review'] = 'pending';
+      goal.scratchpad['learning/review'] = 'deferred:user-stop';
       await this.persistLearning(goal);
       this.changed('goalFailed', { goalId, error: 'Stopped by user' });
       return true;
@@ -1794,7 +1794,8 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('cancelOutstandingTasks', async (msg: AbjectMessage) => {
       const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: GoalId; preserveTaskIds?: string[] };
       const goal = this.goals.get(goalId);
-      if (!goal || goal.status !== 'active' || !this.tupleSpaceId) return { cancelled: 0 };
+      if (!goal || goal.status !== 'active') return { cancelled: 0, safe: false, inactive: true, error: 'Goal is no longer active' };
+      if (!this.tupleSpaceId) return { cancelled: 0, safe: false, error: 'TupleSpace unavailable' };
 
       const runtimeId = await this.taskRuntime();
       if (!runtimeId) return { cancelled: 0, safe: false, error: 'Task runtime unavailable' };

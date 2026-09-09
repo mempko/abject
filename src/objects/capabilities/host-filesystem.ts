@@ -262,7 +262,7 @@ export class HostFileSystem extends Abject {
 
   private setupHandlers(): void {
     describeMessages(this.manifest, [
-      { name: "snapshotTree", description: "Compute a content revision of project files and symlink targets, excluding .git. Incomplete coverage is explicit.", parameters: { "root": protocolText, "maxFiles?": protocolNumber } },
+      { name: "snapshotTree", description: "Hash files and symlink targets. Project scope respects ignore rules; includePaths retains explicitly edited files. Returns revision, files, complete, excludes and issues.", parameters: { "root": protocolText, "maxFiles?": protocolNumber, "scope?": protocolText, "includePaths?": { kind: 'array', elementType: protocolText } } },
     ]);
     this.on('readFile', (msg: AbjectMessage) => {
       const { path: filePath, offset, limit, maxBytes } =
@@ -275,30 +275,58 @@ export class HostFileSystem extends Abject {
     });
 
     this.on('snapshotTree', async (msg: AbjectMessage) => {
-      const { root, maxFiles = 50000 } = msg.payload as { root: string; maxFiles?: number };
+      const { root, maxFiles = 50000, scope = 'all', includePaths = [] } = msg.payload as { root: string; maxFiles?: number; scope?: string; includePaths?: string[] };
+      contractRequire(Number.isSafeInteger(maxFiles) && maxFiles > 0, 'maxFiles must be positive');
+      contractRequire(scope === 'all' || scope === 'project', 'scope must be all or project');
+      contractRequire(Array.isArray(includePaths) && includePaths.every(p => typeof p === 'string'), 'includePaths must be paths');
       const base = await this.validateAndResolve(root);
       const files: Record<string, string> = {};
+      const excludes: string[] = ['.git'], issues: string[] = [];
       let complete = true, count = 0;
-      const walk = async (dir: string): Promise<void> => {
-        for (const item of (await fs.readdir(dir, { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name))) {
-          if (item.name === '.git') continue; // version-control internals, not project contents
-          if (count >= maxFiles) { complete = false; return; }
-          const abs = path.join(dir, item.name), rel = path.relative(base, abs);
-          if (item.isSymbolicLink()) { count++; files[rel] = `symlink:${await fs.readlink(abs)}`; continue; }
-          if (item.isDirectory()) { await walk(abs); continue; }
-          if (!item.isFile()) continue;
+      const capture = async (abs: string, rel: string): Promise<void> => {
+        if (Object.hasOwn(files, rel)) return;
+        if (count >= maxFiles) { complete = false; if (!issues.includes('File limit reached')) issues.push('File limit reached'); return; }
+        try {
+          const before = await fs.lstat(abs);
+          if (before.isSymbolicLink()) { count++; files[rel] = `symlink:${await fs.readlink(abs)}`; return; }
+          if (!before.isFile()) return;
           count++;
-          const before = await fs.stat(abs);
           const hash = createHash('sha256');
           for await (const chunk of fsSync.createReadStream(abs)) hash.update(chunk);
           const after = await fs.stat(abs);
-          if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) complete = false;
+          if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) {
+            complete = false; issues.push(`Changed while reading: ${rel}`);
+          }
           files[rel] = hash.digest('hex');
+        } catch (err) {
+          // A disappearing/generated file must not abort a successful check.
+          complete = false; issues.push(`Could not snapshot ${rel}: ${(err as Error).message}`);
         }
       };
-      await walk(base);
-      const revision = createHash('sha256').update(JSON.stringify(files)).digest('hex');
-      return { revision, files, complete, root: base, excludes: ['.git'] };
+      const walk = async (dir: string, ignores: IgnoreSet): Promise<void> => {
+        for (const item of (await fs.readdir(dir, { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name))) {
+          if (item.name === '.git') continue; // version-control internals, not project contents
+          if (count >= maxFiles) { complete = false; if (!issues.includes('File limit reached')) issues.push('File limit reached'); return; }
+          const abs = path.join(dir, item.name), rel = path.relative(base, abs);
+          if (scope === 'project' && ignores.ignores(abs, item.isDirectory())) { excludes.push(rel); continue; }
+          if (item.isDirectory()) { await walk(abs, scope === 'project' ? await ignores.extend(abs) : ignores); continue; }
+          await capture(abs, rel);
+        }
+      };
+      // Explicit edits stay in scope even when the project normally ignores them.
+      for (const input of includePaths) {
+        const abs = path.resolve(base, input), rel = path.relative(base, abs);
+        contractRequire(rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes('.git'), 'Included path must be a project file outside .git');
+        try { await fs.lstat(abs); } catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue; throw err; }
+        // Validate the parent without dereferencing a leaf symlink.
+        const parent = await this.validateAndResolve(path.dirname(abs));
+        contractRequire(isInsideAny([base], parent), 'Included path parent escapes the project');
+        await capture(abs, rel);
+      }
+      await walk(base, scope === 'project' ? await IgnoreSet.empty().extend(base) : IgnoreSet.empty());
+      const ordered = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b)));
+      const revision = createHash('sha256').update(JSON.stringify(ordered)).digest('hex');
+      return { revision, files: ordered, complete, root: base, scope, excludes, issues };
     });
 
     this.on('conditionalWrite', async (msg: AbjectMessage) => {

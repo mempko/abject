@@ -528,20 +528,26 @@ export class ScrumMaster extends Abject {
       };
 
       // A failed commit must reject delivery so the durable outbox retries it.
+      let obsolete = false;
       await withKeyedLock(`${this.id}:scrum-commit`, async () => {
         const goalId = await this.lookupGoalIdForOTATask(payload.ticketId);
         if (goalId && this.goalManagerId) {
-          const goal = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+          const goal = await this.request<{ status?: string; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
+          // A durable result can outlive its goal. Acknowledge it without replaying effects.
+          if (!goal || ['completed', 'failed', 'archived'].includes(goal.status ?? '')) { obsolete = true; return; }
+          if (goal.status === 'paused') throw new Error('Goal is paused; defer the scrum result until resumed');
           if (goal?.scratchpad?.[`learning/commit/${payload.ticketId}`]) return;
           await this.executeTerminalAction(payload.ticketId, payload.lastAction);
           await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId }));
-        } else await this.executeTerminalAction(payload.ticketId, payload.lastAction);
+        } else if (!goalId) obsolete = true;
+        else throw new Error('GoalManager unavailable; defer the scrum result');
       });
       this.retainTaskResult(payload);
 
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) pending.resolve(payload);
       this.scrumInFlight.delete(payload.ticketId);
+      if (obsolete) { this.scrumAttempts.delete(payload.ticketId); return; }
 
       // Self-healing: a scrum task that died without a decision (provider
       // outage, unhandled step error) gets retried with backoff. This fires

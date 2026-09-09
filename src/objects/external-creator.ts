@@ -63,6 +63,7 @@ const VERIFY_TIMEOUT_MS = 900_000;
 interface CheckOutcome {
   revision?: string;
   stable?: boolean;
+  snapshotNote?: string;
   command: string;
   exitCode: number;
   /**
@@ -589,32 +590,38 @@ clean result I did not observe.`;
     return Math.max(...counts);
   }
 
-  private async projectRevision(extra: TaskExtra): Promise<{ revision?: string; complete: boolean }> {
+  private async projectRevision(extra: TaskExtra): Promise<{ revision?: string; complete: boolean; changed?: string[]; issues?: string[] }> {
     const registry = await this.projects();
     if (!registry || !extra.project) return { complete: false };
     if (!extra.projectSession) {
       await this.call(registry, 'openSession', { project: extra.project.name, taskId: extra.taskId, root: extra.workRoot });
       extra.projectSession = true;
     }
-    const revision = await this.call<{ revision: string; complete: boolean; changed: string[] }>(registry, 'captureRevision', { taskId: extra.taskId }, 120000);
+    const revision = await this.call<{ revision: string; complete: boolean; changed: string[]; issues?: string[] }>(registry, 'captureRevision', { taskId: extra.taskId, includePaths: [...extra.filesModified] }, 120000);
     for (const rel of revision.changed) extra.filesModified.add(path.resolve(extra.workRoot!, rel));
     return revision;
   }
 
+  private async verificationSnapshot(extra: TaskExtra): Promise<{ revision?: string; complete: boolean; changed?: string[]; issues?: string[] }> {
+    try { return await this.projectRevision(extra); }
+    catch (err) { return { complete: false, issues: [`Snapshot unavailable: ${err instanceof Error ? err.message : String(err)}`] }; }
+  }
+
+  private checkOutcome(extra: TaskExtra, command: string, r: { stdout: string; stderr: string; exitCode: number }, before: { revision?: string; complete: boolean; issues?: string[] }, after: { revision?: string; complete: boolean; issues?: string[]; changed?: string[] }): CheckOutcome {
+    const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
+    const stable = before.complete && after.complete && before.revision === after.revision;
+    const snapshotNote = !before.complete || !after.complete
+      ? `Snapshot coverage was incomplete: ${[...(before.issues ?? []), ...(after.issues ?? [])].slice(0, 5).join('; ') || 'not all project inputs could be read'}.`
+      : !stable ? `Project inputs changed during the command${after.changed?.length ? `: ${after.changed.slice(0, 8).join(', ')}` : ''}. The exit status is valid, but it does not establish an unchanged input revision.` : undefined;
+    return { command, revision: after.revision, stable, snapshotNote, exitCode: r.exitCode,
+      signatures: ExternalCreator.signaturesOf(output, extra.workRoot), failureCount: ExternalCreator.failureCountOf(output), at: Date.now(), output };
+  }
+
   private async captureOutcome(extra: TaskExtra, command: string, timeoutMs: number): Promise<CheckOutcome> {
-    const before = await this.projectRevision(extra);
+    const before = await this.verificationSnapshot(extra);
     const r = await this.runCommand(extra, command, timeoutMs);
-    const after = await this.projectRevision(extra);
-    const output = [r.stdout, r.stderr].filter(s => s && s.length > 0).join('\n');
-    return {
-      command,
-      revision: after.revision, stable: before.complete && after.complete && before.revision === after.revision,
-      exitCode: r.exitCode,
-      signatures: ExternalCreator.signaturesOf(output, extra.workRoot),
-      failureCount: ExternalCreator.failureCountOf(output),
-      at: Date.now(),
-      output,
-    };
+    const after = await this.verificationSnapshot(extra);
+    return this.checkOutcome(extra, command, r, before, after);
   }
 
   /**
@@ -626,10 +633,10 @@ clean result I did not observe.`;
    * green makes any failure new by definition.
    */
   private judge(outcome: CheckOutcome, baseline: CheckOutcome | undefined, touched: string[] = []): CheckVerdict {
-    if (outcome.stable === false) return { outcome, newFailures: [], foreignFailures: [], preExisting: 0, passed: false, inconclusive: true };
     if (outcome.exitCode === 0) {
       return { outcome, newFailures: [], foreignFailures: [], preExisting: baseline?.signatures.length ?? 0, passed: true };
     }
+    if (outcome.stable === false) return { outcome, newFailures: outcome.signatures, foreignFailures: [], preExisting: 0, passed: false, inconclusive: true };
     if (!baseline || baseline.stable === false || baseline.command !== outcome.command) {
       return { outcome, newFailures: outcome.signatures, foreignFailures: [], preExisting: 0, passed: false, unbaselined: true };
     }
@@ -694,10 +701,11 @@ clean result I did not observe.`;
         (v.foreignFailures.length > 10 ? `\n  … and ${v.foreignFailures.length - 10} more` : '')
       : '';
     if (v.passed && v.outcome.exitCode === 0) {
-      return `${head} — clean.`;
+      return `${head} — passed.${v.outcome.snapshotNote ? `\nVerification limitation: ${v.outcome.snapshotNote} Do not rerun solely to obtain identical snapshots; report this limitation.` : ''}`;
     }
     if (v.inconclusive) {
       const tail = (v.outcome.output ?? '').trim().split('\n').slice(-12).join('\n');
+      if (v.outcome.stable === false) return `${head} — failed; comparison with the baseline is uncertain. ${v.outcome.snapshotNote ?? 'Project inputs were not stable during the command.'}\n${tail}`;
       return `${head} — INCONCLUSIVE: the command failed but no failure line was recognized as new` +
         (v.outcome.failureCount !== undefined ? ` while its own failure count is ${v.outcome.failureCount}` : '') +
         `. This does not pass. Read the output and decide what failed; the last lines were:\n${tail}`;
@@ -1229,11 +1237,30 @@ clean result I did not observe.`;
     const cwd = action.cwd ? this.resolveWorkPath(extra, String(action.cwd)) : extra.workRoot;
 
     this.reportProgress(extra, 'acting', command.slice(0, 80));
-    this.taintVerifyBaseline(extra);
-    extra.unknownEffects = true;
-    extra.mutationsSinceVerify++;
-    extra.lastVerify = undefined;
-    const r = await this.runCommand(extra, command, timeout, cwd);
+    const before = await this.verificationSnapshot(extra);
+    let r: { stdout: string; stderr: string; exitCode: number };
+    try { r = await this.runCommand(extra, command, timeout, cwd); }
+    catch (err) {
+      extra.unknownEffects = true; extra.mutationsSinceVerify++; this.taintVerifyBaseline(extra);
+      throw err;
+    }
+    const after = await this.verificationSnapshot(extra);
+    if (before.revision !== after.revision) {
+      this.taintVerifyBaseline(extra);
+      extra.unknownEffects = true;
+      extra.mutationsSinceVerify++;
+    } else if (!before.complete || !after.complete) {
+      extra.unknownEffects = true;
+    }
+    // The same declared command is evidence regardless of which action invoked it.
+    const project = extra.project!;
+    if (cwd === extra.workRoot && [project.checkCommand, project.verifyCommand].includes(command.trim())) {
+      const outcome = this.checkOutcome(extra, command.trim(), r, before, after);
+      const baseline = outcome.command === extra.baseline?.verify?.command ? extra.baseline.verify : extra.baseline?.check;
+      const verdict = this.judge(outcome, baseline, this.touchedFiles(extra));
+      if (outcome.command === project.verifyCommand) extra.lastVerify = verdict; else extra.lastCheck = verdict;
+      if (verdict.passed && outcome.command === (project.verifyCommand ?? project.checkCommand)) extra.mutationsSinceVerify = 0;
+    }
     this.audit(extra, `bash exit=${r.exitCode}: ${command.slice(0, 160)}`);
 
     const body = [
@@ -1470,10 +1497,7 @@ clean result I did not observe.`;
     if (latest.inconclusive) {
       return {
         ok: false,
-        reason:
-          `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and its failures could not be attributed ` +
-          `(no recognized failure line was new${latest.outcome.failureCount !== undefined ? `, yet it reports ${latest.outcome.failureCount} failure(s)` : ''}). ` +
-          `Read its output, fix or explain what failed, and run verify again.`,
+        reason: `${this.renderVerdict(latest)}\nInspect the command failure before deciding whether another run is useful.`,
         note: `${changed} file(s) changed, verification inconclusive.`,
       };
     }
@@ -1482,7 +1506,8 @@ clean result I did not observe.`;
       return {
         ok: false,
         reason:
-          `${latest.newFailures.length} failure(s) were introduced by this task and are still present:\n` +
+          `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and did not pass. ` +
+          (latest.newFailures.length ? `${latest.newFailures.length} new diagnostic(s):\n` : 'No diagnostic line was recognized; inspect the command output.\n') +
           latest.newFailures.slice(0, 15).map(s => `  ${s}`).join('\n'),
         note: `${changed} file(s) changed, ${latest.newFailures.length} new failure(s).`,
       };
@@ -1496,7 +1521,7 @@ clean result I did not observe.`;
       note:
         `${changed} file(s) changed; \`${latest.outcome.command}\` exited ${latest.outcome.exitCode}` +
         (latest.preExisting > 0 ? ` with ${latest.preExisting} pre-existing failure(s) untouched` : '') +
-        `, no new failures in files this task wrote.${foreign}`,
+        `, no new failures in files this task wrote.${foreign}${latest.outcome.snapshotNote ? ` Verification limitation: ${latest.outcome.snapshotNote}` : ''}`,
     };
   }
 
@@ -1695,17 +1720,23 @@ clean result I did not observe.`;
 
     this.on('candidateComplete', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can settle this candidate');
-      const { taskId } = msg.payload as { taskId: string };
+      const { taskId, result } = msg.payload as { taskId: string; result?: unknown };
       const extra = this.taskExtras.get(taskId);
       if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
+      let snapshotWarning: string | undefined;
       if (extra.project) {
-        const current = await this.projectRevision(extra);
+        const current = await this.verificationSnapshot(extra);
         const required = extra.project.verifyCommand ?? extra.project.checkCommand;
-        const evidence = [extra.lastVerify, extra.lastCheck].find(v => v?.outcome.command === required && v?.outcome.revision === current.revision && v?.passed);
-        if (required && (extra.filesModified.size > 0 || extra.unknownEffects) && (!current.complete || !evidence)) return { accepted: false, reason: 'Project changed since verification, or snapshot coverage is incomplete. Reconcile changes and verify the current revision.' };
+        const latest = [extra.lastVerify, extra.lastCheck].filter((v): v is CheckVerdict => !!v && v.outcome.command === required).sort((a, b) => b.outcome.at - a.outcome.at)[0];
+        if (latest?.passed && current.complete && latest.outcome.revision && current.revision !== latest.outcome.revision) {
+          return { accepted: false, reason: `Project inputs changed after ${required}. Review ${current.changed?.slice(0, 8).join(', ') || 'the changed inputs'} and verify once after those edits.` };
+        }
+        if (!current.complete) snapshotWarning = `Current snapshot coverage is incomplete. ${current.issues?.slice(0, 3).join('; ') ?? ''}`;
       }
       const gate = this.gateVerdict(extra);
-      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, note: gate.note } };
+      const note = [gate.note, snapshotWarning].filter(Boolean).join('\n');
+      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, note },
+        ...(gate.ok && typeof result === 'string' ? { result: `${result}\n\nVerification: ${note}` } : {}) };
     });
 
     this.on('taskCancelled', async (msg: AbjectMessage) => {
@@ -1954,7 +1985,7 @@ clean result I did not observe.`;
         );
       }
     } else {
-      lines.push(extra.lastResult);
+      lines.push('The previous action result is already in the conversation above.');
     }
 
     // The gate is stated every turn once anything has changed, so "done" is
@@ -2099,10 +2130,10 @@ Emit ONE JSON action per turn in a \`\`\`json code block, and nothing else. Inde
 2. **Write the whole change, then let it be checked.** Put every edit to a file in ONE edit call. Across turns, mark every edit but the last with "more": true to keep the set open, then drop it on the last one.
 3. **Checks run themselves.** When an edit set closes, this project's check command runs automatically and its verdict comes back on that same action. Do not spend a step running it yourself.
 4. **You are judged against a baseline, on the files you wrote.** Failures that existed before you started are not yours and never block you. Failures you introduce in files you wrote do. Other tasks may be working in this project at the same time: your first observation lists them and what they have written, and new diagnostic location alone does not establish which task caused a failure.
-5. **done has to be earned.** A claim of done with unverified changes is rejected and handed back. When the project's check is also its verification, a passing check after your last edit already satisfies this; when it declares a heavier verify command, run verify.
+5. **Use verification evidence.** Run the declared check after relevant edits; a distinct full verification command must also run when required. The exact declared command counts through either verify or bash. Read-only commands and commits do not invalidate unchanged project inputs. Report snapshot limitations honestly; an exit-0 command with limited coverage is not a failed test, and repeating it just to get identical snapshots is unnecessary. If completion still needs correction after one attempt, preserve the work and report the unresolved evidence.
 6. **Say what you did not verify.** When a project declares no commands, there is nothing to run — report exactly what you changed and that it was not verified. Never let silence imply a pass.
 7. **Keep oldText small.** Just enough context to be unique, no padding.
-8. **Delegation is a message to any object.** Anything you cannot do yourself, some Abject can — a capability, a service, or another agent, all reached the same way. Ask the Registry what provides it ({"action":"call","target":"Registry","method":"ask","payload":{"question":"which object ...?"}}), ask that object how it wants to be called, then message it with a self-contained task; its report comes back as your call result. Inside a submit_job the same discovery is dep(name) / find(name). Other objects may message your runTask the same way.
+8. **Delegation is a message to any object.** Discover a known dependency by name and call its describe message for exact methods and schemas; this is deterministic and costs no model call. Use Ask for questions requiring interpretation or collaborator agreement. Then message the receiver with a self-contained request. Inside a submit_job, discovery is dep(name) / find(name). Other objects may message your runTask the same way.
 
 Report in your done result: what changed, which command proved it, and anything you could not check.`;
   }
