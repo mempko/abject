@@ -258,6 +258,135 @@ test('cancelled pipelines retain their pre-action prediction with an unknown out
 });
 
 
+test('runtime actions retain complete observations and automatic pattern provenance through the bus', { timeout: 10000 }, async () => {
+  const f = await fixture();
+  try {
+    const runtime: any = await f.add(new Runtime()), caller = await f.add(new Endpoint('Worker'));
+    const goals = await f.add(new GoalManager()), kb = await f.add(new Knowledge());
+    runtime.goalManagerId = goals.id;
+    const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Read retained evidence', description: 'Review a large diff' });
+    const { id } = await caller.call(kb.id, 'remember', { type: 'pattern', title: 'READ WHOLE DIFF', content: 'Read every diff section before deciding.' });
+    const actions = [
+      { action: 'recall', pattern: 'READ WHOLE DIFF', expect: 'Find a relevant reading pattern' },
+      { action: 'read_chunk', id: 'res-1', offset: 0, length: 30000, expect: 'Read the first diff section', patterns: [{ id, why: 'Inspect the complete diff', revision: 999 }] },
+      { action: 'read_chunk', id: 'res-1', offset: 30000, length: 10000, expect: 'Read the remaining diff' },
+      { action: 'remember', title: 'Reviewed files', content: 'Both sections were read.', expect: 'Save the observation' },
+      { action: 'replan', reason: 'The second section changes the review plan', expect: 'Record the changed understanding' },
+      { action: 'reply', text: 'Review is progressing', expect: 'Send a progress update' },
+      { action: 'done', result: 'Reviewed both sections' },
+    ];
+    let thinks = 0, entry: any;
+    const payload = 'a'.repeat(29990) + 'FIRST-END!' + 'b'.repeat(9990) + 'FINAL-END!';
+    runtime.think = async (current: any) => {
+      entry = current;
+      if (thinks === 0) runtime.storePayload(entry, payload, 'result');
+      if (thinks === 1) {
+        assert.equal(entry.patternSelections[id], JSON.stringify([id, 1]), 'match selections carry receiver-owned receipts');
+        await caller.call(kb.id, 'update', { id, content: 'Read the diff and its tests.', expectedRevision: 1 });
+      }
+      assert(thinks < actions.length, 'no extra model turns are needed for recording');
+      return { ...actions[thinks++], expectOutcome: 'success' };
+    };
+    let finish!: (value: any) => void;
+    const finished = new Promise<any>(resolve => { finish = resolve; });
+    caller.on('taskResult', msg => { finish(msg.payload); });
+    caller.on('agentObserve', () => ({ observation: 'Continue' }));
+    await caller.call(runtime.id, 'registerAgent', { name: 'Worker', config: { directExecution: true, skipFirstObservation: true, maxSteps: 12, intermediateActions: ['reply'] } });
+    await caller.call(runtime.id, 'startTask', { taskId: 'runtime-evidence', task: 'Read and review the diff', goalId });
+    assert.equal((await finished).success, true);
+    const transcript = await caller.call(runtime.id, 'getTaskTranscript', { taskId: 'runtime-evidence' });
+    assert.deepEqual(transcript.predictions.map((p: any) => p.step), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(transcript.predictions.map((p: any) => p.action), actions.slice(0, -1).map(a => a.action));
+    for (const prediction of transcript.predictions) {
+      assert.equal(prediction.outcome, 'success');
+      assert.equal(prediction.semanticVerdict, 'unresolved');
+      const key = `learning/observation/runtime-evidence:${prediction.step}`;
+      const before = await caller.call(goals.id, 'readGoalData', { goalId, key: `${key}:prediction` });
+      const after = await caller.call(goals.id, 'readGoalData', { goalId, key });
+      assert.equal(before.expect, prediction.expect);
+      assert(before.predictedAt <= after.observedAt);
+      if (prediction.step === 2) assert(JSON.parse(after.actual).data.text.includes(payload.slice(0, 30000)), 'full evidence survives the preview limit');
+      if (prediction.step === 3) assert(JSON.parse(after.actual).data.text.includes(payload.slice(30000)));
+    }
+    assert.equal(entry.payloads.length, 1, 'learning observations do not consume payload cache slots');
+    assert(entry.state.llmMessages.some((m: any) => typeof m.content === 'string' && m.content.includes(payload.slice(0, 30000))));
+    const history = await caller.call(kb.id, 'patternHistory', { id });
+    assert.equal(history.applications.length, 1, 'retrieval alone is not an application');
+    assert.equal(history.applications[0].patternRevision, 1, 'application refers to the version selected before revision');
+    assert.equal(history.applications[0].verdict, 'applied', 'usefulness requires reviewer feedback');
+    assert(transcript.predictions[1].patterns[0].applicationRef);
+  } finally { await f.stop(); }
+});
+
+test('runtime evidence distinguishes failed actions, empty searches, and failed job envelopes', { timeout: 10000 }, async () => {
+  const f = await fixture();
+  try {
+    const runtime: any = await f.add(new Runtime()), caller = await f.add(new Endpoint('Worker'));
+    const kb = await f.add(new Endpoint('KnowledgeBase')), jobs = await f.add(new Endpoint('JobManager'));
+    kb.on('remember', () => ({ success: false, error: 'Write rejected' }));
+    kb.on('get', () => null);
+    jobs.on('submitJob', () => ({ status: 'cancelled', error: 'Job cancelled by owner' }));
+    const actions = [
+      { action: 'read_chunk', id: 'missing', expectOutcome: 'failure' },
+      { action: 'read_chunk', id: 'res-1', offset: -1, expectOutcome: 'failure' },
+      { action: 'read_chunk', id: 'res-1', offset: 3, expectOutcome: 'failure' },
+      { action: 'read_chunk', id: 'res-1', grep: 'absent', expectOutcome: 'success' },
+      { action: 'recall', expectOutcome: 'failure' },
+      { action: 'recall', id: 'absent', expectOutcome: 'success' },
+      { action: 'remember', content: 'Will be rejected', expectOutcome: 'failure' },
+      { action: 'submit_job', code: '', expectOutcome: 'failure' },
+      { action: 'submit_job', code: 'return 1', expectOutcome: 'failure' },
+      { action: 'done', result: 'Checked errors' },
+    ];
+    let thinks = 0;
+    runtime.think = async (entry: any) => {
+      if (thinks === 0) runtime.storePayload(entry, 'abc', 'result');
+      assert(thinks < actions.length);
+      return { expect: 'Observe the documented operation status', ...actions[thinks++] };
+    };
+    let finish!: (value: any) => void;
+    const finished = new Promise<any>(resolve => { finish = resolve; });
+    caller.on('taskResult', msg => { finish(msg.payload); });
+    await caller.call(runtime.id, 'registerAgent', { name: 'Worker', config: { directExecution: true, skipFirstObservation: true, maxSteps: 15 } });
+    await caller.call(runtime.id, 'startTask', { taskId: 'runtime-errors', task: 'Check runtime failure results' });
+    assert.equal((await finished).success, true);
+    const { predictions } = await caller.call(runtime.id, 'getTaskTranscript', { taskId: 'runtime-errors' });
+    assert.equal(predictions.length, actions.length - 1);
+    assert.deepEqual(predictions.map((p: any) => p.outcome), actions.slice(0, -1).map(a => a.expectOutcome));
+    assert(predictions.every((p: any) => p.verdict === 'supported'));
+    assert.match(predictions[6].actual, /Write rejected/);
+    assert.match(predictions[7].actual, /non-empty code/);
+    assert.match(predictions[8].actual, /Job cancelled by owner/);
+  } finally { await f.stop(); }
+});
+
+test('cancellation during a runtime memory call keeps an unknown outcome and stops subsequent actions', { timeout: 10000 }, async () => {
+  const f = await fixture();
+  try {
+    const runtime: any = await f.add(new Runtime()), caller = await f.add(new Endpoint('Worker'));
+    const kb = await f.add(new Endpoint('KnowledgeBase'));
+    let release!: (value: unknown) => void, started!: () => void, finish!: (value: any) => void;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    const finished = new Promise<any>(resolve => { finish = resolve; });
+    kb.on('remember', () => { started(); return new Promise(resolve => { release = resolve; }); });
+    caller.on('taskResult', msg => { finish(msg.payload); });
+    let thinks = 0;
+    runtime.think = async () => { thinks++; return { action: 'remember', content: 'Interrupted write', expect: 'Save a fact', expectOutcome: 'success' }; };
+    await caller.call(runtime.id, 'registerAgent', { name: 'Worker', config: { directExecution: true, skipFirstObservation: true, maxSteps: 5 } });
+    await caller.call(runtime.id, 'startTask', { taskId: 'runtime-cancel', task: 'Save a fact' });
+    await began;
+    await caller.call(runtime.id, 'cancelTask', { taskId: 'runtime-cancel' });
+    release({ id: 'saved-after-cancel' });
+    assert.equal((await finished).success, false);
+    const { predictions } = await caller.call(runtime.id, 'getTaskTranscript', { taskId: 'runtime-cancel' });
+    assert.equal(thinks, 1);
+    assert.equal(predictions.length, 1);
+    assert.equal(predictions[0].expect, 'Save a fact');
+    assert.equal(predictions[0].outcome, 'unknown');
+    assert.equal(predictions[0].verdict, 'unresolved');
+  } finally { await f.stop(); }
+});
+
 test('runtime captures application receipts before acting and reviewer settles partial learning without inventing revisions', async () => {
   const f = await fixture();
   try {

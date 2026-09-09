@@ -2263,13 +2263,19 @@ The registered object must implement these handlers to participate in the agent 
    * that says what the update did and did not do, and count it like any
    * other action.
    */
-  private completeIntermediateAction(entry: TaskEntry, agentName: string): void {
+  private async completeIntermediateAction(entry: TaskEntry, agentName: string): Promise<void> {
     const task = entry.state;
+    await this.preparePrediction(entry);
+    if (task.phase === 'error' || entry.finished) return;
+    await this.checkpointSession(entry);
+    if ((task.phase as AgentPhase) === 'error' || entry.finished) return;
     this.emitIntermediateAction(entry);
     task.lastResult = {
       success: true,
-      data: `Progress update "${task.action?.action}" delivered. It does not advance the task; the next action must do concrete work toward it, or finish with a terminal action.`,
+      data: `Progress update "${task.action?.action}" sent. It does not advance the task; the next action must do concrete work toward it, or finish with a terminal action.`,
     };
+    await this.recordPrediction(entry);
+    await this.checkpointSession(entry);
     this.detectAndSteerOscillation(entry, agentName);
   }
 
@@ -2951,7 +2957,8 @@ The registered object must implement these handlers to participate in the agent 
                 // filtered out at parse time, so what remains is intermediate
                 // or plain.
                 if (task.action && this.isIntermediateAction(entry, task.action)) {
-                  this.completeIntermediateAction(entry, agentName);
+                  await this.completeIntermediateAction(entry, agentName);
+                  if (cancelledExternally()) break;
                   task.step++;
                   if (task.step >= task.maxSteps) {
                     await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -3005,150 +3012,14 @@ The registered object must implement these handlers to participate in the agent 
               break;
             }
 
-            // ── Replan: inject reason and continue thinking ──
-            // Replan tells the LLM to try a different approach for the SAME
-            // task. Decomposition is no longer an agent-level concern under
-            // the Scrum model — ScrumMaster splits work across scrums.
-            if (task.action.action === 'replan') {
-              const reason = (task.action.reason as string) ?? 'Agent requested replan';
-              const goalId = entry.goalId ?? entry.incomingGoalId;
-              if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
-                goalId, operationId: `${task.id}:replan:${task.step}`,
-                observation: { taskId: task.id, material: true, reason, hypotheses: task.action.hypotheses, nextExperiment: task.action.nextExperiment },
-              }));
-              log.info(`[${agentName}] Replan requested: ${reason.slice(0, 80)}`);
-
-              let reflection = `[Replan] Reason: ${reason}\n`;
-              if (entry.goalId && this.goalManagerId) {
-                try {
-                  reflection += await this.buildGoalProgressContext(entry.goalId);
-                } catch { /* best effort */ }
-              }
-              reflection += '\nRe-evaluate and pick a different action that addresses what went wrong. If the task is genuinely outside your capability, emit a `fail` action with a clear reason.';
-
-              task.llmMessages.push({ role: 'user', content: reflection });
-              // Consume the pending observation/result so the next think()
-              // doesn't re-append them (and the batch-drain guard doesn't
-              // read a stale failure).
-              task.observation = undefined;
-              task.lastResult = undefined;
+            // Local runtime actions use the same pre-action prediction and
+            // observed-result ledger as domain actions, without another LLM call.
+            if (['replan', 'remember', 'recall', 'read_chunk'].includes(task.action.action)) {
+              await this.executeRuntimeAction(entry, agentName);
+              if (cancelledExternally()) break;
               task.step++;
-              if (task.step >= task.maxSteps) {
-                await this.handleMaxStepsReached(entry, agentName, setPhase);
-                break;
-              }
-              setPhase('thinking');
-              break;
-            }
-
-            // ── Remember: save to KnowledgeBase directly, continue thinking ──
-            if (task.action.action === 'remember') {
-              try {
-                const kbId = await this.discoverDep('KnowledgeBase');
-                if (cancelledExternally()) break;
-                if (kbId) {
-                  await this.request(
-                    request(this.id, kbId, 'remember', {
-                      title: (task.action.title as string) ?? (task.action.description as string) ?? 'Untitled',
-                      content: (task.action.content as string) ?? (task.action.description as string) ?? '',
-                      type: (task.action.type as string) ?? 'fact',
-                      tags: (task.action.tags as string[]) ?? [],
-                    }),
-                    10000,
-                  );
-                  log.info(`[${agentName}] Remembered: "${task.action.title ?? task.action.description}"`);
-                  task.llmMessages.push({
-                    role: 'user',
-                    content: '[Remember] Saved successfully. Continue with the task.',
-                  });
-                } else {
-                  task.llmMessages.push({ role: 'user', content: '[Remember] KnowledgeBase not available.' });
-                }
-              } catch (err) {
-                task.llmMessages.push({
-                  role: 'user',
-                  content: `[Remember Error] ${err instanceof Error ? err.message : String(err)}`,
-                });
-              }
-              // Consume the pending observation/result so the next think()
-              // doesn't re-append them.
-              task.observation = undefined;
-              task.lastResult = undefined;
-              task.step++;
-              if (task.step >= task.maxSteps) {
-                await this.handleMaxStepsReached(entry, agentName, setPhase);
-                break;
-              }
-              break; // re-enter thinking
-            }
-
-            // ── recall: read from KnowledgeBase, continue thinking. The
-            // write-side `remember` has been a runtime verb all along;
-            // without a matching read verb, agents with fixed vocabularies
-            // were told about the KB's lookup modes but had no action that
-            // could reach them.
-            if (task.action.action === 'recall') {
-              try {
-                const kbId = await this.discoverDep('KnowledgeBase');
-                if (kbId) {
-                  const id = task.action.id as string | undefined;
-                  const pattern = task.action.pattern as string | undefined;
-                  const query = task.action.query as string | undefined;
-                  const tags = task.action.tags as string[] | undefined;
-                  const limit = Math.min(typeof task.action.limit === 'number' ? task.action.limit : 5, 10);
-
-                  let rendered: string;
-                  if (id) {
-                    const e = await this.request<{ title?: string; type?: string; content?: string; patternRef?: string } | null>(
-                      request(this.id, kbId, 'get', { id }), 10000);
-                    if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
-                    rendered = e
-                      ? `**${e.title}** (${e.type}): ${(e.content ?? '').slice(0, 4000)}`
-                      : `No entry with id "${id}".`;
-                  } else if (pattern) {
-                    const hits = await this.request<Array<{ id: string; title: string; type: string; content: string }>>(
-                      request(this.id, kbId, 'match', { pattern, limit }), 10000);
-                    rendered = hits.length > 0
-                      ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
-                      : `No entries match pattern "${pattern}".`;
-                  } else if (query || tags?.length) {
-                    const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
-                      request(this.id, kbId, 'recall', { query, tags, limit, previews: true }), 10000);
-                    rendered = hits.length > 0
-                      ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.snippet ?? ''}`).join('\n')
-                      : 'No matching entries. Try different terms, or a `pattern` for exact names.';
-                  } else {
-                    rendered = 'recall needs one of: query (keywords), pattern (exact/regex), id (full entry), or tags.';
-                  }
-                  task.llmMessages.push({ role: 'user', content: `[Recall] ${rendered}` });
-                } else {
-                  task.llmMessages.push({ role: 'user', content: '[Recall] KnowledgeBase not available.' });
-                }
-              } catch (err) {
-                task.llmMessages.push({
-                  role: 'user',
-                  content: `[Recall Error] ${err instanceof Error ? err.message : String(err)}`,
-                });
-              }
-              task.observation = undefined;
-              task.lastResult = undefined;
-              task.step++;
-              if (task.step >= task.maxSteps) {
-                await this.handleMaxStepsReached(entry, agentName, setPhase);
-                break;
-              }
-              break; // re-enter thinking
-            }
-
-            // ── read_chunk: read more of a payload held back as a handle.
-            // A runtime verb like `recall`: every agent gets it, and it costs
-            // a step but no LLM round trip beyond the next think.
-            if (task.action.action === 'read_chunk') {
-              const rendered = this.readChunk(entry, task.action);
-              task.llmMessages.push({ role: 'user', content: `[Chunk] ${rendered}` });
-              task.observation = undefined;
-              task.lastResult = undefined;
-              task.step++;
+              await this.checkpointSession(entry);
+              if (cancelledExternally()) break;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
                 break;
@@ -3172,6 +3043,7 @@ The registered object must implement these handlers to participate in the agent 
               const code = task.action.code as string | undefined;
               const description = (task.action.description as string) ?? 'agent pipeline';
               if (!code || code.trim().length === 0) {
+                observed = { success: false, error: 'submit_job requires non-empty code' };
                 task.llmMessages.push({
                   role: 'user',
                   content: '[Job Error] submit_job requires a non-empty "code" field containing the JavaScript to run.',
@@ -3219,10 +3091,12 @@ The registered object must implement these handlers to participate in the agent 
                       AgentAbject.SUBMIT_JOB_TIMEOUT_MS,
                     );
                     if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
-                    observed = jobReply?.status === 'failed' ? { success: false, error: jobReply.error } : { success: true, data: jobReply?.result };
-                    if (jobReply?.status === 'failed') {
-                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" failed: ${jobReply.error}`);
-                      task.llmMessages.push({ role: 'user', content: `[Job Error] ${jobReply.error ?? 'job failed'}` });
+                    observed = jobReply?.status === 'completed'
+                      ? { success: true, data: jobReply.result }
+                      : { success: false, error: jobReply?.error ?? `Job did not complete (status: ${jobReply?.status ?? 'missing'})` };
+                    if (!observed.success) {
+                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" failed: ${observed.error}`);
+                      task.llmMessages.push({ role: 'user', content: `[Job Error] ${observed.error}` });
                     } else {
                       const value = jobReply?.result;
                       let rendered = value === undefined || value === null
@@ -3236,6 +3110,7 @@ The registered object must implement these handlers to participate in the agent 
                       task.llmMessages.push({ role: 'user', content: `[Job Result] ${rendered}` });
                     }
                   } else {
+                    observed = { success: false, error: 'JobManager not available' };
                     task.llmMessages.push({ role: 'user', content: '[Job Error] JobManager not available.' });
                   }
                 } catch (err) {
@@ -3279,7 +3154,8 @@ The registered object must implement these handlers to participate in the agent 
 
             // Check intermediate
             if (this.isIntermediateAction(entry, task.action)) {
-              this.completeIntermediateAction(entry, agentName);
+              await this.completeIntermediateAction(entry, agentName);
+              if (cancelledExternally()) break;
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -4584,17 +4460,125 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     return stored ? this.renderPayloadHandle(stored.id, stored.text, stored.kind) : undefined;
   }
 
+  /** Runtime verbs bypass the acting phase but need the same prediction/observation pair. */
+  private async executeRuntimeAction(entry: TaskEntry, agentName: string): Promise<void> {
+    const task = entry.state;
+    const cancelled = () => task.phase === 'error' || entry.finished;
+    await this.preparePrediction(entry);
+    if (cancelled()) return;
+    entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
+    await this.checkpointSession(entry);
+    if (cancelled()) return;
+    let result: AgentActionResult;
+    let message: string;
+    try {
+      const response = await this.performRuntimeAction(entry);
+      result = response.result;
+      message = response.message;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      result = { success: false, error };
+      message = `[${task.action?.action} Error] ${error}`;
+    }
+    if (cancelled()) { entry.outstandingOperation = undefined; return; }
+    task.lastResult = result;
+    await this.recordPrediction(entry);
+    entry.outstandingOperation = undefined;
+    if (cancelled()) return;
+    log.info(`[${agentName}] ${task.action?.action} ${result.success ? 'succeeded' : 'failed'}`);
+    task.llmMessages.push({ role: 'user', content: message });
+    this.detectAndSteerOscillation(entry, agentName);
+    // The message already contains this result. Do not append it again or
+    // evict a retained command payload by storing the observation as bulk.
+    task.observation = undefined;
+    task.lastResult = undefined;
+  }
+
+  private async performRuntimeAction(entry: TaskEntry): Promise<{ result: AgentActionResult; message: string }> {
+    const task = entry.state;
+    const action = task.action!;
+    if (action.action === 'read_chunk') {
+      const text = this.readChunk(entry, action);
+      return {
+        result: { success: true, data: { payloadId: action.id, offset: action.offset ?? 0, text } },
+        message: `[Chunk] ${text}`,
+      };
+    }
+    if (action.action === 'replan') {
+      const reason = typeof action.reason === 'string' ? action.reason : 'Agent requested replan';
+      const goalId = entry.goalId ?? entry.incomingGoalId;
+      if (goalId && this.goalManagerId) {
+        const receipt = await this.request<{ success: boolean; error?: string }>(request(this.id, this.goalManagerId, 'recordObservation', {
+          goalId, operationId: `${task.id}:replan:${task.step}`,
+          observation: { taskId: task.id, material: true, reason, hypotheses: action.hypotheses, nextExperiment: action.nextExperiment },
+        }));
+        if (!receipt?.success) throw new Error(receipt?.error ?? 'GoalManager did not accept the replan observation');
+      }
+      let reflection = `[Replan] Reason: ${reason}\n`;
+      if (entry.goalId && this.goalManagerId) {
+        try { reflection += await this.buildGoalProgressContext(entry.goalId); } catch { /* optional context */ }
+      }
+      reflection += '\nRe-evaluate and pick a different action that addresses what went wrong. If the task is outside your capability, emit fail with a clear reason.';
+      return { result: { success: true, data: { reason, reflection } }, message: reflection };
+    }
+    const kbId = await this.discoverDep('KnowledgeBase');
+    if (task.phase === 'error' || entry.finished) throw new Error('Task cancelled');
+    if (!kbId) throw new Error('KnowledgeBase not available');
+    if (action.action === 'remember') {
+      const saved = await this.request<{ id?: string; success?: boolean; error?: string }>(request(this.id, kbId, 'remember', {
+        title: (action.title as string) ?? (action.description as string) ?? 'Untitled',
+        content: (action.content as string) ?? (action.description as string) ?? '',
+        type: (action.type as string) ?? 'fact', tags: (action.tags as string[]) ?? [],
+      }), 10000);
+      if (!saved?.id || saved.success === false) throw new Error(saved?.error ?? 'KnowledgeBase did not acknowledge the saved entry');
+      return { result: { success: true, data: saved }, message: `[Remember] Saved ${saved.id}. Continue with the task.` };
+    }
+    if (action.action !== 'recall') throw new Error(`Unknown runtime action: ${action.action}`);
+    const id = action.id as string | undefined, pattern = action.pattern as string | undefined;
+    const query = action.query as string | undefined, tags = action.tags as string[] | undefined;
+    const limit = Math.min(typeof action.limit === 'number' ? action.limit : 5, 10);
+    let rendered: string;
+    if (id) {
+      const e = await this.request<{ title?: string; type?: string; content?: string; patternRef?: string } | null>(
+        request(this.id, kbId, 'get', { id }), 10000);
+      if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
+      rendered = e
+        ? `**${e.title}** (${e.type}): ${(e.content ?? '').slice(0, 4000)}`
+        : `No entry with id "${id}".`;
+    } else if (pattern) {
+      const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; patternRef?: string }>>(
+        request(this.id, kbId, 'match', { pattern, limit }), 10000);
+      for (const h of hits) if (h.patternRef) (entry.patternSelections ??= {})[h.id] = h.patternRef;
+      rendered = hits.length
+        ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
+        : `No entries match pattern "${pattern}".`;
+    } else if (query || tags?.length) {
+      const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
+        request(this.id, kbId, 'recall', { query, tags, limit, previews: true }), 10000);
+      rendered = hits.length
+        ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.snippet ?? ''}`).join('\n')
+        : 'No matching entries. Try different terms, or a pattern for exact names.';
+    } else throw new Error('recall needs query, pattern, id, or tags');
+    return { result: { success: true, data: { displayedText: rendered } }, message: `[Recall] ${rendered}` };
+  }
+
   /** Serve one read_chunk request against a stored payload. */
   private readChunk(entry: TaskEntry, action: AgentAction): string {
     const id = typeof action.id === 'string' ? action.id : undefined;
     const stored = (entry.payloads ?? []).find(p => p.id === id);
     if (!stored) {
       const have = (entry.payloads ?? []).map(p => `${p.id} (${p.text.length} chars)`).join(', ');
-      return id
+      throw new Error(id
         ? `No payload "${id}". Available: ${have || '(none)'}.`
-        : `read_chunk needs an "id". Available: ${have || '(none)'}.`;
+        : `read_chunk needs an "id". Available: ${have || '(none)'}.`);
     }
     const text = stored.text;
+    for (const key of ['offset', 'length'] as const) {
+      const value = action[key];
+      if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < (key === 'offset' ? 0 : 1))) {
+        throw new Error(`read_chunk ${key} must be ${key === 'offset' ? 'a nonnegative' : 'a positive'} integer`);
+      }
+    }
 
     if (action.outline === true) {
       return AgentAbject.outlinePayload(text) ?? `No structure detected in ${stored.id}; read it with offset/length.`;
@@ -4637,7 +4621,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       typeof action.length === 'number' ? action.length : AgentAbject.MAX_CHUNK_CHARS,
       AgentAbject.MAX_CHUNK_CHARS,
     ));
-    if (offset >= text.length) return `Offset ${offset} is past the end of ${stored.id} (${text.length} chars).`;
+    if (offset > text.length || (offset === text.length && text.length > 0)) {
+      throw new Error(`Offset ${offset} is past the end of ${stored.id} (${text.length} chars).`);
+    }
     const slice = text.slice(offset, offset + length);
     const end = offset + slice.length;
     return `${stored.id} [${offset}..${end} of ${text.length}]:\n${slice}` +
@@ -4648,10 +4634,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private static readonly MAX_EXPECT_CHARS = 300;
 
   /**
-   * File the just-executed action's stated expectation against its outcome.
-   * Called from the acting phase, where the action and its result are both in
-   * hand. Actions without a prediction are recorded as unknown, not silently
-   * promoted to successes. The pre-action record preserves the original claim.
+   * Preserve the original claim before domain, runtime, or intermediate
+   * actions execute. recordPrediction pairs it with the resulting observation;
+   * a missing expectation remains unresolved even when the operation succeeds.
    */
   private async preparePrediction(entry: TaskEntry): Promise<void> {
     const task = entry.state;
