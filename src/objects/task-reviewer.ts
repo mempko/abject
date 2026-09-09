@@ -98,6 +98,9 @@ interface LearningUpdate {
 
 interface ReviewTaskExtra {
   updates?: LearningUpdate[];
+  completionCorrectionSent?: boolean;
+  cancelled?: boolean;
+  completionIssues?: string[];
   assessments?: Record<string, { verdict: string; explanation?: string }>;
   applicationAssessments?: Record<string, string>;
   lastResult?: string;
@@ -254,11 +257,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private setupHandlers(): void {
     this.on('completeReview', async msg => {
       await this.requireTaskRuntime(msg, this.agentAbjectId);
+      const { taskId, result } = msg.payload as { taskId: string; result?: unknown };
+      return this.completeReview(taskId, result);
+    });
+    this.on('taskCancelled', async msg => {
+      await this.requireTaskRuntime(msg, this.agentAbjectId);
       const extra = this.taskExtras.get((msg.payload as { taskId: string }).taskId);
-      // Settlement reports uncertainty; it never forces another LLM turn merely
-      // to satisfy learning bookkeeping.
-      const report = this.learningReport(extra);
-      return { accepted: true, result: report, evidence: report };
+      if (extra) extra.cancelled = true;
+      return { success: true };
     });
     this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
     this.on('restoreTask', msg => {
@@ -314,7 +320,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const extra = this.taskExtras.get(ticketId);
       const succeeded = (msg.payload as { success?: boolean }).success === true;
       if (extra?.goalId && this.goalManagerId) {
-        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report: this.learningReport(extra, !succeeded) }));
+        await this.request(request(this.id, this.goalManagerId, 'ackReview', { goalId: extra.goalId, report: this.learningReport(extra, !succeeded || extra.cancelled === true) }));
       }
       this.inFlight = undefined; this.taskExtras.delete(ticketId);
       for (const taskId of succeeded ? extra?.reviewedTaskIds ?? [] : []) {
@@ -364,20 +370,62 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.on('agentAct', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
-      let result: { success: boolean; data?: unknown; error?: string };
-      try { result = await this.handleAct(taskId, action); }
-      catch (err) { result = { success: false, error: err instanceof Error ? err.message : String(err) }; }
-      const extra = this.taskExtras.get(taskId);
-      if (extra && ['assess_prediction', 'record_pattern_application', 'save_entry', 'update_entry', 'archive_entry', 'forget_entry', 'mark_useful', 'save_pattern', 'update_pattern', 'merge_entries', 'author_skill'].includes(action.action)) {
-        const app = action.application as Record<string, unknown> | undefined;
-        const key = JSON.stringify([action.action, action.id ?? action.title ?? action.name ?? action.ids ?? '', action.taskId ?? app?.taskId ?? '', action.step ?? app?.step ?? '']);
-        const updates = extra.updates ??= [];
-        const update: LearningUpdate = { key, action: structuredClone(action), status: result.success ? 'saved' : /unresolved|provenance|reference/i.test(result.error ?? '') ? 'unresolved' : 'rejected', result: result.data, error: result.error };
-        updates.push(update);
-        return { ...result, learningStatus: update.status };
-      }
-      return result;
+      return this.applyReviewAction(taskId, action);
     });
+  }
+
+  /** Shared validation and receipts for individual actions and completion batches. */
+  private async applyReviewAction(taskId: string, action: AgentAction) {
+    let result: { success: boolean; data?: unknown; error?: string };
+    try { result = await this.handleAct(taskId, action); }
+    catch (err) { result = { success: false, error: err instanceof Error ? err.message : String(err) }; }
+    const extra = this.taskExtras.get(taskId);
+    if (extra && ['assess_prediction', 'record_pattern_application', 'save_entry', 'update_entry', 'archive_entry', 'forget_entry', 'mark_useful', 'save_pattern', 'update_pattern', 'merge_entries', 'author_skill'].includes(action.action)) {
+      const app = action.application as Record<string, unknown> | undefined;
+      const key = JSON.stringify([action.action, action.id ?? action.title ?? action.name ?? action.ids ?? '', action.taskId ?? app?.taskId ?? '', action.step ?? app?.step ?? '']);
+      const updates = extra.updates ??= [];
+      const update: LearningUpdate = { key, action: structuredClone(action), status: result.success ? 'saved' : /unresolved|provenance|reference/i.test(result.error ?? '') ? 'unresolved' : 'rejected', result: result.data, error: result.error };
+      updates.push(update);
+      return { ...result, learningStatus: update.status };
+    }
+    return result;
+  }
+
+  private async completeReview(taskId: string, result: unknown) {
+    const extra = this.taskExtras.get(taskId);
+    if (!extra) return { accepted: true, result: this.learningReport(undefined, true) };
+    const batch = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : {};
+    const actions: AgentAction[] = [];
+    if ('assessments' in batch || 'applications' in batch || 'unresolvedReason' in batch) extra.completionIssues = [];
+    else extra.completionIssues ??= [];
+    for (const [field, action] of [['assessments', 'assess_prediction'], ['applications', 'record_pattern_application']] as const) {
+      const items = batch[field];
+      if (items === undefined) continue;
+      if (!Array.isArray(items)) { extra.completionIssues.push(`${field} must be an array`); continue; }
+      for (const item of items.slice(0, 100)) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) { extra.completionIssues.push(`Invalid ${field} entry`); continue; }
+        actions.push({ ...item, action });
+      }
+      if (items.length > 100) extra.completionIssues.push(`${items.length - 100} ${field} entries exceed the batch limit and remain unprocessed`);
+    }
+    // One completion can record a whole modest review, without an LLM turn
+    // per assessment. Stop below the completion RPC deadline; never loop on a
+    // receiver failure or require invented certainty to finish.
+    const deadline = Date.now() + 10000;
+    for (let i = 0; i < actions.length; i++) {
+      if (extra.cancelled) break;
+      if (Date.now() >= deadline) { extra.completionIssues.push(`${actions.length - i} updates remain unprocessed after the completion time budget`); break; }
+      await this.applyReviewAction(taskId, actions[i]);
+    }
+    if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
+    const hasObservedPredictions = extra.records?.some(r => r.predictions?.some(p => p.expect?.trim() && p.outcome !== 'unknown'));
+    const hasAssessmentAttempt = extra.updates?.some(u => u.action.action === 'assess_prediction');
+    if (!extra.cancelled && extra.kind === 'review' && hasObservedPredictions && !hasAssessmentAttempt && !extra.completionIssues.length && !extra.completionCorrectionSent) {
+      extra.completionCorrectionSent = true;
+      return { accepted: false, reason: 'The review contains observed predictions but no semantic assessments. In your next done action, put assessments in result: {assessments:[{taskId,step,verdict,explanation}],applications:[]}. Compare expected and actual evidence; a successful command does not establish the prediction. Use unresolved with a specific evidence gap when necessary. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason. This correction is requested once; remaining gaps will settle as partial.' };
+    }
+    const report = this.learningReport(extra, extra.cancelled);
+    return { accepted: true, result: report, evidence: report };
   }
 
   private learningReport(extra?: ReviewTaskExtra, interrupted = false) {
@@ -397,8 +445,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (verdict === 'helpful' || verdict === 'harmful' || verdict === 'inconclusive') patternCounts[verdict]++;
       else { patternCounts.unresolved++; unassessedApplications.push({ taskId: r.taskId, step: p.step, id: applied.id, applicationRef: applied.applicationRef }); }
     }
-    const status = interrupted || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
-    return { status, interrupted, saved, pending, attempts: updates,
+    const status = interrupted || extra?.completionIssues?.length || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
+    return { status, interrupted, saved, pending, attempts: updates, limitations: extra?.completionIssues ?? [],
       predictions: { total: episodes.size, ...counts, unassessed },
       patterns: { ...patternCounts, unassessed: unassessedApplications },
       summary: `Learning review ${status}: ${saved.length} updates saved, ${pending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
@@ -668,7 +716,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const predictions = records.flatMap(r => (r.predictions ?? []).map(p => ({ r, p })));
     predictions.sort((a, b) => Number(b.p.verdict === 'contradicted') - Number(a.p.verdict === 'contradicted'));
     append(`Prediction/feedback index (${predictions.length} observations):\n` + predictions.map(({ r, p }) =>
-      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, semantic=unresolved; expected=${p.expect || '(missing)'}; patterns=${JSON.stringify(p.patterns ?? [])}`).join('\n'), 10000);
+      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, semantic=unresolved; expected=${p.expect || '(missing)'}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, 700)}; patterns=${JSON.stringify(p.patterns ?? [])}`).join('\n'), 16000);
     const kb = await this.getKbId();
     if (kb) {
       const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: task, limit: 6, previews: true })).catch(() => []);
@@ -759,7 +807,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!extra.records?.some(r => r.taskId === action.taskId && r.predictions?.some(p => p.step === action.step))) throw new Error('Assessment is outside this review evidence');
           const decision = await this.request<{ success: boolean; error?: string; assessment?: { verdict: string; explanation?: string } }>(request(this.id, this.goalManagerId, 'recordPredictionAssessment', {
             goalId: extra.goalId, taskId: action.taskId, step: action.step, verdict: action.verdict, explanation: action.explanation,
-          }));
+          }), 5000);
           if (!decision.success) throw new Error(decision.error ?? 'Assessment rejected');
           if (decision.assessment) (extra.assessments ??= {})[`${action.taskId}:${action.step}`] = decision.assessment;
           result = JSON.stringify(decision);
@@ -890,14 +938,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
             res = await this.request(request(this.id, this.knowledgeBaseId!, 'assessPatternApplication', {
               id: action.id, applicationRef: applied.applicationRef, goalId: extra.goalId,
               verdict: application.verdict, evidence: application.evidence,
-            }));
+            }), 5000);
           } else if (Number.isSafeInteger(applied.revision) && applied.revision! > 0) {
             // Historical evidence can contain an explicit captured revision.
             // Never substitute today's revision for missing provenance.
             res = await this.request(request(this.id, this.knowledgeBaseId!, 'recordPatternApplication', {
               id: action.id, application: { id: `${extra.goalId}:${action.id}:${observedTaskId}:${step}`, goalId: extra.goalId,
                 context: application.context, evidence: application.evidence, verdict: application.verdict, patternRevision: applied.revision },
-            }));
+            }), 5000);
           } else throw new Error('Unresolved application provenance; retain this evidence for a later review, without guessing a revision');
           if (!res.success) return { success: false, error: res.error };
           (extra.applicationAssessments ??= {})[`${observedTaskId}:${step}:${action.id}`] = String(application.verdict);
@@ -1162,7 +1210,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private reviewSystemPrompt(): string {
     return `You are a post-task reviewer. Work in this workspace just finished: either a goal (with the transcripts of every task that ran under it, across one or more agents) or a single standalone task. The conversation above contains the material: the outcome, each task's transcript, and the knowledge entries that were injected into each agent's prompt. Your job is to grow the workspace's long-term memory from this experience, then finish. The doing is over; you only distill.
 
-The stated outcome at the top governs your judgment. A task that reported "done" inside a goal that ultimately FAILED is a dead end wearing a success label: mine it for what to avoid, never for "what worked". Approaches earn "what worked" status only when the goal itself succeeded.
+Assess each prediction and pattern against its observed episode. A failed goal can contain useful approaches, and a successful goal can contain false predictions. Separate local evidence from the overall outcome.
 
 ## Output Format
 Respond with ONE JSON action object inside \`\`\`json fenced code markers. Output ONLY the JSON block; put any brief note in the action's "reasoning" field.
@@ -1181,13 +1229,18 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
-| done | result | Finish with a one-line summary of what you recorded |
+| done | result: {assessments, applications, summary?, unresolvedReason?} | Submit the review assessments together and finish; receiver messages record them without a separate LLM turn per item |
 | fail | reason | The material was unreviewable |
 
+## Completion example
+After inspecting the evidence, submit assessments directly in the final result:
+{"action":"done","result":{"assessments":[{"taskId":"<observed task>","step":1,"verdict":"contradicted","explanation":"Expected the complete diff; only a preview was delivered."}],"applications":[{"id":"<applied pattern>","application":{"taskId":"<observed task>","step":1,"context":"Inspecting changes","verdict":"inconclusive","evidence":"The retained page was not fully inspected."}}],"summary":"No new reusable lesson; one prediction contradicted."}}
+Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. You may omit applications when none were declared. Save or revise reusable knowledge with the ordinary actions before finishing; those actions remain available individually too.
+
 ## How to review
-1. **Credit first.** Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, skip straight to lessons.
+1. **Evaluate predictions first.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
 2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Only structured predictions assessed as contradicted have a mechanical mismatch; a failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
-3. **Distill sparingly.** Most tasks teach nothing durable; finishing with done and "no learnings" is a good review. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
+3. **Distill sparingly.** New reusable lessons are optional. A routine task can finish with no new lesson after recording its prediction assessments; an empty learning update list does not replace those assessments. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 4. **Consult existing knowledge before saving.** Prefetched entries satisfy recall for the entries shown. Use recall_knowledge or the runtime recall-by-id action when additional context is needed; when a close entry exists, update_entry it rather than adding a sibling.
 5. **Preserve evidence without overstating conclusions.** Expected failures, transient outages, and recoveries can test the world model. Record relevant contextual evidence and competing explanations in pattern applications. Do not turn a single timeout into a permanent claim that a capability is broken; keep uncertainty explicit and propose discriminating observations when the cause is unknown.
 6. **Procedures become skills.** When the transcript shows a reusable multi-step procedure that took real effort to get right (3+ steps, especially after retries), author_skill it. Skills are shared beyond this workspace, so keep them fully generic: the procedure, its steps, its pitfalls. Every personal or workspace-specific detail (names, addresses, accounts, file paths) belongs in save_entry, never in a skill.

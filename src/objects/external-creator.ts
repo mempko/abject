@@ -591,6 +591,7 @@ clean result I did not observe.`;
         if (Number.isFinite(n)) counts.push(n);
       }
     };
+    take(/^(?:ℹ|#)\s+fail\s+(\d+)\s*$/gm);              // Node test runner
     take(/Found (\d+) errors?/g);                          // tsc
     take(/Tests?:\s+(\d+) failed/g);                       // jest / vitest
     take(/\b(\d+) failing\b/g);                            // mocha
@@ -629,7 +630,7 @@ clean result I did not observe.`;
     for (const match of output.matchAll(/^(?:ℹ|#)\s+(tests|pass|fail)\s+(\d+)\s*$/gm)) counts[match[1]] = Number(match[2]);
     const testSummary = Object.keys(counts).length ? { tests: counts.tests, passed: counts.pass, failed: counts.fail } : undefined;
     return { command, taskId: extra.taskId, workRoot: extra.workRoot, testSummary, revision: after.revision, stable, snapshotNote, exitCode: r.exitCode, outputObjectId: r.outputObjectId, outputTruncated: r.truncated,
-      signatures: ExternalCreator.signaturesOf(output, extra.workRoot), failureCount: ExternalCreator.failureCountOf(output), at: Date.now(), output };
+      signatures: r.exitCode === 0 ? [] : ExternalCreator.signaturesOf(output, extra.workRoot), failureCount: ExternalCreator.failureCountOf(output), at: Date.now(), output };
   }
 
   private async captureOutcome(extra: TaskExtra, command: string, timeoutMs: number): Promise<CheckOutcome> {
@@ -827,8 +828,8 @@ clean result I did not observe.`;
         : 'Baseline: this project declares no commands, so there is nothing to run and nothing to compare against.';
     }
     const bits: string[] = [];
-    if (b.check) bits.push(`${b.check.command} → exit ${b.check.exitCode}, ${b.check.signatures.length} known failure(s)`);
-    if (b.verify) bits.push(`${b.verify.command} → exit ${b.verify.exitCode}, ${b.verify.signatures.length} known failure(s)`);
+    if (b.check) bits.push(`${b.check.command} → exit ${b.check.exitCode}, ${(b.check.exitCode === 0 ? 0 : b.check.failureCount ?? b.check.signatures.length)} known failure(s)`);
+    if (b.verify) bits.push(`${b.verify.command} → exit ${b.verify.exitCode}, ${(b.verify.exitCode === 0 ? 0 : b.verify.failureCount ?? b.verify.signatures.length)} known failure(s)`);
     return bits.length > 0
       ? `Baseline at task start (you are NOT accountable for these): ${bits.join('; ')}`
       : 'Baseline: nothing could be captured.';
@@ -1416,14 +1417,13 @@ clean result I did not observe.`;
       readOutput: outcome.outputObjectId ? { action: 'read_output', id: outcome.outputObjectId, offset: 0, length: 30000 } : undefined } };
   }
 
-  private async opReadOutput(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown }> {
+  private async opReadOutput(extra: TaskExtra, action: AgentAction): Promise<import('./agent-abject.js').AgentActionResult> {
     const id = String(action.id ?? '') as AbjectId;
     if (!extra.commandOutputs?.has(id)) throw new Error('Output does not belong to this task, or its process has expired');
-    const output = await this.call<{ text: string; offset: number; nextOffset: number; totalBytes: number }>(id, 'readOutput', { offset: action.offset, length: action.length ?? 30000 }, 30000);
-    // Keep continuation coordinates beside the bulk handle. Otherwise a large
-    // page becomes another clipped preview with its next offset hidden inside.
-    return { ...bulkAwareResult(output.text), data: { outputObjectId: id, offset: output.offset, nextOffset: output.nextOffset, totalBytes: output.totalBytes,
-      ...(output.text.length <= 8000 ? { text: output.text } : {}),
+    const output = await this.call<{ text: string; offset: number; nextOffset: number; totalBytes: number }>(id, 'readOutput', { offset: action.offset, length: typeof action.length === 'number' && Number.isFinite(action.length) ? Math.max(1, Math.min(30000, Math.floor(action.length))) : 30000 }, 30000);
+    // This is a requested page, not unsolicited bulk. The runtime must show
+    // its body before offering the next byte offset.
+    return { success: true, payload: output.text, payloadMode: 'page', data: { outputObjectId: id, offset: output.offset, nextOffset: output.nextOffset, totalBytes: output.totalBytes,
       readOutput: output.nextOffset < output.totalBytes ? { action: 'read_output', id, offset: output.nextOffset, length: 30000 } : undefined } };
 
   }

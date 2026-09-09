@@ -63,6 +63,8 @@ export interface AgentActionResult {
    * greps and outlines the real text.
    */
   payload?: string;
+  /** An explicitly requested, bounded page should be delivered in full. */
+  payloadMode?: 'page';
   /**
    * Set by the runtime once `payload` has been stored, at which point the
    * raw text is dropped so bulk never rides along in task state or events.
@@ -3321,6 +3323,7 @@ The registered object must implement these handlers to participate in the agent 
               data: actResult.data,
               error: actResult.error,
               payload: actResult.payload,
+              payloadMode: actResult.payloadMode,
             };
             // Before emitActionResult forwards it anywhere.
             this.absorbResultPayload(entry);
@@ -3370,7 +3373,7 @@ The registered object must implement these handlers to participate in the agent 
   private actionSignature(task: AgentTaskState): string {
     const a = (task.action ?? {}) as Record<string, unknown>;
     const name = String(a.action ?? 'unknown');
-    const target = String(a.target ?? a.targetName ?? a.objectId ?? a.assignedAgentName ?? '');
+    const target = String(a.target ?? a.targetName ?? a.objectId ?? a.assignedAgentName ?? a.id ?? '');
     const method = String(a.method ?? a.kind ?? '');
     // Subject distinguishes actions that operate on a named member/slice (e.g.
     // read_draft / replace_handler / add_handler) so editing several different
@@ -3386,7 +3389,10 @@ The registered object must implement these handlers to participate in the agent 
         .replace(/\d+/g, '<n>')
         .slice(0, 80);
     }
-    return `${name}:${target}:${method}:${subject}:${outcome}`;
+    const data = task.lastResult?.data as Record<string, unknown> | undefined;
+    const slice = JSON.stringify([a.offset, a.length, a.limit, a.cursor, a.lineRange,
+      data?.offset, data?.nextOffset, data?.totalBytes]);
+    return `${name}:${target}:${method}:${subject}:${slice}:${outcome}`;
   }
 
   /**
@@ -3571,13 +3577,14 @@ The registered object must implement these handlers to participate in the agent 
         // the conversation, from oscillation detection, and from the
         // prediction ledger. The think step returns an AgentAction (no
         // boolean `success`), so it passes through untouched.
-        const r = data as { success?: unknown; data?: unknown; error?: unknown; payload?: unknown } | null;
+        const r = data as { success?: unknown; data?: unknown; error?: unknown; payload?: unknown; payloadMode?: unknown } | null;
         if (r && typeof r === 'object' && typeof r.success === 'boolean') {
           return {
             success: r.success,
             data: r.data,
             error: r.error === undefined ? undefined : String(r.error),
             ...(typeof r.payload === 'string' ? { payload: r.payload } : {}),
+            ...(r.payloadMode === 'page' ? { payloadMode: 'page' as const } : {}),
           };
         }
         return { success: true, data };
@@ -3633,6 +3640,7 @@ The registered object must implement these handlers to participate in the agent 
             data: r.data ?? r.result,
             error: r.error as string | undefined,
             ...(typeof r.payload === 'string' ? { payload: r.payload } : {}),
+            ...(r.payloadMode === 'page' ? { payloadMode: 'page' as const } : {}),
           };
         }
         return { success: true, data: jobResult.result };
@@ -4540,6 +4548,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const text = result?.payload;
     if (!result || typeof text !== 'string' || text.length === 0) return;
     result.payload = undefined;
+    if (result.payloadMode === 'page') {
+      result.payloadId = this.storePayload(entry, text, 'result');
+      return;
+    }
 
     if (text.length <= AgentAbject.PAYLOAD_HANDLE_THRESHOLD) {
       if (result.data === undefined) {
@@ -4552,6 +4564,18 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return;
     }
     result.payloadId = this.storePayload(entry, text, 'result');
+  }
+
+  private renderResultPayload(entry: TaskEntry, result: AgentActionResult): string | undefined {
+    if (!result.payloadId) return undefined;
+    const stored = entry.payloads?.find(p => p.id === result.payloadId);
+    if (!stored) return undefined;
+    if (result.payloadMode !== 'page') return this.renderStoredHandle(entry, stored.id);
+    const shown = stored.text.slice(0, AgentAbject.MAX_CHUNK_CHARS);
+    const remainder = shown.length < stored.text.length
+      ? `\n[Page exceeds the display limit; ${stored.text.length - shown.length} characters remain in ${stored.id}. Continue with read_chunk at offset ${shown.length}.]`
+      : '\n[End of requested page. Use the output continuation for the next page, if present.]';
+    return `[Requested page: ${shown.length} of ${stored.text.length} characters, retained as ${stored.id}]\n${shown}${remainder}`;
   }
 
   /** Render the handle for an already-stored payload. */
@@ -4707,7 +4731,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // Bulk handed over as `payload` was stored verbatim when the result
       // landed; show the structured part next to its handle.
       const storedHandle = task.lastResult.payloadId
-        ? this.renderStoredHandle(entry, task.lastResult.payloadId)
+        ? this.renderResultPayload(entry, task.lastResult)
         : undefined;
       if (storedHandle) {
         resultStr = `Action "${action?.action}" succeeded: ${body}\n${storedHandle}`;
@@ -4730,7 +4754,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         ? `\nPartial data (from sub-tasks that succeeded):\n${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? ''}`
         : '';
       resultStr = `Action "${action?.action}" failed: ${errStr}${dataStr}`;
-      if (task.lastResult.payloadId) resultStr += `\n${this.renderStoredHandle(entry, task.lastResult.payloadId) ?? 'Payload expired'}`;
+      if (task.lastResult.payloadId) resultStr += `\n${this.renderResultPayload(entry, task.lastResult) ?? 'Payload expired'}`;
     }
 
     // Put the agent's own prediction next to the outcome it was about. Seeing

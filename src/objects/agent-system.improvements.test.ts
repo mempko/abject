@@ -78,7 +78,7 @@ test('verification reuses stable baseline evidence, exposes owned output, and ru
     const first = await act({ action: 'verify' });
     assert.equal(first.data.reused, true); assert.equal(counts.verify, 1);
     assert.equal(first.data.outputObjectId, output.id); assert(first.data.outputTruncated);
-    assert.match((await act({ action: 'read_output', id: output.id })).data.text, /complete retained/);
+    assert.match((await act({ action: 'read_output', id: output.id })).payload, /complete retained/);
     output.on('readOutput', msg => {
       const { offset = 0, length } = msg.payload as any;
       assert.equal(length, 30000); assert.equal(msg.routing.from, creator.id);
@@ -87,6 +87,22 @@ test('verification reuses stable baseline evidence, exposes owned output, and ru
     const page = await act({ action: 'read_output', id: output.id });
     assert.equal(page.payload.length, 30000); assert.equal(page.data.nextOffset, 30000);
     assert.equal(page.data.readOutput.offset, 30000); assert.equal(page.data.totalBytes, 60000);
+    const runtime: any = await f.add(new Runtime()), jobs = await f.add(new Endpoint('JobManager'));
+    runtime.jobManagerId = jobs.id;
+    jobs.on('submitJob', () => ({ status: 'completed', result: page }));
+    for (const directExecution of [true, false]) {
+      const entry: any = { config: { directExecution }, state: { id: 'display-page', phase: 'acting', timeout: 5000,
+        action: { action: 'read_output', id: output.id }, llmMessages: [] } };
+      entry.state.lastResult = await runtime.executeStep(entry, 'Read page', 'return page', async () => page);
+      runtime.absorbResultPayload(entry);
+      runtime.addActionResultToConversation(entry);
+      assert(entry.state.llmMessages.at(-1).content.includes(page.payload), 'the model must receive the entire requested page through both execution paths');
+      assert.equal(entry.state.lastResult.payload, undefined, 'raw pages do not ride task state/events');
+      const ordinary: any = { state: { action: { action: 'bash' }, lastResult: { ...page, payloadMode: undefined }, llmMessages: [] } };
+      runtime.absorbResultPayload(ordinary); runtime.addActionResultToConversation(ordinary);
+      assert(!ordinary.state.llmMessages.at(-1).content.includes(page.payload), 'unsolicited bulk still uses a bounded preview');
+    }
+    assert.equal((await act({ action: 'read_output', id: output.id, length: 60000 })).payload.length, 30000, 'requested pages stay bounded');
     const last = await act(page.data.readOutput);
     assert.equal(last.data.nextOffset, 60000); assert.equal(last.data.readOutput, undefined);
     assert.equal(counts.verify, 1, 'reading full retained output does not execute the command again');
@@ -323,4 +339,121 @@ test('interrupted pattern applications cannot be credited as useful and rejected
     assert.equal(report.pending.length, 0); assert.equal(report.predictions.unresolved, 1);
     assert.equal(report.attempts.filter((u: any) => u.status === 'rejected').length, 2, 'attempt evidence survives repair');
   } finally { await f.stop(); }
+});
+
+
+test('paging distinct handles and offsets is progress, while repeating the same page still triggers loop detection', () => {
+  const runtime: any = new Runtime();
+  const entry: any = { state: { llmMessages: [] } };
+  const read = (id: string, offset: number) => {
+    entry.state.action = { action: 'read_output', id, offset, length: 30000 };
+    entry.state.lastResult = { success: true, data: { offset, nextOffset: offset + 30000, totalBytes: 90000 } };
+    runtime.detectAndSteerOscillation(entry, 'Worker');
+  };
+  for (const id of ['first', 'second']) for (const offset of [0, 30000, 60000]) read(id, offset);
+  assert.equal(entry.state.llmMessages.length, 0);
+  for (let i = 0; i < 3; i++) read('second', 60000);
+  assert.equal(entry.state.llmMessages.length, 1);
+  assert.match(entry.state.llmMessages[0].content, /Loop detected/);
+});
+
+test('passing tests with expected error logs have zero known failures; real runner failures remain failures', () => {
+  const creator: any = new Creator();
+  const extra = { taskId: 'test', workRoot: '/fixture', baseline: {} };
+  const snapshot = { complete: true, revision: 'same' };
+  const output = '[Worker] Task error at step 0: Cancelled\nError: Expected fixture rejection\nℹ tests 186\nℹ pass 186\nℹ fail 0\n';
+  const passing = creator.checkOutcome(extra, 'pnpm test', { stdout: output, stderr: '', exitCode: 0 }, snapshot, snapshot);
+  assert.equal(passing.failureCount, 0); assert.deepEqual(passing.signatures, []);
+  assert.deepEqual(passing.testSummary, { tests: 186, passed: 186, failed: 0 });
+  assert.match(creator.baselineSummary({ baseline: { verify: { ...passing, signatures: ['old cached diagnostic'] } } }), /0 known failure/);
+  const failing = creator.checkOutcome(extra, 'pnpm test', { stdout: 'Error: assertion failed\n# tests 2\n# pass 1\n# fail 1\n', stderr: '', exitCode: 1 }, snapshot, snapshot);
+  assert.equal(failing.failureCount, 1); assert.equal(failing.signatures.length, 1);
+  assert.equal(creator.judge(failing, passing, []).passed, false);
+  const compiler = creator.checkOutcome(extra, 'pnpm typecheck', { stdout: 'src/a.ts(2,3): error TS2322: wrong type\n', stderr: '', exitCode: 2 }, snapshot, snapshot);
+  assert(compiler.signatures[0].includes('TS2322')); assert.equal(compiler.failureCount, undefined);
+});
+
+test('one review completion records predictions and applications via their owners without extra model turns', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
+    const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
+    const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Inspect diffs', description: 'Review all changed code' });
+    const { id } = await caller.call(kb.id, 'remember', { title: 'FULL DIFF', type: 'pattern', content: JSON.stringify({ format: 1, name: 'FULL DIFF', context: 'code review', forces: 'previews omit code', therefore: 'read retained pages', evidence: 'candidate', links: [] }) });
+    const selected = await caller.call(kb.id, 'get', { id });
+    const { applicationRef } = await caller.call(kb.id, 'beginPatternApplication', { id, patternRef: selected.patternRef, applicationId: 'worker:1:pattern', goalId, context: 'Read every diff page' });
+    const predictions = Array.from({ length: 17 }, (_, i) => ({ step: i + 1, action: 'read_output', expect: 'Complete requested page is visible', outcome: 'success', verdict: 'supported', actual: i === 0 ? 'Only 2000 characters were displayed; the rest was retained behind a handle' : 'Requested page is visible in the transcript', patterns: i === 0 ? [{ id, applicationRef, why: 'Read the whole diff' }] : [] }));
+    const record = { taskId: 'worker', predictions, transcript: 'Full execution evidence', injectedKnowledge: [] };
+    await caller.call(goals.id, 'recordTaskEvidence', { goalId, taskId: 'worker', record });
+    reviewer.taskExtras.set('review', { kind: 'review', goalId, records: [record] });
+    const dossier = await reviewer.buildLearningDossier('Review', '', [record]);
+    assert.match(dossier, /Only 2000 characters were displayed/);
+    const first = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: 'All predictions aligned; no learnings' });
+    assert.equal(first.accepted, false); assert.match(first.reason, /assessments/);
+    const result = { assessments: predictions.map(p => ({ taskId: 'worker', step: p.step, verdict: p.step === 1 ? 'contradicted' : 'supported', explanation: p.actual })), applications: [{ id, application: { taskId: 'worker', step: 1, verdict: 'inconclusive', evidence: 'The page was fetched but most of its body was not displayed' } }] };
+    const complete = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result });
+    assert.equal(complete.accepted, true); assert.equal(complete.result.status, 'complete');
+    assert.equal(complete.result.predictions.supported, 16); assert.equal(complete.result.predictions.contradicted, 1); assert.equal(complete.result.predictions.unresolved, 0);
+    assert.equal(complete.result.patterns.inconclusive, 1); assert.equal(complete.result.saved.length, 18);
+    const assessment = await caller.call(goals.id, 'readGoalData', { goalId, key: 'learning/assessment/worker:1' });
+    assert.equal(assessment.verdict, 'contradicted');
+    const replay = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result });
+    assert.equal(replay.result.saved.length, 18); assert.equal((await caller.call(kb.id, 'patternHistory', { id })).applications.length, 1);
+    const invalid = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: { assessments: [{ taskId: 'unrelated', step: 1, verdict: 'supported', explanation: 'Not our evidence' }] } });
+    assert.equal(invalid.accepted, true); assert.equal(invalid.result.status, 'partial'); assert.equal(invalid.result.pending.length, 1);
+  } finally { await f.stop(); }
+});
+
+test('empty review correction happens once across restore and genuine evidence gaps settle partially', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id;
+    const records = [{ taskId: 'worker', predictions: [{ step: 1, expect: 'Full diff', outcome: 'success', actual: 'Preview only' }] }];
+    reviewer.taskExtras.set('review', { kind: 'review', records });
+    assert.equal((await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: 'No lessons' })).accepted, false);
+    const snapshot = await caller.call(reviewer.id, 'snapshotTask', { taskId: 'review' });
+    reviewer.taskExtras.delete('review');
+    await caller.call(reviewer.id, 'restoreTask', { taskId: 'review', snapshot });
+    const partial = await caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: 'No lessons' });
+    assert.equal(partial.accepted, true); assert.equal(partial.result.status, 'partial'); assert.equal(partial.result.predictions.unresolved, 1);
+    reviewer.taskExtras.set('gap', { kind: 'review', records });
+    const gap = await caller.call(reviewer.id, 'completeReview', { taskId: 'gap', result: { unresolvedReason: 'The retained output is unavailable' } });
+    assert.equal(gap.accepted, true); assert.equal(gap.result.status, 'partial'); assert.match(gap.result.limitations[0], /unavailable/);
+    const repeated = await caller.call(reviewer.id, 'completeReview', { taskId: 'gap', result: gap.result });
+    assert.deepEqual(repeated.result.limitations, gap.result.limitations, 'runtime acceptance checks preserve recorded limitations');
+  } finally { await f.stop(); }
+});
+
+test('cancelling a completion batch stops subsequent learning messages', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Endpoint('KnowledgeBase')), goals = await f.add(new Endpoint('GoalManager'));
+    const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
+    let release!: () => void, started!: () => void, calls = 0;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    goals.on('recordPredictionAssessment', async msg => { calls++; started(); await gate; return { success: true, assessment: { verdict: (msg.payload as any).verdict } }; });
+    const predictions = [1, 2].map(step => ({ step, expect: 'full page', outcome: 'success' }));
+    reviewer.taskExtras.set('review', { kind: 'review', goalId: 'goal', records: [{ taskId: 'worker', predictions }] });
+    const completion = caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: { assessments: predictions.map(p => ({ taskId: 'worker', step: p.step, verdict: 'unresolved', explanation: 'Output unavailable' })) } });
+    await entered; await caller.call(reviewer.id, 'taskCancelled', { taskId: 'review' }); release();
+    const result = await completion;
+    assert.equal(calls, 1); assert.equal(result.accepted, true); assert.equal(result.result.interrupted, true); assert.equal(result.result.status, 'partial');
+  } finally { await f.stop(); }
+});
+
+
+test('requested pages preserve escaped text verbatim, including small pages and partial failure output', () => {
+  const runtime: any = new Runtime();
+  const text = '"quoted"\n'.repeat(800);
+  assert(text.length < 8000 && JSON.stringify(text).length > 8000);
+  for (const success of [true, false]) {
+    const entry: any = { state: { action: { action: 'read_output' }, llmMessages: [], lastResult: { success, error: success ? undefined : 'partial read', data: { nextOffset: text.length }, payload: text, payloadMode: 'page' } } };
+    runtime.absorbResultPayload(entry); runtime.addActionResultToConversation(entry);
+    assert(entry.state.llmMessages.at(-1).content.includes(text));
+  }
+  const oversized = { state: { action: { action: 'read_output' }, llmMessages: [], lastResult: { success: true, payload: 'a'.repeat(31000) + 'NOT_YET_SHOWN', payloadMode: 'page' } } };
+  runtime.absorbResultPayload(oversized); runtime.addActionResultToConversation(oversized);
+  const shown = (oversized.state.llmMessages.at(-1) as any).content;
+  assert(!shown.includes('NOT_YET_SHOWN')); assert.match(shown, /characters remain/);
 });
