@@ -255,10 +255,8 @@ export class Chat extends Abject {
    */
   private pendingImages: Array<{ name: string; mimeType: string; base64: string }> = [];
 
-  /** Pending ticket promises: ticketId → resolve/reject. `paused` suspends the
-   * timeout while the task is blocked awaiting a goal (the goal has its own
-   * progress-resetting wait, so the chat must not time out before it does). */
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
+  /** Pending routing-task replies, with scoped inactivity timeouts. */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
   /** Current active ticket ID (for progress/stream routing). */
   private _currentTicketId?: string;
@@ -293,14 +291,7 @@ export class Chat extends Abject {
 
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
-  private pendingGoalCompletions = new Map<string, {
-    resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void;
-    reject: (e: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-    timeoutMs: number;
-    paused?: boolean;
-    caller: { id: AbjectId; taskId: string };
-  }>();
+
 
   constructor(args?: ChatConstructorArgs) {
     super({
@@ -447,8 +438,6 @@ export class Chat extends Abject {
     // open (see _goalSubscribed). We reconnect only if this conversation left a
     // goal running before a restart; otherwise we stay quiet until we create a
     // goal ourselves (which subscribes then).
-    await this.reconnectActiveGoal();
-
     // Load persisted conversation history (if any) for this conversation.
     if (this.conversationId && !this.historyLoaded) {
       if (!this.storageId) {
@@ -473,6 +462,8 @@ export class Chat extends Abject {
       log.info(`[Chat ${this.id.slice(0, 8)}] No conversationId set — running in legacy single-chat mode`);
     }
 
+    await this.reconnectActiveGoal();
+
     // Register with AgentAbject (fire-and-forget: handler is idempotent)
     this.send(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'Chat',
@@ -481,6 +472,7 @@ export class Chat extends Abject {
       config: {
         pinnedMessageCount: 1,
         terminalActions: {
+          goal: { type: 'success', execute: true },
           done: { type: 'success', resultFields: ['text', 'result', 'reasoning'] },
           clarify: { type: 'success', resultFields: ['question'], ownContentRequired: true },
           fail: { type: 'error', resultFields: ['reason'] },
@@ -833,7 +825,7 @@ export class Chat extends Abject {
 
             const entry = this.liveGoals.get(data.goalId);
             if (entry) {
-              this.forwardGoalProgress(data.goalId, data.message);
+              if (data.message) this.updateActivityHeader(data.message);
               if (data.message) entry.latestMessage = data.message;
               if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
               // Refetch tasks on any progress so we always show current state
@@ -843,57 +835,9 @@ export class Chat extends Abject {
             return;
           }
 
-          if (aspect === 'goalCompleted') {
-            const data = value as { goalId: string; result?: unknown };
-            const entry = this.liveGoals.get(data.goalId);
-            const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
-            if (entry) {
-              entry.status = 'completed';
-              entry.result = data.result;
-              this.recordGoalOutcome(data.goalId, entry.title, 'completed', data.result);
-              this.scheduleActivityRefresh();
-            }
-            // Top goal done — drop the reconnect marker.
-            if (data.goalId === this._currentGoalId) void this.persistActiveGoal(undefined);
-            // Resolve any waitForGoalCompletion promise for this goal — Chat's
-            // goal action waits on this to surface ScrumMaster's synthesized
-            // result to the user.
-            const pending = this.pendingGoalCompletions.get(data.goalId);
-            if (pending) {
-              this.pendingGoalCompletions.delete(data.goalId);
-              clearTimeout(pending.timer);
-              pending.resolve({ result: data.result, status: 'completed' });
-            } else if (entry && !wasDone) {
-              // No active wait: the chat task that dispatched this goal already
-              // returned, so its normal reply won't fire. Deliver the result
-              // into the conversation so a late success shows up where the user
-              // asked, not just as a standalone popup.
-              void this.deliverLateGoalOutcome({ result: data.result, status: 'completed' });
-            }
-            return;
-          }
-
-          if (aspect === 'goalFailed') {
-            const data = value as { goalId: string; error?: string };
-            const entry = this.liveGoals.get(data.goalId);
-            const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
-            if (entry) {
-              entry.status = 'failed';
-              entry.error = data.error;
-              if (data.error) entry.latestMessage = data.error;
-              this.recordGoalOutcome(data.goalId, entry.title, 'failed', data.error);
-              this.scheduleActivityRefresh();
-            }
-            // Top goal done — drop the reconnect marker.
-            if (data.goalId === this._currentGoalId) void this.persistActiveGoal(undefined);
-            const pending = this.pendingGoalCompletions.get(data.goalId);
-            if (pending) {
-              this.pendingGoalCompletions.delete(data.goalId);
-              clearTimeout(pending.timer);
-              pending.resolve({ error: data.error, status: 'failed' });
-            } else if (entry && !wasDone) {
-              void this.deliverLateGoalOutcome({ error: data.error, status: 'failed' });
-            }
+          if (aspect === 'goalCompleted' || aspect === 'goalFailed') {
+            const data = value as { goalId: string; result?: unknown; error?: string };
+            await this.acceptGoalOutcome(data.goalId, aspect === 'goalCompleted' ? 'completed' : 'failed', data.result, data.error);
             return;
           }
         }
@@ -904,6 +848,7 @@ export class Chat extends Abject {
 
     this.on('taskResult', async (msg: AbjectMessage) => {
       const payload = msg.payload as { ticketId: string };
+      this.retainTaskResult(payload);
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
         this.pendingTickets.delete(payload.ticketId);
@@ -920,7 +865,6 @@ export class Chat extends Abject {
     this.on('taskProgress', async (msg: AbjectMessage) => {
       // Reset pending ticket timeouts on agent progress
       this.resetPendingTicketTimeouts();
-
       const { ticketId, step, maxSteps, phase } =
         msg.payload as { ticketId: string; step: number; maxSteps: number; phase: string; action?: string };
       if (!this._currentTicketId) return;
@@ -955,7 +899,6 @@ export class Chat extends Abject {
       // The progress text itself is now surfaced through the liveGoals tree
       // (via goalUpdated events), so nothing to render here directly.
       this.resetPendingTicketTimeouts();
-      this.resetTaskCompletionTimeouts();
       const { message } = msg.payload as { phase?: string; message?: string };
       if (!this._currentTicketId || !message) return;
     });
@@ -1038,7 +981,7 @@ export class Chat extends Abject {
       const goalId = this._currentGoalId;
       const entry = goalId ? this.liveGoals.get(goalId) : undefined;
       if (!entry || entry.status !== 'active') return;
-      const note = `Lost contact with goal "${entry.title}" (${result.error ?? 'wait failed'}), but it is still running — tracking it rather than starting over.`;
+      const note = `Lost contact with goal "${entry.title}" (${result.error ?? 'wait failed'}), its last recorded status is active. Progress is unconfirmed; this chat will receive further goal events.`;
       try {
         await this.appendBubble('system', 'Chat', note, false);
       } catch { /* best effort */ }
@@ -1054,6 +997,8 @@ export class Chat extends Abject {
     steps: number; maxStepsReached?: boolean; validationErrors?: string[];
   }> {
     type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[] };
+    const early = this.takeTaskResult<TaskResult>(ticketId);
+    if (early) return Promise.resolve(early);
     return new Promise<TaskResult>((resolve, reject) => {
       const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -1076,9 +1021,9 @@ export class Chat extends Abject {
   /** Subscribe to GoalManager once (idempotent). We never auto-unsubscribe,
    *  so a late outcome after the task returned still delivers; a single active
    *  conversation subscribing is cheap — the flood came from ALL of them. */
-  private ensureGoalSubscription(): void {
+  private async ensureGoalSubscription(): Promise<void> {
     if (this._goalSubscribed || !this.goalManagerId) return;
-    this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
+    await this.request(request(this.id, this.goalManagerId, 'addDependent', {}));
     this._goalSubscribed = true;
   }
 
@@ -1110,17 +1055,42 @@ export class Chat extends Abject {
     } catch { return; }
     if (typeof activeGoalId !== 'string' || !activeGoalId) return;
 
-    const goal = await this.request<{ status?: string; title?: string } | null>(
+    this._currentGoalId = activeGoalId;
+    this.liveGoals.set(activeGoalId, { title: '(in progress)', status: 'active' });
+    await this.ensureGoalSubscription();
+    const goal = await this.request<{ status?: string; title?: string; result?: unknown; error?: string } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId: activeGoalId }),
-    ).catch(() => null);
-    if (goal && (goal.status === 'active' || goal.status === 'paused')) {
-      this._currentGoalId = activeGoalId;
-      this.liveGoals.set(activeGoalId, { title: goal.title ?? '(in progress)', status: 'active' });
-      this.ensureGoalSubscription();
-      this.fetchGoalTasks(activeGoalId).then(() => this.scheduleActivityRefresh()).catch(() => { /* window may not exist yet */ });
-    } else {
+    );
+    if (this._currentGoalId !== activeGoalId) return; // A terminal event won the race.
+    if (!goal) {
+      this._currentGoalId = undefined;
+      this.liveGoals.delete(activeGoalId);
       await this.persistActiveGoal(undefined);
+      return;
     }
+    this.liveGoals.get(activeGoalId)!.title = goal.title ?? '(in progress)';
+    if (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived') {
+      await this.acceptGoalOutcome(activeGoalId, goal.status === 'failed' || goal.error ? 'failed' : 'completed', goal.result, goal.error);
+      return;
+    }
+    this.goalPaused = goal.status === 'paused';
+    this.fetchGoalTasks(activeGoalId).then(() => this.scheduleActivityRefresh()).catch(() => { /* window may not exist yet */ });
+  }
+
+  private async acceptGoalOutcome(goalId: string, status: 'completed' | 'failed', result?: unknown, error?: string): Promise<void> {
+    const entry = this.liveGoals.get(goalId);
+    if (!entry || entry.status === 'completed' || entry.status === 'failed') return;
+    entry.status = status;
+    entry.result = result;
+    entry.error = error;
+    this.recordGoalOutcome(goalId, entry.title, status, status === 'completed' ? result : error);
+    this.scheduleActivityRefresh();
+    if (goalId !== this._currentGoalId) return;
+    this._currentGoalId = undefined;
+    await this.persistActiveGoal(undefined);
+    await this.exitGoalControls();
+    await this.removeActivityBubble();
+    await this.deliverLateGoalOutcome({ status, result, error });
   }
 
   /**
@@ -1171,7 +1141,7 @@ export class Chat extends Abject {
       if (g.status === 'active') {
         const detail = [g.latestAgent && `agent: ${g.latestAgent}`, g.latestMessage]
           .filter(Boolean).join(' — ');
-        lines.push(`- STILL RUNNING: goal "${g.title}" (${goalId.slice(0, 8)})${detail ? ` — ${detail}` : ''}. Do NOT create a duplicate goal for this work; it will complete or fail on its own.`);
+        lines.push(`- AWAITING OUTCOME: goal "${g.title}" (${goalId.slice(0, 8)})${detail ? ` — ${detail}` : ''}. Do NOT create a duplicate goal for this work; its status is active, which does not prove progress. Updates arrive through goal events; do not poll or create another goal.`);
       } else if (g.status === 'completed') {
         const result = typeof g.result === 'string' ? g.result : g.result !== undefined ? JSON.stringify(g.result) : '';
         const capped = result.length > 6000 ? `${result.slice(0, 6000)}\n…(truncated)` : result;
@@ -1187,155 +1157,12 @@ export class Chat extends Abject {
   /** Reset all pending ticket timeouts (called on progress events). */
   private resetPendingTicketTimeouts(): void {
     for (const [ticketId, entry] of this.pendingTickets) {
-      if (entry.paused) continue;
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
         entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
       }, entry.timeoutMs);
     }
-  }
-
-  /**
-   * Suspend a ticket's timeout while its task is blocked awaiting a goal. The
-   * goal has its own 10-minute, progress-resetting wait, so the chat task must
-   * not time out before the goal itself does ("the chat shouldn't time out if
-   * the goal hasn't"). Re-armed by resumeTicketTimeout when the goal wait ends.
-   */
-  private pauseTicketTimeout(ticketId?: string): void {
-    if (!ticketId) return;
-    const entry = this.pendingTickets.get(ticketId);
-    if (entry && !entry.paused) {
-      entry.paused = true;
-      clearTimeout(entry.timer);
-    }
-  }
-
-  /** Re-arm a ticket timeout paused by pauseTicketTimeout (goal wait finished). */
-  private resumeTicketTimeout(ticketId?: string): void {
-    if (!ticketId) return;
-    const entry = this.pendingTickets.get(ticketId);
-    if (entry && entry.paused) {
-      entry.paused = false;
-      entry.timer = setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
-      }, entry.timeoutMs);
-    }
-  }
-
-  /**
-   * Wait for a TupleSpace task to complete or fail via GoalManager events.
-   * Resolves with { taskId, result } or rejects with error.
-   */
-  private waitForTaskCompletion(taskId: string, timeoutMs: number): Promise<{ taskId: string; result?: unknown }> {
-    log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} timeout=${timeoutMs}ms pendingCount=${this.pendingTaskCompletions.size}`);
-    return new Promise<{ taskId: string; result?: unknown }>((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
-        this.pendingTaskCompletions.delete(taskId);
-        log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — TIMED OUT after ${timeoutMs}ms`);
-        reject(new Error(`Task ${taskId} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      const entry = {
-        timer: makeTimer(),
-        timeoutMs,
-        resolve: (v: unknown) => {
-          clearTimeout(entry.timer);
-          log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — RESOLVED`);
-          resolve(v as { taskId: string; result?: unknown });
-        },
-        reject: (e: Error) => {
-          clearTimeout(entry.timer);
-          log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — REJECTED: ${e.message?.slice(0, 80)}`);
-          reject(e);
-        },
-      };
-      this.pendingTaskCompletions.set(taskId, entry);
-    });
-  }
-
-  /**
-   * A goal's agents have different task IDs from the Chat task awaiting it.
-   * Bridge observed goal progress to that task's caller so JobManager and
-   * AgentAbject can refresh their scoped request timers as well as our wait.
-   * Only GoalManager events for this goal (or a tracked descendant) reach here.
-   */
-  private forwardGoalProgress(goalId: string, message?: string): void {
-    const visited = new Set<string>();
-    let ancestorId: string | undefined = goalId;
-    while (ancestorId && !visited.has(ancestorId)) {
-      visited.add(ancestorId);
-      const pending = this.pendingGoalCompletions.get(ancestorId);
-      if (pending && !pending.paused) {
-        this.resetGoalCompletionTimeout(ancestorId);
-        this.send(event(this.id, pending.caller.id, 'progress', {
-          taskId: pending.caller.taskId,
-          goalId,
-          message: message ?? 'Goal is making progress',
-        }));
-      }
-      ancestorId = this.liveGoals.get(ancestorId)?.parentId;
-    }
-  }
-
-  private resetGoalCompletionTimeout(goalId: string): void {
-    const entry = this.pendingGoalCompletions.get(goalId);
-    if (!entry || entry.paused) return;
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => {
-      this.pendingGoalCompletions.delete(goalId);
-      log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
-      entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
-    }, entry.timeoutMs);
-  }
-
-  /** Reset all pending task completion timeouts (called on progress events). */
-  private resetTaskCompletionTimeouts(): void {
-    for (const [taskId, entry] of this.pendingTaskCompletions) {
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        this.pendingTaskCompletions.delete(taskId);
-        log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
-        entry.reject(new Error(`Task ${taskId} timed out after ${entry.timeoutMs}ms`));
-      }, entry.timeoutMs);
-    }
-    for (const goalId of this.pendingGoalCompletions.keys()) this.resetGoalCompletionTimeout(goalId);
-  }
-
-  /**
-   * Wait for a goal to reach `goalCompleted` or `goalFailed`. ScrumMaster
-   * makes the completion decision under the Scrum model; Chat awaits it
-   * here and surfaces the synthesized result to the user.
-   *
-   * Goal-level progress refreshes this timer and is forwarded to the waiting
-   * task's caller, so multiple scrums won't exhaust an outer request timer
-   * while the goal is still making progress.
-   */
-  private waitForGoalCompletion(goalId: string, timeoutMs: number, caller: { id: AbjectId; taskId: string }): Promise<{ result?: unknown; error?: string; status: 'completed' | 'failed' }> {
-    log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} timeout=${timeoutMs}ms`);
-    return new Promise((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
-        this.pendingGoalCompletions.delete(goalId);
-        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${timeoutMs}ms`);
-        reject(new Error(`Goal ${goalId} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      const entry = {
-        timer: makeTimer(),
-        timeoutMs,
-        caller,
-        resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => {
-          clearTimeout(entry.timer);
-          log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — RESOLVED (${v.status})`);
-          resolve(v);
-        },
-        reject: (e: Error) => {
-          clearTimeout(entry.timer);
-          log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — REJECTED: ${e.message?.slice(0, 80)}`);
-          reject(e);
-        },
-      };
-      this.pendingGoalCompletions.set(goalId, entry);
-    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1367,105 +1194,42 @@ export class Chat extends Abject {
       }
     }
 
-    // Handle goal action: create the goal and wait for ScrumMaster to run
-    // the sprint to completion. Under the Scrum model, Chat is the Product
-    // Owner — it expresses intent (title + description capturing the user's
-    // words). ScrumMaster runs scrums, agents execute the tasks each scrum
-    // plans, and one of those scrums eventually synthesizes a final result
-    // and calls completeGoal. We wait on the goalCompleted event and surface
-    // that synthesis to the user.
+    // Goal creation is a short handoff. GoalManager events own the rest of
+    // its lifecycle; no job queue or model loop waits for the sprint.
     if (action.action === 'goal') {
       const title = (action.title as string) ?? 'Untitled goal';
       const description = (action.description as string | undefined) ?? '';
-
-      if (!this.goalManagerId) {
-        return { success: false, error: 'GoalManager not available' };
-      }
-      if (!description.trim()) {
-        return {
-          success: false,
-          error: 'Goal action requires a non-empty `description` field — restate the user\'s intent in detail (their words where possible, including any explicit ordering or constraints).',
-        };
-      }
-
-      let goalId: string;
+      if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+      if (!description.trim()) return { success: false, error: 'Goal action requires a non-empty description capturing the user intent and constraints.' };
       try {
-        const created = await this.request<{ goalId: string }>(
-          request(this.id, this.goalManagerId, 'createGoal', {
-            title: title.slice(0, 200),
-            description,
-          }),
-        );
-        goalId = created.goalId;
-        this._currentGoalId = goalId;
+        await this.ensureGoalSubscription();
+        // A retried handoff must reuse the goal this conversation already owns.
+        if (!this._currentGoalId) {
+          const created = await this.request<{ goalId: string }>(request(this.id, this.goalManagerId, 'createGoal', {
+            title: title.slice(0, 200), description, operationId: `chat:${caller.taskId}`,
+          }));
+          this._currentGoalId = created.goalId;
+          this.liveGoals.set(created.goalId, { title, description, status: 'active' });
+        }
+        const goalId = this._currentGoalId;
         this._goalCreatedThisTurn = true;
-        // We now have an active goal: subscribe to GoalManager (idempotent) so
-        // we see its progress and outcome, and persist it so a lazily
-        // re-spawned Chat reconnects after a restart.
-        this.ensureGoalSubscription();
-        void this.persistActiveGoal(goalId);
+        await this.persistActiveGoal(goalId);
+        await this.enterGoalControls();
+        this.updateActivityHeader('Goal submitted — waiting for progress');
+        this.activityStep = 0;
+        this.stepStreamChars = 0;
+        // Reconcile once after subscribing: completion may beat createGoal's reply.
+        const goal = await this.request<{ status?: string; result?: unknown; error?: string } | null>(
+          request(this.id, this.goalManagerId, 'getGoal', { goalId }), 5000,
+        ).catch(() => null);
+        if (goal?.status === 'completed' || goal?.status === 'failed') {
+          await this.acceptGoalOutcome(goalId, goal.status, goal.result, goal.error);
+        }
+        // The goal widget acknowledges the handoff; its final synthesis will
+        // arrive as a separate event, without another Chat model call.
+        return { success: true, data: '' };
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
-      }
-
-      // Swap the composer into goal mode: send button becomes Pause, a Stop
-      // button appears. Fire-and-forget — UI must not gate goal startup.
-      void this.enterGoalControls();
-
-      // Suspend this chat task's own timeout while we wait on the goal: the
-      // goal's wait (below) is authoritative, so the chat can't time out before
-      // the goal does. Re-armed in the finally so the post-goal reply synthesis
-      // is still bounded.
-      this.pauseTicketTimeout(this._currentTicketId);
-      try {
-        // Wait for ScrumMaster's DONE decision. Progress on this goal tree
-        // refreshes this wait and the caller's request chain, so multiple
-        // scrums can run without being mistaken for an inactive Chat task.
-        const completion = await this.waitForGoalCompletion(goalId, 600000, caller);
-
-        // Always pull the goal scratchpad alongside the result so Chat's
-        // next think-step has access to per-task outputs ScrumMaster
-        // synthesized from in the final scrum.
-        let scratchpad: Record<string, unknown> | undefined;
-        try {
-          const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
-            request(this.id, this.goalManagerId, 'getGoal', { goalId }),
-            5000,
-          );
-          scratchpad = goal?.scratchpad;
-        } catch { /* best effort */ }
-
-        if (completion.status === 'failed') {
-          return {
-            success: false,
-            error: completion.error ?? 'Goal failed',
-            data: { scratchpad, partial: true },
-          };
-        }
-        return {
-          success: true,
-          data: { result: completion.result, scratchpad },
-        };
-      } catch (err) {
-        // Goal-wait timeout. The goal may still be running; surface a
-        // partial result with whatever scratchpad has so the LLM can
-        // build a useful reply.
-        let scratchpad: Record<string, unknown> | undefined;
-        try {
-          const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
-            request(this.id, this.goalManagerId, 'getGoal', { goalId }),
-            5000,
-          );
-          scratchpad = goal?.scratchpad;
-        } catch { /* best effort */ }
-        return {
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-          data: { scratchpad, partial: true },
-        };
-      } finally {
-        this.resumeTicketTimeout(this._currentTicketId);
-        await this.exitGoalControls();
       }
     }
 
@@ -1491,6 +1255,8 @@ ${this.recentGoalOutcomes.map(g => `- [${g.status}] "${g.title}"${g.resultPrevie
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents. You do not carry out actions yourself; you route them.
 
 Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.${recentGoalsBlock}
+
+A \`goal\` action ends this routing turn once GoalManager accepts it. The chat receives progress and the final result through bus events. Do not poll goal status or narrate unobserved progress.
 
 ## The desktop is a 3D scene
 
@@ -1839,6 +1605,17 @@ A single successful creation goal is a complete turn. End it with **done**.
       await this.renderHistoryBubbles();
     }
 
+    if (this._currentGoalId) {
+      const paused = this.goalPaused;
+      await this.showActivityBubble();
+      await this.enterGoalControls();
+      this.goalPaused = paused;
+      this.updateActivityHeader(paused ? 'Goal paused' : 'Waiting for goal progress');
+      if (paused && this.sendBtnId) {
+        await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH }));
+        await this.setComposerHint(COMPOSER_HINT_PAUSED);
+      }
+    }
     this.changed('visibility', true);
     return true;
   }
@@ -1983,14 +1760,12 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.sendBtnId = undefined;
     this.stopBtnId = undefined;
     this.goalControlsActive = false;
-    this.goalPaused = false;
     this.messageLabelIds = [];
     this.messageMetadata.clear();
     this.bubbleSenderLabels.clear();
     this.activityBubbleLabelId = undefined;
     this.activityStep = 0;
-    this.liveGoals.clear();
-    this.liveTasks.clear();
+    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
     this.welcomeWidgetIds = [];
     this._streamBuffer = '';
     if (this.activityRefreshTimer) {
@@ -2257,7 +2032,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     messages: { role: string; content: string | ContentPart[] }[],
   ): Promise<{ success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean }> {
     this._goalCreatedThisTurn = false;
-    this._currentGoalId = undefined;
     this._streamBuffer = '';
     const { ticketId } = await this.request<{ ticketId: string }>(
       request(this.id, this.agentAbjectId!, 'startTask', {
@@ -2272,7 +2046,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     this._currentTicketId = ticketId;
     const result = await this.waitForTaskResult(ticketId, 180000);
     this._currentTicketId = undefined;
-    this._currentGoalId = undefined;
     return {
       success: result.success,
       result: result.result,
@@ -2385,8 +2158,8 @@ A single successful creation goal is a complete turn. End it with **done**.
 
       const result = turn;
 
-      // Post-task UI cleanup.
-      await this.removeActivityBubble();
+      // The goal and its controls outlive the short Chat routing task.
+      if (!this._currentGoalId) await this.removeActivityBubble();
 
       if (result.success) {
         const text = (result.result as string) ?? '';
@@ -2406,8 +2179,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       }
     } catch (err) {
       this._currentTicketId = undefined;
-      this._currentGoalId = undefined;
-      await this.removeActivityBubble();
+      if (!this._currentGoalId) await this.removeActivityBubble();
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendBubble('error', 'Error', errMsg.slice(0, 200), false);
       await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
@@ -2476,7 +2248,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   /**
    * A goal just started: the send button becomes Pause and a Stop button
    * joins the composer row. Torn down by exitGoalControls when the goal
-   * reaches a terminal state (or the wait times out).
+   * reaches a terminal state.
    */
   private async enterGoalControls(): Promise<void> {
     if (this.goalControlsActive || !this.windowId || !this.sendBtnId || !this.composerRowId) return;
@@ -2536,8 +2308,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   /**
    * Pause: freeze the goal (GoalManager stops agents, claims, and scrums),
-   * unlock the composer so the user can interject, and suspend the goal-wait
-   * timeout so a long pause can't time the chat out. Resume reverses it all.
+   * and unlock the composer so the user can interject. Resume reverses it.
    */
   private async handlePauseResumeClick(): Promise<void> {
     const goalId = this._currentGoalId;
@@ -2549,7 +2320,6 @@ A single successful creation goal is a complete turn. End it with **done**.
       ).catch(() => false);
       if (!ok) return;
       this.goalPaused = true;
-      this.setGoalWaitPaused(goalId, true);
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
       if (this.textInputId) {
         try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: false } })); } catch { /* widget gone */ }
@@ -2563,7 +2333,6 @@ A single successful creation goal is a complete turn. End it with **done**.
       if (!ok) return;
       this.goalPaused = false;
       this.clarificationPending = false;
-      this.setGoalWaitPaused(goalId, false);
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
       // The input stays live: typing during the running goal queues a note.
       await this.setComposerHint(COMPOSER_HINT_GOAL);
@@ -2572,15 +2341,11 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   /**
    * Stop: hard-stop the goal. GoalManager cancels every task and fails the
-   * goal as "Stopped by user", which resolves the goal wait — the normal
-   * cleanup path then tears the controls down.
+   * goal as "Stopped by user". The terminal event tears down the controls.
    */
   private async handleStopClick(): Promise<void> {
     const goalId = this._currentGoalId;
     if (!goalId || !this.goalManagerId) return;
-    // Re-arm the wait timer first so a stop from the paused state can't
-    // leave the goal wait suspended if the failure event races us.
-    this.setGoalWaitPaused(goalId, false);
     await this.request(
       request(this.id, this.goalManagerId, 'stopGoal', { goalId })
     ).catch(() => undefined);
@@ -2589,14 +2354,13 @@ A single successful creation goal is a complete turn. End it with **done**.
   /**
    * The scrum master paused the goal to ask the user a question. Render it,
    * switch the composer into answer mode (paused state whose next message
-   * auto-resumes), and suspend the goal-wait timer while we wait.
+   * auto-resumes).
    */
   private async handleClarificationRequested(question: string): Promise<void> {
     const goalId = this._currentGoalId;
     if (!goalId) return;
     this.goalPaused = true;
     this.clarificationPending = true;
-    this.setGoalWaitPaused(goalId, true);
     if (this.sendBtnId) {
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
     }
@@ -2632,27 +2396,11 @@ A single successful creation goal is a complete turn. End it with **done**.
       ).catch(() => false);
       if (resumed) {
         this.goalPaused = false;
-        this.setGoalWaitPaused(goalId, false);
         if (this.sendBtnId) {
           try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
         }
         await this.setComposerHint(COMPOSER_HINT_GOAL);
       }
-    }
-  }
-
-  /** Suspend/re-arm the goal-wait timeout while its goal is paused. */
-  private setGoalWaitPaused(goalId: string, paused: boolean): void {
-    const entry = this.pendingGoalCompletions.get(goalId);
-    if (!entry || entry.paused === paused) return;
-    entry.paused = paused;
-    clearTimeout(entry.timer);
-    if (!paused) {
-      entry.timer = setTimeout(() => {
-        this.pendingGoalCompletions.delete(goalId);
-        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
-        entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
-      }, entry.timeoutMs);
     }
   }
 
@@ -2853,8 +2601,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.activityHeader = '\u25CF Thinking\u2026';
     this.activityGoalHeight = 0;
     this.stepStreamChars = 0;
-    this.liveGoals.clear();
-    this.liveTasks.clear();
+    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
     this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
 
     // Embed the shared goal-progress widget directly beneath the header so the

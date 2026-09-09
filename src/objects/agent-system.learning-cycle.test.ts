@@ -35,6 +35,7 @@ test('scripted learning episode carries a surprise through Scrum, retrospective 
   for(const object of [runtime,storage,checker,goals,knowledge]) (object as any).discoverDep=async(name:string)=>deps[name]??null;
   await runtime.init(bus);await storage.init(bus);await checker.init(bus);await knowledge.init(bus);await goals.init(bus);
   const scrum=new FixtureScrum({runtime:runtime.id,goals:goals.id,knowledge:knowledge.id}),reviewer=new TaskReviewer();
+  deps.TaskReviewer = reviewer.id;
   (reviewer as any).discoverDep=async(name:string)=>deps[name]??null;
   await scrum.init(bus);await reviewer.init(bus);
   try{
@@ -54,7 +55,7 @@ test('scripted learning episode carries a surprise through Scrum, retrospective 
     assert(runtime.review,'durable failed-goal review was scheduled');
     assert.equal(runtime.review.config.budgetGoalId,goalId,'retrospective reasoning remains attributable to its originating goal');
     assert.match(JSON.stringify(runtime.review.initialMessages),/Saved 7 but restored 0/);
-    const saved=await runtime.call(reviewer.id,'agentAct',{taskId:runtime.review.taskId,action:{action:'save_pattern',name:'VERIFY RESTORED SETTINGS',context:'Persistent settings restored across restart',forces:'Live state can conceal failed persistence',therefore:'Inspect restored state before acceptance',evidence:'Candidate from the observed failed restoration; invalid-input rejection was expected'}});
+    const saved=await runtime.call(reviewer.id,'agentAct',{taskId:runtime.review.taskId,action:{action:'save_pattern',evidenceRefs:['learning/task/experiment'],name:'VERIFY RESTORED SETTINGS',context:'Persistent settings restored across restart',forces:'Live state can conceal failed persistence',therefore:'Inspect restored state before acceptance',evidence:'Candidate from the observed failed restoration; invalid-input rejection was expected'}});
     assert.equal(saved.success,true);
     await runtime.call(reviewer.id,'taskResult',{ticketId:runtime.review.taskId,success:true});
     assert.equal((await runtime.call(goals.id,'pendingReviews')).length,0);

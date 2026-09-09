@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.5.0",
+  "version": "3.6.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -38,6 +38,40 @@
       ],
       "id": "abjects:knowledge-base",
       "methods": [
+        {
+          "description": "Apply an authenticated journaled correction with a durable idempotent receipt",
+          "name": "applyLearningDecision",
+          "parameters": [
+            {
+              "description": "Evidence owner goal",
+              "name": "goalId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Durable decision",
+              "name": "decisionId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Immutable effect identity",
+              "name": "effectId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
         {
           "description": "Store a knowledge entry. Deduplicates by normalized title+type (updates if exists).",
           "name": "remember",
@@ -129,6 +163,15 @@
               }
             },
             {
+              "description": "Explicit applicability scope",
+              "name": "scope",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
               "description": "Return compact previews instead of full entries",
               "name": "previews",
               "optional": true,
@@ -164,6 +207,15 @@
               }
             },
             {
+              "description": "Explicit applicability scope",
+              "name": "scope",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
               "description": "Link-expansion depth (default 1, max 2)",
               "name": "hops",
               "optional": true,
@@ -185,6 +237,15 @@
             {
               "description": "Literal substring or 'A|B' alternation",
               "name": "pattern",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Explicit applicability scope",
+              "name": "scope",
+              "optional": true,
               "type": {
                 "kind": "primitive",
                 "primitive": "string"
@@ -553,6 +614,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.5.0"
+    "version": "3.6.0"
   }
 }

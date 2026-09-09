@@ -250,6 +250,7 @@ test('commit-only completion reports current baseline tests and declared bash ch
 test('review prioritizes stale task claims over profiles and corrects knowledge in the completion batch', async () => {
   const f = await fixture();
   try {
+    const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
     const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
     const reviewer: any = await f.add(new Reviewer());
     reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
@@ -276,6 +277,7 @@ test('review prioritizes stale task claims over profiles and corrects knowledge 
     assert(dossier.indexOf(stale.id) < dossier.indexOf('Unrelated profile'), 'task claims precede always-injected profile entries');
     await caller.call(goals.id, 'recordTaskEvidence', { goalId, taskId: record.taskId, record });
     reviewer.taskExtras.set('reconcile', { kind: 'review', goalId, records: [record] });
+    reviewer.taskExtras.get('reconcile').knowledgeRefs = Object.fromEntries(await Promise.all([stale, duplicate, user].map(async ({id}) => [id, (await caller.call(kb.id, 'get', {id})).knowledgeRef])));
     const result = {
       assessments: [{ taskId: 'worker', step: 1, verdict: 'contradicted', explanation: 'The registered test script ran 195 tests successfully.' }],
       knowledgeUpdates: [
@@ -297,7 +299,7 @@ test('review prioritizes stale task claims over profiles and corrects knowledge 
     await caller.call(reviewer.id, 'restoreTask', { taskId: 'reconcile', snapshot });
     await caller.call(reviewer.id, 'completeReview', { taskId: 'reconcile', result });
     const replay = await caller.call(reviewer.id, 'snapshotTask', { taskId: 'reconcile' });
-    assert.equal(replay.updates.filter((u: any) => ['update_entry', 'archive_entry'].includes(u.action.action)).length, 2, 'completed corrections are not replayed after restoration');
+    assert.equal(replay.decisions.flatMap((d: any) => d.effects).filter((e: any) => e.state === 'applied').length, 2, 'completed corrections are not replayed after restoration');
     const protectedWrite = await caller.call(reviewer.id, 'completeReview', { taskId: 'reconcile', result: {
       knowledgeUpdates: [{ action: 'update_entry', id: user.id, content: 'Overwritten', evidence: 'Claimed contradiction' }],
     } });
@@ -340,7 +342,7 @@ test('semantic assessments are reviewer-owned, evidence-backed, replay-safe, and
     await assert.rejects(other.call(goals.id, 'recordPredictionAssessment', assessment), /TaskReviewer/);
     assert.equal((await reviewer.call(goals.id, 'recordPredictionAssessment', assessment)).success, true);
     const repeat = await reviewer.call(goals.id, 'recordPredictionAssessment', { ...assessment, verdict: 'supported' });
-    assert.equal(repeat.duplicate, true); assert.equal(repeat.assessment.verdict, 'contradicted');
+    assert.equal(repeat.success, false); assert.equal(repeat.conflict, true); assert.equal(repeat.assessment.verdict, 'contradicted');
     const original = await other.call(goals.id, 'readGoalData', { goalId, key: 'learning/observation/task:1' });
     assert.equal(original.outcome, 'success'); assert.equal(original.actual, 'two records');
     await other.call(goals.id, 'recordObservation', { goalId, operationId: 'task:2', observation: { expect: '', outcome: 'success' } });
@@ -528,6 +530,7 @@ test('cancellation during a runtime memory call keeps an unknown outcome and sto
 test('runtime captures application receipts before acting and reviewer settles partial learning without inventing revisions', async () => {
   const f = await fixture();
   try {
+    const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
     const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge());
     const runtime: any = await f.add(new Runtime()), reviewer: any = await f.add(new Reviewer());
     const goals = await f.add(new GoalManager());
@@ -643,6 +646,7 @@ test('passing tests with expected error logs have zero known failures; real runn
 test('one review completion records predictions and applications via their owners without extra model turns', async () => {
   const f = await fixture();
   try {
+    const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
     const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
     const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
     const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Inspect diffs', description: 'Review all changed code' });

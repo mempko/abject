@@ -104,6 +104,30 @@ struct Entry {
   int64_t last_useful_at = 0;
   /// Archived entries are hidden from recall/match but restorable.
   bool archived = false;
+  json learning = nullptr;
+
+  std::string knowledge_ref() const { return json::array({id, updated_at, learning.is_object() ? int_or(learning, "revision", 0) : 0}).dump(); }
+  bool applicable(const std::string& scope = "") const {
+    if (archived) return false;
+    if (!learning.is_object()) return true;
+    const auto own = str_or(learning, "scope", "");
+    if (!scope.empty() && !own.empty() && scope != own) return false;
+    for (const auto& relation : learning.value("supersessions", json::array())) {
+      const auto affected = str_or(relation, "scope", "");
+      if (affected.empty() || affected == scope) return false;
+    }
+    return true;
+  }
+  bool preserves_learning(const json& incoming) const {
+    if (!learning.is_object()) return true;
+    if (!incoming.is_object() || int_or(incoming, "revision", -1) < int_or(learning, "revision", 0)) return false;
+    for (const auto& h : learning.value("history", json::array())) {
+      bool found = false;
+      for (const auto& r : incoming.value("history", json::array())) if (r == h) found = true;
+      if (!found) return false;
+    }
+    return true;
+  }
 
   /// The entry as its readers want it. Patterns are stored as structure and
   /// rendered here, so every path that hands an entry to a person, a prompt
@@ -111,6 +135,7 @@ struct Entry {
   /// storage. Persistence and cross-peer sync use to_json().
   json to_presented_json() const {
     json j = to_json();
+    j["knowledgeRef"] = knowledge_ref();
     if (type == "pattern") {
       if (auto p = kbpat::read(content, title)) {
         if (!p->learning.is_object()) p->learning = {{"revision", 1}, {"applications", json::array()}, {"feedbackIds", json::array()}, {"history", json::array()}};
@@ -118,6 +143,13 @@ struct Entry {
         j["content"] = p->render();
         j["pattern"] = p->to_json();
       }
+    }
+    if (learning.is_object()) {
+      std::string notices;
+      if (!str_or(learning, "scope", "").empty()) notices += "Applies only in scope: " + str_or(learning, "scope", "") + "\n";
+      for (const auto& d : learning.value("disputes", json::array())) notices += "DISPUTED (" + str_or(d, "scope", "") + "): " + str_or(d, "explanation", "") + "\n";
+      for (const auto& d : learning.value("supersessions", json::array())) notices += "SUPERSEDED (" + str_or(d, "scope", "") + "): use " + str_or(d, "replacementId", "") + "\n";
+      if (!notices.empty()) j["content"] = notices + j["content"].get<std::string>();
     }
     return j;
   }
@@ -134,7 +166,7 @@ struct Entry {
             {"lastAccessedAt", last_accessed_at},
             {"usefulCount", useful_count},
             {"lastUsefulAt", last_useful_at},
-            {"archived", archived}};
+            {"archived", archived}, {"learning", learning}};
   }
 
   /// Provenance/usefulness fields default when absent so entries from
@@ -142,6 +174,7 @@ struct Entry {
   /// over SharedState) round-trip correctly.
   static Entry from_json(const json& j) {
     Entry e;
+    if (j.contains("learning") && j["learning"].is_object()) e.learning = j["learning"];
     e.id = j.value("id", std::string());
     e.title = j.value("title", std::string());
     e.content = j.value("content", std::string());
@@ -254,8 +287,11 @@ class KnowledgeBase final : public Object {
         "generative pattern-language entries with Context/Forces/Therefore "
         "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
-        "3.5.0", "abjects:knowledge-base");
+        "3.6.0", "abjects:knowledge-base");
 
+    m.method("applyLearningDecision", "Apply an authenticated journaled correction with a durable idempotent receipt")
+        .param("goalId", "string", "Evidence owner goal").param("decisionId", "string", "Durable decision")
+        .param("effectId", "string", "Immutable effect identity").returns("object");
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
              "(updates if exists).")
@@ -275,6 +311,7 @@ class KnowledgeBase final : public Object {
         .param("type", "string", "Filter by type", true)
         .param("tags", "array", "Filter by tags", true)
         .param("limit", "number", "Max results (default 10)", true)
+        .param("scope", "string", "Explicit applicability scope", true)
         .param("previews", "boolean", "Return compact previews instead of full entries", true)
         .returns("array");
     m.method("weave",
@@ -286,6 +323,7 @@ class KnowledgeBase final : public Object {
              "to no pattern yet.")
         .param("query", "string", "Goal or task description to match pattern contexts against")
         .param("limit", "number", "Max directly matched patterns (default 5)", true)
+        .param("scope", "string", "Explicit applicability scope", true)
         .param("hops", "number", "Link-expansion depth (default 1, max 2)", true)
         .returns("object");
     m.method("match",
@@ -293,6 +331,7 @@ class KnowledgeBase final : public Object {
              "identifiers, names, and precise strings. Case-insensitive; "
              "'A|B' matches either literal.")
         .param("pattern", "string", "Literal substring or 'A|B' alternation")
+        .param("scope", "string", "Explicit applicability scope", true)
         .param("limit", "number", "Max results (default 10)", true)
         .returns("array");
     m.method("get", "Fetch one full knowledge entry by id")
@@ -522,6 +561,7 @@ class KnowledgeBase final : public Object {
   }
 
   void application_receipt(Request& req, bool assess) {
+    if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
     const auto& payload = req.payload();
     const auto id = str_or(payload, "id", "");
     auto it = entries_.find(id);
@@ -575,6 +615,7 @@ class KnowledgeBase final : public Object {
   }
 
   void record_pattern_application(Request& req) {
+    if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
     const auto& p = req.payload();
     auto it = entries_.find(str_or(p, "id", ""));
     auto pattern = it != entries_.end() && it->second.type == "pattern"
@@ -650,7 +691,7 @@ class KnowledgeBase final : public Object {
       }
       if (!p->learning.is_object()) p->learning = initial_learning();
       e.content = p->to_json().dump();
-      e.updated_at = static_cast<int64_t>(now_ms());
+      e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
       index_.add(e.id, e.title, p->search_text(), e.tags);
       persist_entry(e);
       converted++;
@@ -693,7 +734,7 @@ class KnowledgeBase final : public Object {
               }
               if (!p->learning.is_object()) p->learning = initial_learning();
               e.content = p->to_json().dump();
-              e.updated_at = static_cast<int64_t>(now_ms());
+              e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
               index_.add(e.id, e.title, p->search_text(), e.tags);
               save_entry(e);
               changed("entryUpdated", e.to_presented_json());
@@ -704,7 +745,87 @@ class KnowledgeBase final : public Object {
 
   // ── Handlers ───────────────────────────────────────────────────────────
 
+  std::set<std::string> pending_learning_;
+  bool busy_learning(Request& req, const std::string& id) {
+    if (!pending_learning_.count(id)) return false;
+    req.reply({{"success", false}, {"retryable", true}, {"error", "Knowledge revision is being persisted"}}); return true;
+  }
+  void apply_learning(Request& req) {
+    json envelope = req.payload(); envelope["requester"] = req.from();
+    const auto correlation = req.message_id(); req.defer();
+    request("@GoalManager", "getLearningEffect", envelope, [this, correlation](const Result& r) {
+      auto reject = [this, correlation](const std::string& error, bool retry = false) { reply_to(correlation, {{"success", false}, {"retryable", retry}, {"error", error}}); };
+      if (!r.ok || !r.payload.is_object() || !bool_or(r.payload, "success", false)) { reject("Learning effect unavailable or unauthorized", !r.ok); return; }
+      const json decision = r.payload["decision"], effect = r.payload["effect"], input = effect["input"];
+      const std::string id = str_or(input, "id", ""), action = str_or(input, "action", ""), effect_id = str_or(effect, "id", "");
+      auto it = entries_.find(id);
+      if (it != entries_.end() && it->second.learning.is_object()) {
+        for (const auto& receipt : it->second.learning.value("history", json::array())) if (str_or(receipt, "effectId", "") == effect_id) {
+          reply_to(correlation, {{"success", true}, {"duplicate", true}, {"receipt", receipt}}); return;
+        }
+      }
+      if (pending_learning_.count(id)) { reject("Knowledge revision is being persisted", true); return; }
+      if (str_or(effect, "state", "") != "proposed") { reject("Effect is not awaiting application"); return; }
+      if (r.payload.contains("validationError") && r.payload["validationError"].is_string()) { reject(r.payload["validationError"].get<std::string>()); return; }
+      const bool creating = action == "save_entry";
+      if (creating ? it != entries_.end() : it == entries_.end()) { reject("Knowledge target missing or conflicting"); return; }
+      if (!creating && action != "record_pattern_application" && it->second.knowledge_ref() != str_or(input, "knowledgeRef", "")) { reject("Selected knowledge version changed"); return; }
+      if (!creating && it->second.origin == "user" && action != "dispute_entry" && action != "confirm_entry" && action != "record_pattern_application") { reject("User-authored knowledge is protected; record a supported dispute instead"); return; }
+      const std::string scope = str_or(input, "scope", "");
+      if (action == "archive_entry" && !scope.empty()) { reject("Scoped retirement requires supersede_entry and an applicable replacement"); return; }
+      if (action == "supersede_entry") {
+        auto replacement = entries_.find(str_or(input, "replacementId", ""));
+        if (replacement == entries_.end() || !replacement->second.applicable(scope) || (replacement->second.learning.is_object() && !str_or(replacement->second.learning,"scope","").empty() && str_or(replacement->second.learning,"scope","") != scope)) { reject("Replacement must be saved and applicable before supersession"); return; }
+      }
+      Entry next = creating ? Entry() : it->second;
+      json before = creating ? json(nullptr) : next.to_json();
+      if (before.is_object()) before.erase("learning");
+      const int64_t now = std::max(static_cast<int64_t>(now_ms()), next.updated_at + 1);
+      if (creating) { next.id = id; next.title = str_or(input,"title",""); next.content = str_or(input,"content",""); next.type = str_or(input,"type","learned"); next.origin = "reviewer"; next.created_by = object_id_; next.created_at = now; next.creator_peer_id = self_peer_id(); }
+      if (creating || action == "update_entry") {
+        if (input.contains("title")) next.title = input["title"].get<std::string>();
+        if (input.contains("content")) {
+          auto content = input["content"].get<std::string>();
+          if (next.type == "pattern") { auto revised = revise_pattern(next.title, content, creating ? "" : next.content); if (!revised) { reject("Invalid pattern content"); return; } next.content = *revised; }
+          else next.content = content;
+        }
+        if (input.contains("tags")) next.tags = input["tags"].get<std::vector<std::string>>();
+      }
+      if (!next.learning.is_object()) next.learning = {{"revision",0},{"history",json::array()},{"disputes",json::array()},{"supersessions",json::array()}};
+      if (action == "record_pattern_application") {
+        auto pattern = next.type == "pattern" ? kbpat::read(next.content,next.title) : std::optional<kbpat::Pattern>();
+        bool found = false;
+        if (pattern && pattern->learning.is_object()) for (auto& app : pattern->learning["applications"]) {
+          if (str_or(app,"id","") != str_or(input,"applicationRef","") || app["goalId"] != decision["goalId"]) continue;
+          if (str_or(app,"verdict","") != "applied" && (app["verdict"] != input["verdict"] || app["evidence"] != input["evidence"])) { reject("Conflicting application feedback"); return; }
+          app["verdict"] = input["verdict"]; app["evidence"] = input["evidence"]; found = true;
+        }
+        if (!found) { reject("Unresolved application reference"); return; }
+        next.content = pattern->to_json().dump();
+      }
+      if (action == "archive_entry") next.archived = true;
+      if (action == "supersede_entry") next.learning["supersessions"].push_back({{"replacementId",input["replacementId"]},{"scope",scope},{"effectId",effect_id}});
+      if (action == "dispute_entry") next.learning["disputes"].push_back({{"explanation",input["evidence"]},{"scope",scope},{"effectId",effect_id}});
+      if (action == "narrow_entry" || (creating && !scope.empty())) next.learning["scope"] = scope;
+      next.learning["revision"] = int_or(next.learning,"revision",0) + 1;
+      next.updated_at = now;
+      json receipt = {{"effectId",effect_id},{"decisionId",decision["id"]},{"goalId",decision["goalId"]},{"revision",next.learning["revision"]},{"at",now},{"before",before},{"input",input},{"evidence",decision["evidence"]}};
+      next.learning["history"].push_back(receipt);
+      pending_learning_.insert(id);
+      request("@Storage", "set", {{"key",ENTRY_KEY_PREFIX + id},{"value",next.to_json()}}, [this, correlation, next, receipt, creating](const Result& saved) {
+        pending_learning_.erase(next.id);
+        if (!saved.ok || saved.payload == false || (saved.payload.is_object() && saved.payload.contains("success") && !bool_or(saved.payload,"success",false))) {
+          reply_to(correlation, {{"success",false},{"retryable",true},{"error","Knowledge persistence rejected"}}); return;
+        }
+        entries_[next.id] = next; index_.add(next.id,next.title,index_text(next),next.tags);
+        mark_dirty(next.id); request_sync(); changed(creating ? "entryAdded" : "entryUpdated",next.to_json());
+        reply_to(correlation, {{"success",true},{"receipt",receipt}});
+      });
+    });
+  }
+
   void register_handlers() {
+    on("applyLearningDecision", [this](Request& req) { apply_learning(req); });
     on("remember", [this](Request& req) { handle_remember(req); });
     on("beginPatternApplication", [this](Request& req) { application_receipt(req, false); });
     on("assessPatternApplication", [this](Request& req) { application_receipt(req, true); });
@@ -730,9 +851,11 @@ class KnowledgeBase final : public Object {
     });
 
     on("forget", [this](Request& req) {
+      if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
       const std::string id = req.payload().value("id", std::string());
       auto it = entries_.find(id);
       if (it == entries_.end()) { req.reply({{"success", false}}); return; }
+      if (it->second.learning.is_object()) { req.reply({{"success",false},{"error","Learning history must be retained; archive the entry"}}); return; }
       const std::string title = it->second.title;
       index_.remove(id);
       entries_.erase(it);
@@ -817,6 +940,7 @@ class KnowledgeBase final : public Object {
     });
 
     on("archive", [this](Request& req) {
+      if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
       const json& p = req.payload();
       const std::string id = p.value("id", std::string());
       if (id.empty()) { req.error("CONTRACT_VIOLATION", "id must not be empty"); return; }
@@ -827,7 +951,7 @@ class KnowledgeBase final : public Object {
       }
       Entry& e = it->second;
       e.archived = bool_or(p, "archived", true);
-      e.updated_at = static_cast<int64_t>(now_ms());
+      e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
       save_entry(e);
       changed("entryUpdated", e.to_json());
       log(LogLevel::Info,
@@ -915,10 +1039,12 @@ class KnowledgeBase final : public Object {
       existing = nullptr;
     }
     if (existing) {
+      if (busy_learning(req, existing->id)) return;
+      if (existing->learning.is_object() && (existing->archived || !existing->learning.value("supersessions",json::array()).empty())) { req.reply({{"success",false},{"error","Retired knowledge requires an explicit revision"},{"id",existing->id}}); return; }
       existing->content = type == "pattern" ? *revise_pattern(title, content, existing->content) : body;
       if (p.contains("tags")) existing->tags = tags;
       existing->archived = false;
-      existing->updated_at = now;
+      existing->updated_at = std::max(now, existing->updated_at + 1);
       index_.add(existing->id, existing->title, index_text(*existing), existing->tags);
       save_entry(*existing);
       changed("entryUpdated", existing->to_json());
@@ -937,7 +1063,7 @@ class KnowledgeBase final : public Object {
     e.origin = std::move(origin);
     e.created_by = req.from();
     e.created_at = now;
-    e.updated_at = now;
+    e.updated_at = std::max(now, e.updated_at + 1);
     e.access_count = 0;
     e.last_accessed_at = now;
     e.useful_count = 0;
@@ -957,6 +1083,7 @@ class KnowledgeBase final : public Object {
 
   void handle_recall(Request& req) {
     const json& p = req.payload();
+    const std::string scope = str_or(p,"scope","");
     const std::string query = p.value("query", std::string());
     const std::string type = p.value("type", std::string());
     const bool previews = p.value("previews", false);
@@ -980,7 +1107,7 @@ class KnowledgeBase final : public Object {
         auto it = entries_.find(hit.id);
         if (it == entries_.end()) continue;
         const Entry& e = it->second;
-        if (e.archived) continue;
+        if (!e.applicable(scope)) continue;
         if (!type.empty() && e.type != type) continue;
         if (!tag_filter.empty() && !has_any_tag(e, tag_filter)) continue;
         rows.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true});
@@ -988,6 +1115,7 @@ class KnowledgeBase final : public Object {
       }
     } else {
       for (const Entry* e : filtered_by_recency(type, tag_filter, false)) {
+        if (!e->applicable(scope)) continue;
         rows.push_back({e, clip_utf8(e->content, 160), 0, false});
         if (rows.size() >= max) break;
       }
@@ -1009,7 +1137,7 @@ class KnowledgeBase final : public Object {
       if (previews) {
         json preview = {{"id", row.entry->id},   {"title", row.entry->title},
                         {"type", row.entry->type}, {"tags", row.entry->tags},
-                        {"snippet", row.snippet}};
+                        {"snippet", row.entry->learning.is_object() ? clip_utf8(row.entry->to_presented_json()["content"].get<std::string>(), 240) : row.snippet}, {"knowledgeRef", row.entry->knowledge_ref()}, {"learning", row.entry->learning}};
         if (row.scored) preview["score"] = row.score;
         out.push_back(std::move(preview));
       } else {
@@ -1026,6 +1154,7 @@ class KnowledgeBase final : public Object {
 
   void handle_weave(Request& req) {
     const json& p = req.payload();
+    const std::string scope = str_or(p,"scope","");
     const std::string query = str_or(p, "query", "");
     if (query.empty()) { req.error("CONTRACT_VIOLATION", "query must not be empty"); return; }
     const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 5), 1, 20));
@@ -1041,7 +1170,7 @@ class KnowledgeBase final : public Object {
       auto it = entries_.find(hit.id);
       if (it == entries_.end()) continue;
       Entry& e = it->second;
-      if (e.archived || e.type != "pattern") continue;
+      if (!e.applicable(scope) || e.type != "pattern") continue;
       selected.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true, "matched"});
       if (selected.size() >= 100) break;
     }
@@ -1084,7 +1213,7 @@ class KnowledgeBase final : public Object {
       for (size_t i = frontier_begin; i < frontier_end; i++) {
         for (const auto& name : parse_pattern_links(selected[i].entry->content, selected[i].entry->title)) {
           Entry* linked = find_pattern_by_name(name);
-          if (!linked) { dangling.insert(name); continue; }
+          if (!linked || !linked->applicable(scope)) { dangling.insert(name); continue; }
           if (seen.count(linked->id) || selected.size() >= total_cap) continue;
           seen.insert(linked->id);
           selected.push_back({linked, "", 0, false, "linked-from: " + selected[i].entry->title});
@@ -1120,6 +1249,7 @@ class KnowledgeBase final : public Object {
 
   void handle_match(Request& req) {
     const json& p = req.payload();
+    const std::string scope = str_or(p,"scope","");
     const std::string pattern = p.value("pattern", std::string());
     if (pattern.empty()) { req.error("CONTRACT_VIOLATION", "pattern must not be empty"); return; }
     const size_t max = std::min<int64_t>(p.value("limit", static_cast<int64_t>(10)), 50);
@@ -1152,7 +1282,7 @@ class KnowledgeBase final : public Object {
 
     std::vector<const Entry*> results;
     for (const Entry* e : sorted_by_recency()) {
-      if (e->archived) continue;
+      if (!e->applicable(scope)) continue;
       if (!matches(*e)) continue;
       results.push_back(e);
       if (results.size() >= max) break;
@@ -1174,6 +1304,7 @@ class KnowledgeBase final : public Object {
   }
 
   void handle_update(Request& req) {
+    if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
     const json& p = req.payload();
     const std::string id = p.value("id", std::string());
     if (id.empty()) { req.error("CONTRACT_VIOLATION", "id must not be empty"); return; }
@@ -1221,7 +1352,7 @@ class KnowledgeBase final : public Object {
       }
     }
     const int64_t now = static_cast<int64_t>(now_ms());
-    e.updated_at = now;
+    e.updated_at = std::max(now, e.updated_at + 1);
     index_.add(e.id, e.title, index_text(e), e.tags);
     save_entry(e);
     changed("entryUpdated", e.to_json());
@@ -1297,6 +1428,7 @@ class KnowledgeBase final : public Object {
   /// Durable write of ONE entry — a write serializes one entry, never the
   /// whole store (the JSON boundary makes whole-store writes O(N) per call).
   void persist_entry(const Entry& e) {
+    if (pending_learning_.count(e.id)) return;
     request("@Storage", "set",
             {{"key", ENTRY_KEY_PREFIX + e.id}, {"value", e.to_json()}},
             [](const Result&) {});
@@ -1418,7 +1550,9 @@ class KnowledgeBase final : public Object {
 
     bool have_local_stamp = false;
     int64_t local_stamp = 0;
+    if (pending_learning_.count(id)) return false;
     auto local = entries_.find(id);
+    if (local != entries_.end() && !local->second.preserves_learning(raw.value("entry",json::object()).value("learning",json()))) return false;
     if (local != entries_.end()) {
       have_local_stamp = true;
       local_stamp = local->second.updated_at;
@@ -1495,6 +1629,7 @@ class KnowledgeBase final : public Object {
       auto tomb = tombstones_.find(re.id);
       if (tomb != tombstones_.end() && tomb->second >= re.updated_at) continue;
       auto it = entries_.find(re.id);
+      if (pending_learning_.count(re.id) || (it != entries_.end() && !it->second.preserves_learning(re.learning))) continue;
       if (it == entries_.end() || re.updated_at > it->second.updated_at) {
         const std::string rid = re.id;
         if (it != entries_.end()) index_.remove(rid);
@@ -1526,6 +1661,7 @@ class KnowledgeBase final : public Object {
   /// retire only through explicit curation, never by staleness), and entries
   /// a reviewer has confirmed useful.
   bool is_protected(const Entry& e) const {
+    if (e.learning.is_object() || pending_learning_.count(e.id)) return true;
     if (e.origin == "user") return true;
     if (e.type == "pattern") return true;
     if (e.type == "fact") {
@@ -1541,7 +1677,7 @@ class KnowledgeBase final : public Object {
     log(LogLevel::Info,
         std::string("Distill: archiving \"") + e.title + "\" (" + why + ")");
     e.archived = true;
-    e.updated_at = static_cast<int64_t>(now_ms());
+    e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
     persist_entry(e);
     mark_dirty(e.id);
   }
@@ -1603,7 +1739,7 @@ class KnowledgeBase final : public Object {
     // are never purged.
     std::vector<const Entry*> archived;
     for (const auto& [_, e] : entries_) {
-      if (e.archived && e.origin != "user") archived.push_back(&e);
+      if (e.archived && e.origin != "user" && !e.learning.is_object() && !pending_learning_.count(e.id)) archived.push_back(&e);
     }
     std::sort(archived.begin(), archived.end(), [](const Entry* a, const Entry* b) {
       return a->updated_at < b->updated_at;

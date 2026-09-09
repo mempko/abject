@@ -9,6 +9,8 @@
  * can iterate, which is where BM25 shines.
  */
 
+import { withKeyedLock } from '../core/keyed-lock.js';
+import { knowledgeRef, applicable, preservesLearning, validateLearningEffect, type KnowledgeLearning, type LearningDecision } from '../core/learning.js';
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import { v4 as uuidv4 } from 'uuid';
 import { DatabaseSync } from 'node:sqlite';
@@ -62,6 +64,8 @@ export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference' | 'patt
 export type KnowledgeOrigin = 'user' | 'agent' | 'reviewer' | 'scrum';
 
 export interface KnowledgeEntry {
+  knowledgeRef?: string;
+  learning?: KnowledgeLearning;
   id: string;
   title: string;
   content: string;
@@ -109,6 +113,8 @@ export interface WovenPattern extends KnowledgeEntry {
 
 /** Compact preview shape returned when recall is called with previews: true. */
 export interface RecallPreview {
+  knowledgeRef?: string;
+  learning?: KnowledgeLearning;
   id: string;
   title: string;
   type: KnowledgeType;
@@ -118,6 +124,7 @@ export interface RecallPreview {
 }
 
 export class KnowledgeBase extends Abject {
+  private pendingLearning = new Set<string>();
   private storageId?: AbjectId;
   private sharedStateId?: AbjectId;
   private llmId?: AbjectId;
@@ -153,6 +160,7 @@ export class KnowledgeBase extends Abject {
               name: 'recall',
               description: 'Search knowledge entries by query (BM25-ranked full text, title-boosted), type, or tags. Each result carries a snippet and score. Pass previews: true for compact {id, title, snippet} results, then fetch winners with get.',
               parameters: [
+                { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: 'Explicit applicability scope', optional: true },
                 { name: 'query', type: { kind: 'primitive', primitive: 'string' }, description: 'Search query (keywords)', optional: true },
                 { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by type', optional: true },
                 { name: 'tags', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Filter by tags', optional: true },
@@ -165,6 +173,7 @@ export class KnowledgeBase extends Abject {
               name: 'weave',
               description: "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their links to pull in related patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
               parameters: [
+                { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: 'Explicit applicability scope', optional: true },
                 { name: 'query', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal or task description to match pattern contexts against' },
                 { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max directly matched patterns (default 5)', optional: true },
                 { name: 'hops', type: { kind: 'primitive', primitive: 'number' }, description: 'Link-expansion depth (default 1, max 2)', optional: true },
@@ -178,6 +187,7 @@ export class KnowledgeBase extends Abject {
               name: 'match',
               description: 'Exact/regex lookup over titles and content. Use for identifiers, names, and precise strings where full-text ranking is unnecessary. Pattern is a case-insensitive regex; an invalid regex is treated as a literal substring.',
               parameters: [
+                { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: 'Explicit applicability scope', optional: true },
                 { name: 'pattern', type: { kind: 'primitive', primitive: 'string' }, description: 'Regex or literal substring' },
                 { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max results (default 10)', optional: true },
               ],
@@ -430,6 +440,7 @@ export class KnowledgeBase extends Abject {
     // Migrate pre-provenance databases in place. ADD COLUMN throws when the
     // column already exists, which is the signal to stop probing.
     const migrations = [
+      `ALTER TABLE entries ADD COLUMN learning TEXT`,
       `ALTER TABLE entries ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`,
       `ALTER TABLE entries ADD COLUMN usefulCount INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE entries ADD COLUMN lastUsefulAt INTEGER NOT NULL DEFAULT 0`,
@@ -534,7 +545,7 @@ export class KnowledgeBase extends Abject {
 
       pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
       entry.content = serializePattern(pattern);
-      entry.updatedAt = Date.now();
+      entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
       this.writeEntryToDb(entry);
       converted++;
     }
@@ -603,17 +614,22 @@ export class KnowledgeBase extends Abject {
   }
 
   private present(entry: KnowledgeEntry): KnowledgeEntry {
+    entry = { ...entry, knowledgeRef: knowledgeRef(entry) };
+    const notices = [...(entry.learning?.disputes ?? []).map(d => `DISPUTED (${d.scope || 'all scopes'}): ${d.explanation}`), ...(entry.learning?.supersessions ?? []).map(d => `SUPERSEDED (${d.scope || 'all scopes'}): use ${d.replacementId}`)];
+    if (entry.learning?.scope) notices.push(`Applies only in scope: ${entry.learning.scope}`);
+    if (notices.length) entry = { ...entry, content: `${notices.join('\n')}\n${entry.content}` };
     if (entry.type !== 'pattern') return entry;
-    const pattern = readPattern(entry.content, entry.title);
+    const pattern = readPattern(this.entries.get(entry.id)?.content ?? entry.content, entry.title);
     if (!pattern) return entry;
     pattern.learning ??= { revision: 1, applications: [], feedbackIds: [], history: [] };
-    return { ...entry, content: renderPatternText(pattern), pattern, patternRef: JSON.stringify([entry.id, pattern.learning.revision]) } as KnowledgeEntry;
+    return { ...entry, content: (notices.length ? notices.join('\n') + '\n' : '') + renderPatternText(pattern), pattern, patternRef: JSON.stringify([entry.id, pattern.learning.revision]) } as KnowledgeEntry;
   }
 
   private rowToEntry(r: Record<string, unknown>): KnowledgeEntry {
     let tags: string[] = [];
     try { tags = JSON.parse(String(r.tags ?? '[]')) as string[]; } catch { /* keep [] */ }
     return {
+      learning: typeof r.learning === 'string' ? JSON.parse(r.learning) : undefined,
       id: String(r.id),
       title: String(r.title),
       content: String(r.content),
@@ -645,12 +661,12 @@ export class KnowledgeBase extends Abject {
   }
 
   /** Insert or update an entry row. */
-  private writeEntryToDb(e: KnowledgeEntry): void {
+  private writeEntryToDb(e: KnowledgeEntry, strict = false): void {
     if (!this.db) return;
     try {
       this.db.prepare(`
-        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived, creatorPeerId)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived, creatorPeerId, learning)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           content = excluded.content,
@@ -663,14 +679,16 @@ export class KnowledgeBase extends Abject {
           usefulCount = excluded.usefulCount,
           lastUsefulAt = excluded.lastUsefulAt,
           archived = excluded.archived,
-          creatorPeerId = excluded.creatorPeerId
+          creatorPeerId = excluded.creatorPeerId,
+          learning = excluded.learning
       `).run(
         e.id, e.title, e.content, e.type, JSON.stringify(e.tags), e.createdBy,
         e.createdAt, e.updatedAt, e.accessCount, e.lastAccessedAt,
         e.origin, e.usefulCount, e.lastUsefulAt, e.archived ? 1 : 0,
-        e.creatorPeerId ?? '',
+        e.creatorPeerId ?? '', JSON.stringify(e.learning) ?? null,
       );
     } catch (err) {
+      if (strict) throw err;
       log.warn(`DB write failed for "${e.title}": ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -726,7 +744,8 @@ export class KnowledgeBase extends Abject {
         LIMIT ?
       `).all(match, type ?? null, type ?? null, limit) as Array<Record<string, unknown>>;
       return rows.map(r => ({
-        id: String(r.id),
+        learning: typeof r.learning === 'string' ? JSON.parse(r.learning) : undefined,
+      id: String(r.id),
         score: Number(r.score ?? 0),
         snippet: String(r.snip ?? ''),
       }));
@@ -868,8 +887,79 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     return serializePattern(pattern);
   }
 
+  private async applyLearningDecision(msg: AbjectMessage) {
+    if (msg.routing.from !== await this.discoverDep('TaskReviewer')) throw new Error('Knowledge learning belongs to TaskReviewer');
+    const p = msg.payload as { goalId: string; decisionId: string; effectId: string };
+    const owner = await this.discoverDep('GoalManager');
+    if (!owner) return { success: false, retryable: true, error: 'GoalManager unavailable' };
+    const decision = await this.request<LearningDecision | null>(request(this.id, owner, 'getLearningDecision', p));
+    const effect = decision?.effects.find(e => e.id === p.effectId);
+    if (!decision || !effect) return { success: false, error: 'Unknown durable learning effect' };
+    const input = effect.input;
+    return withKeyedLock(`${this.id}:knowledge:${input.id}`, async () => {
+      const existing = this.entries.get(String(input.id));
+      const receipt = existing?.learning?.history.find(h => h.effectId === effect.id);
+      if (receipt) return { success: true, duplicate: true, receipt };
+      if (effect.state !== 'proposed') return { success: false, error: 'Effect is not awaiting application' };
+      const error = validateLearningEffect(decision, effect);
+      if (error) return { success: false, error };
+      const creating = input.action === 'save_entry';
+      if (creating ? !!existing : !existing) return { success: false, conflict: true, error: creating ? 'Target already exists' : 'Knowledge target unavailable' };
+      if (existing && input.action !== 'record_pattern_application' && knowledgeRef(existing) !== input.knowledgeRef) return { success: false, conflict: true, error: 'Selected knowledge version changed', currentRef: knowledgeRef(existing) };
+      if (existing?.origin === 'user' && !['dispute_entry','confirm_entry','record_pattern_application'].includes(String(input.action))) return { success: false, protected: true, error: 'User-authored knowledge is protected; record a supported dispute instead' };
+      if (input.action === 'supersede_entry') {
+        const replacement = this.entries.get(String(input.replacementId));
+        if (!replacement || !applicable(replacement, String(input.scope ?? '')) || (replacement.learning?.scope && replacement.learning.scope !== input.scope)) return { success: false, error: 'Replacement must be saved and applicable before supersession' };
+      }
+      const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
+      const entry: KnowledgeEntry = existing ? structuredClone(existing) : { id: String(input.id), title: String(input.title), content: String(input.content), type: (input.type as KnowledgeType) ?? 'learned', tags: (input.tags as string[]) ?? [], origin: 'reviewer', createdBy: this.id, createdAt: now, updatedAt: now, archived: false, accessCount: 0, lastAccessedAt: 0, usefulCount: 0, lastUsefulAt: 0 };
+      const learning = entry.learning ??= { revision: 0, history: [], disputes: [], supersessions: [] };
+      if (input.action === 'update_entry') {
+        if (typeof input.title === 'string') entry.title = input.title;
+        if (typeof input.content === 'string') entry.content = entry.type === 'pattern' ? this.revisePatternContent(entry.title, input.content, entry.content) : input.content;
+        if (Array.isArray(input.tags)) entry.tags = input.tags as string[];
+      }
+      if (input.action === 'record_pattern_application') {
+        const pattern = entry.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
+        const app = pattern?.learning?.applications.find(a => a.id === input.applicationRef && a.goalId === decision.goalId);
+        if (!pattern || !app) return { success: false, error: 'Unresolved application reference' };
+        if (app.verdict !== 'applied' && (app.verdict !== input.verdict || app.evidence !== input.evidence)) return { success: false, error: 'Conflicting application feedback' };
+        app.verdict = input.verdict as typeof app.verdict; app.evidence = String(input.evidence);
+        entry.content = serializePattern(pattern);
+      }
+      if (input.action === 'archive_entry') {
+        if (input.scope) return { success: false, error: 'Scoped retirement requires supersede_entry and an applicable replacement' };
+        entry.archived = true;
+      }
+      if (input.action === 'supersede_entry') learning.supersessions.push({ replacementId: String(input.replacementId), scope: String(input.scope ?? ''), effectId: effect.id });
+      if (input.action === 'dispute_entry') learning.disputes.push({ explanation: String(input.evidence), scope: String(input.scope ?? ''), effectId: effect.id });
+      if (input.action === 'narrow_entry' || creating && input.scope) learning.scope = String(input.scope);
+      learning.revision++;
+      const before = existing ? { ...existing, learning: undefined } : null;
+      const accepted = { effectId: effect.id, decisionId: decision.id, goalId: decision.goalId, revision: learning.revision, at: now, before, input: structuredClone(input), evidence: structuredClone(decision.evidence) };
+      learning.history.push(accepted); entry.updatedAt = now;
+      // A successful response is a durable receipt, never an optimistic map update.
+      if (creating && entry.type === 'pattern') entry.content = this.revisePatternContent(entry.title, entry.content);
+      if (this.db) this.writeEntryToDb(entry, true);
+      else {
+        const storage = this.storageId ?? await this.discoverDep('Storage');
+        if (!storage) return { success: false, retryable: true, error: 'Knowledge persistence unavailable' };
+        this.pendingLearning.add(entry.id);
+        try {
+          const saved = await this.request<{ success?: boolean } | boolean | null>(request(this.id, storage, 'set', { key: `${ENTRY_KEY_PREFIX}${entry.id}`, value: entry }));
+          if (saved === false || saved && typeof saved === 'object' && saved.success === false) return { success: false, retryable: true, error: 'Knowledge persistence rejected' };
+        } finally { this.pendingLearning.delete(entry.id); }
+      }
+      this.entries.set(entry.id, entry);
+      this.syncEntryToSharedState(entry); this.changed(existing ? 'entryUpdated' : 'entryAdded', entry);
+      return { success: true, receipt: accepted };
+    });
+  }
+
   private setupHandlers(): void {
+    this.on('applyLearningDecision', msg => this.applyLearningDecision(msg));
     describeMessages(this.manifest, [
+      { name: 'applyLearningDecision', description: 'Apply a journaled, evidence-linked correction and return a durable idempotent revision receipt.', parameters: { goalId: protocolText, decisionId: protocolText, effectId: protocolText } },
       { name: "beginPatternApplication", description: "Capture an application before execution using an opaque selection receipt.", parameters: { id: protocolText, patternRef: protocolText, applicationId: protocolText, goalId: protocolText, context: protocolText } },
       { name: "assessPatternApplication", description: "Attach feedback to a captured application without supplying a revision.", parameters: { id: protocolText, applicationRef: protocolText, goalId: protocolText, verdict: protocolText, evidence: protocolText } },
       { name: "recordPatternApplication", description: "Record one contextual application with distinct goal evidence and helpful/harmful/inconclusive verdict.", parameters: { "id": protocolText, "application": protocolObject } },
@@ -878,6 +968,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     // Receipts describe the version actually presented. Callers carry opaque
     // references; KnowledgeBase alone interprets and assigns revision numbers.
     this.on('beginPatternApplication', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const { id, patternRef, applicationId, goalId, context } = msg.payload as Record<string, string>;
       const entry = this.entries.get(id);
       const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
@@ -902,6 +993,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       return { success: true, applicationRef: applicationId };
     });
     this.on('assessPatternApplication', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const { id, applicationRef, goalId, verdict, evidence } = msg.payload as Record<string, string>;
       const entry = this.entries.get(id);
       const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
@@ -919,6 +1011,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       return { success: true, applicationRef };
     });
     this.on('recordPatternApplication', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const { id, application } = msg.payload as { id: string; application: import('../core/pattern.js').PatternApplication };
       const entry = this.entries.get(id);
       const pattern = entry?.type === 'pattern' ? readPattern(entry.content, entry.title) : undefined;
@@ -978,10 +1071,12 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (existing && existing.origin === 'user' && entryOrigin !== 'user') {
         log.info(`Remember: title collides with user entry "${existing.title}"; creating separate ${entryOrigin} entry`);
       } else if (existing) {
+        if (this.pendingLearning.has(existing.id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
+        if (existing.learning?.supersessions.length || existing.learning && existing.archived) return { success: false, error: 'Retired knowledge requires an explicit revision', id: existing.id };
         existing.content = type === 'pattern' ? this.revisePatternContent(title, content, existing.content) : body;
         existing.tags = tags ?? existing.tags;
         existing.archived = false;
-        existing.updatedAt = Date.now();
+        existing.updatedAt = Math.max(Date.now(), existing.updatedAt + 1);
         this.writeEntryToDb(existing);
         this.syncEntryToSharedState(existing);
         this.changed('entryUpdated', existing);
@@ -1016,8 +1111,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('recall', async (msg: AbjectMessage) => {
-      const { query, type, tags, limit, previews } = msg.payload as {
-        query?: string; type?: KnowledgeType; tags?: string[]; limit?: number; previews?: boolean;
+      const { query, type, tags, limit, previews, scope } = msg.payload as {
+        query?: string; type?: KnowledgeType; tags?: string[]; limit?: number; previews?: boolean; scope?: string;
       };
       const max = Math.min(limit ?? 10, 50);
 
@@ -1030,7 +1125,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         results = [];
         for (const r of ranked) {
           const entry = this.entries.get(r.id);
-          if (!entry || entry.archived) continue;
+          if (!entry || !applicable(entry, scope)) continue;
           if (type && entry.type !== type) continue;
           if (tags?.length && !tags.some(t => entry.tags.includes(t))) continue;
           const shown = this.present(entry);
@@ -1045,7 +1140,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         // No query: return recent entries filtered by type/tags
         results = [...this.entries.values()]
           .filter(e => {
-            if (e.archived) return false;
+            if (!applicable(e, scope)) return false;
             if (type && e.type !== type) return false;
             if (tags?.length && !tags.some(t => e.tags.includes(t))) return false;
             return true;
@@ -1076,7 +1171,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
           title: r.title,
           type: r.type,
           tags: r.tags,
-          snippet: r.snippet ?? r.content.slice(0, 160),
+          snippet: r.learning ? r.content.slice(0, 240) : r.snippet ?? r.content.slice(0, 160),
+          knowledgeRef: r.knowledgeRef, learning: r.learning,
           score: r.score,
         }));
       }
@@ -1084,8 +1180,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('weave', async (msg: AbjectMessage) => {
-      const { query, limit, hops } = msg.payload as {
-        query: string; limit?: number; hops?: number;
+      const { query, limit, hops, scope } = msg.payload as {
+        query: string; limit?: number; hops?: number; scope?: string;
       };
       requireNonEmpty(query, 'query');
       const max = Math.max(1, Math.min(limit ?? 5, 20));
@@ -1105,7 +1201,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const seen = new Set<string>();
       for (const r of ranked) {
         const entry = this.entries.get(r.id);
-        if (!entry || entry.archived || entry.type !== 'pattern') continue;
+        if (!entry || !applicable(entry, scope) || entry.type !== 'pattern') continue;
         selected.push({ ...this.present(entry), snippet: r.snippet, score: r.score, via: `matched; contextual evidence weight=${r.evidenceWeight.toFixed(2)}` });
         seen.add(entry.id);
         if (selected.length >= max) break;
@@ -1123,7 +1219,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         for (const pattern of frontier) {
           for (const name of this.parsePatternLinks(pattern.content)) {
             const linked = this.findPatternByName(name);
-            if (!linked) {
+            if (!linked || !applicable(linked, scope)) {
               dangling.add(name);
               continue;
             }
@@ -1155,7 +1251,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('match', async (msg: AbjectMessage) => {
-      const { pattern, limit } = msg.payload as { pattern: string; limit?: number };
+      const { pattern, limit, scope } = msg.payload as { pattern: string; limit?: number; scope?: string };
       requireNonEmpty(pattern, 'pattern');
       const max = Math.min(limit ?? 10, 50);
 
@@ -1169,7 +1265,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       }
 
       const results = [...this.entries.values()]
-        .filter(e => !e.archived && (test(e.title) || test(e.content) || e.tags.some(t => test(t))))
+        .filter(e => applicable(e, scope) && (test(e.title) || test(e.content) || e.tags.some(t => test(t))))
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, max);
 
@@ -1196,11 +1292,13 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('forget', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const { id } = msg.payload as { id: string };
       requireNonEmpty(id, 'id');
       const entry = this.entries.get(id);
       if (!entry) return { success: false };
 
+      if (entry.learning) return { success: false, error: 'Learning history must be retained; archive the entry' };
       this.entries.delete(id);
       this.deleteEntryFromDb(id);
       // A tombstone, not a snapshot: a whole-array write cannot express a
@@ -1212,6 +1310,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('update', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const payload = msg.payload as {
         id: string; content?: string; title?: string; tags?: string[]; expectedRevision?: number;
         updates?: { content?: string; title?: string; tags?: string[] };
@@ -1238,7 +1337,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (content !== undefined) entry.content = entry.type === 'pattern' ? this.revisePatternContent(title ?? entry.title, content, entry.content) : content;
       if (title !== undefined) entry.title = title.slice(0, 200);
       if (tags !== undefined) entry.tags = tags;
-      entry.updatedAt = Date.now();
+      entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
 
       this.writeEntryToDb(entry);
       this.syncEntryToSharedState(entry);
@@ -1305,12 +1404,13 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('archive', async (msg: AbjectMessage) => {
+      if (this.pendingLearning.has((msg.payload as { id: string }).id)) return { success: false, retryable: true, error: 'Knowledge revision is being persisted' };
       const { id, archived } = msg.payload as { id: string; archived?: boolean };
       requireNonEmpty(id, 'id');
       const entry = this.entries.get(id);
       if (!entry) return { success: false, error: `No entry with id "${id}"` };
       entry.archived = archived ?? true;
-      entry.updatedAt = Date.now();
+      entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
       this.writeEntryToDb(entry);
       this.syncEntryToSharedState(entry);
       this.changed('entryUpdated', entry);
@@ -1407,6 +1507,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
    * a reviewer has confirmed useful.
    */
   private isProtected(entry: KnowledgeEntry): boolean {
+    if (entry.learning) return true;
     if (entry.origin === 'user') return true;
     if (entry.type === 'pattern') return true;
     if (entry.type === 'fact' && entry.tags.some(t => t === 'user' || t === 'person')) return true;
@@ -1418,7 +1519,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
   private archiveEntry(entry: KnowledgeEntry, why: string): void {
     log.info(`Distill: archiving "${entry.title}" (${why})`);
     entry.archived = true;
-    entry.updatedAt = Date.now();
+    entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
     this.writeEntryToDb(entry);
   }
 
@@ -1472,7 +1573,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     // Bound the archive itself: hard-delete archived entries past the purge
     // window, oldest first when over the archive cap.
     const archived = [...this.entries.values()]
-      .filter(e => e.archived && e.origin !== 'user')
+      .filter(e => e.archived && e.origin !== 'user' && !e.learning)
       .sort((a, b) => a.updatedAt - b.updatedAt);
     let purged = 0;
     for (const entry of archived) {
@@ -1557,7 +1658,9 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       | undefined;
     if (!reg || typeof reg !== 'object' || typeof reg.updatedAt !== 'number') return false;
 
+    if (this.pendingLearning.has(id)) return false;
     const local = this.entries.get(id);
+    if (!preservesLearning(local?.learning, reg.entry?.learning)) return false;
     const localStamp = local?.updatedAt ?? this.tombstones.get(id);
     if (localStamp !== undefined) {
       if (reg.updatedAt < localStamp) return false;
@@ -1596,8 +1699,9 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       if (!re || typeof re.id !== 'string') continue;
       const tomb = this.tombstones.get(re.id);
       if (tomb !== undefined && re.updatedAt <= tomb) continue;
+      if (this.pendingLearning.has(re.id)) continue;
       const local = this.entries.get(re.id);
-      if (!local || re.updatedAt > local.updatedAt) {
+      if ((!local || re.updatedAt > local.updatedAt) && preservesLearning(local?.learning, re.learning)) {
         const normalized = this.normalizeEntry(re);
         this.entries.set(normalized.id, normalized);
         this.writeEntryToDb(normalized);

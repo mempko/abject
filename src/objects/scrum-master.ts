@@ -92,6 +92,8 @@ function compactLine(value: unknown, max = 220): string {
   return safeStringify(value, max).replace(/\s+/g, ' ').trim();
 }
 
+class ScrumPlanConflict extends Error {}
+
 export class ScrumMaster extends Abject {
   /** Every action the scrum loop dispatches; feeds the per-step reminder. */
   private static readonly ACTIONS = [
@@ -328,7 +330,7 @@ export class ScrumMaster extends Abject {
           terminalActions: {
             complete_goal: { type: 'success' },
             fail_goal: { type: 'error', resultFields: ['reason'] },
-            dispatch_scrum: { type: 'success' },
+            dispatch_scrum: { type: 'success', execute: true },
             continue_scrum: { type: 'success' },
             ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
           },
@@ -489,7 +491,7 @@ export class ScrumMaster extends Abject {
               terminalActions: {
                 complete_goal: { type: 'success' },
                 fail_goal: { type: 'error', resultFields: ['reason'] },
-                dispatch_scrum: { type: 'success' },
+                dispatch_scrum: { type: 'success', execute: true },
                 quick_dispatch: { type: 'success' },
                 continue_scrum: { type: 'success' },
                 ask_user: { type: 'success', resultFields: ['question'], ownContentRequired: true },
@@ -511,8 +513,8 @@ export class ScrumMaster extends Abject {
     this.on('agentObserve', async (msg: AbjectMessage) => { await this.requireTaskRuntime(msg,this.agentAbjectId); return this.handleObserve(msg); });
     this.on('agentAct', async (msg: AbjectMessage) => { await this.requireTaskRuntime(msg,this.agentAbjectId); return this.handleAct(msg); });
 
-    // taskResult fires when our own scrum task terminates. Terminal actions
-    // (complete_goal / fail_goal / dispatch_scrum) skip AgentAbject's
+    // taskResult finishes lifecycle decisions and replays legacy dispatches.
+    // complete_goal / fail_goal skip AgentAbject's
     // `acting` phase — the state machine sees them as terminal during the
     // thinking phase and jumps straight to `done`. So the side effects
     // (addTask + enqueue for dispatch, completeGoal for done, failGoal for
@@ -520,14 +522,14 @@ export class ScrumMaster extends Abject {
     // is the canonical "scrum cycle terminated, do the commit step" hook.
     this.onDelivery('taskResult', async (msg: AbjectMessage) => {
       if(msg.routing.from!==this.agentAbjectId)throw new Error('Task result must come from AgentAbject');
-      const payload = msg.payload as {
+      const payload = { ...msg.payload as {
         ticketId: string;
         success?: boolean;
         error?: string;
         lastAction?: { action: string; [k: string]: unknown };
-      };
+      } };
 
-      // A failed commit must reject delivery so the durable outbox retries it.
+      // Retry transport failures; obsolete planning decisions need a fresh plan.
       let obsolete = false;
       await withKeyedLock(`${this.id}:scrum-commit`, async () => {
         const goalId = await this.lookupGoalIdForOTATask(payload.ticketId);
@@ -536,9 +538,29 @@ export class ScrumMaster extends Abject {
           // A durable result can outlive its goal. Acknowledge it without replaying effects.
           if (!goal || ['completed', 'failed', 'archived'].includes(goal.status ?? '')) { obsolete = true; return; }
           if (goal.status === 'paused') throw new Error('Goal is paused; defer the scrum result until resumed');
-          if (goal?.scratchpad?.[`learning/commit/${payload.ticketId}`]) return;
-          await this.executeTerminalAction(payload.ticketId, payload.lastAction);
-          await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId }));
+          const receipt = goal?.scratchpad?.[`learning/commit/${payload.ticketId}`] as { outcome?: string; error?: string } | undefined;
+          if (receipt) {
+            if (receipt.outcome === 'replanned') {
+              payload.success = false;
+              payload.error = receipt.error;
+              obsolete = true;
+            }
+            // A prior receipt write may have failed after updating memory.
+            await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId }));
+            return;
+          }
+          if (payload.success !== false || payload.lastAction?.action === 'fail_goal') {
+            try {
+              await this.executeTerminalAction(payload.ticketId, payload.lastAction);
+            } catch (err) {
+              if (!(err instanceof ScrumPlanConflict)) throw err;
+              await this.recoverLegacyPlanConflict(payload.ticketId, goalId, err.message, goal.scratchpad ?? {});
+              payload.success = false;
+              payload.error = err.message;
+              obsolete = true; // Recovery already admitted the replacement.
+            }
+          }
+          await this.request(request(this.id, this.goalManagerId, 'recordScrumCommit', { goalId, operationId: payload.ticketId, ...(obsolete ? { outcome: 'replanned', error: payload.error } : {}) }));
         } else if (!goalId) obsolete = true;
         else throw new Error('GoalManager unavailable; defer the scrum result');
       });
@@ -662,6 +684,28 @@ export class ScrumMaster extends Abject {
    * opened with the reason in front of it. Without this the goal sat until
    * GoalObserver's 30-minute staleness backstop failed it.
    */
+  private async recoverLegacyPlanConflict(taskId: string, goalId: string, error: string, scratchpad: Record<string, unknown>): Promise<void> {
+    const recoveryKey = `learning/scrum-recovery/${taskId}`;
+    const prior = scratchpad[recoveryKey] as { attempt: number } | undefined;
+    const attempt = prior?.attempt ?? 1 + Object.keys(scratchpad).filter(k => k.startsWith('learning/scrum-recovery/')).length;
+    await this.request(request(this.id, this.goalManagerId!, 'recordObservation', {
+      goalId, operationId: `scrum-recovery/${taskId}`,
+      observation: { taskId, kind: 'dispatch', verdict: 'contradicted', semanticVerdict: 'contradicted',
+        expect: 'The Scrum decision dispatches the planned work', actual: error, material: true },
+    }));
+    await this.request(request(this.id, this.goalManagerId!, 'writeGoalData', {
+      goalId, key: recoveryKey, value: { attempt, error, replacementTaskId: `${taskId}:replan` },
+    }));
+    if (attempt >= ScrumMaster.MAX_SCRUM_ATTEMPTS) {
+      await this.request(request(this.id, this.goalManagerId!, 'failGoal', { goalId, error: `Scrum dispatch could not recover after ${attempt} planning conflicts: ${error}` }));
+      return;
+    }
+    await this.request(request(this.id, this.agentAbjectId!, 'enqueueTask', {
+      agentId: this.id, taskId: `${taskId}:replan`, goalId,
+      task: `The previous Scrum decision was not dispatched: ${error}. Review the current goal state and plan again. Preserve work already admitted by the current plan.`,
+    }));
+  }
+
   private async rerunScrumAfterFailedCommit(goalId: string, reason: string): Promise<void> {
     if (!this.goalManagerId) return;
     let priorScrumNumber = 0;
@@ -840,9 +884,11 @@ export class ScrumMaster extends Abject {
    * on every scrum's opening round. Later steps just note loop position;
    * AgentAbject already injects goal context via `buildGoalProgressContext`.
    */
+  private refreshObservations = new Set<string>();
+
   private async handleObserve(msg: AbjectMessage): Promise<{ observation: string; tier?: string }> {
     const { taskId, step } = msg.payload as { taskId: string; step: number };
-    if (step === 0) {
+    if (step === 0 || this.refreshObservations.delete(taskId)) {
       // Deliver the goal-state snapshot up front so the first think decides
       // directly — no separate review_scrum round-trip. This collapses the
       // fast path to a single think (quick_dispatch) and saves a think on
@@ -927,14 +973,28 @@ export class ScrumMaster extends Abject {
           return await this.actLookupKnowledge(action);
         case 'forget_knowledge':
           return await this.actForgetKnowledge(action);
-        // complete_goal / fail_goal / dispatch_scrum are terminal — they
-        // never reach this handler (AgentAbject's state machine routes them
-        // straight to `done` from the thinking phase). Their side effects
-        // execute in the `taskResult` listener via executeTerminalAction.
+        case 'dispatch_scrum':
+          await withKeyedLock(`${this.id}:scrum-commit`, async () => {
+            const goal = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId!, 'getGoal', { goalId }));
+            if (goal?.scratchpad?.[`learning/commit/${taskId}`]) {
+              await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId: taskId }));
+              return;
+            }
+            await this.executeTerminalAction(taskId, action);
+            await this.request(request(this.id, this.goalManagerId!, 'recordScrumCommit', { goalId, operationId: taskId }));
+          });
+          return { success: true, data: 'Scrum dispatch accepted by the goal coordinator.' };
         default:
           return { success: false, error: `Unknown action "${action.action}". Valid intermediate: review_scrum, poll_team, add_task, save_knowledge, lookup_knowledge, forget_knowledge. Terminal: complete_goal, fail_goal, dispatch_scrum, quick_dispatch, continue_scrum, ask_user.` };
       }
     } catch (err) {
+      if (err instanceof ScrumPlanConflict) {
+        // A conflict is feedback for the planner, not a broken transport.
+        // Discard the stale proposal and hand the next think a fresh snapshot.
+        const inflight = this.scrumInFlight.get(taskId);
+        if (inflight) inflight.staged = [];
+        this.refreshObservations.add(taskId);
+      }
       return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
@@ -1000,8 +1060,8 @@ export class ScrumMaster extends Abject {
         await this.commitFailGoal(goalId, normalized);
         return;
       case 'dispatch_scrum':
-        await markIncorporated();
         await this.commitDispatchScrum(otaTaskId, goalId, normalized);
+        await markIncorporated();
         return;
       case 'quick_dispatch':
         await markIncorporated();
@@ -2017,8 +2077,12 @@ Rules:
     const goalState = await this.request<{ scratchpad?: Record<string, unknown> }>(request(this.id, this.goalManagerId, 'getGoal', { goalId }));
     const plans = (goalState?.scratchpad?.['learning/plans'] as Array<{ revision: number; operationId: string }>) ?? [];
     const replay = plans.find(p => p.operationId === otaTaskId);
-    const expectedRevision = decision.planRevision ?? inflight.planRevision ?? 0;
-    if (!replay && expectedRevision !== (plans.at(-1)?.revision ?? 0)) throw new Error('Plan changed during planning; refresh the Scrum observation');
+    // Revision numbers belong to the runtime snapshot, never to model output.
+    const expectedRevision = inflight.planRevision ?? 0;
+    const currentRevision = plans.at(-1)?.revision ?? 0;
+    if (!replay && expectedRevision !== currentRevision) {
+      throw new ScrumPlanConflict(`Plan changed during planning (observed ${expectedRevision}, current ${currentRevision}); refresh the Scrum observation and restage the work`);
+    }
     // A replay must preserve work already admitted by this very plan.
     if (!replay) {
       const stopped = await this.request<{ safe: boolean; pending?: unknown; error?: string }>(
@@ -2027,13 +2091,16 @@ Rules:
       if (!stopped.safe) throw new Error(`Replacement work awaits reconciliation: ${JSON.stringify(stopped)}`);
     }
 
-    const recorded = await this.request<{ success: boolean; error?: string }>(request(this.id, this.goalManagerId, 'recordPlan', {
+    const recorded = await this.request<{ success: boolean; conflict?: boolean; revision?: number; error?: string }>(request(this.id, this.goalManagerId, 'recordPlan', {
       goalId, operationId: otaTaskId, expectedRevision,
       plan: { reason: decision.reasoning ?? decision.reason, assumptions: decision.assumptions,
         patterns: decision.patterns, expectedObservations: decision.expectedObservations,
         change: decision.change, tasks: inflight.staged },
     }));
-    if (!recorded.success) throw new Error(recorded.error ?? 'Plan changed during planning; refresh the scrum before dispatch');
+    if (!recorded.success) {
+      if (recorded.conflict) throw new ScrumPlanConflict(`Plan changed during planning (observed ${expectedRevision}, current ${recorded.revision}); refresh the Scrum observation and restage the work`);
+      throw new Error(recorded.error ?? 'Plan could not be recorded');
+    }
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId: otaTaskId, preserveTaskIds: decision.keepTaskIds ?? [] }),
@@ -2244,7 +2311,7 @@ Some scrum tasks are **interjection checks** (the task description says so): the
 
 ## Your first action
 
-The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. Compare observations with the assumptions in recentPlans. State what changed in your understanding, ask affected collaborators for interpretation, and plan a small discriminating experiment when uncertain. dispatch_scrum should include planRevision from the observation, reasoning, assumptions, patterns (ids/revisions and why they fit), expectedObservations, keepTaskIds (unaffected work to preserve), and change (what stays or changes). Never repeat a failed approach without new evidence. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
+The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. Compare observations with the assumptions in recentPlans. State what changed in your understanding, ask affected collaborators for interpretation, and plan a small discriminating experiment when uncertain. The runtime manages plan revision numbers automatically. dispatch_scrum should include reasoning, assumptions, patterns (ids/revisions and why they fit), expectedObservations, keepTaskIds (unaffected work to preserve), and change (what stays or changes). Never repeat a failed approach without new evidence. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
 
 ## Action vocabulary
 

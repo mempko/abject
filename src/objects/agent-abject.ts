@@ -240,6 +240,8 @@ export interface AgentTaskOptions {
 // ─── Agent Config ────────────────────────────────────────────────────
 
 export interface TerminalActionConfig {
+  /** Execute through agentAct and require its acknowledgement before finishing. */
+  execute?: boolean;
   type: 'success' | 'error';
   resultFields?: string[];
   /**
@@ -268,6 +270,8 @@ export interface AgentConfig {
   maxConversationMessages?: number;
   /** Charge retrospective or other follow-up reasoning to its originating goal. */
   budgetGoalId?: string;
+  /** Explicit project/environment identity for scoped knowledge retrieval. */
+  knowledgeScope?: string;
   queueName?: string;
   directExecution?: boolean;
   skipFirstObservation?: boolean;
@@ -296,6 +300,8 @@ interface ResolvedAgentConfig {
   maxConversationMessages: number;
   /** Charge retrospective or other follow-up reasoning to its originating goal. */
   budgetGoalId?: string;
+  /** Explicit project/environment identity for scoped knowledge retrieval. */
+  knowledgeScope?: string;
   queueName?: string;
   directExecution: boolean;
   skipFirstObservation: boolean;
@@ -408,7 +414,7 @@ interface TaskEntry {
    * The post-task reviewer reads these to judge which entries actually
    * helped (markUseful), closing the usefulness feedback loop.
    */
-  injectedKnowledge?: Array<{ id: string; title: string; source?: 'profile' | 'relevant' | 'pattern'; content?: string }>;
+  injectedKnowledge?: Array<{ id: string; title: string; source?: 'profile' | 'relevant' | 'pattern'; content?: string; knowledgeRef?: string }>;
   /** Receipts for pattern content actually delivered, never model-authored. */
   patternSelections?: Record<string, string>;
   /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
@@ -603,6 +609,7 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
     pinnedMessageCount: partial.pinnedMessageCount ?? DEFAULT_CONFIG.pinnedMessageCount,
     maxConversationMessages: partial.maxConversationMessages ?? DEFAULT_CONFIG.maxConversationMessages,
     budgetGoalId: partial.budgetGoalId,
+    knowledgeScope: partial.knowledgeScope,
     queueName: partial.queueName ?? DEFAULT_CONFIG.queueName,
     directExecution: partial.directExecution ?? DEFAULT_CONFIG.directExecution,
     skipFirstObservation: partial.skipFirstObservation ?? DEFAULT_CONFIG.skipFirstObservation,
@@ -678,6 +685,7 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
     pinnedMessageCount: override.pinnedMessageCount ?? base.pinnedMessageCount,
     maxConversationMessages: override.maxConversationMessages ?? base.maxConversationMessages,
     budgetGoalId: override.budgetGoalId ?? base.budgetGoalId,
+    knowledgeScope: override.knowledgeScope ?? base.knowledgeScope,
     queueName: override.queueName ?? base.queueName,
     directExecution: override.directExecution ?? base.directExecution,
     skipFirstObservation: override.skipFirstObservation ?? base.skipFirstObservation,
@@ -1391,6 +1399,7 @@ The registered object must implement these handlers to participate in the agent 
 
   private setupHandlers(): void {
     describeMessages(this.manifest, [
+      { name: "getRetainedReviewProposals", description: "TaskReviewer recovers original completion proposals from durable review sessions, without replaying tasks.", parameters: {} },
       { name: "getSessions", description: "Inspect durable sessions, outcomes and unknown operations.", parameters: {  } },
       { name: "delegateTask", description: "Ask and execute a bounded child task, including on the same agent. Stable operationId prevents duplicate delegation; parent cancellation and goal budget propagate. Poll getDelegations for evidence.", parameters: { parentTaskId: protocolText, agentId: protocolText, task: protocolText, operationId: protocolText } },
       { name: "getDelegations", description: "Inspect child tasks and their results or interruptions.", parameters: { taskId: protocolText } },
@@ -1493,6 +1502,32 @@ The registered object must implement these handlers to participate in the agent 
       return structuredClone(child);
     });
 
+    this.on('getRetainedReviewProposals', async msg => {
+      if (msg.routing.from !== await this.discoverDep('TaskReviewer')) throw new Error('Review recovery belongs to TaskReviewer');
+      if (!this.sessionStoreId) return [];
+      const sessions = await this.request<SessionRecord[]>(request(this.id, this.sessionStoreId, 'list', {}));
+      const recovered = [], seen = new Set<string>();
+      for (const summary of sessions.filter(s => s.agentName === 'TaskReviewer').sort((a,b) => b.updatedAt - a.updatedAt)) {
+        const session = await this.request<SessionRecord>(request(this.id, this.sessionStoreId, 'get', { id: summary.id }));
+        if (!session?.snapshot) continue;
+        const stored = decodeAgentState<any>(session.snapshot);
+        const extra = stored?.specialist;
+        if (!extra?.goalId || extra.kind !== 'review' || seen.has(extra.goalId)) continue;
+        seen.add(extra.goalId);
+        if (extra.decisions?.length) continue;
+        let result: unknown;
+        for (const message of [...(Array.isArray(stored.state?.llmMessages) ? stored.state.llmMessages : [])].reverse()) {
+          if (message.role !== 'assistant' || typeof message.content !== 'string') continue;
+          for (const text of this.extractAllBalancedJson(message.content)) {
+            try { const action = JSON.parse(text); if (action.action === 'done' && action.result?.knowledgeUpdates) { result = action.result; break; } } catch { /* invalid original text remains unavailable */ }
+          }
+          if (result) break;
+        }
+        if (result) recovered.push({ taskId: session.id, goalId: extra.goalId, result, records: extra.records ?? [] });
+        if (recovered.length >= 5) break;
+      }
+      return recovered;
+    });
     this.on('getSessions', async () => this.sessionStoreId
       ? this.request(request(this.id, this.sessionStoreId, 'list', {})) : []);
     this.on('forkTask', async (msg: AbjectMessage) => {
@@ -1970,7 +2005,7 @@ The registered object must implement these handlers to participate in the agent 
 
     this.on('awaitGoalQuiescence', async msg => {
       const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: string; preserveTaskIds?: string[] };
-      const affected = () => [...this.taskEntries.values()].filter(e => (e.goalId === goalId || e.incomingGoalId === goalId)
+      const affected = () => [...this.taskEntries.values()].filter(e => (e.goalId === goalId || e.incomingGoalId === goalId || e.config.budgetGoalId === goalId)
         && !preserveTaskIds.includes(e.state.id) && this.registeredAgents.get(e.agentId)?.name !== 'ScrumMaster');
       const deadline = Date.now() + 10000;
       while (affected().some(e => !e.finished) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
@@ -1985,7 +2020,7 @@ The registered object must implement these handlers to participate in the agent 
       // next observe/think boundary; runTaskAsync's tail will pop the next
       // queued task as usual).
       for (const [taskId, entry] of this.taskEntries) {
-        if (!preserveTaskIds.includes(taskId) && (entry.goalId === goalId || entry.incomingGoalId === goalId)
+        if (!preserveTaskIds.includes(taskId) && (entry.goalId === goalId || entry.incomingGoalId === goalId || entry.config.budgetGoalId === goalId)
             && (entry.state.phase !== 'done' || entry.settling) && entry.state.phase !== 'error') {
           entry.state.phase = 'error';
           entry.state.error = 'Cancelled';
@@ -2298,10 +2333,10 @@ The registered object must implement these handlers to participate in the agent 
   // Config-driven terminal/intermediate action checking
   // ═══════════════════════════════════════════════════════════════════
 
-  private isTerminalAction(entry: TaskEntry, action: AgentAction): 'success' | 'error' | null {
+  private isTerminalAction(entry: TaskEntry, action: AgentAction, executed = false): 'success' | 'error' | null {
     const config = entry.config;
     const terminal = config.terminalActions[action.action];
-    if (!terminal) return null;
+    if (!terminal || (terminal.execute && !executed)) return null;
 
     if (terminal.type === 'success') {
       // Try each result field in order
@@ -3209,6 +3244,18 @@ The registered object must implement these handlers to participate in the agent 
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
 
+            // An effectful terminal is a proposal until its receiver accepts it.
+            // Failed dispatches return to observe/think with their real error;
+            // successful handoffs finish without another status-polling LLM call.
+            if (actResult.success && task.action && entry.config.terminalActions[task.action.action]?.execute) {
+              const terminal = this.isTerminalAction(entry, task.action, true);
+              if (terminal === 'success') task.result = actResult.data ?? task.result;
+              task.step++;
+              entry.pendingActions = undefined;
+              setPhase(terminal === 'error' ? 'error' : 'done');
+              break;
+            }
+
             // Loop detection: if the same action keeps producing the same result,
             // repeating it won't help. Steer the LLM toward a different approach
             // (or a clean `fail`) once per repeated pattern, so a misdiagnosis
@@ -3865,6 +3912,12 @@ The registered object must implement these handlers to participate in the agent 
   // Conversation Management
   // ═══════════════════════════════════════════════════════════════════
 
+  private async recordKnowledgeSelection(entry: TaskEntry, selected: { id: string; title?: string; content?: string; knowledgeRef?: string }): Promise<void> {
+    const receipt = { id: selected.id, title: selected.title ?? '', content: selected.content?.slice(0, 4000), knowledgeRef: selected.knowledgeRef, source: 'relevant' as const };
+    (entry.injectedKnowledge ??= []).push(receipt);
+    if (this.registeredAgents.get(entry.agentId)?.name === 'TaskReviewer') await this.request(request(this.id, entry.agentId, 'recordKnowledgeSelection', { taskId: entry.state.id, selection: receipt }));
+  }
+
   private async initializeConversation(entry: TaskEntry): Promise<AgentMessage[]> {
     const messages: AgentMessage[] = [];
 
@@ -3935,14 +3988,14 @@ The preview often answers the question on its own — when it does, just act.`, 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; patternRef?: string; pattern?: { learning?: { revision?: number } } };
+        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } } };
         const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
             5000,
           ).catch(() => null),
           this.request<KEntry[] | null>(
-            request(this.id, knowledgeBaseId, 'recall', { query: entry.state.task, limit: 5 }),
+            request(this.id, knowledgeBaseId, 'recall', { query: entry.state.task, limit: 5, scope: entry.config.knowledgeScope }),
             5000,
           ).catch(() => null),
           this.request<Array<{ tag: string; count: number }> | null>(
@@ -3950,7 +4003,7 @@ The preview often answers the question on its own — when it does, just act.`, 
             5000,
           ).catch(() => null),
           this.request<{ patterns?: Array<KEntry & { via?: string }> } | null>(
-            request(this.id, knowledgeBaseId, 'weave', { query: entry.state.task, limit: 3 }),
+            request(this.id, knowledgeBaseId, 'weave', { query: entry.state.task, limit: 3, scope: entry.config.knowledgeScope }),
             5000,
           ).catch(() => null),
         ]);
@@ -4002,7 +4055,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
-            kb += `- **${e.title}** (${e.type}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
+            kb += `- **${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
           add('knowledge', kb, false);
         }
@@ -4021,9 +4074,9 @@ The preview often answers the question on its own — when it does, just act.`, 
         entry.patternSelections ??= {};
         for (const e of [...profile, ...patterns]) if (e.patternRef) entry.patternSelections[e.id] = e.patternRef;
         entry.injectedKnowledge = [
-          ...profile.map(e => ({ id: e.id, title: e.title, source: 'profile' as const, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP)) })),
-          ...relevant.map(e => ({ id: e.id, title: e.title, source: 'relevant' as const, content: sanitizeInjectedFact(e.content.slice(0, 2000)) })),
-          ...patterns.map(e => ({ id: e.id, title: e.title, source: 'pattern' as const, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP)) })),
+          ...profile.map(e => ({ id: e.id, title: e.title, source: 'profile' as const, knowledgeRef: e.knowledgeRef, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP)) })),
+          ...relevant.map(e => ({ id: e.id, title: e.title, source: 'relevant' as const, knowledgeRef: e.knowledgeRef, content: sanitizeInjectedFact(e.content.slice(0, 2000)) })),
+          ...patterns.map(e => ({ id: e.id, title: e.title, source: 'pattern' as const, knowledgeRef: e.knowledgeRef, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP)) })),
         ].filter(e => e.id);
       }
     } catch { /* best effort */ }
@@ -4541,22 +4594,24 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const limit = Math.min(typeof action.limit === 'number' ? action.limit : 5, 10);
     let rendered: string;
     if (id) {
-      const e = await this.request<{ title?: string; type?: string; content?: string; patternRef?: string } | null>(
+      const e = await this.request<{ title?: string; type?: string; content?: string; knowledgeRef?: string; patternRef?: string } | null>(
         request(this.id, kbId, 'get', { id }), 10000);
       if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
+      if (e) await this.recordKnowledgeSelection(entry, { ...e, id });
       rendered = e
-        ? `**${e.title}** (${e.type}): ${(e.content ?? '').slice(0, 4000)}`
+        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${(e.content ?? '').slice(0, 4000)}`
         : `No entry with id "${id}".`;
     } else if (pattern) {
-      const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; patternRef?: string }>>(
-        request(this.id, kbId, 'match', { pattern, limit }), 10000);
+      const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; knowledgeRef?: string; patternRef?: string }>>(
+        request(this.id, kbId, 'match', { pattern, limit, scope: entry.config.knowledgeScope }), 10000);
+      for (const h of hits) await this.recordKnowledgeSelection(entry, { ...h, content: h.content.slice(0, 300) });
       for (const h of hits) if (h.patternRef) (entry.patternSelections ??= {})[h.id] = h.patternRef;
       rendered = hits.length
         ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
         : `No entries match pattern "${pattern}".`;
     } else if (query || tags?.length) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
-        request(this.id, kbId, 'recall', { query, tags, limit, previews: true }), 10000);
+        request(this.id, kbId, 'recall', { query, tags, limit, previews: true, scope: entry.config.knowledgeScope }), 10000);
       rendered = hits.length
         ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.snippet ?? ''}`).join('\n')
         : 'No matching entries. Try different terms, or a pattern for exact names.';

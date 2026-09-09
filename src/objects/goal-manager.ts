@@ -14,6 +14,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
+import { canonical, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
 import { Log } from '../core/timed-log.js';
 const log = new Log('GoalManager');
 
@@ -322,6 +323,12 @@ export class GoalManager extends Abject {
       const name = key.slice('scratch:'.length);
       const reg = value as ScratchRegister | undefined;
       if (!reg || typeof reg !== 'object' || typeof reg.updatedAt !== 'number') return;
+      const prior = goal.scratchpad[name] as any;
+      if (name.startsWith('learning/decision/') && prior) {
+        const incoming = reg.value as LearningDecision;
+        if (!incoming?.effects || prior.effects.some((e: LearningEffect) => e.state === 'applied' && !incoming.effects.some(r => r.id === e.id && r.state === 'applied' && canonical(r.receipt) === canonical(e.receipt)))) return;
+      }
+      if (name.startsWith('learning/assessment/') && prior && Number((reg.value as any)?.revision ?? 1) <= Number(prior.revision ?? 1)) return;
       const stampKey = `${goalId}::${name}`;
       if (!this.registerWins(reg, this.scratchStamps.get(stampKey))) return;
       this.scratchStamps.set(stampKey, { updatedAt: reg.updatedAt, peerId: reg.peerId });
@@ -550,6 +557,7 @@ export class GoalManager extends Abject {
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Short user-facing label (~200 chars)' },
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'REQUIRED. Free-form prose capturing the user\'s intent in detail — including explicit ordering ("do A then B then C"), constraints, examples, and what counts as success. ScrumMaster reads this at every scrum.' },
                 { name: 'parentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent goal ID for sub-goals', optional: true },
+                { name: 'operationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-owned handoff identity; retries return the same goal', optional: true },
               ],
               returns: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -920,7 +928,6 @@ export class GoalManager extends Abject {
       if (Array.isArray(stored)) goalIds = stored;
     } catch { /* No index yet */ }
 
-    if (goalIds.length === 0) return;
 
     // Subscribe to each goal's SharedState and load metadata
     for (const goalId of goalIds) {
@@ -971,6 +978,23 @@ export class GoalManager extends Abject {
       } catch { /* Goal may have been deleted by another peer */ }
     }
 
+    // Unfinished learning outlives the task/goal index and SharedState. Scan
+    // only the owner's journal keys; never require a live task to recover it.
+    const keys = await this.request<string[]>(request(this.id, this.storageId, 'keys', {})).catch(() => []);
+    for (const key of keys.filter(k => k.startsWith('goals:learning:'))) {
+      const checkpoint = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.storageId, 'get', { key }));
+      if (checkpoint?.version !== 2 || !checkpoint.scratchpad) continue;
+      const id = key.slice('goals:learning:'.length), state = checkpoint.goalState ?? {}, existing = this.goals.get(id);
+      if (existing) {
+        for (const [k,v] of Object.entries(checkpoint.scratchpad)) if (/^learning\/(decision|assessment)\//.test(k)) existing.scratchpad[k] = v;
+        continue;
+      }
+      const recovered: Goal = { id, title: state.title ?? 'Recovered learning episode', description: state.description ?? 'Durable evidence retained for unfinished retrospective learning',
+        status: 'archived', createdBy: state.createdBy ?? this.id, creatorName: state.creatorName ?? 'Recovered episode', createdAt: state.createdAt ?? 0,
+        updatedAt: state.updatedAt ?? 0, result:state.result,error:state.error, progress:[],childIds:state.childIds ?? [],interjections:[],currentScrumNumber:0,scratchpad:checkpoint.scratchpad };
+      if (!this.hasPendingLearning(recovered) && recovered.scratchpad['learning/review'] !== 'pending') continue;
+      this.goals.set(id,recovered); if (!this.goalOrder.includes(id)) this.goalOrder.push(id);
+    }
     if (this.goals.size > 0) {
       log.info(`Loaded ${this.goals.size} persisted goals from index`);
     }
@@ -1130,7 +1154,7 @@ reviews results and either plans another round or completes/fails the goal.
     let changed = false;
 
     for (const [id, goal] of this.goals) {
-      if (goal.scratchpad['learning/review'] === 'pending') continue;
+      if (goal.scratchpad['learning/review'] === 'pending' || this.hasPendingLearning(goal)) continue;
       switch (goal.status) {
         case 'active':
           // GoalObserver owns liveness decisions; a read must not abandon running work.
@@ -1180,7 +1204,7 @@ reviews results and either plans another round or completes/fails the goal.
     // Enforce MAX_ARCHIVED cap — evict oldest first
     const archived = this.goalOrder
       .map(id => this.goals.get(id))
-      .filter((g): g is Goal => g !== undefined && g.status === 'archived' && g.scratchpad['learning/review'] !== 'pending');
+      .filter((g): g is Goal => g !== undefined && g.status === 'archived' && g.scratchpad['learning/review'] !== 'pending' && !this.hasPendingLearning(g));
 
     if (archived.length > MAX_ARCHIVED) {
       const toEvict = archived
@@ -1310,16 +1334,164 @@ reviews results and either plans another round or completes/fails the goal.
   }
 
   /** Snapshot learning records before publication; SharedState distributes the same owner state. */
-  private async persistLearning(goal: Goal): Promise<void> {
+  private async persistLearning(goal: Goal, required = false): Promise<void> {
     return withKeyedLock(`${this.id}:learning-persist:${goal.id}`, async () => {
-    if (this.storageId) await this.request(request(this.id, this.storageId, 'set', {
-      key: `goals:learning:${goal.id}`, value: {version:2,goalState:{status:goal.status,result:goal.result,error:goal.error,updatedAt:goal.updatedAt,lastMeaningfulProgressAt:goal.lastMeaningfulProgressAt},scratchpad:goal.scratchpad},
+    if (required && !this.storageId) throw new Error('Learning journal persistence unavailable');
+    if (this.storageId) {
+      const saved = await this.request<unknown>(request(this.id, this.storageId, 'set', {
+      key: `goals:learning:${goal.id}`, value: {version:2,goalState:{id:goal.id,title:goal.title,description:goal.description,createdBy:goal.createdBy,creatorName:goal.creatorName,createdAt:goal.createdAt,parentId:goal.parentId,childIds:goal.childIds,status:goal.status,result:goal.result,error:goal.error,updatedAt:goal.updatedAt,lastMeaningfulProgressAt:goal.lastMeaningfulProgressAt},scratchpad:structuredClone(goal.scratchpad)},
     }));
+      if (saved === false || saved && typeof saved === 'object' && (saved as { success?: boolean }).success === false) throw new Error('Learning journal persistence rejected');
+    }
     await this.syncGoalToSharedState(goal);
     });
   }
 
+  private hasPendingLearning(goal: Goal): boolean {
+    if (goal.scratchpad['learning/review'] === 'partial' && !Object.keys(goal.scratchpad).some(k => k.startsWith('learning/decision/'))) return true;
+    return Object.entries(goal.scratchpad).some(([key, value]) => key.startsWith('learning/decision/')
+      && (value as LearningDecision).effects.some(e => !['applied', 'abandoned'].includes(e.state)));
+  }
+
+  private setupLearningHandlers(): void {
+    describeMessages(this.manifest, [
+      { name: 'recordLearningDecision', description: 'Journal a proposed interpretation and every original effect before mutation validation.', parameters: { goalId: protocolText, operationId: protocolText, reviewTaskId: protocolText, context: protocolObject, effects: { kind: 'array', elementType: protocolObject } } },
+      { name: 'getLearningEffect', description: 'KnowledgeBase resolves an authenticated effect and validates its evidence contract.', parameters: { goalId: protocolText, decisionId: protocolText, effectId: protocolText, requester: protocolText } },
+      { name: 'getLearningDecision', description: 'Read a durable decision, evidence snapshots, proposed effects and receipts.', parameters: { goalId: protocolText, decisionId: protocolText } },
+      { name: 'getLearningStatus', description: 'Learning receipts, unresolved targets and ages, delivery and repair costs. Semantic accuracy requires subsequent-task evaluation.', parameters: {} },
+      { name: 'pendingLearningDecisions', description: 'Unfinished corrections, independent of retrospective completion.', parameters: {} },
+      { name: 'changeLearningEffect', description: 'Reviewer records preparation, attempts, acknowledgments or a bounded repair.', parameters: { goalId: protocolText, decisionId: protocolText, effectId: protocolText, change: protocolObject } },
+      { name: 'claimLearningRepair', description: 'Claim one focused semantic repair; persisted before starting a model.', parameters: { goalId: protocolText, decisionId: protocolText } },
+      { name: 'resumeLearningDecision', description: 'Explicitly resume learning after new evidence or a state change.', parameters: { goalId: protocolText, decisionId: protocolText } },
+    ]);
+    this.on('getLearningDecision', async msg => {
+      const p = msg.payload as { goalId: string; decisionId: string };
+      return withKeyedLock(`${this.id}:decisions:${p.goalId}`, async () => structuredClone(this.goals.get(p.goalId)?.scratchpad[`learning/decision/${p.decisionId}`] ?? null));
+    });
+    this.on('getLearningEffect', async msg => {
+      const p = msg.payload as { goalId: string; decisionId: string; effectId: string; requester: string };
+      if (msg.routing.from !== await this.discoverDep('KnowledgeBase') || p.requester !== await this.discoverDep('TaskReviewer')) throw new Error('Learning effects must be delivered by TaskReviewer to KnowledgeBase');
+      return withKeyedLock(`${this.id}:decisions:${p.goalId}`, async () => {
+      const decision = this.goals.get(p.goalId)?.scratchpad[`learning/decision/${p.decisionId}`] as LearningDecision | undefined;
+      const effect = decision?.effects.find(e => e.id === p.effectId);
+      if (!decision || !effect) return { success: false, error: 'Unknown learning effect' };
+      return { success: true, decision: structuredClone(decision), effect: structuredClone(effect), validationError: validateLearningEffect(decision, effect) ?? null };
+      });
+    });
+    this.on('getLearningStatus', async () => {
+      const decisions = [...this.goals.values()].flatMap(g => Object.entries(g.scratchpad).filter(([k]) => k.startsWith('learning/decision/')).map(([,d]) => d as LearningDecision));
+      const effects = decisions.flatMap(d => d.effects);
+      return { decisions: decisions.length, applied: effects.filter(e => e.state === 'applied').length,
+        pending: effects.filter(e => !['applied','abandoned'].includes(e.state)).length,
+        deliveryAttempts: effects.reduce((n,e) => n + e.attempts,0), repairModelAttempts: decisions.reduce((n,d) => n + d.repairAttempts,0),
+        oldestPendingAgeMs: Math.max(0,...decisions.filter(d => d.effects.some(e => !['applied','abandoned'].includes(e.state))).map(d => Date.now()-d.createdAt)),
+        items: decisions.map(d => ({ decisionId:d.id,goalId:d.goalId,effects:d.effects.map(e => ({id:e.id,target:e.input.id,state:e.state,error:e.error,nextAttemptAt:e.nextAttemptAt})) })) };
+    });
+    this.on('pendingLearningDecisions', async () => (await Promise.all([...this.goals.values()].map(g => withKeyedLock(`${this.id}:decisions:${g.id}`, async () => Object.entries(g.scratchpad)
+      .filter(([k,v]) => k.startsWith('learning/decision/') && (v as LearningDecision).effects.some(e => !['applied','abandoned'].includes(e.state)))
+      .map(([,v]) => structuredClone(v)))))).flat());
+    for (const method of ['recordLearningDecision', 'changeLearningEffect', 'claimLearningRepair', 'resumeLearningDecision']) {
+      this.on(method, async msg => {
+        const p = msg.payload as Record<string, any>;
+        const goal = this.goals.get(p.goalId);
+        if (!goal) throw new Error('Goal evidence unavailable');
+        const reviewer = await this.discoverDep('TaskReviewer');
+        if (msg.routing.from !== reviewer && !(method === 'resumeLearningDecision' && msg.routing.from === goal.createdBy)) throw new Error('Learning decisions belong to TaskReviewer');
+        return withKeyedLock(`${this.id}:decisions:${goal.id}`, async () => {
+          let changedKey: string | undefined, previousValue: unknown;
+          try {
+            let decision: LearningDecision;
+            if (method === 'recordLearningDecision') {
+              requireNonEmpty(p.operationId, 'operationId');
+              if (!Array.isArray(p.effects) || p.effects.length > 100) throw new Error('Expected at most 100 effects');
+              const old = Object.entries(goal.scratchpad).find(([k,v]) => k.startsWith('learning/decision/') && (v as LearningDecision).operationId === p.operationId)?.[1] as LearningDecision | undefined;
+              if (old) {
+                if (canonical(old.context) !== canonical(p.context ?? {}) || canonical(old.effects.map(e => e.original)) !== canonical(p.effects)) return { success: false, conflict: true, decision: structuredClone(old) };
+                await this.persistLearning(goal, true);
+                return { success: true, duplicate: true, decision: structuredClone(old) };
+              }
+              const context = structuredClone(p.context ?? {});
+              const evidence: Record<string, unknown> = {};
+              for (const ref of [...(Array.isArray(context.evidenceRefs) ? context.evidenceRefs : []), ...(Array.isArray(context.assessmentRefs) ? context.assessmentRefs : []), ...p.effects.flatMap((e: any) => Array.isArray(e?.evidenceRefs) ? e.evidenceRefs : [])]) {
+                if (typeof ref === 'string' && /^learning\/(task|observation|assessment)\//.test(ref) && ref in goal.scratchpad) evidence[ref] = structuredClone(goal.scratchpad[ref]);
+              }
+              decision = { version: 1, id: uuidv4(), goalId: goal.id, operationId: p.operationId, reviewTaskId: p.reviewTaskId,
+                createdAt: Date.now(), updatedAt: Date.now(), context, evidence, repairAttempts: 0,
+                effects: p.effects.map((original: unknown): LearningEffect => {
+                  const input = original && typeof original === 'object' && !Array.isArray(original) ? structuredClone(original) as Record<string,unknown> : {};
+                  if (input.action === 'save_entry' || input.action === 'save_pattern') input.id = uuidv4();
+                  if (input.evidence === undefined && typeof context.evidence === 'string') input.evidence = context.evidence;
+                  if (input.scope === undefined && typeof context.scope === 'string') input.scope = context.scope;
+                  return { id: uuidv4(), input, original, state: 'proposed', attempts: 0, nextAttemptAt: 0, history: [] };
+                }) };
+              for (const e of decision.effects) if (['archive_entry','supersede_entry'].includes(String(e.input.action))) {
+                e.dependsOn = decision.effects.filter(other => other !== e && ['save_entry','save_pattern','update_entry','update_pattern','narrow_entry'].includes(String(other.input.action))
+                  && (!e.input.replacementId || e.input.replacementId === other.input.id)).map(other => other.id);
+                if (e.dependsOn.length) e.error = 'Waiting for acknowledged replacement effects';
+              }
+            } else {
+              const found = goal.scratchpad[`learning/decision/${p.decisionId}`] as LearningDecision | undefined;
+              if (!found) throw new Error('Unknown learning decision');
+              decision = structuredClone(found);
+              if (method === 'claimLearningRepair') {
+                if (decision.paused || decision.repairAttempts >= 1 || !decision.effects.some(e => e.state === 'needs_repair')) return { success: false, decision };
+                decision.repairAttempts++;
+                // A crash or incomplete repair must not launch a second model.
+                for (const e of decision.effects) if (e.state === 'needs_repair') { e.state = 'waiting'; e.repairClaimed = true; e.error = `Focused repair claimed; ${e.error ?? ''}`; }
+              } else if (method === 'resumeLearningDecision') {
+                decision.repairAttempts = 0; decision.paused = false;
+                for (const e of decision.effects) if (e.state === 'waiting') {
+                  if (/Delivery|retry budget/i.test(e.error ?? '')) { e.state = 'proposed'; e.attempts = 0; }
+                  else e.state = 'needs_repair';
+                  e.nextAttemptAt = 0;
+                }
+              } else {
+                const effect = decision.effects.find(e => e.id === p.effectId);
+                if (!effect) throw new Error('Unknown learning effect');
+                if (effect.state === 'applied' || effect.state === 'abandoned') return { success: true, decision };
+                const c = p.change ?? {};
+                effect.history.push({ at: Date.now(), id: effect.id, input: structuredClone(effect.input), state: effect.state, error: effect.error });
+                if (c.prepare) {
+                  if (effect.attempts) throw new Error('Attempted operations are immutable; reconcile the receipt before repair');
+                  effect.input = { ...effect.input, ...c.prepare };
+                }
+                if (c.repair) {
+                  if (effect.state !== 'needs_repair' && !(effect.state === 'waiting' && effect.repairClaimed)) throw new Error('Only rejected effects can be repaired; unknown delivery must be reconciled with the same identity');
+                  delete effect.repairClaimed;
+                  const oldEffectId = effect.id; effect.id = uuidv4();
+                  for (const dependent of decision.effects) if (dependent.dependsOn) dependent.dependsOn = dependent.dependsOn.map(id => id === oldEffectId ? effect.id : id);
+                  effect.input = structuredClone(c.repair); effect.attempts = 0;
+                  if (effect.input.evidence === undefined && typeof decision.context.evidence === 'string') effect.input.evidence = decision.context.evidence;
+                  if (effect.input.scope === undefined && typeof decision.context.scope === 'string') effect.input.scope = decision.context.scope;
+                  for (const ref of Array.isArray(effect.input.evidenceRefs) ? effect.input.evidenceRefs : []) if (typeof ref === 'string' && /^learning\/(task|observation|assessment)\//.test(ref) && ref in goal.scratchpad) decision.evidence[ref] = structuredClone(goal.scratchpad[ref]);
+                  if (effect.input.action === 'save_entry' && !effect.input.id) effect.input.id = uuidv4();
+                  effect.state = 'proposed'; effect.nextAttemptAt = 0;
+                }
+                if (c.attempt) { effect.attempts++; effect.nextAttemptAt = Date.now() + Math.min(300000, 1000 * 2 ** effect.attempts); }
+                if (c.state === 'applied' && !(c.receipt?.effectId === effect.id && c.receipt?.decisionId === decision.id)
+                  && !(effect.input.action === 'no_change' && c.receipt?.disposition === 'no_change' && c.receipt?.decisionId === decision.id)) throw new Error('Applied learning requires the matching receiver receipt');
+                if (c.state === 'abandoned' && (typeof c.error !== 'string' || !c.error.trim())) throw new Error('Abandoning learning requires a reason');
+                if (c.state && ['proposed','applied','needs_repair','waiting','abandoned'].includes(c.state)) effect.state = c.state;
+                if (c.error !== undefined) effect.error = String(c.error);
+                if (c.receipt !== undefined) effect.receipt = structuredClone(c.receipt);
+                if (effect.state === 'applied') delete effect.error;
+              }
+            }
+            if (method === 'recordLearningDecision' && goal.scratchpad['learning/review'] === 'deferred:user-stop') decision.paused = true;
+            if (decision.paused) for (const e of decision.effects) if (!['applied','abandoned'].includes(e.state)) { e.state = 'waiting'; e.error = 'Goal stopped; explicit learning resumption required'; }
+            decision.updatedAt = Date.now();
+            changedKey = `learning/decision/${decision.id}`; previousValue = goal.scratchpad[changedKey];
+            goal.scratchpad[changedKey] = decision;
+            await this.persistLearning(goal, true);
+            return { success: true, decision: structuredClone(decision) };
+          } catch (err) { if (changedKey) { if (previousValue === undefined) delete goal.scratchpad[changedKey]; else goal.scratchpad[changedKey] = previousValue; } throw err; }
+        });
+      });
+    }
+  }
+
   private setupHandlers(): void {
+    this.setupLearningHandlers();
     describeMessages(this.manifest, [
       { name: "recordPredictionAssessment", description: "TaskReviewer records its interpretation separately from observed execution evidence; repeated assessments are acknowledged without overwriting.", parameters: { "goalId": protocolText, "taskId": protocolText, "step": protocolNumber, "verdict": protocolText, "explanation": protocolText } },
       { name: "getGoalBriefing", description: "Bounded task briefing with selected scratchpad values and references to complete evidence.", parameters: { "goalId": protocolText, "keys?": { kind: 'array', elementType: protocolText } } },
@@ -1354,10 +1526,41 @@ reviews results and either plans another round or completes/fails the goal.
       if (!prediction) return { success: false, error: 'No observed episode at this task and step' };
       if ((!prediction.expect || prediction.outcome === 'unknown') && verdict !== 'unresolved') return { success: false, error: 'An unstated prediction or unobserved outcome remains unknown' };
       const key = `learning/assessment/${taskId}:${step}`;
-      if (key in goal.scratchpad) { await this.persistLearning(goal); return { success: true, duplicate: true, assessment: goal.scratchpad[key] }; }
-      goal.scratchpad[key] = { taskId, step, verdict, explanation, origin: 'reviewer', at: Date.now() };
-      await this.persistLearning(goal);
-      return { success: true, assessment: goal.scratchpad[key] };
+      return withKeyedLock(`${this.id}:decisions:${goalId}`, async () => {
+        const previous = goal.scratchpad[key] as Record<string, any> | undefined;
+        const p = msg.payload as { expectedRevision?: number; evidenceRefs?: string[] };
+        if (previous?.verdict === verdict && previous.explanation === explanation && canonical(previous.evidenceRefs ?? []) === canonical(p.evidenceRefs ?? [])) {
+          await this.persistLearning(goal); return { success: true, duplicate: true, assessment: previous };
+        }
+        if (previous && (p.expectedRevision !== (previous.revision ?? 1) || !p.evidenceRefs?.length)) return { success: false, conflict: true, error: 'Assessment differs; explicitly revise the current assessment with evidence references', assessment: previous };
+        if (p.evidenceRefs?.some(ref => !/^learning\/(task|observation|assessment)\//.test(ref) || !(ref in goal.scratchpad))) return { success: false, error: 'Assessment evidence reference unavailable' };
+        const assessment = { taskId, step, verdict, explanation, origin: 'reviewer', at: Date.now(), revision: (previous?.revision ?? (previous ? 1 : 0)) + 1,
+          evidenceRefs: p.evidenceRefs ?? [], history: previous ? [...(previous.history ?? []), { ...previous, history: undefined }] : [] };
+        goal.scratchpad[key] = assessment;
+        const reconsiderations: LearningDecision[] = [];
+        if (previous) for (const [decisionKey,value] of Object.entries(goal.scratchpad)) {
+          if (!decisionKey.startsWith('learning/decision/')) continue;
+          const old = value as LearningDecision;
+          const cited = old.evidence[key] as { revision?: number } | undefined;
+          const effects = old.effects.filter(e => e.state === 'applied' && e.input.id && e.input.action !== 'no_change');
+          if (!cited || (cited.revision ?? 1) !== (previous.revision ?? 1) || !effects.length) continue;
+          const reconsideration: LearningDecision = { version:1,id:uuidv4(),goalId,reviewTaskId:old.reviewTaskId,
+            operationId:`reassess:${old.id}:${key}:${assessment.revision}`,createdAt:Date.now(),updatedAt:Date.now(),repairAttempts:0,paused:old.paused,
+            context:{ previousDecisionId:old.id, assessmentRef:key, assessmentRevision:assessment.revision, reason:'An assessment supporting accepted knowledge changed' },
+            evidence:{...structuredClone(old.evidence),[key]:structuredClone(assessment)},
+            effects:effects.map(e => ({id:uuidv4(),input:{action:'reconsider_entry',id:e.input.id},original:{effectId:e.id,assessmentRevision:assessment.revision},
+              state:old.paused?'waiting':'needs_repair',attempts:0,nextAttemptAt:0,error:'Reassess this claim against the revised assessment; keep it unchanged if still justified',history:[]})),
+          };
+          reconsiderations.push(reconsideration);
+        }
+        for (const d of reconsiderations) goal.scratchpad[`learning/decision/${d.id}`] = d;
+        try { await this.persistLearning(goal); } catch (err) {
+          if (previous) goal.scratchpad[key] = previous; else delete goal.scratchpad[key];
+          for (const d of reconsiderations) delete goal.scratchpad[`learning/decision/${d.id}`];
+          throw err;
+        }
+        return { success: true, assessment };
+      });
     });
 
     this.on('recordObservation', async (msg: AbjectMessage) => {
@@ -1375,10 +1578,14 @@ reviews results and either plans another round or completes/fails the goal.
     });
     this.on('recordScrumCommit', async msg => {
       if (msg.routing.from !== await this.discoverDep('ScrumMaster')) throw new Error('Scrum commits belong to ScrumMaster');
-      const { goalId, operationId } = msg.payload as { goalId: string; operationId: string };
+      const { goalId, operationId, outcome, error } = msg.payload as { goalId: string; operationId: string; outcome?: 'replanned'; error?: string };
       const goal = this.goals.get(goalId);
       if (!goal || !operationId) throw new Error('Unknown goal or missing commit identity');
-      goal.scratchpad[`learning/commit/${operationId}`] = true;
+      goal.scratchpad[`learning/commit/${operationId}`] ??= outcome ? { outcome, error } : true;
+      if (outcome === 'replanned') {
+        const evidence = goal.scratchpad[`learning/task/${operationId}`] as Record<string, unknown> | undefined;
+        if (evidence) Object.assign(evidence, { phase: 'error', error, dispatchOutcome: 'replanned' });
+      }
       await this.persistLearning(goal);
       return { success: true };
     });
@@ -1473,62 +1680,77 @@ reviews results and either plans another round or completes/fails the goal.
 
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId, description } = msg.payload as {
+      const { title, parentId, description, operationId } = msg.payload as {
         title: string;
         parentId?: GoalId;
         description: string;
+        operationId?: string;
       };
       requireNonEmpty(title, 'title');
       requireNonEmpty(description, 'description');
-
-      const goalId = uuidv4() as GoalId;
-      const callerId = msg.routing.from;
-
-      const goal: Goal = {
-        id: goalId,
-        parentId,
-        title: title.slice(0, 200),
-        description,
-        status: 'active',
-        createdBy: callerId,
-        creatorName: '',
-        creatorPeerId: this.selfPeerId,
-        progress: [],
-        childIds: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        scratchpad: {},
-        currentScrumNumber: 0,
-        interjections: [],
-      };
-
-      this.goals.set(goalId, goal);
-      this.goalOrder.push(goalId);
-
-      // Link to parent
-      if (parentId) {
-        const parent = this.goals.get(parentId);
-        if (parent) {
-          parent.childIds.push(goalId);
-          parent.updatedAt = Date.now();
+      if (operationId !== undefined) requireNonEmpty(operationId, 'operationId');
+      return withKeyedLock(`${this.id}:create:${msg.routing.from}`, async () => {
+        const prior = operationId ? [...this.goals.values()].find(g => g.createdBy === msg.routing.from && g.scratchpad['routing/creationOperation'] === operationId) : undefined;
+        if (prior) {
+          await this.persistLearning(prior);
+          // A lost reply or interrupted first publication must not orphan round 0.
+          // ScrumMaster deduplicates goalCreated by goal and round.
+          if (prior.status === 'active' && prior.currentScrumNumber === 0) {
+            this.changed('goalCreated', { goalId: prior.id, title: prior.title, description: prior.description, parentId: prior.parentId });
+          }
+          return { goalId: prior.id, duplicate: true };
         }
-      }
 
-      // Create + subscribe to per-goal SharedState namespace
-      if (this.sharedStateId) {
-        const ns = `goal-${goalId}`;
-        try {
-          await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
-          await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
-        } catch { /* best effort */ }
-      }
+        const goalId = uuidv4() as GoalId;
+        const callerId = msg.routing.from;
 
-      log.info(`Goal created: "${goal.title}" (${goalId})`);
-      this.changed('goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
-      this.syncGoalToSharedState(goal);
-      this.saveGoalIndex();
+        const goal: Goal = {
+          id: goalId,
+          parentId,
+          title: title.slice(0, 200),
+          description,
+          status: 'active',
+          createdBy: callerId,
+          creatorName: '',
+          creatorPeerId: this.selfPeerId,
+          progress: [],
+          childIds: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          scratchpad: operationId ? { 'routing/creationOperation': operationId } : {},
+          currentScrumNumber: 0,
+          interjections: [],
+        };
 
-      return { goalId };
+        this.goals.set(goalId, goal);
+        this.goalOrder.push(goalId);
+
+        // Link to parent
+        if (parentId) {
+          const parent = this.goals.get(parentId);
+          if (parent) {
+            parent.childIds.push(goalId);
+            parent.updatedAt = Date.now();
+          }
+        }
+
+        // Create + subscribe to per-goal SharedState namespace
+        if (this.sharedStateId) {
+          const ns = `goal-${goalId}`;
+          try {
+            await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+            await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+          } catch { /* best effort */ }
+        }
+
+        if (operationId) await this.persistLearning(goal);
+        log.info(`Goal created: "${goal.title}" (${goalId})`);
+        this.changed('goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
+        this.syncGoalToSharedState(goal);
+        this.saveGoalIndex();
+
+        return { goalId };
+      });
     });
 
     this.on('updateProgress', async (msg: AbjectMessage) => {
@@ -1706,6 +1928,10 @@ reviews results and either plans another round or completes/fails the goal.
 
       log.info(`Goal stopped by user: "${goal.title}" (${goalId}) — ${cancelled} tasks cancelled`);
       goal.scratchpad['learning/review'] = 'deferred:user-stop';
+      for (const [key,value] of Object.entries(goal.scratchpad)) if (key.startsWith('learning/decision/')) {
+        const decision = value as LearningDecision; decision.paused = true;
+        for (const e of decision.effects) if (!['applied','abandoned'].includes(e.state)) { e.state = 'waiting'; e.error = 'Goal stopped; explicit learning resumption required'; }
+      }
       await this.persistLearning(goal);
       this.changed('goalFailed', { goalId, error: 'Stopped by user' });
       return true;
@@ -1904,7 +2130,7 @@ reviews results and either plans another round or completes/fails the goal.
       const now = Date.now();
 
       for (const [, goal] of this.goals) {
-        if (goal.scratchpad['learning/review'] !== 'pending' && (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived')) {
+        if (goal.scratchpad['learning/review'] !== 'pending' && !this.hasPendingLearning(goal) && (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived')) {
           goalsToClear.push(goal);
         }
       }
@@ -2279,6 +2505,7 @@ reviews results and either plans another round or completes/fails the goal.
       const { goalId, key, value } = msg.payload as { goalId: GoalId; key: string; value: unknown };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(key, 'key');
+      if (/^learning\/(decision|assessment)\//.test(key)) throw new Error('Use the reviewer-owned learning protocol for decisions and assessments');
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
       goal.scratchpad[key] = value;
