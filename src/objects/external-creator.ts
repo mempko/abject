@@ -1259,6 +1259,15 @@ clean result I did not observe.`;
     const timeout = typeof action.timeout === 'number' ? action.timeout : BASH_TIMEOUT_MS;
     const cwd = action.cwd ? this.resolveWorkPath(extra, String(action.cwd)) : extra.workRoot;
 
+    // A declared check has the same evidence/reuse rules regardless of which
+    // action requested it. Do not guess equivalence for arbitrary shell code.
+    if (cwd === extra.workRoot && [extra.project?.checkCommand, extra.project?.verifyCommand].includes(command.trim())) {
+      const verified = await this.opVerify(extra, { ...action, timeout, full: command.trim() === extra.project?.verifyCommand });
+      const data = verified.data as { exitCode?: number } | undefined;
+      return { ...verified, success: verified.success && data?.exitCode === 0,
+        ...(data?.exitCode !== 0 ? { error: `Command exited ${data?.exitCode}; inspect verification evidence.` } : {}) };
+    }
+
     this.reportProgress(extra, 'acting', command.slice(0, 80));
     const before = await this.verificationSnapshot(extra);
     let r: { stdout: string; stderr: string; exitCode: number; truncated?: unknown; outputObjectId?: AbjectId };
@@ -1274,15 +1283,6 @@ clean result I did not observe.`;
       extra.mutationsSinceVerify++;
     } else if (!before.complete || !after.complete) {
       extra.unknownEffects = true;
-    }
-    // The same declared command is evidence regardless of which action invoked it.
-    const project = extra.project!;
-    if (cwd === extra.workRoot && [project.checkCommand, project.verifyCommand].includes(command.trim())) {
-      const outcome = this.checkOutcome(extra, command.trim(), r, before, after);
-      const baseline = outcome.command === extra.baseline?.verify?.command ? extra.baseline.verify : extra.baseline?.check;
-      const verdict = this.judge(outcome, baseline, this.touchedFiles(extra));
-      if (outcome.command === project.verifyCommand) extra.lastVerify = verdict; else extra.lastCheck = verdict;
-      if (verdict.passed && outcome.command === (project.verifyCommand ?? project.checkCommand)) extra.mutationsSinceVerify = 0;
     }
     this.audit(extra, `bash exit=${r.exitCode}: ${command.slice(0, 160)}`);
 
@@ -1402,7 +1402,7 @@ clean result I did not observe.`;
       && newest?.taskId === extra.taskId && newest.workRoot === extra.workRoot
       && newest.exitCode === 0 && newest.stable === true && newest.revision === current.revision ? newest : undefined;
     this.reportProgress(extra, 'acting', `${reusable ? 'reusing' : 'verify:'} ${command}`);
-    const outcome = reusable ?? await this.captureOutcome(extra, command, VERIFY_TIMEOUT_MS);
+    const outcome = reusable ?? await this.captureOutcome(extra, command, typeof action.timeout === 'number' ? action.timeout : VERIFY_TIMEOUT_MS);
     const baseline = command === extra.baseline?.verify?.command ? extra.baseline.verify
       : command === extra.baseline?.check?.command ? extra.baseline.check : undefined;
     const verdict = this.judge(outcome, baseline, this.touchedFiles(extra));
@@ -1513,7 +1513,7 @@ clean result I did not observe.`;
 
     const changed = extra.filesModified.size;
     if (changed === 0 && !extra.unknownEffects) {
-      return { ok: true, note: 'No files were changed.' };
+      return { ok: true, note: 'Source edits made by this task: 0.' };
     }
 
     const hasCommands = Boolean(project.checkCommand || project.verifyCommand);
@@ -1572,6 +1572,24 @@ clean result I did not observe.`;
         (latest.preExisting > 0 ? ` with ${latest.preExisting} pre-existing failure(s) untouched` : '') +
         `, no new failures in files this task wrote.${foreign}${latest.outcome.snapshotNote ? ` Verification limitation: ${latest.outcome.snapshotNote}` : ''}`,
     };
+  }
+
+  /** Describe checks against the live inputs, including a commit-only task's baseline. */
+  private async completionChecks(extra: TaskExtra, current?: { revision?: string; complete: boolean }): Promise<string> {
+    if (!extra.project) return '';
+    current ??= await this.verificationSnapshot(extra);
+    const commands = [...new Set([extra.project.checkCommand, extra.project.verifyCommand].filter((c): c is string => !!c))];
+    const outcomes = [extra.lastVerify?.outcome, extra.lastCheck?.outcome, extra.baseline?.verify, extra.baseline?.check]
+      .filter((v): v is CheckOutcome => !!v).sort((a, b) => b.at - a.at);
+    return commands.map(command => {
+      const outcome = outcomes.find(o => o.command === command);
+      if (!outcome) return `${command}: ${extra.verifyBaseline && !extra.verifyBaseline.done && command === extra.project?.verifyCommand ? 'still running; no completed result' : 'no completed result'}.`;
+      const applicable = current.complete && outcome.stable === true && outcome.taskId === extra.taskId
+        && outcome.workRoot === extra.workRoot && outcome.revision === current.revision && extra.mutationsSinceVerify === 0;
+      const tests = outcome.testSummary;
+      const summary = tests ? `; tests: ${tests.passed ?? '?'} passed, ${tests.failed ?? '?'} failed, ${tests.tests ?? '?'} total` : '';
+      return `${command}: exit ${outcome.exitCode}${summary}; ${applicable ? 'applies to the current project inputs' : 'historical result; current coverage is not established'}.${outcome.snapshotNote ? ` ${outcome.snapshotNote}` : ''}`;
+    }).join('\n');
   }
 
   // ─── Goal scratchpad ────────────────────────────────────────────
@@ -1775,8 +1793,10 @@ clean result I did not observe.`;
       const extra = this.taskExtras.get(taskId);
       if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
       let snapshotWarning: string | undefined;
+      let currentSnapshot: { revision?: string; complete: boolean } | undefined;
       if (extra.project) {
         const current = await this.verificationSnapshot(extra);
+        currentSnapshot = current;
         const required = extra.project.verifyCommand ?? extra.project.checkCommand;
         const latest = [extra.lastVerify, extra.lastCheck].filter((v): v is CheckVerdict => !!v && v.outcome.command === required).sort((a, b) => b.outcome.at - a.outcome.at)[0];
         if (latest?.passed && current.complete && latest.outcome.revision && current.revision !== latest.outcome.revision) {
@@ -1785,7 +1805,7 @@ clean result I did not observe.`;
         if (!current.complete) snapshotWarning = `Current snapshot coverage is incomplete. ${current.issues?.slice(0, 3).join('; ') ?? ''}`;
       }
       const gate = this.gateVerdict(extra);
-      const note = [gate.note, snapshotWarning].filter(Boolean).join('\n');
+      const note = [gate.note, await this.completionChecks(extra, currentSnapshot), snapshotWarning].filter(Boolean).join('\n');
       return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, note },
         ...(gate.ok && typeof result === 'string' ? { result: `${result}\n\nVerification: ${note}` } : {}) };
     });
@@ -1935,6 +1955,7 @@ clean result I did not observe.`;
     loop: { success: boolean; result?: unknown; error?: string },
   ): Promise<{ success: boolean; result?: unknown; error?: string }> {
     const gate = this.gateVerdict(extra);
+    const checks = await this.completionChecks(extra);
     const worktreeNote = await this.teardownIsolation(extra);
     extra.worktree = undefined; // teardown is idempotent; do not repeat it in finally
 
@@ -1944,6 +1965,7 @@ clean result I did not observe.`;
 
     const evidence = [
       gate.note,
+      checks,
       extra.lastVerify ? this.renderVerdict(extra.lastVerify)
         : extra.lastCheck ? this.renderVerdict(extra.lastCheck) : '',
       extra.checkpoints.length > 0
@@ -2164,7 +2186,11 @@ An external project is a named directory holding a body of work. It may be softw
 
 # Response format
 
-Emit ONE JSON action per turn in a \`\`\`json code block, and nothing else. Independent actions may be batched as several blocks in one response; anything depending on an earlier result belongs in a later turn. Emit done, fail, and ask_user alone.
+Emit JSON actions in \`\`\`json code blocks, and nothing else. Batch independent checks in one response. For a short mechanical sequence whose only dependency is successful exit, one bash command may use && to stop on failure; report its combined status honestly. Inspect results before decisions that depend on their content. Emit done, fail, and ask_user alone.
+
+For a Git review and commit, group status, diff statistics, and recent commit conventions into the initial inspection. After reviewing the complete diff and applicable validation evidence, staging followed by staged status can share one command. Commit creation followed by commit metadata and final status can also share one command with &&. Do not spend a new reasoning turn on each predictable bookkeeping step. Keep named verification commands separate so their own exit status and evidence can be reused.
+
+Live project configuration and observed results take precedence over historical knowledge about scripts or capabilities. Recalled command suggestions are not user requirements. Use verify (full:false for the check command) to reuse passing evidence on unchanged inputs, unless the user explicitly requests a fresh run or an additional distinct check. An exact declared command requested through bash follows the same reuse rules; force:true requests execution again. Do not rerun an equivalent compiler invocation merely because an old memory spells it differently.
 
 # Actions
 

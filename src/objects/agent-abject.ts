@@ -408,7 +408,7 @@ interface TaskEntry {
    * The post-task reviewer reads these to judge which entries actually
    * helped (markUseful), closing the usefulness feedback loop.
    */
-  injectedKnowledge?: Array<{ id: string; title: string }>;
+  injectedKnowledge?: Array<{ id: string; title: string; source?: 'profile' | 'relevant' | 'pattern'; content?: string }>;
   /** Receipts for pattern content actually delivered, never model-authored. */
   patternSelections?: Record<string, string>;
   /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
@@ -3881,7 +3881,7 @@ The registered object must implement these handlers to participate in the agent 
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
-    add('response-format', '\n\n## Response Format\nEvery reply is one ```json action block. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nA terminal action still needs its own content field filled in: "reasoning" says why you are finishing, and the result field says what you are delivering. When the action asks the user something, that field carries the question itself, phrased for them to answer.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
+    add('response-format', '\n\n## Response Format\nPut each action in a ```json block. Use one action unless your agent instructions allow batching independent actions in separate blocks. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nA terminal action still needs its own content field filled in: "reasoning" says why you are finishing, and the result field says what you are delivering. When the action asks the user something, that field carries the question itself, phrased for them to answer.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
     add('large-payloads', `\n\n## Large results
@@ -4016,13 +4016,15 @@ The preview often answers the question on its own — when it does, just act.`, 
           add('patterns', block, false);
         }
 
-        // Record what was injected so the post-task reviewer can judge which
-        // entries actually helped (KnowledgeBase.markUseful).
+        // Preserve the claims actually shown, separately from any later KB
+        // revision. Retrieval alone is neither application nor usefulness.
         entry.patternSelections ??= {};
         for (const e of [...profile, ...patterns]) if (e.patternRef) entry.patternSelections[e.id] = e.patternRef;
-        entry.injectedKnowledge = [...(profile ?? []), ...relevant, ...patterns]
-          .filter(e => e.id)
-          .map(e => ({ id: e.id, title: e.title }));
+        entry.injectedKnowledge = [
+          ...profile.map(e => ({ id: e.id, title: e.title, source: 'profile' as const, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP)) })),
+          ...relevant.map(e => ({ id: e.id, title: e.title, source: 'relevant' as const, content: sanitizeInjectedFact(e.content.slice(0, 2000)) })),
+          ...patterns.map(e => ({ id: e.id, title: e.title, source: 'pattern' as const, content: sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP)) })),
+        ].filter(e => e.id);
       }
     } catch { /* best effort */ }
 
@@ -4251,7 +4253,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const messages = entry.state.llmMessages;
     const last = messages[messages.length - 1];
     if (!last || last.role !== 'user') return;
-    const reminder = `\n\nRespond with exactly one JSON action. Action names: ${this.vocabularyFor(entry).join(', ')}.`;
+    const reminder = `\n\nRespond with JSON action blocks as specified by your agent instructions; batch only where they allow it. Action names: ${this.vocabularyFor(entry).join(', ')}.`;
     // Only the newest turn carries the reminder: strip last turn's copy so
     // the history does not grow by one reminder per step.
     for (const m of messages) {

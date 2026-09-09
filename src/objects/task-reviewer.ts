@@ -83,7 +83,7 @@ interface TranscriptResponse {
   result?: unknown;
   error?: string;
   goalId: string | null;
-  injectedKnowledge: Array<{ id: string; title: string }>;
+  injectedKnowledge: Array<{ id: string; title: string; source?: 'profile' | 'relevant' | 'pattern'; content?: string }>;
   predictions?: PredictionRecord[];
   transcript: string;
 }
@@ -396,7 +396,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!extra) return { accepted: true, result: this.learningReport(undefined, true) };
     const batch = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : {};
     const actions: AgentAction[] = [];
-    if ('assessments' in batch || 'applications' in batch || 'unresolvedReason' in batch) extra.completionIssues = [];
+    if ('assessments' in batch || 'applications' in batch || 'knowledgeUpdates' in batch || 'unresolvedReason' in batch) extra.completionIssues = [];
     else extra.completionIssues ??= [];
     for (const [field, action] of [['assessments', 'assess_prediction'], ['applications', 'record_pattern_application']] as const) {
       const items = batch[field];
@@ -408,6 +408,20 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       if (items.length > 100) extra.completionIssues.push(`${items.length - 100} ${field} entries exceed the batch limit and remain unprocessed`);
     }
+    if (batch.knowledgeUpdates !== undefined) {
+      if (!Array.isArray(batch.knowledgeUpdates)) extra.completionIssues.push('knowledgeUpdates must be an array');
+      else {
+        for (const item of batch.knowledgeUpdates.slice(0, 20)) {
+          if (!item || !['update_entry', 'archive_entry'].includes(item.action) || typeof item.id !== 'string'
+            || typeof item.evidence !== 'string' || !item.evidence.trim()) {
+            extra.completionIssues.push('Knowledge corrections need an update_entry/archive_entry action, id, and evidence');
+            continue;
+          }
+          actions.push(item);
+        }
+        if (batch.knowledgeUpdates.length > 20) extra.completionIssues.push('Knowledge corrections beyond the first 20 remain unprocessed');
+      }
+    }
     // One completion can record a whole modest review, without an LLM turn
     // per assessment. Stop below the completion RPC deadline; never loop on a
     // receiver failure or require invented certainty to finish.
@@ -415,6 +429,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     for (let i = 0; i < actions.length; i++) {
       if (extra.cancelled) break;
       if (Date.now() >= deadline) { extra.completionIssues.push(`${actions.length - i} updates remain unprocessed after the completion time budget`); break; }
+      if (['update_entry', 'archive_entry'].includes(actions[i].action)) {
+        const previous = extra.updates?.filter(u => u.action.id === actions[i].id && ['update_entry', 'archive_entry'].includes(u.action.action)).at(-1);
+        if (previous?.status === 'saved' && JSON.stringify(previous.action) === JSON.stringify(actions[i])) continue;
+      }
       await this.applyReviewAction(taskId, actions[i]);
     }
     if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
@@ -712,6 +730,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     };
     append(`Learning dossier: ${records.length} task records. Task success is not prediction accuracy. Missing predictions are unknown, not confirmations.\nUse read_evidence with taskId and optional step for observations, key for learning/plans or learning/observation/<operationId>, or offset/length for complete material.`, 1000);
     append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; ${r.predictions?.length ?? 0} observations, ${r.predictions?.filter(p => p.verdict === 'contradicted').length ?? 0} operation contradictions`).join('\n'), 4000);
+    // Owner-provided completion evidence includes checks that ran before the
+    // first model action. They can disprove recalled claims about capabilities.
+    const outcomeBudget = Math.floor(3600 / Math.max(1, records.length));
+    append('Task completion evidence:\n' + records.map(r => {
+      const outcome = typeof r.result === 'string' ? r.result : JSON.stringify(r.result) ?? r.error ?? '(none)';
+      const excerpt = outcome.length <= outcomeBudget ? outcome
+        : `${outcome.slice(0, outcomeBudget / 2)}\n[... outcome excerpt; read_evidence for full result ...]\n${outcome.slice(-outcomeBudget / 2)}`;
+      return `${r.taskId}: ${excerpt}`;
+    }).join('\n'), 4200);
     // Index surprises across ALL tasks, including tasks omitted from transcript excerpts.
     const predictions = records.flatMap(r => (r.predictions ?? []).map(p => ({ r, p })));
     predictions.sort((a, b) => Number(b.p.verdict === 'contradicted') - Number(a.p.verdict === 'contradicted'));
@@ -720,9 +747,30 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const kb = await this.getKbId();
     if (kb) {
       const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: task, limit: 6, previews: true })).catch(() => []);
-      const ids = [...new Set([...predictions.flatMap(({ p }) => (p.patterns ?? []).map(p => p.id)), ...records.flatMap(r => (r.injectedKnowledge ?? []).map(k => k.id)), ...recalled.map(k => k.id)])].slice(0, 12);
+      const injected = records.flatMap(r => (r.injectedKnowledge ?? []).map(k => ({ ...k, taskId: r.taskId })));
+      // Relevant claims and declared applications precede always-injected
+      // profile facts. Legacy snapshots have no source; rank their recalled
+      // matches first rather than letting profile order consume the budget.
+      const ids = [...new Set([
+        ...injected.filter(k => k.source === 'relevant').map(k => k.id),
+        ...predictions.flatMap(({ p }) => (p.patterns ?? []).map(p => p.id)),
+        ...recalled.map(k => k.id),
+        ...injected.filter(k => k.source !== 'profile').map(k => k.id),
+        ...injected.map(k => k.id),
+      ])].slice(0, 12);
       const entries = await Promise.all(ids.map(id => this.request(request(this.id, kb, 'get', { id })).catch(() => null)));
-      append('Prefetched existing knowledge (injection is not evidence of application; current revision may differ from the applied revision):\n' + entries.filter(Boolean).map(e => JSON.stringify(e)).join('\n'), 9000);
+      append('Knowledge reconciliation: compare historical claims with observed actions and completion evidence. Correct obsolete claims even when the task succeeded and no pattern was applied. Injection does not prove usefulness. Excerpts are bounded; use recall by id before replacing a partially shown entry.', 600);
+      const perEntry = Math.floor(8400 / Math.max(1, ids.length));
+      for (let i = 0; i < ids.length; i++) {
+        const selected = injected.filter(k => k.id === ids[i]);
+        const current = entries[i] as { title?: string; type?: string; content?: string } | null;
+        const claimBudget = Math.max(80, Math.floor((perEntry - 220) / 2));
+        append(JSON.stringify({ id: ids[i], title: current?.title ?? selected[0]?.title,
+          injectedIn: selected.map(k => k.taskId),
+          shownClaim: selected[0]?.content?.slice(0, claimBudget) ?? '(legacy snapshot: claim text not captured)',
+          currentClaim: current?.content?.slice(0, claimBudget) ?? '(unavailable)', type: current?.type,
+        }), perEntry);
+      }
     }
     // After the evidence index and existing model, spend the remainder on execution context.
     append(material, remaining);
@@ -797,6 +845,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!(await this.getKbId())) {
       return { success: false, error: 'KnowledgeBase not available' };
     }
+    if (extra.cancelled) return { success: false, error: 'Review cancelled' };
 
     try {
       if (['record_pattern_application', 'update_pattern', 'mark_useful'].includes(action.action)) await this.requireLearningProtocol();
@@ -875,6 +924,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!id) return { success: false, error: 'update_entry requires "id"' };
           const guard = await this.guardCuratable(id, 'update');
           if (guard) return { success: false, error: guard };
+          if (extra.cancelled) return { success: false, error: 'Review cancelled' };
           const res = await this.request<{ success: boolean; error?: string }>(
             request(this.id, this.knowledgeBaseId!, 'update', {
               id,
@@ -894,6 +944,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!id) return { success: false, error: 'forget_entry requires "id"' };
           const guard = await this.guardCuratable(id, 'forget');
           if (guard) return { success: false, error: guard };
+          if (extra.cancelled) return { success: false, error: 'Review cancelled' };
           const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'forget', { id }), 10000);
           if (!decision?.success) throw new Error(decision?.error ?? 'forget failed');
           result = `Forgot ${id}`;
@@ -905,6 +956,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!id) return { success: false, error: 'archive_entry requires "id"' };
           const guard = await this.guardCuratable(id, 'archive');
           if (guard) return { success: false, error: guard };
+          if (extra.cancelled) return { success: false, error: 'Review cancelled' };
           const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'archive', { id }), 10000);
           if (!decision?.success) throw new Error(decision?.error ?? 'archive failed');
           result = `Archived ${id}`;
@@ -1229,19 +1281,19 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
-| done | result: {assessments, applications, summary?, unresolvedReason?} | Submit the review assessments together and finish; receiver messages record them without a separate LLM turn per item |
+| done | result: {assessments, applications, knowledgeUpdates?, summary?, unresolvedReason?} | Submit assessments and knowledge corrections together; receiver messages record them without a separate LLM turn per item |
 | fail | reason | The material was unreviewable |
 
 ## Completion example
 After inspecting the evidence, submit assessments directly in the final result:
 {"action":"done","result":{"assessments":[{"taskId":"<observed task>","step":1,"verdict":"contradicted","explanation":"Expected the complete diff; only a preview was delivered."}],"applications":[{"id":"<applied pattern>","application":{"taskId":"<observed task>","step":1,"context":"Inspecting changes","verdict":"inconclusive","evidence":"The retained page was not fully inspected."}}],"summary":"No new reusable lesson; one prediction contradicted."}}
-Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. You may omit applications when none were declared. Save or revise reusable knowledge with the ordinary actions before finishing; those actions remain available individually too.
+Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. You may omit applications when none were declared. Existing knowledge corrections can share the completion: knowledgeUpdates:[{action:"update_entry",id:"<existing entry>",title:"<accurate title>",content:"<corrected scoped claim and evidence>",evidence:"<observed task/step or owner verification result>"}]. archive_entry is also supported for obsolete duplicates. New lessons and all existing learning actions remain available individually. Rejected corrections remain visible as partial learning; do not loop to force acceptance.
 
 ## How to review
 1. **Evaluate predictions first.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
 2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Only structured predictions assessed as contradicted have a mechanical mismatch; a failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
 3. **Distill sparingly.** New reusable lessons are optional. A routine task can finish with no new lesson after recording its prediction assessments; an empty learning update list does not replace those assessments. Save a lesson only when it will help a FUTURE, UNRELATED task: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
-4. **Consult existing knowledge before saving.** Prefetched entries satisfy recall for the entries shown. Use recall_knowledge or the runtime recall-by-id action when additional context is needed; when a close entry exists, update_entry it rather than adding a sibling.
+4. **Reconcile existing knowledge with the world.** Compare the claims injected into agents with current observations, including owner-reported checks that ran before the first model action. A successful task can disprove old claims such as a command, test suite, or capability being unavailable. This matters even when no pattern was declared. Correct the existing entry's title AND content, preserving scope, observation date, and evidence; archive obsolete duplicates rather than adding a competing correction alongside them. Do not erase unrelated valid content. Fetch the full entry with recall by id before replacing an excerpt. Current entries may already be corrected: compare them with the historical claim and leave accurate revisions alone. Missing or ambiguous evidence means uncertainty, not an automatic rewrite. Prefetched entries satisfy recall only for the material shown.
 5. **Preserve evidence without overstating conclusions.** Expected failures, transient outages, and recoveries can test the world model. Record relevant contextual evidence and competing explanations in pattern applications. Do not turn a single timeout into a permanent claim that a capability is broken; keep uncertainty explicit and propose discriminating observations when the cause is unknown.
 6. **Procedures become skills.** When the transcript shows a reusable multi-step procedure that took real effort to get right (3+ steps, especially after retries), author_skill it. Skills are shared beyond this workspace, so keep them fully generic: the procedure, its steps, its pitfalls. Every personal or workspace-specific detail (names, addresses, accounts, file paths) belongs in save_entry, never in a skill.
 7. **Scratchpad material stays out.** Goal-specific findings, intermediate data, and in-progress state already live on the goal's scratchpad; the knowledge base is only for lessons that outlive the goal.

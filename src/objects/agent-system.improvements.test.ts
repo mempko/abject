@@ -192,6 +192,144 @@ test('review dossier retains surprises, prefetches knowledge, and exposes comple
   } finally { await f.stop(); }
 });
 
+test('commit-only completion reports current baseline tests and declared bash checks reuse evidence', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'abject-commit-evidence-')), f = await fixture();
+  try {
+    await writeFile(path.join(dir, 'source.ts'), 'existing uncommitted change');
+    const caller = await f.add(new Endpoint('AgentAbject'));
+    await f.add(new HostFileSystem({ allowedPaths: [dir], readOnly: true }));
+    const projects: any = await f.add(new Projects()), creator: any = await f.add(new Creator());
+    creator.agentAbjectId = caller.id;
+    const project = { name: 'fixture', root: dir, trusted: true, vcs: 'none', checkCommand: 'check', verifyCommand: 'tests', isolation: 'none', protectedPaths: [], autonomy: 'full' };
+    projects.projects.set(project.name, project);
+    const shell = await f.add(new Endpoint('ShellExecutor'));
+    const counts: Record<string, number> = {};
+    let exitCode = 0;
+    shell.on('exec', msg => {
+      const { command } = msg.payload as any;
+      assert.equal(msg.routing.from, creator.id);
+      counts[command] = (counts[command] ?? 0) + 1;
+      return { stdout: command === 'tests' ? 'ℹ tests 195\nℹ pass 195\nℹ fail 0\n' : '', stderr: '', exitCode };
+    });
+    const extra: any = { taskId: 'commit-review', taskText: 'Review and commit existing changes', project, workRoot: dir, filesRead: new Set(), filesModified: new Set(), preImages: new Map(), postImages: new Map(), instructionDirsSeen: new Set(), mutationsSinceVerify: 0, checkpoints: [], audit: [], decisions: [], editSetOpen: false };
+    creator.taskExtras.set(extra.taskId, extra);
+    await creator.captureBaseline(extra); await extra.verifyBaseline.promise;
+    const complete = () => caller.call(creator.id, 'candidateComplete', { taskId: extra.taskId, result: 'Created a commit from the existing changes.' });
+    const first = await complete();
+    assert.equal(first.accepted, true);
+    assert.match(first.result, /tests: exit 0; tests: 195 passed, 0 failed, 195 total; applies to the current project inputs/);
+    assert.doesNotMatch(first.result, /No files were changed/);
+    const act = (action: unknown) => caller.call(creator.id, 'agentAct', { taskId: extra.taskId, action });
+    for (const command of ['check', 'tests']) {
+      const reused = await act({ action: 'bash', command });
+      assert.equal(reused.success, true); assert.equal(reused.data.reused, true);
+      assert.equal(counts[command], 1);
+    }
+    await act({ action: 'bash', command: 'tests', force: true });
+    assert.equal(counts.tests, 2);
+    // Only exact declared checks are eligible; shell command equivalence is not guessed.
+    await act({ action: 'bash', command: 'tests && check' });
+    assert.equal(counts['tests && check'], 1);
+    await writeFile(path.join(dir, 'source.ts'), 'concurrent change');
+    assert.equal((await complete()).accepted, false, 'a recorded verify cannot claim newer inputs');
+    const rerun = await act({ action: 'bash', command: 'tests' });
+    assert.equal(rerun.data.reused, false); assert.equal(counts.tests, 3);
+    exitCode = 1;
+    assert.equal((await act({ action: 'bash', command: 'tests', force: true })).success, false);
+    assert.equal((await act({ action: 'bash', command: 'tests' })).data.reused, false, 'a failed rerun prevents reuse of an older pass');
+    // An untouched task may report a failing baseline, but never describe it as a pass.
+    extra.lastVerify = undefined; extra.lastCheck = undefined;
+    extra.filesModified.clear(); extra.unknownEffects = false; extra.mutationsSinceVerify = 0;
+    extra.baseline.verify = { ...extra.baseline.verify, exitCode: 1, testSummary: { tests: 195, passed: 194, failed: 1 } };
+    const historical = await complete();
+    assert.match(historical.result, /194 passed, 1 failed/);
+    assert.match(historical.result, /historical result; current coverage is not established/);
+  } finally { await f.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('review prioritizes stale task claims over profiles and corrects knowledge in the completion batch', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
+    const reviewer: any = await f.add(new Reviewer());
+    reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
+    const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Review repository', description: 'Commit changes' });
+    const stale = await caller.call(kb.id, 'remember', { title: 'Repository has no test script', content: 'No test runner is available.', type: 'fact', origin: 'agent' });
+    const duplicate = await caller.call(kb.id, 'remember', { title: 'Repository tests unavailable', content: 'No tests exist.', type: 'fact', origin: 'agent' });
+    const user = await caller.call(kb.id, 'remember', { title: 'User preference', content: 'Preserve my preference.', type: 'fact', origin: 'user' });
+    const runtime: any = await f.add(new Runtime());
+    const entry: any = { state: { id: 'injected', task: 'Repository test script' }, config: { terminalActions: {}, intermediateActions: [] } };
+    const prompt = await runtime.initializeConversation(entry);
+    const shown = entry.injectedKnowledge.find((k: any) => k.id === stale.id);
+    assert.equal(shown.source, 'relevant'); assert.equal(shown.content, 'No test runner is available.');
+    assert(prompt.some((m: any) => m.content.includes(shown.content)));
+    const profiles = Array.from({ length: 15 }, (_, i) => ({ id: `profile-${i}`, title: `Unrelated profile ${i}`, content: 'Not relevant to this task', source: 'profile' }));
+    const record = { taskId: 'worker', agentName: 'ExternalCreator', task: 'Review repository', phase: 'done', steps: 1, transcript: '',
+      result: 'Owner verification: tests: exit 0; tests: 195 passed, 0 failed, 195 total; applies to current inputs.',
+      predictions: [{ step: 1, action: 'verify', expect: 'The test script is missing', outcome: 'success', actual: '195 tests passed' }],
+      injectedKnowledge: [...profiles, { id: stale.id, title: 'Repository has no test script', content: 'No test runner is available.', source: 'relevant' }],
+    };
+    const dossier = await reviewer.buildLearningDossier('Review repository', 'context'.repeat(20000), [record]);
+    assert(dossier.length <= 40000);
+    assert.match(dossier, /No test runner is available/);
+    assert.match(dossier, /195 passed/);
+    assert(dossier.indexOf(stale.id) < dossier.indexOf('Unrelated profile'), 'task claims precede always-injected profile entries');
+    await caller.call(goals.id, 'recordTaskEvidence', { goalId, taskId: record.taskId, record });
+    reviewer.taskExtras.set('reconcile', { kind: 'review', goalId, records: [record] });
+    const result = {
+      assessments: [{ taskId: 'worker', step: 1, verdict: 'contradicted', explanation: 'The registered test script ran 195 tests successfully.' }],
+      knowledgeUpdates: [
+        { action: 'update_entry', id: stale.id, title: 'Repository test script verified', content: 'The registered test script passed 195 tests in the reviewed workspace. Evidence: worker step 1. Recheck current project configuration on later runs.', evidence: 'worker step 1 and owner completion evidence' },
+        { action: 'archive_entry', id: duplicate.id, evidence: 'Obsolete duplicate contradicted by worker step 1' },
+      ],
+    };
+    const done = await caller.call(reviewer.id, 'completeReview', { taskId: 'reconcile', result });
+    assert.equal(done.accepted, true); assert.equal(done.result.status, 'complete');
+    assert.equal(done.result.saved.length, 3);
+    assert.equal(done.result.patterns.helpful, 0, 'correcting facts does not invent pattern applications');
+    assert.equal((await caller.call(kb.id, 'get', { id: stale.id })).title, 'Repository test script verified');
+    assert.equal((await caller.call(kb.id, 'get', { id: duplicate.id })).archived, true);
+    const active = await caller.call(kb.id, 'recall', { query: 'Repository', limit: 10 });
+    assert(!active.some((e: any) => e.id === duplicate.id));
+    assert.equal(shown.content, 'No test runner is available.', 'historical injection is preserved after correction');
+    const snapshot = await caller.call(reviewer.id, 'snapshotTask', { taskId: 'reconcile' });
+    reviewer.taskExtras.delete('reconcile');
+    await caller.call(reviewer.id, 'restoreTask', { taskId: 'reconcile', snapshot });
+    await caller.call(reviewer.id, 'completeReview', { taskId: 'reconcile', result });
+    const replay = await caller.call(reviewer.id, 'snapshotTask', { taskId: 'reconcile' });
+    assert.equal(replay.updates.filter((u: any) => ['update_entry', 'archive_entry'].includes(u.action.action)).length, 2, 'completed corrections are not replayed after restoration');
+    const protectedWrite = await caller.call(reviewer.id, 'completeReview', { taskId: 'reconcile', result: {
+      knowledgeUpdates: [{ action: 'update_entry', id: user.id, content: 'Overwritten', evidence: 'Claimed contradiction' }],
+    } });
+    assert.equal(protectedWrite.accepted, true); assert.equal(protectedWrite.result.status, 'partial');
+    assert.equal(protectedWrite.result.pending.length, 1);
+    assert.equal((await caller.call(kb.id, 'get', { id: user.id })).content, 'Preserve my preference.');
+  } finally { await f.stop(); }
+});
+
+test('cancellation during knowledge ownership lookup prevents the following mutation', async () => {
+  const f = await fixture();
+  try {
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Endpoint('KnowledgeBase'));
+    const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id;
+    let writes = 0;
+    for (const method of ['update', 'archive', 'forget']) kb.on(method, () => { writes++; return { success: true }; });
+    for (const action of ['update_entry', 'archive_entry', 'forget_entry']) {
+      let release!: () => void, started!: () => void;
+      const began = new Promise<void>(resolve => { started = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      kb.on('get', async () => { started(); await gate; return { origin: 'agent' }; });
+      reviewer.taskExtras.set(action, { kind: 'review', records: [] });
+      const pending = caller.call(reviewer.id, 'agentAct', { taskId: action, action: { action, id: 'fact', content: 'new claim' } });
+      await began;
+      await caller.call(reviewer.id, 'taskCancelled', { taskId: action });
+      release();
+      assert.equal((await pending).success, false);
+    }
+    assert.equal(writes, 0);
+  } finally { await f.stop(); }
+});
+
 test('semantic assessments are reviewer-owned, evidence-backed, replay-safe, and preserve missing predictions as unknown', async () => {
   const f = await fixture();
   try {
@@ -558,16 +696,22 @@ test('cancelling a completion batch stops subsequent learning messages', async (
   try {
     const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Endpoint('KnowledgeBase')), goals = await f.add(new Endpoint('GoalManager'));
     const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
-    let release!: () => void, started!: () => void, calls = 0;
+    let release!: () => void, started!: () => void, calls = 0, knowledgeCalls = 0;
+    kb.on('get', () => { knowledgeCalls++; return { origin: 'agent' }; });
+    kb.on('update', () => { knowledgeCalls++; return { success: true }; });
     const entered = new Promise<void>(resolve => { started = resolve; });
     const gate = new Promise<void>(resolve => { release = resolve; });
     goals.on('recordPredictionAssessment', async msg => { calls++; started(); await gate; return { success: true, assessment: { verdict: (msg.payload as any).verdict } }; });
     const predictions = [1, 2].map(step => ({ step, expect: 'full page', outcome: 'success' }));
     reviewer.taskExtras.set('review', { kind: 'review', goalId: 'goal', records: [{ taskId: 'worker', predictions }] });
-    const completion = caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: { assessments: predictions.map(p => ({ taskId: 'worker', step: p.step, verdict: 'unresolved', explanation: 'Output unavailable' })) } });
+    const completion = caller.call(reviewer.id, 'completeReview', { taskId: 'review', result: {
+      assessments: predictions.map(p => ({ taskId: 'worker', step: p.step, verdict: 'unresolved', explanation: 'Output unavailable' })),
+      knowledgeUpdates: [{ action: 'update_entry', id: 'fact', content: 'Updated claim', evidence: 'worker step 1' }],
+    } });
     await entered; await caller.call(reviewer.id, 'taskCancelled', { taskId: 'review' }); release();
     const result = await completion;
     assert.equal(calls, 1); assert.equal(result.accepted, true); assert.equal(result.result.interrupted, true); assert.equal(result.result.status, 'partial');
+    assert.equal(knowledgeCalls, 0, 'cancellation also stops the following knowledge corrections');
   } finally { await f.stop(); }
 });
 
