@@ -89,7 +89,7 @@ test('live logs and runtime state do not invalidate verification; source edits a
     assert.equal((await complete()).accepted, false, 'a later source change is explained');
     assert.equal((await act({ action: 'bash', command: 'verify' })).success, true);
     assert.equal((await complete()).accepted, true, 'declared commands count when invoked through bash');
-    failing = true; await act({ action: 'verify', full: true });
+    failing = true; await act({ action: 'verify', full: true, force: true });
     assert.equal((await complete()).accepted, false, 'actual failed checks are not presented as passes');
     const scoped = await caller.call(host.id, 'snapshotTree', { root: dir, scope: 'project' });
     assert.equal(scoped.files['app.log'], undefined); assert.equal(scoped.files['dist/generated.js'], undefined);

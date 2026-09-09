@@ -192,9 +192,15 @@ export interface PredictionRecord {
   step: number;
   action: string;
   expect: string;
-  outcome: 'success' | 'failure';
+  outcome: 'success' | 'failure' | 'unknown';
   verdict?: 'supported' | 'contradicted' | 'unresolved';
   actualRef?: string;
+  predictedAt?: number;
+  observedAt?: number;
+  /** Runtime verdict compares operation status only, never the free-text claim. */
+  verdictScope?: 'operation-status';
+  semanticVerdict?: 'unresolved';
+  patterns?: Array<{ id: string; revision?: number; why: string }>;
   /** True when the action failed, which contradicts any expectation of it working. */
   missed?: boolean;
   /** Short rendering of the actual result, so the reviewer sees both sides. */
@@ -409,6 +415,7 @@ interface TaskEntry {
    * through getTaskTranscript.
    */
   predictions?: PredictionRecord[];
+  pendingPrediction?: { step: number; action: AgentAction; at: number };
   /** Whether the last observe callback declared its observation as bulk. */
   observationChunkable?: boolean;
   /** Oversized observations/results held whole, addressed by read_chunk. */
@@ -1270,7 +1277,7 @@ The registered object must implement these handlers to participate in the agent 
       status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
       snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
         taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
-        injectedKnowledge: entry.injectedKnowledge, payloads: entry.payloads, specialist,
+        injectedKnowledge: entry.injectedKnowledge, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
         children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
       outstandingOperation, ...(usage?{usage}:{}),
       ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
@@ -1518,7 +1525,7 @@ The registered object must implement these handlers to participate in the agent 
       const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
         systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
         goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge,
-        payloads: stored.payloads, sessionId: p.id, sessionRevision: resumed.session.revision };
+        payloads: stored.payloads, payloadSeq: stored.payloadSeq, pendingPrediction: stored.pendingPrediction, sessionId: p.id, sessionRevision: resumed.session.revision };
       for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
       this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
       void this.runTaskAsync(entry);
@@ -2431,6 +2438,15 @@ The registered object must implement these handlers to participate in the agent 
     let success = entry.state.phase === 'done';
     const validationErrors = success ? undefined : entry.state.error ? [entry.state.error] : undefined;
 
+    const pending = entry.pendingPrediction;
+    if (pending && !entry.predictions?.some(p => p.step === pending.step)) {
+      (entry.predictions ??= []).push({ step: pending.step, action: pending.action.action,
+        expect: typeof pending.action.expect === 'string' ? pending.action.expect : '',
+        predictedAt: pending.at, outcome: 'unknown', verdict: 'unresolved', semanticVerdict: 'unresolved',
+        patterns: Array.isArray(pending.action.patterns) ? pending.action.patterns : [],
+        actual: 'No completed observation was recorded. Cancellation or interruption does not prove whether the action took effect.' });
+    }
+
     // A task sharing a goal never owns the parent goal's completion. ScrumMaster
     // decides that after reviewing the task evidence, including direct calls.
 
@@ -3142,6 +3158,12 @@ The registered object must implement these handlers to participate in the agent 
             // sandboxed code interacts with the world only via call/dep/find
             // bus messages. This is how a 30-call chain costs one think step.
             if (task.action.action === 'submit_job') {
+              await this.preparePrediction(entry);
+              if (cancelledExternally()) break;
+              entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
+              await this.checkpointSession(entry);
+              if (cancelledExternally()) break;
+              let observed: AgentActionResult = { success: false, error: 'Job did not execute' };
               const code = task.action.code as string | undefined;
               const description = (task.action.description as string) ?? 'agent pipeline';
               if (!code || code.trim().length === 0) {
@@ -3191,6 +3213,8 @@ The registered object must implement these handlers to participate in the agent 
                       }),
                       AgentAbject.SUBMIT_JOB_TIMEOUT_MS,
                     );
+                    if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
+                    observed = jobReply?.status === 'failed' ? { success: false, error: jobReply.error } : { success: true, data: jobReply?.result };
                     if (jobReply?.status === 'failed') {
                       log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" failed: ${jobReply.error}`);
                       task.llmMessages.push({ role: 'user', content: `[Job Error] ${jobReply.error ?? 'job failed'}` });
@@ -3210,12 +3234,18 @@ The registered object must implement these handlers to participate in the agent 
                     task.llmMessages.push({ role: 'user', content: '[Job Error] JobManager not available.' });
                   }
                 } catch (err) {
+                  observed = { success: false, error: err instanceof Error ? err.message : String(err) };
                   task.llmMessages.push({
                     role: 'user',
                     content: `[Job Error] ${err instanceof Error ? err.message : String(err)}`,
                   });
                 }
               }
+              if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
+              task.lastResult = observed;
+              await this.recordPrediction(entry);
+              entry.outstandingOperation = undefined;
+              await this.checkpointSession(entry);
               // Consume the pending observation/result: submit_job chains
               // re-enter thinking repeatedly, and without this each round
               // re-appends the same observation and the previous action's
@@ -3259,6 +3289,8 @@ The registered object must implement these handlers to participate in the agent 
           }
 
           case 'acting': {
+            await this.preparePrediction(entry);
+            if (cancelledExternally()) break;
             entry.outstandingOperation = { taskId: task.id, step: task.step, action: task.action };
             await this.checkpointSession(entry);
             if (cancelledExternally()) { entry.outstandingOperation = undefined; break; }
@@ -3839,18 +3871,18 @@ The registered object must implement these handlers to participate in the agent 
   private async buildGoalProgressContext(goalId: string, dispatchTupleId?: string): Promise<string> {
     if (!this.goalManagerId) return '';
     try {
-      const goal = await this.request<{
-        title?: string; description?: string; status?: string;
-        scratchpad?: Record<string, unknown>;
-      } | null>(
-        request(this.id, this.goalManagerId, 'getGoal', { goalId }),
-        5000,
-      );
-
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
         request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
         5000,
       );
+      const goal = await this.request<{
+        title?: string; description?: string; status?: string;
+        scratchpad?: Record<string, unknown>; scratchpadIndex?: string[]; scratchpadKeyCount?: number; omitted?: string[];
+      } | null>(
+        request(this.id, this.goalManagerId, 'getGoalBriefing', { goalId, keys: tasks?.find(t => t.id === dispatchTupleId)?.fields.consumes ?? [] }),
+        5000,
+      );
+
       if (!tasks || tasks.length === 0) return '';
 
       // Identify the current task (the one this agent is working on) and its contract,
@@ -3872,7 +3904,7 @@ The registered object must implement these handlers to participate in the agent 
         // consumed-keys block or via the auto-mirror path tasks/<id>/result).
         const taskProduces = (t.fields.produces as Array<{ key: string; description: string }> | undefined) ?? [];
         if (status === 'done' && t.fields.result && taskProduces.length === 0) {
-          line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 20000)}`;
+          line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 2000) + ' [Full result: GoalManager.getTasksForGoal]'}`;
         } else if (status === 'done' && taskProduces.length > 0) {
           line += ` -- Wrote scratchpad keys: ${taskProduces.map(p => p.key).join(', ')}`;
         }
@@ -3927,13 +3959,15 @@ The registered object must implement these handlers to participate in the agent 
             ctx += `\n\n## Shared Goal Data (consumed keys)\nValues at the scratchpad keys this task consumes.\n\`\`\`json\n${JSON.stringify(consumed, null, 2)}\n\`\`\``;
           }
           if (missing.length > 0) {
-            ctx += `\n\nConsumed keys not yet written: ${missing.join(', ')}. Earlier tasks should have produced these; if they are missing, the auto-mirror at tasks/<taskId>/result may hold the raw completion output as a fallback.`;
+            ctx += `\n\nConsumed keys not included in this briefing (retrieve before treating as missing): ${missing.join(', ')}. Earlier tasks should have produced these; if they are missing, the auto-mirror at tasks/<taskId>/result may hold the raw completion output as a fallback.`;
           }
         } else {
           ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Add your own findings with \`call("GoalManager", "writeGoalData", {goalId, key, value})\` (a GoalManager method, not a top-level action verb).\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
         }
       }
 
+      if (goal?.scratchpadIndex?.length) ctx += `\nScratchpad index (${goal.scratchpadKeyCount} keys; first 100 shown): ${goal.scratchpadIndex.join(', ')}. Read complete values with GoalManager.readGoalData({goalId,key}).`;
+      if (goal?.omitted?.length) ctx += `\nValues omitted from this briefing: ${goal.omitted.join(', ')}. Retrieve consumed values before relying on them.`;
       return ctx;
     } catch {
       return '';
@@ -3970,7 +4004,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 \`\`\`json
 { "action": "read_chunk", "id": "obs-3", "grep": "temperature" }
 { "action": "read_chunk", "id": "obs-3", "outline": true }
-{ "action": "read_chunk", "id": "obs-3", "offset": 2000, "length": 4000 }
+{ "action": "read_chunk", "id": "obs-3", "offset": 2000, "length": 30000 }
 \`\`\`
 
 **When the question is about ALL of it, use code, not the reader.** Filtering records by a field, counting them, extracting every match, reshaping a list: that is one \`submit_job\` over the payload, and it costs one step however many records there are. Reading the same data back a chunk at a time costs a step per chunk and runs out of budget before it finishes. Inside job code a held payload arrives by message:
@@ -3985,7 +4019,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
+    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions are recorded before execution; observations are recorded afterwards. For consequential actions include patterns: [{id, revision, why}] for patterns you actually apply. Merely seeing a pattern is not using it. Operation success does not establish that your free-text prediction was correct. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
@@ -4014,7 +4048,7 @@ The preview often answers the question on its own — when it does, just act.`, 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number };
+        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; pattern?: { learning?: { revision?: number } } };
         const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
@@ -4079,7 +4113,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         const relevant = (matched ?? [])
           .filter(e => !profileTitles.has(e.title) && e.type !== 'pattern' && !patternIds.has(e.id));
         if (relevant.length > 0) {
-          let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
+          let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
             kb += `- **${e.title}** (${e.type}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
@@ -4090,7 +4124,7 @@ The preview often answers the question on its own — when it does, just act.`, 
           let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern. Apply the patterns whose context holds for this task.\n';
           for (const e of patterns) {
             const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
-            block += `\n### PATTERN: ${e.title}${via}\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
+            block += `\n### PATTERN: ${e.title}${via} [id=${e.id}, revision=${e.pattern?.learning?.revision ?? 'unknown'}]\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
           }
           add('patterns', block, false);
         }
@@ -4206,7 +4240,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'unknown';
     log.info(
       `[${agentName}] prompt: ${stable.length} stable + ${volatile.length} volatile chars ` +
-      `(~${Math.round(stable.length / 4)} cacheable tokens) [${(entry.promptBlockKeys ?? []).join(' ')}]`,
+      `(~${Math.round(stable.length / 4)} cacheable tokens) [${blocks.map(b => `${b.key}:${b.content.length}`).join(' ')}]`,
     );
 
     if (entry.initialMessages && entry.initialMessages.length > 0) {
@@ -4381,7 +4415,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
   /** Keep a payload whole and return its id. */
   private storePayload(entry: TaskEntry, text: string, kind: string): string {
-    const seq = (entry.payloadSeq = (entry.payloadSeq ?? 0) + 1);
+    const previous = Math.max(entry.payloadSeq ?? 0, ...(entry.payloads ?? []).map(p => Number(p.id.match(/-(\d+)$/)?.[1]) || 0));
+    const seq = (entry.payloadSeq = previous + 1);
     const id = `${kind === 'observation' ? 'obs' : 'res'}-${seq}`;
     (entry.payloads ??= []).push({ id, text, kind, storedAt: Date.now() });
     // Bounded: a task that pulls down five big pages should not carry all of
@@ -4401,6 +4436,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * answer the question outright.
    */
   private static outlinePayload(text: string): string | undefined {
+    const diffs = [...text.matchAll(/^diff --git .+$/gm)];
+    if (diffs.length) return `Diff sections (character offsets):\n${diffs.slice(0, 100).map(m => `@${m.index}: ${m[0]}`).join('\n')}${diffs.length > 100 ? '\nMore sections omitted; search the retained payload.' : ''}`;
     const trimmed = text.trimStart();
     if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
       // Markdown-ish: the headings are the outline.
@@ -4477,9 +4514,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const preview = text.slice(0, AgentAbject.PAYLOAD_PREVIEW_CHARS);
     return (
       `[Large ${kind}: ${text.length.toLocaleString()} chars, held whole as "${id}". ` +
-      `Nothing has been discarded. Read more with read_chunk: ` +
+      `This received payload is retained until evicted (five payloads per task); upstream truncation notices still apply. Read up to 30000 characters with read_chunk: ` +
       `{"action":"read_chunk","id":"${id}","grep":"<text>"} to jump to what you need, ` +
-      `or {"action":"read_chunk","id":"${id}","offset":${AgentAbject.PAYLOAD_PREVIEW_CHARS},"length":4000} to continue.]\n` +
+      `or {"action":"read_chunk","id":"${id}","offset":${AgentAbject.PAYLOAD_PREVIEW_CHARS},"length":30000} to continue.]\n` +
       (outline ? `\n${outline}\n` : '') +
       `\nFirst ${Math.min(preview.length, AgentAbject.PAYLOAD_PREVIEW_CHARS).toLocaleString()} chars:\n${preview}`
     );
@@ -4567,10 +4604,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     }
 
     const offset = Math.max(0, typeof action.offset === 'number' ? action.offset : 0);
-    const length = Math.min(
+    const length = Math.max(1, Math.min(
       typeof action.length === 'number' ? action.length : AgentAbject.MAX_CHUNK_CHARS,
       AgentAbject.MAX_CHUNK_CHARS,
-    );
+    ));
     if (offset >= text.length) return `Offset ${offset} is past the end of ${stored.id} (${text.length} chars).`;
     const slice = text.slice(offset, offset + length);
     const end = offset + slice.length;
@@ -4584,24 +4621,41 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   /**
    * File the just-executed action's stated expectation against its outcome.
    * Called from the acting phase, where the action and its result are both in
-   * hand. Actions that stated nothing are skipped entirely: an empty ledger
-   * means the agent never committed to a claim, which is itself worth seeing.
+   * hand. Actions without a prediction are recorded as unknown, not silently
+   * promoted to successes. The pre-action record preserves the original claim.
    */
+  private async preparePrediction(entry: TaskEntry): Promise<void> {
+    const task = entry.state;
+    entry.pendingPrediction = { step: task.step + 1, action: structuredClone(task.action!), at: Date.now() };
+    const goalId = entry.goalId ?? entry.incomingGoalId;
+    if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
+      goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
+      observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
+        expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
+        patterns: task.action?.patterns ?? [], predictedAt: entry.pendingPrediction.at },
+    }));
+  }
+
   private async recordPrediction(entry: TaskEntry): Promise<void> {
     const task = entry.state;
-    const expect = typeof task.action?.expect === 'string' ? task.action.expect.trim() : '';
-    if (!expect || !task.lastResult) return;
+    const predicted = entry.pendingPrediction?.step === task.step + 1 ? entry.pendingPrediction : undefined;
+    const action = predicted?.action ?? task.action;
+    const expect = typeof action?.expect === 'string' ? action.expect.trim() : '';
+    if (!task.lastResult) return;
 
     const outcome = task.lastResult.success ? 'success' : 'failure';
-    const expected = task.action?.expectOutcome;
+    const expected = action?.expectOutcome;
     const verdict = expected === 'success' || expected === 'failure'
       ? expected === outcome ? 'supported' : 'contradicted'
       : 'unresolved';
     const actual = JSON.stringify({ outcome, data: task.lastResult.data, error: task.lastResult.error, payloadId: task.lastResult.payloadId });
-    const stored = this.storePayload(entry, actual, 'prediction-observation');
+    const stored = `${task.id}:step:${task.step + 1}`;
+    // Observations live in the goal evidence ledger, not the five-slot bulk cache.
+    const patterns = Array.isArray(action?.patterns) ? action.patterns.filter((p: any) => p && typeof p.id === 'string' && typeof p.why === 'string').map((p: any) => ({ id: p.id, revision: Number.isSafeInteger(p.revision) ? p.revision : undefined, why: p.why.slice(0, 1000) })) : [];
     (entry.predictions ??= []).push({
       step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
       expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS), outcome, verdict,
+      predictedAt: predicted?.at, observedAt: Date.now(), verdictScope: 'operation-status', semanticVerdict: 'unresolved', patterns,
       ...(verdict === 'contradicted' ? { missed: true } : {}),
       actual: actual.slice(0, 2000), actualRef: stored,
     });
@@ -4648,6 +4702,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         ? `\nPartial data (from sub-tasks that succeeded):\n${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? ''}`
         : '';
       resultStr = `Action "${action?.action}" failed: ${errStr}${dataStr}`;
+      if (task.lastResult.payloadId) resultStr += `\n${this.renderStoredHandle(entry, task.lastResult.payloadId) ?? 'Payload expired'}`;
     }
 
     // Put the agent's own prediction next to the outcome it was about. Seeing

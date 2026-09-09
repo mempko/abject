@@ -1321,6 +1321,8 @@ reviews results and either plans another round or completes/fails the goal.
 
   private setupHandlers(): void {
     describeMessages(this.manifest, [
+      { name: "recordPredictionAssessment", description: "TaskReviewer records its interpretation separately from observed execution evidence; repeated assessments are acknowledged without overwriting.", parameters: { "goalId": protocolText, "taskId": protocolText, "step": protocolNumber, "verdict": protocolText, "explanation": protocolText } },
+      { name: "getGoalBriefing", description: "Bounded task briefing with selected scratchpad values and references to complete evidence.", parameters: { "goalId": protocolText, "keys?": { kind: 'array', elementType: protocolText } } },
       { name: "recordTaskEvidence", description: "Preserve a task record before terminal notification.", parameters: { "goalId": protocolText, "taskId": protocolText, "record": protocolObject } },
       { name: "recordObservation", description: "Idempotently record an observation for the next scrum.", parameters: { "goalId": protocolText, "operationId": protocolText, "observation": protocolObject } },
       { name: "recordPlan", description: "Record an evidence-backed plan revision; stale revisions conflict.", parameters: { "goalId": protocolText, "operationId": protocolText, "expectedRevision": protocolNumber, "plan": protocolObject } },
@@ -1340,6 +1342,24 @@ reviews results and either plans another round or completes/fails the goal.
       await this.persistLearning(goal);
       return { success: true };
     });
+    this.on('recordPredictionAssessment', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== await this.discoverDep('TaskReviewer')) throw new Error('Prediction assessments belong to TaskReviewer');
+      const { goalId, taskId, step, verdict, explanation } = msg.payload as { goalId: GoalId; taskId: string; step: number; verdict: string; explanation: string };
+      const goal = this.goals.get(goalId);
+      if (!goal) return { success: false, error: 'Goal evidence unavailable' };
+      if (!['supported', 'contradicted', 'unresolved'].includes(verdict) || !explanation?.trim()) return { success: false, error: 'Assessment requires a verdict and explanation grounded in evidence' };
+      const task = goal.scratchpad[`learning/task/${taskId}`] as { predictions?: Array<{ step: number; expect?: string; outcome?: string }> } | undefined;
+      const observed = goal.scratchpad[`learning/observation/${taskId}:${step}`] as { expect?: string; outcome?: string } | undefined;
+      const prediction = task?.predictions?.find(p => p.step === step) ?? observed;
+      if (!prediction) return { success: false, error: 'No observed episode at this task and step' };
+      if ((!prediction.expect || prediction.outcome === 'unknown') && verdict !== 'unresolved') return { success: false, error: 'An unstated prediction or unobserved outcome remains unknown' };
+      const key = `learning/assessment/${taskId}:${step}`;
+      if (key in goal.scratchpad) { await this.persistLearning(goal); return { success: true, duplicate: true, assessment: goal.scratchpad[key] }; }
+      goal.scratchpad[key] = { taskId, step, verdict, explanation, origin: 'reviewer', at: Date.now() };
+      await this.persistLearning(goal);
+      return { success: true, assessment: goal.scratchpad[key] };
+    });
+
     this.on('recordObservation', async (msg: AbjectMessage) => {
       const { goalId, operationId, observation } = msg.payload as { goalId: string; operationId: string; observation: unknown };
       const goal = this.goals.get(goalId);
@@ -1834,6 +1854,26 @@ reviews results and either plans another round or completes/fails the goal.
       }
       const receipt = await this.request<{ safe: boolean; pending: unknown }>(request(this.id, runtimeId, 'awaitGoalQuiescence', { goalId, preserveTaskIds }), 15000);
       return { cancelled, ...receipt };
+    });
+
+    this.on('getGoalBriefing', async (msg: AbjectMessage) => {
+      const { goalId, keys = [] } = msg.payload as { goalId: GoalId; keys?: string[] };
+      const goal = this.goals.get(goalId);
+      if (!goal) return null;
+      const all = Object.keys(goal.scratchpad);
+      const selected = keys.length ? keys : all.filter(k => !k.startsWith('learning/') && !k.startsWith('tasks/'));
+      const scratchpad: Record<string, unknown> = {};
+      let remaining = 12000;
+      const omitted: string[] = [];
+      for (const key of selected) {
+        if (!(key in goal.scratchpad)) continue;
+        const value = goal.scratchpad[key], text = JSON.stringify(value) ?? 'null';
+        if (text.length <= Math.min(3000, remaining)) { scratchpad[key] = value; remaining -= text.length; }
+        else omitted.push(key);
+      }
+      return { title: goal.title, description: goal.description, status: goal.status, scratchpad,
+        scratchpadIndex: all.slice(0, 100), scratchpadKeyCount: all.length, omitted: omitted.slice(0, 100), omittedCount: omitted.length,
+        readMore: 'Use readGoalData({goalId,key}) for complete values; getGoal({goalId}) lists all keys.' };
     });
 
     this.on('getGoal', async (msg: AbjectMessage) => {
