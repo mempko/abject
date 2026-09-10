@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { AgentEvaluation } from './agent-evaluation.js';
 import { AGENT_EVALUATION_CASES } from '../evaluation/agent-cases.js';
 const call=(e:any,method:string,payload:unknown)=>e.handlers.get(method)({routing:{from:'user'},payload});
-test('evaluation catalog contains the declared 40 scenarios',()=>{
-  assert.equal(new Set(AGENT_EVALUATION_CASES.map(c=>c.id)).size,40);
-  assert.deepEqual(Object.fromEntries(['object','repository','mixed','recovery'].map(group=>[group,AGENT_EVALUATION_CASES.filter(c=>c.group===group).length])),{object:10,repository:15,mixed:5,recovery:10});
+test('evaluation catalog preserves the original scenarios and adds continuation cases',()=>{
+  assert.equal(new Set(AGENT_EVALUATION_CASES.map(c=>c.id)).size,46);
+  assert.deepEqual(Object.fromEntries(['object','repository','mixed','recovery'].map(group=>[group,AGENT_EVALUATION_CASES.filter(c=>c.group===group).length])),{object:10,repository:19,mixed:6,recovery:11});
+  assert.equal(AGENT_EVALUATION_CASES[39].family,'budget');
+  assert(AGENT_EVALUATION_CASES.slice(40).every(c=>c.family.startsWith('continuation')));
 });
 test('evaluation counts false success and failed setup across all memory conditions',async()=>{
   const e:any=new AgentEvaluation(); e.storageId='storage';e.changed=()=>{};
@@ -64,4 +66,35 @@ test('evaluation restart preserves partial reports without replaying unknown eff
   };
   assert.equal((await call(e,'get',{id:'interrupted'})).status,'interrupted');
   assert.equal((storage.get('evaluation:interrupted') as any).status,'interrupted');
+});
+
+test('continuation evaluation distinguishes measured reuse, proposal mismatch, and missing metrics',async()=>{
+  const e:any=new AgentEvaluation();e.storageId='storage';e.changed=()=>{};
+  e.request=async(m:any)=>{
+    const p=m.payload;
+    switch(m.routing.method){
+      case 'set':return true;
+      case 'get':return null;
+      case 'ask':return 'Version 1';
+      case 'evaluationProtocol':return {version:1,supportsConditions:['fresh']};
+      case 'prepareEvaluation':return {configurationFingerprint:'fixed',baselineMemoryFingerprint:'initial',condition:p.condition,isolated:true};
+      case 'executeEvaluation':return p.caseId==='agent-41'
+        ? {success:true,llmCalls:4,inspectionReads:2,proposalAgreement:true,repeatedInspectionReads:0}
+        : {success:true,llmCalls:-1,inspectionReads:'unknown',proposalAgreement:true};
+      case 'verifyEvaluation':return p.caseId==='agent-41'
+        ? {accepted:false,evidence:{missingHunk:'read_context'},proposalAgreement:false,repeatedInspectionReads:1}
+        : {accepted:true,evidence:{observed:'reported missing proposal'},repeatedInspectionReads:-1};
+      case 'cleanupEvaluation':return true;
+      default:throw new Error(m.routing.method);
+    }
+  };
+  const {id}=await call(e,'run',{driverId:'driver',verifierId:'verifier',options:{caseIds:['agent-41','agent-44'],conditions:['fresh']}});
+  for(let n=0;n<100 && e.runs.get(id).status==='running';n++)await new Promise(resolve=>setTimeout(resolve,1));
+  const run=await call(e,'get',{id});assert.equal(run.status,'complete');
+  assert.equal(run.report.fresh.falseSuccess,1);
+  assert.deepEqual(run.report.fresh.llmCalls,{total:4,reportedEpisodes:1,unreportedEpisodes:1});
+  assert.deepEqual(run.report.fresh.inspectionReads,{total:2,reportedEpisodes:1,unreportedEpisodes:1});
+  assert.deepEqual(run.report.fresh.repeatedInspectionReads,{total:1,reportedEpisodes:1,unreportedEpisodes:1});
+  assert.deepEqual(run.report.fresh.proposalAgreement,{matched:0,mismatched:1,unassessed:1});
+  assert.equal(run.report.frozen.llmCalls.total,null);
 });

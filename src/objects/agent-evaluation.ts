@@ -10,6 +10,7 @@ interface EvaluationOutcome {
   accepted: boolean; claimedSuccess: boolean; elapsedMs: number; error?: string;
   tokens?: number; costUsd?: number; interventions?: number; askCalls?: number;
   duplicateEffects?: number; recovered?: boolean; evidence?: unknown;
+  llmCalls?: number; inspectionReads?: number; repeatedInspectionReads?: number; proposalAgreement?: boolean;
   fixture?: unknown; decisionTrace?: unknown; patternRevisions?: unknown;
 }
 interface EvaluationRun { id: string; status: 'running' | 'complete' | 'cancelled' | 'interrupted'; seed: number; outcomes: EvaluationOutcome[]; startedAt: number; endedAt?: number; agreement?: unknown; fingerprints?: Record<string, string>; }
@@ -21,10 +22,10 @@ export class AgentEvaluation extends Abject {
   private admitting = false;
   private storageId?: AbjectId;
   constructor() {
-    super({ manifest: { name: 'AgentEvaluation', version: '1.0.0', description: 'Repeatable 40-case agent reliability and longitudinal learning evaluation. Ask for the driver and independent verifier protocols.',
+    super({ manifest: { name: 'AgentEvaluation', version: '1.0.0', description: 'Repeatable agent reliability, continuation, and longitudinal learning evaluation. Ask for the driver and independent verifier protocols.',
       interface: { id: 'abjects:agent-evaluation', name: 'AgentEvaluation', description: 'Evidence-backed agent evaluation', methods: [] }, requiredCapabilities: [], providedCapabilities: [], tags: ['system','agent','evaluation'] } });
     describeMessages(this.manifest, [
-      { name:'listCases', description:'Read the fixed 40-case acceptance catalog.', parameters:{} },
+      { name:'listCases', description:'Read the acceptance catalog, including continuation and proposal reuse scenarios.', parameters:{} },
       { name:'run', description:'Start a comparison using driverId, verifierId, optional caseIds, conditions (fresh/frozen/learning), repetitions and seed. Driver and verifier must be distinct Abjects. Returns a run id.', parameters:{ driverId:protocolText, verifierId:protocolText, options:protocolObject } },
       { name:'list', description:'List durable evaluation reports, including interrupted runs. Interrupted effects are never replayed automatically.', parameters:{} },
       { name:'get', description:'Inspect outcomes, evidence, latency, cost and uncertainty for a run.', parameters:{ id:protocolText } },
@@ -61,10 +62,10 @@ export class AgentEvaluation extends Abject {
       this.admitting = true;
       try {
       // Ask exposes constraints and semantics; the explicit receipt seals the operational agreement.
-      const agreement = await this.request(request(this.id,p.driverId,'ask',{ question:'Explain your evaluation protocol: prepareEvaluation, executeEvaluation, cleanupEvaluation. Each trial needs isolated project/workspace and memory snapshots, a configurationFingerprint for model/capability/budget, baselineMemoryFingerprint, isolated:true and condition in each fixture receipt; fresh/frozen/learning memory conditions and evidence-addressable outputs. Criteria and hidden fixtures must stay outside evaluated agent memory. Explain unsupported cases.' }));
+      const agreement = await this.request(request(this.id,p.driverId,'ask',{ question:'Explain your evaluation protocol: prepareEvaluation, executeEvaluation, cleanupEvaluation. Each trial needs isolated project/workspace and memory snapshots, a configurationFingerprint for model/capability/budget, baselineMemoryFingerprint, isolated:true and condition in each fixture receipt; fresh/frozen/learning memory conditions and evidence-addressable outputs. Criteria and hidden fixtures must stay outside evaluated agent memory. Explain unsupported cases. When instrumented, report llmCalls and inspectionReads from execution traces, including proposal and follow-up phase details in decisionTrace. Do not invent missing metrics.' }));
       const protocol = await this.request<{version:number; supportsConditions:EvaluationCondition[]}>(request(this.id,p.driverId,'evaluationProtocol',{}));
       if (protocol.version!==1 || modes.some(c=>!protocol.supportsConditions.includes(c))) throw new Error('Driver cannot honor requested comparison conditions');
-      await this.request(request(this.id,p.verifierId,'ask',{ question:'Explain verifyEvaluation: independently inspect fixture effects against evaluator-supplied acceptance criteria; return accepted, evidence, duplicateEffects and recovered. Do not trust the agent completion claim.' }));
+      await this.request(request(this.id,p.verifierId,'ask',{ question:'Explain verifyEvaluation: independently inspect fixture effects against evaluator-supplied acceptance criteria; return accepted, evidence, duplicateEffects and recovered. Do not trust the agent completion claim. For continuation cases, report proposalAgreement only when actual effects were compared with the accepted proposal, and repeatedInspectionReads for redundant reads of unchanged previously reviewed inputs. Freshness checks, necessary missing-evidence reads, and validation of the executed artifact are not redundant inspection. Omit unavailable metrics.' }));
       const run:EvaluationRun = { id:`evaluation-${crypto.randomUUID()}`, status:'running', seed:opts.seed ?? 1, outcomes:[], startedAt:Date.now(), agreement };
       await this.persist(run); this.runs.set(run.id,run);
       void this.execute(run,p.driverId,p.verifierId,selected,modes,repetitions).catch(async err=>{
@@ -96,9 +97,14 @@ export class AgentEvaluation extends Abject {
           const result=await this.request<any>(request(this.id,driver,'executeEvaluation',{trialId,caseId,intent:c.intent,fixture}),1800000);
           outcome.claimedSuccess=result.success===true;
           for (const key of ['tokens','costUsd','interventions','askCalls','decisionTrace','patternRevisions'] as const) if (result[key]!==undefined) (outcome as any)[key]=result[key];
+          for (const key of ['llmCalls','inspectionReads'] as const) if (Number.isSafeInteger(result[key]) && result[key] >= 0) outcome[key]=result[key];
           const verdict=await this.request<any>(request(this.id,verifier,'verifyEvaluation',{trialId,caseId,fixture,acceptance:c.acceptance,artifactRefs:result.artifactRefs}),120000);
           outcome.accepted=verdict.accepted===true && verdict.evidence!==undefined;
           outcome.evidence=verdict.evidence; outcome.duplicateEffects=verdict.duplicateEffects; outcome.recovered=verdict.recovered;
+          if (verdict.evidence !== undefined) {
+            if (typeof verdict.proposalAgreement === 'boolean') outcome.proposalAgreement=verdict.proposalAgreement;
+            if (Number.isSafeInteger(verdict.repeatedInspectionReads) && verdict.repeatedInspectionReads >= 0) outcome.repeatedInspectionReads=verdict.repeatedInspectionReads;
+          }
         } catch (err) { outcome.error=String(err); }
         finally {
           try { await this.request(request(this.id,driver,'cleanupEvaluation',{trialId,caseId,fixture,condition}),120000); }
@@ -128,6 +134,11 @@ export class AgentEvaluation extends Abject {
         recoveryRate:rows.some(o=>o.recovered!==undefined) ? rows.filter(o=>o.recovered===true).length/rows.filter(o=>o.recovered!==undefined).length : null,
         failuresByFamily:Object.fromEntries([...new Set(rows.map(o=>o.family))].map(family=>[family,rows.filter(o=>o.family===family&&!o.accepted).length])),
         duplicateEffects:rows.reduce((sum,o)=>sum+(o.duplicateEffects??0),0),
+        ...Object.fromEntries((['llmCalls','inspectionReads','repeatedInspectionReads'] as const).map(key=>[key,{
+          total:rows.some(o=>o[key]!==undefined) ? rows.reduce((sum,o)=>sum+(o[key]??0),0) : null,
+          reportedEpisodes:rows.filter(o=>o[key]!==undefined).length, unreportedEpisodes:rows.filter(o=>o[key]===undefined).length,
+        }])),
+        proposalAgreement:{matched:rows.filter(o=>o.proposalAgreement===true).length,mismatched:rows.filter(o=>o.proposalAgreement===false).length,unassessed:rows.filter(o=>o.proposalAgreement===undefined).length},
         note:'Repeated episodes may be correlated; inspect paired per-case outcomes and trial fingerprints before making comparative claims.'}];
     }));
   }
