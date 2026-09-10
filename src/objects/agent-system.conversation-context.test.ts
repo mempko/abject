@@ -11,6 +11,7 @@ import { Chat } from './chat.js';
 import { ChatManager } from './chat-manager.js';
 import { AgentAbject } from './agent-abject.js';
 import { TupleSpace } from './tuple-space.js';
+import { TaskReviewer } from './task-reviewer.js';
 
 class Endpoint extends Abject {
   constructor(name: string) {
@@ -36,6 +37,7 @@ class Store extends Endpoint {
   }
 }
 class Runtime extends AgentAbject { protected override async onInit(): Promise<void> {} }
+class Reviewer extends TaskReviewer { protected override async onInit(): Promise<void> {} }
 class Chats extends ChatManager { protected override async onInit(): Promise<void> {} }
 class HeadlessChat extends Chat {
   constructor() {
@@ -185,5 +187,48 @@ test('a pending chat turn freezes its handoff before later notifications and ret
       attachment: { path: '/attachments/image.png', name: 'image.png', mimeType: 'image/png', kind: 'image' } }]);
     assert.doesNotMatch(JSON.stringify(context), /base64/);
     assert.equal(context.messages[0].attachment?.path, '/attachments/image.png');
+  } finally { await f.stop(); }
+});
+
+test('reviewer retrieves the accepted proposal after source cleanup, with paging and reference isolation', async () => {
+  const f = await fixture();
+  try {
+    const proposal = { subject: 'Add conversation references', patch: 'exact patch\n'.repeat(4000) + 'FINAL_HUNK' };
+    const prior = await priorResult(f, proposal);
+    const other = await priorResult(f, { private: true }, 'other-conversation');
+    const context = captureConversation('conversation', [
+      { id: 'proposal', role: 'assistant', content: 'Proposed commits', sourceGoalId: prior },
+      { id: 'approval', role: 'user', content: 'make these commits' },
+    ]);
+    // Even a linked id cannot cross conversations.
+    context.sourceGoalIds.push(other);
+    const { goalId } = await f.client.call(f.goals.id, 'createGoal', { title: 'Execute', description: 'Make approved commits', context });
+    await f.client.call(f.goals.id, 'completeGoal', { goalId, result: 'Executed' });
+    // Keep this goal's review pending; completed source goals can be removed.
+    await f.client.call(f.goals.id, 'clearCompleted');
+    await f.restartGoals();
+    const reviewer: any = await f.add(new Reviewer());
+    reviewer.agentAbjectId = f.client.id;
+    reviewer.goalManagerId = f.goals.id;
+    reviewer.taskExtras.set('review', { kind: 'review', goalId, records: [] });
+    const act = (fields: Record<string, unknown>, taskId = 'review') => f.client.call(reviewer.id, 'agentAct', {
+      taskId, action: { action: 'read_evidence', context: true, ...fields },
+    });
+    assert.match((await act({})).data, /approval/);
+    assert.match((await act({ messageId: 'approval' })).data, /make these commits/);
+    // A supplied goalId must not override the review's owner-bound context.
+    assert.match((await act({ goalId: other, sourceGoalId: prior })).data, /selection/);
+    const page = await act({ sourceGoalId: prior, key: 'selection', length: 30000 });
+    assert.equal(page.success, true);
+    assert.doesNotMatch(page.data, /FINAL_HUNK/);
+    assert.match((await act({ sourceGoalId: prior, key: 'selection', offset: 30000, length: 30000 })).data, /FINAL_HUNK/);
+    const imported = await f.client.call(f.goals.id, 'readGoalContext', { goalId, sourceGoalId: prior, key: 'selection' });
+    assert.deepEqual(imported.value, proposal);
+    assert.equal((f.goals as any).goals.has(prior), false, 'review reads do not revive the source goal');
+    for (const fields of [{ sourceGoalId: other }, { sourceGoalId: 'unlinked' }, { sourceGoalId: prior, key: 'missing' }, { messageId: 'missing' }, { taskId: 'unrelated' }]) {
+      assert.equal((await act(fields)).success, false);
+    }
+    reviewer.taskExtras.set('standalone', { kind: 'review', records: [] });
+    assert.equal((await act({}, 'standalone')).success, false);
   } finally { await f.stop(); }
 });

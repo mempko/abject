@@ -304,11 +304,13 @@ test('semantic evaluation penalizes false corrections, missing scope and invente
   const {evaluate}=await import('../../scripts/evaluate-learning.js');
   const corpus=JSON.parse(await readFile(new URL('../../tests/fixtures/learning-judgment.json',import.meta.url),'utf8'));
   const answers=corpus.map((c:any)=>({id:c.id,verdict:c.expected.verdict,disposition:c.expected.dispositions[0],scope:c.expected.scope,patternVerdict:c.expected.patternVerdict}));
-  assert.equal(evaluate(corpus,answers).correct,10,'check evaluator plumbing, not model intelligence');
+  assert.equal(evaluate(corpus,answers).correct,corpus.length,'check evaluator plumbing, not model intelligence');
   answers.find((a:any)=>a.id==='preview-is-not-loss').disposition='archive';
   answers.find((a:any)=>a.id==='stale-tests').scope=undefined;
   answers.find((a:any)=>a.id==='injection-not-use').patternVerdict='helpful';
-  const scored=evaluate(corpus,answers); assert.equal(scored.correct,7); assert.equal(scored.unsupportedChanges,2);
+  answers.find((a:any)=>a.id==='successful-commit-wrong-hunks').verdict='supported';
+  answers.find((a:any)=>a.id==='staged-stats-not-agreement').verdict='supported';
+  const scored=evaluate(corpus,answers); assert.equal(scored.correct,corpus.length-5); assert.equal(scored.unsupportedChanges,2);
 });
 
 test('unfinished learning restores from its owner journal without the old goal index or SharedState metadata',async()=>{

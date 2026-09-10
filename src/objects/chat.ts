@@ -1284,6 +1284,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 
 When writing a goal, preserve the user's outcome and explicit constraints. Recalled project facts and command suggestions are historical context, not additional user requirements. Let the owning agent discover current scripts and capabilities and reuse applicable passing checks. Do not require an old workaround or exact validation command unless the user asked for it. When reporting completion, include the owner's verification evidence, including passing background checks and test totals.
 
+For approval of an earlier proposal, make the goal execute that accepted proposal. Carry forward its source goal/message reference and the user's amendments; the originating conversation is attached automatically. Do not turn "make these commits" or "apply that plan" into a new investigation or a request to propose alternatives. Earlier findings are inputs to this goal; only its new results establish that execution happened.
+
 You have no hands and no eyes in this system. You cannot navigate a slide, open or move a window, click anything, change anything, or look at the screen, any window, or any live state. Every real action and every real observation happens inside a **goal** you create: the goal runs on the agents, and the result it returns is your ONLY source of truth about what actually happened.
 
 So:

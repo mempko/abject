@@ -1082,7 +1082,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         }
         case 'read_evidence': {
           let text = extra.fullMaterial ?? '';
-          if (typeof action.key === 'string') {
+          if (action.context === true) {
+            // Reviews have a budgetGoalId, not an active execution goal. Keep
+            // context reads scoped here; GoalManager owns reference validation.
+            if (!extra.goalId || !this.goalManagerId) throw new Error('This review has no goal context');
+            if (action.taskId !== undefined || action.step !== undefined) throw new Error('Read context and task evidence separately');
+            text = JSON.stringify(await this.request(request(this.id, this.goalManagerId, 'readGoalContext', {
+              goalId: extra.goalId, messageId: action.messageId, sourceGoalId: action.sourceGoalId, key: action.key,
+            }))) ?? 'null';
+          } else if (typeof action.key === 'string') {
             if (!extra.goalId || !this.goalManagerId || !(action.key === 'learning/plans' || action.key === 'learning/reviewOutcome' || action.key === 'scrum/plan' || action.key.startsWith('learning/observation/') || action.key.startsWith('learning/assessment/'))) throw new Error('Key is outside the review learning evidence');
             text = JSON.stringify(await this.request(request(this.id, this.goalManagerId, 'readGoalData', { goalId: extra.goalId, key: action.key }))) ?? 'null';
           }
@@ -1484,6 +1492,8 @@ Assess each prediction and pattern against its observed episode. A failed goal c
 
 The observation-step manifest lists the complete assessment coverage. Do not infer agreement from a truncated excerpt. Read full evidence when an excerpt cannot establish the comparison, especially final verification and commit outcomes. Record supported, contradicted, or unresolved with an explanation for every listed step. The runtime may request one targeted correction for omissions.
 
+For execution of an accepted proposal, compare the observed artifact or effect with the actual accepted selection, grouping, and wording, including omissions and additions. Use read_evidence with context:true to find the reviewed goal's conversation references, then context:true with messageId or sourceGoalId and optional key to retrieve the proposal. Read only the missing evidence; do not rerun the work. Git staging exit 0, diff statistics, and git diff --check do not prove that approved hunks landed in the intended commit. Compare full staged/committed evidence with the intended selection; if that evidence is unavailable, mark the substantive claim unresolved rather than supported. Combined-tree verification does not prove every intermediate commit was verified. Assess whether repeated inspections were justified by changed inputs or missing details before crediting a reuse pattern. Record counterexamples only for patterns actually declared, and keep specific proposal contents on the goal scratchpad.
+
 Before superseding a claim, reconcile the replacement too. A promising title or excerpt is insufficient: recall by id to read its complete current content. If it is stale, update it in the same learning decision before supersession. If it is already accurate, provide replacementEvidence explaining how its current claims agree with recorded episode evidence; the runtime captures its selected version. Alternatively, confirm_entry in the same decision records this evidence-backed confirmation. Do not invent version numbers. A no_change with a reason or an explicit dispute is valid when replacement accuracy remains uncertain. Use the recorded project scope; multi-project evidence must not be assigned a guessed common scope.
 
 ## Output Format
@@ -1494,7 +1504,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 |--------|--------|---------|
 | mark_useful | ids | Credit the injected entries that genuinely influenced the work |
 | assess_prediction | taskId, step, verdict, explanation | Record supported/contradicted/unresolved semantic assessment with an evidence-grounded explanation, separately from observations |
-| read_evidence | taskId?, step?, key?, offset?, length? | Retrieve complete task evidence or a prediction/observation pair from this review |
+| read_evidence | taskId?, step?, key?, context?, messageId?, sourceGoalId?, offset?, length? | Retrieve complete task evidence or a prediction/observation pair; context:true reads the reviewed goal's linked conversation/proposal through GoalManager, separately from taskId/step |
 | recall_knowledge | query | Check what the knowledge base already holds before saving |
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
