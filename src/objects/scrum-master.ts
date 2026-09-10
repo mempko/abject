@@ -1208,8 +1208,12 @@ export class ScrumMaster extends Abject {
     const scratchpad = goal.scratchpad ?? {};
     const scratchpadSummary: Record<string, string> = {};
     for (const [k, v] of Object.entries(scratchpad)) {
+      if (k === 'context/conversation') continue; // supplied as a bounded, referenceable briefing below
       scratchpadSummary[k] = safeStringify(v, 6000);
     }
+    const conversationContext = scratchpad['context/conversation']
+      ? (await this.request<{ conversationContext?: unknown }>(request(this.id, this.goalManagerId, 'getGoalBriefing', { goalId }))).conversationContext
+      : undefined;
 
     // Auto-recall against the goal description so prior lessons land in
     // the LLM's context without needing an explicit lookup_knowledge call.
@@ -1275,6 +1279,7 @@ export class ScrumMaster extends Abject {
           assignedAgentId: (t.fields.assignedAgentId as string ?? '').slice(0, 8),
         })),
         scratchpad: scratchpadSummary,
+        ...(conversationContext ? { conversationContext } : {}),
         observations,
         planRevision: planHistory.at(-1)?.revision ?? 0,
         recentPlans: planHistory.slice(-3),

@@ -16,6 +16,7 @@ import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { canonical, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
 import { Log } from '../core/timed-log.js';
+import { CONVERSATION_CONTEXT_KEY, conversationBriefing, type ConversationContext } from '../core/conversation-context.js';
 const log = new Log('GoalManager');
 
 const GOAL_MANAGER_INTERFACE: InterfaceId = 'abjects:goal-manager';
@@ -558,6 +559,7 @@ export class GoalManager extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'REQUIRED. Free-form prose capturing the user\'s intent in detail — including explicit ordering ("do A then B then C"), constraints, examples, and what counts as success. ScrumMaster reads this at every scrum.' },
                 { name: 'parentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent goal ID for sub-goals', optional: true },
                 { name: 'operationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-owned handoff identity; retries return the same goal', optional: true },
+                { name: 'context', type: protocolObject, description: 'Conversation snapshot with stable message and source goal references', optional: true },
               ],
               returns: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -1490,9 +1492,35 @@ reviews results and either plans another round or completes/fails the goal.
     }
   }
 
+  /** Read retained evidence without re-registering or scheduling the old goal. */
+  private async readRetainedGoal(goalId: string): Promise<Goal | null> {
+    const live = this.goals.get(goalId);
+    if (live) return structuredClone(live);
+    if (!this.storageId) return null;
+    const saved = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(
+      request(this.id, this.storageId, 'get', { key: `goals:learning:${goalId}` }));
+    if (saved?.version !== 2 || saved.goalState?.id !== goalId || !saved.scratchpad) return null;
+    return { ...saved.goalState, progress: [], interjections: [], currentScrumNumber: 0, childIds: [], scratchpad: saved.scratchpad } as Goal;
+  }
+
+  private async goalContextBriefing(goal: Goal): Promise<unknown> {
+    const context = goal.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
+    if (!context) return undefined;
+    const sources = await Promise.all(context.sourceGoalIds.map(async sourceGoalId => {
+      let source = await this.readRetainedGoal(sourceGoalId).catch(() => null);
+      const sourceContext = source?.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
+      if (source && (sourceContext ? sourceContext.conversationId !== context.conversationId : source.createdBy !== goal.createdBy)) source = null;
+      const keys = Object.keys(source?.scratchpad ?? {}).filter(k => !/^(learning|routing|context)\//.test(k));
+      return { sourceGoalId, available: !!source, title: source?.title, status: source?.status,
+        keys: keys.slice(0, 100), keyCount: keys.length };
+    }));
+    return { ...conversationBriefing(context), sources };
+  }
+
   private setupHandlers(): void {
     this.setupLearningHandlers();
     describeMessages(this.manifest, [
+      { name: 'readGoalContext', description: 'Read a linked conversation message or prior goal result/data. Full values are retained in the current scratchpad with provenance. Omit selectors for the context index.', parameters: { goalId: protocolText, 'sourceGoalId?': protocolText, 'messageId?': protocolText, 'key?': protocolText } },
       { name: "recordPredictionAssessment", description: "TaskReviewer records its interpretation separately from observed execution evidence; repeated assessments are acknowledged without overwriting.", parameters: { "goalId": protocolText, "taskId": protocolText, "step": protocolNumber, "verdict": protocolText, "explanation": protocolText } },
       { name: "getGoalBriefing", description: "Bounded task briefing with selected scratchpad values and references to complete evidence.", parameters: { "goalId": protocolText, "keys?": { kind: 'array', elementType: protocolText } } },
       { name: "recordTaskEvidence", description: "Preserve a task record before terminal notification.", parameters: { "goalId": protocolText, "taskId": protocolText, "record": protocolObject } },
@@ -1680,15 +1708,27 @@ reviews results and either plans another round or completes/fails the goal.
 
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId, description, operationId } = msg.payload as {
+      const { title, parentId, description, operationId, context: suppliedContext } = msg.payload as {
         title: string;
         parentId?: GoalId;
         description: string;
         operationId?: string;
+        context?: ConversationContext;
       };
       requireNonEmpty(title, 'title');
       requireNonEmpty(description, 'description');
       if (operationId !== undefined) requireNonEmpty(operationId, 'operationId');
+      const inherited = parentId ? this.goals.get(parentId)?.scratchpad[CONVERSATION_CONTEXT_KEY] : undefined;
+      const context = structuredClone(suppliedContext ?? inherited) as ConversationContext | undefined;
+      if (context) {
+        requireNonEmpty(context.conversationId, 'context.conversationId');
+        requireNonEmpty(context.throughMessageId, 'context.throughMessageId');
+        if (!Array.isArray(context.messages) || context.messages.length > 40 ||
+            !context.messages.every(m => m && typeof m.id === 'string' && m.id && typeof m.content === 'string' && ['user', 'assistant', 'system'].includes(m.role)) ||
+            !Array.isArray(context.sourceGoalIds) || context.sourceGoalIds.length > 8 || !context.sourceGoalIds.every(id => typeof id === 'string' && id)) {
+          throw new Error('Invalid conversation context');
+        }
+      }
       return withKeyedLock(`${this.id}:create:${msg.routing.from}`, async () => {
         const prior = operationId ? [...this.goals.values()].find(g => g.createdBy === msg.routing.from && g.scratchpad['routing/creationOperation'] === operationId) : undefined;
         if (prior) {
@@ -1717,7 +1757,7 @@ reviews results and either plans another round or completes/fails the goal.
           childIds: [],
           createdAt: Date.now(),
           updatedAt: Date.now(),
-          scratchpad: operationId ? { 'routing/creationOperation': operationId } : {},
+          scratchpad: { ...(operationId ? { 'routing/creationOperation': operationId } : {}), ...(context ? { [CONVERSATION_CONTEXT_KEY]: context } : {}) },
           currentScrumNumber: 0,
           interjections: [],
         };
@@ -1743,7 +1783,7 @@ reviews results and either plans another round or completes/fails the goal.
           } catch { /* best effort */ }
         }
 
-        if (operationId) await this.persistLearning(goal);
+        if (operationId || context) await this.persistLearning(goal);
         log.info(`Goal created: "${goal.title}" (${goalId})`);
         this.changed('goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
         this.syncGoalToSharedState(goal);
@@ -2083,12 +2123,50 @@ reviews results and either plans another round or completes/fails the goal.
       return { cancelled, ...receipt };
     });
 
+    this.on('readGoalContext', async msg => {
+      const { goalId, sourceGoalId, messageId, key } = msg.payload as { goalId: string; sourceGoalId?: string; messageId?: string; key?: string };
+      const goal = this.goals.get(goalId);
+      const context = goal?.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
+      if (!goal || !context) throw new Error('Goal conversation context unavailable');
+      if (messageId && sourceGoalId || key !== undefined && !sourceGoalId) throw new Error('Select a message or a linked goal and optional key');
+      if (messageId) {
+        const message = context.messages.find(m => m.id === messageId);
+        if (!message) throw new Error('Message is not available in this goal context');
+        return structuredClone(message);
+      }
+      if (!sourceGoalId) return this.goalContextBriefing(goal);
+      if (!context.sourceGoalIds.includes(sourceGoalId)) throw new Error('Source goal is not linked to this conversation context');
+      // The first read fixes the input for the rest of this goal. Concurrent
+      // workers and retries share that same copy, including after a restart.
+      const importKey = `context/imports/${JSON.stringify([sourceGoalId, key ?? null])}`;
+      return withKeyedLock(`${this.id}:${goalId}:${importKey}`, async () => {
+        if (Object.hasOwn(goal.scratchpad, importKey)) return structuredClone(goal.scratchpad[importKey]);
+        const source = await this.readRetainedGoal(sourceGoalId);
+        if (!source) throw new Error('Referenced goal data unavailable; do not reconstruct its selection');
+        const sourceContext = source.scratchpad[CONVERSATION_CONTEXT_KEY] as ConversationContext | undefined;
+        if (sourceContext ? sourceContext.conversationId !== context.conversationId : source.createdBy !== goal.createdBy) {
+          throw new Error('Referenced goal belongs to another conversation');
+        }
+        if (key !== undefined && /^(learning|routing|context)\//.test(key)) throw new Error('Only prior task outputs are available through conversation context');
+        if (key !== undefined && !Object.hasOwn(source.scratchpad, key)) throw new Error('Referenced scratchpad value unavailable');
+        const value = key === undefined
+          ? { title: source.title, status: source.status, result: source.result, error: source.error,
+              keys: Object.keys(source.scratchpad).filter(k => !/^(learning|routing|context)\//.test(k)) }
+          : source.scratchpad[key];
+        const imported = { source: { goalId: sourceGoalId, ...(key !== undefined ? { key } : {}) }, value: structuredClone(value), scratchpadKey: importKey };
+        goal.scratchpad[importKey] = imported;
+        try { await this.persistLearning(goal); } catch (err) { delete goal.scratchpad[importKey]; throw err; }
+        this.syncScratchKeyToSharedState(goal, importKey, imported);
+        return structuredClone(imported);
+      });
+    });
+
     this.on('getGoalBriefing', async (msg: AbjectMessage) => {
       const { goalId, keys = [] } = msg.payload as { goalId: GoalId; keys?: string[] };
       const goal = this.goals.get(goalId);
       if (!goal) return null;
       const all = Object.keys(goal.scratchpad);
-      const selected = keys.length ? keys : all.filter(k => !k.startsWith('learning/') && !k.startsWith('tasks/'));
+      const selected = keys.length ? keys : all.filter(k => !k.startsWith('learning/') && !k.startsWith('tasks/') && k !== CONVERSATION_CONTEXT_KEY);
       const scratchpad: Record<string, unknown> = {};
       let remaining = 12000;
       const omitted: string[] = [];
@@ -2099,6 +2177,7 @@ reviews results and either plans another round or completes/fails the goal.
         else omitted.push(key);
       }
       return { title: goal.title, description: goal.description, status: goal.status, scratchpad,
+        conversationContext: await this.goalContextBriefing(goal),
         scratchpadIndex: all.slice(0, 100), scratchpadKeyCount: all.length, omitted: omitted.slice(0, 100), omittedCount: omitted.length,
         readMore: 'Use readGoalData({goalId,key}) for complete values; getGoal({goalId}) lists all keys.' };
     });
@@ -2106,7 +2185,7 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('getGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       const { goalId } = msg.payload as { goalId: GoalId };
-      return structuredClone(this.goals.get(goalId) ?? null);
+      return this.readRetainedGoal(goalId);
     });
 
     this.on('listGoals', async (msg: AbjectMessage) => {
@@ -2505,6 +2584,7 @@ reviews results and either plans another round or completes/fails the goal.
       const { goalId, key, value } = msg.payload as { goalId: GoalId; key: string; value: unknown };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(key, 'key');
+      if (key === CONVERSATION_CONTEXT_KEY || key.startsWith('context/imports/')) throw new Error('Conversation context is managed by GoalManager');
       if (/^learning\/(decision|assessment)\//.test(key)) throw new Error('Use the reviewer-owned learning protocol for decisions and assessments');
       const goal = this.goals.get(goalId);
       if (!goal) return { success: false };
@@ -2576,7 +2656,7 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('readGoalData', async (msg: AbjectMessage) => {
       const { goalId, key } = msg.payload as { goalId: GoalId; key?: string };
       requireNonEmpty(goalId, 'goalId');
-      const goal = this.goals.get(goalId);
+      const goal = await this.readRetainedGoal(goalId);
       if (!goal) return null;
       if (key) return goal.scratchpad[key] ?? null;
       return goal.scratchpad;

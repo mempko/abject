@@ -7,6 +7,8 @@
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { v4 as uuidv4 } from 'uuid';
+import { captureConversation, identifyMessages, type ConversationContext } from '../core/conversation-context.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { looksLikeClaim } from '../core/claims.js';
 import { request, event } from '../core/message.js';
@@ -86,6 +88,8 @@ const DEFAULT_SUGGESTIONS: SuggestionChip[] = [
 // ─── Chat-specific types ─────────────────────────────────────────────
 
 interface ConversationEntry {
+  id?: string;
+  sourceGoalId?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   /**
@@ -170,6 +174,7 @@ export class Chat extends Abject {
 
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
+  private turnContext?: ConversationContext;
   private uiPhase: UiPhase = 'closed';
 
   /** Current content width of the window (updated on resize). */
@@ -448,7 +453,7 @@ export class Chat extends Abject {
             request(this.id, this.storageId, 'get', { key: `chats:history:${this.conversationId}` })
           );
           if (Array.isArray(hist)) {
-            this.conversationHistory = hist;
+            this.conversationHistory = identifyMessages(this.conversationId, hist);
             log.info(`[Chat ${this.conversationId.slice(0, 8)}] Loaded ${hist.length} entries from history`);
           } else {
             log.info(`[Chat ${this.conversationId.slice(0, 8)}] No persisted history (key miss)`);
@@ -529,6 +534,7 @@ export class Chat extends Abject {
       // → goal action) while still letting renderHistoryBubbles replay the
       // image bubble after a close+reopen of the chat window.
       this.conversationHistory.push({
+        id: uuidv4(),
         role: 'assistant',
         content: trimmed,
         media: true,
@@ -553,7 +559,7 @@ export class Chat extends Abject {
       log.info(`[Chat] addNotification from "${sender}": "${message.trim().slice(0, 80)}"`);
       await this.removeWelcomeState();
       await this.appendBubble('system', sender || 'System', message.trim(), true);
-      this.conversationHistory.push({ role: 'assistant', content: `[${sender}]: ${message.trim()}` });
+      this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: `[${sender}]: ${message.trim()}` });
       this.schedulePersist();
       return true;
     });
@@ -956,7 +962,7 @@ export class Chat extends Abject {
           this._streamBuffer = '';
           await this.removeActivityBubble();
           await this.appendBubble('assistant', 'Agent', text, true);
-          this.conversationHistory.push({ role: 'assistant', content: text });
+          this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text });
           this.schedulePersist();
           await this.showActivityBubble();
         }
@@ -1090,7 +1096,7 @@ export class Chat extends Abject {
     await this.persistActiveGoal(undefined);
     await this.exitGoalControls();
     await this.removeActivityBubble();
-    await this.deliverLateGoalOutcome({ status, result, error });
+    await this.deliverLateGoalOutcome({ status, result, error, goalId });
   }
 
   /**
@@ -1099,7 +1105,7 @@ export class Chat extends Abject {
    * Notification window while the conversation's last word is a stale error,
    * so route it into the chat thread where the user asked.
    */
-  private async deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed' }): Promise<void> {
+  private async deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed'; goalId?: string }): Promise<void> {
     const text = outcome.status === 'completed'
       ? (typeof outcome.result === 'string' ? outcome.result : JSON.stringify(outcome.result))
       : `The goal did not complete: ${outcome.error ?? 'unknown error'}`;
@@ -1107,7 +1113,7 @@ export class Chat extends Abject {
     try {
       await this.removeWelcomeState();
       await this.appendBubble('assistant', 'Agent', text.trim(), true);
-      this.conversationHistory.push({ role: 'assistant', content: text.trim() });
+      this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text.trim(), sourceGoalId: outcome.goalId });
       this.schedulePersist();
     } catch (err) {
       log.warn(`[Chat] deliverLateGoalOutcome failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1205,8 +1211,12 @@ export class Chat extends Abject {
         await this.ensureGoalSubscription();
         // A retried handoff must reuse the goal this conversation already owns.
         if (!this._currentGoalId) {
+          // Capture the actual conversation, independently of the model's prose.
+          // Persisting it with the goal also survives closing/clearing the chat.
+          const context = this.turnContext ?? this.captureGoalContext();
           const created = await this.request<{ goalId: string }>(request(this.id, this.goalManagerId, 'createGoal', {
             title: title.slice(0, 200), description, operationId: `chat:${caller.taskId}`,
+            ...(context ? { context } : {}),
           }));
           this._currentGoalId = created.goalId;
           this.liveGoals.set(created.goalId, { title, description, status: 'active' });
@@ -1811,6 +1821,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private async persistHistory(): Promise<void> {
     if (!this.conversationId || !this.storageId) return;
+    this.conversationHistory = identifyMessages(this.conversationId, this.conversationHistory);
     try {
       await this.request(request(this.id, this.storageId, 'set', {
         key: `chats:history:${this.conversationId}`,
@@ -1883,6 +1894,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     await this.removeWelcomeState();
     await this.appendBubble('user', 'You', `${ATTACH_GLYPH} Attached **${safeName}**`, true);
     this.conversationHistory.push({
+      id: uuidv4(),
       role: 'user',
       content: `${ATTACH_GLYPH} Attached ${safeName}`,
       sender: 'You',
@@ -2001,6 +2013,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
       await this.appendBubble('user', 'You', `![${safeName}](${dataUri})`, true);
       this.conversationHistory.push({
+        id: uuidv4(),
         role: 'user',
         content: `![${safeName}](${dataUri})`,
         sender: 'You',
@@ -2020,39 +2033,43 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.runChatTask(text);
   }
 
-  /**
-   * Run one Chat OTA turn: start the task, wait for its terminal result, and
-   * report whether a goal was created during it. Resets the per-turn goal flag
-   * so the self-audit can tell a grounded reply (goal ran) from a confabulated
-   * one (no goal). `messages` is the full LLM-visible conversation for this
-   * turn; `task` stays the raw user text so the KB recall query is stable.
-   */
+  private captureGoalContext(): ConversationContext | undefined {
+    this.conversationHistory = identifyMessages(this.conversationId ?? this.id, this.conversationHistory);
+    return this.conversationHistory.length ? captureConversation(this.conversationId ?? this.id, this.conversationHistory) : undefined;
+  }
+
+  /** Run one Chat OTA turn with a fixed handoff context, including during model latency. */
   private async runTaskTurn(
     userText: string,
     messages: { role: string; content: string | ContentPart[] }[],
   ): Promise<{ success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean }> {
     this._goalCreatedThisTurn = false;
     this._streamBuffer = '';
-    const { ticketId } = await this.request<{ ticketId: string }>(
-      request(this.id, this.agentAbjectId!, 'startTask', {
-        task: userText,
-        systemPrompt: this.buildSystemPrompt(),
-        initialMessages: messages,
-        goalId: undefined,
-        config: { queueName: `chat-${this.id}` },
-      }),
-      60000,
-    );
-    this._currentTicketId = ticketId;
-    const result = await this.waitForTaskResult(ticketId, 180000);
-    this._currentTicketId = undefined;
-    return {
-      success: result.success,
-      result: result.result,
-      error: result.error,
-      maxStepsReached: result.maxStepsReached,
-      goalCreated: this._goalCreatedThisTurn,
-    };
+    this.turnContext = this.captureGoalContext();
+    try {
+      const { ticketId } = await this.request<{ ticketId: string }>(
+        request(this.id, this.agentAbjectId!, 'startTask', {
+          task: userText,
+          systemPrompt: this.buildSystemPrompt(),
+          initialMessages: messages,
+          goalId: undefined,
+          config: { queueName: `chat-${this.id}` },
+        }),
+        60000,
+      );
+      this._currentTicketId = ticketId;
+      const result = await this.waitForTaskResult(ticketId, 180000);
+      this._currentTicketId = undefined;
+      return {
+        success: result.success,
+        result: result.result,
+        error: result.error,
+        maxStepsReached: result.maxStepsReached,
+        goalCreated: this._goalCreatedThisTurn,
+      };
+    } finally {
+      this.turnContext = undefined;
+    }
   }
 
   /**
@@ -2094,7 +2111,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     // image bubble + attachment were already committed).
     if (userText) {
       await this.appendBubble('user', 'You', userText, false);
-      this.conversationHistory.push({ role: 'user', content: userText });
+      this.conversationHistory.push({ id: uuidv4(), role: 'user', content: userText });
       this.schedulePersist();
       this.maybeAutoTitle(userText);
     }
@@ -2165,7 +2182,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         const text = (result.result as string) ?? '';
         if (text) {
           await this.appendBubble('assistant', 'Agent', text, true);
-          this.conversationHistory.push({ role: 'assistant', content: text });
+          this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text });
           this.schedulePersist();
         }
       } else {
@@ -2378,7 +2395,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     const goalId = this._currentGoalId;
     if (!goalId || !this.goalManagerId) return;
     await this.appendBubble('user', 'You', note, false);
-    this.conversationHistory.push({ role: 'user', content: `[Note to the running goal] ${note}` });
+    this.conversationHistory.push({ id: uuidv4(), role: 'user', content: `[Note to the running goal] ${note}` });
     this.schedulePersist();
     const ok = await this.request<boolean>(
       request(this.id, this.goalManagerId, 'appendGoalNote', { goalId, note })

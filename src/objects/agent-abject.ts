@@ -516,7 +516,7 @@ export function planActionBatch(
 }
 
 /** Verbs the runtime serves itself; an agent would not recognize them. */
-const RUNTIME_VERBS = new Set(['replan', 'remember', 'recall', 'ask_user', 'submit_job', 'read_chunk']);
+const RUNTIME_VERBS = new Set(['replan', 'remember', 'recall', 'ask_user', 'submit_job', 'read_chunk', 'read_context']);
 
 /**
  * Choose which queued task starts next, or -1 when none may.
@@ -3084,7 +3084,7 @@ The registered object must implement these handlers to participate in the agent 
 
             // Local runtime actions use the same pre-action prediction and
             // observed-result ledger as domain actions, without another LLM call.
-            if (['replan', 'remember', 'recall', 'read_chunk'].includes(task.action.action)) {
+            if (['replan', 'remember', 'recall', 'read_chunk', 'read_context'].includes(task.action.action)) {
               await this.executeRuntimeAction(entry, agentName);
               if (cancelledExternally()) break;
               task.step++;
@@ -3856,13 +3856,13 @@ The registered object must implement these handlers to participate in the agent 
       );
       const goal = await this.request<{
         title?: string; description?: string; status?: string;
-        scratchpad?: Record<string, unknown>; scratchpadIndex?: string[]; scratchpadKeyCount?: number; omitted?: string[];
+        scratchpad?: Record<string, unknown>; scratchpadIndex?: string[]; scratchpadKeyCount?: number; omitted?: string[]; conversationContext?: unknown;
       } | null>(
         request(this.id, this.goalManagerId, 'getGoalBriefing', { goalId, keys: tasks?.find(t => t.id === dispatchTupleId)?.fields.consumes ?? [] }),
         5000,
       );
 
-      if (!tasks || tasks.length === 0) return '';
+      if (!tasks) return '';
 
       // Identify the current task (the one this agent is working on) and its contract,
       // if the caller passed a dispatchTupleId. The contract lets us focus the rendered
@@ -3894,6 +3894,7 @@ The registered object must implement these handlers to participate in the agent 
       }
 
       let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"`;
+      if (goal?.conversationContext) ctx += `\n\n## Originating Conversation\n${JSON.stringify(goal.conversationContext)}\nRead full referenced data before acting on a prior selection. Context remains available even when your task consumes other scratchpad keys.`;
       // The user's intent (goal description) — without this, the agent only
       // sees the short title and its individual task description, missing the
       // surrounding context of WHY the work is being done. Adding the
@@ -3977,6 +3978,7 @@ The registered object must implement these handlers to participate in the agent 
     };
 
     add('agent', entry.systemPrompt, true);
+    add('conversation-context', `\n\n## Conversation references\nEvery goal task can use read_context through the runtime. No direct storage access is needed.\n{"action":"read_context"} returns the originating conversation and linked result index.\n{"action":"read_context","messageId":"<message ID>"} reads a full earlier message.\n{"action":"read_context","sourceGoalId":"<linked goal ID>"} reads its result and available data keys.\n{"action":"read_context","sourceGoalId":"<linked goal ID>","key":"<data key>"} reads the full structured value and retains it in this goal's scratchpad with its source. Use those values to resolve follow-ups such as "use those"; do not replace a prior selection by searching again. If the reference is unavailable or ambiguous, report that instead of guessing. For mechanical processing, call GoalManager.readGoalContext({goalId,sourceGoalId,key}) through the bus.`, true);
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.

@@ -10,6 +10,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { AbjectId, AbjectMessage, InterfaceId, TypeId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import { captureConversation, type ContextMessage } from '../core/conversation-context.js';
+import { describeMessages, protocolText } from '../core/protocol-description.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ChatManager');
@@ -207,6 +209,15 @@ export class ChatManager extends Abject {
   }
 
   private setupHandlers(): void {
+    describeMessages(this.manifest, [{ name: 'getConversationContext', description: 'Read a saved conversation through a specific message, including source goal references. Does not open its window.', parameters: { conversationId: protocolText, throughMessageId: protocolText } }]);
+    this.on('getConversationContext', async msg => {
+      const { conversationId, throughMessageId } = msg.payload as { conversationId: string; throughMessageId: string };
+      if (!this.storageId || !this.conversations.has(conversationId)) throw new Error('Conversation unavailable');
+      if (!throughMessageId) throw new Error('A conversation boundary is required');
+      const entries = await this.request<ContextMessage[] | null>(request(this.id, this.storageId, 'get', { key: `chats:history:${conversationId}` }));
+      if (!Array.isArray(entries)) throw new Error('Conversation history unavailable');
+      return captureConversation(conversationId, entries, throughMessageId);
+    });
     this.on('getState', async () => ({
       conversationCount: this.conversations.size,
       latestConversationId: this.latestConversation()?.conversationId ?? '',
