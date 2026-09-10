@@ -2039,6 +2039,12 @@ Rules:
   private async commitDispatchScrum(otaTaskId: string, goalId: string, decision: Record<string, unknown> = {}): Promise<void> {
     if (!this.goalManagerId || !this.agentAbjectId) return;
 
+    // Dispatch runs inside this goal's still-active planning task. Cancelling
+    // obsolete work must spare that task until its acknowledgement is recorded.
+    // This exemption is only for cancellation/quiescence: the planner is not a
+    // worker tuple and must not be added to startNextScrum's retained backlog.
+    const preserveDuringDispatch = [...new Set([otaTaskId, ...((decision.keepTaskIds ?? []) as string[])])];
+
     const inflight = this.scrumInFlight.get(otaTaskId);
     if (!inflight || inflight.staged.length === 0) {
       // No staged tasks — the LLM likely got into a confused state (e.g.
@@ -2114,7 +2120,7 @@ Rules:
     // A replay must preserve work already admitted by this very plan.
     if (!replay) {
       const stopped = await this.request<{ safe: boolean; pending?: unknown; error?: string }>(
-        request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId, preserveTaskIds: decision.keepTaskIds ?? [] }), 20000,
+        request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId, preserveTaskIds: preserveDuringDispatch }), 20000,
       );
       if (!stopped.safe) throw new Error(`Replacement work awaits reconciliation: ${JSON.stringify(stopped)}`);
     }
@@ -2167,7 +2173,7 @@ Rules:
         const why = addResult.error ?? 'unknown';
         log.warn(`addTask failed for staged task "${s.description.slice(0, 60)}": ${why} — aborting the round`);
         await this.request<{ cancelled: number }>(
-          request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId }), 15000,
+          request(this.id, this.goalManagerId, 'cancelOutstandingTasks', { goalId, preserveTaskIds: preserveDuringDispatch }), 15000,
         ).catch(() => ({ cancelled: 0 }));
         inflight.staged = [];
         await this.rerunScrumAfterFailedCommit(

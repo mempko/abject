@@ -8,6 +8,7 @@ import { AgentAbject } from './agent-abject.js';
 import { ScrumMaster } from './scrum-master.js';
 import { GoalManager } from './goal-manager.js';
 import { Registry } from './registry.js';
+import { TupleSpace } from './tuple-space.js';
 
 class Endpoint extends Abject {
   constructor(name: string) {
@@ -182,6 +183,98 @@ test('a receipt persistence failure retries the receipt without dispatching work
 });
 
 class Goals extends GoalManager { protected override async onInit(): Promise<void> {} }
+
+for (const rejectSecondTask of [false, true]) {
+  test(`real Scrum dispatch preserves its executing task during ${rejectSecondTask ? 'partial admission cleanup' : 'replacement cancellation'}`, async () => {
+    const f = await fixture();
+    try {
+      const shared = new Endpoint('SharedState'), values = new Map<string, unknown>();
+      shared.on('set', msg => { const p = msg.payload as any; values.set(`${p.name}:${p.key}`, structuredClone(p.value)); return true; });
+      shared.on('delete', msg => { const p = msg.payload as any; return values.delete(`${p.name}:${p.key}`); });
+      shared.on('getAll', msg => { const prefix = `${(msg.payload as any).name}:`; return Object.fromEntries([...values].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k.slice(prefix.length), structuredClone(v)])); });
+      for (const method of ['create', 'subscribe', 'unsubscribe']) shared.on(method, () => true);
+      await f.add(shared);
+      const runtime: any = await f.add(new Runtime()), tuples = await f.add(new TupleSpace());
+      const goals: any = await f.add(new Goals()), scrum: any = await f.add(new Scrum());
+      const client = await f.add(new Endpoint('Client')), worker = await f.add(new Endpoint('Worker'));
+      Object.assign(goals, { tupleSpaceId: tuples.id, agentAbjectId: runtime.id });
+      Object.assign(scrum, { goalManagerId: goals.id, agentAbjectId: runtime.id });
+      runtime.goalManagerId = goals.id;
+      const enqueued: any[] = [];
+      // Observe worker admission without starting unrelated worker model loops.
+      runtime.on('enqueueTask', (msg: any) => { enqueued.push(msg.payload); return { queued: true }; });
+      const cancelled: string[] = [];
+      worker.on('taskCancelled', msg => {
+        const id = (msg.payload as any).taskId; cancelled.push(id);
+        runtime.taskEntries.get(id).finished = true;
+      });
+      const { goalId } = await client.call(goals.id, 'createGoal', { title: 'Replace work', description: 'Dispatch a new plan while retaining selected work' });
+      await client.call(goals.id, 'startNextScrum', { goalId });
+      const workerTask = async (description: string) => {
+        const { taskId } = await client.call(goals.id, 'addTask', { goalId, description, assignedAgentId: worker.id });
+        runtime.taskEntries.set(taskId, { agentId: worker.id, goalId, config: {}, finished: false, state: { id: taskId, phase: 'acting' } });
+        return taskId;
+      };
+      const kept = await workerTask('Keep this task'), obsolete = await workerTask('Replace this task');
+      if (rejectSecondTask) {
+        const original = goals.handlers.get('addTask'); let adds = 0;
+        goals.on('addTask', (msg: any) => ++adds === 2 ? { error: 'Fixture admission rejected' } : original(msg));
+      }
+      scrum.scrumInFlight.set('planner', { goalId, planRevision: 0, staged: [
+        { description: 'New task one', assignedAgentId: worker.id, assignedAgentName: 'Worker', dependsOnIdx: [] },
+        { description: 'New task two', assignedAgentId: worker.id, assignedAgentName: 'Worker', dependsOnIdx: [] },
+      ] });
+      const decision = { action: 'dispatch_scrum', keepTaskIds: [kept], expect: 'The coordinator accepts this dispatch', expectOutcome: 'success' };
+      runtime.think = async () => decision;
+      await scrum.request(request(scrum.id, runtime.id, 'registerAgent', {
+        name: 'ScrumMaster', config: { directExecution: true, skipFirstObservation: true, maxSteps: 3,
+          actions: ['dispatch_scrum'], terminalActions: { dispatch_scrum: { type: 'success', execute: true } } },
+      }));
+      await scrum.request(request(scrum.id, runtime.id, 'startTask', { taskId: 'planner', task: 'Dispatch the new round', goalId }));
+      await until(() => runtime.taskEntries.get('planner')?.finished);
+      const planner = runtime.taskEntries.get('planner');
+      assert.equal(planner.state.phase, 'done', planner.state.error);
+      assert.equal(planner.state.error, undefined);
+      assert.deepEqual(cancelled, [obsolete], 'replacement cancels obsolete work while preserving the planner and retained workers');
+      assert.equal(runtime.taskEntries.get(kept).state.phase, 'acting');
+      const evidence = await client.call(runtime.id, 'getTaskTranscript', { taskId: 'planner' });
+      assert.equal(evidence.predictions.find((p: any) => p.action === 'dispatch_scrum').outcome, 'success', 'dispatch acknowledgement reaches the prediction ledger');
+      const goal = await client.call(goals.id, 'getGoal', { goalId });
+      assert.deepEqual(goal.scratchpad['learning/backlog/2'], [kept], 'the planner is not a worker backlog tuple');
+      const tasks = await client.call(goals.id, 'getTasksForGoal', { goalId });
+      assert.equal(tasks.find((t: any) => t.id === obsolete).fields.status, 'superseded');
+      assert.equal(tasks.find((t: any) => t.id === kept).fields.status, 'pending');
+      if (rejectSecondTask) {
+        assert.equal(enqueued.length, 1, 'only the recovery scrum is enqueued');
+        assert.equal(enqueued[0].agentId, scrum.id);
+        assert.equal(tasks.find((t: any) => t.fields.description === 'New task one').fields.status, 'superseded');
+      } else {
+        assert.equal(enqueued.length, 2);
+        assert(enqueued.every(t => t.agentId === worker.id));
+        await runtime.request(request(runtime.id, scrum.id, 'taskResult', { ticketId: 'planner', success: true, lastAction: decision }));
+        assert.equal(enqueued.length, 2, 'replaying terminal delivery does not duplicate dispatch');
+      }
+      // A user stop must still cancel Scrum: the exemption is scoped to this dispatch.
+      runtime.taskEntries.set('another-planner', { agentId: scrum.id, goalId, config: {}, finished: false, state: { id: 'another-planner', phase: 'thinking' } });
+      await client.call(goals.id, 'stopGoal', { goalId });
+      assert.equal(runtime.taskEntries.get('another-planner').state.phase, 'error');
+      assert.equal(runtime.taskEntries.get(kept).state.phase, 'error');
+    } finally { await f.stop(); }
+  });
+}
+
+test('quiescence excludes only explicitly preserved planning tasks, not every ScrumMaster operation', async () => {
+  const f = await fixture();
+  try {
+    const runtime: any = await f.add(new Runtime()), caller = await f.add(new Endpoint('Caller'));
+    runtime.registeredAgents.set(caller.id, { agentId: caller.id, name: 'ScrumMaster' });
+    runtime.taskEntries.set('stale-planner', { agentId: caller.id, goalId: 'goal', config: {}, finished: true,
+      state: { id: 'stale-planner', phase: 'error' }, outstandingOperation: { taskId: 'stale-planner', step: 1 } });
+    assert.equal((await caller.call(runtime.id, 'awaitGoalQuiescence', { goalId: 'goal' })).safe, false);
+    assert.equal((await caller.call(runtime.id, 'awaitGoalQuiescence', { goalId: 'goal', preserveTaskIds: ['stale-planner'] })).safe, true);
+  } finally { await f.stop(); }
+});
+
 test('a retried goal-creation operation returns the same goal and remains scoped to its caller', async () => {
   const f = await fixture();
   try {

@@ -2040,7 +2040,7 @@ The registered object must implement these handlers to participate in the agent 
     this.on('awaitGoalQuiescence', async msg => {
       const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: string; preserveTaskIds?: string[] };
       const affected = () => [...this.taskEntries.values()].filter(e => (e.goalId === goalId || e.incomingGoalId === goalId || e.config.budgetGoalId === goalId)
-        && !preserveTaskIds.includes(e.state.id) && this.registeredAgents.get(e.agentId)?.name !== 'ScrumMaster');
+        && !preserveTaskIds.includes(e.state.id));
       const deadline = Date.now() + 10000;
       while (affected().some(e => !e.finished) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
       const pending = affected().filter(e => !e.finished || e.outstandingOperation).map(e => ({ taskId:e.state.id, operation:e.outstandingOperation, finished:!!e.finished }));
@@ -4589,9 +4589,10 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     entry.outstandingOperation = undefined;
     if (cancelled()) return;
     log.info(`[${agentName}] ${task.action?.action} ${result.success ? 'succeeded' : 'failed'}`);
-    const pageId = task.action?.action === 'read_chunk' && typeof task.action.id === 'string' ? task.action.id : undefined;
+    const pageId = task.action?.action === 'read_chunk' && typeof task.action.id === 'string' ? task.action.id
+      : task.action?.action === 'read_context' ? (result.data as { payloadId?: string } | undefined)?.payloadId : undefined;
     task.llmMessages.push({ role: 'user', content: message, ...(pageId && result.success && message.length > 4000 ? {
-      retainedPage: { payloadId: pageId, compact: `[Previously read page]\n${JSON.stringify(task.action)}\n${message.slice(0, 600)}\n[Page body omitted from active context; use the recorded read_chunk action to reread it.]` },
+      retainedPage: { payloadId: pageId, compact: `[Previously read page]\n${JSON.stringify(task.action)}\n${message.slice(0, 600)}\n[Page body omitted from active context; repeat the recorded read action to reread it.]` },
     } : {}) });
     this.detectAndSteerOscillation(entry, agentName);
     // The message already contains this result. Do not append it again or
@@ -4603,6 +4604,17 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private async performRuntimeAction(entry: TaskEntry): Promise<{ result: AgentActionResult; message: string }> {
     const task = entry.state;
     const action = task.action!;
+    if (action.action === 'read_context') {
+      const goalId = entry.goalId ?? entry.incomingGoalId;
+      if (!goalId || !this.goalManagerId) throw new Error('read_context requires a goal context');
+      const data = await this.request(request(this.id, this.goalManagerId, 'readGoalContext', {
+        goalId, sourceGoalId: action.sourceGoalId, messageId: action.messageId, key: action.key,
+      }));
+      const text = JSON.stringify(data);
+      const stored = this.storePayload(entry, text, 'result');
+      return { result: { success: true, data: { payloadId: stored, text: text.slice(0, 30000) } },
+        message: `[Conversation context]\n${text.slice(0, 30000)}${text.length > 30000 ? `\n[Full value retained as ${stored}; continue with read_chunk at offset 30000. Do not treat this page as the complete value.]` : ''}` };
+    }
     if (action.action === 'read_chunk') {
       const text = this.readChunk(entry, action);
       return {
