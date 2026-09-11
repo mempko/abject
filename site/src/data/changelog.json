@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.10.1",
+    "date": "2026-09-11",
+    "title": "Guarded Projects, Gentler Forgetting",
+    "summary": "Abject 0.10.1 makes the system more careful with what it touches: external projects stay inside their own root, forgetting knowledge takes two deliberate steps, and objects notice when their registrations go stale. Settings now persist globally and the site gets accurate install and why pages.",
+    "highlights": [
+      "External projects are guarded against writes outside their project root, so agents working on a registered codebase cannot stray into the rest of your disk.",
+      "Forgetting knowledge is now a two-step act: the first forget archives the entry, and a second forget deletes it for good.",
+      "Objects detect stale registrations through manifest freshness checks and re-sync themselves with the Registry automatically.",
+      "Heartbeats and taskId scoping tighten how long-running work is tracked across objects.",
+      "Global settings now persist across sessions instead of resetting each launch.",
+      "The abject.world site received an accuracy pass, new install and why pages, and OS-aware download links.",
+      "Mac build targets updated for the desktop app."
+    ],
+    "fixes": [
+      "Agent descriptions are kept in full in the ScrumMaster team roster instead of being truncated, so task routing sees each agent's real abilities."
+    ]
+  },
+  {
     "version": "0.10.0",
     "date": "2026-09-11",
     "title": "Agents that remember, learn, and know their limits",
