@@ -233,6 +233,24 @@ export class AbjectStore extends Abject {
       return this.removeSnapshot(objectId);
     });
 
+    // Registry catalog events (we subscribe in onInit). A registration whose
+    // manifest differs from the snapshot's is the snapshot falling behind.
+    const adoptManifest = (msg: AbjectMessage) => {
+      const reg = msg.payload as { id?: string; manifest?: AbjectManifest } | undefined;
+      if (!reg?.id || !reg.manifest?.interface) return;
+      const snap = this.findSnapshot(reg.id);
+      if (!snap || snap.objectId !== reg.id) return;
+      if (JSON.stringify(snap.manifest) === JSON.stringify(reg.manifest)) return;
+      snap.manifest = reg.manifest;
+      snap.savedAt = Date.now();
+      this.schedulePersist();
+      log.info(`Snapshot manifest refreshed for '${reg.manifest.name}' from the Registry`);
+    };
+    this.on('manifestUpdated', adoptManifest);
+    this.on('objectRegistered', adoptManifest);
+    this.on('objectUpdated', adoptManifest);
+    this.on('objectUnregistered', () => undefined);
+
     this.on('getDurableSnapshot', async msg => {
       if (!this.storageId) throw new Error('Storage unavailable');
       const { objectId } = msg.payload as { objectId:string };
@@ -370,6 +388,13 @@ export class AbjectStore extends Abject {
 
     // Discover workspace Registry so we can register user objects in it
     this.registryId = await this.discoverDep('Registry') ?? undefined;
+    // Follow the catalog: a manifest that changes on a live object (a source
+    // update that grew a handler, a redraft) must reach the snapshot too, or
+    // the next restart restores the old self-description.
+    if (this.registryId) {
+      try { await this.request(request(this.id, this.registryId, 'subscribe', {})); }
+      catch (err) { log.warn(`could not subscribe to Registry: ${err instanceof Error ? err.message : String(err)}`); }
+    }
 
     // Discover WidgetManager so we can tag spawned objects with our workspace
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;

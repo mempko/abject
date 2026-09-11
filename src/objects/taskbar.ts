@@ -236,6 +236,10 @@ can restore windows from the sidebar.
 
     this.on('objectRegistered', async () => this.scheduleRebuild());
     this.on('objectUnregistered', async () => this.scheduleRebuild());
+    // An object that gains show and hide through a source update becomes
+    // launchable without ever re-registering; the Registry announces the
+    // manifest swap and the list follows it.
+    this.on('manifestUpdated', async () => this.scheduleRebuild());
 
     // WidgetManager broadcasts these (with the owning app's id) whenever any
     // window opens or closes — the authoritative signal for the open highlight.

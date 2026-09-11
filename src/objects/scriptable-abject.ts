@@ -33,7 +33,23 @@ import { Log } from '../core/timed-log.js';
 const log = new Log('ScriptableAbject');
 
 /** Editable methods merged into every ScriptableAbject's interface */
+/**
+ * Description given to a manifest method that the runtime declared on the
+ * object's behalf because its source registers the handler and nothing had
+ * described it. Authoring tools look for this prefix to know which methods
+ * still need a real description.
+ */
+export const SOURCE_DECLARED_DESCRIPTION = "Registered by this object's source.";
+
 const EDITABLE_METHODS: MethodDeclaration[] = [
+  {
+    name: 'updateManifest',
+    description: 'Replace this object\'s self-description (description, icon, tags, interface methods and events) with a redrafted one. Handlers the source registers stay declared whatever the draft says, and declarations for handlers the source lacks are dropped; the accepted manifest is published to the Registry. Owner, ObjectCreator, AbjectEditor, and AbjectStore may call it.',
+    parameters: [
+      { name: 'manifest', type: { kind: 'object' as const, properties: {} }, description: 'The new manifest ({ name, description, version, icon?, interface: { id, name, description, methods, events? }, requiredCapabilities?, providedCapabilities?, tags? })' },
+    ],
+    returns: { kind: 'object' as const, properties: {} },
+  },
   {
     name: 'getSource',
     description: 'Get the current handler source code',
@@ -420,6 +436,42 @@ export class ScriptableAbject extends Abject {
       return { success: true, resolvedDeps: resolved, missingDeps: [], error: '' };
     });
 
+    this.on('updateManifest', async (msg: AbjectMessage) => {
+      const { manifest: draft } = msg.payload as { manifest?: Partial<AbjectManifest> };
+      if (!draft || typeof draft !== 'object' || !draft.interface || !Array.isArray(draft.interface.methods)) {
+        return { success: false, error: 'updateManifest requires { manifest } with an interface that has a methods array' };
+      }
+      if (!(await this.senderMayEdit(msg.routing.from))) {
+        return { success: false, error: `Only the owner (${this._owner || 'none'}), ObjectCreator, AbjectEditor, or AbjectStore may update the manifest (sender: ${msg.routing.from})` };
+      }
+      const live = this.manifest;
+      if (typeof draft.description === 'string' && draft.description.trim()) live.description = draft.description;
+      if (typeof draft.version === 'string' && draft.version.trim()) live.version = draft.version;
+      if (typeof draft.icon === 'string') live.icon = draft.icon;
+      if (Array.isArray(draft.tags)) {
+        const tags = draft.tags.filter((t): t is string => typeof t === 'string');
+        if (!tags.includes('scriptable')) tags.push('scriptable');
+        live.tags = tags;
+      }
+      if (Array.isArray(draft.requiredCapabilities)) live.requiredCapabilities = draft.requiredCapabilities;
+      if (Array.isArray(draft.providedCapabilities)) live.providedCapabilities = draft.providedCapabilities;
+      const iface = live.interface;
+      if (typeof draft.interface.description === 'string') iface.description = draft.interface.description;
+      // The drafted methods, then the editable methods every scriptable object
+      // has, without duplicates; the source then has the last word on which
+      // handlers actually exist.
+      const drafted = draft.interface.methods.filter((m): m is MethodDeclaration => !!m && typeof m.name === 'string' && typeof m.description === 'string')
+        .map(m => ({ ...m, parameters: Array.isArray(m.parameters) ? m.parameters : [] }));
+      const seen = new Set(drafted.map(m => m.name));
+      iface.methods = [...drafted, ...EDITABLE_METHODS.filter(m => !seen.has(m.name))];
+      if (Array.isArray(draft.interface.events)) iface.events = draft.interface.events;
+      const { added, removed } = this.reconcileManifestWithSource(new Set(this._userMethods));
+      this.publishManifest();
+      log.info(`[${this.manifest.name}] manifest replaced by ${msg.routing.from.slice(0, 8)}: ${iface.methods.length} methods` +
+        `${added.length > 0 ? `; source added ${added.join(', ')}` : ''}${removed.length > 0 ? `; dropped ${removed.join(', ')}` : ''}`);
+      return { success: true, methods: iface.methods.map(m => m.name), sourceDeclared: added, dropped: removed };
+    });
+
     this.on('updateSource', async (msg: AbjectMessage) => {
       const { source, expectedSource } = msg.payload as { source: string; expectedSource?: string };
       if (msg.routing.from !== this._owner) {
@@ -494,6 +546,19 @@ export class ScriptableAbject extends Abject {
     });
 
     this.installDefaultCloseHandler();
+  }
+
+  /**
+   * Whether a sender may change this object's source or manifest: its owner,
+   * or one of the authoring objects, whose ids change every session so the
+   * recorded owner may be stale.
+   */
+  private async senderMayEdit(from: AbjectId): Promise<boolean> {
+    if (from === this._owner) return true;
+    const [creatorId, editorId, storeId] = await Promise.all([
+      this.discoverDep('ObjectCreator'), this.discoverDep('AbjectEditor'), this.discoverDep('AbjectStore'),
+    ]);
+    return from === creatorId || from === editorId || from === storeId;
   }
 
   private installDefaultCloseHandler(): void {
@@ -807,6 +872,57 @@ export class ScriptableAbject extends Abject {
     ticket.resolve();
   }
 
+  /**
+   * Make the manifest say what the source does.
+   *
+   * The manifest is how every other object, the desktop included, learns what
+   * this one can do: the Taskbar lists an object only when its manifest
+   * declares show and hide, the Registry's ask answers from it, and a
+   * generated proxy is built against it. Source is edited far more often than
+   * manifests are redrafted, so a handler the source registers but the
+   * manifest omits is invisible to all of them; that is how an object gained
+   * a window and never appeared in the taskbar. Declare every source handler
+   * the manifest lacks (a placeholder description; a redrafted manifest
+   * replaces it), and drop declarations for handlers the source no longer
+   * registers, so no caller is promised a method that would fail.
+   *
+   * Returns what changed, for the caller to report.
+   */
+  private reconcileManifestWithSource(previousUserMethods: ReadonlySet<string>): { added: string[]; removed: string[] } {
+    const methods = this.manifest.interface.methods;
+    const declared = new Set(methods.map(m => m.name));
+    const added: string[] = [];
+    for (const name of this._userMethods) {
+      if (declared.has(name)) continue;
+      methods.push({
+        name,
+        description: `${SOURCE_DECLARED_DESCRIPTION} Parameters are not declared here; ask the object how to call it.`,
+        parameters: [],
+      });
+      added.push(name);
+    }
+    const removed: string[] = [];
+    for (const name of previousUserMethods) {
+      if (this._userMethods.has(name) || !declared.has(name)) continue;
+      const at = methods.findIndex(m => m.name === name);
+      if (at >= 0) { methods.splice(at, 1); removed.push(name); }
+    }
+    if (added.length > 0 || removed.length > 0) {
+      log.info(`[${this.manifest.name}] manifest reconciled with source: ` +
+        `${added.length > 0 ? `added ${added.join(', ')}` : ''}${added.length > 0 && removed.length > 0 ? '; ' : ''}${removed.length > 0 ? `removed ${removed.join(', ')}` : ''}`);
+    }
+    return { added, removed };
+  }
+
+  /** Push the reconciled manifest to the Registry that holds this object, if any. */
+  private publishManifest(): void {
+    void (async () => {
+      const registryId = await this.resolveRegistryId();
+      if (!registryId) return;
+      await this.request(request(this.id, registryId, 'updateManifest', { objectId: this.id, manifest: this.manifest }), 10_000);
+    })().catch(err => log.warn(`[${this.manifest.name}] manifest update not accepted by Registry: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   private compileAndInstall(source: string): void {
     // Build the this-proxy with safe helpers
     const handlerThis = this.buildHandlerProxy();
@@ -853,13 +969,16 @@ export class ScriptableAbject extends Abject {
         this._userProps.add(key);
       }
     }
+    // Before registration, so the Registry sees the reconciled manifest.
+    this.reconcileManifestWithSource(new Set());
   }
 
   /**
    * Apply new source at runtime. Returns success/error.
+   * The reply also names the manifest methods added or removed by the swap.
    * On failure, old handlers remain — the object never enters a broken state.
    */
-  applySource(source: string, prepared?: Record<string, MessageHandlerFn>): { success: boolean; error?: string; errorLine?: number } {
+  applySource(source: string, prepared?: Record<string, MessageHandlerFn>): { success: boolean; error?: string; errorLine?: number; manifestMethodsAdded?: string[]; manifestMethodsRemoved?: string[] } {
     // Build a fresh this-proxy and compile in sandbox
     const handlerThis = this.buildHandlerProxy();
     let handlerMap: Record<string, MessageHandlerFn>;
@@ -883,6 +1002,7 @@ export class ScriptableAbject extends Abject {
     }
 
     this.sourceHandlers = handlerMap;
+    const previousUserMethods = new Set(this._userMethods);
     // Remove old user handlers and properties
     for (const method of this._userMethods) {
       this.off(method);
@@ -934,6 +1054,9 @@ export class ScriptableAbject extends Abject {
     this._source = source;
     this.installDefaultCloseHandler();
 
+    const { added, removed } = this.reconcileManifestWithSource(previousUserMethods);
+    if (added.length > 0 || removed.length > 0) this.publishManifest();
+
     // Emit sourceUpdated event so Negotiator can regenerate affected proxies
     const newMethods = Array.from(this._userMethods);
     this.send(
@@ -945,6 +1068,6 @@ export class ScriptableAbject extends Abject {
       )
     );
 
-    return { success: true };
+    return { success: true, ...(added.length > 0 ? { manifestMethodsAdded: added } : {}), ...(removed.length > 0 ? { manifestMethodsRemoved: removed } : {}) };
   }
 }

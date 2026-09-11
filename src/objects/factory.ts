@@ -616,8 +616,21 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       }
       this.workerSpawned.set(objectId, constructorName);
 
-      // Use real manifest from the existing registration if available, otherwise build a placeholder
-      const manifest = existingReg?.manifest ?? { name: constructorName, description: '', version: '1.0.0',
+      // Register the manifest the live object actually has, not the one the
+      // snapshot carried in: a scriptable object declares every handler its
+      // source registers as it is constructed, so a snapshot whose manifest
+      // fell behind its code would otherwise re-register stale every boot,
+      // and the desktop (which reads the Registry) would never see the
+      // window the code grew. Fall back to the snapshot's, then a placeholder.
+      let manifest: AbjectManifest | undefined;
+      try {
+        const described = await this.request<{ manifest?: AbjectManifest }>(
+          request(this.id, objectId, 'describe', {}), 10000);
+        if (described?.manifest?.interface) manifest = described.manifest;
+      } catch (err) {
+        log.warn(`respawn: could not read live manifest of ${objectId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      manifest ??= existingReg?.manifest ?? { name: constructorName, description: '', version: '1.0.0',
         interface: { id: 'abjects:unknown', name: constructorName, description: '', methods: [] }, requiredCapabilities: [] as never[], tags: ['system'] };
       const now = Date.now();
       const status = {
@@ -990,8 +1003,22 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     this.workerSpawned.set(objectId, 'ScriptableAbject');
 
-    // Compute the merged manifest (with introspect + editable methods) for registry
-    const realManifest = mergeScriptableManifest(req.manifest);
+    // Register the manifest the live object has, not the one the request
+    // carried in. A scriptable object declares every handler its source
+    // registers as it is constructed, so a request (a store restore, in
+    // particular) whose manifest fell behind its source would otherwise
+    // register stale, and the desktop, which reads the Registry, would never
+    // see the window the code grew. The merged request manifest is the
+    // fallback when the object cannot be asked.
+    let realManifest: AbjectManifest | undefined;
+    try {
+      const described = await this.request<{ manifest?: AbjectManifest }>(
+        request(this.id, objectId, 'describe', {}), 10000);
+      if (described?.manifest?.interface) realManifest = described.manifest;
+    } catch (err) {
+      log.warn(`spawn: could not read live manifest of ${req.manifest.name} (${objectId.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    realManifest ??= mergeScriptableManifest(req.manifest);
 
     // Register with registry including source and owner (for AbjectStore)
     const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);

@@ -25,7 +25,7 @@ import { Abject, DEFERRED_REPLY, isTemporaryAskResponse } from '../core/abject.j
 import { Capabilities } from '../core/capability.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
-import { ScriptableAbject } from './scriptable-abject.js';
+import { ScriptableAbject, SOURCE_DECLARED_DESCRIPTION } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { ContentPart } from '../llm/provider.js';
 import { bulkAwareResult, type AgentAction, type AgentActionResult } from './agent-abject.js';
@@ -1970,6 +1970,162 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * LLM emits a no-payload action so it doesn't have to inline kilobytes of
    * source or supply `owner` / `parentId` (which it can't know).
    */
+  /**
+   * Bring a live object's manifest into line with the code just deployed.
+   *
+   * A scriptable object declares every handler its source registers, but a
+   * handler it had to declare itself carries only a placeholder. This looks
+   * the live manifest up, takes the agent's redrafted declarations for those
+   * methods when it made any, asks an LLM to describe the rest from their
+   * source, and hands the object the finished manifest through its own
+   * updateManifest, which publishes to the Registry. The persisted snapshot
+   * then carries the same manifest. Returns a note for the deploy summary;
+   * every failure degrades to the placeholder, never to a refused deploy.
+   */
+  private async syncManifestWithLiveObject(state: LoopState, objectId: AbjectId, source: string | undefined): Promise<string> {
+    if (!this.registryId) return '';
+    let live: AbjectManifest | undefined;
+    try {
+      const reg = await this.sendRequest<{ manifest: AbjectManifest } | null>(this.registryId, 'lookup', { objectId }, 10000);
+      live = reg?.manifest;
+    } catch (err) {
+      log.warn(`manifest sync: Registry.lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!live) return '';
+
+    const isPlaceholder = (m: MethodDeclaration) => (m.description ?? '').startsWith(SOURCE_DECLARED_DESCRIPTION);
+    const placeholders = (live.interface.methods ?? []).filter(isPlaceholder).map(m => m.name);
+    const drafted = state.draftManifest;
+    const draftedByName = new Map((drafted?.interface.methods ?? []).map(m => [m.name, m] as const));
+    // Nothing to do: no placeholders, and no redraft the object has not seen.
+    const draftDiffers = !!drafted && JSON.stringify(drafted.interface.methods.map(m => [m.name, m.description])) !==
+      JSON.stringify((live.interface.methods ?? []).filter(m => draftedByName.has(m.name)).map(m => [m.name, m.description]));
+    if (placeholders.length === 0 && !draftDiffers) return '';
+
+    const fromDraft = placeholders.filter(n => draftedByName.has(n) && !isPlaceholder(draftedByName.get(n)!));
+    const toDescribe = placeholders.filter(n => !fromDraft.includes(n));
+    const described = toDescribe.length > 0 && source ? await this.describeHandlers(source, toDescribe, live) : [];
+    const describedByName = new Map(described.map(m => [m.name, m] as const));
+
+    const base = drafted ?? live;
+    const merged: AbjectManifest = {
+      ...base,
+      interface: {
+        ...base.interface,
+        methods: [
+          ...(base.interface.methods ?? []).map(m => describedByName.get(m.name) ?? (isPlaceholder(m) ? draftedByName.get(m.name) ?? m : m)),
+          // Placeholders the draft never mentioned, described or not.
+          ...placeholders.filter(n => !(base.interface.methods ?? []).some(m => m.name === n))
+            .map(n => describedByName.get(n) ?? (live!.interface.methods ?? []).find(m => m.name === n)!),
+        ],
+      },
+    };
+
+    try {
+      const res = await this.sendRequest<{ success: boolean; error?: string }>(objectId, 'updateManifest', { manifest: merged }, 15000);
+      if (res && res.success === false) throw new Error(res.error ?? 'updateManifest returned success=false');
+    } catch (err) {
+      // The object refused or is not scriptable: at least the Registry learns.
+      log.warn(`manifest sync: object.updateManifest failed, updating Registry directly: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await this.sendRequest<unknown>(this.registryId, 'updateManifest', { objectId, manifest: merged }, 15000);
+      } catch (err2) {
+        log.warn(`manifest sync: Registry.updateManifest failed: ${err2 instanceof Error ? err2.message : String(err2)}`);
+        return placeholders.length > 0 ? ` Manifest declares ${placeholders.join(', ')} with placeholder descriptions (the object would not accept a redraft).` : '';
+      }
+    }
+    state.draftManifest = merged;
+
+    const still = toDescribe.filter(n => !describedByName.has(n));
+    const parts: string[] = [];
+    if (fromDraft.length > 0) parts.push(`declared ${fromDraft.join(', ')} from your draft`);
+    if (described.length > 0) parts.push(`described ${described.map(m => m.name).join(', ')} from the source`);
+    if (still.length > 0) parts.push(`${still.join(', ')} kept placeholder descriptions (draft_manifest to describe them)`);
+    if (parts.length === 0 && draftDiffers) parts.push('applied your redrafted manifest');
+    return parts.length > 0 ? ` Manifest: ${parts.join('; ')}.` : '';
+  }
+
+  /**
+   * Ask an LLM to declare the named handlers from their source: description,
+   * parameters, return. Returns only well-formed declarations for names it
+   * was asked about; anything else is dropped so a wrong guess never lands.
+   */
+  private async describeHandlers(source: string, names: string[], manifest: AbjectManifest): Promise<MethodDeclaration[]> {
+    if (!this.llmId || names.length === 0) return [];
+    const sys =
+      'You document message handlers of an object in a message-passing system. ' +
+      'Given the object\'s manifest and its handler source, produce a JSON array of method declarations for EXACTLY the requested handler names. ' +
+      'Each declaration: { "name": string, "description": string (one or two sentences: what it does and when to call it), ' +
+      '"parameters": [{ "name": string, "type": { "kind": "primitive", "primitive": "string"|"number"|"boolean" } | { "kind": "object", "properties": {} } | { "kind": "array", "elementType": { "kind": "primitive", "primitive": "string" } }, "description": string, "optional"?: boolean }], ' +
+      '"returns"?: { "kind": "object", "properties": {} } }. ' +
+      'Parameters are the fields the handler reads from msg.payload; when it reads none, use an empty array. Output only the JSON array.';
+    const user =
+      `Object: ${manifest.name} — ${manifest.description}
+` +
+      `Describe these handlers: ${names.join(', ')}
+
+` +
+      `Handler source:
+\`\`\`javascript
+${source}
+\`\`\``;
+    let raw: string;
+    try {
+      const resp = await this.sendRequest<{ content: string }>(
+        this.llmId, 'complete',
+        { messages: [systemMessage(sys), userMessage(user)] as LLMMessage[], options: { tier: 'balanced', maxTokens: 2048 } },
+        90000,
+      );
+      raw = (resp.content ?? '').trim();
+    } catch (err) {
+      log.warn(`describeHandlers: LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+    const text = fenced ? fenced[1] : raw;
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { log.warn('describeHandlers: unparseable LLM output'); return []; }
+    if (!Array.isArray(parsed)) return [];
+    const wanted = new Set(names);
+    return parsed.filter((m): m is MethodDeclaration =>
+      !!m && typeof m === 'object'
+      && typeof (m as MethodDeclaration).name === 'string' && wanted.has((m as MethodDeclaration).name)
+      && typeof (m as MethodDeclaration).description === 'string' && (m as MethodDeclaration).description.trim().length > 0,
+    ).map(m => ({ ...m, parameters: Array.isArray(m.parameters) ? m.parameters : [] }));
+  }
+
+  /**
+   * deploy_update with a redrafted manifest and no source change: the live
+   * object takes the manifest (and publishes it), then the snapshot is
+   * rewritten with the current live source so the change survives a restart.
+   */
+  private async deployManifestOnly(state: LoopState, targetId: AbjectId, targetLabel?: string): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    let source = state.targetSource;
+    if (!source && this.registryId) {
+      try {
+        const reg = await this.sendRequest<{ source?: string } | null>(this.registryId, 'lookup', { objectId: targetId }, 10000);
+        source = reg?.source;
+      } catch { /* persisted below only when known */ }
+    }
+    const note = await this.syncManifestWithLiveObject(state, targetId, source);
+    if (!state.draftManifest) return { ok: false, summary: 'deploy_update: manifest not applied', error: 'the object did not accept the manifest' };
+    if (this.abjectStoreId && source) {
+      try {
+        await this.sendRequest<unknown>(this.abjectStoreId, 'save', { objectId: targetId, manifest: state.draftManifest, source, owner: this.id }, 15000);
+      } catch (err) {
+        return { ok: false, summary: 'deploy_update: manifest applied but not saved', error: `AbjectStore.save failed: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    state.targetObjectId = targetId;
+    if (targetLabel && !state.targetName) state.targetName = targetLabel;
+    const count = state.draftManifest.interface.methods.length;
+    return {
+      ok: true,
+      summary: `deploy_update: ${targetLabel ?? targetId} manifest updated (${count} method${count === 1 ? '' : 's'}, source unchanged)${note}`,
+      data: { objectId: targetId, next: 'The object, the Registry, and the snapshot carry the new manifest. Verify with describe or ask, then done.' },
+    };
+  }
+
   private async opDeploySpawn(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.factoryId) return { ok: false, summary: 'deploy_spawn: Factory unavailable', error: 'Factory not resolved' };
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
@@ -2000,6 +2156,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     state.spawnedObjectId = result.objectId;
+    // The runtime declared any handler the drafted manifest missed; give
+    // those real descriptions before the snapshot is written.
+    const spawnManifestNote = await this.syncManifestWithLiveObject(state, result.objectId, state.draftSource);
 
     // Persist to AbjectStore so the spawned object survives a restart.
     // Use request+catch so save failures show up in logs instead of vanishing.
@@ -2047,7 +2206,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${collisionNote}`,
+      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${collisionNote}${spawnManifestNote}`,
       data: {
         objectId: result.objectId,
         manifest: state.draftManifest,
@@ -2075,10 +2234,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private async opDeployUpdate(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.registryId) return { ok: false, summary: 'deploy_update: Registry unavailable', error: 'Registry not resolved' };
-    if (!state.draftSource) return { ok: false, summary: 'deploy_update: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
+    // A redrafted manifest with the source untouched is a deploy too: it
+    // reaches the live object, the Registry, and the snapshot, the same three
+    // places a source change does.
+    const manifestOnly = !state.draftSource && !!state.draftManifest;
+    if (!state.draftSource && !manifestOnly) return { ok: false, summary: 'deploy_update: nothing drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first; a manifest-only change needs draft_manifest first' };
 
-    const refusal = this.gateDeploy(state, 'deploy_update');
-    if (refusal) return refusal;
+    if (!manifestOnly) {
+      const refusal = this.gateDeploy(state, 'deploy_update');
+      if (refusal) return refusal;
+    }
 
     // Resolve target: explicit objectId / targetName from action wins, else
     // fall back to the kind:modify state target.
@@ -2103,21 +2268,24 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { ok: false, summary: 'deploy_update: no target', error: 'pass {objectId} or {targetName} in the action payload, or use deploy_spawn for new objects' };
     }
 
+    if (manifestOnly) return this.deployManifestOnly(state, targetId, targetLabel);
+
     // Everything from here is one write to one object. Two modify loops
     // running at once would otherwise interleave their four steps and leave
     // the live object, the Registry's cache, and the store each holding a
     // different version of the source.
     // Captured before the closure: the guard above proved it is a string, and
     // a later staging op must not change what this deploy writes.
-    const draftSource = state.draftSource;
+    const draftSource = state.draftSource!; // manifest-only deploys returned above
     const previousLive = state.targetSource;
     return withKeyedLock(`abject-source:${targetId}`, async () => {
       const conflict = await this.detectSourceConflict(state, targetId!);
       if (conflict) return conflict;
+      let manifestNote = '';
 
     // 1. Hot-swap on the live ScriptableAbject.
     try {
-      const updateRes = await this.sendRequest<{ success: boolean; error?: string }>(
+      const updateRes = await this.sendRequest<{ success: boolean; error?: string; manifestMethodsAdded?: string[]; manifestMethodsRemoved?: string[] }>(
         targetId,
         'updateSource',
         { source: draftSource, expectedSource: state.targetSource },
@@ -2148,16 +2316,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     // 3. If we have a manifest draft, update Registry's cached manifest too.
-    if (state.draftManifest) {
-      try {
-        await this.sendRequest<unknown>(this.registryId!, 'updateManifest', {
-          objectId: targetId,
-          manifest: state.draftManifest,
-        }, 30000);
-      } catch (err) {
-        return { ok: false, summary: 'Live source changed; manifest reconciliation failed', error: String(err) };
-      }
-    }
+    // 3. The manifest follows the code. The object declared any new handlers
+    //    with placeholders the moment the source landed; now describe them
+    //    properly (from the agent's redrafted manifest when it made one, else
+    //    by reading the handlers) and hand the object its finished manifest.
+    manifestNote += await this.syncManifestWithLiveObject(state, targetId, draftSource);
 
     // 4. Persist to AbjectStore so the modification survives a restart.
     //    Without this step the live update + Registry caches are in-memory
@@ -2220,7 +2383,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: `deploy_update: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)`,
+      summary: `deploy_update: ${targetLabel ?? targetId} updated (${draftSource.split('\n').length} lines)${manifestNote}`,
       data: {
         objectId: targetId,
         semanticReview: reviewNote,
@@ -3975,7 +4138,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
-- \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
+- \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here. A redrafted manifest with no source change ships the same way: draft_manifest, then deploy_update. Calling Registry.updateManifest yourself updates only the Registry's copy; the object and its snapshot keep the old one and it is lost on restart.
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
 - \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
