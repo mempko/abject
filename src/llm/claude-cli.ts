@@ -235,6 +235,7 @@ const DEFAULT_MAX_SESSIONS = 2;
 export type CliTransport = 'stream-json' | 'terminal';
 
 export class ClaudeCliProvider extends BaseLLMProvider {
+  executionContext() { return { transport: this.transport, nativeAccess: 'none' as const }; }
   /**
    * Top-level provider name; lives alongside `anthropic` etc. The two
    * transports register as separate providers so tier routing can pick

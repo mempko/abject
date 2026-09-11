@@ -5,25 +5,20 @@
  * Why: lets the user reuse their ChatGPT subscription (via `codex login`)
  * instead of providing an OpenAI API key.
  *
- * Mode: warm interactive sessions. The CLI runs its normal terminal session
- * inside a pseudo-terminal and is reused across requests, with `/new`
- * between them to drop the previous conversation. This removes the ~1.1s
- * process boot that the previous per-request `codex exec` paid every time.
- *
- * Because the session is a terminal UI, the reply is read from the rendered
- * screen. See `pty-session.ts` for what that costs in fidelity, and
- * `pty-dialects.ts` for the patterns that recognise this particular UI.
+ * Mode: structured one-shot sessions. Both saved transport choices use this
+ * path so provider-native activity is inspectable and the same permissions apply.
+ * The temporary workspace contains only request attachments.
  *
  * Reports under provider name `'codex-cli'` - its own first-class entry in
  * the provider registry, picked via tier routing in GlobalSettings.
  */
 
+import type { PromptGuidance } from './execution-context.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { flattenConversation, hasImages, runCliIdle } from './cli-process.js';
-import { PtySessionPool } from './pty-session.js';
-import { codexDialect } from './pty-dialects.js';
+import { flattenConversation, runCliIdle } from './cli-process.js';
+import { codexExecutionArgs, checkCodexEvent } from './codex-execution.js';
 import {
   discoverModels,
   fetchJsonWithTimeout,
@@ -179,9 +174,6 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
  */
 const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
 
-/** Warm sessions per model; see the note in claude-cli.ts. */
-const DEFAULT_MAX_SESSIONS = 2;
-
 export class CodexCliProvider extends BaseLLMProvider {
   /** See the note on the same field in ClaudeCliProvider. */
   readonly name: string;
@@ -190,14 +182,14 @@ export class CodexCliProvider extends BaseLLMProvider {
 
   private readonly bin: string;
   private readonly idleTimeoutMs: number;
-  private readonly maxSessions: number;
 
+  executionContext() { return { transport: 'stream-json', nativeAccess: 'restricted' as const }; }
   /**
-   * One pool per resolved model, created on first use. Lazy because
-   * `LLMObject` constructs providers purely to read their manifests;
-   * constructing one must never start a process.
+   * Codex takes its guidance as `developer_instructions` on the command line
+   * (see codex-execution.ts), not as prompt text, so there is nothing to
+   * prepend or append; the version still names what the model was told.
    */
-  private readonly pools = new Map<string, PtySessionPool>();
+  promptGuidance(): PromptGuidance { return { version: 'codex-developer-instructions-v1' }; }
 
   constructor(config: {
     bin?: string;
@@ -210,7 +202,6 @@ export class CodexCliProvider extends BaseLLMProvider {
     this.name = this.transport === 'terminal' ? 'codex-cli-pty' : 'codex-cli';
     this.bin = config.bin ?? 'codex';
     this.idleTimeoutMs = config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-    this.maxSessions = config.maxSessions ?? DEFAULT_MAX_SESSIONS;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -225,24 +216,8 @@ export class CodexCliProvider extends BaseLLMProvider {
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const model = this.resolveModel(options);
 
-    // Images always take the one-shot path, whatever the configured
-    // transport: a pty carries keystrokes, not pictures.
-    if (this.transport === 'stream-json' || hasImages(messages)) {
-      return this.completeOneShot(messages, model);
-    }
-
-    const prompt = buildPrompt(messages);
-
-    return this.withRetries(async () => {
-      const content = await this.poolFor(model).ask(prompt);
-      return {
-        content,
-        finishReason: 'stop' as const,
-        // A terminal UI reports no per-turn token counts, so requests
-        // routed here contribute no usage figures to the ledger.
-        usage: undefined,
-      };
-    }, { isRetryable: cliIsRetryable, label: `${this.name}.complete` });
+    // The terminal alias uses the same enforceable, inspectable transport.
+    return this.completeOneShot(messages, model);
   }
 
   /**
@@ -277,23 +252,15 @@ export class CodexCliProvider extends BaseLLMProvider {
     const terminal = this.transport === 'terminal';
     return {
       id: this.name,
-      label: terminal ? 'Codex CLI (warm terminal session)' : 'Codex CLI',
+      label: terminal ? 'Codex CLI (legacy terminal setting)' : 'Codex CLI',
       storageSuffix: terminal ? 'codexCliPty' : 'codexCli',
       credentialMode: 'cli',
       cli: {
         binary: 'codex',
-        installHint: terminal
-          ? 'Reuses one warm `codex` session per model. Reports no token usage, reads '
-            + 'replies off the rendered screen, and runs in the working directory with '
-            + 'codex\'s own tools available, so a request can see the current project. '
-            + 'Install Codex: npm install -g @openai/codex'
-          : 'One `codex exec` per request, reading structured output: reports token usage '
-            + 'and returns the reply verbatim. Install Codex: npm install -g @openai/codex',
+        installHint: 'Runs structured Codex requests with restricted native access and Abject message guidance. '
+          + 'Install Codex: npm install -g @openai/codex',
       },
-      // vision: true because image requests take the one-shot `codex exec
-      // -i` transport; the warm terminal session cannot carry an image and
-      // complete() routes around it.
-      //
+      // Image attachments are staged in the per-request workspace.
       // Codex's accepted model names depend on auth mode. With a ChatGPT
       // account login (`codex login`, the no-API-key path) only the
       // `gpt-5-codex*` variants are accepted - `gpt-5` / `gpt-5-mini` are
@@ -341,7 +308,7 @@ export class CodexCliProvider extends BaseLLMProvider {
         }
       }
 
-      const argv = ['exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only'];
+      const argv = codexExecutionArgs();
       for (const file of paths) argv.push('-i', file);
       if (!shouldOmitModelFlag(model)) argv.push('--model', model);
       argv.push('-');   // prompt arrives on stdin, avoiding argv length limits
@@ -349,7 +316,7 @@ export class CodexCliProvider extends BaseLLMProvider {
       const prompt = buildPrompt(messages);
       return await this.withRetries(async () => {
         const { code, stdout, stderr } = await runCliIdle(
-          this.bin, argv, { idleTimeoutMs: this.idleTimeoutMs, stdin: prompt, cwd: dir },
+          this.bin, argv, { idleTimeoutMs: this.idleTimeoutMs, stdin: prompt, cwd: dir, validateLine: checkCodexEvent },
         );
         if (code !== 0) {
           throw new Error(`codex exec exited ${code} | stderr=${stderr.trim().slice(0, 400)}`);
@@ -366,55 +333,10 @@ export class CodexCliProvider extends BaseLLMProvider {
     }
   }
 
-  /** Kill every warm session; called when LLMObject stops. */
-  async shutdown(): Promise<void> {
-    const pools = [...this.pools.values()];
-    this.pools.clear();
-    await Promise.all(pools.map(p => p.close()));
-  }
-
-  private poolFor(model: string): PtySessionPool {
-    let pool = this.pools.get(model);
-    if (!pool) {
-      // Append to the dialect's argv rather than replacing it: that argv
-      // carries the sandbox and approval-policy flags.
-      const argv = shouldOmitModelFlag(model)
-        ? [...codexDialect.argv]
-        : [...codexDialect.argv, '--model', model];
-      pool = new PtySessionPool(
-        { ...codexDialect, bin: this.bin, argv },
-        {
-          idleTimeoutMs: this.idleTimeoutMs,
-          maxSessions: this.maxSessions,
-          // Codex runs in the process's own working directory, unlike the
-          // claude provider which gets an empty per-session sandbox.
-          //
-          // Not a preference: codex only starts in a directory its config
-          // records as trusted, and exits immediately (code 0, no output)
-          // in a fresh one. A git repo is not enough, with or without a
-          // commit; verified by running the same session in the project
-          // directory (works) and a fresh sandbox (exits every time).
-          //
-          // This matches what this provider did before it moved to a warm
-          // session, so it is not a regression, but combined with codex's
-          // tool access (see CODEX_HARDENING in pty-dialects.ts) it does
-          // mean a codex session can read the project it runs in.
-          cwd: process.cwd(),
-        },
-      );
-      this.pools.set(model, pool);
-    }
-    return pool;
-  }
+  async shutdown(): Promise<void> { /* one-shot processes are owned by each request */ }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────
 
-/**
- * Flatten a conversation into the single block of text a terminal session
- * accepts as one turn. Codex has no system-prompt concept in its UI, so
- * system messages become a leading delimited block.
- */
 function buildPrompt(messages: LLMMessage[]): string {
   const { system, transcript } = flattenConversation(messages);
   const parts: string[] = [];
@@ -433,12 +355,13 @@ interface CodexFinalMessage {
  *
  * `codex exec --json` emits whole events rather than token deltas:
  * `item.completed` with `item.type === 'agent_message'` carries the reply
- * (possibly more than once across a turn, so they concatenate in order),
+ * (the last completed assistant message is the final response),
  * and `turn.completed` carries token accounting. Reasoning items are
  * deliberately dropped; only agent_message is user-visible.
  */
-function extractCodexFinalMessage(raw: string): CodexFinalMessage | null {
+export function extractCodexFinalMessage(raw: string): CodexFinalMessage | null {
   let text = '';
+  let completed = false;
   let usage: CodexFinalMessage['usage'];
 
   for (const line of raw.split('\n')) {
@@ -447,15 +370,20 @@ function extractCodexFinalMessage(raw: string): CodexFinalMessage | null {
     let obj: Record<string, unknown>;
     try { obj = JSON.parse(trimmed); } catch { continue; }
 
+    checkCodexEvent(trimmed);
+    if (obj.type === 'turn.failed' || obj.type === 'error') {
+      throw new Error('Codex reported a failed generation; no Abject action was accepted.');
+    }
     if (obj.type === 'item.completed') {
       const item = (obj as { item?: { type?: string; text?: string } }).item;
-      if (item?.type === 'agent_message' && typeof item.text === 'string') text += item.text;
+      if (item?.type === 'agent_message' && typeof item.text === 'string') text = item.text;
     } else if (obj.type === 'turn.completed') {
+      completed = true;
       const u = (obj as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
       if (u) usage = { inputTokens: u.input_tokens ?? 0, outputTokens: u.output_tokens ?? 0 };
     }
   }
 
   const finalText = text.trim();
-  return finalText ? { text: finalText, usage } : null;
+  return completed && finalText ? { text: finalText, usage } : null;
 }

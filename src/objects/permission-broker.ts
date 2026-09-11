@@ -31,6 +31,7 @@
  * Nothing an agent can say raises either axis. Levels move through the UI only.
  */
 
+import type { PermissionReceipt } from '../core/permission-outcome.js';
 import * as path from 'path';
 import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -392,13 +393,18 @@ export class PermissionBroker extends Abject {
     });
 
     this.on('requestPermission', (msg: AbjectMessage) => {
-      this.decide(msg.payload as PermissionRequest).then(
-        (outcome) => this.sendDeferredReply(msg, outcome),
-        (err) => {
-          log.warn(`decide failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.sendDeferredReply(msg, { decision: 'deny', asked: false, restrictEnv: false });
-        },
-      );
+      let authorized: PermissionRequest | undefined;
+      this.authorizeRequest(msg).then(async req => {
+        authorized = req;
+        const outcome = await this.decide(req);
+        this.sendDeferredReply(msg, { ...outcome, receipt: req.receipt });
+      }).catch(err => {
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warn(`decide failed: ${reason}`);
+        this.sendDeferredReply(msg, { decision: 'deny', asked: false, restrictEnv: false,
+          receipt: { authority: this.id, callerId: authorized?.callerId ?? msg.routing.from, taskId: authorized?.taskId,
+            operation: authorized?.operation ?? authorized?.type ?? 'permission', resource: authorized?.resource ?? '', decision: 'deny', source: 'unavailable', reason } });
+      });
       return DEFERRED_REPLY;
     });
 
@@ -521,6 +527,36 @@ export class PermissionBroker extends Abject {
   // The decision
   // ═══════════════════════════════════════════════════════════════════
 
+  /** Only capability owners may attest the originating caller and local grants. */
+  private async authorizeRequest(msg: AbjectMessage): Promise<PermissionRequest> {
+    const req = { ...(msg.payload as PermissionRequest) };
+    const ownerNames = req.type === 'shell' || req.type === 'skill_shell' ? ['ShellExecutor']
+      : req.type === 'directory' ? ['HostFileSystem', 'ShellExecutor'] : ['HttpClient', 'StreamClient'];
+    const owners = await Promise.all(ownerNames.map(name => this.discoverDep(name)));
+    if (!owners.includes(msg.routing.from)) {
+      if (req.callerId && req.callerId !== msg.routing.from) throw new Error('Only a capability owner may forward another caller');
+      req.callerId = msg.routing.from;
+      req.preapproved = false;
+      req.skillPreapproved = false;
+      delete req.physicalPaths;
+    }
+    delete req.receipt;
+    req.skillAuthenticated = false;
+    if (req.skillPreapproved && req.callerId) {
+      const rows = await this.workspaceRows();
+      const workspace = rows.find(row => row.childIds?.includes(req.callerId!));
+      const skills = workspace ? await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, workspace.registryId, 'discover', { name: 'SkillAgent' }))
+        : [{ id: await this.discoverDep('SkillAgent') }];
+      req.skillAuthenticated = skills.some(skill => skill.id === req.callerId);
+    }
+    if (req.type === 'directory') {
+      req.operation = req.operation === 'write' ? 'write' : 'read';
+      req.resource = path.resolve(req.resource);
+    }
+    return req;
+  }
+
   private async decide(req: PermissionRequest): Promise<Outcome> {
     contractRequire(typeof req?.resource === 'string', 'resource must be a string');
 
@@ -542,6 +578,19 @@ export class PermissionBroker extends Abject {
     const cwd = req.cwd;
     const analysis = analyzeCommand(command, { cwd });
     const project = cwd ? await this.projectFor(ctx, cwd) : undefined;
+    const guards = [...ALWAYS_PROTECTED, ...(project?.protectedPaths ?? [])];
+    const logicalProtected = project ? protectedWrites(analysis, project.root, guards).length > 0 : false;
+    if (req.physicalPaths) {
+      const destinations = new Map(req.physicalPaths.map(item => [item.logical, item.physical]));
+      const touched = new Set([...analysis.reads, ...analysis.writes,
+        ...analysis.segments.flatMap(segment => [...segment.reads, ...segment.writes])]);
+      for (const item of touched) {
+        if (!item.resolved) continue;
+        const physical = destinations.get(item.resolved);
+        if (physical) item.resolved = physical;
+        else item.unresolved = true;
+      }
+    }
 
     // 1. A deny rule is the narrowest thing the user can say, and it outranks
     //    every allow list and every autonomy level.
@@ -551,12 +600,17 @@ export class PermissionBroker extends Abject {
       return { decision: 'deny_object', asked: false, restrictEnv: false };
     }
 
+    if (logicalProtected || project && protectedWrites(analysis, project.root, guards).length) {
+      this.record(req, ctx, 'deny', false, 'Command writes a protected project path', project);
+      return { decision: 'deny', asked: false };
+    }
+
     // 2. A standing allow rule, or a grant made for this task.
     const allowed = this.matchingRule(analysis, command, ctx.name, project, true)
       ?? this.matchingSessionGrant(analysis, ctx.name, req.taskId, req.callerId);
-    if (allowed) {
+    if (allowed || ((req.preapproved || req.skillPreapproved && req.skillAuthenticated) && ctx.accessMode === 'local' && (!project || project.trusted))) {
       this.record(req, ctx, 'accept_once', false,
-        'kind' in allowed ? `rule: ${describeRule(allowed)}` : `granted for this task: ${allowed.label}`,
+        allowed ? ('kind' in allowed ? `rule: ${describeRule(allowed)}` : `granted for this task: ${allowed.label}`) : 'configured capability grant',
         project);
       // A rule or task grant is something the user set up deliberately, so the
       // command keeps the environment it would have had if they had clicked.
@@ -582,26 +636,56 @@ export class PermissionBroker extends Abject {
    * A path request from HostFileSystem.
    *
    * Reading and writing inside a trusted project the user already registered is
-   * the case that used to prompt per directory. Everything else asks.
+   * the case that used to prompt per directory. Class rules and task grants
+   * are honored here exactly as they are for commands, so "Allow file edits in
+   * X" answers once for both. Everything else asks.
    */
   private async decideDirectory(req: PermissionRequest, ctx: CallerContext): Promise<Outcome> {
     const target = req.resource;
-    const standing = this.standingVerdict(req.type, target);
-    if (standing !== undefined) {
-      this.record(req, ctx, standing ? 'accept_once' : 'deny', false,
-        standing ? 'standing allow for this path' : 'standing block for this path');
-      return { decision: standing ? 'accept_once' : 'deny', asked: false, restrictEnv: false };
+    const operation = req.operation ?? 'read';
+    const effect = fileEffect(operation);
+    const project = await this.projectFor(ctx, target)
+      ?? (req.requestedResource ? await this.projectFor(ctx, req.requestedResource) : undefined);
+    const standing = this.standingVerdict(`directory:${operation}:${ctx.name}`, target)
+      ?? this.standingVerdict(`directory:${operation}`, target);
+    const legacy = this.standingVerdict('directory', target);
+    // The same class rules and task grants the shell path honors. "Allow file
+    // edits in X" is one answer whether the edit arrives as a command or as a
+    // filesystem call; before this the filesystem side asked per file anyway.
+    const blocked = this.matchingPathRule(target, ctx.name, effect, project, false);
+    const allowed = this.matchingPathRule(target, ctx.name, effect, project, true)
+      ?? this.matchingPathSessionGrant(target, ctx.name, effect, req.taskId, req.callerId);
+    const guards = [...ALWAYS_PROTECTED, ...(project?.protectedPaths ?? [])];
+    const relative = project ? path.relative(project.root, target) : target;
+    const requestedRelative = project && req.requestedResource ? path.relative(project.root, req.requestedResource) : req.requestedResource;
+    const protectedPath = (value: string) => guards.some(guard => {
+      const name = guard.replace(/\/$/, '');
+      return value === name || path.basename(value) === name
+        || (guard.endsWith('/') && (value.startsWith(guard) || value.split(path.sep).includes(name)));
+    });
+    if (standing === false || legacy === false || blocked || (operation === 'write' && (protectedPath(relative) || !!requestedRelative && protectedPath(requestedRelative)))) {
+      this.record(req, ctx, 'deny', false, blocked ? `rule: ${describeRule(blocked)}` : 'Filesystem operation blocked by a rule or protected path', project);
+      return { decision: 'deny', asked: false };
     }
-    const project = await this.projectFor(ctx, target);
+    if (allowed) {
+      this.record(req, ctx, 'accept_once', false,
+        'kind' in allowed ? `rule: ${describeRule(allowed)}` : `granted for this task: ${allowed.label}`, project);
+      return { decision: 'accept_once', asked: false, restrictEnv: false };
+    }
+    if (standing === true || (operation === 'read' && legacy === true) || (req.preapproved && ctx.accessMode === 'local' && (!project || (project.trusted && autonomyRank(this.effectiveLevel(ctx, project)) >= autonomyRank(operation === 'write' ? 'edit' : 'read'))))) {
+      this.record(req, ctx, 'accept_once', false, `Standing filesystem ${operation} grant`, project);
+      return { decision: 'accept_once', asked: false };
+    }
     if (project) {
       const effective = this.effectiveLevel(ctx, project);
-      if (autonomyRank(effective) >= autonomyRank('read') && isInside(project.root, target)) {
+      const required = operation === 'write' ? 'edit' : 'read';
+      if (autonomyRank(effective) >= autonomyRank(required) && isInside(project.root, target)) {
         this.record(req, ctx, 'accept_once', false,
-          `inside trusted project "${project.name}" at ${effective}`, project, effective);
-        return { decision: 'accept_once', asked: false, restrictEnv: false };
+          `${operation} inside trusted project "${project.name}" at ${effective}`, project, effective);
+        return { decision: 'accept_once', asked: false };
       }
     }
-    return this.ask(req, ctx, undefined, 'path is not inside a project with standing access', project);
+    return this.ask(req, ctx, undefined, `No standing ${operation} permission for this path`, project);
   }
 
   /** The level actually in force: the project's ask, capped by reachability. */
@@ -840,13 +924,55 @@ export class PermissionBroker extends Abject {
   }
 
   /**
+   * A class rule that answers for a single path.
+   *
+   * A filesystem call touches one path with one effect, so containment is a
+   * plain `isInside` on the rule's territory. Program rules never apply: there
+   * is no program on a filesystem call to name.
+   */
+  private matchingPathRule(
+    target: string,
+    caller: string,
+    effect: EffectClass,
+    project: ExternalProject | undefined,
+    allow: boolean,
+  ): Rule | undefined {
+    return this.rules.find(r => {
+      if (r.kind !== 'class' || r.allow !== allow || (r.caller !== caller && r.caller !== '*')) return false;
+      // An allow must be at least as wide as the request; a block bites when
+      // the request is at least as wide as what was blocked.
+      if (allow ? effectRank(effect) > effectRank(r.effect) : effectRank(effect) < effectRank(r.effect)) return false;
+      const territory = this.territoryOf(r.scope, project);
+      if (territory === undefined) return false;
+      return territory === null || isInside(territory, target);
+    });
+  }
+
+  private matchingPathSessionGrant(
+    target: string,
+    caller: string,
+    effect: EffectClass,
+    taskId?: string,
+    callerId?: AbjectId,
+  ): SessionGrant | undefined {
+    const now = Date.now();
+    this.sessionGrants = this.sessionGrants.filter(g => g.expiresAt > now);
+    return this.sessionGrants.find(g =>
+      g.caller === caller && !!taskId && g.taskId === taskId && g.callerId === callerId
+      && effectRank(effect) <= effectRank(g.effect)
+      && (g.roots === null || g.roots.some(root => isInside(root, target))));
+  }
+
+  /**
    * A previous "always" on this exact path or domain, if there is one.
    * Undefined means nothing has been said about it.
    */
   private standingVerdict(type: string, resource: string): boolean | undefined {
     const key = standingKey(type, resource);
-    const hit = this.rules.find(r => r.kind === 'exact' && r.command === key);
-    return hit ? hit.allow : undefined;
+    const matches = this.rules.filter(r => r.kind === 'exact' && (r.command === key
+      || type.startsWith('directory') && r.command.startsWith(`${type}:`) && isInside(r.command.slice(type.length + 1), resource)));
+    if (matches.some(r => !r.allow)) return false;
+    return matches.some(r => r.allow) ? true : undefined;
   }
 
   private async addRule(rule: Rule): Promise<void> {
@@ -936,7 +1062,7 @@ export class PermissionBroker extends Abject {
     project?: ExternalProject,
   ): Promise<PermissionDecision> {
     const settingsId = await this.settings();
-    if (!settingsId) return 'deny';
+    if (!settingsId) throw new Error('Permission dialog is unavailable');
 
     const groups = this.optionsFor(req, ctx, analysis, project);
     const detail = analysis
@@ -960,7 +1086,7 @@ export class PermissionBroker extends Abject {
           type: req.type,
           title: req.type === 'shell' ? 'Shell Permission'
             : req.type === 'domain' ? 'Network Permission' : 'Filesystem Permission',
-          description: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : 'access'}`
+          description: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : req.type === 'directory' ? `${req.operation ?? 'read'} files` : 'access'}`
             + (project ? ` in ${project.name}` : ''),
           resource: redactCommand(req.resource),
           detail,
@@ -972,7 +1098,7 @@ export class PermissionBroker extends Abject {
       return (reply?.decision as PermissionDecision) ?? 'deny';
     } catch (err) {
       log.warn(`prompt failed or timed out: ${err instanceof Error ? err.message : String(err)}`);
-      return 'deny';
+      throw new Error(`Permission dialog unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1009,6 +1135,28 @@ export class PermissionBroker extends Abject {
         { id: 'deny', label: 'Deny once', tone: 'default' },
       ],
     });
+
+    // A filesystem call has no command line to analyze, but it has the same
+    // answers on offer: this task, this project, or the directory it reached
+    // for. Without these the only durable answer was one file at a time.
+    if (req.type === 'directory') {
+      const operation = req.operation ?? 'read';
+      const classLabel = operation === 'write' ? 'file edits' : 'reads';
+      if (project && isInside(project.root, req.resource)) {
+        const options: PromptOption[] = req.taskId && req.callerId ? [
+          { id: 'accept_session', label: 'Allow for this task', tone: 'good' },
+        ] : [];
+        options.push({ id: 'accept_class', label: `Allow ${classLabel} in ${project.name}`, tone: 'good' });
+        groups.push({ label: `In ${project.name}`, options });
+      } else {
+        const root = fileGrantRoot(req.resource);
+        const options: PromptOption[] = [
+          { id: 'accept_path', label: `Allow ${classLabel} under ${displayPath(root)}`, tone: 'good' },
+        ];
+        if (req.taskId && req.callerId) options.push({ id: 'accept_session', label: 'Allow for this task', tone: 'good' });
+        groups.push({ label: project ? `Outside ${project.name}` : `Under ${displayPath(root)}`, options });
+      }
+    }
 
     // Everything scoped to the project answers only for a command that stays
     // inside it, so these appear only when the line does.
@@ -1071,9 +1219,26 @@ export class PermissionBroker extends Abject {
     const programs = analysis?.programs.filter(Boolean) ?? [];
     const scope: RuleScope = project ? { kind: 'project', name: project.name } : { kind: 'anywhere' };
     const escapeRoot = analysis ? grantableRoot(this.escapesOf(analysis, project)) : undefined;
+    const isFile = req.type === 'directory';
+    const fileRoot = isFile ? fileGrantRoot(req.resource) : undefined;
+    const inProject = !!project && isFile && isInside(project.root, req.resource);
+    // A filesystem call's effect is its operation; there is no line to analyze.
+    const effect: EffectClass | undefined = analysis?.effect ?? (isFile ? fileEffect(req.operation ?? 'read') : undefined);
 
     switch (decision) {
       case 'accept_session':
+        if (isFile && effect && req.taskId && req.callerId) {
+          const root = inProject ? project!.root : fileRoot!;
+          this.sessionGrants.push({
+            caller: ctx.name,
+            taskId: req.taskId, callerId: req.callerId,
+            effect,
+            roots: [root],
+            label: inProject ? `${effect} in ${project!.name}` : `${effect} under ${displayPath(root)}`,
+            expiresAt: Date.now() + SESSION_GRANT_MS,
+          });
+          return;
+        }
         if (analysis && project && req.taskId && req.callerId) {
           this.sessionGrants.push({
             caller: ctx.name,
@@ -1090,7 +1255,7 @@ export class PermissionBroker extends Abject {
         }
         return;
       case 'accept_class':
-        if (analysis) await this.addRule({ kind: 'class', caller: ctx.name, effect: analysis.effect, scope, allow: true });
+        if (effect) await this.addRule({ kind: 'class', caller: ctx.name, effect, scope, allow: true });
         return;
       case 'accept_program':
         for (const program of programs) {
@@ -1098,6 +1263,10 @@ export class PermissionBroker extends Abject {
         }
         return;
       case 'accept_path':
+        if (isFile && effect && fileRoot) {
+          await this.addRule({ kind: 'class', caller: ctx.name, effect, scope: { kind: 'path', root: fileRoot }, allow: true });
+          return;
+        }
         // Two rules per program: the directory the line reached for, and the
         // project it was running in. Writing only the first would leave the
         // in-project half of the same line uncovered, and it would ask again.
@@ -1138,12 +1307,12 @@ export class PermissionBroker extends Abject {
         // a dialog would quietly drop everything the user configured in
         // Settings. Answering from here also keeps one place to revoke.
         if (req.type !== 'shell') {
-          await this.addRule({ kind: 'exact', caller: '*', command: standingKey(req.type, req.resource), allow: true });
+          await this.addRule({ kind: 'exact', caller: '*', command: standingKey(standingType(req, ctx), req.resource), allow: true });
         }
         return;
       case 'deny_always':
         if (req.type !== 'shell') {
-          await this.addRule({ kind: 'exact', caller: '*', command: standingKey(req.type, req.resource), allow: false });
+          await this.addRule({ kind: 'exact', caller: '*', command: standingKey(standingType(req, ctx), req.resource), allow: false });
         }
         return;
       default:
@@ -1172,6 +1341,9 @@ export class PermissionBroker extends Abject {
       workspace: ctx.workspaceName,
       effectiveLevel,
     };
+    req.receipt = { authority: this.id, callerId: req.callerId, taskId: req.taskId,
+      operation: req.operation ?? req.type, resource: req.type === 'directory' ? req.resource : redactCommand(req.resource), decision,
+      source: asked ? 'user' : 'policy', reason, project: project?.name };
     this.decisions.push(entry);
     if (this.decisions.length > 500) this.decisions.splice(0, this.decisions.length - 500);
     log.info(asked
@@ -1338,6 +1510,14 @@ interface Outcome {
 }
 
 interface PermissionRequest {
+  operation?: 'read' | 'write';
+  requestedResource?: string;
+  /** Attested only by the capability owner, for an existing user-configured grant. */
+  preapproved?: boolean;
+  skillPreapproved?: boolean;
+  skillAuthenticated?: boolean;
+  physicalPaths?: Array<{ logical: string; physical?: string }>;
+  receipt?: PermissionReceipt;
   taskId?: string;
   type: 'shell' | 'directory' | 'domain' | 'skill_shell';
   resource: string;
@@ -1365,6 +1545,33 @@ interface WorkspaceRow {
  */
 function standingKey(type: string, resource: string): string {
   return `${type}:${resource}`;
+}
+
+/**
+ * The type prefix a standing path decision is stored under.
+ *
+ * Path decisions carry the caller's name and operation, so "always allow" for
+ * one object's reads never answers another object's writes. The name is used
+ * rather than the object's id because ids are minted per run: a rule keyed on
+ * the id would go dead at the next restart while still appearing in the list.
+ */
+function standingType(req: PermissionRequest, ctx: CallerContext): string {
+  return req.type === 'directory' ? `directory:${req.operation ?? 'read'}:${ctx.name}` : req.type;
+}
+
+/** The effect class a filesystem operation belongs to. */
+function fileEffect(operation: 'read' | 'write'): EffectClass {
+  return operation === 'write' ? 'write' : 'read';
+}
+
+/**
+ * The directory a filesystem grant names: the target's parent, since the
+ * target is usually a file and a grant on a single file would ask again for
+ * the file beside it.
+ */
+function fileGrantRoot(target: string): string {
+  const parent = path.dirname(target);
+  return parent === target ? target : parent;
 }
 
 /**
@@ -1431,10 +1638,15 @@ function commonAncestor(a: string, b: string): string | undefined {
 
 function describeRule(r: Rule): string {
   const scope = (s: RuleScope) => s.kind === 'anywhere' ? 'anywhere' : s.kind === 'project' ? `in ${s.name}` : `under ${s.root}`;
-  if (r.kind === 'class') return `${r.caller} ${r.allow ? 'may run' : 'is blocked from'} ${r.effect} commands ${scope(r.scope)}`;
+  // A class rule covers filesystem calls as well as commands of that effect.
+  if (r.kind === 'class') return `${r.caller} ${r.allow ? 'may perform' : 'is blocked from'} ${r.effect} operations ${scope(r.scope)}`;
   if (r.kind === 'program') return `${r.caller} ${r.allow ? 'may run' : 'is blocked from'} ${r.program} ${scope(r.scope)}`;
   // A standing path or domain decision is stored as `type:resource`; read it
   // back in those terms rather than as a command line.
+  const standingPath = /^directory:(read|write):([^:]+):(.*)$/s.exec(r.command);
+  if (standingPath) {
+    return `${standingPath[2]} ${r.allow ? 'may' : 'may not'} ${standingPath[1]} "${standingPath[3]}"`;
+  }
   const standing = /^(directory|domain|skill_shell):(.*)$/s.exec(r.command);
   if (standing) {
     return `${standing[1] === 'domain' ? 'Network' : 'Filesystem'} access to ` +

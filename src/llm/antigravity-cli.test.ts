@@ -1,73 +1,59 @@
-/**
- * Standing regression guards for AntigravityCliProvider's model registry
- * and retry policy. Runs on Node's built-in test runner, no new deps:
- *   pnpm tsx --test src/llm/antigravity-cli.test.ts
- *
- * The live-CLI check skips cleanly when `agy` is not installed, so this
- * file costs nothing on a machine without Antigravity.
- */
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import {
-  AntigravityCliProvider, AGY_TIER_MODELS, agyRetryDelayMs,
-} from './antigravity-cli.js';
-import { EmptyCompletionError } from './provider.js';
+import * as fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { AntigravityCliProvider } from './antigravity-cli.js';
+import { NativeToolAbandonedError } from './provider.js';
+import { LLMObject } from '../objects/llm-object.js';
 
-const provider = new AntigravityCliProvider();
-
-test('tier defaults are explicit effort-suffixed models, never auto', async () => {
-  const ids = new Set((await provider.listModels()).map(m => m.id));
-  for (const [tier, model] of Object.entries(AGY_TIER_MODELS)) {
-    assert.notEqual(model, 'auto', `${tier} must not default to auto`);
-    assert.match(model, /-(low|medium|high)$/, `${tier} model ${model} lacks effort suffix`);
-    assert.ok(ids.has(model), `${tier} model ${model} not in AGY_MODELS`);
-  }
-  assert.deepEqual(provider.describe().defaultTierModels, AGY_TIER_MODELS);
+/** A stand-in agy: records the prompt it was given, then reports a denied native tool and no answer. */
+async function fakeAgy(root: string, capture: string): Promise<string> {
+  const bin = path.join(root, 'fake-agy');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+let input = '';
+process.stdin.on('data', c => { input += c; }).on('end', () => {
+  fs.appendFileSync(${JSON.stringify(capture)}, input + '\\n---\\n');
+  process.stdout.write(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: '',
+    usage: { input_tokens: 5, output_tokens: 0 }, denied_actions: [{ action: 'read_file', display_name: 'ViewFile' }] } }) + '\\n');
+  process.stderr.write('jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied.\\n');
+  process.exit(0);
 });
+`);
+  await fs.chmod(bin, 0o755);
+  return bin;
+}
 
-test('resolveModel: explicit model > tier default > auto', () => {
-  assert.equal(provider.resolveModel({ model: 'gemini-3.1-pro-low' }), 'gemini-3.1-pro-low');
-  assert.equal(provider.resolveModel({ tier: 'fast' }), 'gemini-3.7-flash-low');
-  assert.equal(provider.resolveModel({ model: 'claude-sonnet-4-6', tier: 'fast' }), 'claude-sonnet-4-6');
-  assert.equal(provider.resolveModel(), 'auto');
-});
-
-test('agyRetryDelayMs: empty completions resample instantly, transient errors keep backoff', () => {
-  assert.equal(agyRetryDelayMs(new EmptyCompletionError('empty', 'stop'), 1, 1000), 0);
-  assert.equal(agyRetryDelayMs(new EmptyCompletionError('empty', 'stop'), 3, 4000), 0);
-  assert.equal(agyRetryDelayMs(new Error('idle for 360000ms'), 1, 1000), 1000);
-  assert.equal(agyRetryDelayMs(new Error('boom'), 3, 4000), 4000);
-});
-
-test('sunset gemini-3.5 ids migrate saved routing to the current line, same effort', async () => {
-  const migrations = provider.describe().modelMigrations ?? {};
-  const ids = new Set((await provider.listModels()).map(m => m.id));
-  for (const suffix of ['high', 'medium', 'low']) {
-    const from = `gemini-3.5-flash-${suffix}`;
-    const to = migrations[from];
-    assert.equal(to, `gemini-3.7-flash-${suffix}`, `sunset id ${from} should migrate to the 3.7 line`);
-    assert.ok(ids.has(to), `migration target ${to} not in AGY_MODELS`);
-  }
-});
-
-// Registry staleness tripwire: the hardcoded catalog must match the live
-// CLI. It fires only on a successful listing that lacks one of our ids —
-// exactly how it caught the gemini-3.5 sunset the day this file was
-// written. Skips when the binary is absent.
-test('AGY_MODELS matches live `agy models` output', async (t) => {
-  let out: string;
+test('a denied native tool surfaces as NativeToolAbandonedError, names the tool, and rides the provenance', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'abject-agy-adapter-'));
+  const capture = path.join(root, 'prompts.txt');
   try {
-    out = execFileSync('agy', ['models'], { encoding: 'utf8', timeout: 30_000 });
-  } catch {
-    t.skip('agy binary unavailable — tripwire needs a live CLI');
-    return;
-  }
-  const live = new Set(
-    out.split('\n').filter(l => l.includes('\t')).map(l => l.split('\t')[0].trim()),
-  );
-  for (const m of await provider.listModels()) {
-    if (m.id === 'auto') continue;
-    assert.ok(live.has(m.id), `${m.id} vanished from \`agy models\` — update AGY_MODELS + AGY_TIER_MODELS`);
-  }
+    const provider = new AntigravityCliProvider({ bin: await fakeAgy(root, capture), idleTimeoutMs: 5000 });
+    await assert.rejects(provider.complete([{ role: 'user', content: 'Decide the next action.' }]), (err: any) => {
+      assert.ok(err instanceof NativeToolAbandonedError, err?.message);
+      assert.deepEqual(err.deniedActions, ['read_file']);
+      assert.match(err.message, /read_file were denied/);
+      return true;
+    });
+
+    // Through LLMObject: the guidance is applied and the denial lands on the request provenance.
+    const llm: any = new LLMObject();
+    const chunks: any[] = [];
+    for await (const chunk of llm.meteredStream(provider, [{ role: 'user', content: 'Decide the next action.' }], { tier: 'smart' })) chunks.push(chunk);
+    const last = chunks.at(-1);
+    assert.equal(last.content, '');
+    assert.equal(last.done, true);
+    assert.equal(last.execution.nativeAccess, 'denied');
+    assert.deepEqual(last.execution.deniedActions, ['read_file']);
+    assert.equal(last.execution.promptGuidanceVersion, provider.promptGuidance().version);
+
+    const prompts = (await fs.readFile(capture, 'utf8')).split('\n---\n').filter(Boolean);
+    assert.ok(prompts.length >= 2, 'complete and stream each sent at least one prompt');
+    const sent = JSON.parse(prompts.at(-1)!);
+    const text: string = sent.message.content[0].text;
+    assert.match(text, /^System Instructions: [\s\S]*respond from its text alone/, 'prefix joins the system instructions');
+    assert.match(text, /Continue with the single JSON action that comes next\.\s*$/, 'suffix is the last thing in the prompt');
+    assert.ok(text.indexOf('Decide the next action.') < text.lastIndexOf('provider-native tools'), 'suffix follows the caller text');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

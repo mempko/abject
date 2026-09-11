@@ -29,10 +29,13 @@
  *     work between turns inside one multi-turn call.
  *  2. Headless mode cannot answer a permission prompt, so a gated tool call
  *     is auto-denied - and the model frequently gives up at that point and
- *     returns an empty answer with status SUCCESS. {@link TOOLLESS_NOTE}
- *     tells the model up front not to bother, and an empty result is
- *     surfaced as {@link EmptyCompletionError} rather than as success; the
- *     retry then resamples instantly ({@link agyRetryDelayMs}) since the
+ *     returns an empty answer with status SUCCESS. The provider's
+ *     {@link AntigravityCliProvider.promptGuidance} tells the model up front
+ *     (prefix) and at the very end (suffix) that no native tool answers
+ *     here; LLMObject applies both to every request. An empty result with
+ *     `denied_actions` is surfaced as {@link NativeToolAbandonedError}, any
+ *     other empty result as {@link EmptyCompletionError}, never as success;
+ *     the retry then resamples instantly ({@link agyRetryDelayMs}) since the
  *     abandonment is stochastic, not load-shedding.
  *
  * Denial is not total either - this is confirmed LIVE, not theoretical:
@@ -54,10 +57,12 @@ import {
   runCliIdleStreaming,
 } from './cli-process.js';
 import { sessionSandboxDir } from './pty-session.js';
+import type { PromptGuidance } from './execution-context.js';
 import { discoverModels, peekCachedModels } from './cli-model-discovery.js';
 import {
   BaseLLMProvider,
   EmptyCompletionError,
+  NativeToolAbandonedError,
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMMessage,
@@ -199,25 +204,38 @@ const DEFAULT_IDLE_TIMEOUT_MS = 360_000;
 const PRINT_TIMEOUT_FACTOR = 4;
 
 /**
- * Told to the model up front, because agy has no flag that removes its
- * tools and its own init advertises ~56 of them. That is a false premise
- * here: headless mode denies every one, and the model that believes it can
- * reach for run_command / list_dir sometimes abandons the turn once denied
- * (measured: two wasted turns and 31k tokens on a request that needed
- * neither tool).
+ * What this provider asks LLMObject to put on every request.
  *
- * Costs ~50 input tokens against a ~15k tool catalog. Measured effect on
- * prompts that carry their own material is small (both forms answered
- * 3 of 3), so this is here to correct the premise, not as a proven speedup.
+ * agy has no flag that removes its tools and its own init advertises ~56 of
+ * them. That is a false premise here: headless mode denies every one, and
+ * the model that believes it can reach for run_command / read_file sometimes
+ * abandons the turn once denied (measured: 12 of 12 samples on one
+ * 147k-character request). The prefix corrects the premise where the system
+ * context lives; the suffix repeats it where a long prompt's recency lies.
+ *
+ * The suffix is deliberately short and says what DOES happen (files arrive
+ * through the JSON action) rather than urging the model to finish: a probe
+ * wording that said "everything is already above, write the action now"
+ * turned every run into a premature `done`. Bump the version with any
+ * change of wording; the ledger keys abandonment rates on it.
  */
+const AGY_GUIDANCE: PromptGuidance = {
+  version: 'antigravity-v2',
+  prefix:
+    'Everything needed to answer is in this message: respond from its text alone. '
+    + 'Return the requested response. External actions are requested through Abject messages; provider-native capabilities are outside that protocol.',
+  suffix:
+    'This runtime exposes no provider-native tools (read_file, view_file, run_command, list_dir, grep_search, find_by_name, browser, MCP). '
+    + 'File contents and command output arrive when you emit the corresponding JSON action. Continue with the single JSON action that comes next.',
+};
+
 /** Appended to every failure: the two commands that diagnose most of them. */
 const AGY_HINT = '(try: `agy auth login` or `agy --version`)';
 
-const TOOLLESS_NOTE =
-  'Everything needed to answer is in this message: respond from its text alone. '
-  + 'This session runs without tools.';
 
 export class AntigravityCliProvider extends BaseLLMProvider {
+  executionContext() { return { transport: 'stream-json', nativeAccess: 'available' as const }; }
+  promptGuidance(): PromptGuidance { return AGY_GUIDANCE; }
   /** Top-level provider name in registry */
   readonly name = 'antigravity-cli';
 
@@ -276,6 +294,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
       let resultText: string | undefined;
       let usage: LLMCompletionResult['usage'];
       let cliErrorMessage: string | undefined;
+      let deniedActions: string[] | undefined;
 
       const { code, stdout, stderr } = await runCliIdleStreaming(
         this.bin, args.argv,
@@ -286,6 +305,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
           if (ev.error) cliErrorMessage = ev.error;
           if (ev.delta) textSoFar += ev.delta;
           if (ev.resultText) resultText = ev.resultText;
+          if (ev.deniedActions) deniedActions = ev.deniedActions;
           // Only the result event's usage is cumulative for the whole call;
           // a step_update reports that step alone, so it is a fallback for
           // a run that ends without a result event rather than a total.
@@ -304,7 +324,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
         // text on stderr ("no output produced - a tool required the
         // \"command\" permission..."), which is not JSON and would
         // otherwise be dropped on the floor.
-        throw emptyCompletionError('agy', stdout, stderr);
+        throw emptyCompletionError('agy', stdout, stderr, deniedActions);
       }
 
       return {
@@ -339,7 +359,8 @@ export class AntigravityCliProvider extends BaseLLMProvider {
           // (empty) completion so callers with their own empty-response
           // handling see what they saw before this layer learned to retry.
           if (err instanceof EmptyCompletionError) {
-            yield { content: '', done: true, stopReason: err.stopReason };
+            yield { content: '', done: true, stopReason: err.stopReason,
+              ...(err instanceof NativeToolAbandonedError ? { deniedActions: err.deniedActions } : {}) };
             return;
           }
           throw err;
@@ -387,6 +408,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     let usage: LLMCompletionResult['usage'];
     let sawDelta = false;
     let resultText: string | undefined;
+    let deniedActions: string[] | undefined;
     let consumedToEnd = false;
 
     // Same accumulation rules as complete(); see the notes there.
@@ -396,6 +418,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
       if (ev.error) cliErrorMessage = ev.error;
       if (ev.usage && (ev.isResult || !usage)) usage = ev.usage;
       if (ev.resultText) resultText = ev.resultText;
+      if (ev.deniedActions) deniedActions = ev.deniedActions;
       if (ev.delta) { sawDelta = true; return ev.delta; }
       return undefined;
     };
@@ -461,7 +484,7 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     // is the fallback for a turn that produced no incremental text, which
     // would otherwise be counted a success and yielded to nobody.
     if (!sawDelta) {
-      if (!resultText) throw emptyCompletionError('agy', allStdout, stderr);
+      if (!resultText) throw emptyCompletionError('agy', allStdout, stderr, deniedActions);
       yield { content: resultText, done: false };
     }
     // The terminal chunk must carry a stop reason. Without one the consumer
@@ -554,9 +577,10 @@ export class AntigravityCliProvider extends BaseLLMProvider {
  * another provider before they reach here.
  */
 function buildPrompt(messages: LLMMessage[]): string {
+  // The provider's guidance is already in these messages: LLMObject applies
+  // promptGuidance() to every request before it reaches an adapter.
   const { system, transcript } = flattenConversation(messages);
-  const instructions = [TOOLLESS_NOTE, system].filter(Boolean).join('\n\n');
-  return [`System Instructions: ${instructions}`, transcript].join('\n\n');
+  return [`System Instructions: ${system}`, transcript].join('\n\n');
 }
 
 /**
@@ -591,8 +615,12 @@ function goDuration(ms: number): string {
  * re-issue the request and, once exhausted, hand callers an empty
  * completion rather than a hard failure.
  */
-function emptyCompletionError(bin: string, stdout: string, stderr: string): EmptyCompletionError {
+function emptyCompletionError(bin: string, stdout: string, stderr: string, deniedActions?: string[]): EmptyCompletionError {
   const detail = stderr.trim() || stdout.trim().slice(0, 300) || 'no output at all';
+  if (deniedActions?.length) {
+    return new NativeToolAbandonedError(
+      `${bin} returned no result after native tool(s) ${deniedActions.join(', ')} were denied: ${detail}`, deniedActions, 'stop');
+  }
   return new EmptyCompletionError(`${bin} returned no result: ${detail}`, 'stop');
 }
 
@@ -608,6 +636,8 @@ interface AgyEvent {
   delta?: string;
   /** The result event's whole reply, used when no deltas arrived. */
   resultText?: string;
+  /** Native tools headless mode refused during the turn, from the result event. */
+  deniedActions?: string[];
   usage?: LLMCompletionResult['usage'];
   error?: string;
   /** True for the terminal `result` event, whose usage covers the whole call. */
@@ -629,8 +659,14 @@ function parseAgyLine(line: string): AgyEvent | undefined {
 
   if (obj.event === 'result') {
     const res = obj.result as
-      { status?: string; error?: string; response?: string; usage?: AgyUsage } | undefined;
+      { status?: string; error?: string; response?: string; usage?: AgyUsage;
+        denied_actions?: Array<{ action?: string; display_name?: string }> } | undefined;
     if (typeof res?.response === 'string' && res.response.length > 0) out.resultText = res.response;
+    if (Array.isArray(res?.denied_actions) && res.denied_actions.length > 0) {
+      out.deniedActions = res.denied_actions
+        .map(d => (typeof d?.action === 'string' && d.action) || (typeof d?.display_name === 'string' && d.display_name) || '')
+        .filter(Boolean);
+    }
     if (res?.status === 'ERROR' && typeof res.error === 'string') out.error = res.error;
     out.usage = toUsage(res?.usage);
   } else if (obj.event === 'step_update') {

@@ -23,6 +23,8 @@ export interface CliResult {
 }
 
 export interface CliRunOptions {
+  /** A protocol failure terminates the process; unlike observational onLine callbacks. */
+  validateLine?: (line: string) => void;
   /**
    * How long the process may be entirely silent before it is killed. Resets
    * on every byte of output, so a long-but-progressing generation keeps
@@ -96,10 +98,11 @@ function runCli(
     armIdle();
 
     proc.stdout.on('data', (b) => {
+      if (killed) return;
       const s = b.toString();
       stdout += s;
       armIdle();
-      if (!onLine) return;
+      if (!onLine && !opts.validateLine) return;
       buffer += s;
       let nl = buffer.indexOf('\n');
       while (nl >= 0) {
@@ -107,7 +110,17 @@ function runCli(
         buffer = buffer.slice(nl + 1);
         nl = buffer.indexOf('\n');
         // A parser fault must never take down the subprocess runner.
-        if (line) { try { onLine(line); } catch { /* skip */ } }
+        if (line) {
+          try { opts.validateLine?.(line); }
+          catch (error) {
+            killed = true;
+            if (idleTimer) clearTimeout(idleTimer);
+            killProc(proc);
+            reject(error);
+            return;
+          }
+          try { onLine?.(line); } catch { /* observational parser */ }
+        }
       }
     });
     proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
@@ -119,6 +132,7 @@ function runCli(
       if (idleTimer) clearTimeout(idleTimer);
       if (killed) return;
       const tail = buffer.trim();
+      try { if (tail) opts.validateLine?.(tail); } catch (error) { reject(error); return; }
       if (tail && onLine) { try { onLine(tail); } catch { /* skip */ } }
       resolve({ code: code ?? 0, stdout, stderr });
     });

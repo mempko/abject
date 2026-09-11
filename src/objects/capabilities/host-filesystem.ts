@@ -7,13 +7,16 @@
  */
 
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../../core/protocol-description.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { physicalPath, physicalGrantRoots } from '../../core/physical-path.js';
+import { PermissionDenied, errorDetails, type PermissionReceipt } from '../../core/permission-outcome.js';
 import { createHash } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'path';
 import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
-import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
+import { Abject, DEFERRED_REPLY, type MessageHandlerFn } from '../../core/abject.js';
 import { error as errorMsg, request } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
@@ -49,6 +52,10 @@ export interface FileInfo {
 }
 
 export class HostFileSystem extends Abject {
+  private readonly operationContext = new AsyncLocalStorage<{
+    callerId: AbjectId; taskId?: string; method: string; operation: 'read' | 'write';
+    path?: string; permission?: PermissionReceipt;
+  }>();
   private allowedPaths?: string[];
   private readOnly: boolean;
   /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
@@ -260,21 +267,49 @@ export class HostFileSystem extends Abject {
     this.setupHandlers();
   }
 
+  private onFilesystem(method: string, handler: MessageHandlerFn): void {
+    this.on(method, async msg => this.operationContext.run({
+      ...await this.capabilityCaller(msg),
+      path: typeof (msg.payload as any)?.path === 'string' ? (msg.payload as any).path : undefined,
+      method, operation: ['conditionalWrite', 'writeFile', 'editFile', 'edit', 'mkdir', 'deleteFile'].includes(method) ? 'write' : 'read',
+    }, async () => {
+      try {
+        const result = await handler(msg);
+        return result === DEFERRED_REPLY ? result : this.withReceipt(result);
+      } catch (err) {
+        this.send(errorMsg(msg, err instanceof PermissionDenied ? err.code : 'HOSTFS_ERROR', String(err instanceof Error ? err.message : err), errorDetails(err)));
+        return DEFERRED_REPLY;
+      }
+    }));
+  }
+
+  private withReceipt(result: unknown): unknown {
+    const ctx = this.operationContext.getStore();
+    if (!ctx?.permission || !result || typeof result !== 'object' || Array.isArray(result)) return result;
+    return { ...result, permission: ctx.permission,
+      ...(ctx.operation === 'write' && (result as any).success !== false
+        ? { mutation: { owner: this.id, callerId: ctx.callerId, taskId: ctx.taskId, method: ctx.method, paths: [ctx.path] } } : {}) };
+  }
+
+  protected override sendDeferredReply(msg: AbjectMessage, result: unknown): void {
+    super.sendDeferredReply(msg, this.withReceipt(result));
+  }
+
   private setupHandlers(): void {
     describeMessages(this.manifest, [
       { name: "snapshotTree", description: "Hash files and symlink targets. Project scope respects ignore rules; includePaths retains explicitly edited files. Returns revision, files, complete, excludes and issues.", parameters: { "root": protocolText, "maxFiles?": protocolNumber, "scope?": protocolText, "includePaths?": { kind: 'array', elementType: protocolText } } },
     ]);
-    this.on('readFile', (msg: AbjectMessage) => {
+    this.onFilesystem('readFile', (msg: AbjectMessage) => {
       const { path: filePath, offset, limit, maxBytes } =
         msg.payload as { path: string; offset?: number; limit?: number; maxBytes?: number };
       this.handleReadFile(filePath, offset, limit, maxBytes).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('snapshotTree', async (msg: AbjectMessage) => {
+    this.onFilesystem('snapshotTree', async (msg: AbjectMessage) => {
       const { root, maxFiles = 50000, scope = 'all', includePaths = [] } = msg.payload as { root: string; maxFiles?: number; scope?: string; includePaths?: string[] };
       contractRequire(Number.isSafeInteger(maxFiles) && maxFiles > 0, 'maxFiles must be positive');
       contractRequire(scope === 'all' || scope === 'project', 'scope must be all or project');
@@ -329,7 +364,7 @@ export class HostFileSystem extends Abject {
       return { revision, files: ordered, complete, root: base, scope, excludes, issues };
     });
 
-    this.on('conditionalWrite', async (msg: AbjectMessage) => {
+    this.onFilesystem('conditionalWrite', async (msg: AbjectMessage) => {
       const { path: filePath, expectedContent, content } = msg.payload as { path: string; expectedContent: string | null; content: string };
       contractRequire(expectedContent === null || typeof expectedContent === 'string', 'expectedContent must be text or null for a new file');
       contractRequire(typeof content === 'string', 'content must be text');
@@ -346,52 +381,52 @@ export class HostFileSystem extends Abject {
       });
     });
 
-    this.on('writeFile', (msg: AbjectMessage) => {
+    this.onFilesystem('writeFile', (msg: AbjectMessage) => {
       const { path: filePath, content } = msg.payload as { path: string; content: string };
       this.handleWriteFile(filePath, content).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('editFile', (msg: AbjectMessage) => {
+    this.onFilesystem('editFile', (msg: AbjectMessage) => {
       const { path: filePath, oldText, newText } = msg.payload as { path: string; oldText: string; newText: string };
       this.handleEditFile(filePath, oldText, newText).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('edit', (msg: AbjectMessage) => {
+    this.onFilesystem('edit', (msg: AbjectMessage) => {
       const { path: filePath, edits } = msg.payload as { path: string; edits: FileEdit[] };
       this.handleEdit(filePath, edits).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('ls', (msg: AbjectMessage) => {
+    this.onFilesystem('ls', (msg: AbjectMessage) => {
       const { path: dirPath, limit } = msg.payload as { path: string; limit?: number };
       this.handleLs(dirPath, limit).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('glob', (msg: AbjectMessage) => {
+    this.onFilesystem('glob', (msg: AbjectMessage) => {
       const { pattern, cwd, limit } = msg.payload as { pattern: string; cwd?: string; limit?: number };
       this.handleGlob(pattern, cwd, limit).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('grep', (msg: AbjectMessage) => {
+    this.onFilesystem('grep', (msg: AbjectMessage) => {
       const { pattern, path: searchPath, glob: globFilter, maxResults, ignoreCase, context } =
         msg.payload as {
           pattern: string; path?: string; glob?: string;
@@ -399,57 +434,57 @@ export class HostFileSystem extends Abject {
         };
       this.handleGrep(pattern, searchPath, globFilter, maxResults, ignoreCase, context).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('stat', (msg: AbjectMessage) => {
+    this.onFilesystem('stat', (msg: AbjectMessage) => {
       const { path: filePath } = msg.payload as { path: string };
       this.handleStat(filePath).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('mkdir', (msg: AbjectMessage) => {
+    this.onFilesystem('mkdir', (msg: AbjectMessage) => {
       const { path: dirPath } = msg.payload as { path: string };
       this.handleMkdir(dirPath).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('readdir', (msg: AbjectMessage) => {
+    this.onFilesystem('readdir', (msg: AbjectMessage) => {
       const { path: dirPath } = msg.payload as { path: string };
       this.handleReaddir(dirPath).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('exists', (msg: AbjectMessage) => {
+    this.onFilesystem('exists', (msg: AbjectMessage) => {
       const { path: filePath } = msg.payload as { path: string };
       this.handleExists(filePath).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('deleteFile', (msg: AbjectMessage) => {
+    this.onFilesystem('deleteFile', (msg: AbjectMessage) => {
       const { path: filePath } = msg.payload as { path: string };
       this.handleDeleteFile(filePath).then(
         (result) => this.sendDeferredReply(msg, result),
-        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err))),
+        (err) => this.send(errorMsg(msg, 'HOSTFS_ERROR', err instanceof Error ? err.message : String(err), errorDetails(err))),
       );
       return DEFERRED_REPLY;
     });
 
-    this.on('grantPath', (msg: AbjectMessage) => {
+    this.onFilesystem('grantPath', (msg: AbjectMessage) => {
       const { path: dirPath } = msg.payload as { path: string };
       // validateAndResolve IS the permission gate: it returns for an already
       // allowed path and otherwise prompts the authority, adding to the allow
@@ -782,44 +817,45 @@ export class HostFileSystem extends Abject {
 
   /** Validate a path and return the resolved absolute path (with ~ expanded). */
   private async validateAndResolve(p: string): Promise<string> {
-    const resolved = this.resolvePath(p);
-    // Boundary-aware: a raw prefix test would let a grant on
-    // /home/me/project also cover /home/me/project-secrets.
-    if (isInsideAny(this.allowedPaths, resolved)) return resolved;
-
-    // Path not in allow list -- ask the permissions authority
+    const requested = this.resolvePath(p);
+    const ctx = this.operationContext.getStore();
+    // Unlink removes the directory entry itself, not a symlink's target.
+    const resolved = ctx?.method === 'deleteFile'
+      ? path.join(await physicalPath(path.dirname(requested)), path.basename(requested))
+      : await physicalPath(requested);
+    const roots = await physicalGrantRoots((this.allowedPaths ?? []).map(root => this.resolvePath(root)));
+    const preapproved = isInsideAny(roots, resolved);
+    const operation = ctx?.operation ?? 'read';
+    const localReceipt = (decision: string, reason: string): PermissionReceipt => ({
+      authority: this.id, callerId: ctx?.callerId, taskId: ctx?.taskId,
+      operation, resource: resolved, decision, source: 'policy', reason,
+    });
+    if (ctx) ctx.path = resolved;
     if (this.permissionsAuthorityId) {
-      const response = await this.request<{ decision: string }>(
+      const response = await this.request<{ decision: string; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
-          type: 'directory',
-          resource: resolved,
-          description: `Filesystem access: ${resolved}`,
-        }),
-        // A user may be away; the authority queues prompts rather than
-        // refusing them, so waiting here waits for a person, not a deadlock.
-        31 * 60 * 1000,
-      );
-
-      switch (response.decision) {
-        case 'accept_always':
-          if (!this.allowedPaths) this.allowedPaths = [];
-          this.allowedPaths.push(resolved);
-          return resolved;
-        case 'accept_once':
-          return resolved;
-        case 'deny_always':
-        case 'deny':
-        default:
-          throw new Error(`Access to "${p}" was denied by user`);
-      }
+          type: 'directory', resource: resolved, requestedResource: requested, operation,
+          callerId: ctx?.callerId ?? this.id, taskId: ctx?.taskId, preapproved,
+          description: `Filesystem ${operation}: ${resolved}`,
+        }), 31 * 60 * 1000);
+      const receipt = response.receipt ?? localReceipt(response.decision, `Filesystem ${operation} ${response.decision}`);
+      if (ctx) ctx.permission = receipt;
+      if (response.decision.startsWith('accept')) return resolved;
+      throw new PermissionDenied(receipt);
     }
-
-    throw new Error(`Path "${p}" is not allowed. Configure permissions in Settings > Permissions.`);
+    const receipt = localReceipt(preapproved ? 'accept_once' : 'deny',
+      preapproved ? 'Configured filesystem path grant' : `Path "${p}" is not allowed. Configure permissions in Settings > Permissions.`);
+    if (ctx) ctx.permission = receipt;
+    if (preapproved) return resolved;
+    throw new PermissionDenied(receipt);
   }
 
   private requireWrite(): void {
     if (this.readOnly) {
-      throw new Error('HostFileSystem is in read-only mode');
+      const ctx = this.operationContext.getStore();
+      throw new PermissionDenied({ authority: this.id, callerId: ctx?.callerId,
+        taskId: ctx?.taskId, operation: 'write', resource: ctx?.path ?? '(requested path)',
+        decision: 'deny', source: 'policy', reason: 'HostFileSystem is in read-only mode' });
     }
   }
 
@@ -970,6 +1006,11 @@ export class HostFileSystem extends Abject {
       `old file or the whole new one, never a half-written one.`,
       ``,
       `### Restrictions`,
+      `Filesystem writes: ${this.readOnly ? 'disabled (read-only mode)' : 'subject to permission policy'}.`,
+      `Configured path grants: ${(this.allowedPaths ?? []).join(', ') || 'none'}.`,
+      `Permission authority: ${this.permissionsAuthorityId ?? 'none; configured paths only'}.`,
+      `Grants are checked against the resolved destination and caller/project policy.`,
+      `Responses carry permission evidence; a provider sandbox restriction does not describe this Abject.`,
     ];
 
     return super.askPrompt(_question) + '\n\n' + lines.join('\n');

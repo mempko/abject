@@ -5,6 +5,8 @@
  * `system.run`. Most developer skills require command execution.
  */
 
+import { physicalPath, physicalGrantRoots } from '../../core/physical-path.js';
+import { PermissionDenied, errorDetails, type PermissionReceipt } from '../../core/permission-outcome.js';
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../../core/protocol-description.js';
 import { RunningProcess } from './running-process.js';
 import os from 'node:os';
@@ -329,6 +331,7 @@ export class ShellExecutor extends Abject {
     });
 
     this.on('setSkillEnv', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== await this.discoverDep('SkillRegistry')) return { success: false, error: 'Only SkillRegistry may set skill environment' };
       const { env } = msg.payload as { env: Record<string, string> };
       this.skillEnv = env ?? {};
       log.info(`setSkillEnv: ${Object.keys(this.skillEnv).length} vars`);
@@ -347,8 +350,9 @@ export class ShellExecutor extends Abject {
     });
 
     this.on('start', async (msg: AbjectMessage) => {
-      const child = await this.startProcess(msg.payload as ExecRequest, msg.routing.from);
-      return { processId: child.id };
+      const context = await this.capabilityCaller(msg);
+      const child = await this.startProcess({ ...(msg.payload as ExecRequest), taskId: context.taskId }, context.callerId);
+      return { processId: child.id, permission: this.running.get(child.id)?.permission };
     });
     this.on('stopTaskProcesses', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
@@ -363,7 +367,7 @@ export class ShellExecutor extends Abject {
 
     this.on('exec', (msg: AbjectMessage) => {
       const req = msg.payload as ExecRequest;
-      this.executeCommand(req, msg.routing.from).then(
+      this.capabilityCaller(msg).then(context => this.executeCommand({ ...req, taskId: context.taskId }, context.callerId)).then(
         (result) => {
           log.info(`exec result: exit=${result.exitCode} stdout=${result.stdout.length}b stderr=${result.stderr.length}b`);
           this.sendDeferredReply(msg, result);
@@ -371,14 +375,14 @@ export class ShellExecutor extends Abject {
         (err) => {
           log.info(`exec error: ${err instanceof Error ? err.message : String(err)}`);
           this.send(errorMsg(msg, 'SHELL_ERROR',
-            err instanceof Error ? err.message : String(err)));
+            err instanceof Error ? err.message : String(err), errorDetails(err)));
         },
       );
       return DEFERRED_REPLY;
     });
   }
 
-  private running = new Map<AbjectId, { owner: AbjectId; taskId?: string; child: RunningProcess }>();
+  private running = new Map<AbjectId, { owner: AbjectId; taskId?: string; permission?: PermissionReceipt; child: RunningProcess }>();
   protected override async onStop(): Promise<void> {
     await Promise.allSettled([...this.running.values()].map(p=>p.child.stop()));
     this.running.clear();
@@ -387,7 +391,7 @@ export class ShellExecutor extends Abject {
   private async executeCommand(req: ExecRequest, callerId?: AbjectId): Promise<ExecResult> {
     const child = await this.startProcess(req, callerId ?? this.id);
     const result = await this.request<{ stdout: string; stderr: string; exitCode: number; outputBytes: number; truncatedStreams: string[]; droppedLines: number }>(request(this.id, child.id, 'wait', {}), (req.timeout ?? this.defaultTimeout) + 30000);
-    return { ...boundOutput(result.stdout, result.stderr, result.exitCode, result), outputObjectId: child.id } as ExecResult;
+    return { ...boundOutput(result.stdout, result.stderr, result.exitCode, result), outputObjectId: child.id, permission: this.running.get(child.id)?.permission } as ExecResult;
   }
 
   private async startProcess(req: ExecRequest, callerId: AbjectId): Promise<RunningProcess> {
@@ -398,24 +402,15 @@ export class ShellExecutor extends Abject {
     const command = req.command;
     const args = req.args ?? [];
     const timeout = req.timeout ?? this.defaultTimeout;
-    const cwd = req.cwd ?? (callerId ? this.defaultCwds.get(callerId) : undefined);
+    const cwd = await physicalPath(req.cwd ?? this.defaultCwds.get(callerId) ?? process.cwd());
 
     // Validate command (may prompt user)
     const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
-    let restrictEnv = false;
-    if (req.skillName) {
-      await this.validateSkillCommand(req.skillName, fullCommand);
-    } else {
-      ({ restrictEnv } = await this.validateCommand(
-        fullCommand, { callerId, taskId: req.taskId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true }));
-    }
-
-    // Validate working directory (may prompt user). A default set earlier by
-    // this caller was validated when it was set, so only an explicit cwd needs
-    // checking again.
-    if (req.cwd) {
-      await this.validatePath(req.cwd, callerId);
-    }
+    // A skill name describes the request; it cannot select a different permission path.
+    const { restrictEnv, permission } = await this.validateCommand(fullCommand, {
+      callerId, taskId: req.taskId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true, skillName: req.skillName,
+    });
+    await this.validatePath(cwd, callerId, req.taskId);
 
     // Build environment: process env + skill env + per-request env.
     //
@@ -431,7 +426,7 @@ export class ShellExecutor extends Abject {
 
     const child = new RunningProcess({ command, args, shell: req.shell, cwd, env, timeout, owner: callerId, supervisor: this.id, taskId: req.taskId });
     await child.init(this.bus, this.id);
-    this.running.set(child.id, { owner: callerId, taskId: req.taskId, child });
+    this.running.set(child.id, { owner: callerId, taskId: req.taskId, permission, child });
     // Output remains inspectable after completion; retire it after an hour.
     void this.request(request(this.id, child.id, 'wait', {}), timeout + 30000).finally(() => {
       const retention = setTimeout(() => { this.running.delete(child.id); void child.stop(); }, 3600000);
@@ -442,12 +437,16 @@ export class ShellExecutor extends Abject {
 
   private async validateCommand(
     fullCommand: string,
-    opts: { callerId?: AbjectId; taskId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean },
-  ): Promise<{ restrictEnv: boolean }> {
+    opts: { callerId?: AbjectId; taskId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean; skillName?: string },
+  ): Promise<{ restrictEnv: boolean; permission?: PermissionReceipt }> {
     const trimmed = fullCommand.trim();
 
+    const receipt = (decision: string, reason: string): PermissionReceipt => ({
+      authority: this.id, callerId: opts.callerId, taskId: opts.taskId,
+      operation: 'shell', resource: trimmed, decision, source: 'policy', reason,
+    });
     if (this.deniedCommands?.has(trimmed)) {
-      throw new Error(`Command "${trimmed}" is permanently denied`);
+      throw new PermissionDenied(receipt('deny', `Command "${trimmed}" is permanently denied`));
     }
 
     const callerName = await this.resolveCallerName(opts.callerId);
@@ -458,20 +457,27 @@ export class ShellExecutor extends Abject {
     // for an agent (agents pipe constantly) and the user was re-asked forever.
     const analysis = analyzeCommand(trimmed, { cwd: opts.cwd });
     const programs = analysis.segments.map(s => s.program).filter(Boolean);
+    // Resolve actual destinations at the owner; the broker remains filesystem-free.
+    const physicalPaths = await Promise.all([...new Set([...analysis.reads, ...analysis.writes]
+      .flatMap(touched => touched.resolved ? [touched.resolved] : []))].map(async logical => {
+      try { return { logical, physical: await physicalPath(logical) }; }
+      catch { return { logical, physical: undefined }; }
+    }));
 
     // A block on the object is the narrowest, most deliberate statement the
     // user can make about this pair, so it outranks the broad allow lists. Any
     // one blocked program in the line is enough.
     const blocked = programs.find(p => this.objectDeniedCommands.get(callerName ?? '')?.has(p));
     if (callerName && blocked) {
-      throw new Error(`${callerName} is blocked from running "${blocked}"`);
+      throw new PermissionDenied(receipt('deny', `${callerName} is blocked from running "${blocked}"`));
     }
 
     // Standing permissions answer for trusted ground only. In an untrusted
     // project every command is put to the authority, whose project autonomy
     // for such a directory is "ask", so the user sees each one.
+    let preapproved = false;
     if (!opts.untrusted) {
-      if (this.allowedCommands?.has(trimmed)) return { restrictEnv: false };
+      if (this.allowedCommands?.has(trimmed)) preapproved = true;
 
       // A grant is on a program, so a line is covered only when every program in
       // it is granted. `cd x && sed … | grep …` passes once cd, sed and grep are
@@ -480,16 +486,19 @@ export class ShellExecutor extends Abject {
       if (grants && programs.length > 0 && !analysis.opaque
           && analysis.effect !== 'dangerous'
           && programs.every(p => grants.has(p))) {
-        return { restrictEnv: false };
+        preapproved = true;
       }
     }
 
+    // Every decision passes the authority, including configured local grants.
     // Nothing local covers it: put it to the authority, which knows about
     // projects and workspaces and can answer without a dialog.
     if (this.permissionsAuthorityId) {
-      const response = await this.request<{ decision: string; asked?: boolean; restrictEnv?: boolean }>(
+      const response = await this.request<{ decision: string; asked?: boolean; restrictEnv?: boolean; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
-          type: 'shell',
+          type: 'shell', preapproved, physicalPaths, skillName: opts.skillName,
+          skillPreapproved: !opts.untrusted && !!opts.skillName && !analysis.opaque && analysis.effect !== 'dangerous'
+            && programs.length > 0 && programs.every(program => this.skillAllowedCommands.get(opts.skillName!)?.has(program)),
           resource: trimmed,
           description: callerName
             ? `${callerName} wants to run${opts.untrusted ? ' (in an UNTRUSTED project)' : ''}:`
@@ -516,54 +525,12 @@ export class ShellExecutor extends Abject {
       // The authority says whether this ran on policy alone. If it did, the
       // command goes without the host's credentials.
       if (response.decision?.startsWith('accept')) {
-        return { restrictEnv: response.restrictEnv === true };
+        return { restrictEnv: response.restrictEnv === true, permission: response.receipt };
       }
-      if (response.decision === 'deny_object' && callerName) {
-        throw new Error(`${callerName} is blocked from running "${analysis.principalProgram}"`);
-      }
-      if (response.decision === 'deny_always') {
-        if (!this.deniedCommands) this.deniedCommands = new Set();
-        this.deniedCommands.add(trimmed);
-        throw new Error(`Command "${trimmed}" was permanently denied by user`);
-      }
-      throw new Error(`Command "${trimmed}" was denied by user`);
+      throw new PermissionDenied(response.receipt ?? receipt(response.decision, 'Shell permission denied by authority'));
     }
-
-    // No authority registered -- deny by default
-    throw new Error(`Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`);
-  }
-
-  private async validateSkillCommand(skillName: string, fullCommand: string): Promise<void> {
-    const cmdName = extractCommandName(fullCommand);
-
-    // Check skill-specific whitelist
-    const skillWhitelist = this.skillAllowedCommands.get(skillName);
-    if (skillWhitelist?.has(cmdName)) return;
-
-    // Not whitelisted -- ask the permissions authority
-    if (this.permissionsAuthorityId) {
-      const response = await this.request<{ decision: string }>(
-        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
-          type: 'skill_shell',
-          resource: cmdName,
-          skillName,
-          description: `Skill "${skillName}" wants to run: ${cmdName}`,
-        }),
-        PERMISSION_WAIT_MS,
-      );
-
-      if (response.decision?.startsWith('accept')) {
-        if (!skillWhitelist) {
-          this.skillAllowedCommands.set(skillName, new Set([cmdName]));
-        } else {
-          skillWhitelist.add(cmdName);
-        }
-        return;
-      }
-      throw new Error(`Skill "${skillName}" was denied permission to run "${cmdName}"`);
-    }
-
-    throw new Error(`Command "${cmdName}" from skill "${skillName}" is not allowed.`);
+    if (preapproved) return { restrictEnv: false, permission: receipt('accept_once', 'Configured shell grant') };
+    throw new PermissionDenied(receipt('deny', `Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`));
   }
 
   /**
@@ -572,38 +539,21 @@ export class ShellExecutor extends Abject {
    *        and which workspace the caller lives in, and an anonymous request
    *        can be answered only by asking a human.
    */
-  private async validatePath(cwd: string, callerId?: AbjectId): Promise<void> {
-    // Boundary-aware: see HostFileSystem.validateAndResolve for why a raw
-    // startsWith is not good enough here.
-    if (isInsideAny(this.allowedPaths, cwd)) return;
-
-    // Path not in allow list -- ask the permissions authority
+  private async validatePath(cwd: string, callerId?: AbjectId, taskId?: string): Promise<void> {
+    const roots = await physicalGrantRoots(this.allowedPaths ?? []);
+    const preapproved = isInsideAny(roots, cwd);
     if (this.permissionsAuthorityId) {
-      const response = await this.request<{ decision: string }>(
+      const response = await this.request<{ decision: string; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
-          type: 'directory',
-          resource: cwd,
-          description: `Directory access: ${cwd}`,
-          callerId,
-        }),
-        PERMISSION_WAIT_MS,
-      );
-
-      switch (response.decision) {
-        case 'accept_always':
-          if (!this.allowedPaths) this.allowedPaths = [];
-          this.allowedPaths.push(cwd);
-          return;
-        case 'accept_once':
-          return;
-        case 'deny_always':
-        case 'deny':
-        default:
-          throw new Error(`Directory "${cwd}" access was denied by user`);
-      }
+          type: 'directory', operation: 'read', resource: cwd, callerId, taskId, preapproved,
+          description: `Shell working directory: ${cwd}`,
+        }), PERMISSION_WAIT_MS);
+      if (response.decision.startsWith('accept')) return;
+      throw new PermissionDenied(response.receipt ?? { authority: this.permissionsAuthorityId, callerId, taskId,
+        operation: 'read', resource: cwd, decision: response.decision, source: 'policy', reason: 'Working directory access denied' });
     }
-
-    throw new Error(`Directory "${cwd}" is not allowed. Configure permissions in Settings > Permissions.`);
+    if (preapproved) return;
+    throw new Error(`Working directory "${cwd}" is not allowed. Configure permissions in Settings > Permissions.`);
   }
 
   protected override askPrompt(_question: string): string {
@@ -656,7 +606,7 @@ export class ShellExecutor extends Abject {
       }
       if (!this.allowedCommands && !this.deniedCommands && !this.allowedPaths
           && this.objectAllowedCommands.size === 0 && this.objectDeniedCommands.size === 0) {
-        lines.push(`No restrictions configured.`);
+        lines.push(`No standing grants configured; operations require permission from the authority.`);
       }
     }
 

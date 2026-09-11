@@ -1,3 +1,4 @@
+import { executionProvenance, withExecutionContext, type ExecutionProvenance } from '../llm/execution-context.js';
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 /**
  * LLM Service object - provides LLM capabilities to other objects.
@@ -976,14 +977,28 @@ export class LLMObject extends Abject {
     return settle;
   }
   private async meteredComplete(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
+    const execution = executionProvenance(provider, this.modelFor(provider, options));
+    messages = withExecutionContext(messages, execution, provider.promptGuidance?.());
     const settle = await this.reserveModelUsage(provider, messages, options);
-    try { const result = await provider.complete(messages, options); settle.usage = result.usage; return result; }
+    try { const result = await provider.complete(messages, options); settle.usage = result.usage; return { ...result, execution }; }
     catch (err) { settle.failure = String(err); throw err; }
     finally { await settle(); }
   }
   private async *meteredStream(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk> {
+    const execution = executionProvenance(provider, this.modelFor(provider, options));
+    messages = withExecutionContext(messages, execution, provider.promptGuidance?.());
     const settle = await this.reserveModelUsage(provider, messages, options);
-    try { for await (const chunk of provider.stream!(messages, options)) { if (chunk.usage) settle.usage = chunk.usage; yield chunk; } }
+    try {
+      for await (const chunk of provider.stream!(messages, options)) {
+        if (chunk.usage) settle.usage = chunk.usage;
+        // A refused native tool is a fact about this request, so it rides on
+        // the provenance the caller records, not just in a log line.
+        const denied = chunk.deniedActions?.length
+          ? { ...execution, nativeAccess: 'denied' as const, deniedActions: chunk.deniedActions }
+          : execution;
+        yield { ...chunk, execution: denied };
+      }
+    }
     catch (err) { settle.failure = String(err); throw err; }
     finally { await settle(); }
   }
@@ -1047,7 +1062,7 @@ export class LLMObject extends Abject {
       if (!provider.stream) {
         const result = await this.complete(messages, options, providerName, callerId, correlationId, onBehalfOf);
         // 'length' is the provider-agnostic signal for a truncated response.
-        return { content: result.content, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
+        return { content: result.content, execution: result.execution, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
@@ -1092,6 +1107,7 @@ export class LLMObject extends Abject {
       let fullContent = '';
       let stopReason: string | undefined;
       let usage: LLMStreamChunk['usage'];
+      let execution: ExecutionProvenance | undefined;
       try {
         for await (const chunk of this.meteredStream(provider, messages, effectiveOptions)) {
           if (activeReq.killed) {
@@ -1102,6 +1118,7 @@ export class LLMObject extends Abject {
           fullContent += chunk.content;
           if (chunk.stopReason) stopReason = chunk.stopReason;
           if (chunk.usage) usage = chunk.usage;
+          if (chunk.execution) execution = chunk.execution;
           activeReq.outputChars = fullContent.length;
           // Send each chunk as an event back to the requester
           this.send(event(this.id, callerId, 'llmChunk', {
@@ -1144,7 +1161,7 @@ export class LLMObject extends Abject {
       log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${reasonNote}${tokenSummary}`);
       this.trackRequestEnd(correlationId, fullContent, usage, stopReason);
       this.trackCacheWarmth(providerName, options, messages, usage);
-      return { content: fullContent, stopReason, usage };
+      return { content: fullContent, stopReason, usage, execution };
     });
 
     this.on('listProviders', async () => {

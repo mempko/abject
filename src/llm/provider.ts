@@ -3,6 +3,7 @@
  */
 
 import { require, requireNonEmpty } from '../core/contracts.js';
+import type { ExecutionProvenance, ProviderExecution, PromptGuidance } from './execution-context.js';
 
 export interface TextPart { type: 'text'; text: string; }
 export interface ImagePart { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string; }
@@ -173,6 +174,7 @@ export interface LLMProviderDescription {
 }
 
 export interface LLMCompletionResult {
+  execution?: ExecutionProvenance;
   content: string;
   finishReason: 'stop' | 'length' | 'error';
   usage?: {
@@ -194,6 +196,9 @@ export interface LLMCompletionResult {
 }
 
 export interface LLMStreamChunk {
+  execution?: ExecutionProvenance;
+  /** Native tools the provider refused on this request; set on the final empty chunk after retries. */
+  deniedActions?: string[];
   content: string;
   done: boolean;
   /**
@@ -325,6 +330,19 @@ export class EmptyCompletionError extends Error {
 }
 
 /**
+ * The model reached for a provider-native tool, the provider refused it, and
+ * the model gave up on the turn. An empty completion with a known cause:
+ * still retryable, but the ledger and the caller can tell it from a gateway
+ * hiccup, and the tools it wanted are named.
+ */
+export class NativeToolAbandonedError extends EmptyCompletionError {
+  constructor(message: string, readonly deniedActions: string[], stopReason?: string) {
+    super(message, stopReason);
+    this.name = 'NativeToolAbandonedError';
+  }
+}
+
+/**
  * Run `fn` with bounded retries and exponential backoff. Returns whatever
  * `fn` returns on the first success; throws the last error if every attempt
  * fails or the error is classified permanent.
@@ -380,6 +398,7 @@ export async function withRetries<T>(fn: () => Promise<T>, opts: RetryOptions = 
  */
 export function cliIsRetryable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
+  if (msg.startsWith('PROVIDER_BOUNDARY:')) return false;
   // CLI-specific transient signals. Match these BEFORE delegating to the
   // default classifier so we don't accidentally drop them under a 4xx test.
   if (/idle for \d+ms/i.test(msg)) return true;
@@ -393,6 +412,13 @@ export function cliIsRetryable(err: unknown): boolean {
  * Abstract LLM provider interface.
  */
 export interface LLMProvider {
+  executionContext?(): ProviderExecution;
+  /**
+   * Prompt guidance LLMObject applies to every request routed here: the
+   * prefix joins the shared system context, the suffix ends the prompt.
+   * Versioned so the ledger can attribute behavior to wording.
+   */
+  promptGuidance?(): PromptGuidance;
   /** Native decoding formats this adapter actually implements; omission means text only. */
   outputFormats?(model?: string): Array<'text' | 'json_object'>;
   /**
