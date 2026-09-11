@@ -342,8 +342,14 @@ export abstract class Abject {
       // still waiting on a deferred reply (e.g. a submitted job that is
       // running in the background). Both hold live stall timers on us.
       const taskId=(msg.payload as {taskId?:string}|undefined)?.taskId;
+      // A beat from a dialog on screen names a person, not a task. When it
+      // carries no task id, every caller stacked up behind this object is
+      // waiting on that same person, so all of them stay alive: an unrelated
+      // caller reset a little late is a far smaller cost than a task expiring
+      // while its own question is still up.
+      const human=!!(msg.payload as {awaitingHuman?:string}|undefined)?.awaitingHuman;
       const contexts=[...this._handlingRequestSenders.values(),...this._deferredRequestSenders.values()];
-      const matching=taskId?contexts.filter(c=>c.taskId===taskId):contexts.length===1?contexts:[];
+      const matching=taskId?contexts.filter(c=>c.taskId===taskId):(contexts.length===1||human)?contexts:[];
       const upstreams=new Set(matching.map(c=>c.sender));
       const pendingCount = this.pendingReplies.size;
       const upstreamCount = upstreams.size;
@@ -363,7 +369,7 @@ export abstract class Abject {
       // Reset stall timers for every outbound request we're awaiting
       const pending=[...this.pendingReplies.entries()].filter(([,p])=>p.targetId===msg.routing.from);
       for (const [id,p] of pending) {
-        if(taskId ? p.taskId===taskId : pending.length===1)this.resetRequestTimeout(id);
+        if(taskId ? p.taskId===taskId : (pending.length===1||human))this.resetRequestTimeout(id);
       }
       // Bubble: forward a progress event to every upstream request sender,
       // skipping the sender of this progress event to avoid ping-pong loops.
@@ -1262,13 +1268,18 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * for: they now fire only when the dialog itself has died, not when the user
    * is slow.
    *
+   * Pass the task the question belongs to when it is known: the beat then
+   * reaches exactly the callers serving that task at every hop, however many
+   * other requests those objects are handling. Without it the beat still
+   * travels, but each hop keeps every caller behind it alive.
+   *
    * Returns the function that stops the heartbeat. Always call it in a
    * `finally`, or the callers behind a closed dialog wait forever.
    */
-  protected awaitingHuman(what: string): () => void {
+  protected awaitingHuman(what: string, taskId?: string): () => void {
     const beat = () => {
       try {
-        this.send(event(this.id, this.id, 'progress', { awaitingHuman: what }));
+        this.send(event(this.id, this.id, 'progress', taskId ? { awaitingHuman: what, taskId } : { awaitingHuman: what }));
       } catch { /* bus gone; nothing left to keep alive */ }
     };
     beat();

@@ -717,6 +717,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         if (skillName) return this.showSkillPermissionPrompt(skillName, p.resource, p.description);
       }
       return this.showPermissionPrompt({
+        taskId: (msg.payload as { taskId?: string }).taskId,
         type: p.type,
         title: p.title || 'Permission',
         description: p.description || '',
@@ -3513,6 +3514,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    *        offered.
    */
   private async showPermissionPrompt(opts: {
+    /** The task the question belongs to, so the heartbeat reaches its callers. */
+    taskId?: string;
     type: string;
     title: string;
     description: string;
@@ -3668,7 +3671,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // to take as long as it likes. The heartbeat holds open every request
       // stacked up behind it, all the way back to the chat that started the
       // work, so an answer given after a coffee break still lands somewhere.
-      const stopBeating = this.awaitingHuman(`permission: ${opts.title}`);
+      const stopBeating = this.awaitingHuman(`permission: ${opts.title}`, opts.taskId);
       let decision: string;
       try {
         decision = await new Promise<string>((resolve) => {

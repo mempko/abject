@@ -1092,6 +1092,9 @@ export class PermissionBroker extends Abject {
           detail,
           groups,
           skillName: req.skillName,
+          // Rides along so the dialog's heartbeat names the task and reaches
+          // every caller serving it, not just the ones with nothing else open.
+          taskId: req.taskId,
         }),
         PROMPT_WAIT_MS,
       );
