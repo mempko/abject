@@ -1,10 +1,4 @@
 ---
-const spotlight = {
-  src: '/gallery/desktop.webp',
-  alt: 'A full Abject desktop: a chat window creating a weather abject, a Seattle tide schedule widget, and a large colorful graph of wiki notes, with a sidebar of running abjects',
-  caption: 'One desktop, mid-conversation: a weather abject being spoken into existence while the tide schedule and a map of 427 wiki notes keep running.',
-};
-
 const shots = [
   {
     src: '/gallery/space.webp',
@@ -24,7 +18,7 @@ const shots = [
   {
     src: '/gallery/telegram.webp',
     alt: 'An Abject chat window that fetched Chicago weather side by side with the Telegram app showing the same weather report delivered as a message',
-    caption: '"Get the weather in Chicago and send it to Telegram." The reply landed on a phone.',
+    caption: '"Get the weather in Chicago and send it to Telegram." The reply landed on a phone, through a messaging skill dropped into the skills folder. Nothing Telegram-specific ships in the box.',
   },
 ];
 ---
@@ -33,14 +27,16 @@ const shots = [
   <div class="container">
     <h2 class="section-title">Sightings</h2>
     <p class="sightings-subtitle">
-      Screenshots from a real, living desktop, taken while posting progress. Nothing staged.
+      Captures from a real, living desktop, taken while posting progress. Nothing staged.
     </p>
 
-    <figure class="sighting sighting-spotlight">
-      <button class="sighting-frame" type="button" data-full={spotlight.src} aria-label="Enlarge screenshot">
-        <img src={spotlight.src} alt={spotlight.alt} loading="lazy" decoding="async" />
-      </button>
-      <figcaption>{spotlight.caption}</figcaption>
+    <figure class="sighting sighting-spotlight sighting-video">
+      <video autoplay loop muted playsinline preload="metadata" poster="/gallery/desktop.webp">
+        <source src="/abject_demo2_1080.webm" type="video/webm" />
+      </video>
+      <figcaption>
+        Live capture: a task list spoken into existence. The window opens because it was asked to.
+      </figcaption>
     </figure>
 
     <div class="sightings-grid">
@@ -171,5 +167,13 @@ const shots = [
     .sightings-grid {
       grid-template-columns: 1fr;
     }
+  }
+
+  .sighting-video video {
+    display: block;
+    width: 100%;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    box-shadow: 0 0 40px rgba(91, 229, 160, 0.08);
   }
 </style>

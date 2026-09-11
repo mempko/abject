@@ -7,14 +7,13 @@
       <span class="logo-highlight">{'{'}abject{'}'}</span>.world
     </a>
     <div class="nav-links">
+      <a href="/install">Install</a>
+      <a href="/why">Why Abject?</a>
       <a href="/theory">Theory</a>
       <a href="/ask-protocol">Ask Protocol</a>
-      <a href="/#symbiogenesis">Why Abject?</a>
-      <a href="/#architecture">How It Works</a>
-      <a href="/#capabilities">Capabilities</a>
       <a href="/about">About</a>
       <a href="/changelog">Changelog</a>
-      <a href="/#downloads">Download</a>
+      <a href="/#downloads" class="nav-dl">Download</a>
       <a href="https://github.com/mempko/abject" class="btn btn-outline btn-icon" target="_blank" rel="noopener" aria-label="GitHub">
         <svg width="20" height="20" viewBox="0 0 98 96" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
           <path d="M48.9 0C21.8 0 0 22 0 49.2 0 70.9 14 89.4 33.4 95.9c2.4.5 3.3-1.1 3.3-2.4 0-1.1 0-4.9-.1-8.9-13.6 3-16.4-5.8-16.4-5.8-2.2-5.7-5.4-7.2-5.4-7.2-4.4-3 .3-3 .3-3 4.9.3 7.5 5 7.5 5 4.3 7.5 11.3 5.3 14.1 4.1.4-3.2 1.7-5.3 3.1-6.5-10.8-1.2-22.2-5.4-22.2-24.3 0-5.4 1.9-9.8 5-13.2-.5-1.2-2.2-6.3.5-13 0 0 4.1-1.3 13.4 5a46.4 46.4 0 0 1 24.5 0c9.3-6.3 13.4-5 13.4-5 2.7 6.7 1 11.8.5 13 3.1 3.4 5 7.8 5 13.2 0 18.9-11.5 23.1-22.3 24.3 1.8 1.5 3.3 4.5 3.3 9.1 0 6.5-.1 11.8-.1 13.4 0 1.3.9 2.9 3.4 2.4 19.4-6.5 33.4-25 33.4-46.7C97.8 22 75.9 0 48.9 0z"/>
@@ -121,22 +120,26 @@
     }
   }
 
-  /* The bar is at its width limit; shed the section anchors first,
-     since those destinations are reachable by scrolling the home page. */
+  .nav-dl {
+    color: var(--eldritch) !important;
+  }
+
+  /* The bar is at its width limit; shed the reading pages first, since
+     the footer links to them and the home page does too. */
   @media (max-width: 1024px) {
-    .nav-links a[href="/#capabilities"] {
+    .nav-links a[href="/about"] {
       display: none;
     }
   }
 
   @media (max-width: 940px) {
-    .nav-links a[href="/#architecture"] {
+    .nav-links a[href="/changelog"] {
       display: none;
     }
   }
 
   @media (max-width: 840px) {
-    .nav-links a[href="/#symbiogenesis"] {
+    .nav-links a[href="/theory"] {
       display: none;
     }
   }

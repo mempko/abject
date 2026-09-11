@@ -42,7 +42,7 @@
         <div class="tier-label">III</div>
         <h3>The Containment</h3>
         <p class="tier-tagline">Untrusted code gets a sandbox, not your filesystem.</p>
-        <p>Worker pool with WASM sandboxes. Capability-gated imports. No ambient authority. Untrusted Abjects run here; they can see only what you allow them to see.</p>
+        <p>A pool of worker threads. Generated JavaScript runs in a locked-down interpreter with no filesystem, network, or process access of its own; abjects compiled from other languages run as WebAssembly with capability-gated imports. No ambient authority: an abject reaches the world only through capability objects, and only the ones you granted.</p>
       </div>
     </div>
 
@@ -72,7 +72,7 @@
         <text x="60" y="130" fill="#5be5a0" font-size="13" font-family="monospace">GoalManager &middot; TupleSpace</text>
         <text x="60" y="152" fill="#5be5a0" font-size="13" font-family="monospace">KnowledgeBase</text>
         <text x="60" y="174" fill="#5be5a0" font-size="13" font-family="monospace">SkillRegistry &middot; Theme</text>
-        <text x="60" y="198" fill="rgba(91,229,160,0.55)" font-size="11" font-family="monospace" font-style="italic">+ Goals, Jobs, Web, ...</text>
+        <text x="60" y="198" fill="rgba(91,229,160,0.55)" font-size="11" font-family="monospace" font-style="italic">+ Scheduler, JobManager, WebAgent, ...</text>
 
         <!-- Workspace B -->
         <rect x="370" y="35" width="310" height="175" rx="10" fill="#0e0e18" stroke="rgba(91,229,160,0.4)" stroke-width="1.5" stroke-dasharray="6 3"/>
@@ -99,7 +99,7 @@
         <rect x="40" y="255" width="640" height="100" rx="10" fill="#0e0e18" stroke="rgba(91,229,160,0.5)" stroke-width="1.5"/>
         <text x="360" y="285" text-anchor="middle" fill="#5be5a0" font-size="14" font-family="monospace">Registry &middot; Factory &middot; LLMObject &middot; ObjectCreator &middot; ProxyGenerator</text>
         <text x="360" y="310" text-anchor="middle" fill="#5be5a0" font-size="14" font-family="monospace">Negotiator &middot; HealthMonitor &middot; WorkspaceManager &middot; Supervisor</text>
-        <text x="360" y="335" text-anchor="middle" fill="#5be5a0" font-size="14" font-family="monospace">IdentityObject &middot; PeerRegistry &middot; RemoteRegistry</text>
+        <text x="360" y="335" text-anchor="middle" fill="#5be5a0" font-size="14" font-family="monospace">Identity &middot; PeerRegistry &middot; PermissionBroker &middot; SkillRegistry</text>
 
         <!-- Down arrows: System → MessageBus (kept clear of the tier label) -->
         <line x1="280" y1="355" x2="280" y2="390" stroke="rgba(91,229,160,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>

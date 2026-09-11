@@ -371,26 +371,30 @@ const manifestStructure = `AbjectManifest {
         <div class="use-case">
           <h3>Task Routing: Approach-Based Dispatch</h3>
           <p>
-            When a task appears in TupleSpace, the system asks every registered abject:
-            "How would you accomplish this?" Each abject self-assesses using its own manifest
-            and capabilities via the Ask Protocol. Abjects respond with a concrete approach
-            or PASS. An evaluator selects the best candidate.
+            When a goal is planned, the planner asks the team of agents:
+            "Can you do this? How?" Each agent self-assesses using its own manifest
+            and capabilities via the Ask Protocol and answers with a concrete approach
+            or PASS. The planner assigns the round's tasks to the agents whose approaches
+            fit, records them in the shared TupleSpace, and reads the results before
+            planning the next round.
           </p>
           <p>
-            The Ask Protocol is the dispatch mechanism.
-            Abjects are not assigned work; they volunteer by explaining their fitness.
+            The Ask Protocol is the dispatch mechanism. Nobody matches task types to
+            agent types; agents explain their fitness and the planner chooses.
           </p>
         </div>
 
         <div class="use-case">
           <h3>Knowledge Integration: Cross-Abject Memory</h3>
           <p>
-            Abjects store learned facts, insights, and references in the KnowledgeBase.
-            Other abjects search and retrieve relevant knowledge via full-text search.
-            Knowledge syncs across peers via SharedState CRDT.
+            Abjects store learned facts, lessons, insights, references, and patterns in the
+            workspace's KnowledgeBase. Other abjects search it with ranked full-text queries.
+            When a workspace is shared, its knowledge replicates to every peer in it through
+            the SharedState CRDT; a private workspace's knowledge never leaves the machine.
           </p>
           <p>
-            What one abject learns on one machine, every abject on every peer can recall.
+            What one abject learns, every abject in that workspace can recall, on every
+            peer that shares it.
           </p>
         </div>
       </section>
@@ -599,7 +603,7 @@ const manifestStructure = `AbjectManifest {
         <div class="thesis-properties">
           <div class="spec-card">
             <h4>Identity</h4>
-            <p>Every object has a PeerId (the SHA-256 hash of its signing key) and a TypeId (a scoped, durable name). Identity is cryptographic, not assigned by a registry.</p>
+            <p>Every peer has a PeerId (the SHA-256 hash of its public signing key) and every object a TypeId (a scoped, durable name under that peer). Identity is cryptographic, not assigned by a registry.</p>
           </div>
           <div class="spec-card">
             <h4>Behavior</h4>

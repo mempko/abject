@@ -61,6 +61,7 @@
 
   .footer-right {
     text-align: right;
+    min-width: 0;
   }
 
   .footer-flavor {
@@ -73,8 +74,20 @@
   .footer-links {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
     font-size: 0.9rem;
+  }
+
+  @media (max-width: 600px) {
+    .footer-right {
+      text-align: left;
+    }
+
+    .footer-links {
+      justify-content: flex-start;
+    }
   }
 
   .sep {

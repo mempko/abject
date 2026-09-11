@@ -2,16 +2,19 @@
 const examples = [
   {
     glyph: '{☾}',
+    real: true,
     title: 'Say "show me when the sun sets." A countdown appears.',
     body: 'A small window with an animated sun sliding toward the horizon, counting down the minutes, refreshing itself from live weather data. Nobody wrote an app for this. Nobody ever will. That is the point: it took one sentence, and now it exists, and it is yours.',
   },
   {
     glyph: '{◉}',
+    real: true,
     title: 'Ten years of notes. A graph view, no app switch.',
     body: 'Thousands of notes in a TiddlyWiki. One sentence, and an abject builds a client that renders them as an explorable graph. Your friends switched note apps to get that feature. You keep your wiki and grow the feature instead. Software that is personal, connected, and yours.',
   },
   {
     glyph: '{∿}',
+    real: true,
     title: 'Your friend doubts the math. Hand them a simulation.',
     body: 'Correlation measures break on non-linear data, but saying so convinces nobody. Ask for a simulation instead: a curve, a noise slider, a live correlation readout. Your friend drags the slider and gets the intuition in a minute. A computer used to compute, not to consume.',
   },
@@ -36,12 +39,13 @@ const examples = [
 <section id="examples" class="examples-section">
   <div class="container">
     <h2 class="section-title">What People Build</h2>
-    <p class="examples-subtitle">A handful of things abjects are good at. The first three are running in the screenshots above, on the author's machine. Some of these you can do elsewhere; all of them, here, you own.</p>
+    <p class="examples-subtitle">A handful of things abjects are good at. The first three are running on the author's machine, in the captures above. The last three are the kind of sentence you type next; nobody has to write an app first. Some of these you can do elsewhere; all of them, here, you own.</p>
 
     <div class="examples-grid">
       {examples.map((e) => (
         <div class="card example-card">
           <span class="example-glyph">{e.glyph}</span>
+          <span class={`example-tag ${e.real ? 'example-tag-real' : ''}`}>{e.real ? 'running today' : 'ask for it'}</span>
           <h3 class="example-title">{e.title}</h3>
           <p class="example-body">{e.body}</p>
         </div>
@@ -136,5 +140,21 @@ const examples = [
   .examples-footer em {
     color: var(--void-purple);
     font-style: italic;
+  }
+
+  .example-tag {
+    float: right;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+  }
+
+  .example-tag-real {
+    color: var(--eldritch-dim);
+    border-color: var(--border-accent);
   }
 </style>

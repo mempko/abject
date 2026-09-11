@@ -1,0 +1,422 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import { latestRelease, platformAssets, fmtSize } from '../lib/releases';
+
+const rel = await latestRelease();
+const pa = platformAssets(rel);
+const v = rel.version || 'x.y.z';
+---
+
+<Layout
+  title="Install - Abject"
+  description="Installing Abject on Linux, Windows, and macOS: the unsigned-build dialogs, first launch, choosing a model, pairing your phone, where your data lives, and what to do when something sticks."
+>
+  <Header />
+  <main class="install">
+    <div class="install-container">
+
+      <header class="install-hero">
+        <p class="install-eyebrow">// INSTALL</p>
+        <h1>From Download to Running</h1>
+        <p class="install-thesis">
+          Everything between the download button and a desktop full of objects that answer
+          for themselves. Most of this page is the two dialogs an unsigned app triggers and
+          the one settings tab you fill in once.
+        </p>
+        <p class="install-quick">
+          <a href="/#downloads" class="btn btn-primary">Get the download</a>
+          {rel.version && <span class="install-version">current: v{rel.version}</span>}
+        </p>
+      </header>
+
+      <nav class="install-toc">
+        <ol>
+          <li><a href="#requirements">What you need</a></li>
+          <li><a href="#first-launch">First launch, per platform</a></li>
+          <li><a href="#mind">Pick a mind</a></li>
+          <li><a href="#first-abject">Your first abject</a></li>
+          <li><a href="#phone">Your phone</a></li>
+          <li><a href="#commune">The terminal client</a></li>
+          <li><a href="#data">Where things live</a></li>
+          <li><a href="#network">What it talks to</a></li>
+          <li><a href="#updating">Updating and uninstalling</a></li>
+          <li><a href="#trouble">When something sticks</a></li>
+        </ol>
+      </nav>
+
+      <section id="requirements" class="install-section">
+        <h2>What you need</h2>
+        <ul class="install-list">
+          <li><strong>A desktop.</strong> A 64-bit Linux from the last few years, Windows 10 or later, or macOS 11 or later. Phones join later as remote views; the objects themselves live on the desktop.</li>
+          <li><strong>Disk.</strong> The installers are large because a headless browser ships inside so abjects can browse the web for you.
+            {pa.linuxAppImage && <> Linux {fmtSize(pa.linuxAppImage.size)},</>}
+            {pa.winExe && <> Windows {fmtSize(pa.winExe.size)},</>}
+            {pa.macArmDmg && <> macOS {fmtSize(pa.macArmDmg.size)}.</>}
+          </li>
+          <li><strong>A mind to borrow.</strong> One of: an API key from any of the supported providers, a local model through <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a> (free), or the Claude Code, Codex, or Antigravity CLI already installed and logged in on this machine. Details in <a href="#mind">Pick a mind</a>.</li>
+          <li><strong>No account.</strong> Abject has no signup. Your machine mints its own identity on first run.</li>
+        </ul>
+      </section>
+
+      <section id="first-launch" class="install-section">
+        <h2>First launch, per platform</h2>
+        <p>
+          The builds are not code-signed yet, so each operating system pauses once with a
+          warning it shows for any software that has not paid for a certificate. This is the
+          only time you will see it. Here is what to click.
+        </p>
+
+        <h3>Linux</h3>
+        <p><strong>AppImage.</strong> Mark it executable and run it:</p>
+        <pre><code>chmod +x Abject-{v}.AppImage
+./Abject-{v}.AppImage</code></pre>
+        <p>
+          AppImages need FUSE 2. On Ubuntu 22.04 and later and on Debian, install it once with
+          <code>sudo apt install libfuse2</code> (Fedora: <code>sudo dnf install fuse</code>).
+          The AppImage starts Electron without the Chromium sandbox helper, because AppImages
+          cannot carry a setuid binary and recent Ubuntu blocks user namespaces by default;
+          the abject sandboxes are separate from that and unaffected.
+        </p>
+        <p><strong>.deb.</strong> Installs a launcher entry and a <code>abjects</code> command:</p>
+        <pre><code>sudo apt install ./abjects_{v}_amd64.deb</code></pre>
+
+        <h3>Windows</h3>
+        <ol class="install-steps">
+          <li>Run the installer. SmartScreen shows "Windows protected your PC".</li>
+          <li>Click <strong>More info</strong>, then <strong>Run anyway</strong>.</li>
+          <li>Choose an install folder if you want one other than the default. Abject appears in the Start menu.</li>
+        </ol>
+
+        <h3>macOS</h3>
+        <ol class="install-steps">
+          <li>Open the .dmg and drag Abject into Applications.</li>
+          <li>Open it once. macOS says it cannot verify the developer and offers only to move it to the Trash. Click <strong>Done</strong>, not Trash.</li>
+          <li>Open <strong>System Settings, Privacy &amp; Security</strong>, scroll to the bottom, and click <strong>Open Anyway</strong> next to Abject. Confirm once.</li>
+        </ol>
+        <p>
+          Prefer the terminal? Clearing the quarantine flag does the same thing in one line:
+        </p>
+        <pre><code>xattr -d com.apple.quarantine /Applications/Abject.app</code></pre>
+        <p>
+          Pick the build that matches your Mac: Apple Silicon for anything from 2020 on with an
+          M-series chip, Intel otherwise (Apple menu, About This Mac). The download section
+          lists whichever builds the current release ships.
+        </p>
+      </section>
+
+      <section id="mind" class="install-section">
+        <h2>Pick a mind</h2>
+        <p>
+          On first launch the settings window opens by itself on the <strong>AI</strong> tab.
+          Nothing works until an abject can think, so this is the one step you cannot skip.
+          Pick any of these, then click <strong>Save</strong>:
+        </p>
+        <ul class="install-list">
+          <li><strong>An API key.</strong> Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, xAI Grok, Moonshot Kimi, MiniMax, or Meta. Paste the key next to the provider. Keys are stored in the app's data directory on your machine and sent only to that provider.</li>
+          <li><strong>Ollama, free and local.</strong> Install Ollama, pull a model (<code>ollama pull</code> and a model name), and leave it running. Abject finds it at <code>http://localhost:11434</code> without configuration; a different host goes in the Ollama URL field.</li>
+          <li><strong>A coding CLI you already use.</strong> If the <code>claude</code>, <code>codex</code>, or <code>agy</code> command is on your PATH and logged in, it appears as a provider and rides the subscription you already pay for.</li>
+          <li><strong>A peer.</strong> Another Abject on the mesh can serve you its models through the PeerLLM provider. Useful when one machine in the house has the GPU.</li>
+        </ul>
+        <p>
+          Below the keys are four <strong>tiers</strong>: smart, balanced, fast, and code.
+          Each points at a provider and model. Leave the defaults, or send the cheap
+          bookkeeping to a cheap model and keep the smart one for planning. The abjects
+          ask for a tier, never a specific model, so you can change your mind later.
+        </p>
+      </section>
+
+      <section id="first-abject" class="install-section">
+        <h2>Your first abject</h2>
+        <ol class="install-steps">
+          <li>Click <strong>Chat</strong> in the sidebar. A chat window opens.</li>
+          <li>Type what you want, in your words. Try: <em>"a countdown to tonight's sunset for my city, with the sun sliding toward the horizon."</em></li>
+          <li>Watch the goal run. A window appears when the object is ready. Close the chat if you like; the window keeps running.</li>
+          <li>Click the <strong>?</strong> in any window's title bar to see what that object can do and ask it questions in plain English.</li>
+        </ol>
+        <p>
+          The first time an abject wants to run a shell command, read a file outside its own
+          sandbox, or reach a new website, a permission prompt appears and waits. Say yes once,
+          or set standing rules under <strong>Settings, Permissions</strong>. The Web sub-tab
+          has domain allow and deny lists; Filesystem has allowed paths and a read-only mode;
+          Shell has a command allow list.
+        </p>
+      </section>
+
+      <section id="phone" class="install-section">
+        <h2>Your phone</h2>
+        <p>
+          There is nothing to install on the phone. The desktop app can show itself in a
+          phone browser over an encrypted, direct connection:
+        </p>
+        <ol class="install-steps">
+          <li>On the desktop, click <strong>Network</strong> in the toolbar and open the <strong>Frontends</strong> tab.</li>
+          <li>Click <strong>Generate Pairing QR</strong>. The code is single-use and expires in about five minutes.</li>
+          <li>Scan it with the phone's camera. It opens <code>client.abject.world</code> with a pairing token, generates its own key pair, finds your desktop through the signaling server, and connects over WebRTC.</li>
+          <li>After the handshake the phone is remembered. Next time it reconnects on its own; revoke it from the same Frontends tab whenever you like.</li>
+        </ol>
+        <p>
+          The signaling server only introduces the two ends; it never sees the session. When
+          the phone is on a cell network that blocks direct connections, traffic relays through
+          a TURN server if the signaling server offers one, still encrypted end to end.
+        </p>
+      </section>
+
+      <section id="commune" class="install-section">
+        <h2>The terminal client</h2>
+        <p>
+          <strong>commune</strong> is a tabbed terminal view of your chats, goals, and
+          permission prompts. It is a single executable with nothing to install, and it does
+          nothing on its own: it connects to the desktop app, which must be running. Download
+          it from the <a href="/#downloads">download section</a>, mark it executable on Linux
+          and macOS, and run it. It looks for the app at <code>ws://127.0.0.1:7723</code>.
+        </p>
+      </section>
+
+      <section id="data" class="install-section">
+        <h2>Where things live</h2>
+        <p>Everything Abject knows about you is in one directory:</p>
+        <table class="install-table">
+          <tbody>
+            <tr><th>Linux</th><td><code>~/.config/abject</code></td></tr>
+            <tr><th>macOS</th><td><code>~/Library/Application Support/abject</code></td></tr>
+            <tr><th>Windows</th><td><code>%APPDATA%\abject</code></td></tr>
+          </tbody>
+        </table>
+        <p>
+          Inside: your identity keys, provider keys, every workspace and the objects in it,
+          the knowledge base, and a <code>skills</code> folder. Drop a SKILL.md into
+          <code>skills</code> (Claude Code or OpenClaw format, unchanged) and rescan from
+          Settings; the agents can use it on their next task. Set <code>ABJECTS_DATA_DIR</code>
+          before launching to put all of it somewhere else. Delete the directory to start
+          over as a stranger.
+        </p>
+      </section>
+
+      <section id="network" class="install-section">
+        <h2>What it talks to</h2>
+        <p>There is no telemetry and nothing phones home. The connections it does make:</p>
+        <ul class="install-list">
+          <li><strong>Your model provider,</strong> whichever you chose. With Ollama that is your own machine.</li>
+          <li><strong><code>signal.abject.world</code>,</strong> so peers and paired phones can find your machine. It relays introductions only; every session is encrypted end to end with keys the server never has. Run your own with <code>pnpm whisper</code> from the source tree and point the app at it.</li>
+          <li><strong>The web, when an abject is asked to.</strong> Web search goes through DuckDuckGo with no API key; page fetches and browsing go wherever the task leads, within the domain rules you set under Permissions.</li>
+        </ul>
+      </section>
+
+      <section id="updating" class="install-section">
+        <h2>Updating and uninstalling</h2>
+        <p>
+          There is no auto-updater yet. Download the new version and install it over the old
+          one; the data directory is untouched and your workspaces come back as they were.
+          The <a href="/changelog">changelog</a> says what changed.
+        </p>
+        <p>
+          To uninstall, remove the app the usual way for your platform (delete the AppImage,
+          <code>apt remove abjects</code>, the Windows uninstaller, or drag it out of
+          Applications) and, if you want no trace, delete the data directory above.
+        </p>
+      </section>
+
+      <section id="trouble" class="install-section">
+        <h2>When something sticks</h2>
+        <dl class="install-faq">
+          <dt>The AppImage does nothing when launched.</dt>
+          <dd>Almost always missing FUSE 2. Install <code>libfuse2</code> (or <code>fuse</code> on Fedora) and try again. Running it from a terminal shows the actual message.</dd>
+
+          <dt>"Port 7719 already in use."</dt>
+          <dd>Another copy is running, or something else took the port. Set <code>WS_PORT</code> to a free port before launching; the terminal client's port moves with it (it is always <code>WS_PORT</code> plus four).</dd>
+
+          <dt>Ollama is running but not offered.</dt>
+          <dd>Abject probes <code>http://localhost:11434</code> at startup. If Ollama is on another host or port, enter its URL in the AI tab and save; if it started after Abject, restart Abject.</dd>
+
+          <dt>The CLI provider is missing.</dt>
+          <dd>The <code>claude</code>, <code>codex</code>, or <code>agy</code> command has to be on the PATH of the launched app, not just your shell. Launch Abject from a terminal where the command works, or install the CLI system-wide.</dd>
+
+          <dt>The window is blank or the desktop looks flat.</dt>
+          <dd>The renderer needs WebGL. On machines without it the desktop falls back to a flat 2D mode rather than staying blank; if you see nothing at all, launch from a terminal and read the log.</dd>
+
+          <dt>I want to start over.</dt>
+          <dd>Quit Abject and delete the data directory listed above. The next launch is a fresh first boot, settings window and all.</dd>
+        </dl>
+        <p class="install-help">
+          Still stuck? Ask on <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">Discord</a>
+          or open an issue on <a href="https://github.com/mempko/abject/issues" target="_blank" rel="noopener">GitHub</a>
+          with the log from a terminal launch.
+        </p>
+      </section>
+
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  .install {
+    padding-top: 64px;
+  }
+
+  .install-container {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 5rem 1.5rem 4rem;
+  }
+
+  .install-hero {
+    margin-bottom: 2.5rem;
+  }
+
+  .install-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.15em;
+    color: var(--eldritch);
+    margin-bottom: 1rem;
+  }
+
+  .install-hero h1 {
+    margin-bottom: 1.25rem;
+  }
+
+  .install-thesis {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    line-height: 1.75;
+    margin-bottom: 1.5rem;
+  }
+
+  .install-quick {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .install-version {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+
+  .install-toc {
+    margin-bottom: 3rem;
+    padding: 1.25rem 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+
+  .install-toc ol {
+    padding-left: 1.25rem;
+    columns: 2;
+    column-gap: 2rem;
+    font-size: 0.92rem;
+    line-height: 1.9;
+  }
+
+  .install-toc a {
+    color: var(--text-secondary);
+  }
+
+  .install-toc a:hover {
+    color: var(--eldritch);
+  }
+
+  .install-section {
+    padding: 0;
+    margin-bottom: 3rem;
+  }
+
+  .install-section h2 {
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .install-section h3 {
+    margin: 1.75rem 0 0.6rem;
+    color: var(--eldritch);
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    letter-spacing: 0.04em;
+  }
+
+  .install-section p {
+    color: var(--text-secondary);
+    line-height: 1.75;
+    margin-bottom: 1rem;
+  }
+
+  .install-section pre {
+    margin-bottom: 1rem;
+  }
+
+  .install-list,
+  .install-steps {
+    padding-left: 1.4rem;
+    color: var(--text-secondary);
+    line-height: 1.7;
+    margin-bottom: 1rem;
+  }
+
+  .install-list li,
+  .install-steps li {
+    margin-bottom: 0.6rem;
+  }
+
+  .install-list li::marker {
+    color: var(--eldritch);
+  }
+
+  .install-steps li::marker {
+    color: var(--void-purple);
+    font-family: var(--font-mono);
+  }
+
+  .install-list strong,
+  .install-steps strong {
+    color: var(--text-primary);
+  }
+
+  .install-table {
+    border-collapse: collapse;
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+  }
+
+  .install-table th {
+    text-align: left;
+    padding: 0.4rem 1.25rem 0.4rem 0;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-weight: 600;
+  }
+
+  .install-table td {
+    padding: 0.4rem 0;
+    color: var(--text-secondary);
+  }
+
+  .install-faq dt {
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-top: 1.25rem;
+  }
+
+  .install-faq dd {
+    color: var(--text-secondary);
+    line-height: 1.7;
+    margin: 0.35rem 0 0;
+  }
+
+  .install-help {
+    margin-top: 2rem;
+    font-size: 0.95rem;
+  }
+
+  @media (max-width: 600px) {
+    .install-toc ol {
+      columns: 1;
+    }
+  }
+</style>

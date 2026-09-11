@@ -1,0 +1,168 @@
+---
+const steps = [
+  {
+    num: 'I',
+    title: 'Install',
+    time: 'two minutes',
+    body: 'Download the build for your machine and open it. The builds are not code-signed yet, so the OS pauses once: Windows shows "More info, Run anyway", macOS wants a trip through Privacy & Security, and a Linux AppImage needs a chmod +x.',
+    link: { href: '/install', text: 'Per-platform steps' },
+  },
+  {
+    num: 'II',
+    title: 'Pick a mind',
+    time: 'one minute',
+    body: 'On first launch the settings window opens by itself on the AI tab. Paste an API key, or point it at Ollama for a free local model (a running Ollama is picked up automatically), or choose the Claude Code or Codex CLI you already log into. Save.',
+    link: { href: '#providers', text: 'Every provider it speaks' },
+  },
+  {
+    num: 'III',
+    title: 'Say it',
+    time: 'one sentence',
+    body: 'Click Chat in the sidebar and type what you want: "a countdown to tonight\'s sunset for Seattle, with the sun sliding down as it goes." A window appears. Close the chat; the window stays and keeps refreshing. Every window\'s ? button shows what it can do and lets you ask it anything.',
+    link: { href: '#examples', text: 'More things to ask for' },
+  },
+  {
+    num: 'IV',
+    title: 'Let it reach out',
+    time: 'when you say so',
+    body: 'The first time an abject wants to run a shell command, read a file outside its sandbox, or browse somewhere new, a permission prompt appears and waits for your yes. Grant once, or set standing rules in Settings. Nothing touches your machine without a receipt.',
+    link: { href: '#faq', text: 'How the containment works' },
+  },
+];
+---
+
+<section id="first-abject" class="first-section">
+  <div class="container">
+    <h2 class="section-title">Download to First Abject in Five Minutes</h2>
+    <p class="first-subtitle">
+      What actually happens between clicking Download and having a running object that is yours.
+    </p>
+
+    <ol class="first-steps">
+      {steps.map((s) => (
+        <li class="first-step card">
+          <div class="first-step-head">
+            <span class="first-num">{s.num}</span>
+            <h3>{s.title}</h3>
+          </div>
+          <span class="first-time">{s.time}</span>
+          <p>{s.body}</p>
+          <a class="first-link" href={s.link.href}>{s.link.text} &rarr;</a>
+        </li>
+      ))}
+    </ol>
+
+    <div class="first-try">
+      <p class="first-try-label">Things to say first, copied from real sessions:</p>
+      <ul class="first-try-list">
+        <li>"When is low tide in Seattle tomorrow?"</li>
+        <li>"Show me the Sun, the Earth, and the Moon, live, and keep it fresh."</li>
+        <li>"Make a fish tank. The fish should get hungry."</li>
+        <li>"Ask the tide widget what it can do."</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<style>
+  .first-subtitle {
+    text-align: center;
+    max-width: 620px;
+    margin: -1.5rem auto 2.5rem;
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.7;
+  }
+
+  .first-steps {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1.25rem;
+    counter-reset: none;
+  }
+
+  .first-step {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .first-step-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+
+  .first-step-head h3 {
+    margin: 0;
+    flex: 1;
+  }
+
+  .first-num {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--void-purple);
+    font-size: 0.9rem;
+  }
+
+  .first-time {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-top: -0.25rem;
+  }
+
+  .first-step p {
+    flex: 1;
+    line-height: 1.7;
+  }
+
+  .first-link {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--eldritch-dim);
+  }
+
+  .first-link:hover {
+    color: var(--eldritch);
+    text-decoration: underline;
+  }
+
+  .first-try {
+    max-width: 720px;
+    margin: 2.5rem auto 0;
+    padding: 1.25rem 1.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+
+  .first-try-label {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    margin-bottom: 0.6rem;
+  }
+
+  .first-try-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .first-try-list li {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--eldritch);
+  }
+
+  .first-try-list li::before {
+    content: 'you> ';
+    color: var(--void-purple);
+  }
+</style>

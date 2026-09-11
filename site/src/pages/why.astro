@@ -1,0 +1,104 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import Symbiogenesis from '../components/Symbiogenesis.astro';
+import AskProtocol from '../components/AskProtocol.astro';
+import Emergence from '../components/Emergence.astro';
+---
+
+<Layout
+  title="Why Abject? - Abject"
+  description="How Abject differs from chatbots, agent frameworks, tool protocols, and orchestration layers: the actor model with one house rule, goals run as scrums, and objects that interview each other."
+>
+  <Header />
+  <main class="why-page">
+    <header class="why-hero">
+      <div class="container">
+        <p class="why-eyebrow">// WHY ABJECT</p>
+        <h1>The Long Answer</h1>
+        <p class="why-thesis">
+          The short answer fits on the front page: an actor system where every actor can be
+          interviewed. This page is the comparison in full, for anyone who has already built
+          on the frameworks named below and wants to know exactly where the line is drawn.
+        </p>
+        <p class="why-nav">
+          <a href="#symbiogenesis">Symbiogenesis</a>
+          <span class="sep">|</span>
+          <a href="#ask-protocol">The Ask Protocol</a>
+          <span class="sep">|</span>
+          <a href="#emergence">Emergence</a>
+        </p>
+      </div>
+    </header>
+    <Symbiogenesis />
+    <AskProtocol />
+    <Emergence />
+    <section class="why-end">
+      <div class="container">
+        <p class="why-end-line">Convinced, or at least curious?</p>
+        <p class="why-end-cta">
+          <a href="/#downloads" class="btn btn-primary">Download Abject</a>
+          <a href="/theory" class="btn btn-outline">Read the theory &rarr;</a>
+        </p>
+      </div>
+    </section>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  .why-hero {
+    padding: calc(64px + 5rem) 0 1rem;
+    text-align: center;
+  }
+
+  .why-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.15em;
+    color: var(--eldritch);
+    margin-bottom: 1rem;
+  }
+
+  .why-hero h1 {
+    margin-bottom: 1.25rem;
+  }
+
+  .why-thesis {
+    max-width: 680px;
+    margin: 0 auto 1.5rem;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    line-height: 1.75;
+  }
+
+  .why-nav {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+
+  .why-nav .sep {
+    margin: 0 0.6rem;
+    opacity: 0.5;
+  }
+
+  .why-end {
+    text-align: center;
+    padding-top: 0;
+  }
+
+  .why-end-line {
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .why-end-cta {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+</style>

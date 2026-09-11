@@ -1,59 +1,28 @@
 ---
-const repo = 'mempko/abject';
-const baseUrl = `https://github.com/${repo}`;
-const latestUrl = `${baseUrl}/releases/latest`;
+import { latestRelease, platformAssets, fmtSize, fmtDate, LATEST_URL } from '../lib/releases';
 
-// Fetch electron-builder manifests at build time to resolve direct download URLs
-type ReleaseAsset = { url: string; version: string };
-type PlatformInfo = { version: string; files: { url: string }[] };
+const rel = await latestRelease();
+const pa = platformAssets(rel);
+const version = rel.version;
+const hasCommune = !!(pa.communeLinux || pa.communeWin || pa.communeMac);
 
-async function fetchManifest(filename: string): Promise<PlatformInfo | null> {
-  try {
-    const res = await fetch(`${baseUrl}/releases/latest/download/${filename}`);
-    if (!res.ok) return null;
-    const text = await res.text();
-    const version = text.match(/^version:\s*(.+)$/m)?.[1]?.trim() ?? '';
-    const files: { url: string }[] = [];
-    for (const m of text.matchAll(/^\s+-\s*url:\s*(.+)$/gm)) {
-      files.push({ url: m[1].trim() });
-    }
-    return { version, files };
-  } catch { return null; }
-}
-
-const [linux, mac, win] = await Promise.all([
-  fetchManifest('latest-linux.yml'),
-  fetchManifest('latest-mac.yml'),
-  fetchManifest('latest.yml'),
-]);
-
-const version = linux?.version || mac?.version || win?.version || '';
-const dlBase = version ? `${baseUrl}/releases/download/v${version}` : latestUrl;
-
-const linuxAppImage = linux?.files.find(f => f.url.endsWith('.AppImage'))?.url;
-const linuxDeb = linux?.files.find(f => f.url.endsWith('.deb'))?.url;
-const winExe = win?.files.find(f => f.url.endsWith('.exe'))?.url;
-const macDmg = mac?.files.find(f => f.url.endsWith('.dmg'))?.url;
-const macZip = mac?.files.find(f => f.url.endsWith('.zip'))?.url;
-
-// commune (terminal client) binaries ship with releases from 0.8.34 on.
-// Deterministic asset names, one per platform, built on native runners.
-function versionAtLeast(v: string, minMinor: number, minPatch: number): boolean {
-  const m = v.match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!m) return false;
-  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  if (major > 0) return true;
-  return minor > minMinor || (minor === minMinor && patch >= minPatch);
-}
-const hasCommune = !!version && versionAtLeast(version, 8, 34);
+const size = (a?: { size: number }) => fmtSize(a?.size);
+const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
 ---
 
 <section id="downloads">
   <div class="container">
     <h2 class="section-title">Get Abject</h2>
     <p class="dl-subtitle">
-      Download Abject as a standalone desktop app. No setup required.
+      A standalone desktop app. Download, open, pick a mind, start talking.
+    </p>
+    <p class="dl-meta">
       {version && <span class="dl-version">v{version}</span>}
+      {rel.date && <span>released {fmtDate(rel.date)}</span>}
+      <span class="dl-meta-sep">&middot;</span>
+      <span>GPL-3.0</span>
+      <span class="dl-meta-sep">&middot;</span>
+      <a href="/install">install guide</a>
     </p>
     <div class="dl-grid">
 
@@ -66,12 +35,13 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
           <circle cx="12" cy="12" r="2"/>
         </svg>
         <span class="dl-platform">Linux</span>
+        <span class="dl-arch">x64</span>
         <div class="dl-buttons">
-          <a href={linuxAppImage ? `${dlBase}/${linuxAppImage}` : latestUrl} class="dl-btn" target="_blank" rel="noopener">
-            AppImage
+          <a href={href(pa.linuxAppImage)} class="dl-btn" rel="noopener">
+            AppImage {size(pa.linuxAppImage) && <span class="dl-size">{size(pa.linuxAppImage)}</span>}
           </a>
-          <a href={linuxDeb ? `${dlBase}/${linuxDeb}` : latestUrl} class="dl-alt" target="_blank" rel="noopener">
-            .deb
+          <a href={href(pa.linuxDeb)} class="dl-alt" rel="noopener">
+            .deb {size(pa.linuxDeb) && <span class="dl-size">{size(pa.linuxDeb)}</span>}
           </a>
         </div>
       </div>
@@ -86,9 +56,10 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
           <path d="M21 9l-4 4 4 4"/>
         </svg>
         <span class="dl-platform">Windows</span>
+        <span class="dl-arch">10 or later, x64</span>
         <div class="dl-buttons">
-          <a href={winExe ? `${dlBase}/${winExe}` : latestUrl} class="dl-btn" target="_blank" rel="noopener">
-            Installer (.exe)
+          <a href={href(pa.winExe)} class="dl-btn" rel="noopener">
+            Installer (.exe) {size(pa.winExe) && <span class="dl-size">{size(pa.winExe)}</span>}
           </a>
         </div>
       </div>
@@ -102,47 +73,75 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
           <path d="M2 12h20"/>
         </svg>
         <span class="dl-platform">macOS</span>
+        <span class="dl-arch">{pa.macX64Dmg ? 'Apple Silicon and Intel' : 'Apple Silicon'}</span>
         <div class="dl-buttons">
-          <a href={macDmg ? `${dlBase}/${macDmg}` : latestUrl} class="dl-btn" target="_blank" rel="noopener">
-            .dmg
+          <a href={href(pa.macArmDmg)} class="dl-btn" rel="noopener">
+            {pa.macX64Dmg ? 'Apple Silicon .dmg' : '.dmg'} {size(pa.macArmDmg) && <span class="dl-size">{size(pa.macArmDmg)}</span>}
           </a>
-          <a href={macZip ? `${dlBase}/${macZip}` : latestUrl} class="dl-alt" target="_blank" rel="noopener">
-            .zip
+          {pa.macX64Dmg && (
+            <a href={pa.macX64Dmg.url} class="dl-btn dl-btn-second" rel="noopener">
+              Intel .dmg <span class="dl-size">{size(pa.macX64Dmg)}</span>
+            </a>
+          )}
+          <a href={href(pa.macArmZip)} class="dl-alt" rel="noopener">
+            .zip {size(pa.macArmZip) && <span class="dl-size">{size(pa.macArmZip)}</span>}
           </a>
         </div>
       </div>
 
     </div>
 
-    {hasCommune && (
-      <div class="dl-terminal">
-        <div class="dl-terminal-head">
-          <span class="dl-terminal-title">commune — the terminal client</span>
-          <span class="dl-terminal-tag">companion</span>
+    <p class="dl-unsigned">
+      The builds are not code-signed yet, so your OS will pause once before the first launch.
+      <a href="/install#first-launch">What to click</a>, per platform, takes ten seconds.
+    </p>
+
+    <div class="dl-companions">
+      {hasCommune && (
+        <div class="dl-companion">
+          <div class="dl-companion-head">
+            <span class="dl-companion-title">commune, the terminal client</span>
+            <span class="dl-companion-tag">companion</span>
+          </div>
+          <p class="dl-companion-desc">
+            Your chats, goals, and permission prompts in a tabbed TUI. A single
+            executable, no install. It talks to the desktop app above, which
+            must be running.<sup>†</sup>
+          </p>
+          <div class="dl-companion-links">
+            {pa.communeLinux && <a href={pa.communeLinux.url} rel="noopener">Linux (x64)</a>}
+            {pa.communeWin && <a href={pa.communeWin.url} rel="noopener">Windows (x64)</a>}
+            {pa.communeMac && <a href={pa.communeMac.url} rel="noopener">macOS (Apple&nbsp;Silicon)</a>}
+          </div>
+          <p class="dl-companion-foot">
+            † The terminal is a view, not a second brain. All the abjects live in the app.
+          </p>
         </div>
-        <p class="dl-terminal-desc">
-          Your chats, goals, and permission prompts in a tabbed TUI. A single
-          executable, no install — it talks to the desktop app above, which
-          must be running.<sup>†</sup>
-        </p>
-        <div class="dl-terminal-links">
-          <a href={`${dlBase}/abject-commune-linux-x64`} target="_blank" rel="noopener">Linux (x64)</a>
-          <a href={`${dlBase}/abject-commune-win-x64.exe`} target="_blank" rel="noopener">Windows (x64)</a>
-          <a href={`${dlBase}/abject-commune-mac-arm64`} target="_blank" rel="noopener">macOS (Apple&nbsp;Silicon)</a>
+      )}
+
+      <div class="dl-companion">
+        <div class="dl-companion-head">
+          <span class="dl-companion-title">your phone</span>
+          <span class="dl-companion-tag">nothing to install</span>
         </div>
-        <p class="dl-terminal-foot">
-          † The terminal is a view, not a second brain. All the Abjects live in the app.
+        <p class="dl-companion-desc">
+          Open Network, generate a pairing QR, scan it. Your desktop opens in the phone's
+          browser over an encrypted WebRTC channel, straight to your machine. Works from
+          the couch and from a cell network across town.
         </p>
+        <div class="dl-companion-links">
+          <a href="/install#phone">How pairing works</a>
+        </div>
       </div>
-    )}
+    </div>
 
     <p class="dl-invite">
       Try it. Break it. Build something slightly cursed.
     </p>
     <p class="dl-note">
       All downloads from the
-      <a href={latestUrl} target="_blank" rel="noopener">latest release</a>
-      on GitHub.
+      <a href={rel.pageUrl} target="_blank" rel="noopener">{version ? `v${version} release` : 'latest release'}</a>
+      on GitHub. No auto-updater yet: new versions install over the old one and keep your data.
     </p>
   </div>
 </section>
@@ -156,14 +155,40 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     text-align: center;
     color: var(--text-secondary);
     font-size: 1.05rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .dl-meta {
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
     margin-bottom: 2.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0 0.5rem;
+  }
+
+  .dl-meta a {
+    color: var(--eldritch-dim);
+  }
+
+  .dl-meta a:hover {
+    color: var(--eldritch);
+    text-decoration: underline;
+  }
+
+  .dl-version {
+    color: var(--eldritch-dim);
+    font-weight: 600;
   }
 
   .dl-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 1.5rem;
-    max-width: 720px;
+    max-width: 760px;
     margin: 0 auto;
   }
 
@@ -171,7 +196,7 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem;
     padding: 2rem 1.5rem;
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -199,11 +224,11 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     color: var(--text-primary);
   }
 
-  .dl-version {
+  .dl-arch {
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--eldritch-dim);
-    margin-left: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin-top: -0.35rem;
   }
 
   .dl-buttons {
@@ -212,6 +237,7 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     align-items: center;
     gap: 0.5rem;
     width: 100%;
+    margin-top: 0.4rem;
   }
 
   .dl-btn {
@@ -230,8 +256,26 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
   }
 
   .dl-btn:hover {
-    background: var(--eldritch-bright, #5cffaa);
+    background: #fff;
     box-shadow: 0 0 16px var(--eldritch-glow);
+  }
+
+  .dl-btn-second {
+    background: transparent;
+    color: var(--eldritch);
+    border: 1px solid var(--eldritch);
+  }
+
+  .dl-btn-second:hover {
+    background: var(--eldritch-glow);
+    color: var(--eldritch);
+  }
+
+  .dl-size {
+    font-weight: 400;
+    opacity: 0.7;
+    margin-left: 0.35rem;
+    font-size: 0.78em;
   }
 
   .dl-alt {
@@ -247,29 +291,45 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     text-decoration: underline;
   }
 
-  .dl-terminal {
-    max-width: 720px;
+  .dl-unsigned {
+    max-width: 640px;
     margin: 1.5rem auto 0;
+    text-align: center;
+    font-size: 0.88rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .dl-companions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.25rem;
+    max-width: 860px;
+    margin: 2rem auto 0;
+  }
+
+  .dl-companion {
     padding: 1.25rem 1.5rem;
     background: var(--bg-card);
     border: 1px solid var(--border);
     border-radius: 12px;
   }
 
-  .dl-terminal-head {
+  .dl-companion-head {
     display: flex;
     align-items: baseline;
+    flex-wrap: wrap;
     gap: 0.6rem;
   }
 
-  .dl-terminal-title {
+  .dl-companion-title {
     font-family: var(--font-mono);
     font-size: 0.95rem;
     font-weight: 600;
     color: var(--text-primary);
   }
 
-  .dl-terminal-tag {
+  .dl-companion-tag {
     font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--eldritch-dim);
@@ -278,30 +338,31 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     padding: 0.1rem 0.5rem;
   }
 
-  .dl-terminal-desc {
+  .dl-companion-desc {
     margin: 0.5rem 0 0.75rem;
     font-size: 0.9rem;
     color: var(--text-secondary);
+    line-height: 1.65;
   }
 
-  .dl-terminal-links {
+  .dl-companion-links {
     display: flex;
     flex-wrap: wrap;
     gap: 0.75rem 1.25rem;
   }
 
-  .dl-terminal-links a {
+  .dl-companion-links a {
     font-family: var(--font-mono);
     font-size: 0.82rem;
     color: var(--eldritch);
     text-decoration: none;
   }
 
-  .dl-terminal-links a:hover {
+  .dl-companion-links a:hover {
     text-decoration: underline;
   }
 
-  .dl-terminal-foot {
+  .dl-companion-foot {
     margin: 0.75rem 0 0;
     font-size: 0.75rem;
     color: var(--text-dim);
@@ -319,9 +380,11 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
 
   .dl-note {
     text-align: center;
-    margin-top: 1.5rem;
+    max-width: 560px;
+    margin: 1.5rem auto 0;
     font-size: 0.85rem;
     color: var(--text-dim);
+    line-height: 1.6;
   }
 
   .dl-note a {
@@ -334,10 +397,10 @@ const hasCommune = !!version && versionAtLeast(version, 8, 34);
     text-decoration: underline;
   }
 
-  @media (max-width: 600px) {
+  @media (max-width: 680px) {
     .dl-grid {
       grid-template-columns: 1fr;
-      max-width: 300px;
+      max-width: 320px;
     }
   }
 </style>

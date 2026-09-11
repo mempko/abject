@@ -33,14 +33,14 @@ const features = [
     abjects: 'SkillRegistry',
     title: 'Drop a SKILL.md. The agents already know.',
     hook: 'Claude Code or OpenClaw format. Both work, both at once.',
-    desc: 'Skills are markdown files. No build, no install, no registry to register with. The SkillRegistry watches the folder; the next time an abject needs a new ability, it reads what landed. The system grows by adoption, not by programming.',
+    desc: 'Skills are markdown files. No build, no install, no registry to register with. Drop one in the skills folder, rescan, and the next abject that needs that ability reads it. MCP servers you already configured for other tools are imported the same way, and a catalog browser finds more. The system grows by adoption, not by programming.',
   },
   {
     icon: '{*}',
     abjects: 'KnowledgeBase',
-    title: 'What one abject learns, every abject knows.',
-    hook: 'A CRDT knowledge base that crosses machines and survives crashes.',
-    desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a machine, the memory stays. Add a machine, it inherits everything the others learned. Forgetting would require everyone to agree on it.',
+    title: 'What one abject learns, its workspace knows.',
+    hook: 'A full-text memory, replicated to every peer in a shared workspace.',
+    desc: 'Save a fact. Save a snippet. Save a lesson from a goal that went sideways. Every abject in the workspace can search it, ranked, and agents recall it into later work. Share the workspace and the memory replicates to every peer over the CRDT; keep it private and it never leaves. Workspaces are the privacy boundary, and memory respects it.',
   },
 ];
 
@@ -51,12 +51,13 @@ const capabilities = [
   { icon: '{/}', name: 'Host Filesystem', desc: 'Read and write real files' },
   { icon: '{#}', name: 'Screenshots', desc: 'Capture canvas, widgets, pages' },
   { icon: '{C}', name: 'Scheduled Tasks', desc: 'Cron-like per-workspace jobs' },
-  { icon: '{K}', name: 'Knowledge Base', desc: 'Persistent memory, CRDT-synced' },
+  { icon: '{K}', name: 'Knowledge Base', desc: 'Ranked full-text memory, peer-synced' },
   { icon: '{.}', name: 'Portable Skills', desc: 'Claude Code & OpenClaw formats' },
   { icon: '{P}', name: 'File Transfer', desc: 'Peer-to-peer, encrypted' },
-  { icon: '{M}', name: 'Media Streaming', desc: 'Audio and video capture' },
+  { icon: '{M}', name: 'Media & Speech', desc: 'Audio, video, text to speech and back' },
   { icon: '{&}', name: 'Shared State', desc: 'LWW-CRDT across peers' },
-  { icon: '{!}', name: 'Permission Gates', desc: 'Capability-gated trust model' },
+  { icon: '{!}', name: 'Permission Gates', desc: 'Prompts, allow lists, standing rules' },
+  { icon: '{⚙}', name: 'Other Languages', desc: 'C++ abjects as sandboxed WASM' },
 ];
 ---
 

@@ -78,11 +78,27 @@
 
   .logo .brace { color: var(--eldritch); }
 
-  .body-block { max-width: 900px; }
+  .body-block { max-width: 640px; position: relative; z-index: 2; }
+
+  /* The real desktop, leaning in from the right edge and fading into the abyss. */
+  .shot {
+    position: absolute;
+    right: -150px;
+    top: 84px;
+    width: 720px;
+    border-radius: 14px;
+    border: 1px solid rgba(91, 229, 160, 0.35);
+    box-shadow: 0 0 60px rgba(91, 229, 160, 0.18), 0 30px 80px rgba(0, 0, 0, 0.7);
+    transform: perspective(1400px) rotateY(-14deg) rotateX(3deg);
+    transform-origin: left center;
+    -webkit-mask-image: linear-gradient(90deg, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 62%, rgba(0,0,0,0) 100%);
+    mask-image: linear-gradient(90deg, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 62%, rgba(0,0,0,0) 100%);
+    z-index: 1;
+  }
 
   h1 {
     font-family: var(--font-display);
-    font-size: 68px;
+    font-size: 60px;
     font-weight: 600;
     line-height: 1.08;
     color: var(--text-primary);
@@ -94,10 +110,10 @@
 
   .sub {
     font-family: var(--font-body);
-    font-size: 25px;
+    font-size: 23px;
     line-height: 1.5;
     color: var(--text-secondary);
-    max-width: 900px;
+    max-width: 600px;
   }
 
   .foot {
@@ -125,19 +141,21 @@
   <canvas id="abyss" width="1200" height="630"></canvas>
   <div class="veil"></div>
 
+  <img class="shot" src="../public/gallery/desktop.webp" alt="" />
+
   <div class="card">
     <div class="logo"><span class="brace">{</span>abject<span class="brace">}</span>.world</div>
 
     <div class="body-block">
-      <h1>Objects that <span class="accent">explain themselves</span>.</h1>
+      <h1>Describe it. An <span class="accent">abject</span> appears, window and all.</h1>
       <p class="sub">
-        A peer-to-peer desktop for local-first AI objects that find each other,
-        negotiate in plain English, and repair what breaks.
+        A free, local-first desktop where AI objects explain themselves,
+        find each other over the mesh, and keep running after you stop talking.
       </p>
     </div>
 
     <div class="foot">
-      <span class="incant">conjure &middot; awaken &middot; scry</span>
+      <span class="incant">linux &middot; windows &middot; macos</span>
       <span>GPL-3.0-or-later</span>
     </div>
   </div>

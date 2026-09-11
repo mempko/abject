@@ -1,0 +1,115 @@
+---
+const providers = [
+  { name: 'Ollama', note: 'local, free, private', tag: 'local' },
+  { name: 'PeerLLM', note: 'a peer serves models to you', tag: 'mesh' },
+  { name: 'Claude Code CLI', note: 'the login you already have', tag: 'cli' },
+  { name: 'Codex CLI', note: 'the login you already have', tag: 'cli' },
+  { name: 'Antigravity CLI', note: 'the login you already have', tag: 'cli' },
+  { name: 'Anthropic', note: 'API key' },
+  { name: 'OpenAI', note: 'API key' },
+  { name: 'Google Gemini', note: 'API key' },
+  { name: 'OpenRouter', note: 'API key, hundreds of models' },
+  { name: 'DeepSeek', note: 'API key' },
+  { name: 'xAI Grok', note: 'API key' },
+  { name: 'Moonshot Kimi', note: 'API key' },
+  { name: 'MiniMax', note: 'API key' },
+  { name: 'Meta', note: 'API key' },
+];
+---
+
+<section id="providers" class="providers-section">
+  <div class="container">
+    <h2 class="section-title">Runs on Your Terms</h2>
+    <p class="providers-intro">
+      Abject needs a mind to borrow and is flexible about whose. Bring an API key, run a
+      free local model, reuse a coding subscription you already pay for, or let a friend's
+      machine serve you models over the mesh. Route cheap jobs to cheap models and the hard
+      ones to the smart one; the four tiers (smart, balanced, fast, code) are yours to point
+      anywhere.
+    </p>
+    <ul class="providers-grid">
+      {providers.map((p) => (
+        <li class={`provider ${p.tag ? `provider-${p.tag}` : ''}`}>
+          <span class="provider-name">{p.name}</span>
+          <span class="provider-note">{p.note}</span>
+        </li>
+      ))}
+    </ul>
+    <p class="providers-foot">
+      Fourteen providers, one settings tab. Switch any time; the abjects never notice.
+    </p>
+  </div>
+</section>
+
+<style>
+  .providers-intro {
+    text-align: center;
+    max-width: 700px;
+    margin: -1.5rem auto 2.5rem;
+    color: var(--text-secondary);
+    font-size: 1.02rem;
+    line-height: 1.75;
+  }
+
+  .providers-grid {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 0.75rem;
+    max-width: 1000px;
+    margin: 0 auto;
+  }
+
+  .provider {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.8rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .provider:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 16px var(--eldritch-glow);
+  }
+
+  .provider-local {
+    border-color: rgba(91, 229, 160, 0.45);
+  }
+
+  .provider-mesh {
+    border-color: rgba(139, 123, 255, 0.45);
+  }
+
+  .provider-name {
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .provider-local .provider-name {
+    color: var(--eldritch);
+  }
+
+  .provider-mesh .provider-name {
+    color: var(--void-purple);
+  }
+
+  .provider-note {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+  }
+
+  .providers-foot {
+    text-align: center;
+    margin-top: 1.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+</style>

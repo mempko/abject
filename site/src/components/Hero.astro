@@ -1,4 +1,18 @@
 ---
+import { latestRelease, platformAssets, fmtSize } from '../lib/releases';
+
+const rel = await latestRelease();
+const pa = platformAssets(rel);
+
+// Per-platform direct links for the OS-aware button. Everything renders
+// without JavaScript; the script only upgrades the primary button.
+const direct = {
+  linux: pa.linuxAppImage,
+  linuxAlt: pa.linuxDeb,
+  win: pa.winExe,
+  mac: pa.macArmDmg,
+  macAlt: pa.macX64Dmg,
+};
 ---
 
 <section class="hero">
@@ -16,18 +30,67 @@
       your machine, your data, no cloud, no code required.
     </p>
     <div class="hero-actions">
-      <a href="#downloads" class="btn btn-primary">Download</a>
+      <a
+        href="#downloads"
+        class="btn btn-primary hero-dl"
+        id="hero-dl"
+        data-linux-url={direct.linux?.url}
+        data-linux-size={fmtSize(direct.linux?.size)}
+        data-linux-alt-url={direct.linuxAlt?.url}
+        data-win-url={direct.win?.url}
+        data-win-size={fmtSize(direct.win?.size)}
+        data-mac-url={direct.mac?.url}
+        data-mac-size={fmtSize(direct.mac?.size)}
+        data-mac-alt-url={direct.macAlt?.url}
+      >Download</a>
       <a href="#summon" class="btn btn-outline">Build from Source</a>
     </div>
-    <div class="hero-demo">
-      <video autoplay loop muted playsinline>
-        <source src="/abject_demo2_1080.webm" type="video/webm" />
-      </video>
-      <p class="hero-demo-caption">
-        Live capture, not a mockup: a task list spoken into existence.
-        The window opens because it was asked to.
-      </p>
+    <p class="hero-meta">
+      {rel.version && <span class="hero-version">v{rel.version}</span>}
+      <span>Linux &middot; Windows &middot; macOS</span>
+      <span class="hero-meta-sep">&middot;</span>
+      <span>free and open source, GPL-3.0</span>
+      <span class="hero-meta-sep">&middot;</span>
+      <a href="/install">install guide</a>
+      <span id="hero-dl-alt" class="hero-dl-alt"></span>
+    </p>
+    <p class="hero-needs">
+      Needs a mind to borrow: an API key, a free local model through Ollama,
+      or the coding CLI you already log into. You pick on first launch.
+    </p>
+
+    <figure class="hero-shot">
+      <button class="sighting-frame hero-shot-frame" type="button" data-full="/gallery/desktop.webp" aria-label="Enlarge screenshot">
+        <img
+          src="/gallery/desktop.webp"
+          alt="A full Abject desktop: a chat window creating a weather abject, a Seattle tide schedule widget, and a large colorful graph of wiki notes, with a sidebar of running abjects"
+          width="1600"
+          height="1000"
+          decoding="async"
+          fetchpriority="high"
+        />
+      </button>
+      <figcaption class="hero-shot-caption">
+        A real desktop, mid-sentence: a weather abject being spoken into existence while
+        the tide schedule and a map of 427 wiki notes keep running. Nothing staged.
+      </figcaption>
+    </figure>
+
+    <div class="hero-glyphs">
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}?{'}'}</span>
+        <span class="glyph-text">Objects that explain themselves</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}!{'}'}</span>
+        <span class="glyph-text">Objects that repair their own plumbing</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}*{'}'}</span>
+        <span class="glyph-text">Software that grows by adoption</span>
+      </div>
     </div>
+
     <h2 class="section-title hero-desc-heading">What are Abjects?</h2>
     <div class="ask-demo">
       <p class="ask-call">
@@ -52,20 +115,6 @@
         </div>
       </div>
     </div>
-    <div class="hero-glyphs">
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}?{'}'}</span>
-        <span class="glyph-text">Objects that explain themselves</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}!{'}'}</span>
-        <span class="glyph-text">Objects that repair their own plumbing</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}*{'}'}</span>
-        <span class="glyph-text">Software that grows by adoption</span>
-      </div>
-    </div>
     <p class="hero-tagline">
       abject <span class="dim">(n.)</span> 1. an AI object. 2. &lsquo;utterly hopeless&rsquo;.
       Anyone who has maintained object-oriented code knows the two meanings are compatible.
@@ -74,6 +123,45 @@
 </section>
 
 <script>
+  // OS-aware primary button. Phones and unknown platforms keep the anchor
+  // to the download section, which lists everything.
+  const btn = document.getElementById('hero-dl') as HTMLAnchorElement | null;
+  const alt = document.getElementById('hero-dl-alt');
+  if (btn) {
+    const ua = navigator.userAgent;
+    const plat = navigator.platform || '';
+    const mobile = /Android|iPhone|iPad|iPod/i.test(ua) || (plat === 'MacIntel' && navigator.maxTouchPoints > 1);
+    let key: 'linux' | 'win' | 'mac' | null = null;
+    if (!mobile) {
+      if (/Win/.test(plat)) key = 'win';
+      else if (/Mac/.test(plat)) key = 'mac';
+      else if (/Linux|X11/.test(plat)) key = 'linux';
+    }
+    const url = key ? btn.dataset[`${key}Url`] : undefined;
+    if (key && url) {
+      const size = btn.dataset[`${key}Size`];
+      const names = { linux: 'Linux', win: 'Windows', mac: 'macOS (Apple Silicon)' };
+      btn.href = url;
+      btn.textContent = `Download for ${names[key]}${size ? ` · ${size}` : ''}`;
+      btn.setAttribute('rel', 'noopener');
+      if (alt) {
+        const altUrl = btn.dataset[`${key}AltUrl`];
+        const altLabel = key === 'linux' ? '.deb instead' : key === 'mac' ? 'Intel Mac' : '';
+        alt.innerHTML = '';
+        if (altUrl && altLabel) {
+          const a = document.createElement('a');
+          a.href = altUrl;
+          a.textContent = altLabel;
+          alt.append(' · ', a);
+        }
+        const all = document.createElement('a');
+        all.href = '#downloads';
+        all.textContent = 'all downloads';
+        alt.append(' · ', all);
+      }
+    }
+  }
+
   const demo = document.querySelector('.ask-demo');
   if (demo && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     demo.setAttribute('data-armed', '');
@@ -117,15 +205,6 @@
     padding-bottom: 0;
   }
 
-  .hero-label {
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--eldritch);
-    letter-spacing: 0.15em;
-    margin-bottom: 1.25rem;
-    animation: pulse-glow 4s ease-in-out infinite;
-  }
-
   h1 {
     margin-bottom: 1.5rem;
     text-shadow: 0 0 40px rgba(91, 229, 160, 0.1);
@@ -155,6 +234,137 @@
     color: var(--text-secondary);
     font-size: 1rem;
     line-height: 1.7;
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-bottom: 0.9rem;
+  }
+
+  .hero-dl {
+    min-width: 160px;
+    justify-content: center;
+  }
+
+  .hero-meta {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 0.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0 0.5rem;
+  }
+
+  .hero-version {
+    color: var(--eldritch-dim);
+    font-weight: 600;
+  }
+
+  .hero-meta a {
+    color: var(--eldritch-dim);
+  }
+
+  .hero-meta a:hover {
+    color: var(--eldritch);
+    text-decoration: underline;
+  }
+
+  .hero-needs {
+    max-width: 560px;
+    margin: 0 auto 2.5rem;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .hero-shot {
+    max-width: 960px;
+    margin: 0 auto 2.5rem;
+  }
+
+  .hero-shot-frame {
+    display: block;
+    width: 100%;
+    padding: 0;
+    background: none;
+    border: 1px solid var(--border-accent);
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: zoom-in;
+    box-shadow: 0 0 48px rgba(91, 229, 160, 0.12), 0 24px 64px rgba(0, 0, 0, 0.5);
+    transition: box-shadow 0.3s, border-color 0.3s;
+  }
+
+  .hero-shot-frame:hover {
+    border-color: var(--eldritch);
+    box-shadow: 0 0 64px rgba(91, 229, 160, 0.2), 0 24px 64px rgba(0, 0, 0, 0.5);
+  }
+
+  .hero-shot-frame img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  .hero-shot-caption {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-style: italic;
+    margin-top: 0.75rem;
+  }
+
+  .hero-glyphs {
+    display: flex;
+    gap: 2rem;
+    justify-content: center;
+    margin-bottom: 1rem;
+    padding: 0.5rem 0;
+    flex-wrap: wrap;
+  }
+
+  .hero-glyph {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .glyph-icon {
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    padding: 0.25rem 0.45rem;
+    border-radius: 5px;
+    animation: breathe 4s ease-in-out infinite;
+  }
+
+  .hero-glyph:nth-child(2) .glyph-icon {
+    color: var(--void-purple);
+    background: var(--void-purple-glow);
+    border-color: rgba(139, 123, 255, 0.2);
+    animation-delay: 1.3s;
+  }
+
+  .hero-glyph:nth-child(3) .glyph-icon {
+    animation-delay: 2.6s;
+  }
+
+  .glyph-text {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    letter-spacing: 0.01em;
+  }
+
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 6px rgba(91, 229, 160, 0.1); }
+    50% { box-shadow: 0 0 14px rgba(91, 229, 160, 0.25); }
   }
 
   .hero-desc-heading {
@@ -290,10 +500,20 @@
     to { opacity: 1; transform: none; }
   }
 
-  @media (max-width: 480px) {
-    .ask-call {
-      font-size: 0.78rem;
-    }
+  .thesis-link {
+    display: inline-block;
+    margin-top: 0.25rem;
+    color: var(--eldritch-dim);
+    font-size: 0.9rem;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
+    padding-bottom: 1px;
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .thesis-link:hover {
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
   }
 
   .hero-tagline {
@@ -312,100 +532,6 @@
     opacity: 0.6;
   }
 
-  .hero-actions {
-    display: flex;
-    gap: 1rem;
-    justify-content: center;
-    margin-bottom: 2.5rem;
-  }
-
-  .hero-glyphs {
-    display: flex;
-    gap: 2rem;
-    justify-content: center;
-    margin-bottom: 2.5rem;
-    padding: 0.5rem 0;
-    flex-wrap: wrap;
-  }
-
-  .hero-glyph {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-  }
-
-  .glyph-icon {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: var(--eldritch);
-    background: var(--eldritch-glow);
-    border: 1px solid var(--border-accent);
-    padding: 0.25rem 0.45rem;
-    border-radius: 5px;
-    animation: breathe 4s ease-in-out infinite;
-  }
-
-  .hero-glyph:nth-child(2) .glyph-icon {
-    color: var(--void-purple);
-    background: var(--void-purple-glow);
-    border-color: rgba(139, 123, 255, 0.2);
-    animation-delay: 1.3s;
-  }
-
-  .hero-glyph:nth-child(3) .glyph-icon {
-    animation-delay: 2.6s;
-  }
-
-  .glyph-text {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    letter-spacing: 0.01em;
-  }
-
-  @keyframes breathe {
-    0%, 100% { box-shadow: 0 0 6px rgba(91, 229, 160, 0.1); }
-    50% { box-shadow: 0 0 14px rgba(91, 229, 160, 0.25); }
-  }
-
-  .thesis-link {
-    display: inline-block;
-    margin-top: 0.25rem;
-    color: var(--eldritch-dim);
-    font-size: 0.9rem;
-    text-decoration: none;
-    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
-    padding-bottom: 1px;
-    transition: color 0.2s, border-color 0.2s;
-  }
-
-  .thesis-link:hover {
-    color: var(--eldritch);
-    border-bottom-color: var(--eldritch);
-  }
-
-  .hero-demo {
-    margin-top: 0;
-    max-width: 900px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  .hero-demo video {
-    width: 100%;
-    border-radius: 12px;
-    border: 1px solid var(--border);
-    box-shadow: 0 0 40px rgba(91, 229, 160, 0.08);
-  }
-
-  .hero-demo-caption {
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--text-dim);
-    font-style: italic;
-    margin-top: 0.75rem;
-  }
-
   @media (max-width: 600px) {
     .hero-actions {
       flex-direction: column;
@@ -415,6 +541,9 @@
       flex-direction: column;
       align-items: center;
       gap: 1rem;
+    }
+    .ask-call {
+      font-size: 0.78rem;
     }
   }
 </style>

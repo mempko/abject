@@ -1,0 +1,110 @@
+---
+const points = [
+  {
+    glyph: '{≠}',
+    label: 'Not a chatbot',
+    title: 'Answers that stay.',
+    body: 'A chat answer scrolls away. An abject is a running object with a window, a mailbox, and its own source. Close the chat and it keeps working: refreshing the tide chart, feeding the fish, watching the inbox.',
+  },
+  {
+    glyph: '{∅}',
+    label: 'Not an agent framework',
+    title: 'No top. No bottom.',
+    body: 'Agent frameworks put a planner on top and tools underneath. Here every piece, the tools included, is an object that can be asked what it does and can ask back. The LLM is a service an object calls when it needs to think, and it is silent the rest of the time.',
+  },
+  {
+    glyph: '{⋈}',
+    label: 'Not a cloud',
+    title: 'Your key is your address.',
+    body: 'No accounts. Your machine generates its own cryptographic name, peers find each other over encrypted WebRTC, and a goal started here survives on every peer that joined it. Nobody rents you your own software.',
+  },
+];
+---
+
+<section id="why" class="why-section">
+  <div class="container">
+    <h2 class="section-title">How is Abject different?</h2>
+    <p class="why-subtitle">
+      Engineers know the shape by name: the actor model, with one house rule Erlang never had.
+      Every actor answers <em>ask</em>.
+    </p>
+
+    <div class="why-grid grid-3">
+      {points.map((p) => (
+        <div class="card why-card">
+          <div class="why-head">
+            <span class="why-glyph">{p.glyph}</span>
+            <span class="why-label">{p.label}</span>
+          </div>
+          <h3>{p.title}</h3>
+          <p>{p.body}</p>
+        </div>
+      ))}
+    </div>
+
+    <p class="why-cta">
+      <a href="/why" class="btn btn-outline">The full comparison &rarr;</a>
+      <a href="/ask-protocol" class="btn btn-outline">The Ask Protocol &rarr;</a>
+      <a href="/theory" class="btn btn-outline">The theory &rarr;</a>
+    </p>
+  </div>
+</section>
+
+<style>
+  .why-subtitle {
+    text-align: center;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.7;
+  }
+
+  .why-subtitle em {
+    color: var(--eldritch);
+    font-style: normal;
+    font-family: var(--font-mono);
+  }
+
+  .why-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.9rem;
+  }
+
+  .why-glyph {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    padding: 0.2rem 0.45rem;
+    border-radius: 5px;
+    font-size: 0.9rem;
+  }
+
+  .why-label {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  .why-card h3 {
+    margin-bottom: 0.6rem;
+  }
+
+  .why-card p {
+    line-height: 1.7;
+  }
+
+  .why-cta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    justify-content: center;
+    margin-top: 2.25rem;
+  }
+</style>
