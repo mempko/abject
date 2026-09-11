@@ -1195,14 +1195,17 @@ export class ScrumMaster extends Abject {
     // description, which is live: SkillAgent rebuilds it from its enabled
     // skills + connected MCP servers and re-registers on every change, so
     // this snapshot reflects current capabilities (unlike the static manifest
-    // description). It is a coarse summary — enough to recognize an obvious
-    // single-agent match for the quick_dispatch fast path — while `poll_team`
-    // remains the deep, live capability probe for anything non-obvious.
+    // description). It goes in whole: an agent's description says what it
+    // does and, just as importantly, what it refuses, and the refusal tends to
+    // come last. Cutting it produced planners that saw "works on files" and
+    // never read "only inside registered projects", so they skipped the poll
+    // that would have found the right agent. `poll_team` remains the deep,
+    // live capability probe for anything the descriptions leave unclear.
     const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
     const eligible = team.filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster');
-    const teamRoster = eligible.map(a => ({ name: a.name, description: (a.description ?? '').slice(0, 300) }));
+    const teamRoster = eligible.map(a => ({ name: a.name, description: a.description ?? '' }));
 
     // Offer quick_dispatch only on the very first look at a fresh goal (no
     // scrum round has planned or run anything yet) and only when this goal

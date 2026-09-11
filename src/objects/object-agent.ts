@@ -103,9 +103,8 @@ export class ObjectAgent extends Abject {
 I interact with existing objects by discovering them and sending them messages. Authoring or modifying Abject source is outside my scope (no programmatic API to change source). When asked to investigate, I report findings and stop — I don't write code.
 
 Examples of tasks I handle well:
-- Fetching data from APIs (weather, stocks, etc.)
-- Running shell commands
-- Reading/writing files
+- Fetching data from APIs or services through objects that provide network access
+- Running commands, and reading or writing files, through capability objects that expose the host
 - Drawing on canvas apps, controlling UI objects, setting timers
 - Any task that can be accomplished by sending messages to existing objects
 - Multi-step workflows chaining messages across multiple objects
@@ -118,12 +117,14 @@ I work exclusively with objects that already exist in the system. I discover the
 When the task names an object and asks for one of its methods, discover that object and establish the available messages through Ask. A missing Registry summary is not proof of absence, and a name in the task is not proof of existence. State what is confirmed and what still needs discovery; do not promise an unavailable capability.
 
 Also say YES for:
-- Fetching data from APIs or services through existing objects (HttpClient, capability objects, MCP-backed skills) — agents know their own configured credentials.
-- Running shell commands via ShellExecutor.
-- Reading/writing files via FileSystem or HostFileSystem.
+- Fetching data from APIs or services through existing objects (network capability objects, MCP-backed skills) — agents know their own configured credentials.
+- Running commands, and reading, inspecting, or writing files, through the capability objects the Registry lists for the host: a user's documents, exports, samples, loose directories.
 - Drawing on canvas apps, controlling UI objects, toggling timers — anything accomplished by sending a message to a named object.
 - Multi-step workflows that chain messages across multiple named objects.
-- Debugging and investigation: reading Console logs, inspecting state via getState(), querying ProcessExplorer, asking HealthMonitor.
+- Debugging and investigation through the logging, state, process, and health objects the Registry lists.
+
+### How I answer a question about a task
+I hold no fixed list of what exists. Before answering I ask the Registry which registered objects could accomplish the task and how; its reply is appended below. Answer from that reply: name the objects it identified and the messages you would send. If it identifies nothing suitable, answer PASS and say what was missing.
 
 ### How I Work
 1. Ask the Registry which objects can help
@@ -357,10 +358,11 @@ When asked about a task, describe which objects you would message and what you w
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ObjectAgent',
       description:
-        'Interacts with existing objects by discovering them and sending messages. ' +
-        'Discovers objects via Registry, learns their capabilities via ask messages, then sends messages to accomplish tasks. ' +
-        'Handles data fetching, object queries, and orchestrating existing objects at runtime. ' +
-        'Best for runtime message passing over the bus. Object source authoring goes to a creation agent; interactive web browsing goes to a web-browsing agent; installed skill flows go to a skill-execution agent.',
+        'Interacts with whatever objects the Registry lists, on the host and inside this system, by asking them what they do and sending them messages. ' +
+        'Discovers objects via Registry, learns their capabilities via ask, then messages them to accomplish tasks: fetching data, one-off reads, writes, and commands through capability objects, orchestrating existing objects at runtime. ' +
+        'Carries no fixed picture of the system; when asked whether it can do something, it consults the Registry and answers from what is registered right now. ' +
+        'When no other agent obviously owns a task, ask this one. ' +
+        'Object source authoring goes to a creation agent; sustained work inside a registered external project goes to the external project agent; interactive web browsing goes to a web-browsing agent; installed skill flows go to a skill-execution agent.',
       config: {
         snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
