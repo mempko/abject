@@ -124,6 +124,12 @@ export interface ExternalProject {
   isolation: IsolationMode;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Set on listed projects whose root is not on disk right now. Computed at
+   * list time, never persisted: the record is kept so the user can fix or
+   * remove it, but no task starts against it.
+   */
+  rootMissing?: boolean;
 }
 
 /** Paths no agent writes, whatever the project says. */
@@ -475,7 +481,7 @@ with the files each has written so far; agents report through \`taskStarted\`,
       return { success: had };
     });
 
-    this.on('listProjects', async () => this.list());
+    this.on('listProjects', async () => this.listAnnotated());
 
     this.on('getProject', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
@@ -484,7 +490,7 @@ with the files each has written so far; agents report through \`taskStarted\`,
 
     this.on('resolveProject', async (msg: AbjectMessage) => {
       const { nameOrPath } = msg.payload as { nameOrPath: string };
-      return this.resolve(nameOrPath);
+      return await this.resolve(nameOrPath);
     });
 
     this.on('setTrusted', async (msg: AbjectMessage) => {
@@ -620,6 +626,20 @@ with the files each has written so far; agents report through \`taskStarted\`,
     precondition(!input.name.includes('/'), 'project name must not contain a slash');
 
     const root = this.resolveRoot(input.root);
+    // A temp directory is a scratch area that the OS or the process that made
+    // it will clear, so a project registered there dangles the moment its
+    // owner is gone and then turns every task that lands on it into a setup
+    // failure. Projects live where the user keeps their work.
+    const tmp = path.resolve(os.tmpdir());
+    const relTmp = path.relative(tmp, root);
+    if (relTmp === '' || (!relTmp.startsWith('..') && !path.isAbsolute(relTmp))) {
+      return { success: false, error: `"${root}" is inside the temp directory (${tmp}); register a directory the user keeps` };
+    }
+    try {
+      await fs.access(root);
+    } catch {
+      return { success: false, error: `"${root}" does not exist on this machine` };
+    }
     const isolation: IsolationMode = input.isolation === 'worktree' ? 'worktree' : 'none';
     // Look for the checkout rather than asking. A caller that forgets to say
     // `vcs: 'git'` would silently lose checkpoints and worktree isolation on a
@@ -665,13 +685,34 @@ with the files each has written so far; agents report through \`taskStarted\`,
   }
 
   /**
-   * A handle, or any path inside a project. Path matching prefers the deepest
-   * root, so a project nested inside another resolves to the inner one.
+   * Whether the project's root is currently on disk. A root can go missing
+   * without the record being wrong: an unmounted drive, a checkout the user
+   * moved. The record stays so the user can fix or remove it; what changes
+   * is that no task is started against it.
    */
-  private resolve(nameOrPath: string): ExternalProject | null {
+  private async rootPresent(p: ExternalProject): Promise<boolean> {
+    try {
+      await fs.access(p.root);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Every project, each annotated with whether its root is on disk right now. */
+  private async listAnnotated(): Promise<ExternalProject[]> {
+    return Promise.all(this.list().map(async p => ({ ...p, rootMissing: !(await this.rootPresent(p)) })));
+  }
+
+  /**
+   * A handle, or any path inside a project, resolved to a project whose root
+   * is on disk. Path matching prefers the deepest root, so a project nested
+   * inside another resolves to the inner one.
+   */
+  private async resolve(nameOrPath: string): Promise<ExternalProject | null> {
     if (!nameOrPath) return null;
     const direct = this.projects.get(nameOrPath);
-    if (direct) return direct;
+    if (direct) return (await this.rootPresent(direct)) ? direct : null;
 
     const candidate = this.resolveRoot(nameOrPath);
     let best: ExternalProject | null = null;
@@ -679,6 +720,10 @@ with the files each has written so far; agents report through \`taskStarted\`,
       const rel = path.relative(p.root, candidate);
       const inside = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
       if (inside && (!best || p.root.length > best.root.length)) best = p;
+    }
+    if (best && !(await this.rootPresent(best))) {
+      log.warn(`project ${best.name} matches ${nameOrPath} but its root ${best.root} is missing`);
+      return null;
     }
     return best;
   }
@@ -751,6 +796,9 @@ with the files each has written so far; agents report through \`taskStarted\`,
         });
       }
       if (this.projects.size > 0) log.info(`loaded ${this.projects.size} external project(s)`);
+      for (const p of this.projects.values()) {
+        if (!(await this.rootPresent(p))) log.warn(`project ${p.name} root ${p.root} is missing; it stays registered but no task will start there`);
+      }
     } catch (err) {
       log.warn(`failed to load projects: ${err instanceof Error ? err.message : String(err)}`);
     }

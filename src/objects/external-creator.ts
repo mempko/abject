@@ -317,19 +317,27 @@ An external project is not assumed to be code. Source, prose, notes, data,
 configuration — same tools, same discipline.
 
 ### I answer YES to
-- Changing, adding, or removing files in a registered external project
-- Investigating a repository or directory on disk and reporting what is there
+- Changing, adding, or removing files inside a registered external project
+- Investigating a registered project and reporting what is there
 - Running a project's build, tests, linter, formatter, or any shell command in it
 - Fixing something that a compiler, test suite, or linter reports
-- Anything phrased as work on a repo, a checkout, a codebase, or a directory path
+- Anything naming a path that lies inside a registered project whose root is on disk
 
 ### I answer PASS to
 - Creating or modifying Abjects inside this system: objects, their source, their
   windows, their handlers. Those live in the Registry, not on disk, and belong to
   the object-authoring agent.
 - Interactive web browsing, and installed skill flows.
-- Work in a directory that is not a registered external project, unless the task
-  names the path — I will ask for it to be registered rather than guess.
+- Reading, inspecting, or summarizing files that lie outside every registered
+  project: a download, a sample export, a config file, a loose directory. The
+  agent that reads files anywhere on this machine and runs shell commands
+  handles those. I say which registered project, if any, the path is near, and
+  I do not pick a project the task did not name.
+- Work in a registered project whose root is missing on disk. I say so and PASS
+  rather than start a task that cannot be prepared.
+
+The list of registered projects below is live. Check the paths in the question
+against it before answering; a path inside no registered root is a PASS.
 
 ### Working beside other tasks
 Several of my tasks may work in one project at once; a scrum round stages them
@@ -343,6 +351,31 @@ baseline captured before I touched anything, so I am accountable for failures I
 introduced and not for the ones already there. When a project declares nothing to
 run, I say plainly what I changed and what I could not verify. I never report a
 clean result I did not observe.`;
+  }
+
+  /**
+   * Ask answers are grounded in the live project list: which roots exist,
+   * which are missing on disk. Without it the model would answer YES to any
+   * path that sounds like a directory, which is how loose files in a download
+   * folder ended up dispatched here.
+   */
+  protected override async handleAsk(question: string, _callerId?: AbjectId): Promise<string> {
+    return this.askLlm(this.askPrompt(question) + await this.askAvailabilityContext(), question, this.askTier());
+  }
+
+  protected override async askAvailabilityContext(): Promise<string> {
+    const reg = await this.projects();
+    if (!reg) return '\n\n### Registered external projects right now\nNone: the project registry is not available.';
+    let all: ExternalProject[] = [];
+    try {
+      all = await this.call<ExternalProject[]>(reg, 'listProjects', {}, 15_000);
+    } catch {
+      return '\n\n### Registered external projects right now\nUnknown: the project registry did not answer.';
+    }
+    if (all.length === 0) return '\n\n### Registered external projects right now\nNone. Every path is outside a registered project.';
+    const lines = all.map(p =>
+      `- ${p.name}: ${p.root}${p.rootMissing ? ' (root MISSING on disk; no task can start here)' : ''}`);
+    return `\n\n### Registered external projects right now\n${lines.join('\n')}`;
   }
 
   private async hostFs(): Promise<AbjectId> {
@@ -405,7 +438,12 @@ clean result I did not observe.`;
     const reg = await this.projects();
     if (!reg) return [];
     try {
-      return await this.call<ExternalProject[]>(reg, 'listProjects', {}, 15_000);
+      const all = await this.call<ExternalProject[]>(reg, 'listProjects', {}, 15_000);
+      // A project whose root is gone is not somewhere a task can start; it
+      // stays registered for the user to fix, not for the agent to pick.
+      const missing = all.filter(p => p.rootMissing);
+      if (missing.length > 0) log.warn(`skipping ${missing.map(p => `${p.name} (${p.root})`).join(', ')}: root missing`);
+      return all.filter(p => !p.rootMissing);
     } catch {
       return [];
     }
@@ -428,22 +466,32 @@ clean result I did not observe.`;
    * conclusive the loop starts unset and the agent picks.
    */
   private async pickProject(taskText: string, data?: Record<string, unknown>): Promise<ExternalProject | undefined> {
+    // `target` is what a planner sends when it means "work here"; the other
+    // two are older spellings of the same intent.
     const hint = typeof data?.project === 'string' ? data.project
       : typeof data?.projectPath === 'string' ? data.projectPath
+      : typeof data?.target === 'string' ? data.target
       : undefined;
+    const hintIsPath = hint !== undefined && /^~?\//.test(hint);
     if (hint) {
       const byHint = await this.resolveProject(hint);
       if (byHint) return byHint;
+      // A path that lies in no registered project is a clear answer: the
+      // task is about somewhere else, and guessing a project would run the
+      // task against the wrong directory.
+      if (hintIsPath) return undefined;
     }
 
     const all = await this.listProjects();
     if (all.length === 0) return undefined;
 
-    // An absolute path in the task text is as explicit as a hint.
+    // An absolute path in the task text is as explicit as a hint, in both
+    // directions: inside a project selects it, outside every project rules
+    // them all out.
     const pathMatch = taskText.match(/(?:^|\s)(~?\/[\w.\-/]+)/);
     if (pathMatch) {
       const byPath = await this.resolveProject(pathMatch[1]);
-      if (byPath) return byPath;
+      return byPath ?? undefined;
     }
 
     // A project named in the text, matched on a word boundary so "abjects"
@@ -1825,11 +1873,13 @@ clean result I did not observe.`;
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ExternalCreator',
       description:
-        'Works on files on the host: reads, writes, and edits them in a registered external project, ' +
-        'runs shell commands there, and runs the project\'s own check and verify commands, comparing ' +
-        'against a baseline so it reports only the failures it introduced. Handles software, prose, ' +
-        'notes, and data alike. Changing Abjects inside this system belongs to an object-authoring ' +
-        'agent; interactive web browsing and installed skill flows belong elsewhere.',
+        'Works inside registered external projects on the host: a repository, a manuscript folder, a ' +
+        'data directory the user has registered. Reads, writes, and edits files there, runs shell ' +
+        'commands there, and runs the project\'s own check and verify commands, comparing against a ' +
+        'baseline so it reports only the failures it introduced. Handles software, prose, notes, and ' +
+        'data alike. Restricted to registered projects: reading or inspecting loose files elsewhere on ' +
+        'the machine (a download, a sample export, a config file) belongs elsewhere, as do changing ' +
+        'Abjects inside this system, interactive web browsing, and installed skill flows.',
       config: {
         completionMethod: 'candidateComplete',
             snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
@@ -2029,16 +2079,38 @@ clean result I did not observe.`;
 
     try {
       extra.project = await this.pickProject(args.taskText, args.data);
+      let projectSetupNote: string | undefined;
       if (extra.project) {
-        await this.setupIsolation(extra);
-        await this.setDefaultCwd(extra);
-        await this.projectRevision(extra);
-        await this.captureBaseline(extra);
-        await this.checkpoint(extra, 'task start');
-        this.announceTaskStarted(extra);
+        try {
+          await this.setupIsolation(extra);
+          await this.setDefaultCwd(extra);
+          await this.projectRevision(extra);
+          await this.captureBaseline(extra);
+          await this.checkpoint(extra, 'task start');
+          this.announceTaskStarted(extra);
+        } catch (err) {
+          // A project that cannot be prepared (root gone, snapshot failing)
+          // is a fact about that project, not about the task. The loop starts
+          // unset and the agent decides: pick another project, or fail with
+          // the real reason. Failing here would blame the runner for it.
+          const why = err instanceof Error ? err.message : String(err);
+          const { name, root } = extra.project;
+          this.audit(extra, `project ${name} at ${root} could not be prepared (${why.slice(0, 200)}); starting without a project`);
+          log.warn(`task ${args.taskId}: project ${name} could not be prepared: ${why}`);
+          try { await this.teardownIsolation(extra); } catch { /* best effort */ }
+          projectSetupNote =
+            `The project "${name}" at ${root} could not be prepared: ${why}\n` +
+            `No project is selected. Use set_project to choose another registered project if the task belongs there, ` +
+            `otherwise fail with this reason so the goal can route the work elsewhere.`;
+          extra.project = undefined;
+          extra.workRoot = undefined;
+          extra.worktree = undefined;
+          extra.projectSession = undefined;
+        }
       }
 
       const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      if (projectSetupNote) initialMessages.push({ role: 'user', content: projectSetupNote });
       if (args.failureHistory && args.failureHistory.length > 0) {
         initialMessages.push({
           role: 'user',

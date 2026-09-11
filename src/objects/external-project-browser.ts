@@ -523,7 +523,9 @@ someone else wrote, so it is a button here rather than something granted on add.
 
   private formatItem(p: ExternalProject): ListItem {
     const commands = [p.checkCommand, p.verifyCommand].filter(Boolean).length;
-    const secondary = p.root;
+    // A root that is not on disk is the first thing to say about a project:
+    // nothing can run there until the user fixes or removes it.
+    const secondary = p.rootMissing ? `${p.root} (missing)` : p.root;
     // What the row has to convey at a glance: where it is, whether it can be
     // checked automatically, and whether its instructions are being trusted.
     const detail = commands === 0
