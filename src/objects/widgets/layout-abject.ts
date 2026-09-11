@@ -12,6 +12,7 @@ import {
   InterfaceDeclaration,
 } from '../../core/types.js';
 import { request, event } from '../../core/message.js';
+import { Log } from '../../core/timed-log.js';
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
@@ -25,9 +26,30 @@ import {
   resolveWH,
 } from './widget-types.js';
 
+const layoutLog = new Log('Layout');
+
 export interface ChildRect {
   widgetId: AbjectId;
   rect: Rect;
+}
+
+/**
+ * Fixed content that does not fit the container.
+ *
+ * A box layout never shrinks fixed or preferred children, so a form with more
+ * rows than the pane is tall silently pushes its last rows past the window
+ * edge. Nothing used to say so; the pane looked finished and its Save button
+ * was simply not there. Recording the overflow lets WidgetManager list it and
+ * lets a verifier fail on it.
+ */
+export interface LayoutOverflow {
+  axis: 'vertical' | 'horizontal';
+  /** Space the fixed children and spacing need, in px. */
+  needed: number;
+  /** Space the container actually has, in px. */
+  available: number;
+  /** Children whose rect ends past the container edge. */
+  hiddenChildren: number;
 }
 
 export interface LayoutMargins {
@@ -53,6 +75,12 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
         { name: 'stretch', type: { kind: 'primitive', primitive: 'number' }, description: 'Stretch factor' },
       ],
       returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
+      name: 'getLayoutOverflow',
+      description: 'Fixed content that does not fit this container ({ axis, needed, available, hiddenChildren }), or null when everything fits. Scrollable layouts never report overflow; scrolling is how they fit.',
+      parameters: [],
+      returns: { kind: 'object', properties: {} },
     },
     {
       name: 'getPreferredHeight',
@@ -135,6 +163,9 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected hiddenChildren: Set<AbjectId> = new Set();
   private layoutDirty = false;
   protected parentLayoutId: AbjectId | null = null;
+  /** Scrollable subclasses turn this off: content taller than the viewport is their job. */
+  protected reportsOverflow = true;
+  private lastOverflow?: LayoutOverflow;
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -215,7 +246,39 @@ export abstract class LayoutAbject extends WidgetAbject {
     await super.onStop();
   }
 
+  /**
+   * Record whether the fixed content fits, and tell WidgetManager when that
+   * changes. Called by subclasses at the end of every layout pass with the
+   * pass's own numbers, so the report always describes the geometry on
+   * screen. A container that has not been sized yet (0 x 0) says nothing.
+   */
+  protected noteOverflow(next: LayoutOverflow | undefined): void {
+    if (!this.reportsOverflow) return;
+    const before = this.lastOverflow ? JSON.stringify(this.lastOverflow) : '';
+    const after = next ? JSON.stringify(next) : '';
+    if (before === after) return;
+    this.lastOverflow = next;
+    if (next) {
+      layoutLog.warn(`${this.manifest.name} ${this.id.slice(0, 8)} overflows ${next.axis}ly: needs ${Math.round(next.needed)}px, has ${Math.round(next.available)}px, ${next.hiddenChildren} child(ren) past the edge`);
+    }
+    if (!this.parentId) return;
+    try {
+      this.send(event(this.id, this.parentId, 'layoutOverflow', {
+        layoutId: this.id,
+        ownerId: this.ownerId,
+        overflow: next ?? null,
+      }));
+    } catch { /* the manager may be gone during teardown */ }
+  }
+
+  /** Count children whose rect ends past the container's far edge. */
+  protected countPastEdge(rects: readonly ChildRect[], edge: number, axis: 'vertical' | 'horizontal'): number {
+    return rects.filter(cr => (axis === 'vertical' ? cr.rect.y + cr.rect.height : cr.rect.x + cr.rect.width) > edge + 0.5).length;
+  }
+
   private setupLayoutHandlers(): void {
+    this.on('getLayoutOverflow', async () => this.lastOverflow ?? null);
+
     this.on('addLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;

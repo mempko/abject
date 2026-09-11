@@ -121,6 +121,14 @@ export class VBoxLayout extends LayoutAbject {
       y += height + this.spacing;
     }
 
+    // Fixed rows plus the gaps between every child is what must fit; expanding
+    // children take whatever is left and can legitimately reach zero.
+    const needed = fixedHeight + totalSpacing;
+    this.noteOverflow(contentRect.height > 0 && needed > contentRect.height + 0.5
+      ? { axis: 'vertical', needed, available: contentRect.height,
+          hiddenChildren: this.countPastEdge(result, contentRect.y + contentRect.height, 'vertical') }
+      : undefined);
+
     return result;
   }
 }

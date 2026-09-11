@@ -28,6 +28,8 @@ export class ScrollableVBoxLayout extends VBoxLayout {
 
   constructor(config: ScrollableVBoxConfig) {
     super(config);
+    // Content taller than the viewport is the normal state here, not a defect.
+    this.reportsOverflow = false;
 
     // Override manifest name
     (this as unknown as { manifest: { name: string } }).manifest.name = 'ScrollableVBoxLayout';

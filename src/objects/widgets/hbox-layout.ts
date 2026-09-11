@@ -118,6 +118,12 @@ export class HBoxLayout extends LayoutAbject {
       x += width + this.spacing;
     }
 
+    const needed = fixedWidth + totalSpacing;
+    this.noteOverflow(contentRect.width > 0 && needed > contentRect.width + 0.5
+      ? { axis: 'horizontal', needed, available: contentRect.width,
+          hiddenChildren: this.countPastEdge(result, contentRect.x + contentRect.width, 'horizontal') }
+      : undefined);
+
     return result;
   }
 }

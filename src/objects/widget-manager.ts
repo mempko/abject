@@ -65,6 +65,7 @@ import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
 import { ScrollableVBoxLayout } from './widgets/scrollable-vbox-layout.js';
+import type { LayoutOverflow } from './widgets/layout-abject.js';
 import { LayoutAbject, LayoutMargins } from './widgets/layout-abject.js';
 import {
   WidgetType,
@@ -153,6 +154,16 @@ export class WidgetManager extends Abject {
   private shimWindowMap: Map<string, AbjectId> = new Map();
   // Maps WindowAbject AbjectId → owning Abject
   private windowOwners: Map<AbjectId, AbjectId> = new Map();
+  /**
+   * Layouts currently reporting fixed content that does not fit, keyed by
+   * layout id. Fed by the `layoutOverflow` event every box layout sends when
+   * its state changes; read by `listLayoutIssues`. A layout's owner is the
+   * window or parent layout it was created in, which is how an entry is
+   * traced back to a window and its owning object.
+   */
+  private layoutOverflows: Map<AbjectId, { ownerId: AbjectId; overflow: LayoutOverflow }> = new Map();
+  /** Every layout's owner (window or parent layout), so an overflow can be traced to a window. */
+  private layoutOwners: Map<AbjectId, AbjectId> = new Map();
   // Maps widget AbjectId → old-style string widget ID (for event translation)
   private widgetIdToShimId: Map<AbjectId, string> = new Map();
   // Maps widget AbjectId → window string ID (for event translation)
@@ -214,6 +225,15 @@ export class WidgetManager extends Abject {
                 name: 'listWindows',
                 description: 'List every live window: [{ windowId, ownerId, title, rect }]. Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
                 parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+              },
+              {
+                name: 'listLayoutIssues',
+                description: 'Windows whose box layouts hold more fixed content than fits: [{ windowId, ownerId, title, layoutId, overflow: { axis, needed, available, hiddenChildren } }]. Empty when every container fits. Pass windowId or ownerId to narrow. Use it after building or resizing a UI: a row past the window edge renders nowhere and no screenshot shows it.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Only this window', optional: true },
+                  { name: 'ownerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Only windows owned by this object', optional: true },
+                ],
                 returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
               },
               {
@@ -652,6 +672,35 @@ export class WidgetManager extends Abject {
           // window mid-teardown — skip it
         }
       }));
+      return out;
+    });
+
+    // A box layout says so whenever its fixed content stops (or starts)
+    // fitting. Kept here rather than polled: the layouts are many and the
+    // question is rare.
+    this.on('layoutOverflow', async (msg: AbjectMessage) => {
+      const { layoutId, ownerId, overflow } = msg.payload as {
+        layoutId: AbjectId; ownerId: AbjectId; overflow: LayoutOverflow | null;
+      };
+      if (!layoutId) return;
+      if (overflow) this.layoutOverflows.set(layoutId, { ownerId, overflow });
+      else this.layoutOverflows.delete(layoutId);
+    });
+
+    this.on('listLayoutIssues', async (msg: AbjectMessage) => {
+      const { windowId, ownerId } = (msg.payload ?? {}) as { windowId?: AbjectId; ownerId?: AbjectId };
+      const out: Array<{ windowId?: AbjectId; ownerId?: AbjectId; title?: string; layoutId: AbjectId; overflow: LayoutOverflow }> = [];
+      for (const [layoutId, entry] of this.layoutOverflows.entries()) {
+        const win = this.windowOfLayout(entry.ownerId);
+        const winOwner = win ? this.windowOwners.get(win) : undefined;
+        if (windowId && win !== windowId) continue;
+        if (ownerId && winOwner !== ownerId) continue;
+        let title: string | undefined;
+        if (win) {
+          try { title = await this.request<string>(request(this.id, win, 'getTitle', {}), 3000); } catch { /* mid-teardown */ }
+        }
+        out.push({ windowId: win, ownerId: winOwner, title, layoutId, overflow: entry.overflow });
+      }
       return out;
     });
 
@@ -1576,6 +1625,22 @@ export class WidgetManager extends Abject {
       },
     };
     this.send(request(this.id, this.uiServerId, 'setSceneTheme', { theme: sceneTheme }));
+  }
+
+  /**
+   * The window a layout lives in, following owner links: a window layout is
+   * owned by its window, a nested one by its parent layout, a split-pane child
+   * by the pane widget. Undefined for a detached layout nobody has placed yet.
+   */
+  private windowOfLayout(ownerId: AbjectId): AbjectId | undefined {
+    let id: AbjectId | undefined = ownerId;
+    for (let hops = 0; id && hops < 32; hops++) {
+      if (this.windowOwners.has(id)) return id;
+      const viaWidget = this.widgetToWindow.get(id);
+      if (viaWidget) return viaWidget;
+      id = this.layoutOverflows.get(id)?.ownerId ?? this.layoutOwners.get(id);
+    }
+    return undefined;
   }
 
   /** Get workspace ID for a widget/window by tracing through windowOwners → objectWorkspaces. */
@@ -2596,6 +2661,8 @@ async timerFired(msg) {
 - Rough formula: lines = ceil(textLength * fontSize * 0.55 / containerWidth), height = lines * (fontSize + 4)
 - When in doubt, over-estimate slightly — extra whitespace is better than clipped text
 
+**Forms and settings panes scroll** — A plain VBox never shrinks fixed rows, so a pane with more rows than the window is tall pushes its last rows (often the Save button) past the edge, where nothing renders and no screenshot shows them. Put any column of more than a handful of fixed-height rows in a ScrollableVBox (or NestedScrollableVBox), the way the built-in settings dialogs do. After building or resizing, listLayoutIssues on WidgetManager returns every container whose fixed content does not fit; an empty list is the check.
+
 **Nested Layouts in ScrollableVBox** — Use autoSize: true for nested layouts inside a ScrollableVBox:
 - Pass autoSize: true when creating nested VBox/HBox inside a ScrollableVBox (e.g. card items)
 - The nested layout auto-computes its preferred height from children and reports it to the parent
@@ -2943,6 +3010,13 @@ async timerFired(msg) {
     }
     this.windowOwners.delete(windowId);
 
+    for (const [layoutId, entry] of this.layoutOverflows.entries()) {
+      if (this.windowOfLayout(entry.ownerId) === windowId) this.layoutOverflows.delete(layoutId);
+    }
+    for (const [layoutId, owner] of this.layoutOwners.entries()) {
+      if (owner === windowId || this.windowOfLayout(owner) === windowId) this.layoutOwners.delete(layoutId);
+    }
+
     // Clean up widgetToWindow entries for this window's children
     for (const [widgetId, winId] of this.widgetToWindow.entries()) {
       if (winId === windowId) {
@@ -2978,6 +3052,7 @@ async timerFired(msg) {
 
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
+    this.layoutOwners.set(layout.id, windowId);
 
     // Add the layout as the window's child with a full-content rect
     // The window will update this rect on resize
@@ -3010,6 +3085,7 @@ async timerFired(msg) {
 
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
+    this.layoutOwners.set(layout.id, parentLayoutId);
 
     // Auto-add to parent with expanding defaults
     await this.request(request(this.id, parentLayoutId, 'addLayoutChild', {
@@ -3516,6 +3592,8 @@ async timerFired(msg) {
     this.widgetIdToShimId.delete(abjectId);
     this.widgetToWindowShimId.delete(abjectId);
     this.spawnedWidgets.delete(abjectId);
+    this.layoutOverflows.delete(abjectId);
+    this.layoutOwners.delete(abjectId);
 
     return true;
   }

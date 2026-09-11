@@ -39,14 +39,60 @@ const WIN_W = 1040;
 const WIN_H = 620;
 const BUTTON_ROW_H = 36;
 
+/** The isolation modes a project can be worked in. */
+const ISOLATION_MODES = ['none', 'worktree'] as const;
+
+/** Decode ListWidget's JSON change payload while preserving legacy raw values. */
+function listSelectionValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return value && typeof value === 'object' && typeof (value as { value?: unknown }).value === 'string'
+      ? (value as { value: string }).value
+      : undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { value?: unknown }).value === 'string') {
+      return (parsed as { value: string }).value;
+    }
+  } catch {
+    // Older `select` events may carry the item value directly.
+  }
+  return value;
+}
+
 export class ExternalProjectBrowser extends Abject {
   private registryObjId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
+  private tabBarId?: AbjectId;
   private detailsWidgetId?: AbjectId;
   private grantsWidgetId?: AbjectId;
+  private rightBodyId?: AbjectId;      // scrollable body of the right pane
+
+  // The configuration pane edits in place. Every control is held by id so a
+  // change event can be traced back to the field it belongs to, and the draft
+  // holds what has been typed but not yet saved.
+  private configEditorIds: AbjectId[] = [];
+  private descInputId?: AbjectId;
+  private checkInputId?: AbjectId;
+  private verifyInputId?: AbjectId;
+  private formatInputId?: AbjectId;
+  private setupInputId?: AbjectId;
+  private sharedInputId?: AbjectId;
+  private protectedInputId?: AbjectId;
+  private isolationSelectId?: AbjectId;
+  private autonomySelectId?: AbjectId;
+  private trustedCheckId?: AbjectId;
+  private saveBtnId?: AbjectId;
+  private revertBtnId?: AbjectId;
+  private configDraft = new Map<string, string>();
+  private configDirty = false;
+  private configProjectName = '';
+
+  private grantRowId?: AbjectId;
   private addBtnId?: AbjectId;
   private settingsBtnId?: AbjectId;
   private editBtnId?: AbjectId;
@@ -64,6 +110,7 @@ export class ExternalProjectBrowser extends Abject {
   private permissionRules: ManagedRule[] = [];
   private selected?: string;
   private selectedRuleIndex?: number;
+  private activeTab = 0;
 
   constructor() {
     super({
@@ -214,38 +261,117 @@ someone else wrote, so it is a button here rather than something granted on add.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
-    const { widgetIds: [listId, detailsId, grantsId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [listId, tabBarId, detailsId, grantsId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'list', windowId: this.windowId, items: [], searchable: true },
+          {
+            type: 'tabBar',
+            windowId: this.windowId,
+            tabs: ['Configuration', 'Grants'],
+            selectedIndex: this.activeTab,
+            closable: false,
+          },
           { type: 'list', windowId: this.windowId, items: [] },
           { type: 'list', windowId: this.windowId, items: [] },
         ],
       }),
     );
     this.listWidgetId = listId;
+    this.tabBarId = tabBarId;
     this.detailsWidgetId = detailsId;
     this.grantsWidgetId = grantsId;
+
+    // What a project needs configured is small and known, so it is offered as
+    // fields to edit rather than a list to click through and a chain of modal
+    // prompts to answer -- the same shape the system settings and network
+    // panes use. The summary list above stays as the at-a-glance view.
+    const { widgetIds: editorIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text: 'Description' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'What this project is' },
+          { type: 'label', windowId: this.windowId, text: 'Check command' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Fast check, run after every edit' },
+          { type: 'label', windowId: this.windowId, text: 'Verify command' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Full verification, such as the test suite' },
+          { type: 'label', windowId: this.windowId, text: 'Format command' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Optional formatting command' },
+          { type: 'label', windowId: this.windowId, text: 'Setup command' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Optional setup command' },
+          { type: 'label', windowId: this.windowId, text: 'Shared paths' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Comma-separated paths isolation may share' },
+          { type: 'label', windowId: this.windowId, text: 'Protected paths' },
+          { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Comma-separated paths that always ask before writes' },
+          { type: 'label', windowId: this.windowId, text: 'Isolation' },
+          { type: 'select', windowId: this.windowId, options: [...ISOLATION_MODES], selectedIndex: 0 },
+          { type: 'label', windowId: this.windowId, text: 'Autonomy requested' },
+          { type: 'select', windowId: this.windowId, options: [...AUTONOMY_LEVELS], selectedIndex: 0 },
+          { type: 'checkbox', windowId: this.windowId, checked: false, text: 'Trusted — may act here without asking every time' },
+          { type: 'button', windowId: this.windowId, text: 'Save changes' },
+          { type: 'button', windowId: this.windowId, text: 'Revert' },
+        ],
+      }),
+    );
+
+    // Positions follow the spec order above: label, control, label, control...
+    this.configEditorIds = editorIds;
+    this.descInputId = editorIds[1];
+    this.checkInputId = editorIds[3];
+    this.verifyInputId = editorIds[5];
+    this.formatInputId = editorIds[7];
+    this.setupInputId = editorIds[9];
+    this.sharedInputId = editorIds[11];
+    this.protectedInputId = editorIds[13];
+    this.isolationSelectId = editorIds[15];
+    this.autonomySelectId = editorIds[17];
+    this.trustedCheckId = editorIds[18];
+    this.saveBtnId = editorIds[19];
+    this.revertBtnId = editorIds[20];
     await this.request(request(this.id, leftPaneId, 'addLayoutChild', {
       widgetId: this.listWidgetId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
-    await this.request(request(this.id, rightPaneId, 'addLayoutChildren', {
+    // The tab bar stays pinned as the pane header; everything that can
+    // overflow lives in a scrollable body -- the same header + scroll body
+    // pattern the system settings and network panes use -- so the full
+    // configuration form stays reachable even on short windows.
+    await this.request(request(this.id, rightPaneId, 'addLayoutChild', {
+      widgetId: this.tabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 34 },
+    }));
+    const rightBodyId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: rightPaneId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 6,
+      }),
+    );
+    this.rightBodyId = rightBodyId;
+    await this.request(request(this.id, rightBodyId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.detailsWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.grantsWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.detailsWidgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 116 } },
+        ...this.configEditorIds.map(id => ({
+          widgetId: id,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 26 },
+        })),
+        // A fixed height: an expanding child inside a scroll container has no
+        // stable height to expand against, which is what let the pane clip.
+        { widgetId: this.grantsWidgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 260 } },
       ],
     }));
 
-    const grantRowId = await this.request<AbjectId>(
+    this.grantRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: rightPaneId,
+        parentLayoutId: rightBodyId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       }),
     );
-    await this.request(request(this.id, rightPaneId, 'updateLayoutChild', {
-      widgetId: grantRowId,
+    await this.request(request(this.id, rightBodyId, 'updateLayoutChild', {
+      widgetId: this.grantRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: BUTTON_ROW_H },
     }));
@@ -299,7 +425,7 @@ someone else wrote, so it is a button here rather than something granted on add.
         { widgetId: this.removeBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 130, height: BUTTON_ROW_H } },
       ],
     }));
-    await this.request(request(this.id, grantRowId, 'addLayoutChildren', {
+    await this.request(request(this.id, this.grantRowId, 'addLayoutChildren', {
       children: [
         { widgetId: this.addGrantBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
         { widgetId: this.editGrantBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: BUTTON_ROW_H } },
@@ -308,7 +434,10 @@ someone else wrote, so it is a button here rather than something granted on add.
     }));
 
     for (const id of widgetIds) this.send(request(this.id, id, 'addDependent', {}));
+    for (const id of this.configEditorIds) this.send(request(this.id, id, 'addDependent', {}));
     if (this.listWidgetId) this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
+    if (this.tabBarId) this.send(request(this.id, this.tabBarId, 'addDependent', {}));
+    await this.updateTabVisibility();
     if (this.registryObjId) this.send(request(this.id, this.registryObjId, 'addDependent', {}));
     this.brokerId = await this.resolveDep('PermissionBroker', this.brokerId);
     if (this.brokerId) this.send(request(this.id, this.brokerId, 'addDependent', {}));
@@ -329,8 +458,26 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.listWidgetId = undefined;
+    this.tabBarId = undefined;
     this.detailsWidgetId = undefined;
     this.grantsWidgetId = undefined;
+    this.configEditorIds = [];
+    this.descInputId = undefined;
+    this.checkInputId = undefined;
+    this.verifyInputId = undefined;
+    this.formatInputId = undefined;
+    this.setupInputId = undefined;
+    this.sharedInputId = undefined;
+    this.protectedInputId = undefined;
+    this.isolationSelectId = undefined;
+    this.autonomySelectId = undefined;
+    this.trustedCheckId = undefined;
+    this.saveBtnId = undefined;
+    this.revertBtnId = undefined;
+    this.configDraft.clear();
+    this.configDirty = false;
+    this.configProjectName = '';
+    this.grantRowId = undefined;
     this.addBtnId = undefined;
     this.settingsBtnId = undefined;
     this.editBtnId = undefined;
@@ -344,6 +491,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.permissionRules = [];
     this.selected = undefined;
     this.selectedRuleIndex = undefined;
+    this.activeTab = 0;
     this.changed('visibility', false);
     return true;
   }
@@ -496,6 +644,164 @@ someone else wrote, so it is a button here rather than something granted on add.
       await this.request(request(this.id, this.detailsWidgetId, 'update', { items: details }));
       await this.request(request(this.id, this.grantsWidgetId, 'update', { items: grants }));
     } catch { /* widgets may have been closed */ }
+
+    await this.rebuildEditor(project);
+  }
+
+  /**
+   * Fill the editable fields from the registry's copy of the project.
+   *
+   * A refresh must not silently discard what someone is in the middle of
+   * typing, so a dirty draft for the project still selected is left alone.
+   * Selecting a different project does replace it: the draft belonged to the
+   * project that was on screen.
+   */
+  private async rebuildEditor(project?: ExternalProject): Promise<void> {
+    if (this.configEditorIds.length === 0) return;
+
+    const name = project?.name ?? '';
+    if (this.configDirty && this.configProjectName === name) return;
+
+    this.configProjectName = name;
+    this.configDraft.clear();
+    this.configDirty = false;
+
+    const isolationIndex = Math.max(0, (ISOLATION_MODES as readonly string[]).indexOf(project?.isolation ?? 'none'));
+    const autonomyIndex = Math.max(0, (AUTONOMY_LEVELS as readonly string[]).indexOf(project?.autonomy ?? 'ask'));
+
+    const updates: Array<[AbjectId | undefined, Record<string, unknown>]> = [
+      [this.descInputId, { text: project?.description ?? '' }],
+      [this.checkInputId, { text: project?.checkCommand ?? '' }],
+      [this.verifyInputId, { text: project?.verifyCommand ?? '' }],
+      [this.formatInputId, { text: project?.formatCommand ?? '' }],
+      [this.setupInputId, { text: project?.setupCommand ?? '' }],
+      [this.sharedInputId, { text: (project?.sharedPaths ?? []).join(', ') }],
+      [this.protectedInputId, { text: (project?.protectedPaths ?? []).join(', ') }],
+      [this.isolationSelectId, { options: [...ISOLATION_MODES], selectedIndex: isolationIndex }],
+      [this.autonomySelectId, { options: [...AUTONOMY_LEVELS], selectedIndex: autonomyIndex }],
+      [this.trustedCheckId, { checked: project?.trusted ?? false }],
+      [this.saveBtnId, { text: 'Save changes' }],
+    ];
+
+    try {
+      for (const [id, payload] of updates) {
+        if (id) await this.request(request(this.id, id, 'update', payload));
+      }
+    } catch { /* widgets may have been closed */ }
+  }
+
+  /** Which configuration field a control in the pane stands for. */
+  private editorFieldFor(widgetId: AbjectId): string | undefined {
+    if (widgetId === this.descInputId) return 'description';
+    if (widgetId === this.checkInputId) return 'checkCommand';
+    if (widgetId === this.verifyInputId) return 'verifyCommand';
+    if (widgetId === this.formatInputId) return 'formatCommand';
+    if (widgetId === this.setupInputId) return 'setupCommand';
+    if (widgetId === this.sharedInputId) return 'sharedPaths';
+    if (widgetId === this.protectedInputId) return 'protectedPaths';
+    if (widgetId === this.isolationSelectId) return 'isolation';
+    if (widgetId === this.autonomySelectId) return 'autonomy';
+    if (widgetId === this.trustedCheckId) return 'trusted';
+    return undefined;
+  }
+
+  /**
+   * Write the pane back to the registry.
+   *
+   * Description, commands, paths and isolation are ordinary settings and go in
+   * one updateProject call. Trust and autonomy are not: the registry gates them
+   * separately because they hand out power, so they only move when they
+   * actually differ from what is stored, and granting trust still asks.
+   */
+  private async saveConfiguration(): Promise<void> {
+    const reg = await this.registry();
+    const project = this.current();
+    if (!reg || !project) {
+      await this.notify('Select a project first', 'warning');
+      return;
+    }
+
+    const draft = (key: string, fallback: string): string => this.configDraft.get(key) ?? fallback;
+    const list = (value: string): string[] => value.split(',').map(v => v.trim()).filter(Boolean);
+
+    const protectedPaths = list(draft('protectedPaths', (project.protectedPaths ?? []).join(', ')));
+    if ((project.protectedPaths ?? []).length > protectedPaths.length) {
+      const ok = await this.confirm({
+        title: 'Reduce protected paths?',
+        message: 'Removing protected paths permits more writes without an explicit prompt. Continue?',
+        confirmLabel: 'Save changes',
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+
+    const checkCommand = draft('checkCommand', project.checkCommand ?? '');
+    const verifyCommand = draft('verifyCommand', project.verifyCommand ?? '');
+    const formatCommand = draft('formatCommand', project.formatCommand ?? '');
+    const setupCommand = draft('setupCommand', project.setupCommand ?? '');
+
+    try {
+      await this.request(request(this.id, reg, 'updateProject', {
+        name: project.name,
+        changes: {
+          description: draft('description', project.description ?? ''),
+          checkCommand: checkCommand || undefined,
+          verifyCommand: verifyCommand || undefined,
+          formatCommand: formatCommand || undefined,
+          setupCommand: setupCommand || undefined,
+          sharedPaths: list(draft('sharedPaths', (project.sharedPaths ?? []).join(', '))),
+          protectedPaths,
+          isolation: draft('isolation', project.isolation) as ExternalProject['isolation'],
+        },
+      }));
+    } catch (err) {
+      await this.notify(`Could not save ${project.name}: ${(err as Error).message}`, 'error');
+      return;
+    }
+
+    // The checkbox reports the string 'true' or 'false', never a boolean.
+    const wantTrusted = this.configDraft.has('trusted')
+      ? this.configDraft.get('trusted') === 'true'
+      : project.trusted;
+    if (wantTrusted !== project.trusted) {
+      const granting = wantTrusted && !await this.confirm({
+        title: `Trust ${project.name}?`,
+        message: 'A trusted project may run commands here without asking every time.',
+        confirmLabel: 'Trust',
+      });
+      if (!granting) {
+        try {
+          await this.request(request(this.id, reg, 'setTrusted', {
+            name: project.name,
+            trusted: wantTrusted,
+          }));
+        } catch (err) {
+          await this.notify(`Could not change trust: ${(err as Error).message}`, 'error');
+        }
+      }
+    }
+
+    const wantAutonomy = draft('autonomy', project.autonomy) as AutonomyLevel;
+    if (wantAutonomy !== project.autonomy) {
+      try {
+        const r = await this.request<{ success: boolean; error?: string }>(
+          request(this.id, reg, 'setAutonomy', { name: project.name, autonomy: wantAutonomy }));
+        if (r && !r.success) await this.notify(r.error ?? 'Could not change autonomy', 'error');
+      } catch (err) {
+        await this.notify(`Could not change autonomy: ${(err as Error).message}`, 'error');
+      }
+    }
+
+    this.configDraft.clear();
+    this.configDirty = false;
+    await this.load();
+  }
+
+  /** Throw the unsaved draft away and show what the registry holds. */
+  private async revertConfiguration(): Promise<void> {
+    this.configDraft.clear();
+    this.configDirty = false;
+    await this.rebuildDetails();
   }
 
   private current(): ExternalProject | undefined {
@@ -515,22 +821,42 @@ someone else wrote, so it is a button here rather than something granted on add.
       return;
     }
 
+    if (fromId === this.tabBarId && aspect === 'change') {
+      if (value === 0 || value === 1) {
+        this.activeTab = value;
+        await this.updateTabVisibility();
+      }
+      return;
+    }
+
     if (fromId === this.listWidgetId && (aspect === 'select' || aspect === 'selectionChanged')) {
-      const v = value as { value?: string } | string | undefined;
-      this.selected = typeof v === 'string' ? v : v?.value;
+      this.selected = listSelectionValue(value);
       this.selectedRuleIndex = undefined;
       await this.rebuildDetails();
       return;
     }
     if (fromId === this.grantsWidgetId && (aspect === 'select' || aspect === 'selectionChanged')) {
-      const v = value as { value?: string } | string | undefined;
-      const raw = typeof v === 'string' ? v : v?.value;
+      const raw = listSelectionValue(value);
       this.selectedRuleIndex = raw?.startsWith('rule:') ? Number(raw.slice(5)) : undefined;
+      return;
+    }
+
+    // Editing happens in the pane itself: each field reports its own change
+    // into the draft, and nothing reaches the registry until Save. These are
+    // input aspects, so they have to be read above the click gate below.
+    const field = this.editorFieldFor(fromId);
+    if (field && (aspect === 'change' || aspect === 'submit')) {
+      this.configDraft.set(field, String(value ?? ''));
+      this.configDirty = true;
+      if (this.saveBtnId) this.send(request(this.id, this.saveBtnId, 'update', { text: 'Save changes •' }));
+      if (aspect === 'submit') await this.saveConfiguration();
       return;
     }
 
     if (aspect !== 'click') return;
 
+    if (fromId === this.saveBtnId) return this.saveConfiguration();
+    if (fromId === this.revertBtnId) return this.revertConfiguration();
     if (fromId === this.addBtnId) return this.addProject();
     if (fromId === this.settingsBtnId) return this.editProjectSettings();
     if (fromId === this.editBtnId) return this.editCommands();
@@ -540,6 +866,23 @@ someone else wrote, so it is a button here rather than something granted on add.
     if (fromId === this.addGrantBtnId) return this.addGrant();
     if (fromId === this.editGrantBtnId) return this.editGrant();
     if (fromId === this.removeGrantBtnId) return this.removeGrant();
+  }
+
+  private async updateTabVisibility(): Promise<void> {
+    const configurationVisible = this.activeTab === 0;
+    const visibility: ReadonlyArray<readonly [AbjectId | undefined, boolean]> = [
+      [this.detailsWidgetId, configurationVisible],
+      ...this.configEditorIds.map(id => [id, configurationVisible] as const),
+      [this.grantsWidgetId, !configurationVisible],
+      [this.grantRowId, !configurationVisible],
+    ];
+
+    for (const [id, visible] of visibility) {
+      if (!id) continue;
+      try {
+        await this.request(request(this.id, id, 'update', { style: { visible } }));
+      } catch { /* widget may be gone */ }
+    }
   }
 
   private async addProject(): Promise<void> {

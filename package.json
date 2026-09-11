@@ -35,7 +35,7 @@
     "release": "node release.mjs",
     "typecheck": "tsc --noEmit",
     "test:agents": "node --import tsx --test --test-isolation=none src/objects/agent-system.*.test.ts",
-    "test": "node --import tsx --test --test-isolation=none src/objects/*.test.ts src/network/*.test.ts src/llm/*.test.ts src/protocol/*.test.ts"
+    "test": "node --import tsx --test --test-isolation=none src/objects/*.test.ts src/objects/widgets/*.test.ts src/network/*.test.ts src/llm/*.test.ts src/protocol/*.test.ts"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.15",
