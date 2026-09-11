@@ -65,12 +65,38 @@ export type ErrorMessage = AbjectMessage<AbjectError>;
 // Interface Declaration
 // =============================================================================
 
+/** What calling a method does to the world. Reads are safe to
+ *  generate and heal autonomously; acts must cross a hand-written gate. */
+export type SideEffect = 'read-only' | 'mutating';
+
+/** A metamorphic relation the method's outputs must satisfy.
+ *  Checked by the fitness gate (src/protocol/fitness.ts) — never by an LLM. */
+export interface RelationDeclaration {
+  kind: 'subset-on-tighter-filter' | 'idempotent' | 'no-duplicates'
+      | 'sorted-by' | 'non-empty-for-known-entity';
+  /** 'sorted-by': output field to be non-decreasing on.
+   *  'subset-on-tighter-filter': the argument that narrows the result. */
+  field?: string;
+}
+
 export interface MethodDeclaration {
   resultContract?: import('./result-contract.js').ResultContract;
   name: string;
   description: string;
   parameters: ParameterDeclaration[];
   returns?: TypeDeclaration;
+  /** Contract fields the fitness gate judges against. All optional, so a
+   *  manifest written before they existed stays valid. */
+  sideEffects?: SideEffect;
+  /** JSON Schema the method's return value must validate against. */
+  outputSchema?: Record<string, unknown>;
+  relations?: RelationDeclaration[];
+  /** A value that must appear somewhere in a healthy output (known-entity probe). */
+  entityRef?: string;
+  /** Dot-paths masked in this method's recorded response bodies before they
+   *  reach cassette storage (e.g. 'user.ssn'). For payload fields the header
+   *  and query redaction cannot know about. */
+  redactPaths?: string[];
 }
 
 export interface ParameterDeclaration {

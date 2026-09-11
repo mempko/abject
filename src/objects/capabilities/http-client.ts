@@ -6,6 +6,7 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
+import { beforeRequest, afterResponse } from '../../protocol/cassette-recorder.js';
 
 const HTTP_INTERFACE = 'abjects:http';
 
@@ -190,7 +191,7 @@ export class HttpClient extends Abject {
     // for health pings during long-running fetches (e.g. LLM API calls).
     this.on('request', async (msg: AbjectMessage) => {
       const req = msg.payload as HttpRequest;
-      this.makeRequest(req).then(
+      this.makeRequest(req, msg.routing.from).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -206,7 +207,7 @@ export class HttpClient extends Abject {
         url: string;
         headers?: Record<string, string>;
       };
-      this.makeRequest({ method: 'GET', url, headers }).then(
+      this.makeRequest({ method: 'GET', url, headers }, msg.routing.from).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -223,7 +224,7 @@ export class HttpClient extends Abject {
         body: string;
         headers?: Record<string, string>;
       };
-      this.makeRequest({ method: 'POST', url, body, headers }).then(
+      this.makeRequest({ method: 'POST', url, body, headers }, msg.routing.from).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -260,7 +261,7 @@ export class HttpClient extends Abject {
         url,
         body: data,
         headers: { 'Content-Type': 'application/json' },
-      }).then(
+      }, msg.routing.from).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -300,12 +301,27 @@ export class HttpClient extends Abject {
   /**
    * Make an HTTP request with retry for transient errors.
    */
-  async makeRequest(req: HttpRequest): Promise<HttpResponse> {
+  async makeRequest(req: HttpRequest, callerId?: string): Promise<HttpResponse> {
     if (this.webDisabled) throw new Error('Web access is disabled. Enable it in Settings > Permissions.');
     // Validate URL
     const url = new URL(req.url);
     this.validateScheme(url.protocol);
     this.validateDomain(url.hostname);
+
+    // Replay seam: a registered replay-mode caller is served from its
+    // cassette store and never touches the network. A miss throws.
+    const replayed = beforeRequest(callerId, { method: req.method, url: req.url, headers: req.headers, body: req.body });
+    if (replayed) {
+      // A full HttpResponse, with the recorded body text verbatim — the
+      // caller must not be able to tell replay from the live network.
+      return {
+        status: replayed.status,
+        statusText: '',
+        headers: replayed.headers,
+        body: replayed.rawBody,
+        ok: replayed.status >= 200 && replayed.status < 300,
+      };
+    }
 
     // Build fetch options
     const options: RequestInit = {
@@ -344,6 +360,9 @@ export class HttpClient extends Abject {
 
         // Read body
         const body = await response.text();
+
+        afterResponse(callerId, { method: req.method, url: req.url, headers: req.headers, body: req.body },
+          { status: response.status, rawBody: body });
 
         return {
           status: response.status,

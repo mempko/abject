@@ -35,6 +35,9 @@ import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import * as acorn from 'acorn';
+import { evaluate, deployGate, verdictDigest, summarizeVerdict, type Verdict } from '../protocol/fitness.js';
+import { CassetteStore } from '../protocol/cassette.js';
+import { buildSandboxInvoker } from '../protocol/sandbox-invoker.js';
 
 const log = new Log('OBJECT-CREATOR');
 
@@ -307,6 +310,14 @@ interface LoopState {
   baselineCallKeys?: Set<string>;
   /** Source the semantic reviewer has already seen — never review the same draft twice. */
   semanticReviewedSource?: string;
+  /** The fitness gate's most recent verdict on a draft, and a digest of what
+   *  it judged: target, source, AND declarations. A verdict is only valid for
+   *  that exact triple — see `deployGate` in `../protocol/fitness.js`. */
+  fitnessVerdict?: Verdict;
+  fitnessSourceDigest?: string;
+  /** Live-manifest methods read for the heal path, cached so the deploy gate
+   *  recomputes the same digest without a second round trip. */
+  fitnessLiveMethods?: { targetId: AbjectId; methods: MethodDeclaration[]; note?: string };
 
   terminal?: { kind: 'done' | 'fail'; result?: unknown; error?: string };
   spawnedObjectId?: AbjectId;
@@ -358,6 +369,8 @@ export class ObjectCreator extends Abject {
   private systemRegistryId?: AbjectId;
   private factoryId?: AbjectId;
   private abjectStoreId?: AbjectId;
+  /** Storage abject, for reading a target object's persisted fitness cassettes. Optional: absent means fitness judges on schema+relations+mutation alone. */
+  private storageId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private goalManagerId?: AbjectId;
   private knowledgeBaseId?: AbjectId;
@@ -479,6 +492,7 @@ export class ObjectCreator extends Abject {
     this.factoryId = await this.requireDep('Factory');
     this.systemRegistryId = (await this.discoverDep('SystemRegistry')) ?? undefined;
     this.abjectStoreId = (await this.discoverDep('AbjectStore')) ?? undefined;
+    this.storageId = (await this.discoverDep('Storage')) ?? undefined;
     this.agentAbjectId = (await this.discoverDep('AgentAbject')) ?? undefined;
     this.goalManagerId = (await this.discoverDep('GoalManager')) ?? undefined;
     this.knowledgeBaseId = (await this.discoverDep('KnowledgeBase')) ?? undefined;
@@ -692,7 +706,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private static readonly VALID_ACTIONS = [
     'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft', 'read_guide',
     'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'clone_object', 'draft_via_llm',
-    'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
+    'compile', 'validate_calls', 'review_semantics', 'fitness', 'deploy_spawn', 'deploy_update',
     'compose_organism', 'extract_organelle',
     'reply', 'ask_user', 'done', 'fail',
   ];
@@ -700,7 +714,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // ── Staging, and when each check runs ─────────────────────────────────
   //
   // Every op that writes `state.draftSource` ends in `finishEdit`. Two checks
-  // exist and they have very different natures, so they run at different times:
+  // run themselves off an edit, and they have very different natures, so they
+  // run at different times:
   //
   //   SYNTAX — runs on EVERY edit, and is load-bearing. Members are addressed by
   //   name through the parsed object literal, so an unparseable draft cannot be
@@ -718,6 +733,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   //   WAITS for the edit set to close: while more edits are coming (more actions
   //   of the same LLM response are queued, or the agent passed `more: true`) it
   //   does not run. It runs once, on the closing edit.
+  //
+  // A THIRD gate — FITNESS — also refuses a deploy, but it is not an edit-time
+  // check and it is not mechanical: it is explicit (`fitness()`), it judges the
+  // whole draft against the target's RECORDED TRAFFIC (replay, declared output
+  // schemas, declared relations, mutation), and it costs a step. See
+  // `opFitness` and `deployGate` in `../protocol/fitness.js`.
   //
   // A staging op never fails merely because the object is incomplete. That
   // matters mechanically: AgentAbject discards the rest of a batched response
@@ -1473,16 +1494,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       try { spawnReq.data = JSON.parse(JSON.stringify(registration.data)); } catch { spawnReq.data = {}; }
     }
 
-    let result: SpawnResult;
-    try {
-      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, summary: `clone_object: spawn failed: ${msg.slice(0, 120)}`, error: msg };
-    }
-    if (!result?.objectId) {
-      return { ok: false, summary: 'clone_object: Factory returned no objectId', error: 'unexpected Factory response' };
-    }
+    const spawned = await this.gatedSpawn(state, spawnReq, 'clone_object', 'redeploys-live-source');
+    if ('refusal' in spawned) return spawned.refusal;
+    const result = spawned.result;
 
     // Persist so the clone survives a restart (same as deploy_spawn).
     if (this.abjectStoreId) {
@@ -1832,11 +1846,100 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return { ok: result.verified, summary, result, data: advisory, error: result.verified ? undefined : this.formatSemanticIssues(result) };
   }
 
+  /**
+   * Load the target object's persisted fitness cassettes from Storage
+   * (key `cassettes:<objectId>`). Absent target, absent Storage, a missing
+   * key, or a corrupt payload all fall back to an empty store rather than
+   * failing the fitness op. An empty store is judged by `evaluate`'s
+   * no-evidence path: every check returns an unverified pass, honestly
+   * labelled. A store holding only `_http` traffic is not empty but is
+   * equally unattributed, so replay and relations report unverified and a
+   * declared outputSchema fails closed.
+   */
+  private async loadCassettes(targetId?: AbjectId): Promise<CassetteStore> {
+    if (!targetId || !this.storageId) return new CassetteStore();
+    try {
+      const raw = await this.sendRequest<unknown>(this.storageId, 'get', { key: `cassettes:${targetId}` });
+      return CassetteStore.fromJSON(raw ?? []);
+    } catch {
+      return new CassetteStore(); // no store, corrupt store, storage down: judge on schema+relations+mutation
+    }
+  }
+
+  /**
+   * The method declarations the fitness gate judges against.
+   *
+   * Normally the staged draft manifest. On a HEAL the agent edits source
+   * without redrafting a manifest, so `draftManifest` is unset and the schema
+   * and relation checks would be vacuous against an empty method list — read
+   * the live target's manifest instead, the same `describe` a dependency
+   * lookup uses. Cached per target: the deploy gate must recompute the SAME
+   * digest, and must not fail a deploy because a best-effort read that
+   * succeeded at judgment time happens to fail now.
+   */
+  private async fitnessMethods(state: LoopState): Promise<{ methods: MethodDeclaration[]; note?: string }> {
+    const drafted = state.draftManifest?.interface?.methods;
+    if (drafted) return { methods: drafted };
+    const targetId = state.targetObjectId;
+    if (!targetId) return { methods: [] };
+    const cached = state.fitnessLiveMethods;
+    if (cached?.targetId === targetId) return { methods: cached.methods, note: cached.note };
+
+    let methods: MethodDeclaration[] = [];
+    let note: string | undefined;
+    try {
+      const ir = await this.sendRequest<Partial<IntrospectResult>>(targetId, 'describe', {}, 5000);
+      methods = (ir?.manifest as AbjectManifest | undefined)?.interface?.methods ?? [];
+      if (methods.length === 0) note = 'live manifest declares no methods — schema/relations vacuous';
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      note = `live manifest unreadable (${msg.slice(0, 60)}) — schema/relations vacuous`;
+    }
+    state.fitnessLiveMethods = { targetId, methods, note };
+    return { methods, note };
+  }
+
+  /**
+   * The hard gate: replays the target's recorded cassettes, validates output
+   * schemas and relations, and mutation-tests the staged draft — entirely
+   * inside the sandbox, with every I/O call shimmed to the object's own
+   * cassettes. Records the verdict and a digest of the judged source;
+   * deploy_spawn/deploy_update consult both via `deployGate` and refuse when
+   * the draft has changed since this ran.
+   */
+  private async opFitness(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!state.draftSource) return { ok: false, summary: 'fitness: no draft source', error: 'draft a source first' };
+    const { methods, note } = await this.fitnessMethods(state);
+    const cassettes = await this.loadCassettes(state.targetObjectId);
+    const verdict = await evaluate({ source: state.draftSource }, { cassettes, methods },
+      buildSandboxInvoker());
+    state.fitnessVerdict = verdict;
+    state.fitnessSourceDigest = verdictDigest(state.draftSource, methods, state.targetObjectId);
+    const failed = verdict.checks.filter(c => !c.pass).map(c => `${c.check}: ${c.detail}`).join('; ');
+    const caveat = note ? ` [${note}]` : '';
+    return {
+      ok: verdict.pass,
+      summary: summarizeVerdict(verdict) + caveat,
+      error: verdict.pass ? undefined : failed,
+      data: verdict,
+    };
+  }
+
   // ── The deploy gate ───────────────────────────────────────────────────
   //
-  // Deploy is the ONLY place a check refuses to proceed, and it refuses on
-  // mechanical grounds only: a draft that does not parse, or that calls a method
-  // a dependency's live manifest does not have, must never reach the live object.
+  // Deploy is the ONLY place a check refuses to proceed, and it refuses on two
+  // different kinds of ground.
+  //
+  //   MECHANICAL (`gateDeploy`, below): a draft that does not parse, or that
+  //   calls a method a dependency's live manifest does not have, must never
+  //   reach the live object.
+  //
+  //   EVIDENTIAL (`deployGate`, ../protocol/fitness.js): the draft must carry a
+  //   PASSING fitness verdict — recorded traffic replayed, declared schemas and
+  //   relations upheld, mutants killed — for exactly this source, these
+  //   declarations, and this target. Not mechanical, and the only non-mechanical
+  //   refusal there is.
+  //
   // LLM judgments (the semantic reviewer) advise but never block — a deployed
   // object answering real calls teaches more per step than another blind pass.
 
@@ -1964,6 +2067,53 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /**
+   * The one door to Factory.spawn. Every op that creates an object routes
+   * through here with an explicit policy:
+   *
+   *   'gate-draft'          -- the source being deployed is a STAGED DRAFT;
+   *                            deployGate must hold a passing fitness verdict
+   *                            for it (digest-bound to source, declarations,
+   *                            and target) or the spawn is refused.
+   *   'redeploys-live-source' -- the source is copied VERBATIM from an object
+   *                            that is already live (clone, extract). There
+   *                            is no draft to judge and no cassettes exist
+   *                            under the not-yet-existing id. Exemption
+   *                            raised with the upstream maintainer on PR #11;
+   *                            tightening it is a one-line policy change.
+   *
+   * `judgeSource` is what the gate judges when it differs from what the
+   * Factory receives -- an organism deploys a JSON spec, but the code being
+   * shipped inside it is the staged membrane source.
+   */
+  private async gatedSpawn(state: LoopState, spawnReq: SpawnRequest, label: string,
+                           policy: 'gate-draft' | 'redeploys-live-source',
+                           judgeSource?: string):
+      Promise<{ result: SpawnResult } | { refusal: { ok: false; summary: string; error: string } }> {
+    if (!this.factoryId) {
+      return { refusal: { ok: false, summary: `${label}: Factory unavailable`, error: 'Factory not resolved' } };
+    }
+    if (policy === 'gate-draft') {
+      const judged = judgeSource ?? spawnReq.source;
+      if (typeof judged !== 'string' || judged.length === 0) {
+        return { refusal: { ok: false, summary: `${label}: no source to judge`, error: 'stage a source first' } };
+      }
+      const gate = deployGate(state, judged, (await this.fitnessMethods(state)).methods);
+      if (!gate.ok) return { refusal: { ok: false, summary: gate.error, error: gate.error } };
+    }
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { refusal: { ok: false, summary: `${label}: spawn failed: ${msg.slice(0, 120)}`, error: msg } };
+    }
+    if (!result?.objectId) {
+      return { refusal: { ok: false, summary: `${label}: Factory returned no objectId`, error: 'unexpected Factory response' } };
+    }
+    return { result };
+  }
+
+  /**
    * Deploy a CREATE: read the staged manifest + source from the loop state
    * and send Factory.spawn server-side. Still pure message passing — this
    * dispatches `request(this.id, factoryId, 'spawn', payload)` — but the
@@ -1987,17 +2137,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       registryHint: this.registryId,
     };
 
-    let result: SpawnResult;
-    try {
-      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, summary: `deploy_spawn: ${msg.slice(0, 120)}`, error: msg };
-    }
-
-    if (!result?.objectId) {
-      return { ok: false, summary: 'deploy_spawn: Factory returned no objectId', error: 'unexpected Factory response' };
-    }
+    const spawned = await this.gatedSpawn(state, spawnReq, 'deploy_spawn', 'gate-draft');
+    if ('refusal' in spawned) return spawned.refusal;
+    const result = spawned.result;
 
     state.spawnedObjectId = result.objectId;
 
@@ -2080,8 +2222,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const refusal = this.gateDeploy(state, 'deploy_update');
     if (refusal) return refusal;
 
-    // Resolve target: explicit objectId / targetName from action wins, else
-    // fall back to the kind:modify state target.
+    // Resolve target BEFORE the fitness gate: the action can name an object
+    // the gate never saw (the gate judged `state.targetObjectId`, which an
+    // explicit objectId/targetName overrides), and a verdict earned against
+    // another object's cassettes says nothing about this one.
     let targetId: AbjectId | undefined;
     let targetLabel: string | undefined;
     const explicitId = this.actionField(action, ['objectId']);
@@ -2102,6 +2246,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     } else {
       return { ok: false, summary: 'deploy_update: no target', error: 'pass {objectId} or {targetName} in the action payload, or use deploy_spawn for new objects' };
     }
+
+    const gate = deployGate(state, state.draftSource,
+      (await this.fitnessMethods(state)).methods, targetId);
+    if (!gate.ok) return { ok: false, summary: gate.error, error: gate.error };
 
     // Everything from here is one write to one object. Two modify loops
     // running at once would otherwise interleave their four steps and leave
@@ -2395,16 +2543,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       registryHint: this.registryId,
     };
 
-    let result: SpawnResult;
-    try {
-      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, summary: `compose_organism: spawn failed: ${msg.slice(0, 120)}`, error: msg };
-    }
-    if (!result?.objectId) {
-      return { ok: false, summary: 'compose_organism: Factory returned no objectId', error: 'unexpected Factory response' };
-    }
+    // The organism's Factory source is the JSON spec, but the code being
+    // shipped is the membrane draft -- that is what the gate judges.
+    const spawned = await this.gatedSpawn(state, spawnReq, 'compose_organism', 'gate-draft', membraneSource);
+    if ('refusal' in spawned) return spawned.refusal;
+    const result = spawned.result;
 
     state.spawnedObjectId = result.objectId;
     // The staged membrane drafts are now live inside the organism.
@@ -2466,16 +2609,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       parentId: this.id,
       registryHint: this.registryId,
     };
-    let result: SpawnResult;
-    try {
-      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, summary: `extract_organelle: spawn failed: ${msg.slice(0, 120)}`, error: msg };
-    }
-    if (!result?.objectId) {
-      return { ok: false, summary: 'extract_organelle: Factory returned no objectId', error: 'unexpected Factory response' };
-    }
+    const spawned = await this.gatedSpawn(state, spawnReq, 'extract_organelle', 'redeploys-live-source');
+    if ('refusal' in spawned) return spawned.refusal;
+    const result = spawned.result;
 
     state.spawnedObjectId = result.objectId;
 
@@ -3567,6 +3703,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'review_semantics':
           res = await this.opReviewSemantics(state);
           break;
+        case 'fitness':
+          res = await this.opFitness(state);
+          break;
         case 'deploy_spawn':
           res = await this.opDeploySpawn(state);
           break;
@@ -3974,6 +4113,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing; use it to resolve a concrete uncertainty. Use it to look at a member you are about to rewrite, or one a check named. Read related members as needed to understand the change; avoid repeating an unchanged read without a new question.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
+- \`fitness()\` — hard gate: replays recorded cassettes, validates output schemas and relations, and mutation-tests the draft. \`deploy_spawn\`/\`deploy_update\` refuse until fitness passes on the current draft.
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.

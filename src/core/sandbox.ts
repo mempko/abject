@@ -49,6 +49,10 @@ export const BLOCKED_CODE_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: stri
   { pattern: /\bfetch\s*\(/, label: 'fetch()' },
   { pattern: /\bXMLHttpRequest\b/, label: 'XMLHttpRequest' },
   { pattern: /\bWebSocket\b/, label: 'WebSocket' },
+  // Realm intrinsics, not injected globals: Atomics.wait blocks the thread
+  // past V8's interrupt check, so no vm timeout can recover from it.
+  { pattern: /\bAtomics\b/, label: 'Atomics' },
+  { pattern: /\bSharedArrayBuffer\b/, label: 'SharedArrayBuffer' },
 ];
 
 /**
