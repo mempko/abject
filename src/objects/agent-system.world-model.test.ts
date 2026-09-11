@@ -313,6 +313,45 @@ test('semantic evaluation penalizes false corrections, missing scope and invente
   const scored=evaluate(corpus,answers); assert.equal(scored.correct,corpus.length-5); assert.equal(scored.unsupportedChanges,2);
 });
 
+test('semantic evaluation rejects exit-code heuristics across command and protocol meanings',async()=>{
+  const {evaluate}=await import('../../scripts/evaluate-learning.js');
+  const corpus=JSON.parse(await readFile(new URL('../../tests/fixtures/learning-judgment.json',import.meta.url),'utf8'));
+  const cases=corpus.filter((c:any)=>c.operation);
+  assert.equal(cases.length,8);
+  // These are deliberately wrong judgments, not simulated model responses.
+  const answers=cases.map((c:any)=>({id:c.id,
+    verdict:c.operation.runtimeOutcome==='success'?'supported':'contradicted',
+    disposition:c.expected.dispositions[0],scope:c.expected.scope}));
+  const scored=evaluate(cases,answers);
+  assert.deepEqual(scored.rows.filter(r=>r.passed).map(r=>r.id),['diff-one-not-zero']);
+  for(const id of ['diff-one-found-differences','search-one-no-matches','expected-rejection-observed']) {
+    assert.equal(scored.rows.find(r=>r.id===id)?.passed,false);
+  }
+});
+
+test('reviewer semantic support preserves a nonzero operation observation through the bus',async()=>{
+  const f=await fixture();
+  try {
+    const record={taskId:'comparison',goalId:f.goalId,task:'Compare files',phase:'done',agentName:'ExternalCreator',steps:1,
+      transcript:'git diff --no-index -- before.txt after.txt returned a complete patch; exit 1 denotes differences',
+      predictions:[{step:1,action:'bash',expect:'The complete differences will be available',outcome:'failure',verdict:'unresolved',
+        actual:JSON.stringify({exitCode:1,stdout:'-before\n+after',stderr:''})}]};
+    await f.runtime.call(f.goals.id,'recordTaskEvidence',{goalId:f.goalId,taskId:record.taskId,record});
+    (f.reviewer as any).taskExtras.get('review').records.push(record);
+    const act=(action:unknown)=>f.runtime.call(f.reviewer.id,'agentAct',{taskId:'review',action});
+    const before=await f.runtime.call(f.goals.id,'readGoalData',{goalId:f.goalId,key:'learning/task/comparison'});
+    const evidence=await act({action:'read_evidence',taskId:'comparison'});
+    assert.equal(evidence.success,true);assert.match(evidence.data,/git diff --no-index/);assert.match(evidence.data,/exitCode/);
+    const assessment=await act({action:'assess_prediction',taskId:'comparison',step:1,verdict:'supported',
+      explanation:'The complete patch was returned. For git diff --no-index, exit 1 reports differences found and supports availability of the diff.'});
+    assert.equal(assessment.success,true,JSON.stringify(assessment));
+    const saved=await f.runtime.call(f.goals.id,'readGoalData',{goalId:f.goalId,key:'learning/assessment/comparison:1'});
+    assert.equal(saved.verdict,'supported');
+    const after=await f.runtime.call(f.goals.id,'readGoalData',{goalId:f.goalId,key:'learning/task/comparison'});
+    assert.deepEqual(after,before,'semantic interpretation must not rewrite the raw execution evidence');
+  }finally{await f.stop();}
+});
+
 test('unfinished learning restores from its owner journal without the old goal index or SharedState metadata',async()=>{
   const f=await fixture();
   try {

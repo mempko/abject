@@ -261,6 +261,16 @@ export class GoalManager extends Abject {
     });
   }
 
+  /** Write time of every stamped scratchpad key on one goal. */
+  private scratchpadStamps(goalId: GoalId): Record<string, number> {
+    const prefix = `${goalId}::`;
+    const out: Record<string, number> = {};
+    for (const [key, stamp] of this.scratchStamps.entries()) {
+      if (key.startsWith(prefix)) out[key.slice(prefix.length)] = stamp.updatedAt;
+    }
+    return out;
+  }
+
   /** Publish one scratchpad key as its own LWW register. */
   private syncScratchKeyToSharedState(goal: Goal, key: string, value: unknown): void {
     const stamp = { updatedAt: Date.now(), peerId: this.selfPeerId };
@@ -2185,7 +2195,12 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('getGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
       const { goalId } = msg.payload as { goalId: GoalId };
-      return this.readRetainedGoal(goalId);
+      const goal = await this.readRetainedGoal(goalId);
+      if (!goal) return null;
+      // When each key was last written, so a reader can tell a round-1 figure
+      // from the run that superseded it. Keys restored from storage carry no
+      // stamp and read as unknown, never as newest.
+      return { ...goal, scratchpadUpdatedAt: this.scratchpadStamps(goalId) };
     });
 
     this.on('listGoals', async (msg: AbjectMessage) => {

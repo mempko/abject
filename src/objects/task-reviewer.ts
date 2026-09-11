@@ -39,6 +39,7 @@ import { request } from '../core/message.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
 import { makePattern, readPattern, serializePattern, PATTERN_FIELDS } from '../core/pattern.js';
 import type { AgentAction, PredictionRecord } from './agent-abject.js';
+import { verificationRecordOf, renderVerificationRecord } from './scrum-master.js';
 import { learningFingerprint, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
 import { Log } from '../core/timed-log.js';
 
@@ -287,14 +288,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (extra) extra.cancelled = true;
       return { success: true };
     });
-    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('snapshotTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      return structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId));
+    });
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
       const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: ReviewTaskExtra };
       if (!snapshot) throw new Error('Missing specialist checkpoint');
       if (this.inFlight && this.inFlight.ticketId !== taskId) throw new Error('Another review is running; retry when it settles');
       this.inFlight = { ticketId: taskId, startedAt: Date.now() };
-      this.taskExtras.set(taskId, structuredClone(snapshot));
+      this.taskExtras.set(taskId, { ...structuredClone(snapshot), cancelled: false });
       return { success: true };
     });
 
@@ -581,6 +585,29 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return result;
   }
 
+  /**
+   * Keep the reviewer's verdict on the user-facing summary with the goal, and
+   * say so in the log when the summary misreported: that is the one review
+   * finding a person reading the log wants immediately, since the summary
+   * was the thing they read.
+   */
+  private async recordSummaryFidelity(extra: ReviewTaskExtra, value: unknown): Promise<void> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const { verdict, explanation } = value as { verdict?: unknown; explanation?: unknown };
+    if (verdict !== 'consistent' && verdict !== 'misreported' && verdict !== 'unverifiable') {
+      extra.completionIssues?.push('summaryFidelity.verdict must be consistent, misreported or unverifiable');
+      return;
+    }
+    const fidelity = { verdict, explanation: typeof explanation === 'string' ? explanation.slice(0, 2000) : undefined, at: Date.now() };
+    if (verdict === 'misreported') log.warn(`goal ${extra.goalId?.slice(0, 8) ?? '?'}: user-facing summary misreported — ${fidelity.explanation ?? '(no explanation)'}`);
+    if (!extra.goalId || !this.goalManagerId) return;
+    try {
+      await this.request(request(this.id, this.goalManagerId, 'writeGoalData', { goalId: extra.goalId, key: 'learning/summary-fidelity', value: fidelity }), 10000);
+    } catch (err) {
+      extra.completionIssues?.push(`Summary fidelity not recorded: ${String(err)}`);
+    }
+  }
+
   private async completeReview(taskId: string, result: unknown) {
     const extra = this.taskExtras.get(taskId);
     if (!extra) return { accepted: true, result: this.learningReport(undefined, true) };
@@ -635,6 +662,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       else extra.completionIssues.push('Invalid standalone correction');
     }
     if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
+    await this.recordSummaryFidelity(extra, batch.summaryFidelity);
     const missing = (extra.records ?? []).flatMap(r => (r.predictions ?? [])
       .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
     if (!extra.cancelled && extra.kind === 'review' && missing.length && !extra.completionIssues.length && !extra.completionCorrectionSent) {
@@ -665,12 +693,26 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (verdict === 'helpful' || verdict === 'harmful' || verdict === 'inconclusive') patternCounts[verdict]++;
       else { patternCounts.unresolved++; unassessedApplications.push({ taskId: r.taskId, step: p.step, id: applied.id, applicationRef: applied.applicationRef }); }
     }
+    // Report the causal chain using recorded references, not a second model pass.
+    // A shared decision may consider several episodes; it is not proof that each
+    // effect was caused by every prediction in that decision's context.
+    const episodesWithLearning = [...episodes].map(([key, prediction]) => {
+      const assessmentRef = `learning/assessment/${key}`;
+      const decisions = (extra?.decisions ?? []).filter(d =>
+        (Array.isArray(d.context.assessmentRefs) && d.context.assessmentRefs.includes(assessmentRef))
+        || Object.hasOwn(d.evidence, assessmentRef));
+      return { episode: key, expected: prediction.expect, observationRef: prediction.actualRef,
+        actual: prediction.actual, appliedPatterns: prediction.patterns ?? [],
+        assessment: assessments[key] ?? { verdict: 'unresolved', explanation: 'No recorded assessment' },
+        assessmentRef, consideredBy: decisions.map(d => ({ decisionId: d.id,
+          effects: d.effects.map(e => ({ effectId: e.id, action: e.input.action, knowledgeId: e.input.id, state: e.state, receipt: e.receipt })) })) };
+    });
     const learningEffects = (extra?.decisions ?? []).flatMap(d => d.effects.map(e => ({ decisionId: d.id, ...e })));
     const allSaved = [...saved, ...learningEffects.filter(e => e.state === 'applied')];
     const allPending = [...pending, ...learningEffects.filter(e => e.state !== 'applied' && e.state !== 'abandoned')];
     const status = interrupted || learningEffects.some(e => e.state !== 'applied' && e.state !== 'abandoned') || extra?.completionIssues?.length || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
     return { status, interrupted, saved: allSaved, pending: allPending, decisions: extra?.decisions ?? [], attempts: updates, limitations: extra?.completionIssues ?? [],
-      predictions: { total: episodes.size, ...counts, unassessed },
+      predictions: { total: episodes.size, ...counts, unassessed, episodes: episodesWithLearning },
       patterns: { ...patternCounts, unassessed: unassessedApplications },
       summary: `Learning review ${status}: ${allSaved.length} updates saved, ${allPending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
   }
@@ -794,7 +836,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
     if (!this.underDailyCap()) return;
 
-    const goal = await this.request<{ title?: string; description?: string; scratchpad?: Record<string, unknown> } | null>(
+    const goal = await this.request<{ title?: string; description?: string; result?: string; scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.goalManagerId!, 'getGoal', { goalId: review.goalId }),
       10000,
     ).catch(() => null);
@@ -859,6 +901,12 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       `Description: ${(goal?.description ?? '').slice(0, 1500)}\n` +
       `Outcome: ${review.outcome}${review.detail ? ` (${review.detail.slice(0, 500)})` : ''}\n` +
       `Tasks reviewed: ${records.length}${goalTaskIds.length > records.length ? ` of ${goalTaskIds.length}` : ''}\n`;
+    // What the user was told, next to what the capability owners recorded.
+    // A summary that quotes a figure no recorded run supports is a finding
+    // in its own right, whatever the goal's outcome.
+    const record = verificationRecordOf(goal?.scratchpad ?? {});
+    material += `\n### User-facing result (what the user was told)\n${(typeof goal?.result === 'string' ? goal.result : '(none recorded)').slice(0, 4000)}\n`;
+    material += `\n### Verification record (capability-owner receipts, newest first)\n${renderVerificationRecord(record)}\n`;
     material += `\n### Plan revisions and observations\n${JSON.stringify(Object.fromEntries(Object.entries(goal?.scratchpad ?? {}).filter(([k]) => k === 'learning/plans' || k.startsWith('learning/observation/')))).slice(0, 16000)}\n`;
     material += `\nAll task outcomes (including tasks omitted from detailed transcripts):\n${all.map(r => `${r.taskId}: ${r.agentName}, ${r.phase}, ${r.error ?? ''}`).join('\n')}\n`;
     if (executionRecord) {
@@ -1488,9 +1536,18 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private reviewSystemPrompt(): string {
     return `You are a post-task reviewer. Work in this workspace just finished: either a goal (with the transcripts of every task that ran under it, across one or more agents) or a single standalone task. The conversation above contains the material: the outcome, each task's transcript, and the knowledge entries that were injected into each agent's prompt. Your job is to grow the workspace's long-term memory from this experience, then finish. The doing is over; you only distill.
 
+Permission and environment claims require owner evidence. Compare recorded execution provider/transport/contextVersion with capability permission receipts. A provider sandbox restriction is not an Abject denial. Worker narratives alone do not establish unavailable access. Read referenced observations when needed; leave unsupported claims unresolved, and correct stale knowledge when owner evidence contradicts it.
+
 Assess each prediction and pattern against its observed episode. A failed goal can contain useful approaches, and a successful goal can contain false predictions. Separate local evidence from the overall outcome.
 
 The observation-step manifest lists the complete assessment coverage. Do not infer agreement from a truncated excerpt. Read full evidence when an excerpt cannot establish the comparison, especially final verification and commit outcomes. Record supported, contradicted, or unresolved with an explanation for every listed step. The runtime may request one targeted correction for omissions.
+
+## Interpret operation results before judging predictions
+Assess the exact prediction made before the action, using the operation's actual arguments, output, and observed effects. The runtime's success/failure and status-comparison verdict are raw execution evidence, not your semantic assessment. Preserve those observations; do not rewrite an exit code to make it agree with your judgment.
+
+An exit status has meaning within a particular command or protocol. For example, git diff --no-index returns 1 when it finds differences: a returned patch can support "the differences will be available", while contradicting "these files are identical" or "this command will exit 0". A search returning 1 with no matches can support "there are no matching records" if the intended scope was searched successfully; an unreadable input or invalid expression does not establish absence. Expected validation rejection can support a prediction when the rejection and absence of side effects are observed. Conversely, exit 0 with skipped items, partial results, or the wrong artifact does not support a claim of complete execution.
+
+Read the command or requested method and its evidence with read_evidence when the index omits them. Do not infer the semantics of an unfamiliar status, a truncated result, or a compound command from its final exit alone. A later successful command or pipeline stage may hide an earlier failure. Explain which part of the recorded expectation the output supports or contradicts. A compound prediction is supported only when its material claims are supported; a disproved material claim is contradicted, and a missing material observation is unresolved when nothing disproves it. If the operation's meaning or result coverage cannot be established from the available evidence, record unresolved with the specific gap rather than guessing. Ground any resulting knowledge correction in this semantic comparison, not merely in the runtime's status label.
 
 For execution of an accepted proposal, compare the observed artifact or effect with the actual accepted selection, grouping, and wording, including omissions and additions. Use read_evidence with context:true to find the reviewed goal's conversation references, then context:true with messageId or sourceGoalId and optional key to retrieve the proposal. Read only the missing evidence; do not rerun the work. Git staging exit 0, diff statistics, and git diff --check do not prove that approved hunks landed in the intended commit. Compare full staged/committed evidence with the intended selection; if that evidence is unavailable, mark the substantive claim unresolved rather than supported. Combined-tree verification does not prove every intermediate commit was verified. Assess whether repeated inspections were justified by changed inputs or missing details before crediting a reuse pattern. Record counterexamples only for patterns actually declared, and keep specific proposal contents on the goal scratchpad.
 
@@ -1529,7 +1586,7 @@ Use real task/step identities from the dossier. Cover the recorded predictions, 
 
 ## How to review
 1. **Evaluate predictions first.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
-2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Runtime verdicts compare declared operation status; they do not assess the free-text expectation. A failed action can be the expected result. Legacy missed flags are not proof. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
+2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Runtime verdicts compare declared operation status; they do not assess the free-text expectation. A failed action can be the expected result. Legacy missed flags are not proof. Distinguish an invalid pattern from incorrect application, changed conditions, and an execution defect. Preserve competing explanations and scope any revision to the evidence. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
 3. **Distill sparingly.** New reusable lessons are optional. A routine task can finish with no new lesson after recording its prediction assessments; an empty learning update list does not replace those assessments. Save a lesson only when it will help a later task in the applicable project or environment: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 4. **Reconcile existing knowledge with the world.** Compare the claims injected into agents with current observations, including owner-reported checks that ran before the first model action. A successful task can disprove old claims such as a command, test suite, or capability being unavailable. This matters even when no pattern was declared. Correct the existing entry's title AND content, preserving scope, observation date, and evidence; archive obsolete duplicates rather than adding a competing correction alongside them. Do not erase unrelated valid content. Fetch the full entry with recall by id before replacing an excerpt. Current entries may already be corrected: compare them with the historical claim and leave accurate revisions alone. Missing or ambiguous evidence means uncertainty, not an automatic rewrite. Prefetched entries satisfy recall only for the material shown.
 5. **Preserve evidence without overstating conclusions.** Expected failures, transient outages, and recoveries can test the world model. Record relevant contextual evidence and competing explanations in pattern applications. Do not turn a single timeout into a permanent claim that a capability is broken; keep uncertainty explicit and propose discriminating observations when the cause is unknown.
@@ -1550,7 +1607,10 @@ The knowledge base is a world model. Compare predictions made before actions wit
 
 Assess patterns actually applied (id, applied revision, reason), not merely injected knowledge. Record helpful, harmful, and inconclusive applications with evidence and competing explanations. When a pattern was used several times, name taskId and step in each application so distinct episodes survive replay deduplication. Revision numbers are managed automatically. Do not supply them. If provenance is unresolved, inspect read_evidence once; retain unresolved evidence and finish a partial review if it cannot be recovered. Inspect read_evidence when a briefing excerpt is insufficient; preserve contradictions even when the overall goal succeeded. Develop candidate patterns from new explanations and strengthen them only with recurring evidence. Learn from transient failures without turning a single outage into a permanent limitation.
 
-Finish when the evidence supports the learning updates; do not invent an update just to make one.`;
+Finish when the evidence supports the learning updates; do not invent an update just to make one.
+
+## Summary fidelity
+The user-facing result is a claim; the verification record is evidence. Compare them: every figure about checks or tests in the result must match the NEWEST recorded run, and caveats a task reported (what it did not cover or verify) must survive into the result. Include \`summaryFidelity: { verdict: "consistent" | "misreported" | "unverifiable", explanation }\` in your done result: misreported when the result quotes a figure or claim the record contradicts or does not support, unverifiable when there is no record to compare against. Name the specific figure or claim in the explanation.`;
   }
 
   private curationSystemPrompt(): string {

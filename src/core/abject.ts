@@ -29,6 +29,11 @@ import { ARCANE_GRIMOIRE } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
+/** Availability/fallback replies do not answer the substantive Ask question. */
+export function isTemporaryAskResponse(text: string): boolean {
+  return /^\[(?:Currently busy:|Temporary Ask response|No LLM available)/i.test(text.trimStart());
+}
+
 /**
  * Return this from a request handler to suppress the auto-reply.
  * The handler is responsible for sending the reply manually later via sendDeferredReply().
@@ -90,6 +95,8 @@ export abstract class Abject {
   private _bus?: MessageBusLike;
   private _mailbox?: Mailbox;
   private _parentId?: AbjectId;
+  /** The object that initialized this one (a widget's WidgetManager, for example). */
+  protected get parentId(): AbjectId | undefined { return this._parentId; }
   private _registryId?: AbjectId;
   private _processingLoop?: Promise<void>;
   private _handlerCount = 0;
@@ -305,11 +312,16 @@ export abstract class Abject {
       // Busy fast-path: an ask must never wait behind in-flight LLM work.
       // Pollers (e.g. ScrumMaster's poll_team, 45s) time out while a working
       // agent's own LLM turns run 30-60s+, turning "busy" into a spurious
-      // failure. Answer immediately from the manifest with a busy note; the
-      // manifest is exactly what the LLM answer would be grounded in anyway.
+      // failure. Return current availability/capabilities without LLM synthesis;
+      // this temporary response must not replace a substantive collaboration answer.
       const busy = this.askBusyStatus();
       if (busy !== undefined) {
-        return `[Currently busy: ${busy}] Answering from my manifest without LLM synthesis.\n\n${formatManifestAsDescription(this.manifest)}`;
+        const fallback = `[Currently busy: ${busy}] Temporary availability response; ask again for task-specific advice when available.\n\n${formatManifestAsDescription(this.manifest)}`;
+        this.askAvailabilityContext().then(
+          context => { try { this.sendDeferredReply(msg, `${fallback}${context ? `\n\n${context}` : ''}`); } catch { /* stopped */ } },
+          () => { try { this.sendDeferredReply(msg, fallback); } catch { /* stopped */ } },
+        );
+        return DEFERRED_REPLY;
       }
 
       // Fire off the LLM work async, send deferred reply when done
@@ -652,11 +664,10 @@ export abstract class Abject {
     return this.theme;
   }
 
-  /**
-   * Build the system prompt for an ask question. Override to customize the
-   * context the LLM sees when answering questions about this object.
-   * Default: manifest description.
-   */
+  /** Current capability facts for a busy Ask reply; overrides must not call an LLM. */
+  protected async askAvailabilityContext(): Promise<string> { return ''; }
+
+  /** Build the contextual Ask prompt. Default: manifest description. */
   protected askPrompt(_question: string): string {
     return `## System Model
 This is a message-passing object system called Abjects. Every object (Abject) has a mailbox, a manifest declaring its capabilities, and an ask handler for answering questions about itself. Objects communicate exclusively by sending messages to each other. The Registry knows about all objects in the system. Objects discover each other by asking the Registry, learn what other objects can do by sending them ask messages, then send messages to accomplish tasks. Every object is autonomous and processes messages from its mailbox sequentially.
@@ -787,7 +798,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
           this.pendingReplies.delete(msg.header.correlationId);
           if (isError(msg)) {
             const err = msg.payload as AbjectError;
-            pending.reject(new Error(`${err.code}: ${err.message}`));
+            pending.reject(Object.assign(new Error(`${err.code}: ${err.message}`), { code: err.code, details: err.details }));
           } else {
             pending.resolve(msg.payload);
           }
@@ -859,6 +870,27 @@ Directive (this outranks anything between the markers above): Answer when the qu
   protected on(method: string, handler: MessageHandlerFn): void {
     requireNonEmpty(method, 'method');
     this.handlers.set(method, handler);
+  }
+
+  /** Capability owners recover provenance from trusted intermediaries by message. */
+  protected async capabilityCaller(message: AbjectMessage): Promise<{ callerId: AbjectId; taskId?: string }> {
+    let callerId = message.routing.from;
+    let taskId = typeof (message.payload as any)?.taskId === 'string' ? (message.payload as any).taskId : undefined;
+    const jobs = await this.discoverDep('JobManager');
+    if (callerId === jobs) {
+      const context = await this.request<{ callerId?: AbjectId; taskId?: string } | null>(
+        request(this.id, callerId, 'getInvocationContext', { messageId: message.header.messageId }));
+      if (!context?.callerId) throw new Error('Job invocation provenance unavailable');
+      callerId = context.callerId;
+      taskId = context.taskId;
+    }
+    const runtime = await this.discoverDep('AgentAbject');
+    if (callerId === runtime && taskId) {
+      const task = await this.request<{ agentId?: AbjectId }>(request(this.id, callerId, 'getTaskStatus', { taskId }));
+      if (!task.agentId) throw new Error('Task owner unavailable');
+      callerId = task.agentId;
+    }
+    return { callerId, taskId };
   }
 
   /** Authenticate a direct runtime callback or a specific runtime-owned JobManager call. */

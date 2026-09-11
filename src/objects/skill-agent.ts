@@ -159,16 +159,20 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   }
 
   protected override async handleAsk(question: string): Promise<string> {
-    let prompt = this.askPrompt(question);
+    return this.askLlm(this.askPrompt(question) + await this.askAvailabilityContext(), question, 'fast');
+  }
+
+  protected override async askAvailabilityContext(): Promise<string> {
+    let prompt = '';
 
     if (this.skillRegistryId) {
       // Fetch skills and MCP servers in parallel
       const [allSkills, servers] = await Promise.all([
         this.request<Array<{ name: string; description: string; enabled: boolean; isMcpServer?: boolean; mcpStatus?: string; error?: string; configFile?: string }>>(
-          request(this.id, this.skillRegistryId, 'listSkills', {}),
+          request(this.id, this.skillRegistryId, 'listSkills', {}), 3000,
         ).catch(() => []),
         this.request<Array<{ name: string; tools: Array<{ name: string; description: string }> }>>(
-          request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
+          request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}), 3000,
         ).catch(() => []),
       ]);
 
@@ -190,7 +194,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       }
     }
 
-    return this.askLlm(prompt, question, 'fast');
+    return prompt;
   }
 
   private getInstalledSkillsSummary(): string {
@@ -198,7 +202,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   }
 
   private setupHandlers(): void {
-    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('snapshotTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      return structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId));
+    });
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
       const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: TaskExtra };
@@ -947,28 +954,15 @@ Example response:
 
 Every action can include a "reasoning" field explaining your thinking.
 
-## Handling Large Tool Results
+## Retaining and processing results
 
-Tool calls can return far more data than fits the context window. Email bodies with embedded base64 images, full file contents, rendered web pages, and large list queries all blow up fast. A single oversized observation poisons every subsequent think call in this task, so the whole task dies with an API error. Budget every call BEFORE you run it.
+Send messages to the capability owner for external access, including MCP operations and shell execution. Choose metadata, filters, or pagination when they answer the question efficiently. The runtime retains large received results behind read_chunk references; use those references instead of repeating the original request. For mechanical filtering or extraction, submit_job can process retained results through bus messages without putting all the data in the model context.
 
-**Pagination first.** When a tool has a limit/offset parameter (emails, messages, records, files), start with a small batch like \`limit: 5\`. Summarise what you saw into scratchpad, then page with \`offset\` only if you need more. Thirty emails with full bodies can exceed a million tokens; five at a time, distilled along the way, stay under a few KB.
+Read enough evidence to make the decision. Several content reads can be appropriate; there is no required summary between each pair. Summarize when it reduces context cost, preserving exact identifiers, selections, cursors, source references, and decision reasons as structured scratchpad values. A prose summary is not a substitute for the exact data a later action needs.
 
-**Distil immediately.** After any call that returns full content (a message body, a file, a web page), your very next action should write a short summary (who, what, when, why, in roughly 500 chars or less) to scratchpad under a stable key like \`email-<id>-summary\`. Do NOT fetch another full-content item before distilling the previous one. If you return to the raw content later, \`read_scratchpad\` with a summary key instead of re-fetching.
+For an approved follow-up, read the originating conversation and linked goal data with read_context. Reuse the saved selection or plan, apply the user's exclusions, and check only facts that may have changed. If required evidence is unavailable, explain the gap instead of inventing identifiers or silently rebuilding a different selection.
 
-**Watch the size.** If a result comes back larger than roughly 10 KB, your next action must either (a) write a summary to scratchpad so the raw data stops mattering, or (b) \`fail\` the task with a short reason so a creation agent can build a dedicated preprocessor object. Do not stack large results.
-
-**Preprocess in the shell.** Whenever you reach data through the \`shell\` action, pipe it through \`jq\`, \`grep\`, \`sed\`, \`head\`, \`awk\`, or redirect to a temp file and read back only the slice you need. For HTML, strip \`data:image/*;base64,...\` URIs before the payload lands in your observation. It is always cheaper to trim before the LLM sees the bytes than to reason about them after.
-
-**Scratchpad is your memory, history is not.** Conversation history gets trimmed and re-sent on every step; scratchpad persists and is read on demand. Summaries, indices, cursors, partial results, anything you need across steps belongs in scratchpad. Your final \`done\` should assemble its answer from scratchpad rather than assuming earlier observations are still in context.
-
-**Escalate oversized work back to ScrumMaster.** For tasks that legitimately need multiple independent chunks (example: "summarise my 30 most recent emails" when one task cannot fit safely), use \`fail\` with a short reason and a concrete proposed split such as "split into 5-email chunks, each writing email-batch-N-summary to scratchpad, then synthesize." ScrumMaster owns task planning and will use the next scrum to split the work with the team.
-
-Worked example. Task: "what are the most important emails I should look at today?"
-1. \`mcp_tool_call\` get_emails with \`limit: 10, offset: 0\` to pull metadata only (sender, subject, date, unread flag).
-2. \`write_scratchpad\` key \`inbox-index\` with a compact one-line-per-message listing.
-3. Rank the index in your head, pick the top 3 candidates that are unread or time-sensitive.
-4. For each candidate: \`mcp_tool_call\` get_email_by_id, then immediately \`write_scratchpad\` key \`email-<id>-summary\` with sender, subject, one-sentence gist, action required. Never carry the full body forward.
-5. \`done\` with a short ranked list composed from the summary keys. Never include raw bodies in the final answer.
+A large response alone is not a reason to fail or split a task. Page or process it through its owner; involve ScrumMaster when the remaining work really requires another collaborator or plan.
 
 ## Installing MCP Server Skills
 

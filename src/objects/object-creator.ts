@@ -21,14 +21,14 @@ import { domainFailure, type ResultContract } from '../core/result-contract.js';
 
 import { encodeAgentState } from '../core/agent-session-codec.js';
 import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, SpawnRequest, SpawnResult } from '../core/types.js';
-import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { Abject, DEFERRED_REPLY, isTemporaryAskResponse } from '../core/abject.js';
 import { Capabilities } from '../core/capability.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { ContentPart } from '../llm/provider.js';
-import type { AgentAction } from './agent-abject.js';
+import { bulkAwareResult, type AgentAction, type AgentActionResult } from './agent-abject.js';
 import { buildOrganismManifest } from './organism.js';
 import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
@@ -690,7 +690,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Valid action verbs this loop dispatches, for unknown-action recovery. */
   private static readonly VALID_ACTIONS = [
-    'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft',
+    'call', 'draft_manifest', 'draft_source', 'edit_source', 'draft_diff', 'read_draft', 'read_guide',
     'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'clone_object', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
     'compose_organism', 'extract_organelle',
@@ -2825,6 +2825,28 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * ~50KB blob never bloats the transcript. The agent verifies layout, color,
    * spacing, and polish visually instead of guessing from getState numbers.
    */
+  /**
+   * What the layouts say about a window owner's containers: an empty string
+   * when everything fits, otherwise a sentence per overflowing container.
+   * Failing to ask (no WidgetManager, a timeout) reads as "unchecked", never
+   * as "fits".
+   */
+  private async layoutIssueNote(ownerId: string | undefined): Promise<string> {
+    if (!ownerId) return '';
+    try {
+      const wm = await this.discoverDep('WidgetManager');
+      if (!wm) return '';
+      const issues = await this.request<Array<{ title?: string; overflow: { axis: string; needed: number; available: number; hiddenChildren: number } }>>(
+        request(this.id, wm, 'listLayoutIssues', { ownerId }), 5000);
+      if (!Array.isArray(issues) || issues.length === 0) return '\n\nLayout check: every container fits its window.';
+      const lines = issues.map(i =>
+        `- "${i.title ?? 'window'}": a container needs ${Math.round(i.overflow.needed)}px ${i.overflow.axis === 'vertical' ? 'of height' : 'of width'} but has ${Math.round(i.overflow.available)}px; ${i.overflow.hiddenChildren} child(ren) lie past the edge and never render.`);
+      return `\n\nLayout check FAILED (fixed content that does not fit is invisible, not merely cramped):\n${lines.join('\n')}\nFix it before reporting the UI done: put the column in a ScrollableVBox, drop rows, or enlarge the window.`;
+    } catch {
+      return '\n\nLayout check: unavailable (WidgetManager did not answer).';
+    }
+  }
+
   private async captureVisionFromCall(
     extra: TaskExtra,
     action: AgentAction,
@@ -2838,14 +2860,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     if (img && typeof img.imageBase64 === 'string' && img.imageBase64.length > 0) {
       const dims = `${img.width ?? '?'}x${img.height ?? '?'}`;
+      // A pixel check cannot see a row that was laid out past the window edge;
+      // the layouts can. Ask them every time a window is captured, so the
+      // finding rides along with the image (or with the note that no model
+      // can look at the image).
+      const layoutNote = await this.layoutIssueNote(img.ownerId ?? extra.state.spawnedObjectId ?? extra.state.targetObjectId);
 
       // An image is only worth attaching if some configured model can see it.
       // Otherwise AgentAbject strips it to a text note downstream and the
       // agent is left guessing — say plainly that visual inspection is
       // impossible in this configuration instead.
       if (await this.refreshVisionCapability() === false) {
-        res.data = `Screenshot captured (${dims}), which proves a visible window exists — but every configured LLM model is text-only, so YOU CANNOT SEE IT and neither visual inspection nor visual verification is possible. Verify what you can through code review (every layout child needs sizePolicy + preferredSize) and state/method checks, and say in your final result that the UI was not visually inspected because no vision-capable model is configured.`;
-        res.summary = `call ${action.target}.${action.method}: screenshot ${dims} captured but NOT inspectable (no vision-capable model configured)`;
+        res.data = `Screenshot captured (${dims}), which proves a visible window exists — but every configured LLM model is text-only, so YOU CANNOT SEE IT and neither visual inspection nor visual verification is possible. Verify what you can through code review (every layout child needs sizePolicy + preferredSize) and state/method checks, and say in your final result that the UI was not visually inspected because no vision-capable model is configured.${layoutNote}`;
+        res.summary = `call ${action.target}.${action.method}: screenshot ${dims} captured but NOT inspectable (no vision-capable model configured)${layoutNote ? '; layout overflow reported' : ''}`;
         return;
       }
 
@@ -2854,8 +2881,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const target = extra.state.spawnedObjectId ?? extra.state.targetObjectId;
       if (extra.state.deployTurn !== undefined && method === 'captureWindow' &&
           (action.target === 'Screenshot' || action.target === screenshotService) && img.ownerId === target) extra.state.visualSinceDeploy = true;
-      res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
-      res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
+      res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.${layoutNote}`;
+      res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)${layoutNote ? '; layout overflow reported' : ''}`;
       return;
     }
 
@@ -2924,10 +2951,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     if (method === 'ask' && typeof response === 'string') {
+      if (isTemporaryAskResponse(response)) return `call ${targetName}.ask: temporary availability response; substantive advice still needed`;
       const key = targetName;
       const existing = state.deps.get(key);
       const guide = existing?.usageGuide ?? '';
-      const merged = guide ? `${guide}\n\n${response}` : response;
+      const merged = guide.startsWith(response) ? guide : guide ? `${response}\n\nEarlier Ask context (may be superseded):\n${guide}` : response;
+      if (merged !== guide) state.renderedGuides.delete(key);
       state.deps.set(key, {
         depName: key,
         depId: existing?.depId ?? targetId,
@@ -3475,7 +3504,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * between). Staging ops use it to keep the edit set OPEN: the syntax and call
    * checks run once, on the last edit of the response, instead of after each one.
    */
-  private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId, batchRemaining = 0): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId, batchRemaining = 0): Promise<AgentActionResult> {
     const extra = this.tasks.get(taskId);
     if (!extra) {
       return { success: false, error: 'No active task' };
@@ -3502,6 +3531,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'draft_diff':
           res = await this.opDraftDiff(state, action, batchRemaining);
           break;
+        case 'read_guide': {
+          const guide = state.deps.get(String(action.name ?? action.target ?? ''))?.usageGuide;
+          res = guide ? { ok: true, summary: 'Retained Ask answer', data: guide }
+            : { ok: false, summary: 'No retained Ask answer', error: 'No saved guide for this collaborator. Send it an Ask message.' };
+          break;
+        }
         case 'read_draft':
           res = this.opReadDraft(state, action);
           break;
@@ -3585,6 +3620,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { success: false, error: state.terminal?.error ?? 'failed' };
     }
 
+    if (action.action === 'read_guide' && res.ok && typeof res.data === 'string') return bulkAwareResult(res.data);
     return { success: res.ok, data: res.data, error: res.error };
   }
 
@@ -3628,11 +3664,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         // every turn is what used to push this loop into the context budget.
         if (dep.usageGuide) {
           if (state.renderedGuides.has(dep.depName)) {
-            lines.push('  Usage guide: shown earlier in this conversation — scroll back to it rather than re-asking.');
+            lines.push('  Usage guide retained locally; read_guide with this collaborator name retrieves it without repeating Ask.');
           } else {
             state.renderedGuides.add(dep.depName);
             lines.push('  Usage guide:');
             lines.push(dep.usageGuide.slice(0, 1600).split('\n').map(l => `    ${l}`).join('\n'));
+            if (dep.usageGuide.length > 1600) lines.push('  Guide excerpt; read_guide with this collaborator name retrieves the full answer.');
           }
         }
       }
@@ -3757,26 +3794,6 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       state.pendingAdvice = undefined;
     }
     lines.push('');
-
-    // Stop-reading steer: read_draft is read-only and makes no progress.
-    // Count how many read_drafts run back-to-back with no productive action
-    // between them; two in a row is already a stall (reading→editing→reading is
-    // fine, this only fires on reading→reading). Point straight at the fix.
-    let consecutiveReads = 0;
-    for (let i = state.turnLog.length - 1; i >= 0; i--) {
-      if (state.turnLog[i].action === 'read_draft') consecutiveReads++;
-      else break;
-    }
-    if (consecutiveReads >= 2) {
-      const compileErr = typeof state.lastValidation?.compile === 'string' && state.lastValidation.compile !== '';
-      lines.push(`⚠️ You have called read_draft ${consecutiveReads}× in a row without changing anything. read_draft is read-only, so it makes no progress.`);
-      if (compileErr) {
-        lines.push('   The syntax error above already names the exact failing line and shows its context, so you HAVE the location. Do NOT read_draft again to find it. Fix it now with edit_source — one { op: "replace", name, body } for the member that contains it.');
-      } else {
-        lines.push('   Act now instead of reading again: make the edit with edit_source (it checks the result for you), then deploy. One more read will not move the build forward.');
-      }
-      lines.push('');
-    }
 
     const recent = state.turnLog.slice(-8);
     if (recent.length > 0) {
@@ -3953,7 +3970,8 @@ Your local actions are the supported way to create and modify Abjects: they carr
 
   SEARCH must match a UNIQUE location — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. For a whole method, an \`edit_source\` \`replace\` is more robust (nothing to match).
 - \`replace_handler({name, body})\` / \`add_handler({name, body})\` / \`remove_handler({name})\` — single-member sugar for the corresponding \`edit_source\` op. Use them for a one-method change; use \`edit_source\` the moment there is more than one.
-- \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing and makes no progress on its own. Use it to look at a member you are about to rewrite, or one a check named. Never two turns in a row without an edit in between.
+- \`read_guide({name})\` — retrieve the retained Ask answers for a collaborator, even after conversation compaction. Ask again when assumptions or capabilities change.
+- \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing; use it to resolve a concrete uncertainty. Use it to look at a member you are about to rewrite, or one a check named. Read related members as needed to understand the change; avoid repeating an unchanged read without a new question.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
@@ -4065,7 +4083,7 @@ A model that lives in the object stays available once this task ends: the object
 2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
 
    **Let the goal's named requirements drive OPEN questions before you commit to an approach.** When the goal names a quality or capability — a presentation style ("3D", "animated"), an input modality (mouse, voice), sound, persistence, networking — your first question to the providing dependency is "what do you offer for <that requirement>?", asked before you settle on how to build it. A modify loop makes this easy to skip: the existing source suggests an approach, and questions shaped as "confirm the commands I already plan to use" get exactly the narrow answer they asked for, leaving a purpose-built capability undiscovered while you hand-roll an imitation on the surface the old code happened to use. One open capability question per named requirement is cheap; rework after shipping the imitation is not.
-3. **Write the whole change, then ship it.** Author the complete change-set — one \`edit_source\` when it fits, \`"more": true\` across turns when it does not — and let the automatic checks tell you where you stand. A syntax error the checks report is a location, not a verdict: fix that member with one \`edit_source\` replace. Do NOT \`read_draft\` to relocate an error the check already pinpointed, and never read twice in a row without editing in between; that is a stall that burns your budget and leaves nothing to verify.
+3. **Write the whole change, then ship it.** Author the complete change-set — one \`edit_source\` when it fits, \`"more": true\` across turns when it does not — and let the automatic checks tell you where you stand. A syntax error the checks report is a location, not a verdict: fix that member with one \`edit_source\` replace. Use the reported error context first; read related members when needed to understand the cause before editing.
 
    **Ship and verify live instead of polishing blind.** The semantic reviewer's findings are advice, not a gate: fix the ones that name a real wrong-payload or wrong-method bug, and let the rest ride into your report. A deployed object answering real calls teaches you more per step than another blind review pass. Budget the endgame explicitly — deploy plus behavioral checks plus a screenshot need ~5 steps, so start deploying while you still have them. A task that dies polishing an undeployed draft delivered nothing.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
@@ -4117,7 +4135,7 @@ A model that lives in the object stays available once this task ends: the object
 
 The TASK section gives the kind, target (if any), and goal.
 The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim. Each usage guide is printed once, the turn it is learned; after that the observation points back to it rather than re-pasting it.
-The SOURCE section shows the code in full ONCE — the first time there is code to show (for a modify, the existing object's code). After that you get a SOURCE OUTLINE: every member with its line range. The full text is not re-pasted every turn, because it is already in this conversation and your own edits are your own. When you need a member's exact current text, \`read_draft({handler:"name"})\` gives it to you.
+The SOURCE section shows the code in full ONCE — the first time there is code to show (for a modify, the existing object's code). After that you get a SOURCE OUTLINE: every member with its line range. The full text is not re-pasted every turn. Conversation content can be compacted; the current source remains available through read_draft. When you need a member's exact current text, \`read_draft({handler:"name"})\` gives it to you.
 The DRAFTS section shows what manifest / source you have staged, and whether that source is deployed (live) or has undeployed edits.
 The CHECKS section shows the automatic syntax / call / semantic verdicts on the staged source, or says they are deferred because your edit set is still open.
 The RECENT TURNS section is your action log so you remember what you have already done.

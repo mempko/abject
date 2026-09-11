@@ -26,8 +26,28 @@ export class TaskSession extends Abject {
         { name: 'resume', description: 'Prepare a new attempt by id and expectedRevision. Unknown operation effects must be reconciled first. AgentAbject.resumeTask performs execution.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'fork', description: 'Fork dialogue and evidence using id and newId. Does not undo external changes or inherit accepted completion.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'reconcile', description: 'Record an evidence-backed outcome for an outstanding operation before resuming: id, expectedRevision, evidence, outcome.', parameters: [], returns: { kind: 'object', properties: {} } },
+        { name: 'retainPayload', description: 'AgentAbject-only: retain a received payload body by sessionId and payload.id before removing it from active memory.', parameters: [], returns: { kind: 'object', properties: {} } },
+        { name: 'readPayload', description: 'AgentAbject-only: retrieve retained evidence by sessionId and id. Agents use runtime read_chunk or readPayload messages.', parameters: [], returns: { kind: 'object', properties: {} } },
       ] }, requiredCapabilities: [], providedCapabilities: [], tags: ['system', 'agent', 'sessions'] } });
     this.on('get', msg => structuredClone(this.sessions.get((msg.payload as { id: string }).id) ?? null));
+    // Bulk evidence lives with the session owner, not in a specialist's context.
+    this.on('retainPayload', async msg => {
+      await this.runtimeOnly(msg.routing.from);
+      const { sessionId, payload } = msg.payload as { sessionId: string; payload: { id: string; text: string; kind: string; storedAt: number } };
+      if (!sessionId || !payload?.id || typeof payload.text !== 'string') throw new Error('Session and payload required');
+      if (!this.storageId) throw new Error('Storage unavailable');
+      const key = `agent:payload:${encodeURIComponent(sessionId)}:${encodeURIComponent(payload.id)}`;
+      await this.request(request(this.id, this.storageId, 'set', { key, value: structuredClone(payload) }));
+      return { success: true };
+    });
+    this.on('readPayload', async msg => {
+      await this.runtimeOnly(msg.routing.from);
+      const { sessionId, id } = msg.payload as { sessionId: string; id: string };
+      if (!sessionId || !id || !this.storageId) throw new Error('Payload storage unavailable');
+      return structuredClone(await this.request(request(this.id, this.storageId, 'get', {
+        key: `agent:payload:${encodeURIComponent(sessionId)}:${encodeURIComponent(id)}`,
+      })));
+    });
     this.on('list', () => [...this.sessions.values()].map(({ snapshot: _snapshot, ...r }) => structuredClone(r)));
     this.on('checkpoint', async msg => {
       await this.runtimeOnly(msg.routing.from);

@@ -300,7 +300,7 @@ test('process previews report either-stream truncation and retain complete outpu
       }
       assert.equal(text, 'x'.repeat(100000));
     }
-    const shell = await f.add(new ShellExecutor({ allowedCommands: [`${process.execPath} -e process.stdout.write('x'.repeat(100000))`], defaultTimeout: 5000 }));
+    const shell = await f.add(new ShellExecutor({ allowedPaths: [process.cwd()], allowedCommands: [`${process.execPath} -e process.stdout.write('x'.repeat(100000))`], defaultTimeout: 5000 }));
     const result = await owner.call(shell.id, 'exec', { command: process.execPath, args: ['-e', "process.stdout.write('x'.repeat(100000))"] });
     assert.equal(result.exitCode, 0); assert.equal(result.truncated.totalBytes, 100000); assert.equal(result.truncated.stream, 'stdout');
     assert.equal((await owner.call(result.outputObjectId, 'readOutput', { offset: 99990 })).text, 'x'.repeat(10));

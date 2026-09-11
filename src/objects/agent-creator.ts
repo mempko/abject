@@ -81,9 +81,9 @@ export class AgentCreator extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
 
-I author NEW autonomous behavior that requires multiple cooperating objects: an agent with an LLM decision loop, a scheduler that fires on a recurring trigger, a watcher that reacts to events.
+I provide design advice for new autonomous behavior that requires multiple cooperating objects: an agent with an LLM decision loop, a scheduler that fires on a recurring trigger, a watcher that reacts to events.
 
-Examples I handle well:
+Examples I can advise on:
 - "Create an agent that delivers a morning briefing every day at 6 AM" (agent + scheduler)
 - "Build an agent that reviews code changes and provides feedback" (agent + watcher on a code source)
 - "Set up a recurring check every 10 minutes that posts to chat when something changes" (scheduler + watcher)
@@ -93,7 +93,7 @@ Examples I handle well:
 - Single-object create/wrap (bridges, proxies, relays, adapters, integrations) — also ObjectCreator unless the request is a multi-object autonomous system.
 - Running an existing agent — ObjectAgent invokes existing objects.
 
-When invited to a Sprint Plan, describe what I'd build and how I'd compose it across multiple cooperating objects. If the goal needs only a single object or only modifications, reply PASS so the work routes to ObjectCreator.`;
+I am advisory-only and do not execute creation tasks. ObjectCreator implements the design through ScrumMaster-planned tasks. When invited to a Sprint Plan, describe the proposed composition and the implementation work to assign to ObjectCreator. If the goal needs only a single object or only modifications, reply PASS so the work routes to ObjectCreator.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {

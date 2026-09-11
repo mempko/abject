@@ -449,7 +449,10 @@ Set keepPageOpen: false to explicitly close the page when done.
   }
 
   private setupHandlers(): void {
-    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('snapshotTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      return structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId));
+    });
     this.on('restoreTask', async msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore browser work');
       const { taskId, snapshot, terminalDelivery } = msg.payload as { taskId: string; snapshot: WebTaskExtra; terminalDelivery?: boolean };

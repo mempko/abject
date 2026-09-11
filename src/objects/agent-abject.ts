@@ -11,6 +11,8 @@
  * to implement agentObserve and agentAct message handlers.
  */
 
+import type { ExecutionProvenance } from '../llm/execution-context.js';
+import { errorDetails } from '../core/permission-outcome.js';
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../core/protocol-description.js';
 import { encodeAgentState, decodeAgentState } from '../core/agent-session-codec.js';
 import type { SessionRecord } from './task-session.js';
@@ -193,6 +195,7 @@ interface PromptBlock {
  * reviewer, which reads both.
  */
 export interface PredictionRecord {
+  execution?: ExecutionProvenance;
   step: number;
   action: string;
   expect: string;
@@ -212,6 +215,7 @@ export interface PredictionRecord {
 }
 
 export interface AgentTaskState {
+  execution?: ExecutionProvenance;
   id: string;
   phase: AgentPhase;
   step: number;
@@ -226,6 +230,10 @@ export interface AgentTaskState {
   timeout: number;
   /** Rolling log of action signatures (action:target:method:errorClass) for loop detection. */
   actionHistory?: string[];
+  /** Evidence novelty is separate from message success; no extra model call. */
+  progressHistory?: Array<{ fingerprint: string; kind: 'evidence' | 'action' | 'narration'; success: boolean; novel: boolean }>;
+  activity?: { actions: number; evidenceReads: number; repeatedEvidence: number; progressUpdates: number; failures: number };
+
   /** Signatures already nudged about, so the loop-detection steer fires once per pattern. */
   nudgedSignatures?: string[];
   /** Step-budget extensions granted so far (progress-aware; capped at MAX_STEP_EXTENSIONS). */
@@ -434,6 +442,8 @@ interface TaskEntry {
   observationChunkable?: boolean;
   /** Oversized observations/results held whole, addressed by read_chunk. */
   payloads?: StoredPayload[];
+  /** Older bodies retained by TaskSession; references survive compaction/resume. */
+  archivedPayloads?: Record<string, { sessionId: string; chars: number; kind: string }>;
   /** Monotonic counter behind payload ids, so an id is never reused. */
   payloadSeq?: number;
   /**
@@ -580,6 +590,57 @@ const AGENT_INTERFACE: InterfaceId = 'abjects:agent-abject';
  */
 const STEP_EXTENSION = 10;
 const MAX_STEP_EXTENSIONS = 2;
+
+/** The shape of a task the budget helpers below read. */
+interface StepBudgetView {
+  step: number;
+  maxSteps: number;
+  extensionsGranted?: number;
+  actionHistory?: string[];
+  progressHistory?: Array<{ novel: boolean }>;
+}
+
+/**
+ * Whether the recent action window shows real forward progress: mostly
+ * successful actions across several DISTINCT signatures, not one action
+ * spinning. New sessions use evidence novelty; signatures are only a
+ * compatibility fallback for sessions created before activity tracking.
+ */
+export function stepProgress(task: StepBudgetView): { progressing: boolean; novel: number } {
+  const history = task.actionHistory ?? [];
+  const okSignatures = history.filter((s) => s.endsWith(':ok'));
+  const distinctOk = new Set(okSignatures).size;
+  const progress = task.progressHistory;
+  const novel = progress?.filter(p => p.novel).length ?? distinctOk;
+  const progressing = progress?.length
+    ? progress.length >= 6 && novel >= Math.ceil(progress.length / 2)
+    : history.length >= 6 && okSignatures.length * 2 >= history.length && distinctOk >= 3;
+  return { progressing, novel };
+}
+
+/**
+ * The step-budget note appended to an observation.
+ *
+ * It describes the budget the task can actually reach. The old note said
+ * "wrap up" at five steps left and "LAST STEP" at two whether or not an
+ * extension was coming, and a task that was progressing well took it at its
+ * word: it skipped the second verification and reported on step 49 of 50,
+ * when 20 more steps were available for the asking. A task that is not
+ * progressing, or has used its extensions, still hears the hard limit.
+ */
+export function stepUrgency(task: StepBudgetView, progressing: boolean): string {
+  const stepsRemaining = task.maxSteps - task.step;
+  if (stepsRemaining > 5) return '';
+  const extensionsLeft = MAX_STEP_EXTENSIONS - (task.extensionsGranted ?? 0);
+  const reachable = task.maxSteps + extensionsLeft * STEP_EXTENSION;
+  if (progressing && extensionsLeft > 0) {
+    const check = stepsRemaining <= 2 ? `${Math.max(stepsRemaining, 1)} step${stepsRemaining === 1 ? '' : 's'}` : `${stepsRemaining} steps`;
+    return `\nℹ️ Budget check in ${check}. Your recent steps show real progress, so the budget extends by ${STEP_EXTENSION} at the check (up to ${reachable} steps in all). Keep working at the same standard: finish the work and its verification, then done. Do not compress or skip verification to beat the count.`;
+  }
+  return stepsRemaining <= 2
+    ? `\n⚠️ LAST STEP — finish with done only if the requested outcome is satisfied; otherwise fail with findings and remaining work.`
+    : `\n⚠️ WARNING: Only ${stepsRemaining} steps remaining and no extension is available. Wrap up and call "done" soon.`;
+}
 
 const DEFAULT_CONFIG: ResolvedAgentConfig = {
   maxSteps: 25,
@@ -781,6 +842,8 @@ export class AgentAbject extends Abject {
    * pauseTasksByGoal/resumeTasksByGoal (called from GoalManager).
    */
   private pausedGoals = new Set<string>();
+  /** Hold queued admission while a specialist is restoring its task-local state. */
+  private restoringAgents = new Set<AbjectId>();
 
   /** Periodic reclaim of wedged queue slots — see sweepStaleQueueSlots. */
   private queueSweepTimer?: ReturnType<typeof setInterval>;
@@ -1295,6 +1358,7 @@ The registered object must implement these handlers to participate in the agent 
 
   private async checkpointSession(entry: TaskEntry, outstandingOperation: unknown = entry.outstandingOperation): Promise<void> {
     if (!this.sessionStoreId) return;
+    await this.archivePayloads(entry);
     const usage=this.llmId?await this.request<SessionRecord['usage']>(request(this.id,this.llmId,'getTaskUsage',{taskId:entry.state.id,sessionId:entry.sessionId})).catch(()=>undefined):undefined;
     const specialist = entry.config.snapshotMethod ? await this.request(request(this.id, entry.agentId, entry.config.snapshotMethod, { taskId: entry.state.id })) : undefined;
     const result = await this.request<{ success: boolean; session?: SessionRecord }>(request(this.id, this.sessionStoreId, 'checkpoint', {
@@ -1303,7 +1367,7 @@ The registered object must implement these handlers to participate in the agent 
       status: entry.settling && outstandingOperation ? 'partial' : entry.state.phase === 'done' && entry.candidateAccepted ? 'accepted' : entry.state.phase === 'error' ? 'partial' : 'running',
       snapshot: encodeAgentState({ state: entry.state, config: entry.config, systemPrompt: entry.systemPrompt,
         taskPrompt: entry.taskPrompt, responseSchema: entry.responseSchema, dispatchTupleId: entry.dispatchTupleId, predictions: entry.predictions,
-        injectedKnowledge: entry.injectedKnowledge, knowledgeScopes: entry.knowledgeScopes, refreshKnowledgePrompt: entry.refreshKnowledgePrompt, patternSelections: entry.patternSelections, payloads: entry.payloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
+        injectedKnowledge: entry.injectedKnowledge, knowledgeScopes: entry.knowledgeScopes, refreshKnowledgePrompt: entry.refreshKnowledgePrompt, patternSelections: entry.patternSelections, payloads: entry.payloads, archivedPayloads: entry.archivedPayloads, payloadSeq: entry.payloadSeq, pendingPrediction: entry.pendingPrediction, specialist,
         children: [...this.delegations.values()].filter(d=>d.parentTaskId===entry.state.id) }),
       outstandingOperation, ...(usage?{usage}:{}),
       ...(entry.delivery ? { outbox: [entry.delivery] } : {}),
@@ -1560,30 +1624,44 @@ The registered object must implement these handlers to participate in the agent 
       if (!agent) throw new Error('Session agent is unavailable; Ask for a compatible collaborator');
       const stored = decodeAgentState<any>(current?.snapshot);
       if (!stored?.state) throw new Error('Session has no resumable conversation');
-      if (stored.dispatchTupleId && this.goalManagerId) {
-        const admission = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'admitTask', { taskId: stored.dispatchTupleId, goalId: current.goalId }));
-        if (!admission.accepted) throw new Error(admission.reason ?? 'This plan no longer owns the interrupted task; fork to reconsider it');
-      }
-      const resumed = await this.request<{ success: boolean; session: SessionRecord }>(request(this.id, this.sessionStoreId, 'resume', p));
-      if (!resumed.success) return resumed;
-      const taskId = `${p.id}:attempt-${resumed.session.attempt}`;
+      if (this.restoringAgents.has(agent.agentId) || this.agentTaskQueues.get(agent.agentId)?.inFlight.size
+          || [...this.taskEntries.values()].some(e => e.agentId === agent.agentId && !e.finished)) throw new Error('Collaborator still has active work; retry restoration when it settles');
+      this.restoringAgents.add(agent.agentId);
       try {
-        if (agent.config.restoreMethod) await this.request(request(this.id, agent.agentId, agent.config.restoreMethod, { taskId, snapshot: stored.specialist }));
-      } catch (err) {
-        await this.request(request(this.id, this.sessionStoreId, 'checkpoint', { id: p.id, expectedRevision: resumed.session.revision, status: 'partial', outcome: { error: String(err) } }));
-        throw err;
+        if (stored.dispatchTupleId && this.goalManagerId) {
+          const admission = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'admitTask', { taskId: stored.dispatchTupleId, goalId: current.goalId }));
+          if (!admission.accepted) throw new Error(admission.reason ?? 'This plan no longer owns the interrupted task; fork to reconsider it');
+        }
+        const resumed = await this.request<{ success: boolean; session: SessionRecord }>(request(this.id, this.sessionStoreId, 'resume', p));
+        if (!resumed.success) return resumed;
+        const taskId = `${p.id}:attempt-${resumed.session.attempt}`;
+        try {
+          if (agent.config.restoreMethod) await this.request(request(this.id, agent.agentId, agent.config.restoreMethod, { taskId, snapshot: stored.specialist }));
+        } catch (err) {
+          await this.request(request(this.id, this.sessionStoreId, 'checkpoint', { id: p.id, expectedRevision: resumed.session.revision, status: 'partial', outcome: { error: String(err) } }));
+          throw err;
+        }
+        const completedSteps = Math.max(stored.state.step ?? 0, ...(stored.predictions ?? []).map((p: PredictionRecord) => p.step));
+        const state: AgentTaskState = { ...stored.state, id: taskId, phase: 'observing', step: completedSteps,
+          maxSteps: Math.max(stored.state.maxSteps ?? 0, completedSteps + (agent.config.maxSteps ?? DEFAULT_CONFIG.maxSteps)),
+          action: undefined, lastResult: undefined, error: undefined, result: undefined };
+        state.llmMessages.push({ role: 'user', content: 'Resumed from a durable checkpoint. Re-observe current collaborators and artifacts through Ask; previously verified state may have changed. Continue the plan from the retained evidence.' });
+        const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
+          systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
+          goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge, patternSelections: stored.patternSelections,
+          knowledgeScopes: stored.knowledgeScopes, refreshKnowledgePrompt: stored.refreshKnowledgePrompt,
+          payloads: stored.payloads, archivedPayloads: stored.archivedPayloads, payloadSeq: stored.payloadSeq, pendingPrediction: undefined, sessionId: p.id, sessionRevision: resumed.session.revision };
+        for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
+        this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
+        let queue = this.agentTaskQueues.get(agent.agentId);
+        if (!queue) { queue = { inFlight: new Map(), pending: [] }; this.agentTaskQueues.set(agent.agentId, queue); }
+        queue.inFlight.set(taskId, { taskId, goalId: current.goalId });
+        void this.runTaskAsync(entry);
+        return { ticketId: taskId, sessionId: p.id };
+      } finally {
+        this.restoringAgents.delete(agent.agentId);
+        this.processNextInQueue(agent.agentId);
       }
-      const state: AgentTaskState = { ...stored.state, id: taskId, phase: 'observing', step: 0, error: undefined, result: undefined };
-      state.llmMessages.push({ role: 'user', content: 'Resumed from a durable checkpoint. Re-observe current collaborators and artifacts through Ask; previously verified state may have changed. Continue the plan from the retained evidence.' });
-      const entry: TaskEntry = { state, agentId: agent.agentId, callerId: agent.agentId, config: mergeConfig(agent.config, { ...stored.config, completionMethod: agent.config.completionMethod, snapshotMethod: agent.config.snapshotMethod, restoreMethod: agent.config.restoreMethod }),
-        systemPrompt: stored.systemPrompt, taskPrompt: stored.taskPrompt, responseSchema: stored.responseSchema,
-        goalId: current.goalId, dispatchTupleId: stored.dispatchTupleId, parentTaskId: current.parentId, predictions: stored.predictions, injectedKnowledge: stored.injectedKnowledge, patternSelections: stored.patternSelections,
-        knowledgeScopes: stored.knowledgeScopes, refreshKnowledgePrompt: stored.refreshKnowledgePrompt,
-        payloads: stored.payloads, payloadSeq: stored.payloadSeq, pendingPrediction: stored.pendingPrediction, sessionId: p.id, sessionRevision: resumed.session.revision };
-      for (const child of stored.children ?? []) this.delegations.set(child.taskId,{...child,status:child.status==='done'?'done':'error',error:child.status==='done'?undefined:'Interrupted child: inspect its session before continuing'});
-      this.taskEntries.set(taskId, entry); this.taskOrder.unshift(taskId);
-      void this.runTaskAsync(entry);
-      return { ticketId: taskId, sessionId: p.id };
     });
 
     // ── Task Management ──
@@ -1626,6 +1704,7 @@ The registered object must implement these handlers to participate in the agent 
 
       const agent = this.registeredAgents.get(agentId);
       if (!agent) throw new Error(`Agent "${agentId}" is not registered`);
+      if (this.restoringAgents.has(agentId)) throw new Error('Agent is restoring a session; enqueue work instead of starting it directly');
 
       const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       // Queue identity and TupleSpace identity are independent. The runtime's
@@ -1895,7 +1974,7 @@ The registered object must implement these handlers to participate in the agent 
         agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
         task: entry.state.task,
         phase: entry.state.phase,
-        steps: entry.state.step,
+        steps: entry.state.step, activity: entry.state.activity,
         result: entry.state.result,
         error: entry.state.error,
         goalId: entry.goalId ?? entry.incomingGoalId ?? null,
@@ -1915,7 +1994,7 @@ The registered object must implement these handlers to participate in the agent 
       const { taskId, id } = msg.payload as { taskId: string; id: string };
       const entry = this.taskEntries.get(taskId);
       if (!entry) throw new Error(`No task "${taskId}"`);
-      const stored = (entry.payloads ?? []).find(p => p.id === id);
+      const stored = await this.loadPayload(entry, id);
       if (!stored) {
         const have = (entry.payloads ?? []).map(p => p.id).join(', ') || '(none)';
         throw new Error(`No payload "${id}" on task ${taskId}. Available: ${have}`);
@@ -2535,7 +2614,7 @@ The registered object must implement these handlers to participate in the agent 
         await this.request(request(this.id, this.goalManagerId, 'recordTaskEvidence', {
           goalId: evidenceGoal, taskId: entry.state.id,
           record: { taskId: entry.state.id, agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
-            task: entry.state.task, phase: entry.state.phase, steps: entry.state.step,
+            task: entry.state.task, phase: entry.state.phase, steps: entry.state.step, activity: entry.state.activity,
             goalId: evidenceGoal, result: entry.state.result, error: entry.state.error,
             knowledgeScope: entry.config.knowledgeScope, knowledgeScopes: entry.knowledgeScopes,
             injectedKnowledge: entry.injectedKnowledge ?? [], predictions: entry.predictions ?? [],
@@ -2807,6 +2886,7 @@ The registered object must implement these handlers to participate in the agent 
    * tail (when a task terminates and the slot frees).
    */
   private processNextInQueue(agentId: AbjectId): void {
+    if (this.restoringAgents.has(agentId)) return;
     const q = this.agentTaskQueues.get(agentId);
     if (!q || q.pending.length === 0) return;
     const limit = this.registeredAgents.get(agentId)?.config.maxConcurrentTasks ?? 1;
@@ -3141,7 +3221,7 @@ The registered object must implement these handlers to participate in the agent 
                     const jobReply = await this.request<{ status?: string; result?: unknown; error?: string }>(
                       request(this.id, jmId, 'submitJob', {
                         description,
-                        code,
+                        code, taskId: task.id,
                         // Held payloads are reachable from job code by
                         // message, so filtering or counting a large result
                         // is one job instead of paging it in by hand. Only
@@ -3151,7 +3231,7 @@ The registered object must implement these handlers to participate in the agent 
                           ? { context: {
                               payloadHost: this.id,
                               taskId: entry.state.id,
-                              payloadIds: entry.payloads.map(pl => pl.id),
+                              payloadIds: [...new Set([...entry.payloads.map(pl => pl.id), ...Object.keys(entry.archivedPayloads ?? {})])],
                             } }
                           : {}),
                         // Dedicated queue per agent: pipeline jobs never
@@ -3337,7 +3417,7 @@ The registered object must implement these handlers to participate in the agent 
     // read_draft / replace_handler / add_handler) so editing several different
     // handlers in a row isn't mistaken for repeating one — a real loop repeats
     // the SAME subject and still collapses to one signature.
-    const subject = String(a.path ?? a.command ?? a.url ?? a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.key ?? '');
+    const subject = String(a.path ?? a.command ?? a.url ?? a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.pattern ?? a.key ?? '');
     let outcome: string;
     if (task.lastResult?.success) {
       outcome = 'ok';
@@ -3348,7 +3428,7 @@ The registered object must implement these handlers to participate in the agent 
         .slice(0, 80);
     }
     const data = task.lastResult?.data as Record<string, unknown> | undefined;
-    const slice = JSON.stringify([a.offset, a.length, a.limit, a.cursor, a.lineRange,
+    const slice = JSON.stringify([a.glob, a.context, a.ignoreCase, a.offset, a.length, a.limit, a.cursor, a.lineRange,
       data?.offset, data?.nextOffset, data?.totalBytes]);
     return `${name}:${target}:${method}:${subject}:${slice}:${outcome}`;
   }
@@ -3358,9 +3438,56 @@ The registered object must implement these handlers to participate in the agent 
    * same result, inject a one-time steering message nudging the agent to change
    * strategy or fail cleanly. Fires once per distinct repeated pattern.
    */
+  private recordProgress(entry: TaskEntry): void {
+    const task = entry.state, action = task.action!;
+    const operation = String(action.method ?? action.tool ?? action.action);
+    const narration = (entry.config?.intermediateActions ?? []).includes(action.action);
+    const readOnly = /^(read|list|get|find|search|discover|describe|ask|inspect|recall)(?:$|[_A-Z])/.test(operation)
+      || ['read_chunk', 'read_context', 'read_draft', 'read_guide'].includes(action.action)
+      || (['bash', 'shell'].includes(action.action) && /^(?:git (?:diff|status|log|show)|cat |rg |grep |sed |ls )/.test(String(action.command ?? '').trim()));
+    const kind = narration ? 'narration' : readOnly ? 'evidence' : 'action';
+    const result = task.lastResult;
+    const held = entry.payloads?.find(p => p.id === result?.payloadId)?.text;
+    const data = result?.data;
+    const value = data && typeof data === 'object' ? data as Record<string, unknown> : undefined;
+    const page = action.action === 'read_chunk' && !action.grep && !action.outline
+      ? entry.payloads?.find(p => p.id === action.id)?.text.slice(Number(action.offset ?? 0), Number(action.offset ?? 0) + Math.min(Number(action.length ?? AgentAbject.MAX_CHUNK_CHARS), AgentAbject.MAX_CHUNK_CHARS)) : undefined;
+    const evidence = page ?? held ?? result?.payload ?? value?.content ?? value?.body ?? value?.text
+      ?? (typeof value?.stdout === 'string' ? `${value.stdout}\n${value.stderr ?? ''}` : undefined) ?? data ?? result?.error;
+    const metadataOnly = !!value && !page && !held && !result?.payload && Object.keys(value).every(k =>
+      ['offset', 'nextOffset', 'cursor', 'nextCursor', 'totalBytes', 'truncated', 'payloadId', 'chars', 'readOutput'].includes(k));
+    const raw = typeof evidence === 'string' ? evidence : JSON.stringify(evidence, (key, v) =>
+      ['offset', 'nextOffset', 'cursor', 'nextCursor', 'timestamp', 'durationMs', 'payloadId'].includes(key) ? undefined : v) ?? '';
+    // Two inexpensive independent hashes, so the bounded history retains no bodies.
+    let h1 = 2166136261, h2 = 5381;
+    for (let i = 0; i < raw.length; i++) { h1 = Math.imul(h1 ^ raw.charCodeAt(i), 16777619); h2 = Math.imul(h2, 33) ^ raw.charCodeAt(i); }
+    const fingerprint = kind === 'evidence' && !metadataOnly ? `${raw.length}:${h1 >>> 0}:${h2 >>> 0}` : this.actionSignature(task);
+    const history = (task.progressHistory ??= []);
+    const success = result?.success === true;
+    const novel = success && kind !== 'narration' && !metadataOnly && !!raw && !history.some(p => p.fingerprint === fingerprint && p.kind === kind && p.success);
+    const activity = (task.activity ??= { actions: 0, evidenceReads: 0, repeatedEvidence: 0, progressUpdates: 0, failures: 0 });
+    activity.actions++;
+    if (!success) activity.failures++;
+    if (kind === 'narration') activity.progressUpdates++;
+    if (kind === 'evidence') {
+      activity.evidenceReads++;
+      if (!metadataOnly && success && !novel) activity.repeatedEvidence++;
+    }
+    history.push({ fingerprint, kind, success, novel });
+    if (history.length > 12) history.shift();
+    if (kind === 'evidence' && !metadataOnly && history.filter(p => p.kind === kind && p.fingerprint === fingerprint).length >= 3) {
+      const key = `evidence:${fingerprint}`;
+      if (!(task.nudgedSignatures ??= []).includes(key)) {
+        task.nudgedSignatures.push(key);
+        task.llmMessages.push({ role: 'user', content: '[Repeated evidence] Recent reads returned the same evidence despite differing requests. Reuse the retained result. Identify the remaining uncertainty and choose a discriminating observation, Ask the owner for help, or proceed from the findings. Reading related sources is appropriate when it adds evidence; no edit is required merely to show activity.' });
+      }
+    }
+  }
+
   private detectAndSteerOscillation(entry: TaskEntry, agentName: string): void {
     const task = entry.state;
     if (!task.action) return;
+    this.recordProgress(entry);
     const sig = this.actionSignature(task);
     const history = (task.actionHistory ??= []);
     history.push(sig);
@@ -3369,6 +3496,7 @@ The registered object must implement these handlers to participate in the agent 
 
     const occurrences = history.filter(s => s === sig).length;
     const failing = !task.lastResult?.success;
+    if (!failing && task.progressHistory?.at(-1)?.novel) return;
     // 3rd identical failure, or 4th identical attempt regardless of outcome
     // (re-doing the same successful step over and over is also a loop).
     const stuck = (failing && occurrences >= 3) || occurrences >= 4;
@@ -3384,7 +3512,7 @@ The registered object must implement these handlers to participate in the agent 
       content:
         `[Loop detected] You have repeated the same action with the same result ${occurrences} times ` +
         `(action: ${String((task.action as Record<string, unknown>).action)}). Repeating it again will produce the same outcome. ` +
-        `Step back and change approach: re-read the latest error, and ask/describe the dependency it involves to learn the correct usage before retrying. ` +
+        `Step back and change approach: re-read the latest error, and Ask the dependency it involves to learn the correct usage before retrying. ` +
         `Fix the root cause the error names rather than re-attempting the identical step. ` +
         `If the task is genuinely blocked, emit a \`fail\` action with a precise diagnosis: what is blocking you, what you tried, and what would unblock it.`,
     });
@@ -3415,23 +3543,19 @@ The registered object must implement these handlers to participate in the agent 
     // the recent action window shows real forward progress — mostly
     // successful actions across several DISTINCT signatures, not one action
     // spinning — grant a bounded extension instead of killing a task
-    // mid-delivery. actionHistory signatures end in ':ok' on success (see
-    // actionSignature), so the window doubles as the progress record.
-    const history = task.actionHistory ?? [];
-    const okSignatures = history.filter((s) => s.endsWith(':ok'));
-    const distinctOk = new Set(okSignatures).size;
-    const progressing = history.length >= 6
-      && okSignatures.length * 2 >= history.length
-      && distinctOk >= 3;
+    // mid-delivery. New sessions use evidence novelty; signatures are only a
+    // compatibility fallback for sessions created before activity tracking.
+    const { progressing, novel } = stepProgress(task);
     const granted = task.extensionsGranted ?? 0;
     if (progressing && granted < MAX_STEP_EXTENSIONS) {
       task.extensionsGranted = granted + 1;
       task.maxSteps += STEP_EXTENSION;
       entry.pendingActions = undefined;
-      log.info(`[${agentName}] Step budget reached with recent progress (${okSignatures.length}/${history.length} ok, ${distinctOk} distinct) — extending by ${STEP_EXTENSION} (extension ${task.extensionsGranted}/${MAX_STEP_EXTENSIONS}, cap now ${task.maxSteps})`);
+      log.info(`[${agentName}] Step budget reached with recent progress (${novel} novel steps) — extending by ${STEP_EXTENSION} (extension ${task.extensionsGranted}/${MAX_STEP_EXTENSIONS}, cap now ${task.maxSteps})`);
+      const more = MAX_STEP_EXTENSIONS - task.extensionsGranted;
       task.llmMessages.push({
         role: 'user',
-        content: `[Budget extended] You hit the step limit, but your recent steps show real progress, so the budget grew by ${STEP_EXTENSION} steps (extension ${task.extensionsGranted} of ${MAX_STEP_EXTENSIONS}; cap now ${task.maxSteps}). Spend them FINISHING, not exploring: ship what is staged, run the single most important verification, and terminate with done/fail. Anything polish-grade still open belongs in your final report, not another editing round.`,
+        content: `[Budget extended] You reached the step budget while making real progress, so it grew by ${STEP_EXTENSION} steps (extension ${task.extensionsGranted} of ${MAX_STEP_EXTENSIONS}; cap now ${task.maxSteps}${more > 0 ? `, and ${more} more extension${more > 1 ? 's' : ''} can follow the same way` : ', the last one'}). Use them to complete the work properly: finish what is in progress and run the verification the task calls for before done. Verification is not optional for lack of steps; if the budget will not cover it, fail with findings rather than report unverified work as done.`,
       });
       setPhase('observing');
       return;
@@ -3455,7 +3579,7 @@ The registered object must implement these handlers to participate in the agent 
       this.appendVocabularyReminder(entry);
 
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
-      const llmResult = await this.request<{ content: string }>(
+      const llmResult = await this.request<{ content: string; execution?: ExecutionProvenance }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages.map(({ retainedPage: _page, ...message }) => message),
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
@@ -3479,6 +3603,7 @@ The registered object must implement these handlers to participate in the agent 
         60000,
       );
 
+      task.execution = llmResult.execution;
       this.markConversationObserved(entry);
       task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
@@ -3779,9 +3904,10 @@ The registered object must implement these handlers to participate in the agent 
         });
 
     this.streamingEntries.set(streamRequest.header.messageId, entry);
-    let llmResult: { content: string; stopReason?: string };
+    let llmResult: { content: string; stopReason?: string; execution?: ExecutionProvenance };
     try {
-      llmResult = await this.request<{ content: string; stopReason?: string }>(streamRequest, 120000);
+      llmResult = await this.request<{ content: string; stopReason?: string; execution?: ExecutionProvenance }>(streamRequest, 120000);
+      task.execution = llmResult.execution;
       this.markConversationObserved(entry);
     } finally {
       this.streamingEntries.delete(streamRequest.header.messageId);
@@ -4258,12 +4384,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
     if (!task.observation) return;
 
-    const stepsRemaining = task.maxSteps - task.step;
-    const urgency = stepsRemaining <= 2
-      ? `\n⚠️ LAST STEP — you MUST call "done" now with whatever data you have. No more actions after this.`
-      : stepsRemaining <= 5
-        ? `\n⚠️ WARNING: Only ${stepsRemaining} steps remaining! Wrap up and call "done" soon.`
-        : '';
+    const urgency = stepUrgency(task, stepProgress(task).progressing);
     // The observation is the last thing the model reads before it decides,
     // and the task statement sits far above it. Restating the task here keeps
     // the goal in the model's recency window on every step, and framing the
@@ -4271,9 +4392,11 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     // result" as "no task was given".
     const taskLine = `Task: ${AgentAbject.summarizeTask(task.task)}`;
     const firstStep = task.step === 0
-      ? '\nThis is your first step: nothing has been done yet. Choose the first action toward the task.'
+      ? '\nThis is the first step of this attempt. Reuse retained conversation, handoffs and evidence before choosing what remains to do.'
       : '';
-    const header = `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${taskLine}${firstStep}`;
+    const retained = [...new Set([...(entry.payloads ?? []).map(p => p.id), ...Object.keys(entry.archivedPayloads ?? {})])];
+    const header = `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${taskLine}${firstStep}`
+      + (retained.length ? `\nRetained evidence (read_chunk or readPayload through the bus): ${retained.join(', ')}` : '');
 
     // If agent provided llmContent (e.g. screenshot), use it directly
     if (entry.lastObservationLlmContent) {
@@ -4417,11 +4540,34 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const seq = (entry.payloadSeq = previous + 1);
     const id = `${kind === 'observation' ? 'obs' : 'res'}-${seq}`;
     (entry.payloads ??= []).push({ id, text, kind, storedAt: Date.now() });
-    // Bounded: a task that pulls down five big pages should not carry all of
-    // them for the rest of its life. Oldest goes first; the agent still has
-    // whatever it copied out of them.
-    while (entry.payloads.length > AgentAbject.MAX_STORED_PAYLOADS) entry.payloads.shift();
+    // Checkpointing archives older bodies before removing them from memory.
+    // Without a durable owner, retain them rather than advertise broken handles.
     return id;
+  }
+
+  private async archivePayloads(entry: TaskEntry): Promise<void> {
+    if (!this.sessionStoreId) return;
+    while ((entry.payloads?.length ?? 0) > AgentAbject.MAX_STORED_PAYLOADS) {
+      const payload = entry.payloads![0];
+      const sessionId = entry.archivedPayloads?.[payload.id]?.sessionId ?? entry.sessionId ?? entry.state.id;
+      try {
+        const saved = await this.request<{ success: boolean }>(request(this.id, this.sessionStoreId, 'retainPayload', { sessionId, payload }));
+        if (!saved?.success) return;
+      } catch { return; } // Preserve evidence in the checkpoint if archival fails.
+      (entry.archivedPayloads ??= {})[payload.id] = { sessionId, chars: payload.text.length, kind: payload.kind };
+      entry.payloads!.shift();
+    }
+  }
+
+  private async loadPayload(entry: TaskEntry, id: string): Promise<StoredPayload | undefined> {
+    const live = entry.payloads?.find(p => p.id === id);
+    if (live) return live;
+    const ref = entry.archivedPayloads?.[id];
+    if (!ref || !this.sessionStoreId) return undefined;
+    const payload = await this.request<StoredPayload | null>(request(this.id, this.sessionStoreId, 'readPayload', { sessionId: ref.sessionId, id }));
+    if (!payload || payload.id !== id || typeof payload.text !== 'string') throw new Error(`Retained evidence ${id} is unavailable from TaskSession; do not infer its contents`);
+    (entry.payloads ??= []).push(payload);
+    return payload;
   }
 
   /**
@@ -4512,7 +4658,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const preview = text.slice(0, AgentAbject.PAYLOAD_PREVIEW_CHARS);
     return (
       `[Large ${kind}: ${text.length.toLocaleString()} chars, held whole as "${id}". ` +
-      `This received payload is retained until evicted (five payloads per task); upstream truncation notices still apply. Read up to 30000 characters with read_chunk: ` +
+      `This received payload remains addressable for this session; upstream truncation notices still apply. Read up to 30000 characters with read_chunk: ` +
       `{"action":"read_chunk","id":"${id}","grep":"<text>"} to jump to what you need, ` +
       `or {"action":"read_chunk","id":"${id}","offset":${AgentAbject.PAYLOAD_PREVIEW_CHARS},"length":30000} to continue.]\n` +
       (outline ? `\n${outline}\n` : '') +
@@ -4586,7 +4732,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       message = response.message;
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      result = { success: false, error };
+      result = { success: false, error, ...(errorDetails(err) ? { data: errorDetails(err) } : {}) };
       message = `[${task.action?.action} Error] ${error}`;
     }
     if (cancelled()) { entry.outstandingOperation = undefined; return; }
@@ -4622,6 +4768,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         message: `[Conversation context]\n${text.slice(0, 30000)}${text.length > 30000 ? `\n[Full value retained as ${stored}; continue with read_chunk at offset 30000. Do not treat this page as the complete value.]` : ''}` };
     }
     if (action.action === 'read_chunk') {
+      if (typeof action.id === 'string') await this.loadPayload(entry, action.id);
       const text = this.readChunk(entry, action);
       return {
         result: { success: true, data: { payloadId: action.id, offset: action.offset ?? 0, text } },
@@ -4795,7 +4942,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
       observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
         expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
-        patterns: action.patterns ?? [], predictedAt: entry.pendingPrediction.at },
+        patterns: action.patterns ?? [], execution: task.execution, predictedAt: entry.pendingPrediction.at },
     }));
   }
 
@@ -4816,6 +4963,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     // Observations live in the goal evidence ledger, not the five-slot bulk cache.
     const patterns = Array.isArray(action?.patterns) ? action.patterns.filter((p: any) => p && typeof p.id === 'string' && typeof p.why === 'string').map((p: any) => ({ id: p.id, applicationRef: predicted ? p.applicationRef : undefined, provenanceError: predicted ? p.provenanceError : 'No pre-action provenance captured', why: p.why.slice(0, 1000) })) : [];
     (entry.predictions ??= []).push({
+      execution: task.execution,
       step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
       expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS), outcome, verdict,
       predictedAt: predicted?.at, observedAt: Date.now(), verdictScope: 'operation-status', semanticVerdict: 'unresolved', patterns,
@@ -4826,7 +4974,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     if (goalId && this.goalManagerId) {
       await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
         goalId, operationId: `${task.id}:${task.step + 1}`,
-        observation: { taskId: task.id, ...entry.predictions!.at(-1), actual },
+        observation: { taskId: task.id, ...entry.predictions!.at(-1), execution: task.execution, actual },
       }));
     }
   }
@@ -4923,7 +5071,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     // from their runtime-owned payloads. This avoids repeatedly summarizing diffs.
     for (let i = pinnedCount; i < task.llmMessages.length - AgentAbject.KEEP_RECENT_MESSAGES; i++) {
       const message = task.llmMessages[i];
-      if (message.retainedPage?.seen && entry.payloads?.some(p => p.id === message.retainedPage!.payloadId)) {
+      if (message.retainedPage?.seen && (entry.payloads?.some(p => p.id === message.retainedPage!.payloadId) || entry.archivedPayloads?.[message.retainedPage.payloadId])) {
         message.content = message.retainedPage.compact;
         delete message.retainedPage;
       }

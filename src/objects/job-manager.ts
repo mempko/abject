@@ -29,6 +29,7 @@ export interface Job {
   description: string;
   code: string;
   callerId: AbjectId;
+  taskId?: string;
   /**
    * Message id of the submitJob request. Carried into the direct jobFailed
    * caller notification so the caller can reject exactly the pending
@@ -70,7 +71,7 @@ const RESERVED_CONTEXT_KEYS = new Set<string>([
 ]);
 
 export class JobManager extends Abject {
-  private invocationContexts = new Map<string,{callerId?:AbjectId;target:AbjectId}>();
+  private invocationContexts = new Map<string,{callerId?:AbjectId;taskId?:string;target:AbjectId}>();
   private jobs: Map<string, Job> = new Map();
   private queues: Map<string, QueueState> = new Map();
   private static readonly DEFAULT_QUEUE = 'default';
@@ -170,7 +171,7 @@ export class JobManager extends Abject {
   private setupHandlers(): void {
     this.on('getInvocationContext', msg=>{
       const context=this.invocationContexts.get((msg.payload as {messageId:string}).messageId);
-      return context?.target===msg.routing.from?{callerId:context.callerId}:null;
+      return context?.target===msg.routing.from?{callerId:context.callerId,taskId:context.taskId}:null;
     });
     // NOTE: no custom 'progress' handler here. A previous version registered
     // one to forward heartbeats to job submitters, but Abject.init() registers
@@ -218,6 +219,7 @@ export class JobManager extends Abject {
         description,
         code,
         callerId,
+        taskId: typeof (msg.payload as any)?.taskId === 'string' ? (msg.payload as any).taskId : undefined,
         requestMessageId: msg.header.messageId,
         context: sanitisedContext,
         status: 'queued',
@@ -485,7 +487,7 @@ export class JobManager extends Abject {
       const resolved = await resolveTarget(to);
       const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
       q.currentCallMsgId = msg.header.messageId;
-      this.invocationContexts.set(msg.header.messageId,{callerId:q.currentJobCallerId,target:resolved as AbjectId});
+      this.invocationContexts.set(msg.header.messageId,{callerId:q.currentJobCallerId,taskId:q.currentJobId ? this.jobs.get(q.currentJobId)?.taskId : undefined,target:resolved as AbjectId});
       try {
         return await this.request<unknown>(msg, 600000);
       } finally {

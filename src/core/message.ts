@@ -205,6 +205,7 @@ export function errorFromException(
     code,
     message,
     stack: err instanceof Error ? err.stack : undefined,
+    ...(err instanceof Error && 'details' in err ? { details: err.details } : {}),
   };
 
   return createBaseMessage(

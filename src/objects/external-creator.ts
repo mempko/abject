@@ -28,14 +28,16 @@ import { domainFailure, type ResultContract } from '../core/result-contract.js';
  *   3. AGENT SHELL      — registration, observe/act, prompt, task lifecycle.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { errorDetails, type PermissionReceipt } from '../core/permission-outcome.js';
 import { encodeAgentState } from '../core/agent-session-codec.js';
 import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
-import { Abject } from '../core/abject.js';
+import { Abject, type MessageHandlerFn } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import type { AgentAction } from './agent-abject.js';
+import type { AgentAction, AgentActionResult } from './agent-abject.js';
 import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ExternalProject } from './external-project-registry.js';
 import { ALWAYS_PROTECTED } from './external-project-registry.js';
@@ -49,6 +51,52 @@ export const EXTERNAL_CREATOR_ID = 'abjects:external-creator' as AbjectId;
 
 /** Goal-scratchpad keys: how one task hands off to the next in the same goal. */
 const SESSION_KEY = 'externalcreator:session';
+
+/**
+ * Steps a code task gets before the budget check. Reading a file in pages,
+ * editing, and running two verifications comfortably takes 60 steps; the old
+ * 50 had both tasks of a two-round goal finishing on step 49 and calling it
+ * "the last step". Progress-based extensions still apply on top.
+ */
+export const DEFAULT_TASK_STEPS = 80;
+const MIN_TASK_STEPS = 20;
+const MAX_TASK_STEPS = 120;
+
+/** A planner-requested budget, clamped; anything unusable means the default. */
+export function taskStepBudget(requested: unknown): number {
+  const n = typeof requested === 'number' ? requested : typeof requested === 'string' ? Number(requested) : NaN;
+  if (!Number.isFinite(n)) return DEFAULT_TASK_STEPS;
+  return Math.min(MAX_TASK_STEPS, Math.max(MIN_TASK_STEPS, Math.round(n)));
+}
+/** Goal scratchpad prefix for structured verification receipts, one per task. */
+export const VERIFICATION_KEY_PREFIX = 'verification/';
+
+/** One run of a project-declared command, as recorded on the goal scratchpad. */
+export interface VerificationRun {
+  command: string;
+  exitCode: number;
+  at: number;
+  passed: boolean;
+  testSummary?: { tests?: number; passed?: number; failed?: number };
+  failureCount?: number;
+  newFailures: number;
+  foreignFailures: number;
+  preExisting: number;
+}
+
+/** What a task's verification actually was, written when the task ends. */
+export interface VerificationReceipt {
+  taskId: string;
+  agent: string;
+  project?: string;
+  at: number;
+  outcome: 'complete' | 'incomplete' | 'cancelled';
+  filesModified: number;
+  mutationsSinceVerify: number;
+  gate: { ok: boolean; note: string };
+  verify?: VerificationRun;
+  check?: VerificationRun;
+}
 const BASELINE_KEY = 'externalcreator:baseline';
 
 /** Long enough for a real build; short enough that a hung command is noticed. */
@@ -136,6 +184,7 @@ interface CheckVerdict {
 }
 
 interface TaskExtra {
+  permissionEvidence?: PermissionReceipt[];
   taskId: string;
   taskText: string;
   goalId?: string;
@@ -191,6 +240,7 @@ export class ExternalCreator extends Abject {
   private jobManagerId?: AbjectId;
   private verificationRuns = new Map<string, Promise<CheckOutcome>>();
 
+  private readonly operationTask = new AsyncLocalStorage<string>();
   private taskExtras = new Map<string, TaskExtra>();
   private _currentGoalId?: string;
 
@@ -318,7 +368,25 @@ clean result I did not observe.`;
     payload: unknown,
     timeoutMs = 60_000,
   ): Promise<T> {
-    return this.request<T>(request(this.id, target, method, payload), timeoutMs);
+    const taskId = this.operationTask.getStore();
+    if (taskId && payload && typeof payload === 'object' && (target === this.hostFsId || target === this.shellId)) {
+      payload = { ...payload, taskId };
+    }
+    const retain = (permission?: PermissionReceipt) => {
+      const extra = taskId ? this.taskExtras.get(taskId) : undefined;
+      if (extra && permission) {
+        (extra.permissionEvidence ??= []).push(permission);
+        if (extra.permissionEvidence.length > 30) extra.permissionEvidence.splice(0, extra.permissionEvidence.length - 30);
+      }
+    };
+    try {
+      const result = await this.request<T>(request(this.id, target, method, payload), timeoutMs);
+      retain((result as any)?.permission);
+      return result;
+    } catch (error) {
+      retain((errorDetails(error) as any)?.permission);
+      throw error;
+    }
   }
 
   private reportProgress(extra: TaskExtra, phase: string, message: string): void {
@@ -406,7 +474,7 @@ clean result I did not observe.`;
     if (rel.startsWith('..') || path.isAbsolute(rel)) {
       throw new Error(
         `"${p}" is outside the project (${root}). Paths are relative to the project root; ` +
-        `use bash if you genuinely need to reach outside it.`,
+        `Ask the capability owner about access to another location.`,
       );
     }
     return abs;
@@ -454,7 +522,7 @@ clean result I did not observe.`;
     const shellId = await this.shell();
     return this.call<{ stdout: string; stderr: string; exitCode: number }>(
       shellId, 'exec',
-      { command: `git ${args}`, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
+      { command: `git ${args}`, taskId: extra.taskId, shell: true, cwd: cwd ?? extra.workRoot, timeout: timeoutMs, untrusted: this.isUntrusted(extra) },
       timeoutMs + 15_000,
     );
   }
@@ -940,7 +1008,7 @@ clean result I did not observe.`;
 
   // ─── The action kernel ──────────────────────────────────────────
 
-  private async opRead(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
+  private async opRead(extra: TaskExtra, action: AgentAction): Promise<AgentActionResult> {
     const p = String(action.path ?? '');
     const abs = this.resolveWorkPath(extra, p);
     const fs = await this.hostFs();
@@ -953,7 +1021,9 @@ clean result I did not observe.`;
     this.audit(extra, `read ${this.displayPath(extra, abs)} (${r.lines}/${r.totalLines} lines)`);
     const instructions = await this.nestedInstructionsFor(extra, abs);
     const header = `${instructions}${this.displayPath(extra, abs)} (${r.totalLines} lines)\n`;
-    return bulkAwareResult(header + r.content);
+    const body = header + r.content;
+    return { success: true, data: { path: abs, offset: Math.max(1, Number(action.offset ?? 1)), lines: r.lines,
+      totalLines: r.totalLines, truncated: r.truncated, nextOffset: r.nextOffset }, payload: body, payloadMode: 'page' };
   }
 
   private async opWrite(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -1487,8 +1557,38 @@ clean result I did not observe.`;
     const timeout = typeof action.timeout === 'number' ? action.timeout : 30_000;
     const supplied = (action.payload ?? {}) as Record<string, unknown>;
     const shellId = await this.discoverDep('ShellExecutor');
-    const payload = targetId === shellId ? { ...supplied, taskId: extra.taskId, cwd: extra.workRoot, untrusted: this.isUntrusted(extra) } : supplied;
-    const response = await this.call<unknown>(targetId, method, payload, timeout);
+    const fsId = await this.discoverDep('HostFileSystem');
+    // Convenience actions and generic owner messages share the same safeguards.
+    if (targetId === shellId && method === 'exec' && supplied.shell === true && typeof supplied.command === 'string' && !supplied.args && !supplied.env) {
+      return this.opBash(extra, { ...action, action: 'bash', command: supplied.command, timeout: supplied.timeout, cwd: supplied.cwd });
+    }
+    const mutatesFile = targetId === fsId && ['writeFile', 'conditionalWrite', 'editFile', 'edit', 'mkdir', 'deleteFile'].includes(method);
+    let mutationPath: string | undefined;
+    if (mutatesFile) {
+      mutationPath = this.resolveWorkPath(extra, String(supplied.path ?? ''));
+      this.assertWritable(extra, mutationPath);
+    }
+    const payload = targetId === shellId ? { ...supplied, taskId: extra.taskId, cwd: extra.workRoot, untrusted: this.isUntrusted(extra) }
+      : targetId === fsId ? { ...supplied, ...(mutationPath ? { path: mutationPath } : {}), taskId: extra.taskId } : supplied;
+    const before = targetId === shellId ? await this.verificationSnapshot(extra) : undefined;
+    let response: unknown;
+    try { response = await this.call<unknown>(targetId, method, payload, timeout); }
+    catch (error) {
+      if (targetId === shellId && !errorDetails(error)) { extra.unknownEffects = true; extra.mutationsSinceVerify++; this.taintVerifyBaseline(extra); }
+      throw error;
+    }
+    if (mutationPath && (response as any)?.success !== false) {
+      extra.filesModified.add(mutationPath);
+      extra.mutationsSinceVerify++;
+      this.taintVerifyBaseline(extra);
+      this.announceFilesTouched(extra);
+    }
+    if (before) {
+      const after = await this.verificationSnapshot(extra);
+      if (method === 'start' || !before.complete || !after.complete || before.revision !== after.revision) {
+        extra.unknownEffects = true; extra.mutationsSinceVerify++; this.taintVerifyBaseline(extra);
+      }
+    }
     const contract = await this.call<ResultContract|null>(targetId,'getResultContract',{method},10000).catch(()=>null);
     const rejected=domainFailure(response,contract);
     if(rejected)return {success:false,data:response,error:rejected};
@@ -1623,7 +1723,7 @@ clean result I did not observe.`;
    * holds, and a summary assembled from them cannot hallucinate a step that was
    * never taken.
    */
-  private async writeSessionSummary(extra: TaskExtra, report: string, gate: { ok: boolean; note: string }): Promise<void> {
+  private async writeSessionSummary(extra: TaskExtra, report: string, gate: { ok: boolean; note: string }, outcome: { success: boolean; error?: string } = { success: false }): Promise<void> {
     if (!extra.goalId) return;
     const prev = await this.readGoalData<{ summary?: string }>(extra, SESSION_KEY);
 
@@ -1643,20 +1743,19 @@ clean result I did not observe.`;
       extra.project?.checkCommand ? `- check: \`${extra.project.checkCommand}\`` : '',
       extra.project?.verifyCommand ? `- verify: \`${extra.project.verifyCommand}\`` : '',
       ``,
-      `## Progress`,
-      `### Done`,
-      report ? `- [x] ${report.split('\n')[0]}` : `- [x] (no report)`,
-      gate.ok ? `- [x] ${gate.note}` : '',
-      `### In Progress`,
-      gate.ok ? `- (nothing outstanding)` : `- [ ] ${gate.note}`,
-      `### Blocked`,
-      gate.ok ? `(none)` : gate.note,
-      ``,
+      `## Outcome`,
+      outcome.success && gate.ok ? 'Completed' : extra.cancelled ? 'Cancelled; work remains' : 'Incomplete; work remains',
+      `## Report`,
+      report || '(no report)',
+      outcome.error ? `Stop reason: ${outcome.error}` : '',
+      `## Verification`,
+      gate.note,
+      `Permission explanations are worker claims unless supported by a capability response. Provider sandbox restrictions do not establish Abject permissions; Ask the owner when access is uncertain.`,
       `## Key Decisions`,
       extra.decisions.length > 0 ? extra.decisions.map(d => `- ${d}`).join('\n') : '- (none recorded)',
-      ``,
       `## Next Steps`,
-      gate.ok ? `1. (task reported complete)` : `1. ${gate.note}`,
+      outcome.success && gate.ok ? 'Task reported complete; use the retained report and evidence for follow-up work.'
+        : `Continue from the findings above. ${outcome.error || (!gate.ok ? gate.note : 'Execution stopped before completing the requested outcome.')}`,
       ``,
       `## Critical Context`,
       extra.checkpoints.length > 0
@@ -1670,10 +1769,51 @@ clean result I did not observe.`;
 
     await this.writeGoalData(extra, SESSION_KEY, {
       summary,
+      taskId: extra.taskId,
+      outcome: { success: outcome.success && gate.ok, error: outcome.error, cancelled: extra.cancelled === true },
+      report, verification: gate, decisions: [...extra.decisions], permissionEvidence: extra.permissionEvidence ?? [],
       previous: prev?.summary ? prev.summary.slice(0, 4000) : undefined,
       audit: extra.audit.slice(-200),
       at: Date.now(),
     });
+    await this.writeGoalData(extra, `${VERIFICATION_KEY_PREFIX}${extra.taskId}`, this.verificationReceipt(extra, gate, outcome, modified.length));
+  }
+
+  /**
+   * The task's verification as data: which commands ran, when, with what exit
+   * code and test counts, next to the gate that judged them. Written beside
+   * the narrative report so whoever summarizes the goal can quote the newest
+   * run instead of whichever figure a prose entry happened to mention.
+   */
+  private verificationReceipt(
+    extra: TaskExtra,
+    gate: { ok: boolean; note: string },
+    outcome: { success: boolean; error?: string },
+    filesModified: number,
+  ): VerificationReceipt {
+    const run = (v?: CheckVerdict): VerificationRun | undefined => v ? {
+      command: v.outcome.command,
+      exitCode: v.outcome.exitCode,
+      at: v.outcome.at,
+      passed: v.passed,
+      testSummary: v.outcome.testSummary,
+      failureCount: v.outcome.failureCount,
+      newFailures: v.newFailures.length,
+      foreignFailures: v.foreignFailures.length,
+      preExisting: v.preExisting,
+    } : undefined;
+    return {
+      taskId: extra.taskId,
+      agent: this.manifest.name,
+      project: extra.project?.name,
+      at: Date.now(),
+      outcome: outcome.success && gate.ok ? 'complete' : extra.cancelled ? 'cancelled' : 'incomplete',
+      filesModified,
+      mutationsSinceVerify: extra.mutationsSinceVerify,
+      gate: { ok: gate.ok, note: gate.note },
+      verify: run(extra.lastVerify),
+      check: run(extra.lastCheck),
+    };
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1699,13 +1839,20 @@ clean result I did not observe.`;
         },
         intermediateActions: ['reply'],
         queueName: `external-creator-${this.id}`,
-        maxSteps: 50,
+        maxSteps: DEFAULT_TASK_STEPS,
       },
     }));
   }
 
+  private onTaskMessage(method: string, handler: MessageHandlerFn): void {
+    this.on(method, message => {
+      const taskId = (message.payload as any)?.taskId;
+      return typeof taskId === 'string' ? this.operationTask.run(taskId, () => handler(message)) : handler(message);
+    });
+  }
+
   private setupHandlers(): void {
-    this.on('executeTask', async (msg: AbjectMessage) => {
+    this.onTaskMessage('executeTask', async (msg: AbjectMessage) => {
       const { tupleId, taskId: explicitTaskId, goalId, description, data, approach, failureHistory } =
         msg.payload as {
           tupleId?: string; taskId?: string; goalId?: string; description: string;
@@ -1714,17 +1861,15 @@ clean result I did not observe.`;
         };
 
       const taskId = explicitTaskId ?? tupleId ?? `ext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      return this.runLoop({ taskId, taskText: description, goalId, data, tupleId, approach, failureHistory });
+      return this.operationTask.run(taskId, () => this.runLoop({ taskId, taskText: description, goalId, data, tupleId, approach, failureHistory }));
     });
 
-    this.on('runTask', async (msg: AbjectMessage) => {
+    this.onTaskMessage('runTask', async (msg: AbjectMessage) => {
       const { task, project } = msg.payload as { task: string; project?: string };
       const taskId = `ext-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      return this.runLoop({
-        taskId,
-        taskText: task,
-        data: project ? { project } : undefined,
-      });
+      return this.operationTask.run(taskId, () => this.runLoop({
+        taskId, taskText: task, data: project ? { project } : undefined,
+      }));
     });
 
     this.onDelivery('taskResult', async (msg: AbjectMessage) => {
@@ -1734,7 +1879,7 @@ clean result I did not observe.`;
       this.pendingTickets.get(payload.ticketId)?.resolve(payload);
     });
 
-    this.on('progress', (msg: AbjectMessage) => {
+    this.onTaskMessage('progress', (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       // Progress arrives untagged, so it cannot be attributed to one task by
       // inspection. With several running, every live goal is genuinely being
@@ -1760,19 +1905,19 @@ clean result I did not observe.`;
     });
 
     // ── AgentAbject callbacks ──
-    this.on('agentObserve', async (msg: AbjectMessage) => {
+    this.onTaskMessage('agentObserve', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId } = msg.payload as { taskId: string };
       return this.handleObserve(taskId);
     });
 
-    this.on('snapshotTask', async (msg: AbjectMessage) => {
+    this.onTaskMessage('snapshotTask', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
       const extra = this.taskExtras.get((msg.payload as { taskId: string }).taskId);
       return extra ? encodeAgentState(extra) : null;
     });
-    this.on('restoreTask', async (msg: AbjectMessage) => {
+    this.onTaskMessage('restoreTask', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can restore this task');
       const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: unknown };
       // AgentAbject decodes the session before sending this message.
@@ -1788,7 +1933,7 @@ clean result I did not observe.`;
       return { success: true };
     });
 
-    this.on('candidateComplete', async (msg: AbjectMessage) => {
+    this.onTaskMessage('candidateComplete', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can settle this candidate');
       const { taskId, result } = msg.payload as { taskId: string; result?: unknown };
       const extra = this.taskExtras.get(taskId);
@@ -1811,7 +1956,7 @@ clean result I did not observe.`;
         ...(gate.ok && typeof result === 'string' ? { result: `${result}\n\nVerification: ${note}` } : {}) };
     });
 
-    this.on('taskCancelled', async (msg: AbjectMessage) => {
+    this.onTaskMessage('taskCancelled', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.agentAbjectId) return;
       const { taskId } = msg.payload as { taskId: string };
       const extra = this.taskExtras.get(taskId);
@@ -1820,7 +1965,7 @@ clean result I did not observe.`;
       await this.request(request(this.id, shell, 'stopTaskProcesses', { taskId }));
     });
 
-    this.on('agentAct', async (msg: AbjectMessage) => {
+    this.onTaskMessage('agentAct', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
@@ -1828,13 +1973,13 @@ clean result I did not observe.`;
       // pending ticket would time out while real work is happening.
       const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 30_000);
       try {
-        return await this.handleAct(taskId, action);
+        return await this.operationTask.run(taskId, () => this.handleAct(taskId, action));
       } finally {
         clearInterval(heartbeat);
       }
     });
 
-    this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+    this.onTaskMessage('agentPhaseChanged', async (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
       const { newPhase } = msg.payload as { newPhase: string };
       if (this.jobManagerId) {
@@ -1842,8 +1987,15 @@ clean result I did not observe.`;
       }
     });
 
-    this.on('agentIntermediateAction', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
-    this.on('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
+    this.onTaskMessage('agentIntermediateAction', async (msg: AbjectMessage) => {
+      await this.requireTaskRuntime(msg, this.agentAbjectId);
+      const { taskId, action } = msg.payload as { taskId: string; action?: AgentAction };
+      this.resetPendingTicketTimeouts(taskId);
+      const extra = this.taskExtras.get(taskId);
+      const text = action?.message ?? action?.text;
+      if (extra && action?.action === 'reply' && typeof text === 'string' && text.trim()) extra.decisions.push(text);
+    });
+    this.onTaskMessage('agentActionResult', async (msg: AbjectMessage) => { this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId); });
   }
 
   // ─── Task lifecycle ─────────────────────────────────────────────
@@ -1914,7 +2066,7 @@ clean result I did not observe.`;
           dispatchTupleId: args.tupleId,
           initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
           config: {
-            maxSteps: 50,
+            maxSteps: taskStepBudget(args.data?.maxSteps),
             knowledgeScope: extra.project ? `project:${extra.project.name}` : undefined,
             timeout: 1_800_000,
             queueName: `external-creator-${args.taskId}`,
@@ -1946,11 +2098,9 @@ clean result I did not observe.`;
   /**
    * Turn the loop's claim into an honest result.
    *
-   * The gate runs here because the agent runtime finishes a task the instant a
-   * terminal action is parsed — there is no point between "the model said done"
-   * and "the task is done" for this object to stand in. So it stands after:
-   * a claim that does not survive the gate is downgraded to a failure carrying
-   * the precise reason, which is what the caller and the user actually need.
+   * candidateComplete supplies verification before the runtime settles the task.
+   * Finalization preserves that evidence alongside the actual execution outcome
+   * and cleans up the project session.
    */
   private async finalize(
     extra: TaskExtra,
@@ -1976,10 +2126,13 @@ clean result I did not observe.`;
       worktreeNote ?? '',
     ].filter(Boolean).join('\n');
 
-    await this.writeSessionSummary(extra, reportText, gate);
+    await this.writeSessionSummary(extra, reportText, gate, loop);
 
     if (!loop.success) {
-      return { success: false, error: `${loop.error ?? 'task failed'}\n\n${evidence}` };
+      const denials = (extra.permissionEvidence ?? []).filter(p => !p.decision.startsWith('accept'));
+      const permissionNote = /permission|read.only|sandbox|approval/i.test(loop.error ?? '')
+        ? `\nPermission evidence: ${denials.length ? JSON.stringify(denials) : 'No capability denial was recorded. The worker explanation is unverified; Ask the owner before treating access as unavailable.'}` : '';
+      return { success: false, error: `${loop.error ?? 'task failed'}\n\n${evidence}${permissionNote}` };
     }
 
     if (!gate.ok) {
@@ -2046,7 +2199,7 @@ clean result I did not observe.`;
 
         const prior = await this.readGoalData<{ summary?: string }>(extra, SESSION_KEY);
         if (prior?.summary) {
-          lines.push(`\nWhere the previous task in this goal left off:\n${prior.summary.slice(0, 4000)}`);
+          lines.push(`\nWhere the previous task in this goal left off:\n${prior.summary.slice(0, 4000)}${prior.summary.length > 4000 ? `\n[Handoff excerpt. Read the complete report, decisions and audit with read_scratchpad key=${SESSION_KEY}.]` : ''}`);
         }
       } else {
         const all = await this.listProjects();
@@ -2166,7 +2319,7 @@ clean result I did not observe.`;
       const message = err instanceof Error ? err.message : String(err);
       extra.lastResult = `Error: ${message}`;
       this.audit(extra, `action ${action.action} threw: ${message}`);
-      return { success: false, error: message };
+      return { success: false, error: message, ...(errorDetails(err) ? { data: errorDetails(err) } : {}) };
     }
   }
 
@@ -2226,7 +2379,7 @@ Live project configuration and observed results take precedence over historical 
 5. **Use verification evidence.** Run the declared check after relevant edits; a distinct full verification command must also run when required. Use verify (full: false for check, full: true for verification) to obtain structured results and reuse applicable evidence. force: true requests a fresh run. The exact declared command counts through either verify or bash; shell pipelines and compound commands do not provide individual verification status. Filter output through read_output after execution, not through a pipeline that can mask failure. Read-only commands and commits do not invalidate unchanged project inputs. Evidence reuse covers the declared command and scoped project snapshot within this task; request force: true when toolchain, environment, services, or other untracked inputs changed. Report snapshot limitations honestly; an exit-0 command with limited coverage is not a failed test, and repeating it just to get identical snapshots is unnecessary. If completion still needs correction after one attempt, preserve the work and report the unresolved evidence.
 6. **Say what you did not verify.** When a project declares no commands, there is nothing to run — report exactly what you changed and that it was not verified. Never let silence imply a pass.
 7. **Keep oldText small.** Just enough context to be unique, no padding.
-8. **Delegation is a message to any object.** Discover a known dependency by name and call its describe message for exact methods and schemas; this is deterministic and costs no model call. Use Ask for questions requiring interpretation or collaborator agreement. Then message the receiver with a self-contained request, including durable input references and the remaining outcome rather than asking it to rediscover completed work. Inside a submit_job, discovery is dep(name) / find(name). Other objects may message your runTask the same way.
+8. **Delegation is a message to any object.** Discover collaborators by name and use Ask to establish how they can help, their constraints, and the appropriate messages. Reuse relevant answers while their assumptions hold. Use describe when exact interface parameters are needed; it does not replace contextual Ask collaboration. Then message the receiver with a self-contained request, including durable input references and the remaining outcome rather than asking it to rediscover completed work. Inside a submit_job, discovery is dep(name) / find(name). Other objects may message your runTask the same way.
 
 Report in your done result: what changed, which command proved it, and anything you could not check.`;
   }

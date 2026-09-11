@@ -39,7 +39,8 @@
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
-import { Abject } from '../core/abject.js';
+import type { SessionRecord } from './task-session.js';
+import { Abject, isTemporaryAskResponse } from '../core/abject.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
@@ -78,6 +79,13 @@ interface StagedTask {
   dependsOnIdx: number[];
   produces?: Array<{ key: string; description: string }>;
   consumes?: string[];
+  /**
+   * Planner-sized step budget for the task, when it gave one. Threaded to the
+   * agent's executeTask as `data.maxSteps`; the agent clamps it to its own
+   * range. A research task and a multi-file implementation are not the same
+   * size, and the agent's default cannot know which one it was handed.
+   */
+  maxSteps?: number;
   /**
    * Optional concrete target object (UUID or registered name) when the task
    * operates on an existing Abject. Threaded to the agent's executeTask as
@@ -357,8 +365,9 @@ export class ScrumMaster extends Abject {
 
   private setupHandlers(): void {
     this.on('snapshotTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot Scrum state');
       const { taskId } = msg.payload as { taskId: string };
-      return { inflight: this.scrumInFlight.get(taskId) };
+      return structuredClone({ inflight: this.scrumInFlight.get(taskId) });
     });
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore Scrum state');
@@ -1269,11 +1278,17 @@ export class ScrumMaster extends Abject {
         ...(userInterjections.length > 0 ? { userInterjections } : {}),
         ...(loopWarning ? { loopWarning } : {}),
         completed: completed.map(t => ({
+          id: t.id,
+          ...(Object.hasOwn(scratchpad, `tasks/${t.id}/result`) ? { resultKey: `tasks/${t.id}/result` } : {}),
+          ...(Object.hasOwn(scratchpad, `learning/task/${t.id}`) ? { evidenceKey: `learning/task/${t.id}` } : {}),
           description: (t.fields.description as string ?? '').slice(0, 300),
           producesKeys: ((t.fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
           assignedAgentId: (t.fields.assignedAgentId as string ?? '').slice(0, 8),
         })),
         failed: failed.map(t => ({
+          id: t.id,
+          ...(Object.hasOwn(scratchpad, `tasks/${t.id}/result`) ? { resultKey: `tasks/${t.id}/result` } : {}),
+          ...(Object.hasOwn(scratchpad, `learning/task/${t.id}`) ? { evidenceKey: `learning/task/${t.id}` } : {}),
           description: (t.fields.description as string ?? '').slice(0, 300),
           error: (t.fields.error as string ?? '').slice(0, 600),
           assignedAgentId: (t.fields.assignedAgentId as string ?? '').slice(0, 8),
@@ -1418,7 +1433,7 @@ export class ScrumMaster extends Abject {
           );
           const text = (typeof response === 'string' ? response : String(response)).trim();
           const pass = !text || /^PASS\b/i.test(text);
-          this.pollReplyCache.set(cacheKey, { text: pass ? '' : text, at: now });
+          if (!isTemporaryAskResponse(text)) this.pollReplyCache.set(cacheKey, { text: pass ? '' : text, at: now });
           if (pass) return null;
           return { agentName: member.name, text };
         } catch (err) {
@@ -1466,6 +1481,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     // operates on an existing Abject. Threads through to the agent's
     // executeTask as `data.target`. Accept common aliases the LLM might emit.
     const target = (action.target ?? action.objectId ?? action.objectName) as string | undefined;
+    const maxSteps = typeof action.maxSteps === 'number' && Number.isFinite(action.maxSteps) ? Math.round(action.maxSteps) : undefined;
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
@@ -1543,6 +1559,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       produces,
       consumes,
       target,
+      maxSteps,
     };
     if ((consumes?.length ?? 0) > 0 || (produces?.length ?? 0) > 0) {
       let existingKeys = new Set<string>();
@@ -1601,7 +1618,12 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     //      and could leave the formatting to a cheap follow-up.
     let synthesis: string;
     if (inlineSynthesis && inlineSynthesis.length > 0) {
-      synthesis = inlineSynthesis;
+      // The planner wrote it, but the same discipline applies: a quoted test
+      // figure has to match a recorded run.
+      const goal = await this.fetchGoalForSynthesis(goalId);
+      synthesis = goal && this.llmId
+        ? await this.groundSynthesis(inlineSynthesis, verificationRecordOf(goal.scratchpad ?? {}))
+        : inlineSynthesis;
     } else {
       synthesis = await this.synthesizeCompletionText(goalId, hint).catch((err) => {
         log.warn(`auto-synthesis failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1725,27 +1747,25 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
    * call only needs to decide "we're done"; the haiku-tier call here handles
    * the formatting. Typical speedup: 10–15s on haiku vs 60s+ on opus for the
    * same output.
+   *
+   * The scratchpad is presented oldest to newest and the verification record
+   * (structured receipts from the capability owners) leads it, because a
+   * summary once quoted a round-1 test count after a later round had added
+   * tests and re-run them. Prose from an earlier task is history; the newest
+   * receipt is the fact.
    */
   private async synthesizeCompletionText(goalId: string, hint?: string): Promise<string> {
     if (!this.llmId || !this.goalManagerId) {
       return hint && hint.length > 0 ? hint : 'Sprint complete.';
     }
 
-    const goal = await this.request<{
-      title: string; description: string; scratchpad?: Record<string, unknown>;
-      interjections?: Array<{ note: string; at: number; status: string }>;
-    } | null>(
-      request(this.id, this.goalManagerId, 'getGoal', { goalId }),
-    ).catch(() => null);
+    const goal = await this.fetchGoalForSynthesis(goalId);
     if (!goal) {
       return hint && hint.length > 0 ? hint : 'Sprint complete.';
     }
 
-    const scratchpad = goal.scratchpad ?? {};
-    const scratchpadKeys = Object.keys(scratchpad);
-    const scratchpadBlock = scratchpadKeys.length > 0
-      ? scratchpadKeys.map((k) => `### ${k}\n${safeStringify(scratchpad[k], 8000)}`).join('\n\n')
-      : '(empty)';
+    const record = verificationRecordOf(goal.scratchpad ?? {});
+    const scratchpadBlock = orderedScratchpadBlock(goal.scratchpad ?? {}, goal.scratchpadUpdatedAt ?? {});
 
     const hintBlock = hint && hint.length > 0
       ? `\n\nFraming hint from the planner: ${hint}`
@@ -1765,12 +1785,18 @@ Goal: "${goal.title}"
 User's intent:
 ${goal.description}${interjectionBlock}
 
-Scratchpad (results from completed tasks — this is the data your answer must inline):
+Verification record (written by the capability owners that ran the commands; newest run first):
+${renderVerificationRecord(record)}
+
+Scratchpad (results from completed tasks, oldest first — this is the data your answer must inline):
 ${scratchpadBlock}${hintBlock}
 
 Rules:
 - The user only sees this text. They do not see the scratchpad, task list, or any internal artifacts.
 - INLINE the actual data from the scratchpad. Lists, tables, full content, all of it. Do not say "see above" or reference internal artifacts.
+- Figures about checks and tests (how many ran, passed, failed; exit codes) come ONLY from the verification record, and the newest run supersedes every earlier figure, including numbers quoted in older scratchpad prose. When the record is empty, say the work was not verified by a recorded run rather than quoting a number from prose.
+- When a task report lists what it did not verify, could not cover, or left open, carry that forward under a heading "Not verified" so the reader knows the edges of the claim.
+- When the verification record shows that a task asked to change something modified 0 files, say so plainly: the change was already present in the working tree, or nothing was changed by this run. Do not describe it as work done now.
 - When the work created or modified objects, open with how the user reaches the result: a window they can open now, or — for objects with no visual surface — say plainly that nothing appears on screen and they use it by asking in chat; offer building a window as a natural next step.
 - Markdown formatting is fine and encouraged.
 - If the scratchpad is empty or the goal couldn't be resolved, say so plainly.
@@ -1778,25 +1804,75 @@ Rules:
 - Output the answer directly — no preamble like "Here is the result:".`;
 
     try {
-      const result = await this.request<{ content: string }>(
-        request(this.id, this.llmId, 'complete', {
-          messages: [{ role: 'user', content: prompt }],
-          // 16384 matches the smart-tier think call's budget so a synthesis
-          // that enumerates many scratchpad items (long email digests,
-          // multi-section reports, large search results) doesn't get clipped
-          // mid-list. Haiku is tight — it won't pad to fill the budget — so
-          // raising the cap costs nothing on typical short syntheses.
-          options: { tier: 'fast', maxTokens: 16384 },
-        }),
-        120000,
-      );
-      const text = (result.content ?? '').trim();
-      return text.length > 0
-        ? text
-        : (hint && hint.length > 0 ? hint : 'Sprint complete.');
+      const text = await this.fastComplete(prompt);
+      if (!text) return hint && hint.length > 0 ? hint : 'Sprint complete.';
+      return await this.groundSynthesis(text, record);
     } catch (err) {
       log.warn(`synthesizeCompletionText LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
       return hint && hint.length > 0 ? hint : 'Sprint complete.';
+    }
+  }
+
+  private async fetchGoalForSynthesis(goalId: string): Promise<{
+    title: string; description: string; scratchpad?: Record<string, unknown>;
+    scratchpadUpdatedAt?: Record<string, number>;
+    interjections?: Array<{ note: string; at: number; status: string }>;
+  } | null> {
+    if (!this.goalManagerId) return null;
+    return this.request<{
+      title: string; description: string; scratchpad?: Record<string, unknown>;
+      scratchpadUpdatedAt?: Record<string, number>;
+      interjections?: Array<{ note: string; at: number; status: string }>;
+    } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+    ).catch(() => null);
+  }
+
+  private async fastComplete(prompt: string): Promise<string> {
+    if (!this.llmId) return '';
+    const result = await this.request<{ content: string }>(
+      request(this.id, this.llmId, 'complete', {
+        messages: [{ role: 'user', content: prompt }],
+        // 16384 matches the smart-tier think call's budget so a synthesis
+        // that enumerates many scratchpad items (long email digests,
+        // multi-section reports, large search results) doesn't get clipped
+        // mid-list. Haiku is tight — it won't pad to fill the budget — so
+        // raising the cap costs nothing on typical short syntheses.
+        options: { tier: 'fast', maxTokens: 16384 },
+      }),
+      120000,
+    );
+    return (result.content ?? '').trim();
+  }
+
+  /**
+   * One fidelity re-ask, never a rewrite.
+   *
+   * When the draft quotes a test figure that matches no run in the record,
+   * the model is shown the discrepancy once and asked to correct the figures
+   * and nothing else. A second mismatch is logged and the corrected draft is
+   * used as is: the record sits in the scratchpad for anyone who looks, and
+   * this object does not edit a model's prose behind its back.
+   */
+  private async groundSynthesis(text: string, record: VerificationRecordEntry[]): Promise<string> {
+    const mismatch = findVerificationMismatch(text, record);
+    if (!mismatch) return text;
+    log.warn(`synthesis quotes a test figure the verification record does not support (${mismatch}); asking once for a correction`);
+    try {
+      const corrected = await this.fastComplete(
+        `The final answer below quotes a verification figure that the verification record does not support.\n\n` +
+        `Discrepancy: ${mismatch}\n\n` +
+        `Verification record (newest run first):\n${renderVerificationRecord(record)}\n\n` +
+        `Rewrite the answer with the figures taken from the newest run in the record. Change nothing else: keep every other sentence, list, and heading as written. Output the corrected answer only.\n\n` +
+        `Answer:\n${text}`,
+      );
+      if (!corrected) return text;
+      const still = findVerificationMismatch(corrected, record);
+      if (still) log.warn(`synthesis still disagrees with the verification record after one correction (${still}); using the corrected draft as returned`);
+      return corrected;
+    } catch (err) {
+      log.warn(`synthesis correction failed: ${err instanceof Error ? err.message : String(err)}`);
+      return text;
     }
   }
 
@@ -2157,7 +2233,7 @@ Rules:
       const addResult = await this.request<{ taskId?: string; error?: string }>(
         request(this.id, this.goalManagerId, 'addTask', {
           goalId, operationId: `${otaTaskId}:task:${taskIds.length}`,
-          data: { planOperationId: otaTaskId, target: s.target, priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
+          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
           description: s.description,
           dependsOn: depIds.length > 0 ? depIds : undefined,
           produces: s.produces,
@@ -2236,15 +2312,30 @@ Rules:
     this.recoveringDispatches = true;
     try {
       const goals = await this.request<Array<{ id: string; scratchpad?: Record<string, unknown> }>>(request(this.id, this.goalManagerId, 'listGoals', { status: 'active' }));
-      const sessions = await this.request<Array<{ id: string }>>(request(this.id, this.agentAbjectId, 'getSessions', {}));
-      const sessionsById = new Set(sessions.map(s => s.id));
+      const sessions = await this.request<SessionRecord[]>(request(this.id, this.agentAbjectId, 'getSessions', {}));
+      const sessionsById = new Map(sessions.map(s => [s.id, s]));
       const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(request(this.id, this.agentAbjectId, 'listAgents', {}));
       for (const goal of goals) {
         if (await this.isRemoteGoal(goal.id)) continue;
         const tuples = await this.request<Array<{ id: string; fields: Record<string, any> }>>(request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId: goal.id }));
         const byId = new Map(tuples.map(t => [t.id, t]));
         for (const tuple of tuples) {
-          if (tuple.fields.status !== 'pending' || sessionsById.has(tuple.id) || this.recoveredEnqueues.has(tuple.id)) continue;
+          if (this.recoveredEnqueues.has(tuple.id)) continue;
+          const session = sessionsById.get(tuple.id);
+          if (session) {
+            // A crash changes running sessions to partial. Resume only unfinished,
+            // still-owned work without a recorded stop/failure or uncertain effect.
+            // Deliberate stops and completed failures require a planning decision.
+            if (session.status === 'partial' && !session.outstandingOperation && !(session.outcome as { error?: string } | undefined)?.error
+                && ['pending', 'running', 'in_progress'].includes(tuple.fields.status)) {
+              try {
+                const resumed = await this.request<{ ticketId?: string }>(request(this.id, this.agentAbjectId, 'resumeTask', { id: session.id, expectedRevision: session.revision }));
+                if (resumed.ticketId) this.recoveredEnqueues.add(tuple.id);
+              } catch (err) { log.warn(`Interrupted task ${tuple.id} not resumed: ${String(err)}`); }
+            }
+            continue;
+          }
+          if (tuple.fields.status !== 'pending') continue;
           const data = tuple.fields.data ?? {};
           if (data.planOperationId && !goal.scratchpad?.[`learning/commit/${data.planOperationId}`]) continue;
           const agent = agents.find(a => a.name === data.assignedAgentName) ?? agents.find(a => a.agentId === tuple.fields.assignedAgentId);
@@ -2321,7 +2412,9 @@ Rules:
   // ═══════════════════════════════════════════════════════════════════
 
   private buildSystemPrompt(): string {
-    return `You are the ScrumMaster. Each task in your queue is one scrum meeting for a goal. Your job is to look at the goal's state and decide ONE of:
+    return `Permission and environment blockers must be grounded in capability responses. Worker explanations are hypotheses until supported. A provider's native sandbox does not describe Abject access. Ask the capability owner or inspect existing permission receipts before declaring access impossible; distinguish policy denial, unavailable owner/provider, and an unverified explanation. Preserve this distinction in the goal report.
+
+You are the ScrumMaster. Each task in your queue is one scrum meeting for a goal. Your job is to look at the goal's state and decide ONE of:
 
 1. The sprint is **done** — call \`complete_goal({ synthesis })\` with a complete, self-contained final answer for the user.
 2. The sprint needs more work — call \`add_task\` (one or more times to stage), then \`dispatch_scrum\` to commit.
@@ -2364,6 +2457,8 @@ No parameters. Returns the same snapshot you were already given in the opening o
 }
 \`\`\`
 
+Reuse the originating conversation, linked goal results, and task handoffs before assigning follow-up work. An interrupted, still-owned task can resume through AgentAbject's session protocol after unknown effects are reconciled; restart recovery handles eligible interruptions. A completed failure or superseded task needs new work with explicit references to retained findings, the unresolved outcome, and the reason the approach changes. Never rediscover a saved plan merely because a new task is starting. Current observations can disprove retrieved knowledge: respond to them during this goal and retain the contradiction for TaskReviewer rather than waiting for retrospective learning.
+
 \`team\` lists each agent with its live capability summary (kept current as skills and MCP servers come and go). The summaries are enough to recognize when one agent obviously owns a request; they are a coarse summary, not a full tool signature, so when the right agent isn't obvious from the descriptions — or you need to confirm a specific tool/skill/MCP is installed RIGHT NOW — call \`poll_team\`, which asks agents directly and returns their detailed live replies. Pass an agent's \`name\` to \`add_task\`'s \`assignedAgentName\` or to \`quick_dispatch\`.
 
 \`quickDispatchAvailable\` appears only on the first look at a fresh goal. When it's present and the goal is a SINGLE concrete step that one agent's \`team\` description clearly covers, skip planning entirely and emit \`quick_dispatch\` (see below). When the goal needs multiple steps, coordination, verification, or the right agent isn't obvious, plan normally instead.
@@ -2399,6 +2494,7 @@ Append one task to the current scrum's plan. **This does NOT commit** — it sta
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: names (from \`id\`) or indices of THIS scrum's prior add_task calls. This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason. And when a task would depend not on data another staged task writes but on knowledge nobody has yet — \"research X, then build whatever X implies\" — that is not a dependency to encode here: end the round at the research and plan the build next scrum (see **Research-first goals**).
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
+- \`maxSteps\`: OPTIONAL. A step budget sized to the task when the agent's default would be wrong: a quick lookup needs far fewer steps than a multi-file implementation that must also run the project's checks. The agent clamps it to its own range and still earns progress-based extensions. Omit it when unsure.
 - **Parallel tasks on one external project (files on disk) run in the same checkout at once.** Partition them by area — different files or directories per task — so two tasks never edit the same file; name the area in each description.
 - \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context). **A consumed key is an edge.** If another task in this round produces it, this task automatically waits for that task, whether or not you also list it in \`dependsOn\`. So describing the data a task needs is enough; you do not have to keep the topology right by hand as well. A key nothing in the round produces has to already be on the goal scratchpad from an earlier round, otherwise the whole round is refused and you plan it again.
 - \`id\`: an optional short name for this task (\`"audit-web"\`). Other tasks can then depend on it by name instead of by position, which is worth doing the moment a round has more than two or three tasks: a mistaken index produces a valid graph of the wrong shape and nothing downstream can tell.
@@ -2527,6 +2623,8 @@ Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad c
 - Multiple \`add_task\` calls = multiple OTA cycles. Each call stages one task; \`dispatch_scrum\` commits the batch.
 - Prefer 1-3 tasks per scrum unless work is naturally parallelizable. When it is, stage the whole independent set in ONE round with \`dependsOn: []\` on each: a wide parallel round finishes sooner than the same tasks split across sequential rounds, and agents run several at once. When what makes that set plannable is research nobody has done yet, run the research round FIRST and stage the wide round in the next scrum (see **Research-first goals**).
 - Synthesis in \`complete_goal\` MUST be self-contained text. Pull data from scratchpad and inline it. No "see above".
+- Figures about checks and tests come from the \`verification/*\` scratchpad receipts (written by the capability owners), and the NEWEST receipt supersedes any number an earlier task's prose mentions. A task report's "what this does not cover" notes travel into the synthesis under "Not verified".
+- A receipt showing 0 files modified for a task that was asked to change something means the change was already on disk or nothing was changed by this run; the synthesis says which, rather than presenting it as work done now.
 - All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.
 
 ## Research-first goals: research one round, build the next
@@ -2559,3 +2657,117 @@ The same discipline applies to the PLATFORM's own capabilities (rendering, UI, s
 }
 
 void event; // keep import live; reserved for future events
+
+// ═══════════════════════════════════════════════════════════════════
+// Verification record: what the capability owners recorded, in order
+// ═══════════════════════════════════════════════════════════════════
+
+/** One task's structured verification receipt, as ExternalCreator writes it. */
+export interface VerificationRecordEntry {
+  key: string;
+  taskId: string;
+  agent?: string;
+  project?: string;
+  at: number;
+  outcome?: string;
+  filesModified?: number;
+  gate?: { ok: boolean; note: string };
+  verify?: VerificationRunLike;
+  check?: VerificationRunLike;
+}
+
+interface VerificationRunLike {
+  command: string;
+  exitCode: number;
+  at: number;
+  passed?: boolean;
+  testSummary?: { tests?: number; passed?: number; failed?: number };
+  failureCount?: number;
+}
+
+/**
+ * Every scratchpad key rendered oldest first, each labeled with its write
+ * time and round position, so a later entry visibly supersedes an earlier
+ * one on the same subject. Receipts are rendered separately and skipped here.
+ */
+export function orderedScratchpadBlock(scratchpad: Record<string, unknown>, updatedAt: Record<string, number>): string {
+  // Only structured receipts are rendered elsewhere. A planner may name a
+  // prose key "verification/…" too, and that prose still belongs here.
+  const keys = Object.keys(scratchpad).filter(k => !isVerificationReceipt(k, scratchpad[k]));
+  if (keys.length === 0) return '(empty)';
+  const ordered = keys
+    .map((key, index) => ({ key, index, at: updatedAt[key] }))
+    .sort((a, b) => (a.at ?? -1) - (b.at ?? -1) || a.index - b.index);
+  return ordered.map((e, i) =>
+    `### [${i + 1} of ${ordered.length}${e.at ? `, written ${new Date(e.at).toISOString()}` : ''}] ${e.key}\n${safeStringify(scratchpad[e.key], 8000)}`,
+  ).join('\n\n');
+}
+
+function isVerificationReceipt(key: string, value: unknown): value is Partial<VerificationRecordEntry> & { at: number } {
+  return key.startsWith('verification/') && !!value && typeof value === 'object' && typeof (value as { at?: unknown }).at === 'number';
+}
+
+/** Receipts on the scratchpad, newest first. Prose under the same prefix is not a receipt. */
+export function verificationRecordOf(scratchpad: Record<string, unknown>): VerificationRecordEntry[] {
+  const out: VerificationRecordEntry[] = [];
+  for (const [key, value] of Object.entries(scratchpad)) {
+    if (!isVerificationReceipt(key, value)) continue;
+    out.push({ ...value, key, taskId: typeof value.taskId === 'string' ? value.taskId : key.slice('verification/'.length), at: value.at });
+  }
+  return out.sort((a, b) => b.at - a.at);
+}
+
+function renderRun(label: string, run?: VerificationRunLike): string {
+  if (!run) return `${label}: not run`;
+  const t = run.testSummary;
+  const tests = t && (t.tests !== undefined || t.passed !== undefined)
+    ? `; tests ${t.passed ?? '?'} passed of ${t.tests ?? '?'}${t.failed ? `, ${t.failed} failed` : ''}`
+    : run.failureCount ? `; ${run.failureCount} failure(s) reported` : '';
+  return `${label}: \`${run.command}\` exit ${run.exitCode} at ${new Date(run.at).toISOString()}${tests}`;
+}
+
+export function renderVerificationRecord(record: VerificationRecordEntry[]): string {
+  if (record.length === 0) return '(no recorded verification runs)';
+  return record.map((r, i) => {
+    const head = `${i === 0 ? 'NEWEST — ' : ''}${r.agent ?? 'task'} ${r.taskId.slice(0, 8)}${r.project ? ` in ${r.project}` : ''} (${new Date(r.at).toISOString()}, ${r.outcome ?? 'unknown'}, ${r.filesModified ?? '?'} file(s) modified)`;
+    return `- ${head}\n  ${renderRun('verify', r.verify)}\n  ${renderRun('check', r.check)}${r.gate ? `\n  gate: ${r.gate.ok ? 'ok' : 'NOT ok'} — ${r.gate.note}` : ''}`;
+  }).join('\n');
+}
+
+/**
+ * A STALE test figure in the text: one that matches a count from an older
+ * recorded run and not the newest one. Only that case is flagged. A figure
+ * the record does not know at all is left alone, because a task legitimately
+ * quotes counts the record never saw (a single test file run through bash,
+ * a subset suite), and "correcting" those to the full-suite total once
+ * turned an accurate "9/9 pass" into a wrong "305/305 pass".
+ */
+export function findVerificationMismatch(text: string, record: VerificationRecordEntry[]): string | undefined {
+  const runs = record
+    .flatMap(r => [r.verify, r.check].filter((x): x is VerificationRunLike => !!x && !!x.testSummary))
+    .sort((a, b) => b.at - a.at);
+  const newest = runs[0];
+  if (!newest?.testSummary) return undefined;
+  const counts = (run: VerificationRunLike) =>
+    [run.testSummary?.tests, run.testSummary?.passed, run.testSummary?.failed].filter((n): n is number => typeof n === 'number');
+  const current = new Set(counts(newest));
+  const stale = new Set(runs.slice(1).flatMap(counts).filter(n => !current.has(n)));
+  if (stale.size === 0) return undefined;
+  const quoted = new Set<number>();
+  const patterns = [
+    /(\d+)\s*\/\s*(\d+)\s*(?:tests?|passing|passed|pass)\b/gi,
+    /(\d+)\s+(?:of|out of)\s+(\d+)\s+(?:tests?|passing|passed)\b/gi,
+    /(\d+)\s+tests?\s+(?:passed|passing|pass|ran|run)\b/gi,
+    /(\d+)\s+(?:passed|passing)\b/gi,
+    /(?:tests?|passed|passing)[:\s]+(\d+)\b/gi,
+  ];
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      for (const g of m.slice(1)) if (g !== undefined) quoted.add(Number(g));
+    }
+  }
+  const wrong = [...quoted].filter(n => stale.has(n));
+  if (wrong.length === 0) return undefined;
+  const { tests, passed, failed } = newest.testSummary;
+  return `text quotes ${wrong.join(', ')}, a count from an older run; newest recorded run \`${newest.command}\` counted ${passed ?? '?'} passed of ${tests ?? '?'}${failed ? ` with ${failed} failed` : ''}`;
+}

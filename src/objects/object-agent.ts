@@ -115,7 +115,7 @@ I work exclusively with objects that already exist in the system. I discover the
 
 ### When I answer YES
 
-Whenever the task **names a specific object and asks me to call one of its existing methods** (e.g. "Call show() on the FooWidget", "Invoke refresh on DashboardApp", "Call getState on TelegramBridge", "Trigger a poll on TelegramBridge"), answer YES. A recent Registry scan may not list every freshly-created object, but the dispatcher gave me the object name directly, so I can discover it at execution time via \`find(name)\` or \`dep(name)\` and send the message. Do not answer NO just because the object did not appear in the Registry summary above — the object exists if the task names it.
+When the task names an object and asks for one of its methods, discover that object and establish the available messages through Ask. A missing Registry summary is not proof of absence, and a name in the task is not proof of existence. State what is confirmed and what still needs discovery; do not promise an unavailable capability.
 
 Also say YES for:
 - Fetching data from APIs or services through existing objects (HttpClient, capability objects, MCP-backed skills) — agents know their own configured credentials.
@@ -167,7 +167,10 @@ When asked about a task, describe which objects you would message and what you w
   }
 
   private setupHandlers(): void {
-    this.on('snapshotTask', msg => structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId)));
+    this.on('snapshotTask', msg => {
+      if (msg.routing.from !== this.agentAbjectId) throw new Error('Only the task runtime can snapshot this task');
+      return structuredClone(this.taskExtras.get((msg.payload as { taskId: string }).taskId));
+    });
     this.on('restoreTask', msg => {
       if (msg.routing.from !== this.agentAbjectId) throw new Error('Only AgentAbject may restore task state');
       const { taskId, snapshot } = msg.payload as { taskId: string; snapshot: TaskExtra };

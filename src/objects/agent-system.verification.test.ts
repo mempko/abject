@@ -209,3 +209,44 @@ test('stopping a goal does not launch an automatic learning review', async () =>
     assert.equal(reviews, 0);
   } finally { await f.stop(); }
 });
+
+test('a task writes a structured verification receipt beside its narrative report', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'abject-receipt-'));
+  const f = await fixture();
+  try {
+    await writeFile(path.join(dir, 'source.ts'), 'original');
+    const caller = await f.add(new Endpoint('AgentAbject'));
+    await f.add(new HostFileSystem({ allowedPaths: [dir], readOnly: true }));
+    const projects: any = await f.add(new Projects());
+    const project = { name: 'fixture', root: dir, trusted: true, vcs: 'none', checkCommand: 'check', verifyCommand: 'verify', isolation: 'none', protectedPaths: [] };
+    projects.projects.set('fixture', project);
+    const shell = new Endpoint('ShellExecutor');
+    shell.on('exec', async m => {
+      if ((m.payload as any).command === 'edit') await writeFile(path.join(dir, 'source.ts'), 'edited');
+      return { stdout: 'ℹ tests 290\nℹ pass 290\nℹ fail 0', stderr: '', exitCode: 0 };
+    });
+    await f.add(shell);
+    const goals = await f.add(new Endpoint('GoalManager'));
+    const writes: any[] = [];
+    goals.on('writeGoalData', msg => { writes.push(msg.payload); return { success: true }; });
+    goals.on('readGoalData', () => null);
+    const creator: any = await f.add(new Creator()); creator.agentAbjectId = caller.id; creator.goalManagerId = goals.id;
+    const extra = { taskId: 'receipt', goalId: 'goal-1', taskText: 'add tests', project, workRoot: dir, filesRead: new Set(), filesModified: new Set(),
+      preImages: new Map(), postImages: new Map(), instructionDirsSeen: new Set(), mutationsSinceVerify: 0, checkpoints: [], audit: [], decisions: [], editSetOpen: false };
+    creator.taskExtras.set('receipt', extra);
+    const act = (action: unknown) => caller.call(creator.id, 'agentAct', { taskId: 'receipt', action });
+    assert.equal((await act({ action: 'bash', command: 'edit' })).success, true);
+    assert.equal((await act({ action: 'verify', full: true })).success, true);
+    await creator.writeSessionSummary(extra, 'Added tests.', creator.gateVerdict(extra), { success: true });
+    const receipt = writes.find(w => w.key === 'verification/receipt')?.value;
+    assert.ok(receipt, 'receipt written under verification/<taskId>');
+    assert.equal(receipt.taskId, 'receipt');
+    assert.equal(receipt.outcome, 'complete');
+    assert.equal(receipt.gate.ok, true);
+    assert.equal(receipt.verify.command, 'verify');
+    assert.equal(receipt.verify.exitCode, 0);
+    assert.equal(receipt.verify.passed, true);
+    assert.equal(typeof receipt.verify.at, 'number');
+    assert.deepEqual(receipt.verify.testSummary, { tests: 290, passed: 290, failed: 0 });
+  } finally { await f.stop(); await rm(dir, { recursive: true, force: true }); }
+});
