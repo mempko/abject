@@ -49,9 +49,16 @@ win:
     - nsis
 
 mac:
+  # Both architectures from the one arm64 runner. electron-builder fetches
+  # the matching Electron and rebuilds native deps (node-datachannel ships
+  # napi prebuilds for darwin-x64); incarnate:mac already downloads the
+  # mac-x64 and mac-arm64 Playwright shells. Default artifact names keep
+  # the x64 build unsuffixed (Abject-<v>.dmg) and mark arm64 explicitly.
   target:
-    - dmg
-    - zip
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
   category: public.app-category.utilities
 
 nsis:
