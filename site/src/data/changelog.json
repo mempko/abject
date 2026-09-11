@@ -1,5 +1,31 @@
 [
   {
+    "version": "0.10.0",
+    "date": "2026-09-11",
+    "title": "Agents that remember, learn, and know their limits",
+    "summary": "Agents now carry context across goals, reuse what they already agreed on, and learn from evidence instead of assumptions. Shared workspaces gain collaboration UI and collaborative goals, and every kind of session (local, peer, and CLI provider) gets firmer boundaries.",
+    "highlights": [
+      "Agents keep conversation context across goals, reuse accepted proposals when a goal continues, and run under explicit step budgets with permission-aware asks",
+      "Task outcomes now feed a world model: agents reconcile knowledge with verification evidence, record runtime action evidence, and revise patterns with automatic provenance and review settlement",
+      "Shared workspaces get a collaboration UI, collaborative goal tracking, per-entry knowledge synchronization, and workspace-scoped state routed to native peers",
+      "Peer identity is bound to authenticated session epochs, and each object declares how far a copy of it may travel",
+      "Durable agent sessions with trustworthy outcomes and adaptive scrum rounds; verification and cancellation now settle reliably",
+      "New PeerLLM provider lets one peer serve models to another, with planning controls; native CLI providers run inside enforced execution boundaries and have their models discovered rather than pinned",
+      "Object creators bind acceptance to the live object and its project revision, so a proposal is judged against what actually exists",
+      "Task-scoped processes and conditional file writes give capabilities safer, cleaner cleanup",
+      "Box layouts report and surface overflow, and Settings supports dynamic widget layouts",
+      "Chat browser can search inside conversation content, not just titles"
+    ],
+    "fixes": [
+      "Planners are preserved during scrum dispatch instead of being dropped mid-goal",
+      "Review settlement and output paging corrected for long agent runs",
+      "Action parsing hardened and loop guidance improved for agent harness reliability and concurrency",
+      "A signaling drop during ICE candidate exchange can no longer kill the process (fence narrowed to the one call and its exception)",
+      "LLM requests use the model's sampling defaults and account usage to the sender; retries accept a per-error delay override",
+      "Antigravity CLI provider gets explicit tier defaults and instantly resamples empty completions"
+    ]
+  },
+  {
     "version": "0.9.13",
     "date": "2026-08-25",
     "title": "Clean Exits, Steady Handoffs",
