@@ -1967,14 +1967,17 @@ Rules:
     if (!kbId) return { success: false, error: 'KnowledgeBase not registered in this workspace' };
     const id = action.id as string | undefined;
     if (!id) return { success: false, error: 'forget_knowledge requires id (from a prior recall or save result)' };
-    const result = await this.request<{ success: boolean }>(
+    type ForgetResult = { success: boolean; archived?: boolean; deleted?: boolean; error?: string };
+    const result = await this.request<ForgetResult>(
       request(this.id, kbId, 'forget', { id }),
       5000,
-    ).catch((err) => ({ success: false, error: err instanceof Error ? err.message : String(err) }) as { success: boolean });
-    log.info(`forget_knowledge: id=${id.slice(0, 8)} success=${result.success}`);
+    ).catch((err): ForgetResult => ({ success: false, error: err instanceof Error ? err.message : String(err) }));
+    log.info(`forget_knowledge: id=${id.slice(0, 8)} success=${result.success}${result.archived ? ' (archived)' : result.deleted ? ' (deleted)' : ''}`);
+    // The first forget archives (restorable, out of recall); forgetting an
+    // archived entry deletes it. Say which one happened.
     return result.success
-      ? { success: true, data: { id, forgotten: true } }
-      : { success: false, error: `forget failed: no entry with id ${id} (already removed?)` };
+      ? { success: true, data: { id, forgotten: true, archived: result.archived === true, deleted: result.deleted === true } }
+      : { success: false, error: `forget failed: ${result.error ?? `no entry with id ${id} (already removed?)`}` };
   }
 
   // ─── Terminal commit: dispatch_scrum ──────────────────────────────

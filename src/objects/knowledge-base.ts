@@ -203,7 +203,7 @@ export class KnowledgeBase extends Abject {
             },
             {
               name: 'forget',
-              description: 'Delete a knowledge entry by ID',
+              description: 'Forget an entry by ID. A live entry is archived: hidden from recall, match, and the default list, restorable with archive({archived:false}). Forgetting an entry that is already archived deletes it permanently, learning history included. Returns {success, archived:true} or {success, deleted:true}.',
               parameters: [
                 { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Entry ID' },
               ],
@@ -830,6 +830,8 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
 
   await call(await dep('KnowledgeBase'), 'update', { id: entryId, content: 'Updated...' });
   await call(await dep('KnowledgeBase'), 'forget', { id: entryId });
+  // First forget archives (out of recall, restorable); forgetting an archived
+  // entry deletes it for good, learning history included.
   const all = await call(await dep('KnowledgeBase'), 'list', { type: 'learned', limit: 20 });
 
 ### When to remember (durable knowledge only)
@@ -1302,17 +1304,30 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       const { id } = msg.payload as { id: string };
       requireNonEmpty(id, 'id');
       const entry = this.entries.get(id);
-      if (!entry) return { success: false };
+      if (!entry) return { success: false, error: `No entry with id "${id}"` };
 
-      if (entry.learning) return { success: false, error: 'Learning history must be retained; archive the entry' };
+      // Forgetting is two-step. The first forget archives: the entry leaves
+      // recall, match, and the default list, but nothing is lost and it can
+      // be restored, so a lesson with learning history behind it is kept
+      // whole. Forgetting an entry that is already archived is the user
+      // saying it twice, and that deletes it for good, history included.
+      if (!entry.archived) {
+        entry.archived = true;
+        entry.updatedAt = Math.max(Date.now(), entry.updatedAt + 1);
+        this.writeEntryToDb(entry);
+        this.syncEntryToSharedState(entry);
+        this.changed('entryUpdated', entry);
+        log.info(`Forgot (archived): "${entry.title}"`);
+        return { success: true, archived: true };
+      }
       this.entries.delete(id);
       this.deleteEntryFromDb(id);
       // A tombstone, not a snapshot: a whole-array write cannot express a
       // deletion, so peers would resurrect this entry on their next merge.
       this.syncDeletionToSharedState(id, Date.now());
       this.changed('entryRemoved', { id });
-      log.info(`Forgot: "${entry.title}"`);
-      return { success: true };
+      log.info(`Forgot (deleted): "${entry.title}"`);
+      return { success: true, deleted: true };
     });
 
     this.on('update', async (msg: AbjectMessage) => {

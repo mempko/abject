@@ -1219,9 +1219,9 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           const guard = await this.guardCuratable(id, 'forget');
           if (guard) return { success: false, error: guard };
           if (extra.cancelled) return { success: false, error: 'Review cancelled' };
-          const decision = await this.request<{ success: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'forget', { id }), 10000);
+          const decision = await this.request<{ success: boolean; archived?: boolean; deleted?: boolean; error?: string }>(request(this.id, this.knowledgeBaseId!, 'forget', { id }), 10000);
           if (!decision?.success) throw new Error(decision?.error ?? 'forget failed');
-          result = `Forgot ${id}`;
+          result = decision.deleted ? `Deleted ${id} (it was already archived)` : `Forgot ${id}: archived, restorable`;
           break;
         }
 

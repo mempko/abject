@@ -733,7 +733,10 @@ export class KnowledgeBrowser extends Abject {
       })),
       // showEmptyState() reveals Forget for every detail render; a remote
       // entry takes it away again.
+      // The same button forgets a live entry and deletes an archived one, and
+      // its label says which.
       this.request(request(this.id, this.deleteBtnId!, 'update', {
+        text: entry.archived ? 'Delete' : 'Forget',
         style: { visible: !remote },
       })),
       this.request(request(this.id, this.contentLabelId!, 'update', {
@@ -1219,20 +1222,34 @@ export class KnowledgeBrowser extends Abject {
         await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
         return;
       }
+      // Forgetting is two-step, and the dialog says which step this is. A
+      // live entry is archived: out of recall and the default list, but kept
+      // and restorable. An archived entry is deleted for good, learning
+      // history included; the user has now said it twice.
+      const deleting = entry?.archived === true;
+      const name = entry ? `"${entry.title}"` : 'This entry';
       const confirmed = await this.confirm({
-        title: 'Forget this knowledge?',
-        message: entry ? `"${entry.title}" will be permanently removed.` : 'This entry will be permanently removed.',
-        confirmLabel: 'Forget',
+        title: deleting ? 'Delete this knowledge for good?' : 'Forget this knowledge?',
+        message: deleting
+          ? `${name} is archived and will be permanently removed, along with everything learned from it.`
+          : `${name} will be archived: hidden from recall and from this list. Tick "Show archived" to find it again, or forget it once more to delete it.`,
+        confirmLabel: deleting ? 'Delete' : 'Forget',
         destructive: true,
       });
       if (!confirmed) return;
 
       this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
       try {
-        await this.request(
+        const res = await this.request<{ success?: boolean; archived?: boolean; deleted?: boolean; error?: string }>(
           request(this.id, this.knowledgeBaseId, 'forget', { id: this.selectedId })
         );
-        await this.notify(entry ? `Forgot "${entry.title}"` : 'Entry forgotten', 'success');
+        if (res && res.success === false) {
+          throw new Error(res.error ?? 'entry no longer exists');
+        }
+        await this.notify(
+          res?.deleted ? `Deleted ${name}` : `Forgot ${name}: archived, restorable from "Show archived"`,
+          'success',
+        );
         this.selectedId = undefined;
         await this.showEmptyState(true);
         await this.loadEntries();

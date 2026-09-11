@@ -284,7 +284,7 @@
           }
         },
         {
-          "description": "Delete a knowledge entry by ID",
+          "description": "Forget an entry by ID. A live entry is archived: hidden from recall, match, and the default list, restorable with archive({archived:false}). Forgetting an entry that is already archived deletes it permanently, learning history included. Returns {success, archived:true} or {success, deleted:true}.",
           "name": "forget",
           "parameters": [
             {

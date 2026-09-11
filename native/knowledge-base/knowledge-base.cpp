@@ -337,7 +337,12 @@ class KnowledgeBase final : public Object {
     m.method("get", "Fetch one full knowledge entry by id")
         .param("id", "string", "Entry ID")
         .returns("object");
-    m.method("forget", "Delete a knowledge entry by ID")
+    m.method("forget",
+             "Forget an entry by ID. A live entry is archived: hidden from recall, "
+             "match, and the default list, restorable with archive({archived:false}). "
+             "Forgetting an entry that is already archived deletes it permanently, "
+             "learning history included. Returns {success, archived:true} or "
+             "{success, deleted:true}.")
         .param("id", "string", "Entry ID")
         .returns("object");
     m.method("update", "Update an existing knowledge entry")
@@ -866,17 +871,31 @@ class KnowledgeBase final : public Object {
       if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
       const std::string id = req.payload().value("id", std::string());
       auto it = entries_.find(id);
-      if (it == entries_.end()) { req.reply({{"success", false}}); return; }
-      if (it->second.learning.is_object()) { req.reply({{"success",false},{"error","Learning history must be retained; archive the entry"}}); return; }
-      const std::string title = it->second.title;
+      if (it == entries_.end()) { req.reply({{"success", false}, {"error", "No entry with id \"" + id + "\""}}); return; }
+      // Forgetting is two-step. The first forget archives: the entry leaves
+      // recall, match, and the default list, but nothing is lost and it can
+      // be restored, so a lesson with learning history behind it is kept
+      // whole. Forgetting an entry that is already archived is the user
+      // saying it twice, and that deletes it for good, history included.
+      Entry& e = it->second;
+      if (!e.archived) {
+        e.archived = true;
+        e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
+        save_entry(e);
+        changed("entryUpdated", e.to_json());
+        log(LogLevel::Info, "Forgot (archived): \"" + e.title + "\"");
+        req.reply({{"success", true}, {"archived", true}});
+        return;
+      }
+      const std::string title = e.title;
       index_.remove(id);
       entries_.erase(it);
       unpersist_entry(id);
       tombstone_entry(id, static_cast<int64_t>(now_ms()));
       request_sync();
       changed("entryRemoved", {{"id", id}});
-      log(LogLevel::Info, "Forgot: \"" + title + "\"");
-      req.reply({{"success", true}});
+      log(LogLevel::Info, "Forgot (deleted): \"" + title + "\"");
+      req.reply({{"success", true}, {"deleted", true}});
     });
 
     on("update", [this](Request& req) { handle_update(req); });
