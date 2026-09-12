@@ -696,22 +696,36 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // Report the causal chain using recorded references, not a second model pass.
     // A shared decision may consider several episodes; it is not proof that each
     // effect was caused by every prediction in that decision's context.
+    // The report is a summary that names its evidence, not a copy of it. The
+    // observations, decisions and assessments it refers to are already on
+    // record under the goal; carrying their bodies here made a single review
+    // result run to ten megabytes, and the session store held each result
+    // several times over. Long text is clipped, records are reduced to their
+    // keys and states.
+    const clip = (v: unknown, max = 400): string => {
+      const text = typeof v === 'string' ? v : v === undefined ? '' : JSON.stringify(v);
+      return text.length > max ? `${text.slice(0, max)}… (${text.length} chars)` : text;
+    };
     const episodesWithLearning = [...episodes].map(([key, prediction]) => {
       const assessmentRef = `learning/assessment/${key}`;
       const decisions = (extra?.decisions ?? []).filter(d =>
         (Array.isArray(d.context.assessmentRefs) && d.context.assessmentRefs.includes(assessmentRef))
         || Object.hasOwn(d.evidence, assessmentRef));
-      return { episode: key, expected: prediction.expect, observationRef: prediction.actualRef,
-        actual: prediction.actual, appliedPatterns: prediction.patterns ?? [],
-        assessment: assessments[key] ?? { verdict: 'unresolved', explanation: 'No recorded assessment' },
+      const assessment = assessments[key];
+      return { episode: key, expected: clip(prediction.expect), observationRef: prediction.actualRef,
+        actual: clip(prediction.actual), appliedPatterns: (prediction.patterns ?? []).map(p => p.id),
+        assessment: assessment ? { verdict: assessment.verdict, explanation: clip(assessment.explanation, 600) } : { verdict: 'unresolved', explanation: 'No recorded assessment' },
         assessmentRef, consideredBy: decisions.map(d => ({ decisionId: d.id,
-          effects: d.effects.map(e => ({ effectId: e.id, action: e.input.action, knowledgeId: e.input.id, state: e.state, receipt: e.receipt })) })) };
+          effects: d.effects.map(e => ({ effectId: e.id, action: e.input.action, knowledgeId: e.input.id, state: e.state })) })) };
     });
-    const learningEffects = (extra?.decisions ?? []).flatMap(d => d.effects.map(e => ({ decisionId: d.id, ...e })));
-    const allSaved = [...saved, ...learningEffects.filter(e => e.state === 'applied')];
-    const allPending = [...pending, ...learningEffects.filter(e => e.state !== 'applied' && e.state !== 'abandoned')];
+    const learningEffects = (extra?.decisions ?? []).flatMap(d => d.effects.map(e => ({ decisionId: d.id, id: e.id, state: e.state, action: e.input.action, knowledgeId: e.input.id })));
+    const brief = (u: LearningUpdate) => ({ key: u.key, action: u.action.action, status: u.status, error: u.error ? clip(u.error, 300) : undefined });
+    const allSaved = [...saved.map(brief), ...learningEffects.filter(e => e.state === 'applied')];
+    const allPending = [...pending.map(brief), ...learningEffects.filter(e => e.state !== 'applied' && e.state !== 'abandoned')];
     const status = interrupted || learningEffects.some(e => e.state !== 'applied' && e.state !== 'abandoned') || extra?.completionIssues?.length || pending.length || counts.unresolved || patternCounts.unresolved ? 'partial' : 'complete';
-    return { status, interrupted, saved: allSaved, pending: allPending, decisions: extra?.decisions ?? [], attempts: updates, limitations: extra?.completionIssues ?? [],
+    return { status, interrupted, saved: allSaved, pending: allPending,
+      decisions: (extra?.decisions ?? []).map(d => ({ id: d.id, effects: d.effects.map(e => ({ id: e.id, state: e.state, action: e.input.action, knowledgeId: e.input.id })) })),
+      attempts: updates.map(brief), limitations: extra?.completionIssues ?? [],
       predictions: { total: episodes.size, ...counts, unassessed, episodes: episodesWithLearning },
       patterns: { ...patternCounts, unassessed: unassessedApplications },
       summary: `Learning review ${status}: ${allSaved.length} updates saved, ${allPending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
