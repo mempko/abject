@@ -228,6 +228,22 @@ export class GoalManager extends Abject {
   /** Goals adopted from a peer's catalog rather than created here. */
   private remoteGoalIds = new Set<string>();
 
+  /** A paused goal can still be failed (e.g. the user stops it mid-pause). */
+  private async failGoalWith(goalId: GoalId, error?: string): Promise<void> {
+    const goal = this.goals.get(goalId);
+    if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return;
+
+    goal.status = 'failed';
+    goal.error = error;
+    goal.updatedAt = Date.now();
+
+    goal.scratchpad['learning/review'] = 'pending';
+    await this.persistLearning(goal);
+    log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
+    this.changed('goalFailed', { goalId, error });
+    this.syncGoalToSharedState(goal);
+  }
+
   private goalNamespace(goalId: GoalId): string {
     return `goal-${goalId}`;
   }
@@ -611,6 +627,14 @@ export class GoalManager extends Abject {
                 { name: 'error', type: { kind: 'primitive', primitive: 'string' }, description: 'Error message', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'undefined' },
+            },
+            {
+              name: 'failActiveGoals',
+              description: 'Fail every active or paused goal with one reason. Used after a worker crash, when the agents running them are gone. Returns { failed }.',
+              parameters: [
+                { name: 'reason', type: { kind: 'primitive', primitive: 'string' }, description: 'Why the goals cannot continue' },
+              ],
+              returns: { kind: 'object', properties: {} },
             },
             {
               name: 'pauseGoal',
@@ -1895,19 +1919,16 @@ reviews results and either plans another round or completes/fails the goal.
 
     this.on('failGoal', async (msg: AbjectMessage) => {
       const { goalId, error } = msg.payload as { goalId: GoalId; error?: string };
-      // A paused goal can still be failed (e.g. the user stops it mid-pause).
-      const goal = this.goals.get(goalId);
-      if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return;
+      await this.failGoalWith(goalId, error);
+    });
 
-      goal.status = 'failed';
-      goal.error = error;
-      goal.updatedAt = Date.now();
-
-      goal.scratchpad['learning/review'] = 'pending';
-      await this.persistLearning(goal);
-      log.info(`Goal failed: "${goal.title}" (${goalId}) — ${error ?? 'unknown'}`);
-      this.changed('goalFailed', { goalId, error });
-      this.syncGoalToSharedState(goal);
+    // After a worker crash the agents that were running this workspace's
+    // goals are gone; the goals cannot continue and must not sit as active.
+    this.on('failActiveGoals', async (msg: AbjectMessage) => {
+      const { reason } = msg.payload as { reason?: string };
+      const running = [...this.goals.values()].filter(g => g.status === 'active' || g.status === 'paused');
+      for (const goal of running) await this.failGoalWith(goal.id, reason ?? 'Runtime failure');
+      return { failed: running.length };
     });
 
     /**

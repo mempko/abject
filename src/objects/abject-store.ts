@@ -170,6 +170,14 @@ export class AbjectStore extends Abject {
                 returns: { kind: 'reference', reference: 'RestoreResult' },
               },
               {
+                name: 'restoreLost',
+                description: 'Respawn the snapshots of the named objects only, after a worker crash took the live instances; other objects are left alone. Returns { restored, failed, errors }.',
+                parameters: [
+                  { name: 'objectIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Ids of live objects that are gone' },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
                 name: 'listVersions',
                 description: 'List an object\'s saved source versions (newest first). Every source-changing save keeps the prior source, bounded at 10. Returns { name, typeId, objectId, current: { savedAt, sizeChars }, versions: [{ index, savedAt, sizeChars }] }, or null when the object has no snapshot. Accepts a live objectId, durable typeId, or object name.',
                 parameters: [
@@ -264,6 +272,16 @@ export class AbjectStore extends Abject {
 
     this.on('restoreAll', async () => {
       return this.restoreAll();
+    });
+
+    // A crashed worker takes its objects with it; their snapshots survive.
+    this.on('restoreLost', async (msg: AbjectMessage) => {
+      const { objectIds } = msg.payload as { objectIds: string[] };
+      const wanted = new Set(Array.isArray(objectIds) ? objectIds : []);
+      const hit = [...this.snapshots.values()].filter(s => wanted.has(s.objectId));
+      if (hit.length === 0) return { restored: 0, failed: 0, errors: [] };
+      log.info(`restoreLost: ${hit.length} snapshot(s) belong to objects lost with a worker`);
+      return this.restoreAll(wanted);
     });
 
     this.on('listVersions', async (msg: AbjectMessage) => {
@@ -656,9 +674,12 @@ export class AbjectStore extends Abject {
    * Restore all saved abjects by spawning them via Factory.
    * Objects get new IDs; snapshots are updated with the new IDs and re-persisted.
    */
-  async restoreAll(): Promise<RestoreResult> {
+  async restoreAll(only?: ReadonlySet<string>): Promise<RestoreResult> {
     const result: RestoreResult = { restored: 0, failed: 0, errors: [] };
-    const snapshotList = Array.from(this.snapshots.values());
+    // `only` names object ids whose live instances are gone (a worker
+    // crashed under them); their snapshots are respawned and the rest of the
+    // store is left alone. Without it, everything is restored, as at boot.
+    const snapshotList = Array.from(this.snapshots.values()).filter(s => !only || only.has(s.objectId));
 
     if (snapshotList.length === 0) {
       log.info('No snapshots to restore');
@@ -684,7 +705,8 @@ export class AbjectStore extends Abject {
     const wsId = await this.ensureWorkspaceId();
 
     // Clear old snapshots — we'll rebuild keyed by typeId
-    this.snapshots.clear();
+    if (only) { for (const snap of snapshotList) this.snapshots.delete(snap.typeId); }
+    else this.snapshots.clear();
 
     for (const snap of snapshotList) {
       // Guard against corrupted snapshots whose manifest was persisted as

@@ -42,6 +42,13 @@ export class WorkerPool {
   private config: WorkerPoolConfig;
   private objectToBridge: Map<AbjectId, WorkerBridge> = new Map();
   private started = false;
+  /**
+   * Called after a pool worker has died and been replaced. `lostIds` are the
+   * objects it hosted; every route to them is already cut and every caller
+   * now gets an immediate error. Rebuilding what they were is the runtime's
+   * job, not the pool's.
+   */
+  onWorkerLost?: (lostIds: AbjectId[], workerIndex: number) => void;
 
   constructor(config: WorkerPoolConfig, bus: MessageBus) {
     require(config.workerCount > 0, 'workerCount must be positive');
@@ -56,21 +63,7 @@ export class WorkerPool {
     require(!this.started, 'WorkerPool already started');
 
     for (let i = 0; i < this.config.workerCount; i++) {
-      const worker = this.config.workerFactory();
-      const bridge = new WorkerBridge(worker, this.bus);
-      // Objects constructed locally inside the worker (e.g. widgets newed up
-      // by a worker-hosted WidgetManager) announce themselves via
-      // bus:registered — keep the routing map current so the whole system
-      // can reach them.
-      bridge.onLocalRegistered = (objectId) => {
-        this.objectToBridge.set(objectId, bridge);
-      };
-      bridge.onLocalUnregistered = (objectId) => {
-        if (this.objectToBridge.get(objectId) === bridge) {
-          this.objectToBridge.delete(objectId);
-        }
-      };
-      this.bridges.push(bridge);
+      this.bridges.push(this.createBridge(i));
     }
 
     // Wait for all workers to report ready
@@ -88,6 +81,75 @@ export class WorkerPool {
 
     this.started = true;
     log.info(`${this.config.workerCount} workers ready (${this.bridges.length * (this.bridges.length - 1) / 2} peer channels)`);
+  }
+
+  private createBridge(index: number): WorkerBridge {
+    const worker = this.config.workerFactory();
+    const bridge = new WorkerBridge(worker, this.bus);
+    // Objects constructed locally inside the worker (e.g. widgets newed up
+    // by a worker-hosted WidgetManager) announce themselves via
+    // bus:registered — keep the routing map current so the whole system
+    // can reach them.
+    bridge.onLocalRegistered = (objectId) => {
+      this.objectToBridge.set(objectId, bridge);
+    };
+    bridge.onLocalUnregistered = (objectId) => {
+      if (this.objectToBridge.get(objectId) === bridge) {
+        this.objectToBridge.delete(objectId);
+      }
+    };
+    bridge.onDead = (code, lost) => { void this.handleWorkerDeath(index, bridge, code, lost); };
+    return bridge;
+  }
+
+  /**
+   * A pool worker died (out of memory, an uncaught error). Three things must
+   * happen, in this order: every route to the objects it hosted is cut, on
+   * the main bus and in every other worker, so callers fail now instead of
+   * posting into a terminated thread for their full timeout; a fresh worker
+   * takes the dead one's shard, so later spawns and Supervisor restarts land
+   * somewhere alive; and the runtime is told what was lost so it can rebuild.
+   */
+  private async handleWorkerDeath(index: number, dead: WorkerBridge, code: number, lost: AbjectId[]): Promise<void> {
+    const lostIds = new Set<AbjectId>(lost);
+    // Ids the bridge hosted but never announced back (spawned before it
+    // could report) still route to it; sweep them too.
+    for (const [id, b] of this.objectToBridge) if (b === dead) lostIds.add(id);
+    log.error(`pool worker ${index} died (code ${code}); ${lostIds.size} objects lost. Cutting routes and replacing the worker.`);
+    for (const id of lostIds) {
+      if (this.objectToBridge.get(id) === dead) this.objectToBridge.delete(id);
+      this.bus.unregisterWorkerObject(id);
+      for (const b of this.bridges) if (b !== dead) b.sendPeerRemove(id);
+    }
+    // The other workers may have requests outstanding on the dead one over
+    // their direct channels; nothing will answer those unless they are told.
+    for (const b of this.bridges) if (b !== dead) b.sendPeerDead(index);
+
+    try {
+      const fresh = this.createBridge(index);
+      await fresh.waitReady();
+      for (let j = 0; j < this.bridges.length; j++) {
+        if (j === index) continue;
+        const { port1, port2 } = new MessageChannel();
+        fresh.sendPeerPort(j, port1);
+        this.bridges[j].sendPeerPort(index, port2);
+      }
+      this.bridges[index] = fresh;
+      // The newcomer knows nothing about where its peers' objects live; tell
+      // it, or every message it sends takes the slower path through main.
+      for (const [id, b] of this.objectToBridge) {
+        const at = this.bridges.indexOf(b);
+        if (at >= 0 && at !== index) fresh.sendPeerPlace(id, at);
+      }
+      this.bus.announceLivenessTo(fresh);
+      log.info(`pool worker ${index} replaced`);
+    } catch (err) {
+      log.error(`pool worker ${index} could not be replaced: ${err instanceof Error ? err.message : String(err)}. Its shard stays dead until restart.`);
+    }
+
+    try { this.onWorkerLost?.([...lostIds], index); } catch (err) {
+      log.error(`worker-loss handler threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**

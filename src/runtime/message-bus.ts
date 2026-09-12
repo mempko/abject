@@ -374,6 +374,12 @@ export class MessageBus implements MessageBusLike {
     for (const id of this.workerObjects) pool.broadcastLiveness(id, true);
   }
 
+  /** Replay the whole liveness picture into one bridge (a replacement worker starts blank). */
+  announceLivenessTo(bridge: { sendLiveness(objectId: AbjectId, alive: boolean): void }): void {
+    for (const id of this.mailboxes.keys()) bridge.sendLiveness(id, true);
+    for (const id of this.workerObjects) bridge.sendLiveness(id, true);
+  }
+
   /**
    * Register an object ID as worker-hosted (lives in a Web Worker, not main thread).
    */

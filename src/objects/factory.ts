@@ -63,6 +63,8 @@ export class Factory extends Abject {
   // Worker parallelism
   private _workerPool?: WorkerPool;
   private workerEligible: Set<string> = new Set();
+  /** Objects being stopped whose snapshots must survive (see the kill handler). */
+  private snapshotKeep = new Set<AbjectId>();
   private workerSpawned: Map<AbjectId, string> = new Map(); // objectId → constructorName
   private workerRegistries: Map<AbjectId, AbjectId> = new Map(); // objectId → registryId
 
@@ -226,8 +228,12 @@ export class Factory extends Abject {
     });
 
     this.on('kill', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: AbjectId };
-      return this.kill(objectId);
+      const { objectId, keepSnapshot } = msg.payload as { objectId: AbjectId; keepSnapshot?: boolean };
+      // Stopping an object is normally the user discarding it, so its
+      // snapshot goes too. Recovery stops objects it is about to bring back
+      // from those very snapshots, and says so.
+      if (keepSnapshot) this.snapshotKeep.add(objectId);
+      try { return await this.kill(objectId); } finally { this.snapshotKeep.delete(objectId); }
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
@@ -1242,7 +1248,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         const storeResults = await this.request<Array<{ id: AbjectId }>>(
           request(this.id, objRegistry, 'discover', { name: 'AbjectStore' })
         );
-        if (storeResults.length > 0) {
+        if (storeResults.length > 0 && !this.snapshotKeep.has(objectId)) {
           await this.request(
             request(this.id, storeResults[0].id, 'remove', { objectId })
           );
@@ -1298,7 +1304,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         const storeResults = await this.request<Array<{ id: AbjectId }>>(
           request(this.id, objRegistry, 'discover', { name: 'AbjectStore' })
         );
-        if (storeResults.length > 0) {
+        if (storeResults.length > 0 && !this.snapshotKeep.has(objectId)) {
           await this.request(
             request(this.id, storeResults[0].id, 'remove', { objectId })
           );

@@ -63,6 +63,7 @@ import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
 import { WorkspaceManager } from '../src/objects/workspace-manager.js';
+import { WorkerRecovery } from '../src/objects/worker-recovery.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { Sidebar } from '../src/objects/sidebar.js';
@@ -584,6 +585,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
   runtime.objectFactory.registerConstructor('PeersViewer', () => new PeersViewer());
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
+  runtime.objectFactory.registerConstructor('WorkerRecovery', () => new WorkerRecovery());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('Sidebar', () => new Sidebar());
@@ -1050,6 +1052,19 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
 
   // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
   const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry', 'permanent', systemTypeId('WorkspaceShareRegistry'));
+
+  // Rebuilds what a dead pool worker took with it. Main thread only: it must
+  // outlive any worker.
+  const workerRecoveryId = await supervisedSpawn('WorkerRecovery', 'permanent', systemTypeId('WorkerRecovery'));
+  if (runtime.workerPool) {
+    runtime.workerPool.onWorkerLost = (lostIds, workerIndex) => {
+      try {
+        runtime.messageBus.send(message.event(workerRecoveryId, workerRecoveryId, 'workerLost', { objectIds: lostIds, workerIndex, reason: 'worker exited' }));
+      } catch (err) {
+        alog.error(`could not hand the worker loss to WorkerRecovery: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+  }
 
   // Register allowed system objects for remote access
   peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID, systemTypeId('WorkspaceShareRegistry'));

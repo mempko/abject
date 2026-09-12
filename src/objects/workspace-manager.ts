@@ -283,6 +283,15 @@ export class WorkspaceManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'recoverLostObjects',
+                description: 'After a worker thread crash: rebuild any workspace that lost objects (respawn it, restore its user objects from snapshots, fail its running goals with the reason), and restore lost user objects elsewhere. Returns { workspaces: [{ workspaceId, name, lost, restored, goalsFailed }] }.',
+                parameters: [
+                  { name: 'objectIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Ids of the objects that died' },
+                  { name: 'reason', type: { kind: 'primitive', primitive: 'string' }, description: 'Reason recorded on the failed goals', optional: true },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
                 name: 'switchWorkspace',
                 description: 'Switch to a workspace',
                 parameters: [
@@ -520,6 +529,12 @@ export class WorkspaceManager extends Abject {
     this.on('createWorkspace', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       return this.createWorkspace(name);
+    });
+
+    this.on('recoverLostObjects', async (msg: AbjectMessage) => {
+      const { objectIds, reason } = msg.payload as { objectIds: string[]; reason?: string };
+      return this.recoverLostObjects(new Set((Array.isArray(objectIds) ? objectIds : []) as AbjectId[]),
+        reason ?? 'A worker thread crashed and took this workspace\'s objects with it');
     });
 
     this.on('deleteWorkspace', async (msg: AbjectMessage) => {
@@ -921,6 +936,100 @@ export class WorkspaceManager extends Abject {
 
     wsLog.info(`Deleted workspace '${ws.name}' (${workspaceId})`);
     return true;
+  }
+
+  /**
+   * A worker thread died and `lost` are the objects it hosted. A workspace
+   * that lost any part of itself (its registry, storage, or one of its
+   * per-workspace objects) is rebuilt whole: the survivors are stopped, the
+   * same set of objects is spawned again under the same workspace id, the
+   * user objects come back from the workspace's snapshots, and the goals
+   * that were running are failed with the reason. Workspaces that only lost
+   * user objects get those objects restored from their snapshots.
+   */
+  private async recoverLostObjects(lost: Set<AbjectId>, reason: string): Promise<{
+    workspaces: Array<{ workspaceId: string; name: string; lost: number; restored: number; goalsFailed: number }>;
+  }> {
+    const report: Array<{ workspaceId: string; name: string; lost: number; restored: number; goalsFailed: number }> = [];
+    if (lost.size === 0 || !this.factoryId) return { workspaces: report };
+    const childNamed = (ws: WorkspaceInfo, name: string): AbjectId | undefined => {
+      for (const [id, typeId] of ws.childTypeIds) if (String(typeId).split('/').pop() === name) return id;
+      return undefined;
+    };
+
+    for (const [workspaceId, ws] of [...this.workspaces]) {
+      const hit = [ws.registryId, ws.storageId, ...ws.childIds].filter((id): id is AbjectId => !!id && lost.has(id));
+      const wsLog = new Log(`WS-RECOVER:${ws.name}`);
+      if (hit.length === 0) {
+        // Only user objects can have died here; the store knows which.
+        const storeId = childNamed(ws, 'AbjectStore');
+        if (!storeId) continue;
+        try {
+          const r = await this.request<{ restored: number }>(request(this.id, storeId, 'restoreLost', { objectIds: [...lost] }), 300_000);
+          if (r?.restored) {
+            wsLog.info(`restored ${r.restored} user object(s) from snapshots`);
+            report.push({ workspaceId, name: ws.name, lost: r.restored, restored: r.restored, goalsFailed: 0 });
+          }
+        } catch (err) { wsLog.warn(`restoreLost failed: ${err instanceof Error ? err.message : String(err)}`); }
+        continue;
+      }
+
+      wsLog.warn(`${hit.length} of this workspace's objects died with a worker; rebuilding the workspace`);
+      // Survivors are stopped so the rebuilt workspace has one of everything.
+      for (const childId of [...ws.childIds].reverse()) {
+        if (lost.has(childId)) continue;
+        try { await this.request(request(this.id, this.factoryId, 'kill', { objectId: childId, keepSnapshot: true }), 15_000); } catch { /* may already be gone */ }
+      }
+      if (this.globalRegistryId) {
+        try { await this.request(request(this.id, this.globalRegistryId, 'unregister', { objectId: ws.registryId })); } catch { /* already gone */ }
+      }
+
+      const objects = ws.uiSpawned ? PER_WORKSPACE_OBJECTS : INFRA_OBJECTS;
+      const info = await this.spawnWorkspaceObjects(workspaceId, ws.name, objects);
+      info.accessMode = ws.accessMode;
+      info.whitelist = ws.whitelist;
+      info.description = ws.description;
+      info.tags = ws.tags;
+      info.curated = ws.curated;
+      info.exposedTypeIds = ws.exposedTypeIds;
+      // Object ids are new; the durable exposure list is by typeId.
+      info.exposedObjectIds = [...info.childTypeIds].filter(([, t]) => ws.exposedTypeIds.includes(t)).map(([id]) => id);
+      if (info.accessMode !== 'local' && !info.exposedObjectIds.includes(info.registryId)) info.exposedObjectIds.push(info.registryId);
+      info.joined = ws.joined;
+      info.ownerPeerId = ws.ownerPeerId;
+      info.participants = ws.participants;
+      this.workspaces.set(workspaceId, info);
+      await this.syncExposedToRegistry(info);
+
+      // The spawn above already restored the workspace's snapshots (it does
+      // so for every workspace it brings up); count what came back.
+      let restored = 0;
+      const storeId = childNamed(info, 'AbjectStore');
+      if (storeId) {
+        try {
+          const snaps = await this.request<unknown[]>(request(this.id, storeId, 'list', {}), 30_000);
+          restored = Array.isArray(snaps) ? snaps.length : 0;
+        } catch (err) { wsLog.warn(`could not count restored snapshots: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+
+      let goalsFailed = 0;
+      const goalManagerId = childNamed(info, 'GoalManager');
+      if (goalManagerId) {
+        try {
+          const r = await this.request<{ failed: number }>(request(this.id, goalManagerId, 'failActiveGoals', { reason }), 60_000);
+          goalsFailed = r?.failed ?? 0;
+        } catch (err) { wsLog.warn(`could not fail running goals: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+
+      wsLog.info(`rebuilt: ${info.childIds.length} objects, ${restored} restored from snapshots, ${goalsFailed} goal(s) failed`);
+      this.changed('workspaceObjectsChanged', { workspaceId });
+      report.push({ workspaceId, name: ws.name, lost: hit.length, restored, goalsFailed });
+    }
+
+    if (report.length > 0) {
+      try { await this.refreshTaskbar(); } catch { /* best effort */ }
+    }
+    return { workspaces: report };
   }
 
   async switchWorkspace(workspaceId: string): Promise<boolean> {

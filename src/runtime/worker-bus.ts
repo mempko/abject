@@ -39,6 +39,13 @@ export class WorkerBus implements MessageBusLike {
    * isRegistered() with the same truth the main bus has.
    */
   private globalObjects: Set<AbjectId> = new Set();
+  /**
+   * Requests sent straight to a peer worker and not yet answered. When main
+   * reports that peer dead, each gets a WORKER_DEAD reply here, in the
+   * sender's own worker; nothing else would ever answer them.
+   */
+  private peerInFlight: Map<string, { message: AbjectMessage; workerIndex: number; at: number }> = new Map();
+  private static readonly PEER_IN_FLIGHT_MAX = 20_000;
 
   constructor(postToMain?: PostToMainFn) {
     this.postToMain = postToMain ?? ((data: unknown) => self.postMessage(data));
@@ -132,6 +139,13 @@ export class WorkerBus implements MessageBusLike {
     if (peerIdx !== undefined) {
       const port = this.peerPorts.get(peerIdx);
       if (port) {
+        if (message.header.type === 'request') {
+          if (this.peerInFlight.size >= WorkerBus.PEER_IN_FLIGHT_MAX) {
+            const oldest = this.peerInFlight.keys().next().value;
+            if (oldest !== undefined) this.peerInFlight.delete(oldest);
+          }
+          this.peerInFlight.set(message.header.messageId, { message, workerIndex: peerIdx, at: Date.now() });
+        }
         const peerMsg: PeerMessage = { type: 'peer:msg', message };
         port.postMessage(peerMsg);
         return;
@@ -169,6 +183,9 @@ export class WorkerBus implements MessageBusLike {
    * Deliver a message from a peer worker via direct MessagePort.
    */
   deliverFromPeer(message: AbjectMessage): void {
+    if ((message.header.type === 'reply' || message.header.type === 'error') && message.header.correlationId) {
+      this.peerInFlight.delete(message.header.correlationId);
+    }
     const recipient = message.routing.to;
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
@@ -177,6 +194,26 @@ export class WorkerBus implements MessageBusLike {
       return;
     }
     mailbox.send(message);
+  }
+
+  /**
+   * A peer worker died. Its port is useless, its placements are stale, and
+   * every request we sent it is unanswerable: reply to each with an error so
+   * the local caller fails now instead of at its timeout.
+   */
+  failPeer(workerIndex: number): void {
+    this.peerPorts.delete(workerIndex);
+    for (const [id, idx] of [...this.peerObjects]) if (idx === workerIndex) this.peerObjects.delete(id);
+    let failed = 0;
+    for (const [id, entry] of [...this.peerInFlight]) {
+      if (entry.workerIndex !== workerIndex) continue;
+      this.peerInFlight.delete(id);
+      const reply = createError(entry.message, 'WORKER_DEAD',
+        `Worker hosting ${entry.message.routing.to} exited before answering; the object is gone until it is rebuilt`);
+      const mailbox = this.mailboxes.get(entry.message.routing.from);
+      if (mailbox) { mailbox.send(reply); failed++; }
+    }
+    if (failed > 0) log.warn(`peer worker ${workerIndex} died with ${failed} of our request(s) in flight; each got a WORKER_DEAD reply`);
   }
 
   /**

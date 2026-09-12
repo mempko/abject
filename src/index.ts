@@ -75,6 +75,7 @@ export type { OrganismSpec, OrganelleSpec } from './objects/organism.js';
 export { Supervisor, SUPERVISOR_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
+export { WorkerRecovery, WORKER_RECOVERY_ID } from './objects/worker-recovery.js';
 export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';

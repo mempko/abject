@@ -368,7 +368,14 @@ port.on('message', async (data: WorkerInboundMessage) => {
     }
 
     case 'live:remove': {
-      if (data.objectId) workerBus.removeGlobalObject(data.objectId);
+      if (data.objectId) {
+        workerBus.removeGlobalObject(data.objectId);
+        // A dead object cannot be a peer target either: a direct MessagePort
+        // to the worker that hosted it posts into the void and the caller
+        // sits out its full timeout. Route through main from now on, where
+        // the answer is an immediate error.
+        workerBus.removePeerObject(data.objectId);
+      }
       break;
     }
 
@@ -377,6 +384,11 @@ port.on('message', async (data: WorkerInboundMessage) => {
       if (objectId) {
         workerBus.removePeerObject(objectId);
       }
+      break;
+    }
+
+    case 'peer:dead': {
+      if (data.workerIndex !== undefined) workerBus.failPeer(data.workerIndex);
       break;
     }
 

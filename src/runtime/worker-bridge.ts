@@ -30,7 +30,7 @@ export interface WorkerLike {
 /** Message types sent from main thread to worker. */
 export interface WorkerInboundMessage {
   type: 'init' | 'spawn' | 'kill' | 'bus:deliver'
-      | 'peer:port' | 'peer:place' | 'peer:remove'
+      | 'peer:port' | 'peer:place' | 'peer:remove' | 'peer:dead'
       | 'live:add' | 'live:remove';
   objectId?: AbjectId;
   constructorName?: string;
@@ -68,6 +68,16 @@ export class WorkerBridge {
   private pendingKills: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
   private _dead = false;
   /**
+   * Requests forwarded into the worker whose reply has not come back
+   * through main. If the worker dies first, each gets a WORKER_DEAD error
+   * reply, so a caller mid-request fails now rather than at its timeout.
+   * Replies that travel worker-to-worker never pass here, so entries are
+   * also aged out; any caller's own timeout is shorter than that.
+   */
+  private inFlight: Map<string, { message: AbjectMessage; at: number }> = new Map();
+  private static readonly IN_FLIGHT_MAX = 20_000;
+  private static readonly IN_FLIGHT_TTL_MS = 10 * 60 * 1000;
+  /**
    * Set by terminate() so the exit that follows is understood as ours.
    * Without it every deliberate shutdown reports itself as a worker death:
    * the loud "WORKER DIED" line and the onDead observers exist for a worker
@@ -91,7 +101,7 @@ export class WorkerBridge {
    * registerDedicatedBridge rather than hostedObjects, so the generic
    * "lost N objects" line under-reports what actually died.
    */
-  onDead?: (code: number) => void;
+  onDead?: (code: number, lostIds: AbjectId[]) => void;
 
   constructor(worker: WorkerLike, bus: MessageBus) {
     this.worker = worker;
@@ -122,6 +132,16 @@ export class WorkerBridge {
         this.bus.unregister(objectId);
       }
       this.hostedObjects.clear();
+      // And the requests already inside it: nobody will answer them now.
+      const stranded = [...this.inFlight.values()];
+      this.inFlight.clear();
+      for (const { message } of stranded) {
+        try {
+          this.bus.send(errorMessage(message, 'WORKER_DEAD',
+            `Worker hosting ${message.routing.to} exited (code ${e.code}) before answering; the object is gone until it is rebuilt`));
+        } catch { /* sender already gone */ }
+      }
+      if (stranded.length > 0) log.warn(`${stranded.length} request(s) were in flight in the dead worker; each got a WORKER_DEAD reply`);
       // Reject all pending operations
       for (const [, pending] of this.pendingSpawns) {
         pending.reject(new Error(`Worker exited with code ${e.code}`));
@@ -134,7 +154,7 @@ export class WorkerBridge {
       // Only an unexpected exit is a death. A terminate() we issued during
       // shutdown must not trip the "the UI is gone" alarms.
       if (!this.terminating) {
-        try { this.onDead?.(e.code); } catch { /* observer error must not mask the exit */ }
+        try { this.onDead?.(e.code, objectIds); } catch { /* observer error must not mask the exit */ }
       }
     };
   }
@@ -165,6 +185,16 @@ export class WorkerBridge {
         } catch { /* sender already gone */ }
       }
       return;
+    }
+    if (message.header.type === 'request') {
+      const now = Date.now();
+      if (this.inFlight.size >= WorkerBridge.IN_FLIGHT_MAX) {
+        for (const [id, entry] of this.inFlight) {
+          if (now - entry.at > WorkerBridge.IN_FLIGHT_TTL_MS || this.inFlight.size >= WorkerBridge.IN_FLIGHT_MAX) this.inFlight.delete(id);
+          else break;
+        }
+      }
+      this.inFlight.set(message.header.messageId, { message, at: now });
     }
     const msg: WorkerInboundMessage = {
       type: 'bus:deliver',
@@ -243,6 +273,13 @@ export class WorkerBridge {
    */
   sendPeerPlace(objectId: AbjectId, workerIndex: number): void {
     this.worker.postMessage({ type: 'peer:place', objectId, workerIndex } as WorkerInboundMessage);
+  }
+
+  /** Tell this worker that a peer worker died: fail what it was waiting on there. */
+  sendPeerDead(workerIndex: number): void {
+    if (this._dead) return;
+    try { this.worker.postMessage({ type: 'peer:dead', workerIndex } as WorkerInboundMessage); }
+    catch { /* worker going down */ }
   }
 
   /**
@@ -345,6 +382,9 @@ export class WorkerBridge {
       case 'bus:send': {
         // Worker-side object wants to send a message — route through main bus
         const message = data.message!;
+        if ((message.header.type === 'reply' || message.header.type === 'error') && message.header.correlationId) {
+          this.inFlight.delete(message.header.correlationId);
+        }
         this.bus.send(message);
         break;
       }

@@ -109,6 +109,14 @@ export class SkillRegistry extends Abject {
               returns: { kind: 'object', properties: { found: { kind: 'primitive', primitive: 'number' } } },
             },
             {
+              name: 'respawnLostBridges',
+              description: 'Respawn the MCP bridges among the given object ids, after a worker crash took the live processes. Returns { respawned }.',
+              parameters: [
+                { name: 'objectIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Ids of objects that are gone' },
+              ],
+              returns: { kind: 'object', properties: {} },
+            },
+            {
               name: 'installSkill',
               description: 'Install a skill by writing SKILL.md to disk',
               parameters: [
@@ -470,6 +478,28 @@ whenever the skill set changes.
       this.changed('skillsChanged', { reason: 'disabled' });
       log.info(`Disabled skill: ${name}`);
       return { success: true };
+    });
+
+    // MCP bridges that died with a worker thread come back under the same
+    // skill name, with the same credentials, if the skill is still enabled.
+    this.on('respawnLostBridges', async (msg: AbjectMessage) => {
+      const { objectIds } = msg.payload as { objectIds: string[] };
+      const lost = new Set(Array.isArray(objectIds) ? objectIds : []);
+      let respawned = 0;
+      for (const [name, bridgeId] of [...this.mcpBridges]) {
+        if (!lost.has(bridgeId)) continue;
+        this.mcpBridges.delete(name);
+        const entry = this.skills.get(name);
+        if (!entry?.enabled || !entry.parsed.mcpServer) continue;
+        try {
+          await this.spawnMCPBridge(name, entry);
+          respawned++;
+          log.info(`respawned MCP bridge "${name}" after its worker died`);
+        } catch (err) {
+          log.warn(`could not respawn MCP bridge "${name}": ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return { respawned };
     });
 
     this.on('scanSkills', async () => {
