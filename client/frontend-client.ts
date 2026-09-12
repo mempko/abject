@@ -35,6 +35,7 @@ import type {
 import type { AbyssBgControl } from './abyss-bg.js';
 import type { ClientTransport } from './transport.js';
 import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
+import { computeInputDelta } from './mobile-input-delta.js';
 
 /**
  * The thin browser frontend that owns the Canvas and Compositor.
@@ -108,6 +109,10 @@ export class FrontendClient {
   /** Touch-capable device (phones AND tablets in desktop layout) -- gates the virtual keyboard. */
   private touchDevice = false;
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
+  /** Proxy value already forwarded to the backend (delta baseline). */
+  private proxySentValue = '';
+  /** True while an IME composition (predictive/autocorrect) is active in the proxy. */
+  private proxyComposing = false;
   /** Backend wants the virtual keyboard up (a text widget holds focus). */
   private keyboardWanted = false;
   /** Virtual keyboard currently shown (tracked via visualViewport shrink). */
@@ -236,38 +241,59 @@ export class FrontendClient {
     // Keep a zero-width-space sentinel in the proxy: iOS fires no event at
     // all for backspace on an empty field, so deletion must always have a
     // character to consume.
+    this.proxySentValue = FrontendClient.KB_SENTINEL;
+    this.proxyComposing = false;
+
     proxy.addEventListener('focus', () => this.resetProxySentinel(proxy));
 
-    // Track composition state to avoid double-sending during autocomplete/predictive text
-    let composing = false;
-    proxy.addEventListener('compositionstart', () => { composing = true; });
+    // Track composition state. Mobile IMEs (GBoard, iOS predictive) deliver
+    // typed text as insertCompositionText updates that cannot be
+    // preventDefault-ed; the composed text lands in the proxy and is
+    // forwarded as a delta against the last-sent value.
+    proxy.addEventListener('compositionstart', () => { this.proxyComposing = true; });
     proxy.addEventListener('compositionend', () => {
-      composing = false;
+      this.proxyComposing = false;
       // Flush whatever the composition produced
       this.flushProxyInput(proxy);
     });
+
+    // Deliver composed/autocorrected text as it evolves. Some keyboards
+    // (iOS autocorrect/predictive) often never fire compositionend, so
+    // relying on it to flush dropped every composed character; 'input'
+    // fires after each edit the keyboard applies to the proxy, and the
+    // delta against the last-sent value is what reaches the widget.
+    proxy.addEventListener('input', () => {
+      if (!this.focusedSurface) return;
+      this.sendProxyDelta(proxy);
+    });
+
+    // Flush pending composed text when the proxy loses focus (keyboard
+    // dismissed, another element focused) so nothing is left stranded.
+    proxy.addEventListener('blur', () => this.flushProxyInput(proxy));
 
     // Use beforeinput for the most reliable character capture on mobile.
     // Only handle insertText (typed characters) and insertCompositionText here.
     proxy.addEventListener('beforeinput', (e: InputEvent) => {
       if (!this.focusedSurface) return;
 
-      // During composition, let compositionend handle the final text
-      if (composing && e.inputType === 'insertCompositionText') return;
+      // While an IME composition is active the keyboard owns the proxy's
+      // content: every edit lands in the field and is delta-forwarded by
+      // the 'input' listener above. Never reset the proxy mid-composition —
+      // a programmatic value write aborts the composition and the
+      // compositionend flush never arrives.
+      if (this.proxyComposing) return;
 
       if (e.inputType === 'insertText' && e.data) {
         e.preventDefault();
-        for (const ch of e.data) {
-          this.sendToBackend({
-            type: 'input',
-            inputType: 'keydown',
-            surfaceId: this.focusedSurface,
-            key: ch,
-            code: '',
-            modifiers: { shift: false, ctrl: false, alt: false, meta: false },
-          } as FrontendToBackendMsg);
-        }
+        this.sendTypedChars(e.data);
         this.resetProxySentinel(proxy);
+        return;
+      }
+
+      // insertReplacementText (iOS autocorrect substitutions), insertFromPaste
+      // and other insertions we do not cancel: let the edit land in the
+      // proxy and forward the resulting delta via the 'input' listener.
+      if (e.inputType.startsWith('insert') && e.data) {
         return;
       }
 
@@ -276,17 +302,12 @@ export class FrontendClient {
       // IME composition is active the IME edits the proxy itself and
       // compositionend flushes the net result, so let those pass through.
       if (e.inputType.startsWith('delete')) {
-        if (composing || e.inputType === 'deleteCompositionText') return;
+        // deleteCompositionText is the IME undoing its own edits; the
+        // delta sync above already accounts for the net change.
+        if (e.inputType === 'deleteCompositionText' || e.inputType === 'deleteByComposition') return;
         e.preventDefault();
         const key = e.inputType === 'deleteContentForward' ? 'Delete' : 'Backspace';
-        this.sendToBackend({
-          type: 'input',
-          inputType: 'keydown',
-          surfaceId: this.focusedSurface,
-          key,
-          code: key,
-          modifiers: { shift: false, ctrl: false, alt: false, meta: false },
-        } as FrontendToBackendMsg);
+        this.sendSpecialKey(key, key);
         this.resetProxySentinel(proxy);
         return;
       }
@@ -294,16 +315,15 @@ export class FrontendClient {
       // insertLineBreak = Enter on mobile
       if (e.inputType === 'insertLineBreak') {
         e.preventDefault();
-        this.sendToBackend({
-          type: 'input',
-          inputType: 'keydown',
-          surfaceId: this.focusedSurface,
-          key: 'Enter',
-          code: 'Enter',
-          modifiers: { shift: false, ctrl: false, alt: false, meta: false },
-        } as FrontendToBackendMsg);
+        this.sendSpecialKey('Enter', 'Enter');
         return;
       }
+
+      // Unknown input types (historyUndo, format*, ...) are not text input,
+      // but log them loudly: a silent fall-through here is exactly how typed
+      // text was being lost (insertCompositionText/insertReplacementText
+      // used to fall through this handler with no branch at all).
+      console.warn(`[mobile-keyboard] unhandled beforeinput inputType: ${e.inputType}`, { data: e.data });
     });
 
     // Fallback: capture special keys that don't fire beforeinput (arrows, Tab, Escape)
@@ -313,6 +333,8 @@ export class FrontendClient {
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
       // Skip keys already handled by beforeinput
       if (e.key === 'Backspace' || e.key === 'Enter') return;
+      // Deliver any pending composed text first so it precedes the special key.
+      this.sendProxyDelta(proxy);
       e.preventDefault();
       this.sendToBackend({
         type: 'input',
@@ -335,17 +357,37 @@ export class FrontendClient {
 
   /** Restore the proxy to just the sentinel with the caret after it. */
   private resetProxySentinel(proxy: HTMLInputElement): void {
+    // A programmatic value write aborts an active IME composition (and the
+    // compositionend that would flush it) — never touch the field then.
+    if (this.proxyComposing) return;
     proxy.value = FrontendClient.KB_SENTINEL;
     proxy.setSelectionRange(proxy.value.length, proxy.value.length);
+    this.proxySentValue = proxy.value;
   }
 
-  /** Flush any remaining text in the proxy input (after composition ends). */
+  /** Flush any remaining text in the proxy input (after composition ends,
+   *  on blur, or when the keyboard is dismissed). */
   private flushProxyInput(proxy: HTMLInputElement): void {
-    const text = proxy.value.split(FrontendClient.KB_SENTINEL).join('');
-    if (!this.focusedSurface || !text) {
-      this.resetProxySentinel(proxy);
-      return;
+    if (this.focusedSurface) this.sendProxyDelta(proxy);
+    this.resetProxySentinel(proxy);
+  }
+
+  /** Forward the difference between the proxy's current value and the value
+   *  already delivered to the backend. Delta-based so it works for plain
+   *  appends AND for in-place replacements (autocorrect/predictive text). */
+  private sendProxyDelta(proxy: HTMLInputElement): void {
+    const delta = computeInputDelta(this.proxySentValue, proxy.value);
+    this.proxySentValue = proxy.value;
+    if (!this.focusedSurface) return;
+    for (let i = 0; i < delta.backspaces; i++) {
+      this.sendSpecialKey('Backspace', 'Backspace');
     }
+    this.sendTypedChars(delta.inserted);
+  }
+
+  /** Send printable characters as per-char keydown input messages. */
+  private sendTypedChars(text: string): void {
+    if (!this.focusedSurface) return;
     for (const ch of text) {
       this.sendToBackend({
         type: 'input',
@@ -356,7 +398,19 @@ export class FrontendClient {
         modifiers: { shift: false, ctrl: false, alt: false, meta: false },
       } as FrontendToBackendMsg);
     }
-    this.resetProxySentinel(proxy);
+  }
+
+  /** Send a single non-printable key (Backspace, Delete, Enter, ...). */
+  private sendSpecialKey(key: string, code: string): void {
+    if (!this.focusedSurface) return;
+    this.sendToBackend({
+      type: 'input',
+      inputType: 'keydown',
+      surfaceId: this.focusedSurface,
+      key,
+      code,
+      modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+    } as FrontendToBackendMsg);
   }
 
   /**
