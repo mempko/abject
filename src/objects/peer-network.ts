@@ -443,7 +443,7 @@ Interface: abjects:peer-network`;
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = 500;
+    const winW = 620;
     const winH = 700;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
