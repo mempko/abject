@@ -57,7 +57,7 @@ const INFRA_OBJECTS = [
   'ExternalProjectRegistry', 'ExternalCreator', 'ObjectCreator',
   // TaskReviewer discovers KnowledgeBase, so it spawns after it.
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'AgentEvaluation', 'ChatManager',
-  'Console', 'CollectionStore', 'TriggerManager',
+  'Console', 'CollectionStore', 'TriggerManager', 'WebExposure',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */

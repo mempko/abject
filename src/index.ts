@@ -76,6 +76,9 @@ export { Supervisor, SUPERVISOR_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
 export { WorkerRecovery, WORKER_RECOVERY_ID } from './objects/worker-recovery.js';
+export { WebGateway, WEB_GATEWAY_ID } from './objects/web-gateway.js';
+export { WebExposure, WEB_EXPOSURE_ID } from './objects/web-exposure.js';
+export { WebGatewayBrowser, WEB_GATEWAY_BROWSER_ID } from './objects/web-gateway-browser.js';
 export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
@@ -222,7 +225,6 @@ export {
 } from './core/host-mcp-import.js';
 export type { HostMcpServer } from './core/host-mcp-import.js';
 export type { SkillInfo, SkillConfig, EnabledSkillSummary, MCPServerMeta } from './core/skill-types.js';
-export { HttpServer, HTTP_SERVER_ID } from './objects/http-server.js';
 export { MCPBridge, MCP_BRIDGE_ID } from './objects/mcp-bridge.js';
 export type { MCPBridgeConfig, MCPBridgeStatus } from './objects/mcp-bridge.js';
 export { MCPTransport } from './network/mcp-transport.js';

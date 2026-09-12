@@ -5,7 +5,7 @@
  * and caller-provided helpers. No require, fetch, process, globalThis, or other
  * Node.js/browser globals are available inside the sandbox.
  *
- * Consumers (JobManager, HttpServer, ScriptableAbject) compose their own context
+ * Consumers (JobManager, ScriptableAbject) compose their own context
  * dictionaries and pass them in alongside the standard built-ins.
  */
 

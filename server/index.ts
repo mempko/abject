@@ -111,7 +111,6 @@ import { SecretsVault } from '../src/objects/secrets-vault.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
-import { HttpServer } from '../src/objects/http-server.js';
 import { WasmAbject } from '../src/objects/wasm-abject.js';
 import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 import { ingestAllExtensions } from '../src/sandbox/extensions.js';
@@ -124,6 +123,9 @@ import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js
 import { WebSocketUITransport, toUIWireData, postUIWireData, normalizeWsPayload } from './ui-transport.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
 import { CliServer } from './cli-server.js';
+import { WebGateway } from '../src/objects/web-gateway.js';
+import { WebExposure } from '../src/objects/web-exposure.js';
+import { WebGatewayBrowser } from '../src/objects/web-gateway-browser.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -151,6 +153,11 @@ const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
  */
 const CLI_PORT_OFFSET = 4;
 const CLI_PORT = parseInt(process.env.CLI_PORT ?? String(WS_PORT + CLI_PORT_OFFSET), 10);
+// The HTTP gateway's port follows WS_PORT the same way, one past the CLI, so
+// a second instance (awaken2/awaken3) does not collide. HTTP_BIND stays
+// loopback unless set; a public bind is the user's deliberate choice.
+const HTTP_GATEWAY_PORT_OFFSET = 5;
+const HTTP_PORT = parseInt(process.env.HTTP_PORT ?? String(WS_PORT + HTTP_GATEWAY_PORT_OFFSET), 10);
 const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const DEDICATED_WORKERS = process.env.ABJECTS_DEDICATED_WORKERS !== '0'; // default: enabled
 const alog = new Log('ABJECTS');
@@ -524,6 +531,15 @@ async function main(): Promise<void> {
   let cliServer: CliServer | undefined;
   runtime.objectFactory.registerConstructor('CliServer',
     () => (cliServer = new CliServer({ port: CLI_PORT, authConfig, sessions: sessionStore })));
+  // The HTTP gateway shares the browser client's auth gate (session tokens)
+  // and adds its own API tokens. Main-thread only, like CliServer: it holds a
+  // listening socket. Its per-workspace config (WebExposure) and its window
+  // (WebGatewayBrowser) are ordinary abjects.
+  let webGateway: WebGateway | undefined;
+  runtime.objectFactory.registerConstructor('WebGateway',
+    () => (webGateway = new WebGateway({ port: HTTP_PORT, bind: process.env.HTTP_BIND, authConfig, sessions: sessionStore })));
+  runtime.objectFactory.registerConstructor('WebExposure', () => new WebExposure());
+  runtime.objectFactory.registerConstructor('WebGatewayBrowser', () => new WebGatewayBrowser());
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
   runtime.objectFactory.registerConstructor('Storage', (args?: unknown) => {
@@ -640,7 +656,6 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     const config = args as MCPBridgeConfig;
     return new MCPBridge(config);
   });
-  runtime.objectFactory.registerConstructor('HttpServer', () => new HttpServer());
   runtime.objectFactory.registerConstructor('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
   // Mark worker-eligible constructors (only used when workerEnabled).
@@ -652,7 +667,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'Clipboard', 'Console', 'FileSystem',
       'ShellExecutor', 'HostFileSystem',
       'WebSearch', 'WebFetch', 'Screenshot',
-      'Storage', 'HttpServer', 'StreamClient', 'AudioOutput', 'Speech',
+      'Storage', 'StreamClient', 'AudioOutput', 'Speech',
       // Global services
       'GlobalSettings', 'PermissionBroker', 'PeerNetwork',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
@@ -754,7 +769,6 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const screenshotId = await supervisedSpawn('Screenshot');
   const audioOutputId = await supervisedSpawn('AudioOutput');
   const speechId = await supervisedSpawn('Speech');
-  const httpServerId = await supervisedSpawn('HttpServer');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
   // CommandPalette / NotificationCenter / WindowSwitcher are per-workspace —
@@ -999,6 +1013,8 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
   const skillBrowserId = await supervisedSpawn('SkillBrowser', 'permanent', systemTypeId('SkillBrowser'));
+  const webGatewayId = await supervisedSpawn('WebGateway', 'permanent', systemTypeId('WebGateway'));
+  const webGatewayBrowserId = await supervisedSpawn('WebGatewayBrowser', 'permanent', systemTypeId('WebGatewayBrowser'));
   const mcpRegistryClientId = await supervisedSpawn('MCPRegistryClient', 'permanent', systemTypeId('MCPRegistryClient'));
   const clawHubClientId = await supervisedSpawn('ClawHubClient', 'permanent', systemTypeId('ClawHubClient'));
   const catalogBrowserId = await supervisedSpawn('CatalogBrowser', 'permanent', systemTypeId('CatalogBrowser'));
@@ -1210,6 +1226,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     await Promise.allSettled([
       wsServer.close(),
       cliServer ? cliServer.stop() : Promise.resolve(),
+      webGateway ? webGateway.stop() : Promise.resolve(),
     ]);
     // Stop the dedicated workers first — and stop their objects before their
     // threads.
