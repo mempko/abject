@@ -45,7 +45,13 @@ export class Settings extends Abject {
   private rootLayoutId?: AbjectId;
 
   // Tab state
-  private activeTab: 'general' | 'access' | 'appearance' = 'general';
+  private activeTab: 'general' | 'access' | 'web' | 'appearance' = 'general';
+  // Web tab state
+  private webEnableCheckboxId?: AbjectId;
+  private webSaveBtnId?: AbjectId;
+  private webStatusLabelId?: AbjectId;
+  private webExposeCheckboxes = new Map<AbjectId, string>();
+  private webAccessSelects = new Map<AbjectId, string>();
   private tabBarId?: AbjectId;
 
   // Appearance tab state
@@ -307,13 +313,15 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       // Tab bar change — clear and rebuild tab content without destroying window
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
-        this.activeTab = idx === 0 ? 'general' : idx === 1 ? 'access' : 'appearance';
+        this.activeTab = idx === 0 ? 'general' : idx === 1 ? 'access' : idx === 2 ? 'web' : 'appearance';
         await this.clearTabContent();
         const r0 = { x: 0, y: 0, width: 0, height: 0 };
         if (this.activeTab === 'general') {
           await this.buildGeneralTab(r0);
         } else if (this.activeTab === 'access') {
           await this.buildAccessTab(r0);
+        } else if (this.activeTab === 'web') {
+          await this.buildWebTab(r0);
         } else {
           await this.buildAppearanceTab();
         }
@@ -349,6 +357,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       // Access tab save button
       if (fromId === this.accessSaveBtnId && aspect === 'click') {
         await this.saveAccessSettings();
+        return;
+      }
+
+      if (fromId === this.webSaveBtnId && aspect === 'click') {
+        await this.saveWebSettings();
         return;
       }
 
@@ -486,8 +499,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [{
         type: 'tabBar', windowId: this.windowId,
-        tabs: ['General', 'Access', 'Appearance'],
-        selectedIndex: this.activeTab === 'general' ? 0 : this.activeTab === 'access' ? 1 : 2,
+        tabs: ['General', 'Access', 'Web', 'Appearance'],
+        selectedIndex: this.activeTab === 'general' ? 0 : this.activeTab === 'access' ? 1 : this.activeTab === 'web' ? 2 : 3,
       }] })
     );
     this.tabBarId = tabBarId;
@@ -516,6 +529,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       await this.buildGeneralTab(r0);
     } else if (this.activeTab === 'access') {
       await this.buildAccessTab(r0);
+    } else if (this.activeTab === 'web') {
+      await this.buildWebTab(r0);
     } else {
       await this.buildAppearanceTab();
     }
@@ -2283,6 +2298,154 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
           selected: themeId === newId,
         }));
       } catch { /* gone */ }
+    }
+  }
+
+  // ─────────────────────────────── Web tab ───────────────────────────────
+  //
+  // The Web tab curates which of this workspace\'s abjects the HTTP gateway
+  // serves, and on what terms. It is deliberately separate from the Access
+  // tab (peer exposure): reaching an abject from a browser and reaching it
+  // from another Abject peer are different decisions. The workspace\'s
+  // WebExposure holds the config; this tab reads and writes it.
+
+  private async findWebExposure(): Promise<AbjectId | undefined> {
+    const registryId = await this.discoverDep('Registry');
+    if (!registryId) return undefined;
+    try {
+      const hits = await this.request<Array<{ id: AbjectId; name: string }>>(
+        request(this.id, registryId, 'search', { query: 'WebExposure' }));
+      return hits.find(h => h.name === 'WebExposure')?.id;
+    } catch { return undefined; }
+  }
+
+  /** Workspace abjects that can be offered over HTTP: every child, user objects first. */
+  private async webExposableObjects(): Promise<Array<{ id: string; name: string }>> {
+    await this.ensureWorkspaceId();
+    if (!this.workspaceId || !this.workspaceManagerId) return [];
+    let childIds = new Set<string>();
+    try {
+      const detailed = await this.request<Array<{ workspaceId: string; childIds: string[] }>>(
+        request(this.id, this.workspaceManagerId, 'listWorkspacesDetailed', {}));
+      const mine = detailed.find(w => w.workspaceId === this.workspaceId);
+      if (mine) childIds = new Set(mine.childIds);
+    } catch { /* none */ }
+    const registryId = await this.discoverDep('Registry');
+    if (!registryId) return [];
+    let all: Array<{ id: string; name: string; manifest?: { tags?: string[] } }> = [];
+    try { all = await this.request(request(this.id, registryId, 'list', {})); } catch { return []; }
+    const userIds = new Set<string>();
+    if (this.abjectStoreId) {
+      try { for (const s of await this.request<Array<{ objectId: string }>>(request(this.id, this.abjectStoreId, 'list', {}))) userIds.add(s.objectId); }
+      catch { /* store not ready */ }
+    }
+    // Only objects that actually have callable, non-meta methods are worth a row.
+    const rows = all
+      .filter(o => childIds.has(o.id))
+      .filter(o => o.name !== 'WebExposure' && !(o.manifest?.tags ?? []).includes('capability'))
+      .map(o => ({ id: o.id, name: o.name }));
+    rows.sort((a, b) => {
+      const au = userIds.has(a.id) ? 0 : 1, bu = userIds.has(b.id) ? 0 : 1;
+      if (au !== bu) return au - bu;
+      return a.name.localeCompare(b.name);
+    });
+    // Dedup by name — routes are name-addressed, so one row per name.
+    const seen = new Set<string>();
+    return rows.filter(r => (seen.has(r.name) ? false : (seen.add(r.name), true)));
+  }
+
+  private async buildWebTab(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    const cId = this.tabContentContainerId!;
+    this.webExposeCheckboxes.clear();
+    this.webAccessSelects.clear();
+
+    const exposureId = await this.findWebExposure();
+    let config: { enabled: boolean; entries: Record<string, { access: string; methods: string[] | null }> } = { enabled: false, entries: {} };
+    if (exposureId) { try { config = await this.request(request(this.id, exposureId, 'getConfig', {})); } catch { /* defaults */ } }
+
+    const { widgetIds: [headerId, descId, enableId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Web Access', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Serve chosen abjects over HTTP. The gateway itself is turned on in the Web Gateway window.', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+        { type: 'checkbox', windowId: this.windowId, text: 'Serve this workspace over HTTP', checked: config.enabled === true },
+      ] }));
+    this.webEnableCheckboxId = this.trackTabWidget(enableId);
+    this.trackTabWidget(headerId); this.trackTabWidget(descId);
+    await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: headerId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 24 } }));
+    await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: descId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 32 } }));
+    await this.request(request(this.id, this.webEnableCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: this.webEnableCheckboxId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 26 } }));
+
+    const objects = await this.webExposableObjects();
+    if (objects.length === 0) {
+      const { widgetIds: [noneId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'No abjects here can be exposed yet. Create one first.', style: { color: this.theme.textDescription, fontSize: 12 } }] }));
+      this.trackTabWidget(noneId);
+      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: noneId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } }));
+    }
+    for (const obj of objects) {
+      const entry = config.entries[obj.name];
+      const rowId = this.trackTabWidget(await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', { parentLayoutId: cId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 8 })));
+      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: rowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 30 } }));
+      const { widgetIds: [checkId, selectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'checkbox', windowId: this.windowId, text: obj.name, checked: !!entry },
+          { type: 'select', windowId: this.windowId, options: ['Authenticated', 'Public'], selectedIndex: entry?.access === 'public' ? 1 : 0 },
+        ] }));
+      this.trackTabWidget(checkId); this.trackTabWidget(selectId);
+      this.webExposeCheckboxes.set(checkId, obj.name);
+      this.webAccessSelects.set(selectId, obj.name);
+      await this.request(request(this.id, checkId, 'addDependent', {}));
+      await this.request(request(this.id, rowId, 'addLayoutChild', { widgetId: checkId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 26 } }));
+      await this.request(request(this.id, rowId, 'addLayoutChild', { widgetId: selectId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 150, height: 28 } }));
+    }
+
+    // Save row
+    const saveRowId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', { parentLayoutId: cId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 8 })));
+    await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: saveRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } }));
+    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
+    const { widgetIds: [btnId, statusId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 12, align: 'right', selectable: true } },
+      ] }));
+    this.webSaveBtnId = this.trackTabWidget(btnId);
+    this.webStatusLabelId = this.trackTabWidget(statusId);
+    await this.request(request(this.id, this.webSaveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutChild', { widgetId: this.webSaveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } }));
+    await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: this.webStatusLabelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 18 } }));
+  }
+
+  private async saveWebSettings(): Promise<void> {
+    const exposureId = await this.findWebExposure();
+    if (!exposureId) return;
+    let enabled = false;
+    if (this.webEnableCheckboxId) {
+      try { enabled = (await this.request<string>(request(this.id, this.webEnableCheckboxId, 'getValue', {}))) === 'true'; } catch { /* off */ }
+    }
+    const access = new Map<string, string>();
+    for (const [selectId, name] of this.webAccessSelects) {
+      try {
+        const v = await this.request<string>(request(this.id, selectId, 'getValue', {}));
+        // select getValue is the index as a string, or the label
+        access.set(name, v === '1' || v === 'Public' ? 'public' : 'authenticated');
+      } catch { access.set(name, 'authenticated'); }
+    }
+    const entries: Record<string, { access: string; methods: string[] | null }> = {};
+    for (const [checkId, name] of this.webExposeCheckboxes) {
+      try {
+        const checked = await this.request<string>(request(this.id, checkId, 'getValue', {}));
+        if (checked === 'true') entries[name] = { access: access.get(name) ?? 'authenticated', methods: null };
+      } catch { /* gone */ }
+    }
+    try {
+      await this.request(request(this.id, exposureId, 'setConfig', { config: { enabled, entries } }));
+      if (this.webStatusLabelId) await this.request(request(this.id, this.webStatusLabelId, 'update', { text: `Saved. ${Object.keys(entries).length} abject(s) exposed.` }));
+    } catch (err) {
+      if (this.webStatusLabelId) await this.request(request(this.id, this.webStatusLabelId, 'update', { text: `Save failed: ${err instanceof Error ? err.message.slice(0, 60) : ''}` }));
     }
   }
 }

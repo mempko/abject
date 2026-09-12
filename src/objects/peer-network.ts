@@ -10,6 +10,10 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 
 
+interface GatewayStatus { enabled: boolean; listening: boolean; bind: string; port: number; baseUrl: string; workspaces: number; routes: number; tokens: number; }
+interface RouteInfo { workspace: string; workspaceSlug: string; abject: string; access: string; methods: string[] | null; path: string; }
+interface TokenInfo { id: string; name: string; createdAt: number; lastUsedAt?: number; }
+
 const PEER_NETWORK_INTERFACE: InterfaceId = 'abjects:peer-network';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
@@ -77,6 +81,18 @@ export class PeerNetwork extends Abject {
   private refreshing = false;
   private refreshPending = false;
   private frontendsListAreaId?: AbjectId;
+
+  // Web Access section widgets
+  private webGatewayId?: AbjectId;
+  private webAccessStatusId?: AbjectId;
+  private webToggleBtnId?: AbjectId;
+  private webRoutesId?: AbjectId;
+  private webMintBtnId?: AbjectId;
+  private webTokenResultId?: AbjectId;
+  private webTokensId?: AbjectId;
+  private webPortInputId?: AbjectId;
+  private webPortApplyBtnId?: AbjectId;
+  private webGatewayEnabled = false;
 
   // Discovery dep
   private peerDiscoveryId?: AbjectId;
@@ -197,6 +213,51 @@ Interface: abjects:peer-network`;
       }
 
       // Signaling server remove buttons
+      // Web Access tab — toggle the HTTP gateway
+      if (fromId === this.webToggleBtnId && aspect === 'click') {
+        if (this.webGatewayId) {
+          try {
+            await this.request(request(this.id, this.webGatewayId, 'setEnabled', { enabled: !this.webGatewayEnabled }));
+            this.webGatewayEnabled = !this.webGatewayEnabled;
+          } catch { /* best effort */ }
+        }
+        await this.rebuildWebAccessTab();
+        return;
+      }
+
+      // Web Access tab — apply the gateway port (empty = automatic)
+      if (fromId === this.webPortApplyBtnId && aspect === 'click') {
+        if (this.webGatewayId && this.webPortInputId) {
+          try {
+            const raw = ((await this.request<string>(request(this.id, this.webPortInputId, 'getValue', {}))) ?? '').trim();
+            const port = raw.length === 0 ? 0 : Number(raw);
+            if (raw.length === 0 || (Number.isInteger(port) && port >= 0 && port <= 65535)) {
+              await this.request(request(this.id, this.webGatewayId, 'setPort', { port }));
+            }
+          } catch { /* best effort */ }
+        }
+        await this.rebuildWebAccessTab();
+        return;
+      }
+
+      // Web Access tab — mint an API token (secret shown once)
+      if (fromId === this.webMintBtnId && aspect === 'click') {
+        if (this.webGatewayId) {
+          try {
+            const minted = await this.request<{ id: string; name: string; secret: string }>(
+              request(this.id, this.webGatewayId, 'mintToken', { name: 'token' })
+            );
+            await this.rebuildWebAccessTab();
+            if (this.webTokenResultId) {
+              await this.request(request(this.id, this.webTokenResultId, 'update', {
+                text: `Token secret (shown once): ${minted.secret}`,
+              }));
+            }
+          } catch { /* best effort */ }
+        }
+        return;
+      }
+
       if (aspect === 'click' && this.signalingRemoveButtons.has(fromId)) {
         const url = this.signalingRemoveButtons.get(fromId)!;
         await this.removeSignalingServer(url);
@@ -408,7 +469,7 @@ Interface: abjects:peer-network`;
     // Tab bar
     const { widgetIds: [_tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions', 'Frontends'], selectedIndex: 0 },
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions', 'Frontends', 'Web Access'], selectedIndex: 0 },
       ] })
     );
     this.tabBarId = _tabBarId;
@@ -419,9 +480,9 @@ Interface: abjects:peer-network`;
       preferredSize: { height: 36 },
     }));
 
-    // Create 5 tab content ScrollableVBoxes
+    // Create 6 tab content ScrollableVBoxes
     this.tabContents = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       const tabVBox = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createScrollableVBox', {
           windowId: this.windowId,
@@ -470,6 +531,12 @@ Interface: abjects:peer-network`;
     this.blockButtons.clear();
     this.unblockButtons.clear();
     this.signalingPeerAddButtons.clear();
+    this.webAccessStatusId = undefined;
+    this.webToggleBtnId = undefined;
+    this.webRoutesId = undefined;
+    this.webMintBtnId = undefined;
+    this.webTokenResultId = undefined;
+    this.webTokensId = undefined;
     // NOTE: frontendDisconnectButtons / frontendRevokeButtons and the pairing
     // widget refs (remoteEnableCheckboxId, remoteQrImageId, frontendsListAreaId,
     // etc.) are NOT reset here. The Frontends tab is refreshed in place —
@@ -1214,6 +1281,9 @@ Interface: abjects:peer-network`;
 
     // ========== TAB 4: FRONTENDS ==========
     await this.populateFrontendsTab(this.tabContents[4]);
+
+    // ========== TAB 5: WEB ACCESS ==========
+    await this.populateWebAccessTab(this.tabContents[5]);
   }
 
   /** Populate the Frontends tab — currently connected UI clients (WS + WebRTC). */
@@ -1498,6 +1568,119 @@ Interface: abjects:peer-network`;
     }));
   }
 
+  /** Populate the Web Access tab — HTTP gateway status, toggle, routes, and API tokens. */
+  private async populateWebAccessTab(tab5: AbjectId): Promise<void> {
+    if (!this.webGatewayId) {
+      this.webGatewayId = await this.discoverDep('WebGateway') ?? undefined;
+      if (this.webGatewayId) {
+        try { await this.request(request(this.id, this.webGatewayId, 'addDependent', {})); } catch { /* best effort */ }
+      }
+    }
+    if (!this.webGatewayId) {
+      const { widgetIds: [unavailableId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'Web Gateway is not available.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        ] })
+      );
+      await this.request(request(this.id, tab5, 'addLayoutChild', {
+        widgetId: unavailableId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 24 },
+      }));
+      return;
+    }
+
+    const { widgetIds: [titleId, statusId, toggleBtnId, portLblId, portInputId, portApplyId, div1Id, routesHdrId, routesId, div2Id, tokensHdrId, tokensDescId, mintBtnId, resultId, tokensListId] } =
+      await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'HTTP Gateway', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 16 } },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
+          { type: 'button', windowId: this.windowId, text: 'Enable', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          { type: 'label', windowId: this.windowId, text: 'Port', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          { type: 'textInput', windowId: this.windowId, placeholder: 'Leave empty for automatic (system finds a free port), or enter a port number' },
+          { type: 'button', windowId: this.windowId, text: 'Apply Port', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          { type: 'divider', windowId: this.windowId },
+          { type: 'label', windowId: this.windowId, text: 'Routes', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
+          { type: 'divider', windowId: this.windowId },
+          { type: 'label', windowId: this.windowId, text: 'API Tokens', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: 'Authenticated routes need one of these as a Bearer token. The secret is shown once at mint time.', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+          { type: 'button', windowId: this.windowId, text: 'Mint Token', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true, selectable: true } },
+        ] })
+      );
+    this.webAccessStatusId = statusId;
+    this.webToggleBtnId = toggleBtnId;
+    this.webPortInputId = portInputId;
+    this.webPortApplyBtnId = portApplyId;
+    this.webRoutesId = routesId;
+    this.webMintBtnId = mintBtnId;
+    this.webTokenResultId = resultId;
+    this.webTokensId = tokensListId;
+
+    const layoutSpecs: Array<[AbjectId, number]> = [
+      [titleId, 24], [statusId, 40], [toggleBtnId, 30], [portLblId, 20], [portInputId, 30], [portApplyId, 30], [div1Id, 1], [routesHdrId, 20], [routesId, 60],
+      [div2Id, 1], [tokensHdrId, 20], [tokensDescId, 32], [mintBtnId, 30], [resultId, 32], [tokensListId, 80],
+    ];
+    for (const [widgetId, height] of layoutSpecs) {
+      await this.request(request(this.id, tab5, 'addLayoutChild', {
+        widgetId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height },
+      }));
+    }
+    await this.request(request(this.id, toggleBtnId, 'addDependent', {}));
+    await this.request(request(this.id, mintBtnId, 'addDependent', {}));
+    await this.request(request(this.id, portApplyId, 'addDependent', {}));
+
+    await this.updateWebAccessData();
+  }
+
+  /** Refresh the Web Access tab data from the gateway. */
+  private async updateWebAccessData(): Promise<void> {
+    if (!this.webGatewayId || !this.windowId) return;
+    try {
+      const status = await this.request<GatewayStatus>(request(this.id, this.webGatewayId, 'getStatus', {}));
+      this.webGatewayEnabled = !!status.enabled;
+      const routes = await this.request<RouteInfo[]>(request(this.id, this.webGatewayId, 'getRoutes', {}));
+      const tokens = await this.request<TokenInfo[]>(request(this.id, this.webGatewayId, 'listTokens', {}));
+      if (this.webAccessStatusId) {
+        await this.request(request(this.id, this.webAccessStatusId, 'update', {
+          text: status.enabled
+            ? `ON — ${status.baseUrl} (${status.routes} route(s) across ${status.workspaces} workspace(s))`
+            : 'OFF — the HTTP listener is not running.',
+        }));
+      }
+      if (this.webRoutesId) {
+        await this.request(request(this.id, this.webRoutesId, 'update', {
+          text: routes.length
+            ? routes.map(r => `${r.path} — ${r.abject} (${r.access})`).join('\n')
+            : 'No routes yet. Enable serving on a workspace to expose it here.',
+        }));
+      }
+      if (this.webTokensId) {
+        await this.request(request(this.id, this.webTokensId, 'update', {
+          text: tokens.length
+            ? tokens.map(t => `${t.name} — created ${new Date(t.createdAt).toISOString().slice(0, 10)} (${t.id.slice(0, 8)})`).join('\n')
+            : 'No API tokens.',
+        }));
+      }
+      if (this.webToggleBtnId) {
+        await this.request(request(this.id, this.webToggleBtnId, 'update', { text: status.enabled ? 'Disable' : 'Enable' }));
+      }
+    } catch { /* gateway not ready */ }
+  }
+
+  /** Clear and rebuild just the Web Access tab in place. */
+  private async rebuildWebAccessTab(): Promise<void> {
+    if (!this.windowId || !this.webGatewayId) return;
+    const tab5 = this.tabContents[5];
+    if (!tab5) return;
+    await this.request(request(this.id, tab5, 'clearLayoutChildren', {}));
+    await this.populateWebAccessTab(tab5);
+  }
+
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
@@ -1532,6 +1715,12 @@ Interface: abjects:peer-network`;
     this.signalingPeerAddButtons.clear();
     this.frontendDisconnectButtons.clear();
     this.frontendRevokeButtons.clear();
+    this.webAccessStatusId = undefined;
+    this.webToggleBtnId = undefined;
+    this.webRoutesId = undefined;
+    this.webMintBtnId = undefined;
+    this.webTokenResultId = undefined;
+    this.webTokensId = undefined;
     this.remoteEnableCheckboxId = undefined;
     this.remoteStatusLabelId = undefined;
     this.remoteGenerateBtnId = undefined;
