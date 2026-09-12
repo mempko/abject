@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.10.2",
+    "date": "2026-09-12",
+    "title": "Your desktop, reachable from a browser",
+    "summary": "This release lets you serve a workspace over plain HTTP, so anything you build in Abject can be opened from a regular browser on your network. It also keeps a workspace running when a worker thread dies, and stops long agent sessions from growing without bound.",
+    "highlights": [
+      "New Web Gateway object serves plain HTTP on a port you choose, so workspaces can be reached from an ordinary browser instead of only through the Abject client",
+      "New Web Access tab in the Network UI, with per-workspace settings for what is exposed to the web",
+      "The runtime now rebuilds objects after a pool worker dies, so a crashed worker no longer leaves a workspace with missing objects"
+    ],
+    "fixes": [
+      "The server answers plain HTTP requests properly instead of returning 426 Upgrade Required, so browsers and tools like curl get a real response",
+      "Task sessions and review reports no longer grow without bound during long agent runs"
+    ]
+  },
+  {
     "version": "0.10.1",
     "date": "2026-09-11",
     "title": "Guarded Projects, Gentler Forgetting",
