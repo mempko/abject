@@ -2,6 +2,7 @@
  * Node.js WebSocket server wrapper using the 'ws' package.
  */
 
+import * as http from 'http';
 import { WebSocketServer as WsServer, WebSocket } from 'ws';
 
 export interface WsServerConfig {
@@ -27,14 +28,26 @@ type LivenessWs = WebSocket & { isAlive?: boolean };
  */
 export class NodeWebSocketServer {
   private wss: WsServer;
+  private httpServer: http.Server;
   private connections: Set<WebSocket> = new Set();
   private _ready: Promise<void>;
   private heartbeat?: ReturnType<typeof setInterval>;
 
   constructor(config: WsServerConfig) {
+    // Back the WebSocket server with a real http.Server so plain HTTP
+    // requests (curl, health checks, a stray browser) get a helpful answer
+    // instead of ws's built-in "Upgrade Required" (426). WebSocket upgrade
+    // requests are forwarded to ws unchanged.
+    this.httpServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(
+        `This is an Abject WebSocket endpoint (ws://${req.headers.host ?? 'localhost'}).\n` +
+        'Plain HTTP is not served here — connect with a WebSocket client.\n'
+      );
+    });
+    this.httpServer.listen(config.port, config.host ?? '0.0.0.0');
     this.wss = new WsServer({
-      port: config.port,
-      host: config.host ?? '0.0.0.0',
+      server: this.httpServer,
       perMessageDeflate: config.perMessageDeflate ?? false,
     });
 
@@ -57,14 +70,16 @@ export class NodeWebSocketServer {
       this.heartbeat.unref?.();
     }
 
+    // In server mode, ws does not emit 'listening' itself — wait on the
+    // underlying http.Server.
     this._ready = new Promise<void>((resolve, reject) => {
-      this.wss.once('listening', () => {
-        const addr = this.wss.address();
+      this.httpServer.once('listening', () => {
+        const addr = this.httpServer.address();
         const addrStr = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : String(addr);
         console.log(`[WS-SERVER] listening on ${addrStr} (T+${Math.round(performance.now())}ms)`);
         resolve();
       });
-      this.wss.once('error', reject);
+      this.httpServer.once('error', reject);
     });
 
     this.wss.on('error', (err) => {
