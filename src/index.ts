@@ -27,6 +27,8 @@ export { ObjectCreator, OBJECT_CREATOR_ID } from './objects/object-creator.js';
 export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js';
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
+export { CassetteRecorder, CASSETTE_RECORDER_ID } from './objects/cassette-recorder.js';
+export type { Cassette } from './objects/cassette-recorder.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { PeersViewer, PEERS_VIEWER_ID } from './objects/peers-viewer.js';

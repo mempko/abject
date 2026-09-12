@@ -20,6 +20,7 @@ import { ObjectCreator } from '../src/objects/object-creator.js';
 import { ProxyGenerator } from '../src/objects/proxy-generator.js';
 import { Negotiator } from '../src/protocol/negotiator.js';
 import { HealthMonitor } from '../src/protocol/health-monitor.js';
+import { CassetteRecorder } from '../src/objects/cassette-recorder.js';
 import { HttpClient } from '../src/objects/capabilities/http-client.js';
 import { Timer } from '../src/objects/capabilities/timer.js';
 import { Clipboard } from '../src/objects/capabilities/clipboard.js';
@@ -144,6 +145,7 @@ constructors.set('FileSystem', (args?: unknown) => {
 constructors.set('ProxyGenerator', () => new ProxyGenerator());
 constructors.set('Negotiator', () => new Negotiator());
 constructors.set('HealthMonitor', () => new HealthMonitor());
+constructors.set('CassetteRecorder', () => new CassetteRecorder());
 constructors.set('ObjectCreator', () => new ObjectCreator());
 constructors.set('AbjectEditor', () => new AbjectEditor());
 constructors.set('Settings', () => new Settings());

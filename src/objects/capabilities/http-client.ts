@@ -4,8 +4,11 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
-import { error } from '../../core/message.js';
+import { error, event } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
+import { Log } from '../../core/timed-log.js';
+
+const log = new Log('HTTP');
 
 const HTTP_INTERFACE = 'abjects:http';
 
@@ -25,6 +28,34 @@ export interface HttpResponse {
   ok: boolean;
 }
 
+/** What the CassetteRecorder receives per completed request (event
+ *  `httpExchange`, sent to that one object only — never broadcast).
+ *  Redacted and size-capped BEFORE emission: secrets never cross the bus,
+ *  and multi-megabyte bodies never ride it. Bodies stay text — nothing on
+ *  this path parses JSON. */
+export interface HttpExchangeEvent {
+  /** Verified by recorders against the registry, not trusted from here. */
+  caller: AbjectId;
+  request: { method: string; url: string; headers?: Record<string, string>; bodyText?: string; truncated?: boolean };
+  response: { status: number; headers?: Record<string, string>; bodyText?: string; truncated?: boolean };
+  durationMs: number;
+  at: number;
+}
+
+/** Stem match on the NAME of a header, query param, or body field. Stems
+ *  rather than exact names, so client_secret, refresh_token, x-amz-security-
+ *  token, and whatever header a generated object invents all match; a false
+ *  positive redacts something harmless, a false negative persists a live
+ *  credential, so this errs toward matching. (`auth(?!or\b)` keeps
+ *  authorization in while leaving author alone.) */
+const SECRET_NAME_STEM = /key|token|secret|passw|credential|session|signature|cookie|auth(?!or\b)/i;
+const EXCHANGE_BODY_CAP = 64 * 1024; // characters, not bytes
+/** How long a failed recorder discovery is trusted before asking the
+ *  registry again. Bounds the cost of running without a recorder to one
+ *  registry request per interval, and bounds the gap after a recorder
+ *  restart (recipientGone clears the wait entirely). */
+const RECORDER_RETRY_MS = 1000;
+
 /**
  * HTTP Client capability object.
  */
@@ -34,6 +65,18 @@ export class HttpClient extends Abject {
   private webDisabled = false;
   /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
   private permissionsAuthorityId?: AbjectId;
+  /** The one recipient of httpExchange events, found through the registry.
+   *  Resolved lazily (the recorder spawns after HttpClient at boot) and
+   *  dropped on recipientGone so a restarted recorder is picked back up. */
+  private recorderId?: AbjectId;
+  private nextRecorderResolveAt = 0;
+  private recorderResolve?: Promise<void>;
+  /** Per-caller verdict of "is this LLM?", decided once per AbjectId against
+   *  the global registry's current LLM. An id belongs to one object for its
+   *  lifetime and a respawned LLM arrives with a fresh id, so a verdict never
+   *  goes stale and a restarted LLM is classified afresh. Callers that cannot
+   *  be classified (LLM not registered yet) are never recorded on a guess. */
+  private callerIsLlm = new Map<AbjectId, boolean>();
 
   constructor(config?: {
     allowedDomains?: string[];
@@ -188,9 +231,21 @@ export class HttpClient extends Abject {
   private setupHandlers(): void {
     // All handlers use DEFERRED_REPLY so the processing loop stays free
     // for health pings during long-running fetches (e.g. LLM API calls).
+    // The bus sends this when an httpExchange bounced off a dead recorder.
+    // Forget the link so the next exchange re-resolves (a restarted recorder
+    // has a new id); everything in between is not recorded, by design.
+    this.on('recipientGone', (msg: AbjectMessage) => {
+      const { recipient } = msg.payload as { recipient?: AbjectId };
+      if (recipient && recipient === this.recorderId) {
+        this.recorderId = undefined;
+        this.nextRecorderResolveAt = 0;
+      }
+      return true;
+    });
+
     this.on('request', async (msg: AbjectMessage) => {
       const req = msg.payload as HttpRequest;
-      this.makeRequest(req).then(
+      this.tracked(msg, req).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -206,7 +261,7 @@ export class HttpClient extends Abject {
         url: string;
         headers?: Record<string, string>;
       };
-      this.makeRequest({ method: 'GET', url, headers }).then(
+      this.tracked(msg, { method: 'GET', url, headers }).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -223,7 +278,7 @@ export class HttpClient extends Abject {
         body: string;
         headers?: Record<string, string>;
       };
-      this.makeRequest({ method: 'POST', url, body, headers }).then(
+      this.tracked(msg, { method: 'POST', url, body, headers }).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -255,7 +310,7 @@ export class HttpClient extends Abject {
         url: string;
         data: object;
       };
-      this.makeRequest({
+      this.tracked(msg, {
         method: 'POST',
         url,
         body: data,
@@ -295,6 +350,68 @@ export class HttpClient extends Abject {
       }
       return { success: true };
     });
+  }
+
+  /**
+   * makeRequest plus the `httpExchange` event for the CassetteRecorder.
+   * Wraps the message entry points only: `msg.routing.from` is the caller
+   * identity the recorder attributes the exchange to. Recording is
+   * best-effort and detached: it never delays or breaks the reply.
+   */
+  private async tracked(msg: AbjectMessage, req: HttpRequest): Promise<HttpResponse> {
+    const started = Date.now();
+    const result = await this.makeRequest(req);
+    this.recordExchange(msg.routing.from, req, result, Date.now() - started)
+      .catch((err) => log.warn('httpExchange emission failed', err));
+    return result;
+  }
+
+  /** Point-to-point, not a broadcast: the exchange goes to the registered
+   *  CassetteRecorder and nothing else, so an object cannot subscribe to
+   *  other objects' traffic via addDependent. LLM's calls are dropped before
+   *  any redaction or serialization runs; with no recorder, nothing runs.
+   *  Fails closed: a caller that cannot yet be told apart from LLM is not
+   *  recorded either (the recorder would drop an unattributable exchange
+   *  anyway, so no evidence is lost by waiting). */
+  private async recordExchange(caller: AbjectId | undefined, req: HttpRequest, res: HttpResponse, durationMs: number): Promise<void> {
+    if (!caller) return;
+    const recorderId = await this.resolveRecorder();
+    if (!recorderId) return;
+    if (await this.isLlm(caller) !== false) return;
+    this.send(event(this.id, recorderId, 'httpExchange', buildExchange(caller, req, res, durationMs)));
+  }
+
+  private async resolveRecorder(): Promise<AbjectId | undefined> {
+    if (this.recorderId) return this.recorderId;
+    if (Date.now() < this.nextRecorderResolveAt) return undefined;
+    // Concurrent exchanges share one registry round-trip. A recipientGone
+    // that lands while this is in flight can be overwritten by the id that
+    // just died; the next send bounces again and self-heals.
+    this.recorderResolve ??= (async () => {
+      try {
+        this.recorderId = await this.discoverDep('CassetteRecorder') ?? undefined;
+      } finally {
+        if (!this.recorderId) this.nextRecorderResolveAt = Date.now() + RECORDER_RETRY_MS;
+        this.recorderResolve = undefined;
+      }
+    })();
+    await this.recorderResolve;
+    return this.recorderId;
+  }
+
+  /** true = LLM, false = someone else, undefined = cannot tell yet (LLM is
+   *  not in the global registry, so no verdict is cached). One registry
+   *  discover per new caller id, a Map hit per request after that. Workspace
+   *  registries are never consulted: a user object naming itself LLM does
+   *  not get itself excused. */
+  private async isLlm(caller: AbjectId): Promise<boolean | undefined> {
+    const known = this.callerIsLlm.get(caller);
+    if (known !== undefined) return known;
+    const llmId = await this.discoverDep('LLM');
+    if (!llmId) return undefined;
+    if (this.callerIsLlm.size >= 512) this.callerIsLlm.clear();
+    this.callerIsLlm.set(caller, caller === llmId);
+    return caller === llmId;
   }
 
   /**
@@ -585,3 +702,87 @@ Every response has: { status, statusText, headers, body, ok }
 
 // Well-known HTTP client ID
 export const HTTP_CLIENT_ID = 'abjects:http-client' as AbjectId;
+
+function buildExchange(caller: AbjectId, req: HttpRequest, res: HttpResponse, durationMs: number): HttpExchangeEvent {
+  const reqBody = typeof req.body === 'string' ? req.body
+    : req.body !== undefined ? JSON.stringify(req.body) : undefined;
+  const [reqBodyText, reqTruncated] = capBody(reqBody);
+  const [resBodyText, resTruncated] = capBody(res.body);
+  return {
+    caller,
+    request: {
+      method: req.method,
+      url: redactUrl(req.url),
+      headers: redactHeaders(req.headers),
+      ...(reqBodyText !== undefined ? { bodyText: reqBodyText } : {}),
+      ...(reqTruncated ? { truncated: true } : {}),
+    },
+    response: {
+      status: res.status,
+      headers: redactHeaders(res.headers),
+      ...(resBodyText !== undefined ? { bodyText: resBodyText } : {}),
+      ...(resTruncated ? { truncated: true } : {}),
+    },
+    durationMs,
+    at: Date.now(),
+  };
+}
+
+/** Secret-bearing query params and headers are replaced, never dropped:
+ *  the shape of the request stays visible, the credential does not. */
+function redactUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    let touched = false;
+    for (const name of Array.from(u.searchParams.keys())) {
+      if (SECRET_NAME_STEM.test(name)) {
+        u.searchParams.set(name, 'REDACTED');
+        touched = true;
+      }
+    }
+    return touched ? u.toString() : rawUrl;
+  } catch {
+    return rawUrl.split('?')[0];
+  }
+}
+
+function redactHeaders(headers?: Record<string, string>): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    out[name] = SECRET_NAME_STEM.test(name) ? 'REDACTED' : value;
+  }
+  return out;
+}
+
+/** Field-level scrub of body TEXT: the value of any JSON string field or
+ *  form-encoded field whose NAME matches the secret stems is replaced. Plain
+ *  regex over text - no JSON.parse on this path, ever. Pattern-based, so it
+ *  catches named fields (access_token, client_secret, password), not a
+ *  secret embedded in free text under an innocent name. Only string VALUES
+ *  are rewritten: `"pin": 1234` or `"token": null` pass through as they
+ *  did before.
+ *
+ *  Linear by construction: the patterns match EVERY string-key/string-value
+ *  pair (and every form field) and the stem test happens in the replacer.
+ *  Putting the stem alternation inside the key's character class made the
+ *  engine backtrack across every split of a long value containing a stem
+ *  word (seconds per 100 KB), and this runs synchronously on a shared pool
+ *  worker. */
+const JSON_STRING_FIELD = /"((?:[^"\\]|\\.)*)"(\s*:\s*")(?:[^"\\]|\\.)*"/g;
+const FORM_FIELD = /(^|[&?])([^=&]*=)[^&]*/g;
+
+function redactBodyText(body: string): string {
+  return body
+    .replace(JSON_STRING_FIELD, (m, key: string, sep: string) =>
+      SECRET_NAME_STEM.test(key) ? `"${key}"${sep}REDACTED"` : m)
+    .replace(FORM_FIELD, (m, lead: string, name: string) =>
+      SECRET_NAME_STEM.test(name) ? `${lead}${name}REDACTED` : m);
+}
+
+function capBody(body: string | undefined): [string | undefined, boolean] {
+  if (body === undefined) return [undefined, false];
+  const scrubbed = redactBodyText(body);
+  if (scrubbed.length <= EXCHANGE_BODY_CAP) return [scrubbed, false];
+  return [scrubbed.slice(0, EXCHANGE_BODY_CAP), true];
+}

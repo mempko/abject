@@ -16,6 +16,7 @@ import { ObjectCreator } from '../src/objects/object-creator.js';
 import { ProxyGenerator } from '../src/objects/proxy-generator.js';
 import { Negotiator } from '../src/protocol/negotiator.js';
 import { HealthMonitor } from '../src/protocol/health-monitor.js';
+import { CassetteRecorder } from '../src/objects/cassette-recorder.js';
 import { HttpClient } from '../src/objects/capabilities/http-client.js';
 import { NodeStorage } from './node-storage.js';
 import { Timer } from '../src/objects/capabilities/timer.js';
@@ -549,6 +550,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
   runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
+  runtime.objectFactory.registerConstructor('CassetteRecorder', () => new CassetteRecorder());
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
@@ -656,7 +658,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       // Global services
       'GlobalSettings', 'PermissionBroker', 'PeerNetwork',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
-      'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'ProxyGenerator', 'Negotiator', 'HealthMonitor', 'CassetteRecorder',
       'SkillRegistry', 'SkillBrowser',
       'MCPRegistryClient', 'ClawHubClient', 'CatalogBrowser',
       'SecretsVault', 'OAuthHelper',
@@ -1008,6 +1010,10 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
   const healthMonitorId = await supervisedSpawn('HealthMonitor', 'permanent', systemTypeId('HealthMonitor'));
+  // Records objects' HTTP traffic as typeId-keyed cassettes (evidence for
+  // judging generated objects — mempko/abject#11 series). HttpClient finds
+  // it through the registry and sends exchanges to it directly.
+  const cassetteRecorderId = await supervisedSpawn('CassetteRecorder', 'permanent', systemTypeId('CassetteRecorder'));
 
   // Sidebar owns the dock window the rails populate; WorkspaceSwitcher is a
   // global UI (never hidden during workspace switch)
