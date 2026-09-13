@@ -263,7 +263,10 @@ export class FrontendClient {
     // fires after each edit the keyboard applies to the proxy, and the
     // delta against the last-sent value is what reaches the widget.
     proxy.addEventListener('input', () => {
-      if (!this.focusedSurface) return;
+      if (!this.focusedSurface) {
+        console.warn('[frontend-client] mobile proxy input dropped: no focused surface');
+        return;
+      }
       this.sendProxyDelta(proxy);
     });
 
@@ -274,7 +277,10 @@ export class FrontendClient {
     // Use beforeinput for the most reliable character capture on mobile.
     // Only handle insertText (typed characters) and insertCompositionText here.
     proxy.addEventListener('beforeinput', (e: InputEvent) => {
-      if (!this.focusedSurface) return;
+      if (!this.focusedSurface) {
+        console.warn(`[frontend-client] mobile proxy beforeinput (${e.inputType}) dropped: no focused surface`);
+        return;
+      }
 
       // While an IME composition is active the keyboard owns the proxy's
       // content: every edit lands in the field and is delta-forwarded by
@@ -377,8 +383,11 @@ export class FrontendClient {
    *  appends AND for in-place replacements (autocorrect/predictive text). */
   private sendProxyDelta(proxy: HTMLInputElement): void {
     const delta = computeInputDelta(this.proxySentValue, proxy.value);
-    this.proxySentValue = proxy.value;
+    // Update the forwarded baseline ONLY when the delta is actually
+    // delivered: absorbing it before the focusedSurface gate silently
+    // swallowed typed text whenever no surface held focus.
     if (!this.focusedSurface) return;
+    this.proxySentValue = proxy.value;
     for (let i = 0; i < delta.backspaces; i++) {
       this.sendSpecialKey('Backspace', 'Backspace');
     }
@@ -502,7 +511,16 @@ export class FrontendClient {
    */
   private summonKeyboardIfWanted(): void {
     if (!this.keyboardWanted || !this.touchDevice || !this.mobileKeyboardProxy) return;
-    if (this.keyboardVisible) return;
+    if (this.keyboardVisible) {
+      // Keyboard is already up: just re-establish proxy focus so its
+      // beforeinput/input listeners keep firing after surface churn (a
+      // destroy/recreate can leave the proxy unfocused). Do NOT do the full
+      // blur/refocus dance here — blurring would dismiss the keyboard.
+      if (document.activeElement !== this.mobileKeyboardProxy) {
+        this.focusMobileKeyboard();
+      }
+      return;
+    }
     // Refocus from scratch: iOS ignores focus() on an already-focused
     // element, and the earlier async attempt may have left the proxy
     // focused without a keyboard.
@@ -820,6 +838,16 @@ export class FrontendClient {
       case 'destroySurface':
         this.compositor.destroySurface(msg.surfaceId);
         this.resizableSurfaces.delete(msg.surfaceId);
+        // The destroyed surface may have held keyboard focus (window churn on
+        // mobile destroys a surface and recreates it under a new id). A stale
+        // focusedSurface silently swallows every keystroke and strands the
+        // keyboard proxy's forwarding target. Clear the stale focus and
+        // re-summon the proxy so typing keeps working on the new surface.
+        if (this.focusedSurface === msg.surfaceId) {
+          this.focusedSurface = undefined;
+          this.compositor.setFocusedSurface(undefined);
+          this.summonKeyboardIfWanted();
+        }
         break;
 
       case 'imageBlob':
@@ -2679,11 +2707,21 @@ export class FrontendClient {
       }
     }
 
-    if (!this.focusedSurface) return;
+    if (!this.focusedSurface) {
+      // Silent drop point: without a focused surface, keys go nowhere.
+      // Proxy-targeted events are exempt here — they are logged below.
+      if (!(this.mobileKeyboardProxy && e.target === this.mobileKeyboardProxy)) {
+        console.warn(`[frontend-client] ${type} dropped: no focused surface (target=${(e.target as HTMLElement)?.id || (e.target as HTMLElement)?.tagName})`);
+      }
+      return;
+    }
 
     // On mobile, the hidden proxy input handles keyboard events -- skip
     // the document-level handler to avoid sending duplicate characters.
-    if (this.mobileKeyboardProxy && e.target === this.mobileKeyboardProxy) return;
+    if (this.mobileKeyboardProxy && e.target === this.mobileKeyboardProxy) {
+      console.warn(`[frontend-client] ${type} delegated to mobile keyboard proxy (surfaceId=${this.focusedSurface})`);
+      return;
+    }
 
     // Let clipboard shortcuts through so browser fires paste/copy/cut events
     if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) {
