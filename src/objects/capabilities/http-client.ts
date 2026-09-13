@@ -6,6 +6,7 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, event } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
+import { ensure } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
 
 const log = new Log('HTTP');
@@ -706,8 +707,8 @@ export const HTTP_CLIENT_ID = 'abjects:http-client' as AbjectId;
 function buildExchange(caller: AbjectId, req: HttpRequest, res: HttpResponse, durationMs: number): HttpExchangeEvent {
   const reqBody = typeof req.body === 'string' ? req.body
     : req.body !== undefined ? JSON.stringify(req.body) : undefined;
-  const [reqBodyText, reqTruncated] = capBody(reqBody);
-  const [resBodyText, resTruncated] = capBody(res.body);
+  const [reqBodyText, reqTruncated] = capBody(reqBody, req.headers);
+  const [resBodyText, resTruncated] = capBody(res.body, res.headers);
   return {
     caller,
     request: {
@@ -756,33 +757,93 @@ function redactHeaders(headers?: Record<string, string>): Record<string, string>
 }
 
 /** Field-level scrub of body TEXT: the value of any JSON string field or
- *  form-encoded field whose NAME matches the secret stems is replaced. Plain
- *  regex over text - no JSON.parse on this path, ever. Pattern-based, so it
- *  catches named fields (access_token, client_secret, password), not a
- *  secret embedded in free text under an innocent name. Only string VALUES
- *  are rewritten: `"pin": 1234` or `"token": null` pass through as they
- *  did before.
+ *  form-encoded field whose NAME matches the secret stems is replaced. No
+ *  JSON.parse on this path, ever. Name-based, so it catches named fields
+ *  (access_token, client_secret, password), not a secret embedded in free
+ *  text under an innocent name. Only string VALUES are rewritten:
+ *  `"pin": 1234` or `"token": null` pass through.
  *
- *  Linear by construction: the patterns match EVERY string-key/string-value
- *  pair (and every form field) and the stem test happens in the replacer.
- *  Putting the stem alternation inside the key's character class made the
- *  engine backtrack across every split of a long value containing a stem
- *  word (seconds per 100 KB), and this runs synchronously on a shared pool
- *  worker. */
-const JSON_STRING_FIELD = /"((?:[^"\\]|\\.)*)"(\s*:\s*")(?:[^"\\]|\\.)*"/g;
-const FORM_FIELD = /(^|[&?])([^=&]*=)[^&]*/g;
-
-function redactBodyText(body: string): string {
-  return body
-    .replace(JSON_STRING_FIELD, (m, key: string, sep: string) =>
-      SECRET_NAME_STEM.test(key) ? `"${key}"${sep}REDACTED"` : m)
-    .replace(FORM_FIELD, (m, lead: string, name: string) =>
-      SECRET_NAME_STEM.test(name) ? `${lead}${name}REDACTED` : m);
+ *  Linear in the body length, whatever its shape. This runs synchronously on
+ *  a shared pool worker over bodies of any size, so a superlinear scrub
+ *  stalls every object co-located with HttpClient. */
+function redactBodyText(body: string, headers?: Record<string, string>): string {
+  const scrubbed = redactJsonStringFields(body);
+  return isFormEncoded(scrubbed, headers) ? redactFormFields(scrubbed) : scrubbed;
 }
 
-function capBody(body: string | undefined): [string | undefined, boolean] {
+const QUOTE = 0x22;
+const BACKSLASH = 0x5c;
+const COLON = 0x3a;
+
+/** One left-to-right pass over the unescaped quotes. Every quote is tried as
+ *  the opening of a key, so a stray quote in non-JSON text does not hide the
+ *  fields after it. Escaped quotes are never tried: a regex that retried
+ *  from each `\"` rescanned to the end of the enclosing string every time,
+ *  quadratic in bodies such as double-encoded JSON (seconds per 64 KB). */
+function redactJsonStringFields(body: string): string {
+  const parts: string[] = [];
+  let copied = 0;
+  // The last three unescaped quotes. With the next one they frame a candidate
+  // "key" : "value" pair: key is (q0, q1), value is (q2, next).
+  let q0 = -1;
+  let q1 = -1;
+  let q2 = -1;
+  let colonBetweenQ1Q2 = false;
+  for (let i = 0; i < body.length; i++) {
+    const c = body.charCodeAt(i);
+    if (c === BACKSLASH) { i++; continue; }
+    if (c !== QUOTE) continue;
+    if (q0 >= 0 && colonBetweenQ1Q2 && SECRET_NAME_STEM.test(body.slice(q0 + 1, q1))) {
+      parts.push(body.slice(copied, q2 + 1), 'REDACTED');
+      copied = i;
+    }
+    q0 = q1;
+    q1 = q2;
+    q2 = i;
+    colonBetweenQ1Q2 = q1 >= 0 && isKeyValueSeparator(body, q1 + 1, q2);
+  }
+  if (copied === 0) return body;
+  parts.push(body.slice(copied));
+  return parts.join('');
+}
+
+/** True when body[from, to) is JSON whitespace around exactly one colon.
+ *  Stops at the first other character, so each gap is walked at most once. */
+function isKeyValueSeparator(body: string, from: number, to: number): boolean {
+  let colon = false;
+  for (let i = from; i < to; i++) {
+    const c = body.charCodeAt(i);
+    if (c === COLON && !colon) colon = true;
+    else if (c !== 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) return false;
+  }
+  return colon;
+}
+
+/** Form fields are scrubbed only in form-encoded bodies. Run over JSON or
+ *  HTML, a `name=value` pattern stretches across the markup and replaces
+ *  everything up to the next `&`, truncating the recorded body. A body
+ *  counts as form-encoded when its content-type says so, or when it has the
+ *  shape: an `=`, and none of the characters encoding would have escaped. */
+function isFormEncoded(body: string, headers?: Record<string, string>): boolean {
+  const declared = Object.entries(headers ?? {}).some(([name, value]) =>
+    name.toLowerCase() === 'content-type' && /application\/x-www-form-urlencoded/i.test(value));
+  return declared || (body.includes('=') && !/[\s"<>{}[\]]/.test(body));
+}
+
+/** Anchored on `&` alone: each attempt scans one field, so the pass is linear.
+ *  Query strings are not body text; redactUrl covers those. */
+const FORM_FIELD = /(^|&)([^=&]*)=([^&]*)/g;
+
+function redactFormFields(body: string): string {
+  return body.replace(FORM_FIELD, (m, lead: string, name: string) =>
+    SECRET_NAME_STEM.test(name) ? `${lead}${name}=REDACTED` : m);
+}
+
+function capBody(body: string | undefined, headers?: Record<string, string>): [string | undefined, boolean] {
   if (body === undefined) return [undefined, false];
-  const scrubbed = redactBodyText(body);
-  if (scrubbed.length <= EXCHANGE_BODY_CAP) return [scrubbed, false];
-  return [scrubbed.slice(0, EXCHANGE_BODY_CAP), true];
+  const scrubbed = redactBodyText(body, headers);
+  const truncated = scrubbed.length > EXCHANGE_BODY_CAP;
+  const text = truncated ? scrubbed.slice(0, EXCHANGE_BODY_CAP) : scrubbed;
+  ensure(text.length <= EXCHANGE_BODY_CAP, 'recorded body text must fit the exchange cap');
+  return [text, truncated];
 }
