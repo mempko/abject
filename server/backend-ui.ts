@@ -3222,7 +3222,12 @@ IMPORTANT:
       this.setFocusedNode(undefined);
     }
 
-    // Keyboard routes to the selected node while one holds focus.
+    // Keyboard routes to the selected node while one holds focus. Node
+    // delivery is fire-and-forget (no consumption signal), so after
+    // forwarding to the focused node we FALL THROUGH to the normal surface
+    // routing below: otherwise an armed focusedNode (e.g. from an earlier
+    // tap on a canvas scene node) hijacks every keydown and silently starves
+    // the focused text widget (mobile keyboard shows but text never lands).
     if ((msg.inputType === 'keydown' || msg.inputType === 'keyup') && this.focusedNode) {
       this.deliverNodeEvent(this.focusedNode, {
         type: msg.inputType,
@@ -3232,7 +3237,6 @@ IMPORTANT:
         code: msg.code,
         modifiers: msg.modifiers,
       });
-      return;
     }
 
     const inputEvent: InputEvent = {
@@ -3317,6 +3321,10 @@ IMPORTANT:
         }
 
         await this.sendInputEvent(state.objectId, inputEvent);
+      } else {
+        // Unknown surface: make the silent drop observable instead of
+        // swallowing the event (e.g. stale surfaceId after a reconnect).
+        console.warn(`[backend-ui] input dropped: unknown surfaceId ${msg.surfaceId} (type=${msg.inputType}, key=${msg.key ?? ''})`);
       }
     }
   }
