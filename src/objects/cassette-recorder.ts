@@ -33,6 +33,7 @@
 import { AbjectId, AbjectMessage, TypeId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import { ensure, invariant, requirePositive } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { HttpExchangeEvent } from './capabilities/http-client.js';
 
@@ -76,10 +77,18 @@ export class CassetteRecorder extends Abject {
   /** typeIds whose in-memory list has been merged with what Storage held. */
   private merged = new Set<TypeId>();
   private flushTimers = new Map<TypeId, ReturnType<typeof setTimeout>>();
+  /** When each typeId's oldest unwritten exchange arrived. Bounds how long
+   *  steady traffic can hold a flush back. */
+  private unflushedSince = new Map<TypeId, number>();
   /** Single FIFO pump: exchanges append in arrival order regardless of how
    *  long identity resolution or the initial Storage load takes. */
   private pump: Promise<void> = Promise.resolve();
+  /** A flush waits for this much quiet after the latest exchange... */
   private readonly flushMs: number;
+  /** ...but never longer than this after the oldest unwritten one, so an
+   *  object polling faster than flushMs is still persisted, and a busy one
+   *  rewrites its list at most once per interval. */
+  private readonly flushMaxWaitMs: number;
   private storageRetryDelay: number;
 
   constructor(options: { flushMs?: number } = {}) {
@@ -101,7 +110,22 @@ export class CassetteRecorder extends Abject {
       },
     });
     this.flushMs = options.flushMs ?? 500;
+    requirePositive(this.flushMs, 'flushMs');
+    this.flushMaxWaitMs = this.flushMs * 10;
     this.storageRetryDelay = this.flushMs;
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    for (const [typeId, list] of this.byType) {
+      invariant(list.length <= PER_TYPE_CAP, `cassettes for ${typeId} must stay within the per-type cap`);
+    }
+    for (const typeId of this.flushTimers.keys()) {
+      invariant(this.byType.has(typeId), `a flush is only scheduled for a typeId with recordings (${typeId})`);
+    }
+    for (const typeId of this.merged) {
+      invariant(this.byType.has(typeId), `a merged typeId must hold a list (${typeId})`);
+    }
   }
 
   protected override async onInit(): Promise<void> {
@@ -131,6 +155,7 @@ export class CassetteRecorder extends Abject {
     });
     this.evict(list);
     this.scheduleFlush(typeId);
+    this.checkInvariants();
   }
 
   /** The first contact with Storage for a typeId merges what the store
@@ -157,6 +182,7 @@ export class CassetteRecorder extends Abject {
     this.evict(list);
     this.byType.set(typeId, list);
     this.merged.add(typeId);
+    this.checkInvariants();
   }
 
   /** Endpoint bucket: method + URL with the query stripped, so parameterized
@@ -199,19 +225,32 @@ export class CassetteRecorder extends Abject {
         if (n > maxN) { maxN = n; maxKey = key; }
       }
       const victim = list.findIndex(c => this.bucketKey(c) === maxKey);
-      if (victim < 0) break; // counts out of sync - never loop forever
+      ensure(victim >= 0, 'the largest bucket must have an entry in the list');
       counts.set(maxKey, maxN - 1);
       list.splice(victim, 1);
     }
+    ensure(list.length <= PER_TYPE_CAP, 'eviction must bring the list within the per-type cap');
   }
 
-  private scheduleFlush(typeId: TypeId, delayMs?: number): void {
+  /** New exchanges debounce the flush, up to flushMaxWaitMs after the oldest
+   *  unwritten one. Until the store has been merged (Storage unknown, or its
+   *  read failed) a backoff retry is already pending, and new exchanges leave
+   *  its delay alone rather than cut the backoff short. */
+  private scheduleFlush(typeId: TypeId): void {
+    const now = Date.now();
+    if (!this.unflushedSince.has(typeId)) this.unflushedSince.set(typeId, now);
+    if (!this.merged.has(typeId) && this.flushTimers.has(typeId)) return;
+    const deadline = this.unflushedSince.get(typeId)! + this.flushMaxWaitMs;
+    this.armFlush(typeId, Math.max(0, Math.min(this.flushMs, deadline - now)));
+  }
+
+  private armFlush(typeId: TypeId, delayMs: number): void {
     const existing = this.flushTimers.get(typeId);
     if (existing) clearTimeout(existing);
     this.flushTimers.set(typeId, setTimeout(() => {
       this.flushTimers.delete(typeId);
       void this.flush(typeId);
-    }, delayMs ?? this.flushMs));
+    }, delayMs));
   }
 
   private async flush(typeId: TypeId): Promise<void> {
@@ -223,21 +262,24 @@ export class CassetteRecorder extends Abject {
     if (!this.storageId) {
       // Nowhere to persist yet: keep the data in memory and back off
       // polling discoverDep('Storage') instead of spinning every 500ms.
-      this.scheduleFlush(typeId, this.storageRetryDelay);
+      this.armFlush(typeId, this.storageRetryDelay);
       this.storageRetryDelay = Math.min(this.storageRetryDelay * 2, 5000);
       return;
     }
     if (!this.merged.has(typeId)) {
       // Still waiting to merge existing store data
-      this.scheduleFlush(typeId, this.storageRetryDelay);
+      this.armFlush(typeId, this.storageRetryDelay);
       return;
     }
+    // Everything recorded so far rides this write; later exchanges start a
+    // fresh max-wait window.
+    this.unflushedSince.delete(typeId);
     try {
       await this.request(
         request(this.id, this.storageId, 'set', { key: `cassettes:${typeId}`, value: list }), 5000);
     } catch (err) {
       log.warn(`cassette flush failed for ${typeId}`, err);
-      this.scheduleFlush(typeId, this.flushMs);
+      this.armFlush(typeId, this.flushMs);
     }
   }
 }
