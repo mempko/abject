@@ -3127,14 +3127,6 @@ IMPORTANT:
   }
 
   private async handleFrontendInput(msg: InputMsg, clientId: string): Promise<void> {
-    // P4: log keyboard/paste input *receipt* (drops were already logged).
-    // Without this, a client that never sends (e.g. a silent client-side
-    // focusedSurface drop) is indistinguishable in abject.log from one whose
-    // events the backend mishandles. Mouse events are not logged: they flood.
-    if (msg.inputType === 'keydown' || msg.inputType === 'keyup' || msg.inputType === 'paste') {
-      log.info(`[backend-ui] input received: type=${msg.inputType} surface=${msg.surfaceId ?? '(none)'} key=${msg.key ?? ''} code=${(msg as { code?: string }).code ?? ''} clientId=${clientId}`);
-    }
-
     // Track last mouse position and client (global coords) for requestDrag
     if (msg.inputType === 'mousedown' || msg.inputType === 'mousemove') {
       const surfState = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
