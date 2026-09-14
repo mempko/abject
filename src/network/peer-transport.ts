@@ -218,6 +218,18 @@ export class PeerTransport extends Transport {
   async handleSdpAnswer(sdp: RTCSessionDescriptionInit): Promise<void> {
     precondition(this.peerConnection !== undefined, 'No peer connection');
 
+    // Stale-transport guard: an answer only applies while the offer it answers
+    // is still pending ('have-local-offer'). After resetForGlare() or a
+    // re-offer, the connection returns to 'stable' — an answer arriving then
+    // belongs to an abandoned offer cycle (the reconnect race that produced
+    // "Unexpected remote answer description in signaling state stable" at
+    // boot). Drop it instead of erroring; the live negotiation proceeds on
+    // its own path.
+    if (this.peerConnection!.signalingState !== 'have-local-offer') {
+      log.warn(`Ignoring stale SDP answer for ${this.remotePeerId.slice(0, 16)} (signaling state ${this.peerConnection!.signalingState}, expected have-local-offer)`);
+      return;
+    }
+
     const gen = this.offerGeneration;
 
     try {

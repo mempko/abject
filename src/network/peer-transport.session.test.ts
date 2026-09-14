@@ -161,3 +161,53 @@ test('stale prior-epoch traffic is rejected before chunk assembly or lease refre
   assert.deepEqual(transport.authenticatedSession, currentSession);
   await transport.disconnect();
 });
+
+class FakePeerConnection {
+  signalingState: RTCSignalingState;
+  remoteDescriptionCalls = 0;
+  oniceconnectionstatechange: unknown = null;
+  ondatachannel: unknown = null;
+  onicecandidate: unknown = null;
+  ontrack: unknown = null;
+
+  constructor(signalingState: RTCSignalingState) {
+    this.signalingState = signalingState;
+  }
+
+  async setRemoteDescription(): Promise<void> {
+    this.remoteDescriptionCalls++;
+  }
+
+  close(): void {}
+}
+
+(globalThis as any).RTCSessionDescription ??= class {
+  type: string;
+  sdp?: string;
+  constructor(init: { type: RTCSdpType; sdp?: string }) {
+    this.type = init.type;
+    this.sdp = init.sdp;
+  }
+};
+
+test('stale SDP answer while signaling state is stable is dropped, not thrown', async () => {
+  const { transport } = await harness();
+  const pc = new FakePeerConnection('stable');
+  transport.peerConnection = pc as unknown as RTCPeerConnection;
+
+  await transport.handleSdpAnswer({ type: 'answer', sdp: 'v=0' });
+
+  assert.equal(pc.remoteDescriptionCalls, 0);
+  transport.stopPing();
+});
+
+test('SDP answer while have-local-offer is still applied', async () => {
+  const { transport } = await harness();
+  const pc = new FakePeerConnection('have-local-offer');
+  transport.peerConnection = pc as unknown as RTCPeerConnection;
+
+  await transport.handleSdpAnswer({ type: 'answer', sdp: 'v=0' });
+
+  assert.equal(pc.remoteDescriptionCalls, 1);
+  transport.stopPing();
+});
