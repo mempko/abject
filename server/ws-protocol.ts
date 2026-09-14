@@ -559,6 +559,23 @@ export interface FontMetricsMsg extends WsEnvelope {
   metrics: Record<string, Record<string, number>>;
 }
 
+/** P3: client-side diagnostic report (silent input drop at a known gate). */
+export interface ClientDiagnosticMsg extends WsEnvelope {
+  type: 'clientDiagnostic';
+  /** Which drop gate fired, e.g. 'proxy-input', 'proxy-beforeinput', 'proxy-delta'. */
+  gate: string;
+  detail: string;
+}
+
+/** P6: client handshake — identifies which bundle is running. */
+export interface HelloMsg extends WsEnvelope {
+  type: 'hello';
+  client: {
+    bundle: string;
+    userAgent: string;
+  };
+}
+
 /**
  * Global keyboard shortcut intercept. The frontend pulls a small set of
  * known combos (currently ⌘K / Ctrl-K) out of the regular keydown stream
@@ -705,6 +722,8 @@ export type FrontendToBackendMsg =
   | ReadyMsg
   | DisplayResizedMsg
   | FontMetricsMsg
+  | ClientDiagnosticMsg
+  | HelloMsg
   | GlobalShortcutMsg
   | AudioEventMsg
   | VideoEventMsg

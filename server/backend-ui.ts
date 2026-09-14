@@ -20,6 +20,8 @@ import type {
   BackendToFrontendMsg,
   FrontendToBackendMsg,
   FontMetricsMsg,
+  ClientDiagnosticMsg,
+  HelloMsg,
   InputMsg,
   EndWindowDragMsg,
   FileUploadMsg,
@@ -2176,6 +2178,10 @@ IMPORTANT:
     }
 
     if (this.focusedNode?.surfaceId === surfaceId) this.focusedNode = undefined;
+    // P2: the focused *surface* must also be cleared when the destroyed
+    // surface was focused — otherwise the backend keeps routing keyboard
+    // input to a surface that no longer exists (silent drop on the client).
+    if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
     for (const log of state.drawLogs.values()) this.releaseBlobs(this.blobHashesIn(log));
     this.surfaces.delete(surfaceId);
 
@@ -3059,6 +3065,23 @@ IMPORTANT:
       case 'surfaceCreated':
         // Acknowledgment from frontend -- no action needed
         break;
+
+      case 'clientDiagnostic': {
+        // P3: the client's console never crosses the wire, so silent client-side
+        // drops (e.g. typed characters discarded at the proxy gates) were
+        // invisible in abject.log. Log them here so deployment debugging works.
+        const d = msg as ClientDiagnosticMsg;
+        log.warn(`[backend-ui] clientDiagnostic: gate=${d.gate} detail=${d.detail} clientId=${clientId}`);
+        break;
+      }
+
+      case 'hello': {
+        // P6: record which bundle the client is actually running, so a stale
+        // cached index.html after a deploy is distinguishable in the log.
+        const h = msg as HelloMsg;
+        log.info(`[backend-ui] client hello: bundle=${h.client?.bundle ?? 'unknown'} ua=${h.client?.userAgent ?? 'unknown'} clientId=${clientId}`);
+        break;
+      }
     }
   }
 
@@ -3104,6 +3127,14 @@ IMPORTANT:
   }
 
   private async handleFrontendInput(msg: InputMsg, clientId: string): Promise<void> {
+    // P4: log keyboard/paste input *receipt* (drops were already logged).
+    // Without this, a client that never sends (e.g. a silent client-side
+    // focusedSurface drop) is indistinguishable in abject.log from one whose
+    // events the backend mishandles. Mouse events are not logged: they flood.
+    if (msg.inputType === 'keydown' || msg.inputType === 'keyup' || msg.inputType === 'paste') {
+      log.info(`[backend-ui] input received: type=${msg.inputType} surface=${msg.surfaceId ?? '(none)'} key=${msg.key ?? ''} code=${(msg as { code?: string }).code ?? ''} clientId=${clientId}`);
+    }
+
     // Track last mouse position and client (global coords) for requestDrag
     if (msg.inputType === 'mousedown' || msg.inputType === 'mousemove') {
       const surfState = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;

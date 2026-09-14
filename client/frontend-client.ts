@@ -6,6 +6,24 @@
  * Handles measureText and displayInfo requests locally.
  */
 
+/**
+ * P6: identity of the deployed client bundle. Vite fingerprints the entry
+ * script (index-<hash>.js); that hash identifies exactly which bundle is
+ * running, so sessions can be matched against server logs and a stale
+ * cached page becomes visible.
+ */
+const CLIENT_BUNDLE_ID: string = (() => {
+  try {
+    for (const script of Array.from(document.querySelectorAll('script[src]'))) {
+      const m = (script.getAttribute('src') ?? '').match(/index-([A-Za-z0-9_-]+)\.js/);
+      if (m) return m[1];
+    }
+  } catch {
+    // DOM not available or query failed — fall through to unknown.
+  }
+  return 'unknown';
+})();
+
 import { Compositor, DrawCommand, MobileViewState } from '../src/ui/compositor.js';
 import type { SceneOp, SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AbjectId } from '../src/core/types.js';
@@ -75,6 +93,18 @@ export class FrontendClient {
   /** Draw commands waiting on a blob that wasn't cached (evicted or raced). */
   private pendingBlobDraws: Map<string, DrawCommand[]> = new Map();
   private focusedSurface?: string;
+  /**
+   * P1: set when the focused surface is destroyed by churn, with the owning
+   * object id of the destroyed surface. The next createSurface for the same
+   * object (the reminted replacement) is adopted as the new forwarding
+   * target within FOCUS_ADOPTION_WINDOW_MS.
+   */
+  private focusedDestroyedAt = 0;
+  private focusedDestroyedObjectId?: string;
+  /** P1: how long after a focused-surface destroy a replacement may be adopted. */
+  private static readonly FOCUS_ADOPTION_WINDOW_MS = 10_000;
+  /** P3: last clientDiagnostic send per gate, for per-gate rate limiting. */
+  private lastDiagnosticAt: Record<string, number> = {};
   private grabbedSurface?: string;
   /** Currently hovered 3D scene node (mesh), for enter/leave synthesis. */
   private hoveredNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
@@ -265,6 +295,7 @@ export class FrontendClient {
     proxy.addEventListener('input', () => {
       if (!this.focusedSurface) {
         console.warn('[frontend-client] mobile proxy input dropped: no focused surface');
+        this.sendDiagnostic('proxy-input', 'proxy input dropped: no focused surface');
         return;
       }
       this.sendProxyDelta(proxy);
@@ -279,6 +310,7 @@ export class FrontendClient {
     proxy.addEventListener('beforeinput', (e: InputEvent) => {
       if (!this.focusedSurface) {
         console.warn(`[frontend-client] mobile proxy beforeinput (${e.inputType}) dropped: no focused surface`);
+        this.sendDiagnostic('proxy-beforeinput', `beforeinput ${e.inputType} dropped: no focused surface`);
         return;
       }
 
@@ -371,6 +403,20 @@ export class FrontendClient {
     this.proxySentValue = proxy.value;
   }
 
+  /**
+   * P6: tell the backend which client bundle this session runs. Sent on the
+   * post-auth path as a 'hello' handshake carrying the bundle identity.
+   */
+  private sendBundleIdentity(): void {
+    this.sendRaw({
+      type: 'hello',
+      client: {
+        bundle: CLIENT_BUNDLE_ID,
+        userAgent: navigator.userAgent,
+      },
+    });
+  }
+
   /** Flush any remaining text in the proxy input (after composition ends,
    *  on blur, or when the keyboard is dismissed). */
   private flushProxyInput(proxy: HTMLInputElement): void {
@@ -386,7 +432,10 @@ export class FrontendClient {
     // Update the forwarded baseline ONLY when the delta is actually
     // delivered: absorbing it before the focusedSurface gate silently
     // swallowed typed text whenever no surface held focus.
-    if (!this.focusedSurface) return;
+    if (!this.focusedSurface) {
+      this.sendDiagnostic('proxy-delta', `proxy delta dropped: no focused surface (len ${proxy.value.length})`);
+      return;
+    }
     this.proxySentValue = proxy.value;
     for (let i = 0; i < delta.backspaces; i++) {
       this.sendSpecialKey('Backspace', 'Backspace');
@@ -420,6 +469,18 @@ export class FrontendClient {
       code,
       modifiers: { shift: false, ctrl: false, alt: false, meta: false },
     } as FrontendToBackendMsg);
+  }
+
+  /**
+   * P3: report a silent client-side drop to the backend as a clientDiagnostic
+   * message so it lands in the server log — the browser console never crosses
+   * the wire. Rate-limited to one message per gate per second.
+   */
+  private sendDiagnostic(gate: string, detail: string): void {
+    const now = Date.now();
+    if (now - (this.lastDiagnosticAt[gate] ?? 0) < 1000) return;
+    this.lastDiagnosticAt[gate] = now;
+    this.sendRaw({ type: 'clientDiagnostic', gate, detail });
   }
 
   /**
@@ -808,6 +869,10 @@ export class FrontendClient {
    * render frame has wrong glyph widths / visually different font weight.
    */
   private sendFontMetricsWhenReady(): void {
+    // P6: report which client bundle this session runs so server logs can
+    // attribute sessions to a deployed bundle (and a stale cached page is
+    // visible in the log).
+    this.sendBundleIdentity();
     document.fonts.ready.then(() => {
       this.sendFontMetrics();
       this.sendRaw({ type: 'ready' });
@@ -835,7 +900,12 @@ export class FrontendClient {
         this.handleCreateSurface(msg as CreateSurfaceMsg);
         break;
 
-      case 'destroySurface':
+      case 'destroySurface': {
+        // P1: capture the destroyed surface's owning object BEFORE the
+        // compositor drops it, so the reminted replacement surface (same
+        // object, new id) can be adopted as the new forwarding target in
+        // handleCreateSurface.
+        const destroyedObjectId = this.compositor.getSurface(msg.surfaceId)?.objectId;
         this.compositor.destroySurface(msg.surfaceId);
         this.resizableSurfaces.delete(msg.surfaceId);
         // The destroyed surface may have held keyboard focus (window churn on
@@ -845,10 +915,13 @@ export class FrontendClient {
         // re-summon the proxy so typing keeps working on the new surface.
         if (this.focusedSurface === msg.surfaceId) {
           this.focusedSurface = undefined;
+          this.focusedDestroyedAt = Date.now();
+          this.focusedDestroyedObjectId = destroyedObjectId;
           this.compositor.setFocusedSurface(undefined);
           this.summonKeyboardIfWanted();
         }
         break;
+      }
 
       case 'imageBlob':
         this.handleImageBlob(msg as ImageBlobMsg);
@@ -1671,6 +1744,21 @@ export class FrontendClient {
       msg.closable ?? true,
     );
 
+    // P1: if the focused surface was recently destroyed by churn, adopt this
+    // reminted surface (same owning object, new id) as the forwarding target
+    // so proxy keystrokes keep flowing without requiring a fresh tap.
+    if (
+      !this.focusedSurface &&
+      this.focusedDestroyedObjectId !== undefined &&
+      this.focusedDestroyedObjectId === (msg.objectId as string) &&
+      Date.now() - this.focusedDestroyedAt < FrontendClient.FOCUS_ADOPTION_WINDOW_MS
+    ) {
+      this.focusedSurface = msg.surfaceId;
+      this.focusedDestroyedObjectId = undefined;
+      this.compositor.setFocusedSurface(msg.surfaceId);
+      this.sendDiagnostic('focus-adopted', `adopted reminted surface ${msg.surfaceId} as forwarding target after churn`);
+    }
+
     this.sendToBackend({
       type: 'surfaceCreated',
       surfaceId: msg.surfaceId,
@@ -2149,6 +2237,16 @@ export class FrontendClient {
       case 'content':
         this.handleTouchEvent(touch, 'mouseup');
         if (isTap) {
+          // P5: a tap on content must (re-)establish the forwarding target.
+          // After surface churn focusedSurface can be undefined even though
+          // the tap landed on a live surface; set it before anything else so
+          // the keyboard proxy has a target when input arrives.
+          const tapped = this.compositor.surfaceAt(cx, cy);
+          if (tapped && this.focusedSurface !== tapped.id) {
+            this.focusedSurface = tapped.id;
+            this.compositor.setFocusedSurface(tapped.id);
+            this.sendDiagnostic('tap-refocus', `tap set forwarding target to surface ${tapped.id}`);
+          }
           this.summonKeyboardIfWanted();
           this.maybeDoubleTap(cx, cy);
         }
