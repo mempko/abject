@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.10.3",
+    "date": "2026-09-14",
+    "title": "Typing that lands, traffic that remembers",
+    "summary": "Mobile typing on Android Chrome now arrives reliably, and every object's HTTP traffic is recorded as redacted cassettes you can replay and inspect.",
+    "highlights": [
+      "HTTP cassettes: each user-created object's HTTP exchanges are recorded by a new CassetteRecorder, keyed by the object's typeId and spawned permanently at boot (worker-eligible).",
+      "Exchanges are redacted before they leave the HTTP client, sent straight to the recorder, and skip the LLM at the source; redaction is linear and form-scoped so large bodies stay cheap.",
+      "Mobile typing on Android Chrome no longer drops characters: IME and autocorrect text is delivered through proxy value deltas, and the keyboard proxy keeps focus during surface churn.",
+      "The dock and toasts never steal keyboard focus (new focusOnCreate option for windows).",
+      "The default Peer Network window is wider so all six tabs fit."
+    ],
+    "fixes": [
+      "Keydown events delivered to a scene node now fall through to surface routing instead of being swallowed.",
+      "Cassette flush deferral is bounded by a max-wait window so recordings cannot be postponed indefinitely.",
+      "Redaction of HTTP exchange bodies is linear-time and limited to form fields, fixing slow or over-broad scrubbing."
+    ]
+  },
+  {
     "version": "0.10.2",
     "date": "2026-09-12",
     "title": "Your desktop, reachable from a browser",
