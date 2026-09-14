@@ -9,9 +9,9 @@
     "favicons": "bash tools/gen-favicons.sh"
   },
   "dependencies": {
-    "astro": "^5.5.0"
+    "astro": "^5.18.2"
   },
   "devDependencies": {
-    "@astrojs/sitemap": "^3.7.2"
+    "@astrojs/sitemap": "^3.7.4"
   }
 }
