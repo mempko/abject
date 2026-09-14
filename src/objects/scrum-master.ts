@@ -2729,7 +2729,8 @@ function renderRun(label: string, run?: VerificationRunLike): string {
   const tests = t && (t.tests !== undefined || t.passed !== undefined)
     ? `; tests ${t.passed ?? '?'} passed of ${t.tests ?? '?'}${t.failed ? `, ${t.failed} failed` : ''}`
     : run.failureCount ? `; ${run.failureCount} failure(s) reported` : '';
-  return `${label}: \`${run.command}\` exit ${run.exitCode} at ${new Date(run.at).toISOString()}${tests}`;
+  const at = Number.isFinite(run.at) ? new Date(run.at).toISOString() : 'unknown time';
+  return `${label}: \`${run.command}\` exit ${run.exitCode} at ${at}${tests}`;
 }
 
 export function renderVerificationRecord(record: VerificationRecordEntry[]): string {

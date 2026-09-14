@@ -1842,7 +1842,7 @@ clean result I did not observe.`;
     const run = (v?: CheckVerdict): VerificationRun | undefined => v ? {
       command: v.outcome.command,
       exitCode: v.outcome.exitCode,
-      at: v.outcome.at,
+      at: Number.isFinite(v.outcome.at) ? v.outcome.at : Date.now(),
       passed: v.passed,
       testSummary: v.outcome.testSummary,
       failureCount: v.outcome.failureCount,
