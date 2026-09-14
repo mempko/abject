@@ -280,6 +280,8 @@ export class NotificationCenter extends Abject {
           transparent: true,
           resizable: false,
           zIndex: 10000,
+          // Toasts appear unprompted; taking focus would steal typing.
+          focusOnCreate: false,
         }),
       );
     } catch {

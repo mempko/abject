@@ -210,6 +210,7 @@ export class WidgetManager extends Abject {
                   { name: 'chromeless', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, no title bar', optional: true },
                   { name: 'resizable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, window is resizable', optional: true },
                   { name: 'closable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the mobile card overview cannot close this window (default true)', optional: true },
+                  { name: 'focusOnCreate', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the new window does not take keyboard focus (default true). Use for docks and chrome that rebuild in the background.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -633,7 +634,7 @@ export class WidgetManager extends Abject {
 
     // Direct factory: create window, return AbjectId (not shim string)
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex, chromeless, transparent, resizable, draggable, closable } = msg.payload as {
+      const { title, rect, zIndex, chromeless, transparent, resizable, draggable, closable, focusOnCreate } = msg.payload as {
         title: string;
         rect: { x: number; y: number; width?: number; height?: number; w?: number; h?: number };
         zIndex?: number;
@@ -642,8 +643,9 @@ export class WidgetManager extends Abject {
         resizable?: boolean;
         draggable?: boolean;
         closable?: boolean;
+        focusOnCreate?: boolean;
       };
-      return this.createWindowDirect(msg.routing.from, title, this.normalizeWindowRect(rect), { chromeless, transparent, resizable, draggable, zIndex, closable });
+      return this.createWindowDirect(msg.routing.from, title, this.normalizeWindowRect(rect), { chromeless, transparent, resizable, draggable, zIndex, closable, focusOnCreate });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)

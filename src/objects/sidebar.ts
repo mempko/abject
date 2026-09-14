@@ -213,6 +213,11 @@ click handling.
           chromeless: true,
           draggable: false,
           closable: false,
+          // The dock rebuilds on every viewport resize and client connect
+          // (including a phone keyboard opening). Focus is global across
+          // clients, so taking it here stole keyboard input from whatever
+          // window the user was typing into, on every connected client.
+          focusOnCreate: false,
         })
       );
 
