@@ -349,16 +349,16 @@ export class ScrumMaster extends Abject {
       }),
     ).catch(err => log.warn(`registerAgent failed: ${err instanceof Error ? err.message : String(err)}`));
 
-    this.recoveryTimer = setInterval(() => { void this.recoverDispatches().catch(err => log.warn(`Dispatch recovery: ${String(err)}`)); }, 10000);
+    this.recoveryTimer = this.setRecurringTimer(() => { void this.recoverDispatches().catch(err => log.warn(`Dispatch recovery: ${String(err)}`)); }, 10000);
     this.recoveryTimer.unref?.();
     log.info('Initialized; registered as Agent and subscribed to GoalManager events');
   }
 
   protected override async onStop(): Promise<void> {
-    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
-    for (const timer of this.scrumRetryTimers) clearTimeout(timer);
+    if (this.recoveryTimer) this.cancelTimer(this.recoveryTimer);
+    for (const timer of this.scrumRetryTimers) this.cancelTimer(timer);
     this.scrumRetryTimers.clear();
-    for (const timer of this.interjectionTimers.values()) clearTimeout(timer);
+    for (const timer of this.interjectionTimers.values()) this.cancelTimer(timer);
     this.interjectionTimers.clear();
     await super.onStop();
   }
@@ -385,7 +385,7 @@ export class ScrumMaster extends Abject {
         if (parentId) return; // only top-level goals
         try { if (await this.isRemoteGoal(goalId)) { log.info(`ignoring remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
         // Defer one tick so the creator (e.g. Chat) has time to settle.
-        setTimeout(() => this.enqueueScrumTask(goalId, 0).catch(err =>
+        this.setTimer(() => this.enqueueScrumTask(goalId, 0).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         ), 200);
       } else if (aspect === 'goalReadyForCompletion') {
@@ -451,7 +451,7 @@ export class ScrumMaster extends Abject {
         this.forceFullScrum.delete(goalId);
         const interjectionTimer = this.interjectionTimers.get(goalId);
         if (interjectionTimer) {
-          clearTimeout(interjectionTimer);
+          this.cancelTimer(interjectionTimer);
           this.interjectionTimers.delete(goalId);
         }
       } else if (aspect === 'taskCompleted') {
@@ -604,8 +604,8 @@ export class ScrumMaster extends Abject {
       if(!taskId)return;
       const pending=this.pendingTickets.get(taskId);
       for (const entry of pending?[pending]:[]) {
-        clearTimeout(entry.timer);
-        entry.timer = setTimeout(() => {
+        this.cancelTimer(entry.timer);
+        entry.timer = this.setTimer(() => {
           // Re-arm timeout — only fires if NO further progress lands.
           // Same handler logic as initial timer.
           entry.reject(new Error('Task timed out (no progress)'));
@@ -621,7 +621,7 @@ export class ScrumMaster extends Abject {
     const early=this.takeTaskResult<any>(ticketId);
     if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer = this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -632,7 +632,7 @@ export class ScrumMaster extends Abject {
       this.pendingTickets.set(ticketId, {
         timer,
         resolve: (payload: unknown) => {
-          clearTimeout(timer);
+          this.cancelTimer(timer);
           this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
@@ -643,7 +643,7 @@ export class ScrumMaster extends Abject {
           });
         },
         reject: (err: Error) => {
-          clearTimeout(timer);
+          this.cancelTimer(timer);
           this.pendingTickets.delete(ticketId);
           reject(err);
         },
@@ -754,7 +754,7 @@ export class ScrumMaster extends Abject {
     }
     const delay = ScrumMaster.SCRUM_RETRY_BASE_MS * 2 ** (attempt - 1);
     log.info(`Scrum for goal ${goalId.slice(0, 8)} round ${priorScrumNumber} died (attempt ${attempt}: ${(error ?? 'unknown').slice(0, 120)}) — retrying in ${Math.round(delay / 1000)}s`);
-    const timer = setTimeout(() => {
+    const timer = this.setTimer(() => {
       this.scrumRetryTimers.delete(timer);
       void this.retryScrum(goalId, priorScrumNumber, attempt + 1);
     }, delay);
@@ -778,7 +778,7 @@ export class ScrumMaster extends Abject {
     } catch { /* GoalManager unreachable — fall through to reschedule */ }
 
     if (status === 'paused' || status === undefined) {
-      const timer = setTimeout(() => {
+      const timer = this.setTimer(() => {
         this.scrumRetryTimers.delete(timer);
         void this.retryScrum(goalId, priorScrumNumber, attempt);
       }, 30_000);
@@ -824,8 +824,8 @@ export class ScrumMaster extends Abject {
   /** Debounced entry point from the goalInterjection event. */
   private scheduleInterjectionCheck(goalId: string, delayMs = ScrumMaster.INTERJECTION_DEBOUNCE_MS): void {
     const existing = this.interjectionTimers.get(goalId);
-    if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => {
+    if (existing) this.cancelTimer(existing);
+    const timer = this.setTimer(() => {
       this.interjectionTimers.delete(goalId);
       void this.runInterjectionCheck(goalId).catch(err =>
         log.warn(`interjection check for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),

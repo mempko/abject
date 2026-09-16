@@ -1090,7 +1090,7 @@ export class LLMObject extends Abject {
       // hops), which killed every ask whose LLM synthesis ran past ~29s.
       const KEEPALIVE_MS = 10000;
       let lastChunkAt = start;
-      const keepaliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
+      const keepaliveTimer: ReturnType<typeof setInterval> = this.setRecurringTimer(() => {
         const sinceChunk = Date.now() - lastChunkAt;
         // Skip keepalive if a chunk arrived within the last interval —
         // chunks already reset upstream timers, so the keepalive is redundant
@@ -1134,7 +1134,7 @@ export class LLMObject extends Abject {
         this.trackRequestError(correlationId, errMsg);
         throw err;
       } finally {
-        clearInterval(keepaliveTimer);
+        this.cancelTimer(keepaliveTimer);
       }
 
       const elapsed = Date.now() - start;
@@ -1608,7 +1608,7 @@ export class LLMObject extends Abject {
       const KEEPALIVE_MS = 10000;
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     if (callerId) {
-      keepaliveTimer = setInterval(() => {
+      keepaliveTimer = this.setRecurringTimer(() => {
         this.send(
           event(this.id, callerId, 'progress', {
             phase: 'llm-waiting', taskId: options?.cacheKey,
@@ -1631,7 +1631,7 @@ export class LLMObject extends Abject {
       if (callerId) this.trackRequestError(trackId, errMsg);
       throw err;
     } finally {
-      if (keepaliveTimer) clearInterval(keepaliveTimer);
+      if (keepaliveTimer) this.cancelTimer(keepaliveTimer);
     }
   }
 
@@ -2496,7 +2496,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
   private scheduleLedgerSave(): void {
     if (this.ledgerSaveTimer || !this.storageId) return;
-    this.ledgerSaveTimer = setTimeout(() => {
+    this.ledgerSaveTimer = this.setTimer(() => {
       this.ledgerSaveTimer = undefined;
       this.saveLedger().catch(err => log.warn('Failed to persist LLM ledger:', err));
     }, LLMObject.LEDGER_SAVE_DEBOUNCE_MS);
@@ -3142,9 +3142,9 @@ Only output the code, no explanations. Use proper formatting and comments.`;
    * hung ping cannot pile up successors.
    */
   private scheduleWarmPing(entry: WarmEntry): void {
-    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    if (entry.timer !== undefined) this.cancelTimer(entry.timer);
     const delay = Math.max(entry.lastWarmAt + entry.policy.tauMs - Date.now(), 1000);
-    entry.timer = setTimeout(() => {
+    entry.timer = this.setTimer(() => {
       entry.timer = undefined;
       void this.warmPingTick(entry);
     }, delay);
@@ -3243,7 +3243,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
   private dropWarmEntry(entry: WarmEntry, reason: string, quiet = false): void {
     if (entry.timer !== undefined) {
-      clearTimeout(entry.timer);
+      this.cancelTimer(entry.timer);
       entry.timer = undefined;
     }
     const idx = this.warmEntries.indexOf(entry);
@@ -3296,7 +3296,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     // without this they outlive the runtime that spawned them.
     await this.shutdownCliProviders();
     if (this.ledgerSaveTimer) {
-      clearTimeout(this.ledgerSaveTimer);
+      this.cancelTimer(this.ledgerSaveTimer);
       this.ledgerSaveTimer = undefined;
     }
     // Flush rather than losing up to a debounce window of recorded calls.

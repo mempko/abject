@@ -195,7 +195,7 @@ pane shows details, configuration, and actions for the selected skill.
         await this.saveSkillConfig();
         // Flash button text as confirmation
         await this.request(request(this.id, this.saveConfigBtnId, 'update', { text: 'Saved!' }));
-        setTimeout(() => {
+        this.setTimer(() => {
           if (this.saveConfigBtnId) {
             this.send(request(this.id, this.saveConfigBtnId, 'update', { text: 'Save Config' }));
           }

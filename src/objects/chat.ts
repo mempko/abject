@@ -1750,7 +1750,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     // Flush any pending history persist before the window goes away
     if (this.persistTimer) {
-      clearTimeout(this.persistTimer);
+      this.cancelTimer(this.persistTimer);
       this.persistTimer = undefined;
       void this.persistHistory();
     }
@@ -1781,11 +1781,11 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.welcomeWidgetIds = [];
     this._streamBuffer = '';
     if (this.activityRefreshTimer) {
-      clearTimeout(this.activityRefreshTimer);
+      this.cancelTimer(this.activityRefreshTimer);
       this.activityRefreshTimer = undefined;
     }
     if (this.reflowTimer) {
-      clearTimeout(this.reflowTimer);
+      this.cancelTimer(this.reflowTimer);
       this.reflowTimer = undefined;
     }
     this.changed('visibility', false);
@@ -1802,7 +1802,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private notifyRectChanged(): void {
     if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
     if (this.rectPersistTimer) return;
-    this.rectPersistTimer = setTimeout(() => {
+    this.rectPersistTimer = this.setTimer(() => {
       this.rectPersistTimer = undefined;
       if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
       this.send(event(this.id, this.chatManagerId, 'rectChanged', {
@@ -1815,7 +1815,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private schedulePersist(): void {
     if (!this.conversationId || !this.storageId) return;
     if (this.persistTimer) return;
-    this.persistTimer = setTimeout(() => {
+    this.persistTimer = this.setTimer(() => {
       this.persistTimer = undefined;
       void this.persistHistory();
     }, 200);
@@ -2744,7 +2744,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    */
   private scheduleActivityRefresh(): void {
     if (this.activityRefreshTimer) return;
-    this.activityRefreshTimer = setTimeout(() => {
+    this.activityRefreshTimer = this.setTimer(() => {
       this.activityRefreshTimer = undefined;
       this.refreshActivityBubble().catch(() => { /* widget gone */ });
     }, 120);
@@ -2771,7 +2771,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private async removeActivityBubble(): Promise<void> {
     if (this.activityRefreshTimer) {
-      clearTimeout(this.activityRefreshTimer);
+      this.cancelTimer(this.activityRefreshTimer);
       this.activityRefreshTimer = undefined;
     }
     if (!this.activityBubbleLabelId) return;
@@ -2803,7 +2803,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   /** Debounce resize-driven reflow so rapid drag events collapse into one pass. */
   private scheduleReflow(): void {
     if (this.reflowTimer) return;
-    this.reflowTimer = setTimeout(() => {
+    this.reflowTimer = this.setTimer(() => {
       this.reflowTimer = undefined;
       this.reflowAllBubbles().catch(() => { /* window may be gone */ });
     }, 140);

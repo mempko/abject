@@ -328,11 +328,11 @@ When asked about a task, describe which objects you would message and what you w
       // agentObserve / agentAct event fires, so the inactivity timer would
       // reject our pending tickets even though work is genuinely happening.
       // Heartbeat the timeouts every 60s while the action is in flight.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
+      const heartbeat = this.setRecurringTimer(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
       try {
         return await this.handleAct(taskId, action);
       } finally {
-        clearInterval(heartbeat);
+        this.cancelTimer(heartbeat);
       }
     });
 
@@ -711,8 +711,8 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
     if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
       if (ticketId !== taskId) continue;
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
+      this.cancelTimer(entry.timer);
+      entry.timer = this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(
@@ -728,7 +728,7 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
     const early=this.takeTaskResult<any>(ticketId);
     if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
+      const makeTimer = () => this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(
@@ -742,7 +742,7 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
         timer: makeTimer(),
         timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
@@ -753,7 +753,7 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY 
           });
         },
         reject: (err: Error) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           reject(err);
         },

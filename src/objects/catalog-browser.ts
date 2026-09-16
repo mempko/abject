@@ -740,7 +740,7 @@ Browse and install skills and MCP servers from public registries.
   private async flashInstallStatus(text: string): Promise<void> {
     if (!this.detailInstallBtnId) return;
     await this.request(request(this.id, this.detailInstallBtnId, 'update', { text }));
-    setTimeout(() => {
+    this.setTimer(() => {
       if (this.detailInstallBtnId) {
         this.send(request(this.id, this.detailInstallBtnId, 'update', { text: 'Install' }));
       }

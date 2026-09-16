@@ -562,7 +562,7 @@ export class SharedState extends Abject {
     }
 
     // Phase 4: Anti-entropy — every 30s, pick one random remote peer and exchange state digests
-    this.antiEntropyTimer = setInterval(() => {
+    this.antiEntropyTimer = this.setRecurringTimer(() => {
       this.antiEntropyExchange();
     }, ANTI_ENTROPY_INTERVAL);
 
@@ -596,8 +596,8 @@ export class SharedState extends Abject {
   }
 
   private scheduleDiscovery(): void {
-    if (this.discoveryTimer) clearTimeout(this.discoveryTimer);
-    this.discoveryTimer = setTimeout(() => {
+    if (this.discoveryTimer) this.cancelTimer(this.discoveryTimer);
+    this.discoveryTimer = this.setTimer(() => {
       this.discoveryTimer = undefined;
       this.discoverRemoteSharedStates().catch(err => {
         log.warn('discovery failed:', err);

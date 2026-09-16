@@ -2021,11 +2021,11 @@ clean result I did not observe.`;
       const { taskId, action } = msg.payload as { taskId: string; action: AgentAction };
       // A verify can legitimately run for many minutes; without a heartbeat the
       // pending ticket would time out while real work is happening.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 30_000);
+      const heartbeat = this.setRecurringTimer(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 30_000);
       try {
         return await this.operationTask.run(taskId, () => this.handleAct(taskId, action));
       } finally {
-        clearInterval(heartbeat);
+        this.cancelTimer(heartbeat);
       }
     });
 
@@ -2535,8 +2535,8 @@ Report in your done result: what changed, which command proved it, and anything 
     if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
       if (ticketId !== taskId) continue;
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
+      this.cancelTimer(entry.timer);
+      entry.timer = this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -2554,7 +2554,7 @@ Report in your done result: what changed, which command proved it, and anything 
     if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
       const entry = {
-        timer: setTimeout(() => {
+        timer: this.setTimer(() => {
           this.pendingTickets.delete(ticketId);
           if (this.agentAbjectId) {
             this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -2563,7 +2563,7 @@ Report in your done result: what changed, which command proved it, and anything 
         }, timeout),
         timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           const p = payload as {
             success?: boolean; result?: unknown; error?: string;
@@ -2576,7 +2576,7 @@ Report in your done result: what changed, which command proved it, and anything 
           });
         },
         reject: (err: Error) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           reject(err);
         },

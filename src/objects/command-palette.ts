@@ -339,7 +339,7 @@ export class CommandPaletteAbject extends Abject {
   private scheduleRebuild(): void {
     if (this.rebuildScheduled) return;
     this.rebuildScheduled = true;
-    setTimeout(async () => {
+    this.setTimer(async () => {
       this.rebuildScheduled = false;
       await this.rebuildResults();
     }, 30);

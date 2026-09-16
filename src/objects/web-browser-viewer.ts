@@ -274,7 +274,7 @@ export class WebBrowserViewer extends Abject {
         return { completed: true, reason: 'the user is already in control' };
       }
 
-      const timer = setTimeout(() => {
+      const timer = this.setTimer(() => {
         void this.resolveHandoff(false, 'timeout: the user did not respond in time');
       }, timeoutMs ?? HANDOFF_DEFAULT_TIMEOUT_MS);
       this.pendingHandoff = { msg, pageId, reason, timer, resolveOn: resolveOn ?? 'handback' };
@@ -707,7 +707,7 @@ export class WebBrowserViewer extends Abject {
     const handoff = this.pendingHandoff;
     if (!handoff) return;
     this.pendingHandoff = undefined;
-    clearTimeout(handoff.timer);
+    this.cancelTimer(handoff.timer);
     try {
       this.sendDeferredReply(handoff.msg, { completed, ...(reason ? { reason } : {}) });
     } catch { /* requester gone */ }
@@ -893,12 +893,12 @@ export class WebBrowserViewer extends Abject {
 
     if (discrete) {
       if (this.flushTimer) {
-        clearTimeout(this.flushTimer);
+        this.cancelTimer(this.flushTimer);
         this.flushTimer = undefined;
       }
       void this.flushEvents();
     } else if (!this.flushTimer) {
-      this.flushTimer = setTimeout(() => {
+      this.flushTimer = this.setTimer(() => {
         this.flushTimer = undefined;
         void this.flushEvents();
       }, FLUSH_INTERVAL_MS);
@@ -947,7 +947,7 @@ export class WebBrowserViewer extends Abject {
     this.pendingEvents = [];
     this.mouseButtonsDown.clear();
     if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
+      this.cancelTimer(this.flushTimer);
       this.flushTimer = undefined;
     }
   }

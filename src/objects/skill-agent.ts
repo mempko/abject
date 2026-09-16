@@ -349,11 +349,11 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       // Heartbeat: long sub-calls (e.g. MCP tool that takes minutes) shouldn't
       // let the parent's inactivity timer fire while we're genuinely working.
-      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
+      const heartbeat = this.setRecurringTimer(() => this.resetPendingTicketTimeouts((msg.payload as { taskId?: string }).taskId), 60000);
       try {
         return await this.handleAct(taskId, action);
       } finally {
-        clearInterval(heartbeat);
+        this.cancelTimer(heartbeat);
       }
     });
 
@@ -1148,8 +1148,8 @@ When using curl, use -s (silent) and pipe JSON through jq.
     if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
       if (ticketId !== taskId) continue;
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
+      this.cancelTimer(entry.timer);
+      entry.timer = this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -1163,7 +1163,7 @@ When using curl, use -s (silent) and pipe JSON through jq.
     const early=this.takeTaskResult<any>(ticketId);
     if(early)return Promise.resolve(early);
     return new Promise((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
+      const makeTimer = () => this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -1175,7 +1175,7 @@ When using curl, use -s (silent) and pipe JSON through jq.
         timer: makeTimer(),
         timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
@@ -1186,7 +1186,7 @@ When using curl, use -s (silent) and pipe JSON through jq.
           });
         },
         reject: (err: Error) => {
-          clearTimeout(entry.timer);
+          this.cancelTimer(entry.timer);
           this.pendingTickets.delete(ticketId);
           reject(err);
         },

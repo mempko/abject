@@ -740,7 +740,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       // own ticket timers AND send progress to JobManager, whose handler
       // bubbles it to every ancestor's stall timer — otherwise the caller's
       // submitJob times out while this step is still legitimately running.
-      const heartbeat = setInterval(() => {
+      const heartbeat = this.setRecurringTimer(() => {
         this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
         if (this.jobManagerId) {
           this.send(event(this.id, this.jobManagerId, 'progress', { phase: 'acting' }));
@@ -749,7 +749,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       try {
         return await this.handleAct(taskId, action);
       } finally {
-        clearInterval(heartbeat);
+        this.cancelTimer(heartbeat);
       }
     });
 
@@ -822,7 +822,7 @@ Set keepPageOpen: false to explicitly close the page when done.
   /** Start an idle timeout for a kept-open page; auto-closes when it expires. */
   private trackKeptOpenPage(pageId: string): void {
     this.untrackKeptOpenPage(pageId);
-    const handle = setTimeout(async () => {
+    const handle = this.setTimer(async () => {
       log.info(`Idle timeout expired for page ${pageId}, closing`);
       this.keptOpenPages.delete(pageId);
       try {
@@ -838,13 +838,13 @@ Set keepPageOpen: false to explicitly close the page when done.
   private untrackKeptOpenPage(pageId: string): void {
     const existing = this.keptOpenPages.get(pageId);
     if (existing) {
-      clearTimeout(existing);
+      this.cancelTimer(existing);
       this.keptOpenPages.delete(pageId);
     }
   }
 
   protected override async onStop(): Promise<void> {
-    for (const timeout of this.keptOpenPages.values()) clearTimeout(timeout);
+    for (const timeout of this.keptOpenPages.values()) this.cancelTimer(timeout);
     this.keptOpenPages.clear();
     // Reject any pending tickets
     for (const [id, pending] of this.pendingTickets) {
@@ -857,8 +857,8 @@ Set keepPageOpen: false to explicitly close the page when done.
     if (!taskId) return;
     for (const [ticketId, entry] of this.pendingTickets) {
       if (ticketId !== taskId) continue;
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
+      this.cancelTimer(entry.timer);
+      entry.timer = this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -877,7 +877,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     const early=this.takeTaskResult<any>(ticketId);
     if(early)return Promise.resolve(early);
     return new Promise<TaskResult>((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
+      const makeTimer = () => this.setTimer(() => {
         this.pendingTickets.delete(ticketId);
         if (this.agentAbjectId) {
           this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
@@ -888,8 +888,8 @@ Set keepPageOpen: false to explicitly close the page when done.
       const entry = {
         timer: makeTimer(),
         timeoutMs,
-        resolve: (v: unknown) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); resolve(v as TaskResult); },
-        reject: (e: Error) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); reject(e); },
+        resolve: (v: unknown) => { this.cancelTimer(entry.timer); this.pendingTickets.delete(ticketId); resolve(v as TaskResult); },
+        reject: (e: Error) => { this.cancelTimer(entry.timer); this.pendingTickets.delete(ticketId); reject(e); },
       };
       this.pendingTickets.set(ticketId, entry);
     });
