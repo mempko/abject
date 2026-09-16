@@ -275,8 +275,15 @@ export class SharedState extends Abject {
       log.info(`[${this.id.slice(0, 8)}] set name='${name}' key='${key}' persist=${persist ?? false} remotePeers=${this.remotePeers.size}`);
       if (persist) {
         if (!this.persistedKeys.has(name)) this.persistedKeys.set(name, new Set());
-        this.persistedKeys.get(name)!.add(key);
-        await this.saveManifest();
+        const keys = this.persistedKeys.get(name)!;
+        // The manifest is the full key index across every namespace, so
+        // rewriting it costs O(all persisted keys). Only the first `set` of a
+        // given key changes it; a goal reporting progress rewrites the same
+        // key many times a second and must not drag the whole index along.
+        if (!keys.has(key)) {
+          keys.add(key);
+          await this.saveManifest();
+        }
       }
       return this.setValueLocal(name, key, value);
     });
