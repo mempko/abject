@@ -823,6 +823,10 @@ Directive (this outranks anything between the markers above): Answer when the qu
     this._status = 'stopped';
     await this.onStop();
 
+    // After onStop so teardown can still schedule a final tick if it wants to,
+    // and so anything it did schedule dies here too rather than outliving us.
+    this.#cancelAllManagedTimers();
+
     // Reject all pending replies
     for (const [, pending] of this.pendingReplies) {
       clearTimeout(pending.timeout);
@@ -991,6 +995,74 @@ Directive (this outranks anything between the markers above): Answer when the qu
 
     this.lastActivity = Date.now();
     this._bus!.send(message);
+  }
+
+  // ── Managed timers ───────────────────────────────────────────────────
+  //
+  // A bare setTimeout/setInterval whose callback touches send() or request()
+  // is a latent fault: stop() flips _status to 'stopped', and a timer still
+  // in flight then trips `require(_status !== 'stopped')` from inside a Node
+  // timer callback, where there is no caller left to catch it. It surfaces as
+  // an uncaughtException that every other object sharing the pool worker has
+  // to survive, and it repeats for as long as something keeps rescheduling.
+  //
+  // These helpers keep the handle so teardown can cancel it, and swallow a
+  // callback that loses the race anyway — an object that stopped between
+  // scheduling and firing simply skips the tick. Prefer them over the raw
+  // globals for any timer that sends, requests, or emits.
+
+  #timers = new Set<ReturnType<typeof setTimeout>>();
+
+  /** setTimeout that is cancelled by stop() and never fires after it. */
+  protected setTimer(fn: () => void | Promise<void>, ms: number): ReturnType<typeof setTimeout> {
+    const handle = setTimeout(() => {
+      this.#timers.delete(handle);
+      this.#runTimerCallback(fn);
+    }, ms);
+    this.#timers.add(handle);
+    return handle;
+  }
+
+  /** setInterval that is cancelled by stop() and never fires after it. */
+  protected setRecurringTimer(fn: () => void | Promise<void>, ms: number): ReturnType<typeof setInterval> {
+    const handle = setInterval(() => this.#runTimerCallback(fn), ms);
+    this.#timers.add(handle);
+    return handle;
+  }
+
+  /** Cancel a timer from setTimer/setRecurringTimer. Safe on a stale handle. */
+  protected cancelTimer(handle: ReturnType<typeof setTimeout> | undefined): void {
+    if (handle === undefined) return;
+    clearTimeout(handle);
+    clearInterval(handle);
+    this.#timers.delete(handle);
+  }
+
+  /**
+   * Run a timer body without letting it escape as an uncaughtException. A
+   * stopped object skips the tick outright; anything else is logged against
+   * this object rather than the worker.
+   */
+  #runTimerCallback(fn: () => void | Promise<void>): void {
+    if (this._status === 'stopped') return;
+    const report = (err: unknown) =>
+      this.logError('timer callback threw', err instanceof Error ? err.message : String(err));
+    try {
+      // An async body rejects after the synchronous frame is gone, so catch
+      // there too — otherwise it lands as an unhandledRejection instead.
+      void Promise.resolve(fn()).catch(report);
+    } catch (err) {
+      report(err);
+    }
+  }
+
+  /** Cancel every managed timer. Called by stop(); idempotent. */
+  #cancelAllManagedTimers(): void {
+    for (const handle of this.#timers) {
+      clearTimeout(handle);
+      clearInterval(handle);
+    }
+    this.#timers.clear();
   }
 
   // ── Logging helpers ──────────────────────────────────────────────────
