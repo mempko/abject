@@ -466,6 +466,10 @@ export class Compositor {
   private mobileView = MobileViewState.NATIVE_FIT;
   /** Slim bottom band that hints the swipe-up gesture (replaces the tab bar). */
   private static readonly MOBILE_GESTURE_HANDLE_HEIGHT = 28;
+  /** Optional hook: relay client-side compositor diagnostics to the backend
+   *  (clientDiagnostic path — the browser console never reaches the log). */
+  onDiagnostic?: (gate: string, detail: string) => void;
+
   /** Cached mobile transform for coordinate mapping (native states). */
   private mobileTransform = { scale: 1, offsetX: 0, offsetY: 0 };
   // Pinch / double-tap zoom state: userZoom multiplies the fit-to-screen base scale.
@@ -2137,7 +2141,11 @@ export class Compositor {
         // read it. Stop retrying; the slab keeps its last-good texture (or the
         // 1x1 placeholder) so the rest of the desktop renders normally.
         surface.tainted = true;
-        console.warn(`[Compositor] surface ${surface.id} tainted by a cross-origin image; freezing its texture`);
+        const taintDetail = `surface ${surface.id} tainted by a cross-origin image; freezing its texture`;
+        console.warn(`[Compositor] ${taintDetail}`);
+        // The browser console never crosses the wire; surface the taint
+        // through the clientDiagnostic relay so it lands in abject.log.
+        this.onDiagnostic?.('surface-tainted', taintDetail);
       }
     }
     this.renderer.drawSurface({
@@ -3362,13 +3370,30 @@ export class Compositor {
         scaledW, scaledH, 1,
       );
       state.model = model;
+      // Off-axis camera fitted to the on-screen slab: the same per-window
+      // projection the desktop uses, so scene-vocabulary nodes keep their
+      // exact desktop geometry while the slab stays a front-facing rectangle.
+      const cam = this.windowCamera(
+        offsetX + scaledW / 2,
+        offsetY + scaledH / 2,
+        0,
+      );
       this.drawSurfaceSlab(surface, state, model, {
         radius: 0,
         dim: 1,
         opacity: 1,
+        viewProj: cam.viewProj,
         // Clip to content area (above the gesture handle)
         scissor: { x: 0, y: 0, width: availW, height: availH },
       });
+      // Render the surface's scene-vocabulary nodes (3D meshes and
+      // kind:'canvas' layers) in the same slab space. Without this, any
+      // scene-rendered abject (FluidSimulation's 3D fluid, OpenStreetMap's
+      // tile layer) is blank on the phone client while slab-only content
+      // (MaximKhailoPhoto) works. Card overview stays 2D-slab-only.
+      this.renderer.clearDepth();
+      this.drawVocabNodes(surface, model, 'occluded', cam);
+      this.drawVocabNodes(surface, model, 'overlay', cam);
     }
 
     const ctx = this.overlay.begin();

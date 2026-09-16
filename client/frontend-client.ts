@@ -215,6 +215,10 @@ export class FrontendClient {
     this.canvas = canvas;
     this.abyssBg = abyssBg;
     this.compositor = new Compositor(canvas);
+    // Relay compositor diagnostics (e.g. cross-origin surface taint) into the
+    // backend log via the clientDiagnostic message — the browser console is
+    // invisible in abject.log.
+    this.compositor.onDiagnostic = (gate, detail) => this.sendDiagnostic(gate, detail);
     this.detectMobileMode();
     this.setupInputListeners();
     this.setupMobileKeyboard();
