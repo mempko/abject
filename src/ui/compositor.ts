@@ -2303,6 +2303,29 @@ export class Compositor {
   private contentClip(surface: Surface): { x: number; y: number; width: number; height: number } {
     const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
     const border = surface.transparent ? 0 : 2;
+    if (this.mobileMode) {
+      // The phone draws the focused window fitted and centred (mobileTransform)
+      // instead of at its desktop rect, which it never moves. Clipping to that
+      // rect therefore scissors the subtree to wherever the window happens to
+      // sit on the virtual desktop — off-screen for any window past the ~390px
+      // phone viewport, which is what kept scene-rendered abjects blank even
+      // once they started being drawn. Follow the on-screen slab instead, and
+      // stay inside the content band so nodes cannot paint over the gesture
+      // handle.
+      const { scale, offsetX, offsetY } = this.mobileTransform;
+      const x = offsetX + border * scale;
+      const y = offsetY + titleBar * scale;
+      const right = x + Math.max(0, surface.rect.width - border * 2) * scale;
+      const bottom = y + Math.max(0, surface.rect.height - titleBar - border) * scale;
+      const x0 = Math.max(0, x);
+      const y0 = Math.max(0, y);
+      return {
+        x: x0,
+        y: y0,
+        width: Math.max(0, Math.min(this.width, right) - x0),
+        height: Math.max(0, Math.min(this.mobileAvailHeight, bottom) - y0),
+      };
+    }
     return {
       x: surface.rect.x - this.scrollX + border,
       y: surface.rect.y - this.scrollY + titleBar,
@@ -2482,7 +2505,14 @@ export class Compositor {
       entry.needsUpload = false;
       if (!ok) {
         entry.tainted = true;
-        console.warn(`[Compositor] canvas layer ${key}/${node.id} tainted by a cross-origin image; freezing its texture`);
+        const taintDetail = `canvas layer ${key}/${node.id} tainted by a cross-origin image; freezing its texture`;
+        console.warn(`[Compositor] ${taintDetail}`);
+        // Same relay as the slab taint: the browser console never crosses the
+        // wire, and canvas layers are exactly the content that goes missing on
+        // the phone, so a silent taint here is the hardest kind to chase. Its
+        // own gate, since sendDiagnostic rate-limits per gate and a chatty
+        // surface taint would otherwise mask this one.
+        this.onDiagnostic?.('canvas-layer-tainted', taintDetail);
       }
     }
     const model = this.canvasNodeModel(key, node, surfaceModel);
@@ -3364,8 +3394,10 @@ export class Compositor {
       this.mobileTransform = { scale, offsetX, offsetY };
 
       const state = this.glState(surface.id);
+      const cx = offsetX + scaledW / 2;
+      const cy = offsetY + scaledH / 2;
       const model = mat4TRS(
-        offsetX + scaledW / 2, offsetY + scaledH / 2, 0,
+        cx, cy, 0,
         0, 0, 0,
         scaledW, scaledH, 1,
       );
@@ -3373,11 +3405,7 @@ export class Compositor {
       // Off-axis camera fitted to the on-screen slab: the same per-window
       // projection the desktop uses, so scene-vocabulary nodes keep their
       // exact desktop geometry while the slab stays a front-facing rectangle.
-      const cam = this.windowCamera(
-        offsetX + scaledW / 2,
-        offsetY + scaledH / 2,
-        0,
-      );
+      const cam = this.windowCamera(cx, cy, 0);
       this.drawSurfaceSlab(surface, state, model, {
         radius: 0,
         dim: 1,
@@ -3391,9 +3419,18 @@ export class Compositor {
       // scene-rendered abject (FluidSimulation's 3D fluid, OpenStreetMap's
       // tile layer) is blank on the phone client while slab-only content
       // (MaximKhailoPhoto) works. Card overview stays 2D-slab-only.
+      //
+      // Nodes ride a frame WITHOUT the slab's px size baked in, exactly as the
+      // desktop does (see renderDesktop). Handing them the slab model instead
+      // multiplied every node offset by the slab's width/height — a 256px
+      // canvas tile landed tens of thousands of px wide, far outside the clip —
+      // and, since the slab scales x/y but not z, squashed every mesh flat.
+      // The phone's fit-to-screen factor is the one scale the subtree does
+      // want, applied UNIFORMLY so geometry shrinks with the window undistorted.
+      const frame = mat4TRS(cx, cy, 0, 0, 0, 0, scale, scale, scale);
       this.renderer.clearDepth();
-      this.drawVocabNodes(surface, model, 'occluded', cam);
-      this.drawVocabNodes(surface, model, 'overlay', cam);
+      this.drawVocabNodes(surface, frame, 'occluded', cam);
+      this.drawVocabNodes(surface, frame, 'overlay', cam);
     }
 
     const ctx = this.overlay.begin();
@@ -4183,6 +4220,15 @@ export class Compositor {
 
   setMobileMode(enabled: boolean): void {
     this.mobileMode = enabled;
+    if (enabled) {
+      // The phone positions everything in SCREEN space (mobileTransform) and
+      // pans with mobilePanX/Y, never by scrolling the virtual desktop. But
+      // windowCamera() still maps through the desktop scroll offset, so a
+      // scroll restored from a previous desktop session would slide the slab
+      // and its 3D subtree off the screen together. Drop it up front.
+      this.scrollX = 0;
+      this.scrollY = 0;
+    }
     this.resetMobileZoom();
     this.mobileView = MobileViewState.NATIVE_FIT;
     this.needsRender = true;
