@@ -24,6 +24,12 @@ const PROCESS_EXPLORER_INTERFACE: InterfaceId = 'abjects:process-explorer';
 const WIN_W = 650;
 const WIN_H = 500;
 
+/**
+ * How often the heap strip re-reads while the window is open. Matched to the
+ * monitor's own poll: reading faster only redraws the same numbers.
+ */
+const HEAP_STRIP_REFRESH_MS = 15_000;
+
 /** Names of protected objects that cannot be stopped or restarted. */
 const PROTECTED_NAMES = new Set([
   'Registry', 'Factory', 'Supervisor', 'WidgetManager', 'WindowManager',
@@ -49,6 +55,7 @@ export class ProcessExplorer extends Abject {
   private systemRegistryId?: AbjectId;
   private factoryId?: AbjectId;
   private supervisorId?: AbjectId;
+  private heapMonitorId?: AbjectId;
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -56,6 +63,12 @@ export class ProcessExplorer extends Abject {
   private searchInputId?: AbjectId;
   private summaryLabelId?: AbjectId;
   private refreshBtnId?: AbjectId;
+  /** Row holding the per-isolate heap readings, one label each. */
+  private heapRowId?: AbjectId;
+  private heapLabelIds: AbjectId[] = [];
+  private heapTimer?: ReturnType<typeof setInterval>;
+  /** What the strip currently reads, so getState can report it as text. */
+  private heapStripText: string[] = [];
 
   private searchText = '';
 
@@ -94,6 +107,7 @@ export class ProcessExplorer extends Abject {
                 parameters: [],
                 returns: { kind: 'object', properties: {
                   visible: { kind: 'primitive', primitive: 'boolean' },
+                  heap: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
                 }},
               },
             ],
@@ -154,7 +168,10 @@ export class ProcessExplorer extends Abject {
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
     this.on('getState', async () => {
-      return { visible: !!this.windowId };
+      // The heap strip is reported as text, not just drawn: a caller without
+      // a screen — the CLI, an agent, whatever is asking why a worker died —
+      // should be able to read what the window is showing.
+      return { visible: !!this.windowId, heap: [...this.heapStripText] };
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
@@ -310,6 +327,9 @@ export class ProcessExplorer extends Abject {
     this.searchInputId = undefined;
     this.summaryLabelId = undefined;
     this.refreshBtnId = undefined;
+    this.heapRowId = undefined;
+    this.heapLabelIds = [];
+    this.heapStripText = [];
     this.stopButtons.clear();
     this.restartButtons.clear();
     this.currentRows = [];
@@ -347,12 +367,20 @@ export class ProcessExplorer extends Abject {
         }));
       } catch { /* window gone */ }
     }
+    // Heap moves on its own, so the strip refreshes on its own. A reading you
+    // have to ask for is no use for noticing a slow climb, which is the whole
+    // point of showing it. Managed, so hide() and stop() both end it.
+    this.heapTimer = this.setRecurringTimer(() => { void this.refreshHeapStrip(); }, HEAP_STRIP_REFRESH_MS);
+
     this.changed('visibility', true);
     return true;
   }
 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
+
+    this.cancelTimer(this.heapTimer);
+    this.heapTimer = undefined;
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -444,6 +472,24 @@ export class ProcessExplorer extends Abject {
       preferredSize: { height: 18 },
     }));
 
+    // ── Heap strip ──
+    // Above the list because it describes the isolates the listed objects sit
+    // in, not the objects themselves: a worker climbing toward its ceiling is
+    // about to take every object hosted there with it.
+    this.heapRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 10,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.heapRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 18 },
+    }));
+    await this.refreshHeapStrip();
+
     // ── Header row ──
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -494,6 +540,109 @@ export class ProcessExplorer extends Abject {
 
     // Build and display rows
     await this.rebuildList();
+  }
+
+  /**
+   * Heap pressure per isolate, as one label each so a hot one can carry its
+   * own colour.
+   *
+   * Labels are updated in place when the isolate count is unchanged — the
+   * common case, since a replaced worker keeps its slot. They are only torn
+   * down and rebuilt when the count actually differs, because a nested box
+   * adds itself to its parent at creation, so recreating the row wholesale
+   * would move it below the list it is meant to sit above.
+   */
+  private async refreshHeapStrip(): Promise<void> {
+    if (!this.heapRowId || !this.windowId) return;
+    // Resolved here rather than in onInit: the monitor is spawned after this
+    // object during bootstrap, so binding it at init finds nothing and the
+    // strip stays empty for the life of the process. Resolving on use also
+    // survives the monitor being restarted under it.
+    this.heapMonitorId = await this.resolveDep('HeapMonitor', this.heapMonitorId);
+    if (!this.heapMonitorId) return;
+
+    let watches: Array<{ source: string; workerIndex?: number; fraction: number; regime: string;
+      sample: { usedBytes: number; limitBytes: number } }> = [];
+    try {
+      const state = await this.request<{ watches: typeof watches }>(
+        request(this.id, this.heapMonitorId, 'getState', {})
+      );
+      watches = state?.watches ?? [];
+    } catch {
+      return; // The monitor is a diagnostic; its absence must not break this view.
+    }
+
+    // Main first, then workers in slot order, so a reading stays in the same
+    // place between refreshes and the eye can track one column.
+    watches.sort((a, b) => {
+      if (a.workerIndex === undefined) return -1;
+      if (b.workerIndex === undefined) return 1;
+      return a.workerIndex - b.workerIndex;
+    });
+
+    const specs = watches.map((w) => ({
+      text: this.heapLabelText(w),
+      style: { fontSize: 11, color: this.heapColor(w.regime) },
+    }));
+    this.heapStripText = specs.map((s) => s.text);
+
+    if (specs.length !== this.heapLabelIds.length) {
+      for (const id of this.heapLabelIds) {
+        try {
+          await this.request(request(this.id, this.heapRowId, 'removeLayoutChild', { widgetId: id }));
+        } catch { /* already detached */ }
+        try {
+          await this.request(request(this.id, id, 'destroy', {}));
+        } catch { /* already gone */ }
+      }
+      this.heapLabelIds = [];
+      if (specs.length === 0) return;
+
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: specs.map((s) => ({ type: 'label' as const, windowId: this.windowId!, ...s })),
+        })
+      );
+      this.heapLabelIds = widgetIds;
+      for (const widgetId of widgetIds) {
+        await this.request(request(this.id, this.heapRowId, 'addLayoutChild', {
+          widgetId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: 96, height: 18 },
+        }));
+      }
+      return;
+    }
+
+    for (let i = 0; i < specs.length; i++) {
+      try {
+        await this.request(request(this.id, this.heapLabelIds[i], 'update', specs[i]));
+      } catch { /* widget gone; the next rebuild picks it up */ }
+    }
+  }
+
+  /**
+   * e.g. `main 1.0% 46MB` — the fraction leads, since that is what matters.
+   *
+   * A decimal below 10% because against an 8GB ceiling a healthy worker sits
+   * near 0.4%, and a whole-number strip reading `0%` nine times looks broken
+   * rather than calm. Above 10% the decimal stops earning its width.
+   */
+  private heapLabelText(w: { source: string; fraction: number;
+    sample: { usedBytes: number } }): string {
+    const pct = w.fraction * 100;
+    const shown = pct < 10 ? pct.toFixed(1) : String(Math.round(pct));
+    const mb = Math.round(w.sample.usedBytes / (1024 * 1024));
+    const name = w.source === 'main' ? 'main' : w.source.replace('worker-', 'w');
+    return `${name} ${shown}% ${mb}MB`;
+  }
+
+  private heapColor(regime: string): string {
+    switch (regime) {
+      case 'critical': return this.theme.statusError;
+      case 'elevated': return this.theme.statusWarning;
+      default: return this.theme.textMeta;
+    }
   }
 
   /**
@@ -688,6 +837,7 @@ export class ProcessExplorer extends Abject {
     // Refresh button
     if (fromId === this.refreshBtnId && aspect === 'click') {
       await this.rebuildList();
+      await this.refreshHeapStrip();
       return;
     }
 
