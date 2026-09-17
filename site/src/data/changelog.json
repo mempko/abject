@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.10.6",
+    "date": "2026-09-17",
+    "title": "Watching the Heap",
+    "summary": "This release adds a heap monitor so you can see how much memory the backend and its workers are using, and catch runaway growth before it turns into a crash.",
+    "highlights": [
+      "New HeapMonitor object tracks memory usage across the worker pool and the main thread, sampling heap size over time so leaks show up as a trend instead of a surprise.",
+      "Process Explorer gains a heap strip: a compact per-process view of memory use that sits alongside the existing process list."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.10.5",
     "date": "2026-09-17",
     "title": "Steadier Memory for Long-Running Sessions",
