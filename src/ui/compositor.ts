@@ -2177,10 +2177,20 @@ export class Compositor {
    *   with no clip, so they sit on top of everything and may extend past the
    *   window (pop-out 3D, decorations meant to be visible over the chrome).
    */
-  private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay', cam: SceneCamera): void {
+  private drawVocabNodes(
+    surface: Surface,
+    surfaceModel: Mat4,
+    pass: 'occluded' | 'overlay',
+    cam: SceneCamera,
+    // Force the projected-quad clip even when the window itself is untilted:
+    // the card switcher rotates and recedes its cards through the model it
+    // passes here rather than through the surface's glState, so the tilt test
+    // below cannot see it and would fall back to an upright screen rect.
+    forceQuadClip = false,
+  ): void {
     const state = this.glState(surface.id);
     const rot = state.userRotation;
-    const tilted = !!(state.tiltX || state.tiltY || (rot && (rot[0] || rot[1] || rot[2])));
+    const tilted = forceQuadClip || !!(state.tiltX || state.tiltY || (rot && (rot[0] || rot[1] || rot[2])));
     let clip = this.contentClip(surface);
     let clipQuad: { model: Mat4; viewProj: Mat4 } | undefined;
     if (tilted) {
@@ -2303,7 +2313,7 @@ export class Compositor {
   private contentClip(surface: Surface): { x: number; y: number; width: number; height: number } {
     const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
     const border = surface.transparent ? 0 : 2;
-    if (this.mobileMode) {
+    if (this.mobileMode && this.mobileView !== MobileViewState.CARD_OVERVIEW) {
       // The phone draws the focused window fitted and centred (mobileTransform)
       // instead of at its desktop rect, which it never moves. Clipping to that
       // rect therefore scissors the subtree to wherever the window happens to
@@ -3599,6 +3609,35 @@ export class Compositor {
         opacity: alpha,
         rim: isActive ? { ...chrome.glow, a: 0.8 * alpha } : undefined,
       });
+
+      // Scene-vocabulary nodes on the CENTRED card. The deck used to draw
+      // slabs only, so every canvas widget (CanvasWidget owns a kind:'canvas'
+      // node, not slab pixels) and every 3D scene was blank in the switcher
+      // even though the same window rendered fine once opened.
+      //
+      // Only the active card: node opacity comes from the node's own params,
+      // with no global multiplier to fade it alongside a receding card's slab,
+      // and a phone should not run every card's scene at once (a live
+      // simulation re-uploads its geometry per frame). Off-centre cards keep
+      // their slab preview. Deferred until the deck has finished revealing so
+      // 3D content does not pop in at full opacity over a still-fading slab.
+      if (isActive && this.cardRevealT >= 0.99) {
+        // Frame WITHOUT the card's px size baked in (see renderMobile), scaled
+        // by the card's own factor so content shrinks with the card, and
+        // carrying the card's recede + turn so nodes sit in the same space as
+        // the slab. Cards rotate mid-swipe, so clip to the projected content
+        // quad rather than an upright rectangle.
+        const cardScale = w / Math.max(1, surface.rect.width);
+        const cardFrame = mat4TRS(
+          cx, cy, zRecede,
+          0, yTurn, 0,
+          cardScale, cardScale, cardScale,
+        );
+        const cardCam = this.globalCamera();
+        this.renderer.clearDepth();
+        this.drawVocabNodes(surface, cardFrame, 'occluded', cardCam, true);
+        this.drawVocabNodes(surface, cardFrame, 'overlay', cardCam, true);
+      }
 
       // Title below the card (active card sits unrotated, so 2D chrome aligns).
       overlayCtx.globalAlpha = alpha;
