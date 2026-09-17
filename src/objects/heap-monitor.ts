@@ -1,11 +1,16 @@
 /**
- * HeapMonitor — watches the worker pool's heap usage.
+ * HeapMonitor — watches every isolate's heap usage.
  *
  * Each pool worker measures its own V8 isolate (only code inside an isolate
  * can read its heap) and reports a sample every 30s through its bridge; the
  * WorkerPool keeps the latest reading per slot and this abject holds the
  * policy: what counts as elevated, what counts as critical, and what gets
- * logged when a worker moves between those regimes.
+ * logged when an isolate moves between those regimes.
+ *
+ * The main thread is watched too, and it is not an afterthought: its ceiling
+ * is roughly half a worker's (~4.2GB against ~8.4GB), so it has the least
+ * headroom in the system despite hosting the least. Running here is what
+ * makes reading it free.
  *
  * Main-thread only, and absent from workerEligible on purpose: it reads the
  * pool's heap reports, and an object watching for a worker to die cannot
@@ -14,7 +19,7 @@
 
 import { AbjectId, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { require } from '../core/contracts.js';
+import { invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { WorkerPool } from '../runtime/worker-pool.js';
 import type { WorkerHeapSample } from '../runtime/worker-bridge.js';
@@ -36,13 +41,24 @@ const CRITICAL_FRACTION = 0.9;
 
 type Regime = 'nominal' | 'elevated' | 'critical';
 
-/** One worker's latest reading plus the regime the monitor assigned to it. */
+/** Watch key for the main thread; pool workers use `worker-<index>`. */
+const MAIN_SOURCE = 'main';
+
+/** One isolate's latest reading plus the regime the monitor assigned to it. */
 export interface HeapWatch {
-  workerIndex: number;
+  /** 'main', or 'worker-<index>' for a pool worker. */
+  source: string;
+  /** Pool slot. Absent for the main thread, which has no slot. */
+  workerIndex?: number;
   sample: WorkerHeapSample;
   /** usedBytes / limitBytes, in [0, 1+]. Values above 1 should not happen. */
   fraction: number;
   regime: Regime;
+}
+
+/** The slice of node:v8 this needs, so the import can stay dynamic. */
+interface HeapStatsSource {
+  getHeapStatistics(): { used_heap_size: number; total_heap_size: number; heap_size_limit: number };
 }
 
 export interface HeapMonitorOptions {
@@ -58,9 +74,15 @@ function regimeFor(fraction: number): Regime {
 
 export class HeapMonitor extends Abject {
   private pool?: WorkerPool;
-  /** Latest reading per worker index, refreshed on each poll. */
-  private watches: Map<number, HeapWatch> = new Map();
+  /** Latest reading per source ('main', 'worker-<n>'), refreshed on each poll. */
+  private watches: Map<string, HeapWatch> = new Map();
   private pollTimer?: ReturnType<typeof setInterval>;
+  /**
+   * node:v8, when running on Node. Held rather than imported at the top
+   * because this module is re-exported from the browser barrel, where a
+   * static 'node:v8' import breaks the bundle.
+   */
+  private heapStats?: HeapStatsSource;
 
   constructor(options: HeapMonitorOptions = {}) {
     super({
@@ -76,10 +98,10 @@ export class HeapMonitor extends Abject {
           methods: [
             {
               name: 'sampleNow',
-              description: 'Read the pool now and return the latest sample per worker',
+              description: 'Read every isolate now and return the latest watch for the main thread and each pool worker',
               parameters: [],
               returns: { kind: 'object', properties: {
-                workers: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+                watches: { kind: 'array', elementType: { kind: 'object', properties: {} } },
               }},
             },
             {
@@ -123,18 +145,28 @@ export class HeapMonitor extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    // Take a first reading right away so a worker is never unobserved for
-    // its first poll interval, then keep polling. The unref keeps an idle
-    // runtime able to exit.
-    this.readSamples();
-    this.pollTimer = setInterval(() => {
-      try {
-        this.readSamples();
-      } catch (err) {
-        log.warn(`Heap poll failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }, POLL_MS);
+    try {
+      this.heapStats = await import('node:v8') as HeapStatsSource;
+    } catch {
+      // Not on Node — the pool's worker reports still arrive.
+    }
+    // Take a first reading right away so nothing is unobserved for its first
+    // poll interval, then keep polling. Guarded like the poll itself: a
+    // monitor that cannot take a reading must still come up, or the one
+    // object meant to explain a memory problem is the one that fails to
+    // start because of it. The unref keeps an idle runtime able to exit.
+    this.pollOnce();
+    this.pollTimer = setInterval(() => this.pollOnce(), POLL_MS);
     this.pollTimer.unref?.();
+  }
+
+  /** One sweep, with any failure contained to this tick. */
+  private pollOnce(): void {
+    try {
+      this.readSamples();
+    } catch (err) {
+      log.warn(`Heap poll failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   protected override async onStop(): Promise<void> {
@@ -153,49 +185,90 @@ export class HeapMonitor extends Abject {
    * reading — absence of data is reported as absence.
    */
   private readSamples(): HeapWatch[] {
-    if (this.pool === undefined) return [];
+    const readings: Array<{ source: string; workerIndex?: number; sample: WorkerHeapSample }> = [];
 
-    const samples = this.pool.heapSamples();
-    const stale = [...this.watches.keys()].filter((i) => !samples.has(i));
-    for (const i of stale) this.watches.delete(i);
+    const local = this.localSample();
+    if (local) readings.push({ source: MAIN_SOURCE, sample: local });
+
+    if (this.pool !== undefined) {
+      for (const [index, sample] of this.pool.heapSamples()) {
+        readings.push({ source: `worker-${index}`, workerIndex: index, sample });
+      }
+    }
+
+    const reporting = new Set(readings.map((r) => r.source));
+    for (const source of [...this.watches.keys()]) {
+      if (!reporting.has(source)) this.watches.delete(source);
+    }
 
     const result: HeapWatch[] = [];
-    for (const [index, sample] of samples) {
-      require(sample.limitBytes > 0, `worker ${index} reported a zero heap limit`);
+    for (const { source, workerIndex, sample } of readings) {
+      // A malformed reading is skipped, never thrown on. These numbers cross
+      // a thread boundary, so they are input rather than our own state, and
+      // a contract violation here would abandon the rest of the sweep and
+      // leave every later isolate unread — a monitor that stops monitoring
+      // precisely when something has gone wrong.
+      if (!(sample.limitBytes > 0) || !(sample.usedBytes >= 0)) {
+        log.warn(`${source} reported an unusable heap sample ` +
+          `(used=${sample.usedBytes}, limit=${sample.limitBytes}); skipping it this poll`);
+        this.watches.delete(source);
+        continue;
+      }
+
       const fraction = sample.usedBytes / sample.limitBytes;
       const regime = regimeFor(fraction);
-      const previous = this.watches.get(index);
-      this.watches.set(index, { workerIndex: index, sample, fraction, regime });
+      const previous = this.watches.get(source);
+      const watch: HeapWatch = { source, workerIndex, sample, fraction, regime };
+      this.watches.set(source, watch);
 
-      // Log on regime change only: a worker sitting at 80% for an hour is
+      // Log on regime change only: an isolate sitting at 80% for an hour is
       // one log entry, not one every poll.
       if (previous === undefined || previous.regime !== regime) {
-        const mb = (n: number): string => `${(n / (1024 * 1024)).toFixed(1)}MB`;
-        if (regime === 'critical') {
-          log.error(
-            `worker ${index} heap CRITICAL: ${mb(sample.usedBytes)} / ${mb(sample.limitBytes)} ` +
-            `(${(fraction * 100).toFixed(0)}%), ${sample.objectCount} objects`);
-        } else if (regime === 'elevated') {
-          log.warn(
-            `worker ${index} heap elevated: ${mb(sample.usedBytes)} / ${mb(sample.limitBytes)} ` +
-            `(${(fraction * 100).toFixed(0)}%), ${sample.objectCount} objects`);
-        } else if (previous !== undefined) {
-          log.info(
-            `worker ${index} heap back to nominal: ${mb(sample.usedBytes)} / ${mb(sample.limitBytes)}`);
-        }
+        this.announce(watch, previous !== undefined);
       }
-      result.push(this.watches.get(index)!);
+      result.push(watch);
     }
 
     this.checkInvariants();
     return result;
   }
 
+  /**
+   * The main thread's own reading. Absent off Node, and absent before init,
+   * since the object count comes from the bus.
+   */
+  private localSample(): WorkerHeapSample | undefined {
+    if (this.heapStats === undefined) return undefined;
+    const stats = this.heapStats.getHeapStatistics();
+    return {
+      usedBytes: stats.used_heap_size,
+      totalBytes: stats.total_heap_size,
+      limitBytes: stats.heap_size_limit,
+      objectCount: (this.bus as unknown as { objectCount?: number }).objectCount ?? 0,
+      at: Date.now(),
+    };
+  }
+
+  /** Say that an isolate changed regime, at the volume the new regime warrants. */
+  private announce(watch: HeapWatch, hadPrevious: boolean): void {
+    const mb = (n: number): string => `${(n / (1024 * 1024)).toFixed(1)}MB`;
+    const usage = `${mb(watch.sample.usedBytes)} / ${mb(watch.sample.limitBytes)}`;
+    const pct = `${(watch.fraction * 100).toFixed(0)}%`;
+    if (watch.regime === 'critical') {
+      log.error(`${watch.source} heap CRITICAL: ${usage} (${pct}), ${watch.sample.objectCount} objects. ` +
+        `At the ceiling the thread is terminated and every object on it is lost.`);
+    } else if (watch.regime === 'elevated') {
+      log.warn(`${watch.source} heap elevated: ${usage} (${pct}), ${watch.sample.objectCount} objects`);
+    } else if (hadPrevious) {
+      log.info(`${watch.source} heap back to nominal: ${usage} (${pct})`);
+    }
+  }
+
   protected override checkInvariants(): void {
     super.checkInvariants();
     for (const watch of this.watches.values()) {
-      require(watch.fraction >= 0, `worker ${watch.workerIndex} heap fraction is negative`);
-      require(watch.sample.at > 0, `worker ${watch.workerIndex} sample has no timestamp`);
+      invariant(watch.fraction >= 0, `${watch.source} heap fraction is negative`);
+      invariant(watch.sample.at > 0, `${watch.source} sample has no timestamp`);
     }
   }
 }
