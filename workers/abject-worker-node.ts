@@ -9,6 +9,7 @@ import { TaskSession } from '../src/objects/task-session.js';
 
 import { parentPort } from 'node:worker_threads';
 import * as path from 'node:path';
+import * as v8 from 'node:v8';
 import { AbjectId, AbjectManifest } from '../src/core/types.js';
 import { Abject } from '../src/core/abject.js';
 import { WorkerBus } from '../src/runtime/worker-bus.js';
@@ -410,6 +411,40 @@ port.on('message', async (data: WorkerInboundMessage) => {
       console.warn(`[AbjectWorker:Node] Unknown message type: ${type}`);
   }
 });
+
+/**
+ * Heap probe.
+ *
+ * A worker gets a fixed heap ceiling and is terminated on reaching it, so
+ * the interesting question is never "did it die" but "how close is it, and
+ * since when". Only code inside this isolate can answer that, so the
+ * measurement happens here; every judgement about it belongs to the
+ * HeapMonitor abject on main.
+ *
+ * Unref'd so an idle worker can still exit, and wrapped because a worker
+ * being torn down mid-post is ordinary, not an error.
+ */
+const HEAP_SAMPLE_MS = 30_000;
+function reportHeap(): void {
+  const stats = v8.getHeapStatistics();
+  try {
+    port.postMessage({
+      type: 'worker:heap',
+      heap: {
+        usedBytes: stats.used_heap_size,
+        totalBytes: stats.total_heap_size,
+        limitBytes: stats.heap_size_limit,
+        objectCount: objects.size,
+        at: Date.now(),
+      },
+    });
+  } catch { /* worker going down */ }
+}
+const heapTimer = setInterval(reportHeap, HEAP_SAMPLE_MS);
+heapTimer.unref?.();
+// A baseline right away, so a worker is never unobserved for its first
+// half-minute and the monitor has something to compare against.
+reportHeap();
 
 // Signal ready
 port.postMessage({ type: 'ready' });

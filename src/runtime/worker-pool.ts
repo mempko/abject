@@ -9,7 +9,7 @@
 import { AbjectId } from '../core/types.js';
 import { require, invariant } from '../core/contracts.js';
 import { WorkerBridge } from './worker-bridge.js';
-import type { WorkerLike } from './worker-bridge.js';
+import type { WorkerLike, WorkerHeapSample } from './worker-bridge.js';
 import type { MessageBus } from './message-bus.js';
 import { Log } from '../core/timed-log.js';
 
@@ -41,6 +41,12 @@ export class WorkerPool {
   private bus: MessageBus;
   private config: WorkerPoolConfig;
   private objectToBridge: Map<AbjectId, WorkerBridge> = new Map();
+  /**
+   * Each worker's most recent heap report, keyed by worker index — one entry
+   * per worker, overwritten in place. The pool only holds the latest reading;
+   * history and thresholds belong to whoever is watching.
+   */
+  private latestHeap: Map<number, WorkerHeapSample> = new Map();
   private started = false;
   /**
    * Called after a pool worker has died and been replaced. `lostIds` are the
@@ -111,8 +117,18 @@ export class WorkerPool {
       // out its full timeout instead of failing against main immediately.
       for (const b of this.bridges) if (b !== bridge) b.sendPeerRemove(objectId);
     };
+    bridge.onHeapSample = (sample) => { this.latestHeap.set(index, sample); };
     bridge.onDead = (code, lost) => { void this.handleWorkerDeath(index, bridge, code, lost); };
     return bridge;
+  }
+
+  /**
+   * The latest heap reading from each worker that has reported one. A
+   * replacement worker reuses its predecessor's index, so a restarted slot
+   * reports afresh rather than accumulating a second entry.
+   */
+  heapSamples(): Map<number, WorkerHeapSample> {
+    return new Map(this.latestHeap);
   }
 
   /**
@@ -143,6 +159,10 @@ export class WorkerPool {
     // could report) still route to it; sweep them too.
     for (const [id, b] of this.objectToBridge) if (b === dead) lostIds.add(id);
     log.error(`pool worker ${index} died (code ${code}); ${lostIds.size} objects lost. Cutting routes and replacing the worker.`);
+    // The dead worker's last reading describes a thread that no longer
+    // exists; leaving it in place would have the replacement inherit its
+    // predecessor's pressure until it reports for itself.
+    this.latestHeap.delete(index);
     for (const id of lostIds) {
       if (this.objectToBridge.get(id) === dead) this.objectToBridge.delete(id);
       this.bus.unregisterWorkerObject(id);
@@ -275,6 +295,7 @@ export class WorkerPool {
 
     this.bridges = [];
     this.objectToBridge.clear();
+    this.latestHeap.clear();
     this.started = false;
 
     log.info('Shut down');

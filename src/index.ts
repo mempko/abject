@@ -89,6 +89,7 @@ export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
 export { ProcessExplorer, PROCESS_EXPLORER_ID } from './objects/process-explorer.js';
+export { HeapMonitor, HEAP_MONITOR_ID } from './objects/heap-monitor.js';
 export { LLMMonitor, LLM_MONITOR_ID } from './objects/llm-monitor.js';
 export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
 export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';

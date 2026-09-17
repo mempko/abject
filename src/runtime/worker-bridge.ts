@@ -42,13 +42,32 @@ export interface WorkerInboundMessage {
   port?: unknown;  // MessagePort (transferred)
 }
 
+/**
+ * One worker's view of its own heap.
+ *
+ * Only code running inside a V8 isolate can read that isolate's heap — the
+ * parent has no API for it — so each worker measures itself and reports.
+ * What the numbers mean is not decided here: this is the probe, and the
+ * HeapMonitor abject holds the policy.
+ */
+export interface WorkerHeapSample {
+  usedBytes: number;
+  totalBytes: number;
+  /** The isolate's ceiling. Exceeding it is termination, not a slow GC. */
+  limitBytes: number;
+  /** Objects this worker currently hosts, for attributing growth. */
+  objectCount: number;
+  at: number;
+}
+
 /** Message types sent from worker to main thread. */
 export interface WorkerOutboundMessage {
   type: 'ready' | 'spawned' | 'stopped' | 'bus:send' | 'error'
-      | 'bus:registered' | 'bus:unregistered';
+      | 'bus:registered' | 'bus:unregistered' | 'worker:heap';
   objectId?: AbjectId;
   message?: AbjectMessage;
   error?: string;
+  heap?: WorkerHeapSample;
 }
 
 /**
@@ -102,6 +121,9 @@ export class WorkerBridge {
    * "lost N objects" line under-reports what actually died.
    */
   onDead?: (code: number, lostIds: AbjectId[]) => void;
+
+  /** Invoked each time this worker reports its own heap usage. */
+  onHeapSample?: (sample: WorkerHeapSample) => void;
 
   constructor(worker: WorkerLike, bus: MessageBus) {
     this.worker = worker;
@@ -393,6 +415,13 @@ export class WorkerBridge {
         // half-torn-down registration.
         this.onLocalUnregistered?.(objectId);
         this.bus.unregisterWorkerObject(objectId);
+        break;
+      }
+
+      case 'worker:heap': {
+        if (data.heap) {
+          try { this.onHeapSample?.(data.heap); } catch { /* a watchdog must never break the bridge */ }
+        }
         break;
       }
 

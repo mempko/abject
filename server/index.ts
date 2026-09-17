@@ -73,6 +73,7 @@ import { PermissionBroker } from '../src/objects/permission-broker.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
+import { HeapMonitor } from '../src/objects/heap-monitor.js';
 import { LLMMonitor } from '../src/objects/llm-monitor.js';
 import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
@@ -612,6 +613,11 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
   runtime.objectFactory.registerConstructor('ProcessExplorer', () => new ProcessExplorer());
+  // Main-thread only, and absent from workerEligible on purpose: it reads the
+  // pool's heap reports, and an object watching for a worker to die cannot
+  // live inside one.
+  runtime.objectFactory.registerConstructor('HeapMonitor',
+    () => new HeapMonitor({ pool: runtime.workerPool }));
   runtime.objectFactory.registerConstructor('LLMMonitor', () => new LLMMonitor());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
@@ -1012,6 +1018,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
   const methodInspectorId = await supervisedSpawn('MethodInspector', 'permanent', systemTypeId('MethodInspector'));
   const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
+  const heapMonitorId = await supervisedSpawn('HeapMonitor', 'permanent', systemTypeId('HeapMonitor'));
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
   const skillBrowserId = await supervisedSpawn('SkillBrowser', 'permanent', systemTypeId('SkillBrowser'));
@@ -1106,7 +1113,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId, objectCatalogId,
-    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, methodInspectorId, processExplorerId, skillRegistryId, skillBrowserId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, methodInspectorId, processExplorerId, heapMonitorId, skillRegistryId, skillBrowserId,
     mcpRegistryClientId, clawHubClientId, catalogBrowserId,
     secretsVaultId, oauthHelperId,
     proxyGenId, negotiatorId,
