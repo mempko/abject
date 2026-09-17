@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.10.5",
+    "date": "2026-09-17",
+    "title": "Steadier Memory for Long-Running Sessions",
+    "summary": "This is a small maintenance release focused on stability. It fixes memory leaks in the worker pool so Abject can run for long stretches without slowly using more and more memory.",
+    "highlights": [
+      "Long-running sessions stay stable: the background workers that host your objects no longer accumulate memory over time, which could eventually crash a worker after many hours of use"
+    ],
+    "fixes": [
+      "Plugged several memory leaks in the worker pool plumbing (bookkeeping for in-flight messages and spawned objects is now cleaned up properly)"
+    ]
+  },
+  {
     "version": "0.10.4",
     "date": "2026-09-17",
     "title": "Steadier Phones, Tidier Timers",
