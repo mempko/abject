@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.10.4",
+    "date": "2026-09-17",
+    "title": "Steadier Phones, Tidier Timers",
+    "summary": "This release makes the phone client show abject content correctly and removes a source of memory growth and storage load on long-running desktops. It also fixes a peer connection error during reconnects.",
+    "highlights": [
+      "Phone client: abjects that draw through the 3D scene now render correctly in the focused view and on the active card in the card overview.",
+      "Timers are now managed by the Abject base class: agent and UI timers are cancelled automatically when an object stops, so stopped objects no longer leave timers running in long sessions.",
+      "Shared state skips rewriting its manifest when you re-set a key that is already persisted, which cuts storage work during busy periods.",
+      "Tainted-canvas diagnostics (canvases blocked by cross-origin images) are now relayed from the client, which makes rendering problems on remote and mobile clients easier to trace."
+    ],
+    "fixes": [
+      "Peer connections drop stale SDP answers that arrive after a negotiation reset, so they no longer cause connection errors during reconnects.",
+      "The task reviewer now guards against invalid run timestamps instead of failing on them.",
+      "Scene-rendered abject content no longer renders incorrectly on the phone client."
+    ]
+  },
+  {
     "version": "0.10.3",
     "date": "2026-09-14",
     "title": "Typing that lands, traffic that remembers",
