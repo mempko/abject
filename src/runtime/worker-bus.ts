@@ -46,6 +46,22 @@ export class WorkerBus implements MessageBusLike {
    */
   private peerInFlight: Map<string, { message: AbjectMessage; workerIndex: number; at: number }> = new Map();
   private static readonly PEER_IN_FLIGHT_MAX = 20_000;
+  /**
+   * How long an unanswered peer request stays worth remembering. Past this
+   * the caller's own request timeout has long since fired, so the WORKER_DEAD
+   * reply this entry exists to produce would go to nobody: holding the message
+   * any longer only holds its payload.
+   */
+  private static readonly PEER_IN_FLIGHT_TTL_MS = 10 * 60 * 1000;
+
+  /**
+   * Invoked after an object unregisters from this bus, however it got there —
+   * a kill from main, or the far more common case of an object stopping
+   * itself (a widget torn down with its window, a Supervisor restart). The
+   * worker entry point hooks this to release its spawn-map reference; without
+   * it a self-stopped object is unreachable but still retained.
+   */
+  onUnregistered?: (objectId: AbjectId) => void;
 
   constructor(postToMain?: PostToMainFn) {
     this.postToMain = postToMain ?? ((data: unknown) => self.postMessage(data));
@@ -81,6 +97,7 @@ export class WorkerBus implements MessageBusLike {
     this.mailboxes.delete(objectId);
     resetSequence(objectId);
     this.postToMain({ type: 'bus:unregistered', objectId });
+    try { this.onUnregistered?.(objectId); } catch { /* an observer must not break teardown */ }
   }
 
   /**
@@ -140,11 +157,13 @@ export class WorkerBus implements MessageBusLike {
       const port = this.peerPorts.get(peerIdx);
       if (port) {
         if (message.header.type === 'request') {
+          const now = Date.now();
+          this.sweepPeerInFlight(now);
           if (this.peerInFlight.size >= WorkerBus.PEER_IN_FLIGHT_MAX) {
             const oldest = this.peerInFlight.keys().next().value;
             if (oldest !== undefined) this.peerInFlight.delete(oldest);
           }
-          this.peerInFlight.set(message.header.messageId, { message, workerIndex: peerIdx, at: Date.now() });
+          this.peerInFlight.set(message.header.messageId, { message, workerIndex: peerIdx, at: now });
         }
         const peerMsg: PeerMessage = { type: 'peer:msg', message };
         port.postMessage(peerMsg);
@@ -169,6 +188,12 @@ export class WorkerBus implements MessageBusLike {
    * Deliver a message from the main thread into a local object's mailbox.
    */
   deliverFromMain(message: AbjectMessage): void {
+    // A request we sent straight to a peer can still be answered through
+    // main — whenever the peer does not know where WE live, its reply takes
+    // the main-thread fallback. Clearing here as well as on the direct path
+    // is what keeps peerInFlight from retaining a full message per request
+    // for the life of the worker.
+    this.clearPeerInFlight(message);
     const recipient = message.routing.to;
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
@@ -183,9 +208,7 @@ export class WorkerBus implements MessageBusLike {
    * Deliver a message from a peer worker via direct MessagePort.
    */
   deliverFromPeer(message: AbjectMessage): void {
-    if ((message.header.type === 'reply' || message.header.type === 'error') && message.header.correlationId) {
-      this.peerInFlight.delete(message.header.correlationId);
-    }
+    this.clearPeerInFlight(message);
     const recipient = message.routing.to;
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
@@ -194,6 +217,29 @@ export class WorkerBus implements MessageBusLike {
       return;
     }
     mailbox.send(message);
+  }
+
+  /**
+   * An answer arrived: the request it answers is no longer in flight,
+   * whichever path it came home by.
+   */
+  private clearPeerInFlight(message: AbjectMessage): void {
+    if (message.header.type !== 'reply' && message.header.type !== 'error') return;
+    if (!message.header.correlationId) return;
+    this.peerInFlight.delete(message.header.correlationId);
+  }
+
+  /**
+   * Drop entries past the TTL. Insertion order is `at` order — ids are
+   * unique per message, so nothing is ever re-inserted and moved to the
+   * back — which means the walk can stop at the first entry still inside
+   * the window, making this O(1) amortised per send.
+   */
+  private sweepPeerInFlight(now: number): void {
+    for (const [id, entry] of this.peerInFlight) {
+      if (now - entry.at <= WorkerBus.PEER_IN_FLIGHT_TTL_MS) break;
+      this.peerInFlight.delete(id);
+    }
   }
 
   /**

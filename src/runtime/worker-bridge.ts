@@ -188,11 +188,20 @@ export class WorkerBridge {
     }
     if (message.header.type === 'request') {
       const now = Date.now();
+      // Age entries out on every insert, not only once the map is full:
+      // gating the sweep on the cap left the TTL dead below it, so a reply
+      // that came home worker-to-worker (never passing through here) kept
+      // its request message alive until 20k others had piled up behind it.
+      // Insertion order is `at` order, so the walk stops at the first entry
+      // still inside the window.
+      for (const [id, entry] of this.inFlight) {
+        if (now - entry.at <= WorkerBridge.IN_FLIGHT_TTL_MS) break;
+        this.inFlight.delete(id);
+      }
+      // The cap stays as the backstop for a burst inside one TTL window.
       if (this.inFlight.size >= WorkerBridge.IN_FLIGHT_MAX) {
-        for (const [id, entry] of this.inFlight) {
-          if (now - entry.at > WorkerBridge.IN_FLIGHT_TTL_MS || this.inFlight.size >= WorkerBridge.IN_FLIGHT_MAX) this.inFlight.delete(id);
-          else break;
-        }
+        const oldest = this.inFlight.keys().next().value;
+        if (oldest !== undefined) this.inFlight.delete(oldest);
       }
       this.inFlight.set(message.header.messageId, { message, at: now });
     }
@@ -272,7 +281,9 @@ export class WorkerBridge {
    * Notify this worker that an object has been placed in a peer worker.
    */
   sendPeerPlace(objectId: AbjectId, workerIndex: number): void {
-    this.worker.postMessage({ type: 'peer:place', objectId, workerIndex } as WorkerInboundMessage);
+    if (this._dead) return;
+    try { this.worker.postMessage({ type: 'peer:place', objectId, workerIndex } as WorkerInboundMessage); }
+    catch { /* worker going down */ }
   }
 
   /** Tell this worker that a peer worker died: fail what it was waiting on there. */
@@ -286,7 +297,9 @@ export class WorkerBridge {
    * Notify this worker that an object has been removed from a peer worker.
    */
   sendPeerRemove(objectId: AbjectId): void {
-    this.worker.postMessage({ type: 'peer:remove', objectId } as WorkerInboundMessage);
+    if (this._dead) return;
+    try { this.worker.postMessage({ type: 'peer:remove', objectId } as WorkerInboundMessage); }
+    catch { /* worker going down */ }
   }
 
   /**
@@ -296,6 +309,10 @@ export class WorkerBridge {
     this.terminating = true;
     this.worker.terminate();
     this.hostedObjects.clear();
+    // Nothing will answer what was inside it, and a terminated bridge that
+    // keeps its in-flight map retains every one of those request payloads
+    // until the bridge itself is collected.
+    this.inFlight.clear();
 
     // Reject pending operations
     for (const [, pending] of this.pendingSpawns) {

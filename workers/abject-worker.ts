@@ -91,6 +91,10 @@ constructors.set('ScriptableAbject', (args?: unknown) => {
 // Worker state
 const workerBus = new WorkerBus();
 const objects = new Map<AbjectId, Abject>();
+// An object that stops itself leaves the bus but was never removed from
+// here, because only an explicit `kill` from main did that — leaving it
+// unreachable and still fully retained. Release it on unregister.
+workerBus.onUnregistered = (objectId) => { objects.delete(objectId); };
 
 /**
  * Spawn an object inside this worker.
@@ -121,11 +125,16 @@ async function spawnObject(
       obj.setRegistryHint(registryId);
     }
 
-    await obj.init(workerBus, parentId);
+    // Held before init, not after: an object that stops itself partway
+    // through starting unregisters from the bus, and onUnregistered has to
+    // find it here to release it. Setting it afterwards would re-add the
+    // corpse the hook had just dropped.
     objects.set(objectId, obj);
+    await obj.init(workerBus, parentId);
 
     self.postMessage({ type: 'spawned', objectId });
   } catch (err) {
+    objects.delete(objectId);
     self.postMessage({
       type: 'error',
       objectId,

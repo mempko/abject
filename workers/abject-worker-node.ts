@@ -261,6 +261,13 @@ process.on('unhandledRejection', (reason) => {
 // Worker state — pass parentPort.postMessage so WorkerBus routes via worker_threads
 const workerBus = new WorkerBus((data) => port.postMessage(data));
 const objects = new Map<AbjectId, Abject>();
+// An object that stops itself — a widget torn down with its window, a
+// Supervisor restart, a workspace switch — leaves the bus but was never
+// removed from here, because only an explicit `kill` from main did that.
+// It was then unreachable and still fully retained, with its state,
+// handlers, dependents and every closure they captured. Releasing it on
+// unregister is what makes a stopped object actually collectable.
+workerBus.onUnregistered = (objectId) => { objects.delete(objectId); };
 
 /**
  * Spawn an object inside this worker.
@@ -291,11 +298,16 @@ async function spawnObject(
       obj.setRegistryHint(registryId);
     }
 
-    await obj.init(workerBus, parentId);
+    // Held before init, not after: an object that stops itself partway
+    // through starting unregisters from the bus, and onUnregistered has to
+    // find it here to release it. Setting it afterwards would re-add the
+    // corpse the hook had just dropped.
     objects.set(objectId, obj);
+    await obj.init(workerBus, parentId);
 
     port.postMessage({ type: 'spawned', objectId });
   } catch (err) {
+    objects.delete(objectId);
     port.postMessage({
       type: 'error',
       objectId,

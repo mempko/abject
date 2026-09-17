@@ -92,14 +92,41 @@ export class WorkerPool {
     // can reach them.
     bridge.onLocalRegistered = (objectId) => {
       this.objectToBridge.set(objectId, bridge);
+      // Tell the other workers where it lives, exactly as spawnInWorker does
+      // for objects the pool placed itself. Without this a worker-local
+      // object — every window and widget WidgetManager news up, the largest
+      // population in the system — is absent from its peers' routing tables,
+      // so their sends fall back to the main thread and the reply comes home
+      // that way too. That is the one path that cannot clear the sender's
+      // peerInFlight entry, which is how an idle worker accumulated a
+      // retained request message per call until it hit its heap ceiling.
+      this.placeInPeers(objectId, bridge, index);
     };
     bridge.onLocalUnregistered = (objectId) => {
       if (this.objectToBridge.get(objectId) === bridge) {
         this.objectToBridge.delete(objectId);
       }
+      // Symmetry matters more than the placement itself: a stale entry points
+      // a direct MessagePort at an object that is gone, and the caller waits
+      // out its full timeout instead of failing against main immediately.
+      for (const b of this.bridges) if (b !== bridge) b.sendPeerRemove(objectId);
     };
     bridge.onDead = (code, lost) => { void this.handleWorkerDeath(index, bridge, code, lost); };
     return bridge;
+  }
+
+  /**
+   * Announce an object's placement to every worker except the one hosting it.
+   *
+   * `index` is the owner's slot rather than `bridges.indexOf(bridge)`: a
+   * replacement bridge is built and can register objects before it is stored
+   * back into `bridges`, and indexOf would report -1 for it during exactly
+   * that window.
+   */
+  private placeInPeers(objectId: AbjectId, owner: WorkerBridge, index: number): void {
+    for (const b of this.bridges) {
+      if (b !== owner) b.sendPeerPlace(objectId, index);
+    }
   }
 
   /**
