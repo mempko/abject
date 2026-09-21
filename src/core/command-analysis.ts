@@ -483,6 +483,22 @@ function lex(input: string): LexResult {
       if (input[i + 1] === '>') i++;
       continue;
     }
+    // `2>&1` — the `&1` is the redirect's target file descriptor, not a
+    // control operator. Treating the `&` as one split the segment and left
+    // the `1` to lex as a program, so every command using stderr redirection
+    // reported a program named "1": nonsense in the permission dialog, and
+    // impossible to put on an allow list, which meant such a command could
+    // never be pre-approved however it was granted. `1>&2` was worse — the
+    // phantom `2` became the segment's principal program.
+    if (c === '&' && pendingRedirect && /^[0-9-]$/.test(next)) {
+      let j = i + 1;
+      while (j < input.length && /^[0-9]$/.test(input[j])) j++;
+      if (input[j] === '-') j++;
+      items.push({ kind: 'redirect', op: pendingRedirect, target: { text: `&${input.slice(i + 1, j)}`, hasVariable: false, fullyQuoted: false } });
+      pendingRedirect = undefined;
+      i = j - 1;
+      continue;
+    }
     if (c === '&') { pushOp(';'); continue; }
 
     if (c === '>' || c === '<') {
@@ -637,6 +653,10 @@ function classifySegment(
 
   let redirectWrite = false;
   for (const r of redirects) {
+    // `2>&1` points one file descriptor at another. Nothing is opened and no
+    // path is touched, so it is neither a read nor a write — counting it as a
+    // write would make every `cmd 2>&1` look like it modifies the filesystem.
+    if (r.target?.text.startsWith('&')) continue;
     if (r.op.includes('<')) {
       if (r.target) reads.push(resolveTouched(r.target, cwd));
       continue;

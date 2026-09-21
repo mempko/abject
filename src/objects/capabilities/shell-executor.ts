@@ -19,6 +19,7 @@ import { truncateTail, droppedNotice, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } fro
 import { Log } from '../../core/timed-log.js';
 import { isInsideAny } from '../../core/path-scope.js';
 import { analyzeCommand, isCredentialVarName } from '../../core/command-analysis.js';
+import type { CommandAnalysis } from '../../core/command-analysis.js';
 
 interface PlatformInfo {
   os: string;
@@ -154,6 +155,55 @@ export class ShellExecutor extends Abject {
   private permissionsAuthorityId?: AbjectId;
   /** Per-skill command whitelists (command name only, no args). */
   private skillAllowedCommands: Map<string, Set<string>> = new Map();
+  /** Programs a skill declares by being installed and enabled, as opposed to
+   *  ones the user granted through a dialog. Set by SkillRegistry. */
+  private skillDeclaredCommands: Map<string, Set<string>> = new Map();
+
+  /**
+   * Text utilities that shape output without reaching anything.
+   *
+   * A skill's command is rarely the bare program: an agent writes
+   * `<tool> status | head -40` or pipes through `echo` for a separator. With
+   * every program needing its own grant, one `head` in the line put the whole
+   * thing back in front of the user, which made a skill grant worth very
+   * little in practice. These read stdin and write stdout — the paths a
+   * command touches are still analysed separately, and this list only applies
+   * where the analysis already found no writes and no danger.
+   */
+  private static readonly INERT_FILTERS = new Set([
+    'echo', 'printf', 'head', 'tail', 'cat', 'wc', 'sort', 'uniq',
+    'cut', 'tr', 'rev', 'column', 'fold', 'nl', 'true', 'false',
+  ]);
+
+  /**
+   * Whether a skill's own installation covers this command.
+   *
+   * Every clause is a guard the user already set: the skill is enabled
+   * (declared), the command is legible (not opaque), it changes nothing
+   * (no writes, not dangerous), and it runs outside an untrusted project.
+   * The broker checks separately that the caller really is SkillAgent.
+   */
+  private skillPreapproves(
+    skillName: string | undefined,
+    untrusted: boolean | undefined,
+    analysis: CommandAnalysis,
+    programs: string[],
+  ): boolean {
+    if (untrusted || !skillName || analysis.opaque) return false;
+    if (analysis.effect === 'dangerous' || analysis.writes.length > 0) return false;
+    if (programs.length === 0) return false;
+    const declared = this.skillDeclaredCommands.get(skillName);
+    const granted = this.skillAllowedCommands.get(skillName);
+    if (!declared?.size && !granted?.size) return false;
+    // At least one program must be the skill's own; the rest may be filters.
+    // Otherwise "echo hi" would ride in on any enabled skill.
+    let sawSkillProgram = false;
+    for (const program of programs) {
+      if (declared?.has(program) || granted?.has(program)) { sawSkillProgram = true; continue; }
+      if (!ShellExecutor.INERT_FILTERS.has(program)) return false;
+    }
+    return sawSkillProgram;
+  }
   /** Per-calling-object command whitelists (command name only, no args). */
   private objectAllowedCommands: Map<string, Set<string>> = new Map();
   /** Per-calling-object blocklists; outrank every allow list. */
@@ -338,6 +388,34 @@ export class ShellExecutor extends Abject {
       return { success: true };
     });
 
+    /**
+     * The programs a skill declares by existing.
+     *
+     * Enabling a skill is the user's decision that this machine may run it,
+     * and a skill named `foo` is there to drive the tool `foo` — so asking
+     * again, the first time it runs, asks them to confirm what they just
+     * did. This is narrow on purpose: the skill's own name, not a general
+     * grant, and it only ever reaches the skill-preapproval path, which
+     * additionally requires an authenticated SkillAgent caller, a local
+     * access mode, and a command that is neither opaque nor dangerous.
+     *
+     * Only SkillRegistry may set this, because only SkillRegistry knows what
+     * the user actually enabled.
+     */
+    this.on('setSkillCommands', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== await this.discoverDep('SkillRegistry')) return { success: false, error: 'Only SkillRegistry may declare skill commands' };
+      const { skills } = msg.payload as { skills: Array<{ name: string; commands?: string[] }> };
+      this.skillDeclaredCommands.clear();
+      for (const skill of skills ?? []) {
+        const programs = new Set<string>([skill.name, ...(skill.commands ?? [])]
+          .map(c => c.trim())
+          .filter(c => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(c)));
+        if (programs.size > 0) this.skillDeclaredCommands.set(skill.name, programs);
+      }
+      log.info(`setSkillCommands: ${this.skillDeclaredCommands.size} skills declare programs`);
+      return { success: true };
+    });
+
     this.on('setDefaultCwd', async (msg: AbjectMessage) => {
       const { cwd } = msg.payload as { cwd?: string };
       if (cwd) {
@@ -407,10 +485,15 @@ export class ShellExecutor extends Abject {
     // Validate command (may prompt user)
     const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
     // A skill name describes the request; it cannot select a different permission path.
-    const { restrictEnv, permission } = await this.validateCommand(fullCommand, {
+    const { restrictEnv, permission, skillCovered } = await this.validateCommand(fullCommand, {
       callerId, taskId: req.taskId, usesShell: !!req.shell, cwd, untrusted: req.untrusted === true, skillName: req.skillName,
     });
-    await this.validatePath(cwd, callerId, req.taskId);
+    // A command the skill grant already covers still has to start SOMEWHERE.
+    // Asking separately about the directory it starts in turns one approval
+    // into two questions and leaves the grant unable to do its job, so the
+    // same coverage carries to the working directory.
+    await this.validatePath(cwd, callerId, req.taskId,
+      skillCovered ? { skillName: req.skillName, skillPreapproved: true } : undefined);
 
     // Build environment: process env + skill env + per-request env.
     //
@@ -438,7 +521,7 @@ export class ShellExecutor extends Abject {
   private async validateCommand(
     fullCommand: string,
     opts: { callerId?: AbjectId; taskId?: string; usesShell: boolean; cwd?: string; untrusted?: boolean; skillName?: string },
-  ): Promise<{ restrictEnv: boolean; permission?: PermissionReceipt }> {
+  ): Promise<{ restrictEnv: boolean; permission?: PermissionReceipt; skillCovered?: boolean }> {
     const trimmed = fullCommand.trim();
 
     const receipt = (decision: string, reason: string): PermissionReceipt => ({
@@ -475,6 +558,8 @@ export class ShellExecutor extends Abject {
     // Standing permissions answer for trusted ground only. In an untrusted
     // project every command is put to the authority, whose project autonomy
     // for such a directory is "ask", so the user sees each one.
+    const skillCovered = this.skillPreapproves(opts.skillName, opts.untrusted, analysis, programs);
+
     let preapproved = false;
     if (!opts.untrusted) {
       if (this.allowedCommands?.has(trimmed)) preapproved = true;
@@ -497,8 +582,7 @@ export class ShellExecutor extends Abject {
       const response = await this.request<{ decision: string; asked?: boolean; restrictEnv?: boolean; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'shell', preapproved, physicalPaths, skillName: opts.skillName,
-          skillPreapproved: !opts.untrusted && !!opts.skillName && !analysis.opaque && analysis.effect !== 'dangerous'
-            && programs.length > 0 && programs.every(program => this.skillAllowedCommands.get(opts.skillName!)?.has(program)),
+          skillPreapproved: skillCovered,
           resource: trimmed,
           description: callerName
             ? `${callerName} wants to run${opts.untrusted ? ' (in an UNTRUSTED project)' : ''}:`
@@ -525,11 +609,11 @@ export class ShellExecutor extends Abject {
       // The authority says whether this ran on policy alone. If it did, the
       // command goes without the host's credentials.
       if (response.decision?.startsWith('accept')) {
-        return { restrictEnv: response.restrictEnv === true, permission: response.receipt };
+        return { restrictEnv: response.restrictEnv === true, permission: response.receipt, skillCovered };
       }
       throw new PermissionDenied(response.receipt ?? receipt(response.decision, 'Shell permission denied by authority'));
     }
-    if (preapproved) return { restrictEnv: false, permission: receipt('accept_once', 'Configured shell grant') };
+    if (preapproved) return { restrictEnv: false, permission: receipt('accept_once', 'Configured shell grant'), skillCovered };
     throw new PermissionDenied(receipt('deny', `Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`));
   }
 
@@ -539,13 +623,19 @@ export class ShellExecutor extends Abject {
    *        and which workspace the caller lives in, and an anonymous request
    *        can be answered only by asking a human.
    */
-  private async validatePath(cwd: string, callerId?: AbjectId, taskId?: string): Promise<void> {
+  private async validatePath(
+    cwd: string,
+    callerId?: AbjectId,
+    taskId?: string,
+    skill?: { skillName?: string; skillPreapproved: boolean },
+  ): Promise<void> {
     const roots = await physicalGrantRoots(this.allowedPaths ?? []);
     const preapproved = isInsideAny(roots, cwd);
     if (this.permissionsAuthorityId) {
       const response = await this.request<{ decision: string; receipt?: PermissionReceipt }>(
         request(this.id, this.permissionsAuthorityId, 'requestPermission', {
           type: 'directory', operation: 'read', resource: cwd, callerId, taskId, preapproved,
+          ...(skill ?? {}),
           description: `Shell working directory: ${cwd}`,
         }), PERMISSION_WAIT_MS);
       if (response.decision.startsWith('accept')) return;

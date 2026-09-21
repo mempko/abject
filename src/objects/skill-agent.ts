@@ -32,6 +32,14 @@ const SKILL_AGENT_INTERFACE: InterfaceId = 'abjects:skill-agent';
  */
 const PERMISSION_AWARE_TIMEOUT = 180000;
 
+/**
+ * Characters of each skill's description carried into this agent's roster
+ * line. Long enough for a skill to say what it actually does — a planner
+ * choosing between agents has nothing else to go on — while keeping a
+ * dozen skills from crowding out the rest of the roster.
+ */
+const SKILL_SUMMARY_CHARS = 180;
+
 /** Show enough of a secret to confirm which value is set, never the value. */
 function maskSecret(value: string): string {
   if (!value) return '(unset)';
@@ -48,9 +56,25 @@ interface TaskExtra {
    * handler's cleanup used to wipe the new task's goal context.
    */
   goalId?: string;
+  /**
+   * Skills this task has loaded, most recent last.
+   *
+   * The permission layer grants a skill's own programs on the strength of
+   * the user having enabled it, and it keys that grant by skill name — so
+   * the exec has to say which skill it is running. Sending a constant
+   * instead looked up a skill nobody installed and every command fell
+   * through to a dialog, however the real skill had been granted.
+   */
+  loadedSkills?: string[];
 }
 
 export class SkillAgent extends Abject {
+  /** Attempts to publish the skill list before giving up until the next
+   *  skill change. The only cause of a rejection is the object's own
+   *  registration not having landed yet, so a few short retries cover it. */
+  private static readonly REGISTRY_PUBLISH_RETRIES = 4;
+  private static readonly REGISTRY_PUBLISH_RETRY_MS = 250;
+
   private agentAbjectId?: AbjectId;
   private shellExecutorId?: AbjectId;
   private httpClientId?: AbjectId;
@@ -390,6 +414,25 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     // Always append the authoring-exclusion so dispatch never mistakes "wrap
     // a skill in a new object" for a skill-execution task.
     const AUTHORING_EXCLUSION = 'Best for exercising an installed skill or MCP tool to complete the task. Object authoring (widgets, apps, agents, bridges, proxies, relays, skill wrappers) belongs with a creation agent, including when the new object would wrap a skill or MCP server handled here.';
+    /**
+     * A skill's line in the team roster. This is the ONLY thing a planner
+     * sees when deciding whether this agent covers a request, so it has to
+     * survive the cut: an 80-char slice through the middle of a word threw
+     * away the half of chief's description that said it queries live state,
+     * leaving a fragment about "investigating evidence" that read as a poor
+     * match for "get me chief status" — and the goal went elsewhere.
+     */
+    const summarizeSkill = (text: string): string => {
+      const clean = text.replace(/\s+/g, ' ').trim();
+      if (clean.length <= SKILL_SUMMARY_CHARS) return clean;
+      // Cut on a word boundary and mark it, rather than stopping at the
+      // first sentence: a description's later clauses are often the
+      // specific ones, and trading them for a tidy full stop is how the
+      // clause that would have matched the request goes missing.
+      const window = clean.slice(0, SKILL_SUMMARY_CHARS);
+      const space = window.lastIndexOf(' ');
+      return `${(space > 0 ? window.slice(0, space) : window).replace(/[,;:.]$/, '')}…`;
+    };
     let description = `Executes tasks only when they match an installed skill. ${AUTHORING_EXCLUSION}`;
     const skillNames: string[] = [];
 
@@ -400,7 +443,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         );
         if (skills.length > 0) {
           skillNames.push(...skills.map(s => s.name));
-          description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}. ${AUTHORING_EXCLUSION}`;
+          description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${summarizeSkill(s.description)})`).join('; ')}. ${AUTHORING_EXCLUSION}`;
           this.installedSkillDescriptions = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
         } else {
           description = `Skill execution agent (no skills currently enabled). ${AUTHORING_EXCLUSION}`;
@@ -422,6 +465,52 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         queueName: `skill-agent-${this.id}`,
       },
     }));
+
+    await this.publishDescriptionToRegistry(description, skillNames);
+  }
+
+  /**
+   * Publish the live skill list to the Registry as well as the agent roster.
+   *
+   * These are two different catalogs read by two different kinds of caller.
+   * The roster reaches planners through their `team` block; the Registry's
+   * catalog is what `Registry.ask` reasons over and what every non-planner —
+   * a chat turn, a sandboxed job, any object doing discovery — can see. With
+   * the manifest left at its static text, a skill installed at runtime exists
+   * in one catalog and not the other, so "who handles <skill>?" asked through
+   * the Registry has nothing to find and comes back as "no such object".
+   *
+   * Best-effort: discovery degrades to the static description, which is how
+   * it behaved before, so a Registry that is slow or absent never blocks
+   * registration.
+   */
+  private async publishDescriptionToRegistry(description: string, skillNames: string[], attempt = 0): Promise<void> {
+    try {
+      const registryId = await this.resolveRegistryId();
+      if (!registryId) return;
+      const accepted = await this.request<boolean>(request(this.id, registryId, 'updateManifest', {
+        objectId: this.id,
+        manifest: {
+          ...this.manifest,
+          description,
+          // Skill names as tags too: `search` ranks a tag hit above a
+          // description hit, so an exact-name query for an installed skill
+          // finds this agent without depending on prose matching.
+          tags: [...new Set([...(this.manifest.tags ?? []), ...skillNames.map(n => n.toLowerCase())])],
+        },
+      }));
+      // `false` means the Registry has no entry for this object yet. The
+      // first publish runs from onInit, which finishes BEFORE the factory
+      // registers the object, so the opening attempt normally lands here and
+      // the catalog would keep the static description until some skill
+      // happened to change. Retry briefly rather than wait for that.
+      if (!accepted && attempt < SkillAgent.REGISTRY_PUBLISH_RETRIES) {
+        this.setTimer(() => { void this.publishDescriptionToRegistry(description, skillNames, attempt + 1); },
+          SkillAgent.REGISTRY_PUBLISH_RETRY_MS * (attempt + 1));
+      }
+    } catch (err) {
+      log.warn(`Could not publish skill list to the Registry: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -478,6 +567,23 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     return { observation: lastResult + skillState, tier };
   }
 
+  /**
+   * Which loaded skill a shell command is running on behalf of.
+   *
+   * A task may have loaded several. Prefer the one the command actually
+   * invokes — its name appearing as a bare word is the strong signal, since
+   * a CLI-backed skill is named after its command — and otherwise the most
+   * recently loaded, which is the one whose instructions were just read.
+   * Undefined when nothing has been loaded: the exec then carries no skill
+   * claim at all rather than a false one, and the user is asked as before.
+   */
+  private static skillForCommand(command: string, loaded: string[] | undefined): string | undefined {
+    if (!loaded?.length) return undefined;
+    const named = loaded.find(name =>
+      new RegExp(String.raw`(^|[\s;|&(])${name.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')}([\s;|&)]|$)`).test(command));
+    return named ?? loaded[loaded.length - 1];
+  }
+
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
@@ -504,7 +610,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               args: action.args as string[] | undefined,
               shell: true,
               timeout: 30000,
-              skillName: 'skill-agent',
+              skillName: SkillAgent.skillForCommand(command, extra.loadedSkills),
             }),
             PERMISSION_AWARE_TIMEOUT,
           );
@@ -729,6 +835,13 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           const enabled = await this.request<EnabledSkillSummary[]>(request(this.id, this.skillRegistryId, 'getEnabledSkills', {}));
           const skill = enabled.find(s => s.name === action.name);
           if (!skill) return { success: false, error: 'Skill is not enabled; Ask SkillRegistry about availability' };
+          // Remember it: a later shell command in this task runs on behalf of
+          // this skill, and the permission layer needs its name to find the
+          // grant the user made by enabling it.
+          const loaded = (extra.loadedSkills ??= []);
+          const already = loaded.indexOf(skill.name);
+          if (already >= 0) loaded.splice(already, 1);
+          loaded.push(skill.name);
           result = `Skill ${skill.name}: ${skill.description}\n${skill.instructions ?? '(no instructions)'}`;
           break;
         }
@@ -1081,9 +1194,11 @@ When using curl, use -s (silent) and pipe JSON through jq.
         );
         if (skills.length > 0) {
           prompt += '\n## Enabled Skills\n\n';
+          prompt += 'When a task names one of these, or asks for something one of them covers, **your first action is `load_skill` for it**. The line below each name is a one-sentence summary written for a roster; the skill\'s own instructions say what it actually is, how it is invoked, and what it can report, and you cannot plan the task properly without them. Loading costs one step and settles what the rest of the task should be.\n\n';
+          prompt += 'A task about the state of something a skill covers is answered BY that skill — run it and report what it says. It is not answered by investigating this system: searching the registry for an object of that name, reading logs, or asking agents about themselves tells you about Abjects, not about the thing the user asked after. If the skill turns out not to cover it, say so from what the skill reported.\n\n';
           for (const skill of skills) {
             prompt += `### ${skill.name}\n${skill.description}\n`;
-            prompt += `Load instructions when needed: {"action":"load_skill","name":${JSON.stringify(skill.name)}}\n\n`;
+            prompt += `Load its instructions: {"action":"load_skill","name":${JSON.stringify(skill.name)}}\n\n`;
 
             // Show configured env vars (masked)
             if (skill.env) {

@@ -676,6 +676,16 @@ export class PermissionBroker extends Abject {
       this.record(req, ctx, 'accept_once', false, `Standing filesystem ${operation} grant`, project);
       return { decision: 'accept_once', asked: false };
     }
+    // The working directory of a command the skill grant already covers. The
+    // command was approved on the strength of the user enabling the skill,
+    // and a process has to start somewhere — asking about that separately
+    // splits one decision into two prompts and answers neither better. Read
+    // only, and only for a caller the skill check authenticated as the skill
+    // agent; a write still goes through everything below.
+    if (operation === 'read' && req.skillPreapproved && req.skillAuthenticated && ctx.accessMode === 'local' && (!project || project.trusted)) {
+      this.record(req, ctx, 'accept_once', false, 'working directory of a command the enabled skill covers', project);
+      return { decision: 'accept_once', asked: false };
+    }
     if (project) {
       const effective = this.effectiveLevel(ctx, project);
       const required = operation === 'write' ? 'edit' : 'read';

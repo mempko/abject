@@ -118,7 +118,7 @@ export class SkillRegistry extends Abject {
             },
             {
               name: 'installSkill',
-              description: 'Install a skill by writing SKILL.md to disk',
+              description: "Install a skill for this system by writing SKILL.md into the one skills directory this registry scans. This is what makes a skill available here — a vendor's own `<tool> skill --install` writes into other harnesses' directories, which are never scanned, so it installs nothing here. Pass the SKILL.md text; follow with enableSkill.",
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill directory name' },
                 { name: 'content', type: { kind: 'primitive', primitive: 'string' }, description: 'SKILL.md file content' },
@@ -256,10 +256,9 @@ export class SkillRegistry extends Abject {
     // disabled skills, so they can be bridged natively instead of shelled out to.
     await this.importHostMcpServers();
 
-    this.shellExecutorId = await this.discoverDep('ShellExecutor') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
     this.secretsVaultId = await this.discoverDep('SecretsVault') ?? undefined;
-    await this.pushEnvToShell();
+    await this.pushSkillStateToShell();
 
     // Auto-start any MCP servers that were previously enabled — in the
     // BACKGROUND. Each MCP server boots an external process (npm/npx startup
@@ -308,6 +307,20 @@ print why they refused to start. Read it before investigating anything else.
 
   await call(await dep('SkillRegistry'), 'installSkill', { name: 'my-skill', content: '---\\nname: my-skill\\n---\\nInstructions...' });
   await call(await dep('SkillRegistry'), 'uninstallSkill', { name: 'my-skill' });
+
+\`installSkill\` takes the SKILL.md **content as a string** and writes it into
+the one directory this registry scans. That call is what makes a skill exist
+here: a skill is installed for this system when it appears in \`listSkills\`,
+and nowhere else counts.
+
+This matters when a tool ships its own installer. A vendor command such as
+\`<tool> skill --install\` writes SKILL.md into the skill directories of other
+agent harnesses, which this registry never reads — so it completes
+successfully and leaves nothing installed here. To install a skill that a
+vendor tool provides, obtain the SKILL.md text (the same command usually
+prints it, or it can be read from wherever the vendor installer put it) and
+pass that text to \`installSkill\`, then \`enableSkill\`. Call \`listSkills\` or
+\`getSkill\` afterwards to confirm it landed.
 
 ### Get enabled skill summaries (for prompt injection)
 
@@ -1008,9 +1021,63 @@ whenever the skill set changes.
     } catch { /* best effort */ }
   }
 
-  /** Collect env vars from all enabled skills and push to ShellExecutor. */
-  private async pushEnvToShell(): Promise<void> {
-    if (!this.shellExecutorId) return;
+  /**
+   * ShellExecutor's id, resolved when it is first needed rather than once at
+   * init.
+   *
+   * This registry initialises early, before ShellExecutor is discoverable, so
+   * a single lookup at startup came back empty and every later push returned
+   * at the door — silently, forever, because nothing retried. Skill
+   * environment variables and skill command grants both travel this path, so
+   * both were being assembled and then dropped.
+   */
+  private async resolveShellExecutor(): Promise<AbjectId | undefined> {
+    this.shellExecutorId ??= await this.discoverDep('ShellExecutor') ?? undefined;
+    return this.shellExecutorId;
+  }
+
+  /** Boot attempts before leaving the push to the next skill change. The
+   *  budget is deliberately generous: ShellExecutor was measured appearing
+   *  around ten seconds after this registry is ready, and a boot slower than
+   *  the budget leaves every already-enabled skill ungranted for the whole
+   *  session, since nothing else pushes unless the user toggles something.
+   *  Each attempt stops the chain as soon as it resolves, so the only cost
+   *  of a wide budget is a few timers on a machine with no shell at all. */
+  private static readonly SHELL_PUSH_RETRIES = 12;
+  private static readonly SHELL_PUSH_RETRY_MS = 750;
+
+  /**
+   * Send the enabled skills' environment and command grants to ShellExecutor,
+   * waiting for it to exist.
+   *
+   * At boot this registry is ready well before ShellExecutor, so the first
+   * attempt finds nothing. Retrying on a short backoff is what makes a skill
+   * usable in the session it was enabled in, rather than only after the user
+   * happens to toggle something.
+   */
+  private async pushSkillStateToShell(attempt = 0): Promise<void> {
+    if (await this.pushEnvToShell()) return;
+    if (attempt < SkillRegistry.SHELL_PUSH_RETRIES) {
+      this.setTimer(() => { void this.pushSkillStateToShell(attempt + 1); },
+        SkillRegistry.SHELL_PUSH_RETRY_MS * (attempt + 1));
+    } else {
+      log.warn('Could not publish skill env and command grants to ShellExecutor; skills will prompt for every command until one is enabled or disabled');
+    }
+  }
+
+  /**
+   * Collect env vars from all enabled skills and push to ShellExecutor.
+   *
+   * Returns whether the push actually landed. ShellExecutor authorises these
+   * by resolving this registry's id and comparing senders, and at boot it
+   * cannot resolve anything yet — so it answers `{success:false}`, which is a
+   * perfectly successful REPLY and never reaches a catch block. Reading the
+   * reply is the only way to tell a delivered grant from a refused one, and
+   * without it the whole thing failed silently for the entire session.
+   */
+  private async pushEnvToShell(): Promise<boolean> {
+    const shellId = await this.resolveShellExecutor();
+    if (!shellId) return false;
     const merged: Record<string, string> = {};
     for (const [name, entry] of this.skills) {
       if (!entry.enabled) continue;
@@ -1019,11 +1086,43 @@ whenever the skill set changes.
         Object.assign(merged, config.env);
       }
     }
+    let ok = false;
     try {
-      await this.request(
-        request(this.id, this.shellExecutorId, 'setSkillEnv', { env: merged }),
+      const reply = await this.request<{ success?: boolean }>(
+        request(this.id, shellId, 'setSkillEnv', { env: merged }),
       );
+      ok = reply?.success !== false;
     } catch { /* ShellExecutor may not be ready */ }
+    return (await this.pushCommandsToShell()) && ok;
+  }
+
+  /**
+   * Tell ShellExecutor which programs the enabled skills stand behind.
+   *
+   * Enabling a skill is the user's decision that this machine may run that
+   * tool; without this the decision stopped at the registry and the first
+   * command still interrupted them to ask. Sent on the same occasions as the
+   * environment, so the two never disagree about what is enabled.
+   */
+  private async pushCommandsToShell(): Promise<boolean> {
+    const shellId = await this.resolveShellExecutor();
+    if (!shellId) return false;
+    const skills: Array<{ name: string; commands?: string[] }> = [];
+    for (const [name, entry] of this.skills) {
+      if (!entry.enabled) continue;
+      // The skill's own name is the program it exists to drive. Its parsed
+      // `allowed-tools` are harness tool names ("Bash", "Read"), not shell
+      // programs, so they are deliberately not treated as grants here.
+      const mcp = entry.parsed?.mcpServer?.command;
+      skills.push({ name, commands: mcp ? [mcp] : undefined });
+    }
+    try {
+      const reply = await this.request<{ success?: boolean }>(
+        request(this.id, shellId, 'setSkillCommands', { skills }),
+      );
+      return reply?.success !== false;
+    } catch { /* ShellExecutor may not be ready */ }
+    return false;
   }
 
   // ─── Helpers ────────────────────────────────────────────────────
