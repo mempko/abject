@@ -15,8 +15,10 @@ import {
   ContentPart,
   EffortLevel,
   CacheProfile,
+  ContextOverflowError,
   defaultIsRetryable,
   getTextContent,
+  isContextOverflowMessage,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -346,10 +348,10 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   private fallbackModels(): ModelInfo[] {
     return [
-      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', vision: true },
-      { id: 'claude-fable-5', name: 'Claude Fable 5', vision: true },
-      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', vision: true },
-      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', vision: true },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', vision: true, contextWindow: 200_000 },
+      { id: 'claude-fable-5', name: 'Claude Fable 5', vision: true, contextWindow: 200_000 },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', vision: true, contextWindow: 200_000 },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', vision: true, contextWindow: 200_000 },
     ];
   }
 
@@ -584,7 +586,13 @@ export class AnthropicProvider extends BaseLLMProvider {
           detail = parsed.error.type ? `${parsed.error.type}: ${parsed.error.message}` : parsed.error.message;
         }
       } catch { /* not JSON — use raw text */ }
-      throw new Error(`Anthropic API error: ${response.status}${detail ? ` — ${detail.slice(0, 500)}` : ''}`);
+      const summary = `Anthropic API error: ${response.status}${detail ? ` — ${detail.slice(0, 500)}` : ''}`;
+      // A length rejection is recoverable by compacting and retrying; every
+      // other 400 is not. Only the boundary can tell them apart.
+      if (response.status === 400 && isContextOverflowMessage(detail)) {
+        throw new ContextOverflowError(summary, 'anthropic');
+      }
+      throw new Error(summary);
     }
 
     const reader = response.body?.getReader();

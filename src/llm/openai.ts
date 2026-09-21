@@ -15,8 +15,10 @@ import {
   ContentPart,
   EffortLevel,
   CacheProfile,
+  ContextOverflowError,
   EmptyCompletionError,
   defaultIsRetryable,
+  isContextOverflowMessage,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -342,9 +344,9 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   protected fallbackModels(): ModelInfo[] {
     return [
-      { id: 'gpt-5.4', name: 'GPT-5.4', vision: true },
-      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', vision: true },
-      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano', vision: true },
+      { id: 'gpt-5.4', name: 'GPT-5.4', vision: true, contextWindow: 400_000 },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', vision: true, contextWindow: 400_000 },
+      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano', vision: true, contextWindow: 400_000 },
     ];
   }
 
@@ -641,7 +643,12 @@ export class OpenAIProvider extends BaseLLMProvider {
 
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`OpenAI API error: ${response.status} - ${body}`);
+        const summary = `${this.name} API error: ${response.status} - ${body}`;
+        // Recoverable by compacting and retrying, unlike every other 400.
+        if (response.status === 400 && isContextOverflowMessage(body)) {
+          throw new ContextOverflowError(summary, this.name);
+        }
+        throw new Error(summary);
       }
 
       const reader = response.body?.getReader();

@@ -10,7 +10,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { v4 as uuidv4 } from 'uuid';
 import { captureConversation, identifyMessages, type ConversationContext } from '../core/conversation-context.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
-import { looksLikeClaim } from '../core/claims.js';
+import { looksLikeAbsenceClaim, looksLikeClaim } from '../core/claims.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
@@ -1325,8 +1325,11 @@ So:
   Types: 'fact' (personal info, discovered truths), 'learned' (lessons from outcomes), 'insight' (patterns), 'reference' (pointers)
 
 ### Communication
-- **clarify**: Ask the user a clarifying question before proceeding. Use when your assumptions
-  about their request have low confidence. The user will see your question and respond.
+- **clarify**: Ask the user a clarifying question before proceeding. Use when the answer is
+  one only they hold — which of their own things they meant, what outcome they want, an
+  irreversible choice. When the system could settle it instead (which object or skill, whether
+  something exists here, what some state is), create a goal and find out. The user will see
+  your question and respond.
   \`{ "action": "clarify", "question": "Did you mean X or Y?", "assumptions": [
     { "assumption": "User wants to modify the existing Counter", "confidence": "high" },
     { "assumption": "The reset should set count to zero", "confidence": "low" }
@@ -1389,14 +1392,16 @@ Task descriptions are how agents decide whether they can handle a task. Describe
 
 ## Assumption Checking
 
-Before creating a goal, consider what assumptions you are making. For each assumption, estimate your confidence (high/medium/low).
+Before creating a goal, consider what assumptions you are making. For each, estimate your confidence (high/medium/low), and ask where the answer lives.
 
-If ANY assumption has low confidence, use **clarify** first.
+**Assumptions the system can settle belong in a goal, not a question.** Which object, agent, or skill the user means; whether something exists here; what a tool reports; what some state currently is. You have no picture of what is installed, and that is exactly why these go to the team: a goal finds out and tells you. Asking the user to identify something the system already has installed asks them to do a lookup on your behalf. If the goal comes back without it, you then have a real finding to put a question on top of.
 
-Examples of assumptions to check:
-- Which existing object the user is referring to (if ambiguous)
-- What specific behavior or appearance the user wants
-- Whether the user wants a new object or a change to an existing one
+**Assumptions only the user can settle belong in \`clarify\`.** Which of several things of THEIR own they meant, what outcome they actually want, a preference between approaches you cannot rank for them, and anything irreversible you would rather confirm than guess at.
+
+Create a goal: which existing object or skill they are referring to; whether some capability is present; what the current state of something is.
+Clarify: what specific behavior or appearance they want; whether they want a new object or a change to an existing one; which of two of their accounts, files, or projects is meant.
+
+When an assumption could be settled by trying, try. A goal that comes back empty is a better basis for a question than a guess about what you do not have.
 
 You do not need to clarify simple greetings, direct questions, or unambiguous requests.
 
@@ -2076,14 +2081,20 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   /**
    * Cheap prefilter for the self-audit: does this reply assert that an action
-   * was performed, report live/UI state, or claim a verification — things Chat
-   * can only truthfully know from a goal it ran? Greetings, questions, and
-   * answers built from given facts won't match, so they skip the extra check.
-   * This only decides whether the one audit re-prompt is worth running; the
-   * model makes the real call there. It is a soft prefilter, not a hard block.
+   * was performed, report live/UI state, claim a verification, or declare that
+   * something is missing — things Chat can only truthfully know from a goal it
+   * ran? Greetings, questions, and answers built from given facts won't match,
+   * so they skip the extra check. This only decides whether the one audit
+   * re-prompt is worth running; the model makes the real call there. It is a
+   * soft prefilter, not a hard block.
+   *
+   * Absence counts because "there is no such object" is a report on live state
+   * just as much as "I opened it", and Chat's own lookups cannot establish it:
+   * a registered name says nothing about capabilities acquired since
+   * registration, so a miss is a fact about a spelling, not about the system.
    */
   private mightBeUngroundedClaim(text: string): boolean {
-    return looksLikeClaim(text);
+    return looksLikeClaim(text) || looksLikeAbsenceClaim(text);
   }
 
   /**
@@ -2093,7 +2104,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    * own ungrounded claim when asked point-blank.
    */
   private buildAuditPrompt(draft: string): string {
-    return `Before this reply reaches the user, audit it:\n\n"${draft}"\n\nYou created NO goal this turn, so you did not actually perform any action or observe any live state. Does this reply claim an action was done, report the state of a window/screen/deck, or say something was "verified"? If YES, you cannot know that without a goal — respond now with a \`goal\` action that actually performs what the user asked, and report the real outcome only after it runs. If the reply is only a greeting, a question, or an answer built from facts already in this conversation, it's fine — respond with the same \`done\` unchanged.`;
+    return `Before this reply reaches the user, audit it:\n\n"${draft}"\n\nYou created NO goal this turn, so you did not actually perform any action or observe any live state. Two things to check, and either one means this reply is not ready:\n\n1. Does it claim an action was done, report the state of a window/screen/deck, or say something was "verified"?\n2. Does it tell the user something is missing, unavailable, not installed, not registered, or beyond reach?\n\nThe second is a report on live state exactly as much as the first, and you cannot establish it from here. A name that failed to resolve means nothing is registered under that spelling — it does not mean the system lacks the capability, because a registered name cannot see a skill, tool, or connection acquired after registration, and much of what this system can do is reached through an agent rather than an object of that name.\n\nIf either is YES, respond now with a \`goal\` action that actually attempts what the user asked, and report the outcome — including a genuine inability — only from what that goal returns. If the reply is only a greeting, a question, or an answer built from facts already in this conversation, it's fine — respond with the same \`done\` unchanged.`;
   }
 
   private async runChatTask(userText: string): Promise<void> {

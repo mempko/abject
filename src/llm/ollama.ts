@@ -15,8 +15,10 @@ import {
   ModelInfo,
   ContentPart,
   ImagePart,
+  ContextOverflowError,
   defaultIsRetryable,
   getTextContent,
+  isContextOverflowMessage,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -152,7 +154,12 @@ export class OllamaProvider extends BaseLLMProvider {
           if (res.statusCode && res.statusCode >= 400) {
             let errBody = '';
             res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
-            res.on('end', () => reject(new Error(`Ollama API error (${res.statusCode}): ${errBody}`)));
+            res.on('end', () => {
+              const summary = `Ollama API error (${res.statusCode}): ${errBody}`;
+              reject(isContextOverflowMessage(errBody)
+                ? new ContextOverflowError(summary, 'ollama')
+                : new Error(summary));
+            });
             return;
           }
 
@@ -278,7 +285,12 @@ export class OllamaProvider extends BaseLLMProvider {
         if (res.statusCode && res.statusCode >= 400) {
           let errBody = '';
           res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
-          res.on('end', () => fail(new Error(`Ollama API error: ${res.statusCode} ${errBody}`)));
+          res.on('end', () => {
+            const summary = `Ollama API error: ${res.statusCode} ${errBody}`;
+            fail(isContextOverflowMessage(errBody)
+              ? new ContextOverflowError(summary, 'ollama')
+              : new Error(summary));
+          });
           return;
         }
 
@@ -358,9 +370,44 @@ export class OllamaProvider extends BaseLLMProvider {
         models: { name: string }[];
       };
 
-      return data.models.map((m) => ({ id: m.name, name: m.name, vision: OllamaProvider.modelVision(m.name) }));
+      // Local models are exactly where an unknown window hurts most: they
+      // are the small ones, and a caller falling back to a fixed budget
+      // overflows them. /api/tags carries no window, so ask /api/show per
+      // model. This list is cached for the process, so it runs once.
+      return await Promise.all(data.models.map(async (m) => ({
+        id: m.name,
+        name: m.name,
+        vision: OllamaProvider.modelVision(m.name),
+        contextWindow: await this.modelContextWindow(m.name),
+      })));
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * Context window from /api/show. The key is architecture-prefixed
+   * (`llama.context_length`, `qwen2.context_length`, ...), so match on the
+   * suffix rather than guessing the architecture. Undefined on any failure:
+   * a missing number leaves the caller on its own budget, which is right,
+   * whereas a wrong one silently truncates or overflows.
+   */
+  private async modelContextWindow(name: string): Promise<number | undefined> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/show`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: name }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) return undefined;
+      const data = await response.json() as { model_info?: Record<string, unknown> };
+      for (const [key, value] of Object.entries(data.model_info ?? {})) {
+        if (key.endsWith('.context_length') && typeof value === 'number' && value > 0) return value;
+      }
+      return undefined;
+    } catch {
+      return undefined;
     }
   }
 

@@ -5,6 +5,52 @@
 import { require, requireNonEmpty } from '../core/contracts.js';
 import type { ExecutionProvenance, ProviderExecution, PromptGuidance } from './execution-context.js';
 
+/**
+ * A prompt the model refused for length, whatever the provider called it.
+ *
+ * Providers report this as an ordinary 400 with prose that differs per
+ * vendor, which leaves a caller unable to tell "this prompt is too long"
+ * (recoverable by compacting and retrying) from "these roles don't
+ * alternate" (not recoverable by anything). Classifying it once at the
+ * provider boundary is what lets the agent loop recover instead of
+ * spending the step.
+ */
+export class ContextOverflowError extends Error {
+  override readonly name = 'ContextOverflowError';
+  constructor(message: string, readonly provider: string) {
+    // The marker rides in the message because that is the only part that
+    // survives the message bus: an error reply carries text, not a class,
+    // so a recovering caller in another object has nothing else to match on.
+    super(`${CONTEXT_OVERFLOW_MARKER}: ${message}`);
+  }
+}
+
+/** Stable token identifying a length rejection across the message bus. */
+export const CONTEXT_OVERFLOW_MARKER = 'CONTEXT_OVERFLOW';
+
+/**
+ * Whether an error — local or relayed as text from another object — is a
+ * prompt-length rejection that compacting could fix.
+ */
+export function isContextOverflowError(err: unknown): boolean {
+  if (err instanceof ContextOverflowError) return true;
+  const text = err instanceof Error ? err.message : String(err ?? '');
+  return text.includes(CONTEXT_OVERFLOW_MARKER) || text.includes('PROMPT_TOO_LONG');
+}
+
+/**
+ * Whether a provider's error body describes a context-length rejection.
+ *
+ * Matches the shapes the major vendors actually emit. A false negative
+ * only costs the recovery that would have happened anyway; a false
+ * positive would spend one compaction on an error compacting cannot fix,
+ * so the patterns stay specific to length rather than matching any 400.
+ */
+export function isContextOverflowMessage(detail: string): boolean {
+  return /context[_ -]?length[_ -]?exceeded|maximum context length|prompt is too long|too many tokens|exceeds? the (maximum )?(context|token) limit|input length and `max_tokens` exceed|reduce the length of the messages/i
+    .test(detail);
+}
+
 export interface TextPart { type: 'text'; text: string; }
 export interface ImagePart { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string; }
 /** A document (e.g. a PDF) sent as base64. `name` is an optional display label. */
@@ -87,6 +133,15 @@ export interface ModelInfo {
    * UIs hide the effort selector for such models.
    */
   efforts?: EffortLevel[];
+  /**
+   * Total context window in tokens, input and output together. Undefined
+   * means unknown — callers fall back to their own fixed budget rather than
+   * guessing, because guessing high overflows and guessing low compacts a
+   * conversation that had room. A CLI provider that cannot report its
+   * backing model's window leaves this undefined even for a model whose
+   * window is documented elsewhere.
+   */
+  contextWindow?: number;
 }
 
 /**

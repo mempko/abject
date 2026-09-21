@@ -83,6 +83,12 @@ export interface TierCapability {
   provider: string;
   model: string | null;
   vision: boolean | null;
+  /**
+   * Total context window in tokens, or null when the provider does not
+   * report one. Null is not "small" — callers keep their own fixed budget
+   * rather than deriving one from a number nobody supplied.
+   */
+  contextWindow: number | null;
   /** The tier's configured reasoning-effort override, when one is set. */
   effort?: EffortLevel;
   /** Effort levels the model supports ([] = no selectable effort). */
@@ -905,15 +911,20 @@ export class LLMObject extends Abject {
   }
 
   /**
-   * Hard backstop on prompt size, checked before any provider call. ~600k
-   * chars ≈ 150–200k tokens, at or above every configured model's context
-   * window — anything bigger is a runaway prompt (e.g. an agent embedding a
-   * multi-megabyte scratchpad dump) that would burn a round-trip just to get
-   * an opaque 400 back. Failing locally is free and names the fat messages so
-   * the caller can compact the right thing. Callers are expected to stay far
-   * below this via their own budgets (AgentAbject trims to 180k chars).
+   * Hard backstop on prompt size, checked before any provider call. This is
+   * a runaway guard, not a model limit: it catches a prompt no model could
+   * want (an agent embedding a multi-megabyte scratchpad dump) that would
+   * otherwise burn a round-trip to get an opaque 400 back. Failing locally
+   * is free and names the fat messages so the caller can compact the right
+   * thing.
+   *
+   * It sits deliberately above every real context window, because the real
+   * limit now belongs to the caller: AgentAbject derives its budget from the
+   * routed model's own window, and a genuine overflow is recovered by
+   * compress-and-retry rather than prevented here. Sizing this to the
+   * smallest window would reject legitimate conversations on large ones.
    */
-  private static readonly MAX_PROMPT_CHARS = 600_000;
+  private static readonly MAX_PROMPT_CHARS = 2_000_000;
 
   private checkPromptSize(messages: LLMMessage[]): void {
     const sizes = messages.map((msg) => getTextContent(msg).length);
@@ -2898,6 +2909,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         provider,
         model,
         vision: await this.lookupVision(provider, model),
+        contextWindow: await this.lookupContextWindow(provider, model),
       };
     }
 
@@ -2929,6 +2941,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         provider: providerName,
         model: model ?? null,
         vision: model ? await this.lookupVision(providerName, model) : null,
+        contextWindow: model ? await this.lookupContextWindow(providerName, model) : null,
         ...(effort ? { effort } : {}),
         supportedEfforts: model && tierProvider?.supportedEfforts ? tierProvider.supportedEfforts(model) : [],
       };
@@ -2945,6 +2958,15 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     // list missed, and providers whose live fetch failed)
     const catalog = this.providers.get(providerName)?.describe().models ?? [];
     return catalog.find(mi => mi.id === model)?.vision ?? null;
+  }
+
+  /** Same live-then-catalog resolution as lookupVision, for the token window. */
+  private async lookupContextWindow(providerName: string, model: string): Promise<number | null> {
+    const models = await this.getProviderModels(providerName);
+    const live = models.find(mi => mi.id === model);
+    if (live?.contextWindow !== undefined) return live.contextWindow;
+    const catalog = this.providers.get(providerName)?.describe().models ?? [];
+    return catalog.find(mi => mi.id === model)?.contextWindow ?? null;
   }
 
   private resolveProviderAndModel(
