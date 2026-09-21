@@ -25,7 +25,7 @@ import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
-import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
+import { truncateText, conversationTextChars, enforceConversationCharBudget, isContextOverflowError } from '../llm/provider.js';
 import type { TierCapabilities } from './llm-object.js';
 import { Log } from '../core/timed-log.js';
 
@@ -86,6 +86,9 @@ export interface AgentMessage {
   cacheBreakpoint?: boolean;
   /** Runtime-owned replacement for an already-observed page, never an LLM summary. */
   retainedPage?: { payloadId: string; compact: string; seen?: boolean };
+  /** Body was replaced by an elision stub at the soft budget threshold.
+   *  Marks it so a later pass doesn't elide an already-elided message. */
+  elided?: boolean;
 }
 
 /**
@@ -236,6 +239,16 @@ export interface AgentTaskState {
 
   /** Signatures already nudged about, so the loop-detection steer fires once per pattern. */
   nudgedSignatures?: string[];
+  /** Run of consecutive identical failures — same signature AND same error.
+   *  Cleared by any success, any different failure, and any denial. */
+  failStreak?: { signature: string; error: string; count: number };
+  /** Set when the failure streak reaches the terminate threshold; the state
+   *  machine turns it into a `fail` with a diagnosis of its own. */
+  stalled?: { action: string; count: number; error: string };
+  /** The run ended on a stall rather than on the step budget. Distinct from
+   *  maxStepsReached so a reviewer can tell "wedged on one failing action"
+   *  from "ran out of room", which call for different lessons. */
+  stalledOut?: boolean;
   /** Step-budget extensions granted so far (progress-aware; capped at MAX_STEP_EXTENSIONS). */
   extensionsGranted?: number;
   /** Reparse retries taken so far; the first FREE_REPARSE_STEPS of them do not consume step budget. */
@@ -464,6 +477,10 @@ interface TaskEntry {
   emptyResponses?: number;
   /** Consecutive truncated terminal responses (cut off mid-generation). Reset on every complete response. */
   truncationRetries?: number;
+  /** Prompt-length rejections recovered by recompacting and retrying, for
+   *  this task's lifetime. Not reset: a task needing this twice has an
+   *  oversized part that compaction cannot reach. */
+  overflowRecoveries?: number;
   /** Actions 2..N from a multi-action LLM response, drained in order by the thinking phase without an LLM round-trip between them. Replaced on every parse; discarded on failure or max-steps. */
   pendingActions?: AgentAction[];
 }
@@ -921,7 +938,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'startTask',
-              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event. Default maxSteps is 25. When the step limit is reached and the recent action window shows real progress (mostly-successful, distinct actions), the budget auto-extends by 10 steps up to twice; a stuck task gets no extension. At the final limit the agent makes one last LLM call to return collected data, then salvages the last successful result, or errors. Pass config.maxSteps to override.',
+              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event. Default maxSteps is 25. When the step limit is reached and the recent action window shows real progress (mostly-successful, distinct actions), the budget auto-extends by 10 steps up to twice; a stuck task gets no extension. At the final limit the agent makes one last LLM call to return collected data, then salvages the last successful result, or errors. A task whose action keeps failing identically ends early with stalled: true rather than spending its remaining steps. Pass config.maxSteps to override.',
               parameters: [
                 { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target agent (defaults to caller if registered)', optional: true },
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-provided task ID', optional: true },
@@ -1123,6 +1140,7 @@ export class AgentAbject extends Abject {
                 error: { kind: 'primitive', primitive: 'string' },
                 steps: { kind: 'primitive', primitive: 'number' },
                 maxStepsReached: { kind: 'primitive', primitive: 'boolean' },
+                stalled: { kind: 'primitive', primitive: 'boolean' },
                 validationErrors: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
               } },
             },
@@ -1199,7 +1217,7 @@ startTask returns a ticketId immediately. The result arrives as a taskResult eve
 - When the limit is reached, the agent makes one final LLM call asking for a done/fail response.
 - If that fails, it salvages the last successful action result.
 - If nothing was collected, the task errors with "Max steps reached".
-- The taskResult event includes \`maxStepsReached: true\` when the limit was hit.
+- The taskResult event includes \`maxStepsReached: true\` when the limit was hit, and \`stalled: true\` when the run ended early because one action kept failing the same way.
 - For complex tasks (pagination, multi-step workflows), pass a higher maxSteps (e.g. 30-50).
 
   // 3. Optionally handle taskProgress events for live updates
@@ -2671,6 +2689,7 @@ The registered object must implement these handlers to participate in the agent 
       deliveryId: `${entry.sessionId ?? entry.state.id}:${entry.state.id}:result`,
       ticketId: entry.state.id, success, result: entry.state.result, error: entry.state.error,
       steps: entry.state.step, maxStepsReached: entry.state.step >= entry.state.maxSteps,
+      stalled: entry.state.stalledOut === true,
       validationErrors, evidence: entry.acceptanceEvidence, lastAction: entry.state.action,
     };
     entry.delivery = { id: resultPayload.deliveryId, destination: entry.callerId,
@@ -3377,6 +3396,19 @@ The registered object must implement these handlers to participate in the agent 
             // can't burn the whole step budget oscillating.
             this.detectAndSteerOscillation(entry, agentName);
 
+            // A run that keeps failing the same way has already been warned
+            // twice. Ending it here, with a diagnosis naming the action and
+            // its error, is worth more than the remaining steps it would
+            // otherwise spend reproducing the same failure.
+            if (task.stalled) {
+              const { action, count, error } = task.stalled;
+              task.error = `Stalled: \`${action}\` failed ${count} times in a row with the same error — ${error || 'no error text'}. ` +
+                `Steering did not change the approach, so the run was ended rather than spending the remaining steps on it.`;
+              task.stalledOut = true;
+              setPhase('error');
+              break;
+            }
+
             task.step++;
 
             if (task.step >= task.maxSteps) {
@@ -3484,6 +3516,14 @@ The registered object must implement these handlers to participate in the agent 
     }
   }
 
+  /** Identical consecutive failures before the second, final-warning nudge. */
+  private static readonly STALL_SECOND_NUDGE_STREAK = 5;
+  /** Identical consecutive failures before the run ends. The budget already
+   *  extends on demonstrated progress; without this it never contracts on
+   *  demonstrated stall, so a wedged agent grinds out every remaining step
+   *  and then pays a forced smart-tier call to say it failed. */
+  private static readonly STALL_TERMINATE_STREAK = 8;
+
   private detectAndSteerOscillation(entry: TaskEntry, agentName: string): void {
     const task = entry.state;
     if (!task.action) return;
@@ -3496,25 +3536,70 @@ The registered object must implement these handlers to participate in the agent 
 
     const occurrences = history.filter(s => s === sig).length;
     const failing = !task.lastResult?.success;
+    const error = failing ? String(task.lastResult?.error ?? '') : '';
+
+    // A denial is a decision, not a malfunction: the agent asked for
+    // something it may not have, and repeating it is how it discovers the
+    // boundary. Counting those toward a stall would end tasks that are
+    // behaving correctly.
+    const denied = failing && /\bdenied\b|\bnot permitted\b|\bpermission\b/i.test(error);
+
+    // Consecutive identical FAILURES, which is what "grinding" means —
+    // distinct from occurrences-in-window, which counts a repeat that had
+    // useful work between its attempts. Both the signature and the error
+    // must match: a retry that fails differently is making progress.
+    const streak = task.failStreak;
+    if (failing && !denied && streak?.signature === sig && streak.error === error) {
+      streak.count++;
+    } else if (failing && !denied) {
+      task.failStreak = { signature: sig, error, count: 1 };
+    } else {
+      task.failStreak = undefined;
+    }
+    const failCount = task.failStreak?.count ?? 0;
+
+    // An identical failure that will not stop is the one case where ending
+    // the run beats spending the rest of the budget on it. The nudges above
+    // have already had two chances to change the approach.
+    if (failCount >= AgentAbject.STALL_TERMINATE_STREAK) {
+      log.warn(`[${agentName}] Stalled — ${failCount} identical failures of ${sig.slice(0, 60)}; ending the run`);
+      task.stalled = {
+        action: String((task.action as Record<string, unknown>).action),
+        count: failCount,
+        error: error.slice(0, 300),
+      };
+      return;
+    }
+
     if (!failing && task.progressHistory?.at(-1)?.novel) return;
     // 3rd identical failure, or 4th identical attempt regardless of outcome
     // (re-doing the same successful step over and over is also a loop).
     const stuck = (failing && occurrences >= 3) || occurrences >= 4;
     if (!stuck) return;
 
+    // Two nudges per pattern, not one. The first assumes the repeat was an
+    // oversight; the second says plainly that the run ends if it continues,
+    // which is the only warning the agent gets before it does.
+    const escalated = failCount >= AgentAbject.STALL_SECOND_NUDGE_STREAK;
+    const nudgeKey = escalated ? `${sig}#2` : sig;
     const nudged = (task.nudgedSignatures ??= []);
-    if (nudged.includes(sig)) return;
-    nudged.push(sig);
+    if (nudged.includes(nudgeKey)) return;
+    nudged.push(nudgeKey);
 
-    log.info(`[${agentName}] Loop detected — same action repeated ${occurrences}x (${sig.slice(0, 60)}); steering`);
+    log.info(`[${agentName}] Loop detected — same action repeated ${occurrences}x (${sig.slice(0, 60)}); steering${escalated ? ' (final warning)' : ''}`);
+    const actionName = String((task.action as Record<string, unknown>).action);
     task.llmMessages.push({
       role: 'user',
-      content:
-        `[Loop detected] You have repeated the same action with the same result ${occurrences} times ` +
-        `(action: ${String((task.action as Record<string, unknown>).action)}). Repeating it again will produce the same outcome. ` +
-        `Step back and change approach: re-read the latest error, and Ask the dependency it involves to learn the correct usage before retrying. ` +
-        `Fix the root cause the error names rather than re-attempting the identical step. ` +
-        `If the task is genuinely blocked, emit a \`fail\` action with a precise diagnosis: what is blocking you, what you tried, and what would unblock it.`,
+      content: escalated
+        ? `[Loop detected — final warning] \`${actionName}\` has failed the same way ${failCount} times. ` +
+          `Repeating it will NOT work, and the run ends on its own if it keeps failing identically. ` +
+          `Read the actual error, then do something different: a different command, more context, or a step back to reconsider the plan. ` +
+          `If the task is genuinely blocked, emit \`fail\` now with a precise diagnosis — what is blocking you, what you tried, and what would unblock it.`
+        : `[Loop detected] You have repeated the same action with the same result ${occurrences} times ` +
+          `(action: ${actionName}). Repeating it again will produce the same outcome. ` +
+          `Step back and change approach: re-read the latest error, and Ask the dependency it involves to learn the correct usage before retrying. ` +
+          `Fix the root cause the error names rather than re-attempting the identical step. ` +
+          `If the task is genuinely blocked, emit a \`fail\` action with a precise diagnosis: what is blocking you, what you tried, and what would unblock it.`,
     });
   }
 
@@ -3575,13 +3660,13 @@ The registered object must implement these handlers to participate in the agent 
       });
 
       const finalRoute = await this.applyVisionTiering(entry, 'smart');
-      await this.trimConversation(entry);
+      await this.trimConversation(entry, await this.resolveContextBudget(finalRoute));
       this.appendVocabularyReminder(entry);
 
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
       const llmResult = await this.request<{ content: string; execution?: ExecutionProvenance }>(
         request(this.id, this.llmId, 'complete', {
-          messages: task.llmMessages.map(({ retainedPage: _page, ...message }) => message),
+          messages: task.llmMessages.map(({ retainedPage: _page, elided: _elided, ...message }) => message),
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
           // Thinking / action decisions run on 'smart' regardless of the observe
@@ -3869,8 +3954,10 @@ The registered object must implement these handlers to participate in the agent 
     // carries image bytes into compression either
     const route = await this.applyVisionTiering(entry, this.resolveThinkTier(entry.observeTier));
 
-    // Trim conversation (may do an LLM-compressor pass when over byte budget)
-    await this.trimConversation(entry);
+    // Trim against the window of the model this step will actually run on,
+    // which vision tiering may just have changed.
+    const budget = await this.resolveContextBudget(route);
+    await this.trimConversation(entry, budget);
     this.appendVocabularyReminder(entry);
 
     this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
@@ -3878,7 +3965,7 @@ The registered object must implement these handlers to participate in the agent 
     // Build the request first: its message id is the correlation id the
     // chunk events come back with, which is how a chunk finds its own task.
     const streamRequest = request(this.id, this.llmId, 'stream', {
-      messages: task.llmMessages.map(({ retainedPage: _page, ...message }) => message),
+      messages: task.llmMessages.map(({ retainedPage: _page, elided: _elided, ...message }) => message),
       // Thinking is the JSON-action-decision step. Tier comes from the
       // agent's per-state observe hint, floored at 'balanced' (never 'fast'
       // — haiku drops the action envelope under load), then adjusted for
@@ -3909,6 +3996,12 @@ The registered object must implement these handlers to participate in the agent 
       llmResult = await this.request<{ content: string; stopReason?: string; execution?: ExecutionProvenance }>(streamRequest, 120000);
       task.execution = llmResult.execution;
       this.markConversationObserved(entry);
+    } catch (err) {
+      if (!isContextOverflowError(err)) throw err;
+      // The budget estimate was wrong for this model — characters are only a
+      // proxy for tokens. Losing the step here would end the task on an error
+      // the harness can fix, so compact hard and try once more.
+      llmResult = await this.recoverFromOverflow(entry, streamRequest, budget, err);
     } finally {
       this.streamingEntries.delete(streamRequest.header.messageId);
     }
@@ -4233,7 +4326,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         const relevant = (matched ?? [])
           .filter(e => !profileTitles.has(e.title) && e.type !== 'pattern' && !patternIds.has(e.id));
         if (relevant.length > 0) {
-          let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Use remember(title, content, type, tags) to save new insights.\n';
+          let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Where an entry says which object or agent handles a kind of work, read it as a record of what happened once, not as a rule: capabilities move as skills and tools are installed, and the agent that wrote the note is often the one it names. Decide that question from the live roster and by asking. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
             kb += `- **${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
@@ -4267,9 +4360,15 @@ The preview often answers the question on its own — when it does, just act.`, 
     // instead of each prompt re-deriving (or omitting) it; per-agent prompts
     // add only their own specifics on top.
     add('system-primer', `\n\n## How this system works
-Everything here is an Abject: an autonomous object with a manifest (its declared methods and events), a mailbox, and message handlers. Abjects never call each other directly; they communicate only by passing messages, find each other through the Registry, and coordinate by subscribing to each other's change events. Nothing is a local library or an imported function: every read, write, or action is a message to some Abject, addressed by its durable registered name (or its AbjectId). You act through the actions in your vocabulary below, and the system turns each one into the right messages for you, so you never hand-write raw envelopes; \`submit_job\` additionally hands you \`call\`/\`dep\`/\`find\` to message objects directly for mechanical multi-step work.
+Everything here is an Abject: an autonomous object with a manifest (its declared methods and events), a mailbox, and message handlers. Abjects never call each other directly; they communicate only by passing messages, find each other through the Registry, and coordinate by subscribing to each other's change events. Nothing is a local library or an imported function: every read, write, or action is a message to some Abject, addressed by its durable registered name (or its AbjectId). You act through the actions in your vocabulary below, and the system turns each one into the right messages for you, so you never hand-write raw envelopes; \`submit_job\` additionally hands you \`ask\`/\`call\`/\`dep\`/\`find\` to message objects directly for mechanical multi-step work.
 
 An Abject's capabilities are live, not a fixed list: the way to know what an object can do right now is to ask it (the ask protocol), and it answers from its current, real capabilities, which shift as skills, tools, and connections come and go. Prefer asking over assuming from a name or a remembered fact. Other parts of the system may ask you the same way; answer from what you can genuinely do this moment, and decline plainly when a request falls outside your role.
+
+**When the question is WHICH object, ask the Registry.** It holds every registered object's description and methods and answers in natural language — "which object can do X?", "who handles Y?", "does anything provide Z?" — reading across the whole catalog at once. That is the first move for any find-me-the-right-object question, ahead of matching on names yourself.
+
+A name lookup answers a different question: it resolves a handle you already know. It matches the name an object registered under, so it cannot see what an object gained afterwards — an installed skill, a connected tool, a capability that arrived at runtime. A name that fails to resolve therefore means "nothing is registered under that spelling", never "this system cannot do that". Treat a miss as a reason to ask, and establish that something is genuinely unavailable only from a real attempt that really failed.
+
+**The Registry knows this system, not the world.** It can say which object handles a subject; it knows nothing about the state of anything outside — a tool on the host, a remote service, a mailbox, a device. So when your task is about something's real-world state, the answer comes from doing the thing, not from looking the thing up: run the tool and read what it reports. Searching the catalog for a name matching the subject answers "is this a registered object", which is almost never what was asked, and a thorough investigation of the wrong question still ends in the wrong answer. When your own capabilities already cover the task — a skill you have, an action in your vocabulary — use them first and reach for discovery only for what they do not cover.
 
 You run inside an observe-think-act loop: each turn you observe the current state, then think and emit exactly ONE action as JSON, and the system carries it out and returns the result to your next observation. You keep looping until you emit a terminal action that ends the task. The rest of this prompt tells you which actions you have and when to use each.
 
@@ -4293,6 +4392,10 @@ When to remember (durable knowledge for future unrelated tasks):
 - User preferences or personal facts they share (location, name, job, etc.) — tag these with "profile" so they are always available in future tasks, even ones whose wording does not mention them
 - Stable system architecture insights or validated patterns
 - Useful API details or capabilities that are unlikely to change
+
+Record what the system can do and how it works — a tool's commands and flags, where its config lives, how it authenticates, what its output looks like. Leave out who should do it. Which agent handles a goal is decided when the goal runs, from the live team and by asking, because installed skills and capabilities change between the moment a note is written and the moment it is read; a remembered owner is a guess about a roster that has since moved on. Write "this tool reports status as JSON and authenticates from its own config file" rather than naming the agent that happened to run it.
+
+Leave out the recipe as well. A note that says which steps to take to answer a kind of question — look here, then check that — fixes one attempt's route as though it were a property of the world, and the next task follows it instead of thinking. It is worth least when it is most confident: a run that answered the wrong question smoothly produces a clean-looking procedure for doing so again, and writing it down is how one wrong turn becomes the standard route. Save what you learned that stays true — what a thing is, what it exposes, what its output means, what surprised you — and let each task work out its own steps from that.
 
 The "profile" tag is reserved for WHO THE USER IS: name, location, role, preferences, accounts they use. Facts ABOUT their projects, writings, or interests are still worth remembering, with topical tags — keyword recall surfaces them when relevant. Every profile-tagged entry competes for a small always-injected block in every future prompt, so tagging trivia "profile" crowds out the user's actual identity.
 Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
@@ -4319,7 +4422,23 @@ Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact ide
 \`\`\`json
 { "action": "submit_job", "description": "what it does", "code": "<javascript>" }
 \`\`\`
-The code runs in a sandboxed job. Inside it you have \`call(id, method, payload)\` to message any object, \`dep(name)\` (resolve an object by name, throws if missing), and \`find(name)\` (resolve or null). Inside the job's \`code\`, \`call\`, \`dep\`, and \`find\` are JavaScript functions you invoke from the script, separate from the JSON actions you emit as your response. \`return\` a value and it comes back as this single action's result.
+The code runs in a sandboxed job. Inside it you have \`call(id, method, payload)\` to message any object, \`dep(name)\` (resolve an object by name, throws if missing), \`find(name)\` (resolve or null), and \`ask(question)\` — which puts a natural-language question to the Registry and answers from the whole catalog, or \`ask(nameOrId, question)\` to put it to one object. Inside the job's \`code\`, \`ask\`, \`call\`, \`dep\`, and \`find\` are JavaScript functions you invoke from the script, separate from the JSON actions you emit as your response. \`return\` a value and it comes back as this single action's result.
+
+**Every one of them is async — \`await\` all four, every time.** Without the await you hold a Promise, and a Promise is always truthy, so \`if (!obj)\` never fires and the missing-object branch you wrote is skipped:
+
+\`\`\`js
+const obj = await find('GoalManager');          // await, always
+if (!obj) return await ask('which object tracks goals?');
+const goals = await call(obj, 'listGoals', {});  // an id, not a Promise
+return goals.length;
+\`\`\`
+
+\`\`\`js
+// Wrong: find() without await. found is a Promise, so the guard is dead
+// code and call() receives a Promise instead of an id.
+const found = find('GoalManager');
+if (!found) { /* never runs */ }
+\`\`\`
 
 Use it when your next chunk of work is a mechanical multi-step sequence with no judgment needed between steps: fetch N items, transform each, aggregate; poll-then-collect; bulk reads. One job costs one step, however many calls it makes, where doing the same through individual actions costs a step each. Example:
 \`\`\`json
@@ -4327,7 +4446,9 @@ Use it when your next chunk of work is a mechanical multi-step sequence with no 
 \`\`\`
 Keep the return value small — aggregate or summarize inside the job instead of returning raw bulk data (results are truncated past 20k chars). Use your regular actions when each step's outcome should change what you do next; use one job when it wouldn't. Your own domain actions (browsing, shell, drafting) stay as actions — the job sandbox has no browser, no shell, and no filesystem, only object messaging.
 
-Object names in job code must be EXACT registered object names as they appear in your context (goals, scratchpad, registry listings) — a skill, service, or server name is not an object name. When unsure a name exists, use \`find(name)\` and handle null instead of \`dep(name)\`, which fails the whole job. Anything you reach through a dedicated action of yours (like a tool-call action) has no object of that name on the bus; keep using your action for it.`, true);
+Object names in job code must be EXACT registered object names as they appear in your context (goals, scratchpad, registry listings) — a skill, service, or server name is not an object name. When unsure a name exists, use \`find(name)\` and handle null instead of \`dep(name)\`, which fails the whole job. Anything you reach through a dedicated action of yours (like a tool-call action) has no object of that name on the bus; keep using your action for it.
+
+**Start from \`ask\` when you do not already know the object's name.** \`ask("which object can do X?")\` reads the Registry's whole catalog and names the right one; \`find\` and \`dep\` then resolve that name. Going the other way — guessing a name, then reading what a miss means — answers a question you did not intend: \`find\` matches only the spelling an object registered under, so it cannot see a skill, tool, or connection that object picked up afterwards. A null from \`find\`, or an empty filter over a catalog listing, is a fact about that spelling and nothing more. Never conclude from one that the system lacks a capability; ask, or run the real attempt and let it fail for a real reason.`, true);
 
     if (entry.goalId) {
       add('goal-context', `
@@ -5035,16 +5156,39 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     } : {}) });
   }
 
-  /** Whole-conversation byte budget. Above this, the middle block is
-   *  distilled by a fast-tier LLM pass and replaced with a single synthetic
-   *  summary message. 180k chars ≈ 45k tokens — well under every provider's
-   *  context window, leaves headroom for the current observation + response. */
+  /** Whole-conversation byte budget used when the routed model's context
+   *  window is unknown. 180k chars ≈ 45k tokens — small enough for almost
+   *  any window, which is exactly why it is only the fallback: applied to a
+   *  200k-token model it compacts at a quarter of capacity, and to a 32k
+   *  local model it never fires at all. When the window IS known,
+   *  resolveContextBudget derives the real thresholds from it. */
   private static readonly MAX_CONVERSATION_CHARS = 180000;
+  /** Characters per token. Deliberately below the usual ~4 so the estimate
+   *  errs toward under-using the window rather than overflowing it. */
+  private static readonly CHARS_PER_TOKEN = 3.5;
+  /** Tokens held back for the model's own response. The window covers input
+   *  and output together, and the harness sets no maxTokens (provider
+   *  per-tier sizing owns that), so reserve enough for a long reasoning
+   *  turn. Floored at half the window so a small local model still gets a
+   *  usable input budget instead of zero. */
+  private static readonly OUTPUT_RESERVE_TOKENS = 32000;
+  /** Fraction of the usable window at which cheap deterministic elision
+   *  starts. Below this the conversation is left verbatim. */
+  private static readonly SOFT_BUDGET_FRACTION = 0.60;
+  /** Fraction at which LLM summarization is allowed to run. Elision has
+   *  already had its chance between soft and hard. */
+  private static readonly HARD_BUDGET_FRACTION = 0.85;
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
   /** Per-observation cap applied at ingestion (head+tail slice). */
   private static readonly MAX_OBSERVATION_CHARS = 60000;
+  /** Below this an action result is not worth eliding — the stub and the
+   *  retained head would cost nearly as much as the body. */
+  private static readonly ELISION_MIN_CHARS = 2000;
+  /** Head of an elided result kept verbatim, so the agent can still see what
+   *  the action returned without recovering the whole body. */
+  private static readonly ELISION_KEEP_CHARS = 600;
   /** Floor below which the budget enforcer stops shrinking a message. The
    *  byte path collapses the middle of the conversation to one summary first
    *  (compress keeps pinned + KEEP_RECENT_MESSAGES), so what the enforcer sees
@@ -5055,8 +5199,107 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     for (const message of entry.state.llmMessages) if (message.retainedPage) message.retainedPage.seen = true;
   }
 
-  private async trimConversation(entry: TaskEntry): Promise<void> {
+  /** Overflow recoveries allowed per task. One is enough when compaction can
+   *  help; a second failure means the prompt is oversized in a part
+   *  compaction cannot touch (a fat pinned system prompt), and retrying that
+   *  forever is how a task burns its whole budget on 400s. */
+  private static readonly MAX_OVERFLOW_RECOVERIES = 2;
+
+  /**
+   * Compact hard and retry a request the model refused for length.
+   *
+   * The estimate that sized the budget is a proxy — characters per token
+   * varies by tokenizer and by content — so a conversation can clear the
+   * local budget and still be rejected. That is a recoverable condition and
+   * the harness knows how to fix it, so recover rather than spending the
+   * step. Compaction targets half the failing budget, because landing just
+   * under the limit that was just refused invites a second refusal.
+   */
+  private async recoverFromOverflow(
+    entry: TaskEntry,
+    original: ReturnType<typeof request>,
+    budget: { soft: number; hard: number; windowTokens?: number },
+    cause: unknown,
+  ): Promise<{ content: string; stopReason?: string; execution?: ExecutionProvenance }> {
+    const used = (entry.overflowRecoveries ?? 0) + 1;
+    entry.overflowRecoveries = used;
+    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+    if (used > AgentAbject.MAX_OVERFLOW_RECOVERIES) {
+      log.warn(`[${agentName}] Context overflow after ${used - 1} recoveries — the oversized part is not compactable`);
+      throw cause;
+    }
+
+    const target = Math.max(Math.floor(budget.hard / 2), AgentAbject.TRUNCATION_FLOOR_CHARS * 4);
+    log.warn(
+      `[${agentName}] Context overflow${budget.windowTokens ? ` on a ${budget.windowTokens}-token window` : ''} ` +
+      `— recompacting to ${target} chars and retrying (attempt ${used})`,
+    );
+    await this.trimConversation(entry, { soft: Math.floor(target * 0.7), hard: target });
+
+    const retry = request(this.id, this.llmId!, 'stream', {
+      ...(original.payload as Record<string, unknown>),
+      messages: entry.state.llmMessages.map(({ retainedPage: _page, elided: _elided, ...message }) => message),
+    });
+    this.streamingEntries.set(retry.header.messageId, entry);
+    try {
+      const result = await this.request<{ content: string; stopReason?: string; execution?: ExecutionProvenance }>(retry, 120000);
+      entry.state.execution = result.execution;
+      this.markConversationObserved(entry);
+      return result;
+    } finally {
+      this.streamingEntries.delete(retry.header.messageId);
+    }
+  }
+
+  /**
+   * Character budgets for the model this step will actually run on.
+   *
+   * A fixed budget is wrong in both directions: too small for a large
+   * window (paying compaction for capacity that was there) and too large
+   * for a small one (never firing, so the provider rejects the prompt
+   * instead). So derive it from the routed model's own window, and fall
+   * back to the fixed constant only when nothing reports one — an unknown
+   * window is not a small window, and guessing either way is worse than
+   * keeping today's behavior.
+   */
+  private async resolveContextBudget(
+    route: { tier: 'smart' | 'balanced' | 'code'; provider?: string; model?: string },
+  ): Promise<{ soft: number; hard: number; windowTokens?: number }> {
+    const fromChars = (hard: number) => ({
+      soft: Math.floor(hard * (AgentAbject.SOFT_BUDGET_FRACTION / AgentAbject.HARD_BUDGET_FRACTION)),
+      hard,
+    });
+
+    const caps = await this.tierCapabilities();
+    if (!caps) return fromChars(AgentAbject.MAX_CONVERSATION_CHARS);
+
+    // A vision fallback overrides provider+model for this step, so its
+    // window is the one that binds — not the nominal tier's.
+    const tierCap = caps[route.tier];
+    const cap = route.model && caps.visionFallback?.model === route.model
+      ? caps.visionFallback
+      : tierCap;
+    const windowTokens = cap?.contextWindow ?? null;
+    if (!windowTokens || windowTokens <= 0) return fromChars(AgentAbject.MAX_CONVERSATION_CHARS);
+
+    const usableTokens = Math.max(
+      windowTokens - AgentAbject.OUTPUT_RESERVE_TOKENS,
+      windowTokens * 0.5,
+    );
+    const usableChars = usableTokens * AgentAbject.CHARS_PER_TOKEN;
+    return {
+      soft: Math.floor(usableChars * AgentAbject.SOFT_BUDGET_FRACTION),
+      hard: Math.floor(usableChars * AgentAbject.HARD_BUDGET_FRACTION),
+      windowTokens,
+    };
+  }
+
+  private async trimConversation(entry: TaskEntry, budget?: { soft: number; hard: number }): Promise<void> {
     const task = entry.state;
+    const { soft: softBudget, hard: hardBudget } = budget ?? {
+      soft: Math.floor(AgentAbject.MAX_CONVERSATION_CHARS * (AgentAbject.SOFT_BUDGET_FRACTION / AgentAbject.HARD_BUDGET_FRACTION)),
+      hard: AgentAbject.MAX_CONVERSATION_CHARS,
+    };
     const maxMsgs = entry.config.maxConversationMessages;
     // pinnedMessageCount was written when the prompt was one system message,
     // so it counts that message plus the opening turns. Splitting the prompt
@@ -5084,12 +5327,22 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       task.llmMessages = [...pinned, ...recent];
     }
 
-    // 2. Byte cap — only kick in if the conversation blew past the budget
-    //    (e.g. an accidental Registry.list dump). Delegate to the LLM
-    //    object's `compress` method: it split-distills oversized messages
-    //    with the fast tier, summarizes the middle block, and falls back to
-    //    deterministic truncation internally.
-    if (conversationTextChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
+    // 2. Soft threshold — cheap deterministic elision, no LLM call. Bulky
+    //    action results in the middle region become stubs that say how much
+    //    was removed and how to get it back. Doing this first is what keeps
+    //    the expensive summarizer from running at all in most conversations:
+    //    elision reclaims the same bytes for nothing, and a stub the agent
+    //    can reverse loses less than a summary it cannot.
+    if (conversationTextChars(task.llmMessages) > softBudget) {
+      this.elideMiddleObservations(entry, pinnedCount);
+    }
+
+    // 3. Hard threshold — only now is an LLM pass worth its cost. Delegate
+    //    to the LLM object's `compress`: it split-distills oversized
+    //    messages with the fast tier, folds the middle into the running
+    //    structured summary, and falls back to deterministic truncation
+    //    internally.
+    if (conversationTextChars(task.llmMessages) <= hardBudget) {
       return;
     }
 
@@ -5101,7 +5354,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
           onBehalfOf: this.registeredAgents.get(entry.agentId)?.name,
           goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id,
           options: {
-            targetChars: AgentAbject.MAX_CONVERSATION_CHARS,
+            targetChars: hardBudget,
             pinnedCount,
             keepRecent: AgentAbject.KEEP_RECENT_MESSAGES,
             taskHint: entry.state.task,
@@ -5127,15 +5380,53 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       }
     }
 
-    // 3. Budget guarantee, no matter which path ran above. Deterministically
+    // 4. Budget guarantee, no matter which path ran above. Deterministically
     //    shrink the largest messages, wherever they sit (a fat system prompt
     //    or a fat message in the keep-recent window is exactly how a
     //    3.1M-char prompt once reached the API as a 400).
     enforceConversationCharBudget(
       task.llmMessages,
-      AgentAbject.MAX_CONVERSATION_CHARS,
+      hardBudget,
       AgentAbject.TRUNCATION_FLOOR_CHARS,
     );
+  }
+
+  /**
+   * Replace bulky action-result bodies in the middle region with stubs.
+   *
+   * Deterministic and free — no LLM call — which is the whole point: run
+   * this at the soft threshold and most conversations never reach the
+   * summarizer at all. Only the middle is touched; the pinned preamble and
+   * the recent window stay verbatim, because those are what the model is
+   * actually reasoning over right now.
+   *
+   * The stub says how much was removed and how to get it back, so this is
+   * reversible where a payload exists and honest where it doesn't. Messages
+   * carrying a retainedPage are left to the runtime-owned collapse above,
+   * which has a better replacement than a generic stub.
+   */
+  private elideMiddleObservations(entry: TaskEntry, pinnedCount: number): void {
+    const messages = entry.state.llmMessages;
+    const middleEnd = messages.length - AgentAbject.KEEP_RECENT_MESSAGES;
+    for (let i = pinnedCount; i < middleEnd; i++) {
+      const message = messages[i];
+      if (message.retainedPage || message.elided) continue;
+      const text = typeof message.content === 'string' ? message.content : '';
+      if (text.length < AgentAbject.ELISION_MIN_CHARS) continue;
+      // Only action results are safe to elide: an observation or a steering
+      // message is the runtime talking to the agent, and the agent's own
+      // turns carry the decisions the summary would otherwise have to
+      // reconstruct.
+      if (!text.startsWith('[Action Result]')) continue;
+
+      const payloadId = entry.payloads?.find(p => text.includes(p.id))?.id;
+      const lines = text.split('\n').length;
+      const recovery = payloadId
+        ? `Use {"action":"read_chunk","id":"${payloadId}"} for the full output.`
+        : 'Re-run the action if you need it again.';
+      message.content = `[Action result elided: ${lines} lines / ${text.length} chars. ${recovery}]\n${text.slice(0, AgentAbject.ELISION_KEEP_CHARS)}`;
+      message.elided = true;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════

@@ -67,7 +67,7 @@ export interface JobResult {
  * entries with these keys are silently dropped on submit.
  */
 const RESERVED_CONTEXT_KEYS = new Set<string>([
-  'call', 'dep', 'find', 'id', 'progress', 'console',
+  'ask', 'call', 'dep', 'find', 'id', 'progress', 'console',
 ]);
 
 export class JobManager extends Abject {
@@ -447,9 +447,18 @@ export class JobManager extends Abject {
      * actually registered removes the hunt when a name is genuinely wrong.
      */
     const resolveTarget = async (to: unknown): Promise<AbjectId> => {
+      const wasPending = typeof (to as { then?: unknown } | null)?.then === 'function';
       const raw = await to;
       if (typeof raw !== 'string' || raw.length === 0) {
-        throw new Error('call() needs a recipient: an object id, or the name of a registered object');
+        // A recipient that arrived as a Promise is almost always an
+        // un-awaited `find`/`dep`. Saying only "needs a recipient" sends the
+        // author looking for a wrong name, when the name was fine and the
+        // `await` was missing — and the same omission makes `if (!found)`
+        // test a Promise, which is always truthy, so the guard above this
+        // line silently did nothing too.
+        throw new Error(wasPending
+          ? 'call() was given a pending Promise as the recipient, which resolved to nothing. `find()` and `dep()` are async — write `const obj = await find(name)`. Without the await, `if (!obj)` is also always false, so a missing-object check above this call did not fire.'
+          : 'call() needs a recipient: an object id, or the name of a registered object');
       }
       if (UUID_RE.test(raw)) return raw as AbjectId;
 
@@ -508,9 +517,43 @@ export class JobManager extends Abject {
     const depFn = async (name: string) => this.requireDep(name);
     const findFn = async (name: string) => this.discoverDep(name);
 
+    /**
+     * Ask an object a question in its own words.
+     *
+     * `find` resolves a name that is already known; `ask` is how code learns
+     * what it does not. Without an affordance of its own the ask protocol was
+     * reachable only as `call(await find('Registry'), 'ask', {...})`, so job
+     * code reached for the name lookup sitting in scope and treated a miss as
+     * proof of absence — which it is not, since a name match cannot see a
+     * capability an object gained after it registered.
+     *
+     * `target` is an AbjectId or a registered name; omit it to ask the
+     * Registry, which answers "which object does X?" from its whole catalog
+     * and is the preferred first move for any which-object question.
+     */
+    const askFn = async (targetOrQuestion: string, maybeQuestion?: string) => {
+      const asRegistry = maybeQuestion === undefined;
+      const question = asRegistry ? targetOrQuestion : maybeQuestion;
+      const target = asRegistry
+        ? await this.resolveRegistryId()
+        : (targetOrQuestion.includes('-') ? targetOrQuestion as AbjectId : await this.discoverDep(targetOrQuestion));
+      if (!target) throw new Error(`ask: no object found for '${asRegistry ? 'Registry' : targetOrQuestion}'`);
+      // Asking yourself can only return your own manifest, or — while a task
+      // is running, which is exactly when job code runs — the busy notice,
+      // whose whole purpose is to keep a poll from timing out. An agent once
+      // asked itself for its state, got "busy executing 1 skill task" back,
+      // and reported that to the user as a finding about the subject it was
+      // supposed to be investigating.
+      if (q.currentJobCallerId && target === q.currentJobCallerId) {
+        throw new Error('ask: that object is you. Asking yourself returns your own description, or the busy notice while you are working — neither is evidence. Answer from what you already know, or do the work and report what it returns.');
+      }
+      return callFn(target as AbjectId, 'ask', { question });
+    };
+
     // Caller-bound values first; built-ins second so they cannot be shadowed.
     const context: Record<string, unknown> = {
       ...(userContext ?? {}),
+      ask: askFn,
       call: callFn,
       dep: depFn,
       find: findFn,
