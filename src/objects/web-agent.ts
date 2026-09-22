@@ -602,8 +602,28 @@ Set keepPageOpen: false to explicitly close the page when done.
       // is what unlocks "profile=linkedin" / "the 'linkedin' profile" phrasings.
       const profileFromData = (data?.profile as string | undefined)
         ?? (data?.pageOptions as { profile?: string } | undefined)?.profile;
-      const profileFromDescription = extractProfileName(description);
+      const parsed = extractProfileName(description);
+      // A weak parse (an unquoted word in prose) may only pick a profile that
+      // already exists; it must not bring a new one into being.
+      let profileFromDescription = parsed?.strong ? parsed.name : undefined;
+      if (parsed && !parsed.strong) {
+        const existing = await this.request<Array<{ name: string }>>(
+          request(this.id, this.webBrowserId!, 'listProfiles', {}), 10000,
+        ).catch(() => [] as Array<{ name: string }>);
+        if (existing.some(p => p.name === parsed.name)) profileFromDescription = parsed.name;
+        else log.info(`executeTask: ignoring weakly-parsed profile "${parsed.name}" — no such profile exists, and prose is not enough to create one`);
+      }
       const profile = profileFromData ?? profileFromDescription;
+      // A task that talks about a profile and then runs without one is the
+      // worst outcome available: the page opens in a clean slate, the site
+      // shows it logged out, and the agent truthfully reports a signed-out
+      // session while the real one sits signed in elsewhere. That happened —
+      // "the signed-in 'amazon' persistent browser profile" matched none of
+      // the patterns, so checkout ran in a fresh context and reported the
+      // cart as empty. Say so rather than proceeding quietly.
+      if (!profile && /\bprofile\b/i.test(description)) {
+        log.warn(`executeTask: the task names a profile but none resolved — running EPHEMERAL (clean slate, signed out). Description: ${description.slice(0, 200)}`);
+      }
       // A planner may pre-select a real (headful) browser for known anti-bot /
       // login sites; otherwise the page opens headless and request_human
       // upgrades it on demand.
@@ -1110,6 +1130,14 @@ Set keepPageOpen: false to explicitly close the page when done.
       const lines: string[] = [];
       lines.push(`URL: ${url}`);
       lines.push(`Title: ${title}`);
+      // Which browser this is. Without it a clean slate is indistinguishable
+      // from an expired session: a checkout task that lost its profile found
+      // itself logged out, reported the user's session as expired and their
+      // cart as emptied, and asked for credentials — while the real signed-in
+      // session sat untouched in the profile the task was supposed to use.
+      lines.push(extra.pageOptions?.profile
+        ? `Browser profile: ${extra.pageOptions.profile} (persistent — logins and cookies from earlier tasks in this profile apply)`
+        : 'Browser profile: none (EPHEMERAL clean slate — no cookies, no logins, nothing from any earlier task). Being signed out here says nothing about whether the user has a session elsewhere; do not report a session as expired or a cart as emptied on this evidence.');
       lines.push('');
       lines.push('Page structure (ARIA snapshot):');
       lines.push(truncatedSnapshot);
@@ -1600,7 +1628,7 @@ export const WEB_AGENT_ID = 'abjects:web-agent' as AbjectId;
  * "the persistent linkedin profile", etc. — is the only signal available.
  * Returns the first plausible match or undefined.
  */
-function extractProfileName(description: string): string | undefined {
+function extractProfileName(description: string): { name: string; strong: boolean } | undefined {
   if (!description) return undefined;
 
   // Ordered strongest-signal first. Explicit assignment and "named/called X"
@@ -1615,19 +1643,32 @@ function extractProfileName(description: string): string | undefined {
     // "named 'linkedin' (Playwright )profile" / "called linkedin profile"
     /\b(?:named|called)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+(?:persistent\s+|real[- ]?browser\s+|Playwright\s+)?profile\b/i,
     // "the 'linkedin' profile" (quoted name directly before "profile")
-    /['"`]([A-Za-z0-9][\w.-]{0,63})['"`]\s+(?:Playwright\s+)?profile\b/i,
+    // "the 'linkedin' profile", and the same with descriptors in between:
+    // "the signed-in 'amazon' persistent browser profile" matched nothing
+    // when only "Playwright" was tolerated here, so a checkout ran signed
+    // out. The name is quoted, which is what makes this a strong signal
+    // however many adjectives follow it.
+    /['"`]([A-Za-z0-9][\w.-]{0,63})['"`]\s+(?:(?:signed[- ]?in|persistent|real[- ]?browser|browser|headful|headless|Playwright|named|existing)\s+){0,4}profile\b/i,
     // Loosest, lowest priority: "(persistent|the) linkedin profile"
     /\b(?:persistent|the)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+profile\b/i,
   ];
 
-  for (const re of patterns) {
-    const m = description.match(re);
+  for (let i = 0; i < patterns.length; i++) {
+    const m = description.match(patterns[i]);
     if (m && m[1]) {
       const name = m[1].trim();
       // Skip generic/descriptor words so we don't latch onto phrasings like
       // "the persistent real-browser profile named X".
       if (!/^(browser|real|real-browser|headful|headless|playwright|persistent|named|called|the|a|this|that|new)$/i.test(name)) {
-        return name;
+        // The last pattern matches an UNQUOTED word between "the"/"persistent"
+        // and "profile", which catches ordinary prose: "using the persistent
+        // remove profile" minted a Chromium user-data-dir called `remove`,
+        // and the profile list grew `same`, `what`, `structured`,
+        // `unsubscribe` the same way. A weak match may only SELECT a profile
+        // that already exists, never create one.
+        const quoted = /['"`]/.test(m[0]);
+        const strong = i < patterns.length - 1 || quoted;
+        return { name, strong };
       }
     }
   }

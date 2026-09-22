@@ -94,6 +94,19 @@ interface StagedTask {
    * source). Omit when unknown — the agent resolves the target itself.
    */
   target?: string;
+  /**
+   * Named persistent browser profile the task must run in, when it depends on
+   * login state a previous task established. Threaded to the agent's
+   * executeTask as `data.profile`.
+   *
+   * Say it here rather than only in the description. A browsing agent
+   * otherwise has to recover the name from prose, and a task that read
+   * "in the signed-in 'amazon' persistent browser profile" was not matched by
+   * that parse: it ran in a clean slate, found itself logged out with an
+   * empty cart, and reported a session as expired while the real one sat
+   * signed in with the item still in it.
+   */
+  profile?: string;
 }
 
 function compactLine(value: unknown, max = 220): string {
@@ -1495,6 +1508,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     // executeTask as `data.target`. Accept common aliases the LLM might emit.
     const target = (action.target ?? action.objectId ?? action.objectName) as string | undefined;
     const maxSteps = typeof action.maxSteps === 'number' && Number.isFinite(action.maxSteps) ? Math.round(action.maxSteps) : undefined;
+    const profile = typeof action.profile === 'string' && action.profile.trim() ? action.profile.trim() : undefined;
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
@@ -1573,6 +1587,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       consumes,
       target,
       maxSteps,
+      profile,
     };
     if ((consumes?.length ?? 0) > 0 || (produces?.length ?? 0) > 0) {
       let existingKeys = new Set<string>();
@@ -2029,6 +2044,7 @@ Rules:
     const agentName = action.agentName as string | undefined;
     const task = action.task as string | undefined;
     const target = (action.target ?? action.objectName ?? action.objectId) as string | undefined;
+    const profile = typeof action.profile === 'string' && action.profile.trim() ? action.profile.trim() : undefined;
 
     if (!agentName || !task) {
       log.warn(`quick_dispatch missing agentName/task for goal ${goalId.slice(0, 8)} — falling back to full scrum`);
@@ -2049,7 +2065,7 @@ Rules:
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId }),
     );
-    const taskId = await this.dispatchSingleTask(goalId, agent.agentId, task, scrumNumber, target, operationId);
+    const taskId = await this.dispatchSingleTask(goalId, agent.agentId, task, scrumNumber, target, operationId, profile);
     if (!taskId) {
       await this.fallBackToFullScrum(goalId);
       return;
@@ -2068,11 +2084,12 @@ Rules:
    * same accounting the normal dispatch path relies on.
    */
   private async dispatchSingleTask(
-    goalId: string, agentId: AbjectId, description: string, scrumNumber: number, target?: string, operationId?: string,
+    goalId: string, agentId: AbjectId, description: string, scrumNumber: number, target?: string, operationId?: string, profile?: string,
   ): Promise<string | undefined> {
     const addResult = await this.request<{ taskId?: string; error?: string }>(
       request(this.id, this.goalManagerId!, 'addTask', {
-        goalId, description, assignedAgentId: agentId, scrumNumber, operationId, data: { target, planOperationId: operationId },
+        goalId, description, assignedAgentId: agentId, scrumNumber, operationId,
+        data: { target, planOperationId: operationId, ...(profile ? { profile } : {}) },
       }),
     );
     if (!addResult.taskId) {
@@ -2249,7 +2266,7 @@ Rules:
       const addResult = await this.request<{ taskId?: string; error?: string }>(
         request(this.id, this.goalManagerId, 'addTask', {
           goalId, operationId: `${otaTaskId}:task:${taskIds.length}`,
-          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
+          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, ...(s.profile ? { profile: s.profile } : {}), priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
           description: s.description,
           dependsOn: depIds.length > 0 ? depIds : undefined,
           produces: s.produces,
