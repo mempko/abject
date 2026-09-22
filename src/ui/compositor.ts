@@ -655,6 +655,14 @@ export class Compositor {
    */
   destroySurface(surfaceId: string): boolean {
     const deleted = this.surfaces.delete(surfaceId);
+    // Never leave the mobile view pointed at a destroyed surface: renderMobile
+    // would otherwise draw an empty frame (black screen) instead of the
+    // fallback. Dropping the id makes the next render pick the top visible
+    // surface. Mobile-only state; desktop ignores it.
+    if (this.mobileFocusedSurfaceId === surfaceId) {
+      this.mobileFocusedSurfaceId = undefined;
+      this.needsRender = true;
+    }
     if (deleted) {
       this.liveDataImages.delete(surfaceId);
       this.surfaceVideoStamps.delete(surfaceId);
@@ -3465,10 +3473,16 @@ export class Compositor {
     const availW = this.width;
     const availH = this.mobileAvailHeight;
 
-    // Find focused surface (or fallback to top visible)
-    const surface = this.mobileFocusedSurfaceId
+    // Find focused surface (or fallback to top visible). A focused id that
+    // is stale (destroyed), not yet drawn, or hidden must NOT render an
+    // empty frame (black screen) — fall back to the top visible surface
+    // until the focused surface becomes displayable.
+    let surface = this.mobileFocusedSurfaceId
       ? this.surfaces.get(this.mobileFocusedSurfaceId)
-      : this.getTopVisibleSurface();
+      : undefined;
+    if (!surface || !surface.drawn || !surface.visible) {
+      surface = this.getTopVisibleSurface();
+    }
 
     if (surface && surface.drawn && surface.visible) {
       // Base scale: fit window into available area

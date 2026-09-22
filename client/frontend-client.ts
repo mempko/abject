@@ -106,6 +106,9 @@ export class FrontendClient {
   /** P3: last clientDiagnostic send per gate, for per-gate rate limiting. */
   private lastDiagnosticAt: Record<string, number> = {};
   private grabbedSurface?: string;
+  /** Latest setFocused surface id deferred by an interaction guard; applied
+   *  when the guard clears (touch end, drag end, composition end, blur). */
+  private pendingMobileAutoSwitch?: string;
   /** Currently hovered 3D scene node (mesh), for enter/leave synthesis. */
   private hoveredNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
   /**
@@ -318,6 +321,8 @@ export class FrontendClient {
       this.proxyComposing = false;
       // Flush whatever the composition produced
       this.flushProxyInput(proxy);
+      // Composition guard released — a deferred auto-switch can land now.
+      this.applyPendingMobileAutoSwitch();
     });
 
     // Deliver composed/autocorrected text as it evolves. Some keyboards
@@ -336,7 +341,14 @@ export class FrontendClient {
 
     // Flush pending composed text when the proxy loses focus (keyboard
     // dismissed, another element focused) so nothing is left stranded.
-    proxy.addEventListener('blur', () => this.flushProxyInput(proxy));
+    proxy.addEventListener('blur', () => {
+      this.flushProxyInput(proxy);
+      // A blur ends any in-flight composition (some keyboards, e.g. iOS
+      // predictive, never fire compositionend), so the composition guard
+      // must be released here too — a deferred auto-switch can then land.
+      this.proxyComposing = false;
+      this.applyPendingMobileAutoSwitch();
+    });
 
     // Use beforeinput for the most reliable character capture on mobile.
     // Only handle insertText (typed characters) and insertCompositionText here.
@@ -1801,8 +1813,24 @@ export class FrontendClient {
    */
   private mobileAutoSwitchToFocusedSurface(surfaceId: string): void {
     if (!this.mobileMode) return;
-    if (this.activeTouch || this.localDragState || this.grabbedSurface || this.proxyComposing) return;
+    if (this.activeTouch || this.localDragState || this.grabbedSurface || this.proxyComposing) {
+      // The switch was skipped because the user is mid-gesture, dragging,
+      // or composing IME text (e.g. typing in the command palette or
+      // tapping a result row). Defer it instead of dropping it: the latest
+      // deferred target is applied as soon as the guard clears.
+      this.pendingMobileAutoSwitch = surfaceId;
+      return;
+    }
     this.compositor.setMobileFocusSurface(surfaceId);
+  }
+
+  /** Apply a deferred mobile auto-switch once no interaction guard is active. */
+  private applyPendingMobileAutoSwitch(): void {
+    if (!this.mobileMode || !this.pendingMobileAutoSwitch) return;
+    if (this.activeTouch || this.localDragState || this.grabbedSurface || this.proxyComposing) return;
+    const target = this.pendingMobileAutoSwitch;
+    this.pendingMobileAutoSwitch = undefined;
+    this.compositor.setMobileFocusSurface(target);
   }
 
   private handleCreateSurface(msg: CreateSurfaceMsg): void {
@@ -1946,6 +1974,7 @@ export class FrontendClient {
     this.localDragState = undefined;
     this.grabbedSurface = undefined;
     this.canvas.style.cursor = 'default';
+    this.applyPendingMobileAutoSwitch();
   }
 
   private handleMouseUp(e: MouseEvent): void {
@@ -1960,6 +1989,8 @@ export class FrontendClient {
       this.canvas.style.cursor = 'default';
     }
     this.handleMouseEvent(e, 'mouseup');
+    // A grab release can clear the last guard holding a deferred switch.
+    this.applyPendingMobileAutoSwitch();
   }
 
   // ── Resize cursor helpers ─────────────────────────────────────────
@@ -2301,6 +2332,7 @@ export class FrontendClient {
   private onTouchEnd(touch: Touch, cx: number, cy: number): void {
     const at = this.activeTouch;
     this.activeTouch = undefined;
+    this.applyPendingMobileAutoSwitch();
     if (!at) return;
     if (at.longPressTimer) clearTimeout(at.longPressTimer);
 
