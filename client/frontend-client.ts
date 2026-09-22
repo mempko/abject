@@ -1003,6 +1003,7 @@ export class FrontendClient {
         if (msg.glowColor) this.compositor.setFocusGlowColor(msg.glowColor);
         if (typeof msg.glowRadius === 'number') this.compositor.setFocusGlowRadius(msg.glowRadius);
         this.compositor.setFocusedSurface(msg.surfaceId);
+        this.mobileAutoSwitchToFocusedSurface(msg.surfaceId);
         break;
 
       case 'sceneOps':
@@ -1782,6 +1783,26 @@ export class FrontendClient {
       ? window.speechSynthesis.getVoices().map(v => v.name)
       : [];
     this.sendToBackend({ type: 'speechVoicesReply', requestId: msg.requestId, voices });
+  }
+
+  /**
+   * Mobile only: when the backend focuses a surface, switch the mobile view
+   * to it so a newly created window (own launch via palette/taskbar, or one
+   * created remotely by an agent/abject — both take focus server-side via
+   * the focusOnCreate window option) is immediately visible and focused.
+   * Reuses the compositor's existing mobile focus machinery rather than a
+   * parallel path. Skipped while the user is actively interacting (touch
+   * gesture in flight, local drag, or IME composition) so background window
+   * creation never fights their hands. The soft keyboard is NOT summoned
+   * here — that stays server-driven via showMobileKeyboard, which fires
+   * only when a text widget holds focus, so non-input windows switch
+   * without forcing the keyboard. Desktop is untouched: desktop layout is
+   * multi-window and follows backend focus only for the glow halo.
+   */
+  private mobileAutoSwitchToFocusedSurface(surfaceId: string): void {
+    if (!this.mobileMode) return;
+    if (this.activeTouch || this.localDragState || this.grabbedSurface || this.proxyComposing) return;
+    this.compositor.setMobileFocusSurface(surfaceId);
   }
 
   private handleCreateSurface(msg: CreateSurfaceMsg): void {
