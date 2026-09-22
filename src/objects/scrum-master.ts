@@ -917,6 +917,9 @@ export class ScrumMaster extends Abject {
         }
         const interjectionNudge = pendingNotes.length > 0
           ? ` The user sent ${pendingNotes.length} message(s) while this goal ran — see \`userInterjections\`; pending ones take precedence over the original plan (continue_scrum / re-plan / complete / fail / ask_user as they warrant).`
+            + (snap.data.awaitingAnswerTo
+              ? ` This goal is paused on a question of yours — \`awaitingAnswerTo\`. Read the pending note as the ANSWER to it and act on what it chooses. A reply to a question is short because the question carried the detail: "1", "2", "yes", "the second one", "done it" are complete answers, not empty ones. Map the answer onto what you offered and carry it out; ask again only when it genuinely fits none of the options.`
+              : '')
           : '';
 
         // Tier the first decision by trouble: a goal with failed tasks, a
@@ -1180,6 +1183,8 @@ export class ScrumMaster extends Abject {
       title: string; description: string; status: string; currentScrumNumber: number;
       scratchpad?: Record<string, unknown>;
       interjections?: Array<{ note: string; at: number; status: 'pending' | 'incorporated' }>;
+      /** Set while the goal is paused on an ask_user question. */
+      pendingQuestion?: { question: string; at: number };
     } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     );
@@ -1279,6 +1284,11 @@ export class ScrumMaster extends Abject {
           status: goal.status,
         },
         ...(userInterjections.length > 0 ? { userInterjections } : {}),
+        // The question this goal was paused to ask. A reply arrives as an
+        // ordinary interjection, so this is what makes a short one legible:
+        // "1" means nothing beside a plan, and everything beside the menu
+        // that offered option 1.
+        ...(goal.pendingQuestion ? { awaitingAnswerTo: goal.pendingQuestion.question.slice(0, 1000) } : {}),
         ...(loopWarning ? { loopWarning } : {}),
         completed: completed.map(t => ({
           id: t.id,

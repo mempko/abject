@@ -120,6 +120,17 @@ export interface Goal {
    */
   interjections: Array<{ note: string; at: number; status: 'pending' | 'incorporated' }>;
   /**
+   * The question `requestClarification` paused this goal to ask.
+   *
+   * The user's reply arrives as an ordinary interjection, so without the
+   * question beside it a short answer is unreadable: "1" was weighed on its
+   * own and dismissed as "an ambiguous, contentless note — likely an
+   * accidental keystroke", when it was the user picking option 1 from a
+   * numbered menu the scrum itself had just offered. Cleared once a decision
+   * weighs it, the same moment the interjection is marked incorporated.
+   */
+  pendingQuestion?: { question: string; at: number };
+  /**
    * Scrum-shaped orchestration: each ScrumMaster scrum that plans more work
    * increments this. New tasks created in that round carry the same scrumNumber
    * on their tuple, so the next scrum only fires when every task at the
@@ -1363,6 +1374,7 @@ reviews results and either plans another round or completes/fails the goal.
           scratchpad: goal.scratchpad,
           currentScrumNumber: goal.currentScrumNumber,
           interjections: goal.interjections,
+          ...(goal.pendingQuestion ? { pendingQuestion: goal.pendingQuestion } : {}),
         },
         persist: true,
       }));
@@ -2064,6 +2076,7 @@ reviews results and either plans another round or completes/fails the goal.
 
       goal.status = 'paused';
       goal.updatedAt = Date.now();
+      goal.pendingQuestion = { question, at: goal.updatedAt };
       const runtimeId = await this.taskRuntime();
       if (runtimeId) {
         try {
@@ -2095,6 +2108,10 @@ reviews results and either plans another round or completes/fails the goal.
         }
       }
       if (flipped > 0) {
+        // A decision that weighed these notes has now read the question they
+        // were answering, so the question has served its purpose. Leaving it
+        // would attach it to whatever the user says next.
+        goal.pendingQuestion = undefined;
         goal.updatedAt = Date.now();
         this.syncGoalToSharedState(goal);
       }
