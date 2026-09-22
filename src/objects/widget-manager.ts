@@ -1889,8 +1889,10 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           WHOLE ops batch is rejected (scene ops validate atomically — one bad node and nothing renders).
           BLOOM threshold is the brightness a pixel must EXCEED to glow, and the highlight rolloff keeps lit
           colour just under 1.0 — so a threshold at or near 1.0 never fires and you get no bloom and no error.
-          Around 0.6 is the working default; go lower for more glow. Bloom is also a DESKTOP-WIDE post pass,
-          not a per-window effect: an environment node's bloom settings apply to every window on screen.
+          Around 0.6 is the working default; go lower for more glow. Bloom is PER WINDOW: an environment
+          node's bloom applies to the window that declared it and nothing else, so a neon scene glows without
+          putting a halo on a neighbouring document or screenshot. (A world-scene environment is the one
+          exception: the world scene is the desktop, so its bloom covers the desktop.)
           ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
           tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
           params: { preset: 'spin', duration: 4000 } }] }). Presets (extras ride in params beside preset):

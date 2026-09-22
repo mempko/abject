@@ -76,9 +76,11 @@ The hand-rolled WebGL2 engine:
 The compositor owns mesh-material resolution, an `environment`-node ambient/fog
 lookup, billboard matrices, a mesh-texture cache, a client-side declarative
 animation engine (presets + per-channel tweens + paths) driven off the render
-loop, and post/auxiliary passes: opt-in bloom (`environment.bloom`) and opt-in
-directional shadow maps (`light.castShadow`, auto-fit ortho frustum). Both are
-contained — they only run when enabled and never disturb the base render.
+loop, and post/auxiliary passes: opt-in bloom (`environment.bloom`, applied per
+window — masked and scissored to the declaring window's projected rect; a
+world-scene environment blooms the whole desktop) and opt-in directional shadow
+maps (`light.castShadow`, auto-fit ortho frustum). Both are contained — they
+only run when enabled and never disturb the base render.
 
 Window 3D children are **occluded by default**: scissor-clipped to the window's
 content rect (below the title bar) so they can't spill across the desktop or

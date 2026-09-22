@@ -131,8 +131,16 @@ precision highp float;
 in vec2 vUv;
 uniform sampler2D uTex;
 uniform float uThreshold;
+// The region (uv, y-down) that may contribute glow: the owning window's
+// screen rect. Everything outside is zeroed BEFORE the blur, so a bright
+// neighbour cannot bleed into a window that never asked for bloom.
+uniform vec4 uRect;
 out vec4 outColor;
 void main() {
+  if (vUv.x < uRect.x || vUv.y < uRect.y || vUv.x > uRect.z || vUv.y > uRect.w) {
+    outColor = vec4(0.0);
+    return;
+  }
   vec3 c = texture(uTex, vUv).rgb;
   float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
   float k = clamp((l - uThreshold) / max(l, 1e-4), 0.0, 1.0);

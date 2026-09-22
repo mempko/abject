@@ -57,6 +57,51 @@ export interface Rect {
   height: number;
 }
 
+/**
+ * Screen-space bounding rect (CSS px, y-down) of a slab's unit quad
+ * (local [-0.5, 0.5]) under `model` and `viewProj`, grown by `pad`. Returns
+ * undefined when any corner is behind the camera or the rect is empty.
+ *
+ * Exported so the projection can be checked without a GL context.
+ */
+export function projectUnitQuadToCss(
+  model: ArrayLike<number>, viewProj: ArrayLike<number>,
+  cssWidth: number, cssHeight: number, pad = 0,
+): Rect | undefined {
+  // mvp = viewProj × model, but only the columns a z=0 quad needs.
+  const col = (m: ArrayLike<number>, c: number) => [m[c * 4], m[c * 4 + 1], m[c * 4 + 2], m[c * 4 + 3]];
+  const mul = (v: number[]) => [
+    viewProj[0] * v[0] + viewProj[4] * v[1] + viewProj[8] * v[2] + viewProj[12] * v[3],
+    viewProj[1] * v[0] + viewProj[5] * v[1] + viewProj[9] * v[2] + viewProj[13] * v[3],
+    viewProj[2] * v[0] + viewProj[6] * v[1] + viewProj[10] * v[2] + viewProj[14] * v[3],
+    viewProj[3] * v[0] + viewProj[7] * v[1] + viewProj[11] * v[2] + viewProj[15] * v[3],
+  ];
+  const mx = mul(col(model, 0)), my = mul(col(model, 1)), mt = mul(col(model, 3));
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]) {
+    const cx = mx[0] * x + my[0] * y + mt[0];
+    const cy = mx[1] * x + my[1] * y + mt[1];
+    const cw = mx[3] * x + my[3] * y + mt[3];
+    if (cw <= 0) return undefined;
+    const sx = (cx / cw * 0.5 + 0.5) * cssWidth;
+    const sy = (0.5 - cy / cw * 0.5) * cssHeight;
+    if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
+    if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
+  }
+  // Snap away float noise before widening: the matrices are Float32Arrays,
+  // so an edge at 700 arrives as 700.00003 and Math.ceil would make it 701.
+  // A thousandth of a CSS pixel is far above float32 error at screen scale
+  // and far below anything a scissor can see.
+  const EPS = 1e-3;
+  const x0 = Math.max(0, Math.floor(minX - pad + EPS)), y0 = Math.max(0, Math.floor(minY - pad + EPS));
+  const x1 = Math.min(cssWidth, Math.ceil(maxX + pad - EPS)), y1 = Math.min(cssHeight, Math.ceil(maxY + pad - EPS));
+  if (x1 <= x0 || y1 <= y0) return undefined;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
+/** How far (CSS px) a window's glow may extend past its own edge. */
+const BLOOM_SPILL_PX = 24;
+
 export interface Surface {
   id: string;
   objectId: AbjectId;
@@ -395,9 +440,24 @@ export class Compositor {
    * ONE 'animate' scene op instead of a transform message every frame.
    */
   private nodeAnims = new Map<string, { surfaceKey: string; id: string; anims: NodeAnim[] }>();
-  /** Global bloom post-effect config, set by an 'environment' node's `bloom`. */
-  private bloomConfig?: { threshold: number; intensity: number };
-  private bloomOwnerKey?: string;
+  /**
+   * Bloom post-effect config per surface key, set by that surface's
+   * 'environment' node. A window's bloom is applied to that window's screen
+   * rect only; a world-scene (`world:<owner>`) environment blooms the whole
+   * desktop, since the world scene IS the desktop. It used to be one global
+   * field: a single game enabling bloom for its own neon put a halo on every
+   * bright pixel of every window on screen, screenshots included.
+   */
+  private bloomBySurface = new Map<string, { nodeId: string; threshold: number; intensity: number }>();
+  /**
+   * Surfaces whose model matrix was set THIS frame. `SurfaceGlState.model` is
+   * kept between frames for picking, so on a phone — where only the focused
+   * window is drawn — an unfocused window still carries the matrix from the
+   * last time it was on screen. Bloom must key off what was drawn, not what
+   * has a matrix, or an unfocused neon window glows a rect that now shows
+   * something else.
+   */
+  private drawnThisFrame = new Set<string>();
   private sceneTheme?: SceneTheme;
   private surfaceGl: Map<string, SurfaceGlState> = new Map();
   /** Owners with world-scope scene nodes (keys into sceneStore: `world:<ownerId>`). */
@@ -976,7 +1036,7 @@ export class Compositor {
     }
     if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
     for (const op of anims) this.startOrStopAnim(surfaceKey, op);
-    // Pick up bloom config from any 'environment' node (global post-effect).
+    // Pick up bloom config from this surface's 'environment' node.
     for (const op of rest) this.syncBloomFrom(surfaceKey, op);
     // Only wake the render loop for changes that can reach pixels. A 30-60fps
     // animation stream aimed at a hidden window or an inactive workspace
@@ -985,23 +1045,47 @@ export class Compositor {
     if (this.isSurfaceKeyRenderable(surfaceKey)) this.needsRender = true;
   }
 
-  /** Update the global bloom config when an 'environment' node changes. */
+  /** Update this surface's bloom config when its 'environment' node changes. */
   private syncBloomFrom(surfaceKey: string, op: SceneOp): void {
-    const fullKey = `${surfaceKey}/${op.id}`;
+    const current = this.bloomBySurface.get(surfaceKey);
     if (op.op === 'remove') {
-      if (this.bloomOwnerKey === fullKey) { this.bloomConfig = undefined; this.bloomOwnerKey = undefined; }
+      if (current?.nodeId === op.id) this.bloomBySurface.delete(surfaceKey);
       return;
     }
     const node = this.sceneStore.getNode(surfaceKey, op.id);
     if (node?.kind !== 'environment') return;
     const b = node.params.bloom as boolean | { threshold?: number; intensity?: number } | undefined;
     if (b) {
-      this.bloomConfig = b === true
-        ? { threshold: 0.6, intensity: 1 }
-        : { threshold: b.threshold ?? 0.6, intensity: b.intensity ?? 1 };
-      this.bloomOwnerKey = fullKey;
-    } else if (this.bloomOwnerKey === fullKey) {
-      this.bloomConfig = undefined; this.bloomOwnerKey = undefined;
+      this.bloomBySurface.set(surfaceKey, b === true
+        ? { nodeId: op.id, threshold: 0.6, intensity: 1 }
+        : { nodeId: op.id, threshold: b.threshold ?? 0.6, intensity: b.intensity ?? 1 });
+    } else if (current?.nodeId === op.id) {
+      this.bloomBySurface.delete(surfaceKey);
+    }
+  }
+
+  /**
+   * One bloom pass per surface that asked for it, each clipped to that
+   * surface's projected rect. A surface that has gone away drops its entry
+   * here rather than needing a hook in surface removal.
+   */
+  private applyBloomPasses(): void {
+    if (this.bloomBySurface.size === 0) return;
+    for (const [surfaceKey, cfg] of this.bloomBySurface) {
+      if (surfaceKey.startsWith('world:')) {
+        this.renderer.applyBloom(cfg.threshold, cfg.intensity);
+        continue;
+      }
+      const surface = this.surfaces.get(surfaceKey);
+      if (!surface) { this.bloomBySurface.delete(surfaceKey); continue; }
+      if (!this.isSurfaceKeyRenderable(surfaceKey)) continue;
+      // Drawn this frame, on either the desktop or the phone path — a
+      // matrix left over from an earlier frame is not a place on screen.
+      if (!this.drawnThisFrame.has(surfaceKey)) continue;
+      const model = this.glState(surfaceKey).model;
+      if (!model) continue;
+      const rect = projectUnitQuadToCss(model, this.viewProj, this.width, this.height, BLOOM_SPILL_PX);
+      if (rect) this.renderer.applyBloom(cfg.threshold, cfg.intensity, 3, rect);
     }
   }
 
@@ -1929,14 +2013,16 @@ export class Compositor {
     if (this.stepAnimations(performance.now())) this.needsRender = true;
     this.touchedCustomMeshes.clear();
     this.touchedInstanced.clear();
+    this.drawnThisFrame.clear();
     this.renderer.beginFrame();
     if (this.mobileMode) {
       this.renderMobile();
     } else {
       this.renderDesktop();
     }
-    // Bloom is a post pass over the rendered scene, beneath the 2D chrome.
-    if (this.bloomConfig) this.renderer.applyBloom(this.bloomConfig.threshold, this.bloomConfig.intensity);
+    // Bloom is a post pass over the rendered scene, beneath the 2D chrome,
+    // clipped to each window that asked for it.
+    this.applyBloomPasses();
     this.overlay.draw();
     this.pruneCustomMeshes();
     this.pruneCanvasLayers();
@@ -2014,6 +2100,7 @@ export class Compositor {
         rect.width, rect.height, 1,
       );
       state.model = model;
+      this.drawnThisFrame.add(surface.id);
 
       // The window's own camera — used for the slab AND its content subtree.
       // For an unrotated slab the off-axis projection renders identically to
@@ -3412,6 +3499,7 @@ export class Compositor {
         scaledW, scaledH, 1,
       );
       state.model = model;
+      this.drawnThisFrame.add(surface.id);
       // Off-axis camera fitted to the on-screen slab: the same per-window
       // projection the desktop uses, so scene-vocabulary nodes keep their
       // exact desktop geometry while the slab stays a front-facing rectangle.
@@ -3578,6 +3666,7 @@ export class Compositor {
       const state = this.glState(surface.id);
       const model = mat4TRS(cx, cy, zRecede, 0, yTurn, 0, w, h, 1);
       state.model = model;
+      this.drawnThisFrame.add(surface.id);
 
       // Card shadow.
       const pad = 40;

@@ -950,11 +950,25 @@ void main() { fragColor = vec4(1.0); }`,
    * copy, so a failure here can only affect the glow, never the base render.
    * Call after the scene draws and before the 2D chrome overlay.
    */
-  applyBloom(threshold: number, intensity: number, iterations = 3): void {
+  applyBloom(
+    threshold: number,
+    intensity: number,
+    iterations = 3,
+    rect?: { x: number; y: number; width: number; height: number },
+  ): void {
     const gl = this.gl;
     if (this.contextLost) return;
     this.ensureBloomTargets();
     if (this.bloomUnavailable) return;
+    // `rect` (CSS px, y-down) scopes the pass to one window: the bright
+    // extraction is masked to it and the final composite is scissored to it,
+    // so glow neither enters from outside nor spills out. Omitted, the pass
+    // covers the whole frame, which is what a world-scene environment means.
+    const dpr = this.canvas.width / Math.max(1, this.cssWidth);
+    const cssH = this.canvas.height / dpr;
+    const uvRect = rect
+      ? [rect.x / this.cssWidth, rect.y / cssH, (rect.x + rect.width) / this.cssWidth, (rect.y + rect.height) / cssH]
+      : [0, 0, 1, 1];
     // 1. Snapshot the lit backbuffer.
     gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex!);
     gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, this.canvas.width, this.canvas.height, 0);
@@ -963,13 +977,14 @@ void main() { fragColor = vec4(1.0); }`,
     gl.viewport(0, 0, this.bloomW, this.bloomH);
 
     // 2. Bright-pass scene → bloomTex[0].
-    const bright = this.getProgram('bloomBright', OVERLAY_VS, BRIGHT_FS, ['uTex', 'uThreshold']);
+    const bright = this.getProgram('bloomBright', OVERLAY_VS, BRIGHT_FS, ['uTex', 'uThreshold', 'uRect']);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomFbo[0]);
     gl.useProgram(bright.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex!);
     gl.uniform1i(bright.uniforms.uTex, 0);
     gl.uniform1f(bright.uniforms.uThreshold, threshold);
+    gl.uniform4f(bright.uniforms.uRect, uvRect[0], uvRect[1], uvRect[2], uvRect[3]);
     this.blitFullscreen();
 
     // 3. Separable gaussian, ping-ponging between the two half-res targets.
@@ -998,9 +1013,11 @@ void main() { fragColor = vec4(1.0); }`,
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.bloomTex[src]);
     gl.uniform1i(comp.uniforms.uTex, 0);
+    if (rect) this.setScissor(rect);
     // Scale glow by intensity via repeated additive blits (cheap, 1-3x).
     const passes = Math.max(1, Math.round(intensity));
     for (let i = 0; i < passes; i++) this.blitFullscreen();
+    if (rect) this.clearScissor();
     // Restore the standard premultiplied source-over blend.
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
