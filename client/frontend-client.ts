@@ -641,6 +641,17 @@ export class FrontendClient {
   /**
    * Listen for visual viewport changes (keyboard show/hide) and shift
    * the canvas up so content stays visible above the keyboard.
+   *
+   * Two mechanisms cooperate:
+   *  - `interactive-widget=resizes-content` in index.html makes Android
+   *    Chrome shrink the layout viewport itself when the keyboard opens;
+   *    the compositor's resize handling then re-centers the focused
+   *    surface in the smaller canvas and keyboardHeight stays ~0.
+   *  - Browsers that keep the layout viewport full-height (resizes-visual
+   *    fallback) get the transform below: shift the canvas up by HALF the
+   *    keyboard height, which centers mid-canvas content (the mobile
+   *    renderer centers the focused surface) in the region the keyboard
+   *    leaves visible. Only applied in mobile mode.
    */
   private setupViewportShift(): void {
     if (!window.visualViewport) return;
@@ -656,9 +667,16 @@ export class FrontendClient {
         this.keyboardWanted = false;
       }
       this.keyboardVisible = visible;
-      if (visible) {
-        // Keyboard is open -- shift canvas up
-        this.canvas.style.transform = `translateY(-${keyboardHeight}px)`;
+      if (visible && this.mobileMode) {
+        // Keyboard is open -- shift the canvas up by HALF the keyboard
+        // height, not the whole thing. The mobile renderer centers the
+        // focused surface (command palette, text windows) in the available
+        // area, so a half-shift centers that content in the region the
+        // keyboard leaves visible. Shifting by the full keyboard height
+        // pushed the top of centered windows -- the palette's search
+        // input -- off the top of the screen.
+        const shift = Math.floor(keyboardHeight / 2);
+        this.canvas.style.transform = `translateY(-${shift}px)`;
       } else {
         this.canvas.style.transform = '';
       }
