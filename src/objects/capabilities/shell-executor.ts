@@ -171,8 +171,41 @@ export class ShellExecutor extends Abject {
    * where the analysis already found no writes and no danger.
    */
   private static readonly INERT_FILTERS = new Set([
+    // Slice and shape a stream.
     'echo', 'printf', 'head', 'tail', 'cat', 'wc', 'sort', 'uniq',
     'cut', 'tr', 'rev', 'column', 'fold', 'nl', 'true', 'false',
+    'tac', 'expand', 'unexpand', 'paste', 'fmt', 'pr', 'seq', 'printenv',
+    // Shaping a tool's --json output is the common case for a CLI-backed
+    // skill, and it is the same kind of work as `cut` or `sort`.
+    'jq',
+    // Selects lines and cannot execute anything. The most common filter
+    // there is, and its file operands are modelled, so the no-reads rule
+    // sees them.
+    'grep',
+    // Inspect bytes without changing them.
+    'strings', 'od', 'hexdump', 'cksum', 'base64',
+    'shasum', 'sha1sum', 'sha256sum', 'sha512sum', 'md5sum', 'md5',
+    // Windows equivalents. Most Windows filtering happens inside a
+    // `powershell -Command` string, which the analysis marks opaque and so
+    // never covers — correctly, since its contents are unreadable from here.
+    'findstr', 'where',
+    //
+    // Deliberately absent, and worth keeping absent: `sed` (GNU `e` and `w`
+    // execute and write, `-i` edits in place), `awk` (`system()`, `| "sh"`,
+    // `print > file`), `tee` (writes by design), `xargs` / `find` / `env` /
+    // `watch` / `timeout` / `script` (all run other programs), `less` /
+    // `more` / `vi` (`!cmd` escapes to a shell), every interpreter, and
+    // everything that reaches the network.
+  ]);
+
+  /**
+   * Redirection targets that discard or re-aim output instead of touching the
+   * filesystem. `2>/dev/null` is how anything suppresses stderr, so counting
+   * it as a write meant no command that quietened itself could ever be
+   * covered by a skill grant — including a bare `<tool> status 2>/dev/null`.
+   */
+  private static readonly NULL_SINKS = new Set([
+    '/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty',
   ]);
 
   /**
@@ -190,11 +223,25 @@ export class ShellExecutor extends Abject {
     programs: string[],
   ): boolean {
     if (untrusted || !skillName || analysis.opaque) return false;
-    if (analysis.effect === 'dangerous' || analysis.writes.length > 0) return false;
-    if (programs.length === 0) return false;
+    if (analysis.effect === 'dangerous') return false;
+    if (analysis.writes.some(w => !ShellExecutor.NULL_SINKS.has(w.resolved ?? w.raw))) return false;
+    // The filters are inert only while they read a pipe: `<tool> status |
+    // head -40` shapes the tool's own output, whereas `<tool> status; head
+    // /etc/shadow` would borrow the skill's grant to read something the
+    // skill has nothing to do with.
+    //
+    // Judged per segment, not over the whole line. A skill's own program is
+    // unknown to the analysis, so its arguments are path-GUESSED: `<tool>
+    // search 'max@thetaedge.ai'` reported that address as a file read, and
+    // a whole-line rule then refused every skill command whose argument
+    // happened to contain a dot. What the skill's own program does with its
+    // arguments is the skill's business, and enabling it is what said so.
     const declared = this.skillDeclaredCommands.get(skillName);
     const granted = this.skillAllowedCommands.get(skillName);
     if (!declared?.size && !granted?.size) return false;
+    const isSkillProgram = (p: string) => declared?.has(p) === true || granted?.has(p) === true;
+    if (analysis.segments.some(s => !isSkillProgram(s.program) && s.reads.length > 0)) return false;
+    if (programs.length === 0) return false;
     // At least one program must be the skill's own; the rest may be filters.
     // Otherwise "echo hi" would ride in on any enabled skill.
     let sawSkillProgram = false;

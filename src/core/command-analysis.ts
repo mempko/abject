@@ -139,6 +139,13 @@ interface ProgramRule {
   argsArePaths?: boolean;
   /** Non-flag path arguments are written, not read (`mkdir`, `rm`). */
   argsAreWrites?: boolean;
+  /**
+   * The LAST non-flag operand is written, earlier ones read. POSIX `uniq`
+   * and `comm`-style tools take `[input [output]]`, where a second operand
+   * silently overwrites a file — reporting it as a read told the user a
+   * command would look at a path it actually destroys.
+   */
+  lastArgIsWrite?: boolean;
 }
 
 /**
@@ -176,8 +183,46 @@ const PROGRAMS: Record<string, ProgramRule> = {
   whoami: { effect: 'read' },
   hostname: { effect: 'read' },
   uname: { effect: 'read' },
-  sort: { effect: 'read', argsArePaths: true },
-  uniq: { effect: 'read', argsArePaths: true },
+  // `-o` names a file sort OVERWRITES, and `/O` is the Windows spelling.
+  // Listed as valued as well as out, or the same path lands in both reads
+  // and writes.
+  sort: {
+    effect: 'read', argsArePaths: true,
+    outFlags: ['-o', '--output', '/O'],
+    valuedFlags: ['-o', '--output', '/O', '-k', '--key', '-t', '--field-separator', '-S', '--buffer-size', '-T', '--temporary-directory'],
+  },
+  uniq: { effect: 'read', argsArePaths: true, lastArgIsWrite: true },
+  // Reverse, number, wrap, retab, merge, reflow, paginate. stdin to stdout,
+  // or named files read in place with no way to write one.
+  rev: { effect: 'read', argsArePaths: true },
+  nl: { effect: 'read', argsArePaths: true },
+  fold: { effect: 'read', argsArePaths: true },
+  expand: { effect: 'read', argsArePaths: true },
+  unexpand: { effect: 'read', argsArePaths: true },
+  paste: { effect: 'read', argsArePaths: true },
+  fmt: { effect: 'read', argsArePaths: true },
+  pr: { effect: 'read', argsArePaths: true },
+  tac: { effect: 'read', argsArePaths: true },
+  seq: { effect: 'read' },
+  printenv: { effect: 'read' },
+  // Inspect bytes. Read-only views of a file's contents.
+  strings: { effect: 'read', argsArePaths: true },
+  od: { effect: 'read', argsArePaths: true },
+  hexdump: { effect: 'read', argsArePaths: true },
+  cksum: { effect: 'read', argsArePaths: true },
+  shasum: { effect: 'read', argsArePaths: true },
+  sha1sum: { effect: 'read', argsArePaths: true },
+  sha512sum: { effect: 'read', argsArePaths: true },
+  // BSD base64 writes with `-o`; GNU has no such flag, so listing it is
+  // harmless on Linux and necessary on macOS.
+  base64: {
+    effect: 'read', argsArePaths: true,
+    outFlags: ['-o', '--output'], valuedFlags: ['-o', '--output', '-w', '--wrap'],
+  },
+  // Windows: findstr is grep, more is a pager with no shell escape, where
+  // locates an executable.
+  findstr: { effect: 'read', skipArgs: 1, argsArePaths: true },
+  where: { effect: 'read' },
   cut: { effect: 'read', argsArePaths: true },
   tr: { effect: 'read' },
   column: { effect: 'read' },
@@ -742,6 +787,7 @@ function classifySegment(
 
   if (rule.argsArePaths) {
     let skipped = 0;
+    const operands: TouchedPath[] = [];
     for (let i = 0; i < argWords.length; i++) {
       const w = argWords[i];
       // A flag that takes a value swallows the next word, so `-name '*.ts'`
@@ -757,9 +803,19 @@ function classifySegment(
       }
       if (!isPathCandidate(w)) continue;
       if (skipped < (rule.skipArgs ?? 0)) { skipped++; continue; }
-      const touched = resolveTouched(w, cwd);
+      operands.push(resolveTouched(w, cwd));
+    }
+    // `uniq in out` overwrites `out`. Only when there IS a second operand:
+    // with one, the tool reads it and prints to stdout.
+    const trailingWrite = rule.lastArgIsWrite && operands.length > 1 ? operands.pop() : undefined;
+    for (const touched of operands) {
       if (argsAreWrites) writes.push(touched);
       else reads.push(touched);
+    }
+    if (trailingWrite) {
+      writes.push(trailingWrite);
+      effect = maxEffect(effect, 'write');
+      reason = `${program} overwrites its output operand`;
     }
   }
 
