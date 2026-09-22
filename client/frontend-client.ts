@@ -224,6 +224,34 @@ export class FrontendClient {
     this.setupMobileKeyboard();
     this.setupViewportShift();
     this.setupFileUpload();
+    this.setupMobilePaletteButton();
+  }
+
+  /**
+   * Wire the floating mobile palette button (touch equivalent of desktop
+   * Cmd/Ctrl+K). It sends the exact same globalShortcut message the desktop
+   * keydown handler sends, so the per-workspace CommandPalette abject opens
+   * in the canvas with the same registry-sourced entry list.
+   */
+  private setupMobilePaletteButton(): void {
+    const btn = document.getElementById('mobile-palette-btn');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      if (!this.authenticated) return;
+      this.sendToBackend({ type: 'globalShortcut', combo: 'commandPalette' });
+    });
+    this.updateMobilePaletteButton();
+  }
+
+  /** Show the floating palette button only on mobile once authenticated. */
+  private updateMobilePaletteButton(): void {
+    const btn = document.getElementById('mobile-palette-btn');
+    if (!btn) return;
+    if (this.authenticated && this.mobileMode) {
+      btn.removeAttribute('hidden');
+    } else {
+      btn.setAttribute('hidden', '');
+    }
   }
 
   private detectMobileMode(): void {
@@ -246,6 +274,7 @@ export class FrontendClient {
       this.mobileMode = (coarse || touch) && nowNarrow;
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
+        this.updateMobilePaletteButton();
       }
     });
 
@@ -735,6 +764,7 @@ export class FrontendClient {
         this.hideConnecting();
         this.hideLoginForm();
         this.sendFontMetricsWhenReady();
+        this.updateMobilePaletteButton();
         break;
 
       case 'authRequired': {
@@ -756,6 +786,7 @@ export class FrontendClient {
           this.hideConnecting();
           this.hideLoginForm();
           this.sendFontMetricsWhenReady();
+          this.updateMobilePaletteButton();
         } else {
           // Token was rejected — clear it and show form
           localStorage.removeItem('abjects_auth_token');

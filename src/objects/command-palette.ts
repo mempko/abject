@@ -171,13 +171,17 @@ export class CommandPaletteAbject extends Abject {
     this.applyFilter();
 
     const display = await this.getDisplaySize();
-    const x = Math.max(0, Math.floor((display.width  - PALETTE_WIDTH)  / 2));
-    const y = Math.max(40, Math.floor((display.height - PALETTE_HEIGHT) / 3));
+    // Clamp to the display: phone canvases are far smaller than the
+    // desktop-centered 520×380 default, which would overflow them.
+    const width = Math.min(PALETTE_WIDTH, Math.floor(display.width * 0.94));
+    const height = Math.min(PALETTE_HEIGHT, Math.floor(display.height * 0.6));
+    const x = Math.max(0, Math.floor((display.width  - width)  / 2));
+    const y = Math.max(40, Math.floor((display.height - height) / 3));
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId, 'createWindowAbject', {
         title: 'Command Palette',
-        rect: { x, y, width: PALETTE_WIDTH, height: PALETTE_HEIGHT },
+        rect: { x, y, width, height },
         chromeless: true,
         resizable: false,
         zIndex: 9000,

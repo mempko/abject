@@ -388,6 +388,33 @@
         font-size: 0.9rem;
         cursor: pointer;
       }
+
+      /* Floating mobile palette button — the touch equivalent of desktop
+         Cmd/Ctrl+K. Shown only on mobile once authenticated. */
+      #mobile-palette-btn {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        border: 1px solid #2a2c42;
+        background: rgba(26, 27, 46, 0.92);
+        color: #e2e4f0;
+        font-size: 1.45rem;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 500;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        cursor: pointer;
+      }
+      #mobile-palette-btn[hidden] {
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -443,6 +470,7 @@
     <!-- Hidden input for file uploads, opened on demand by the backend -->
     <input id="file-upload-proxy" type="file"
       style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;" />
+    <button id="mobile-palette-btn" type="button" aria-label="Search abjects" hidden>⌘</button>
     <script type="module" src="./index.ts"></script>
   </body>
 </html>
