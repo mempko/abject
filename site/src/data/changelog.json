@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.10.7",
+    "date": "2026-09-22",
+    "title": "Steadier hands, clearer signals",
+    "summary": "This release makes agents more resilient when work gets long or messy: conversations that overflow the model's context recover on their own, skills can run the commands they declare, and short replies to clarification questions are understood in context. Bloom is now something you can tune per window.",
+    "highlights": [
+      "Bloom is now a per-window effect: each window can carry its own glow instead of one global setting for the whole desktop",
+      "Agents recover from LLM context overflow automatically by compressing the conversation and retrying, rather than failing the task",
+      "Skills can declare the commands they need, and those commands are granted through the permission layer; command analysis in the shell now covers more cases and grants are scoped more precisely",
+      "Agent jobs gain an ask() call in their context, along with improved guidance on how agents should approach their work"
+    ],
+    "fixes": [
+      "Browser profile is now carried through scrum tasks, and profile parsing tolerates malformed input instead of breaking",
+      "Clarification questions are carried with the conversation, so short user replies (like \"yes\" or \"the second one\") are interpreted correctly"
+    ]
+  },
+  {
     "version": "0.10.6",
     "date": "2026-09-17",
     "title": "Watching the Heap",
