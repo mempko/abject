@@ -51,6 +51,9 @@ export class Taskbar extends Abject {
   /** Horizontal dock collapse (pushed via show()): render icon-only rows. */
   private compact = false;
   private headerBtnId?: AbjectId;
+  /** Chat system-row button (for the goal-activity busy pulse). */
+  private chatBtnId?: AbjectId;
+  private chatBusy = false;
 
   // Button -> target maps for click dispatch
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
@@ -183,6 +186,11 @@ can restore windows from the sidebar.
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect === 'goalActivity') {
+        // A chat is busy (turn running or goal active) → pulse the chat icon.
+        this.setChatBusy(!!(value as { active?: boolean } | undefined)?.active);
+        return;
+      }
       if (aspect === 'visibility') {
         // Update single button style in-place (no rebuild)
         const fromId = msg.routing.from;
@@ -454,7 +462,13 @@ can restore windows from the sidebar.
 
     if (!collapsed) {
       let idx = sysRowStartIdx;
-      this.systemButtons.set(widgetIds[idx++], this.chatBrowserId!);
+      const chatBtnId = widgetIds[idx++];
+      this.chatBtnId = chatBtnId;
+      this.systemButtons.set(chatBtnId, this.chatBrowserId!);
+      // Rebuild creates fresh widgets; re-apply any busy pulse in effect.
+      if (this.chatBusy) {
+        try { this.send(event(this.id, chatBtnId, 'update', { busy: true })); } catch { /* widget gone */ }
+      }
       if (showPeers) this.systemButtons.set(widgetIds[idx++], this.peersViewerId!);
       if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
       this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
@@ -557,6 +571,19 @@ can restore windows from the sidebar.
    * user-authored scriptable apps, and self-correcting (closed apps go
    * inactive), so click-away and close are reflected and every open app shows.
    */
+  /**
+   * Apply/clear the chat row's busy pulse on the `goalActivity` aspect.
+   * Uses the standard widget long-op affordance (`update { busy }`), which
+   * pulses an accent halo around the button without blocking clicks.
+   */
+  private setChatBusy(busy: boolean): void {
+    if (this.chatBusy === busy) return;
+    this.chatBusy = busy;
+    if (this.chatBtnId) {
+      try { this.send(event(this.id, this.chatBtnId, 'update', { busy })); } catch { /* widget gone */ }
+    }
+  }
+
   private async refreshOpenStates(): Promise<void> {
     if (!this.windowId) return;
     const owners = new Set<AbjectId>();

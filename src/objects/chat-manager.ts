@@ -312,10 +312,18 @@ export class ChatManager extends Abject {
       this.changed('rosterChanged', {});
     });
 
-    // `messageAdded` from a child Chat → bump that conversation's lastActiveAt
+    // Events from child Chat Abjects.
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
+      // goalActivity from a child Chat (a turn is running or a goal this
+      // conversation owns is active) → forward verbatim so UI surfaces
+      // (ChatBrowser → taskbar) can pulse the chat icon.
+      if (aspect === 'goalActivity') {
+        this.changed('goalActivity', value ?? {});
+        return;
+      }
+      // `messageAdded` → bump that conversation's lastActiveAt
       if (aspect !== 'messageAdded') return;
       for (const c of this.conversations.values()) {
         if (c.chatId === fromId) {

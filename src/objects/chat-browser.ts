@@ -117,6 +117,13 @@ export class ChatBrowser extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
+      // goalActivity from ChatManager (a chat turn/goal is busy) → forward
+      // verbatim; the taskbar pulses the chat icon while active.
+      if (aspect === 'goalActivity') {
+        this.changed('goalActivity', value ?? {});
+        return;
+      }
+
       if (aspect === 'click' && fromId === this.newChatBtnId) {
         await this.requestNewConversation();
         return;

@@ -176,6 +176,8 @@ export class Chat extends Abject {
   private conversationHistory: ConversationEntry[] = [];
   private turnContext?: ConversationContext;
   private uiPhase: UiPhase = 'closed';
+  /** Last goalActivity value emitted (dedupe transitions). */
+  private lastGoalActivity?: boolean;
 
   /** Current content width of the window (updated on resize). */
   private currentWindowWidth = DEFAULT_WIN_W;
@@ -406,6 +408,14 @@ export class Chat extends Abject {
                     width: { kind: 'primitive', primitive: 'number' },
                     height: { kind: 'primitive', primitive: 'number' },
                   } },
+                }},
+              },
+              {
+                name: 'goalActivity',
+                description: 'Fires when this chat starts or stops working on a goal (a turn is running, or a goal this conversation owns is active and not yet terminal). ChatManager forwards it to UI surfaces so the chat icon can pulse while busy.',
+                payload: { kind: 'object', properties: {
+                  active: { kind: 'primitive', primitive: 'boolean' },
+                  goalId: { kind: 'primitive', primitive: 'string' },
                 }},
               },
             ],
@@ -1063,6 +1073,7 @@ export class Chat extends Abject {
 
     this._currentGoalId = activeGoalId;
     this.liveGoals.set(activeGoalId, { title: '(in progress)', status: 'active' });
+    this.emitGoalActivity();
     await this.ensureGoalSubscription();
     const goal = await this.request<{ status?: string; title?: string; result?: unknown; error?: string } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId: activeGoalId }),
@@ -1093,6 +1104,7 @@ export class Chat extends Abject {
     this.scheduleActivityRefresh();
     if (goalId !== this._currentGoalId) return;
     this._currentGoalId = undefined;
+    this.emitGoalActivity();
     await this.persistActiveGoal(undefined);
     await this.exitGoalControls();
     await this.removeActivityBubble();
@@ -1220,6 +1232,7 @@ export class Chat extends Abject {
           }));
           this._currentGoalId = created.goalId;
           this.liveGoals.set(created.goalId, { title, description, status: 'active' });
+          this.emitGoalActivity();
         }
         const goalId = this._currentGoalId;
         this._goalCreatedThisTurn = true;
@@ -1612,6 +1625,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.send(request(this.id, this.textInputId, 'addDependent', {}));
 
     this.uiPhase = 'idle';
+    this.emitGoalActivity();
 
     log.info(`[Chat ${(this.conversationId ?? this.id).slice(0, 8)}] show() historyLen=${this.conversationHistory.length} title="${this.conversationTitle ?? ''}"`);
     if (this.conversationHistory.length === 0) {
@@ -1748,10 +1762,25 @@ A single successful creation goal is a complete turn. End it with **done**.
     return chip?.prompt;
   }
 
+  /**
+   * Emit the goalActivity aspect on busy-state transitions. Busy means either
+   * a turn is running (uiPhase === 'busy') or this conversation owns an
+   * active goal (created but not yet accepted as terminal). ChatManager
+   * forwards this to ChatBrowser, which forwards it to the taskbar so the
+   * chat icon pulses while work is in flight.
+   */
+  private emitGoalActivity(): void {
+    const active = this.uiPhase === 'busy' || this._currentGoalId !== undefined;
+    if (this.lastGoalActivity === active) return;
+    this.lastGoalActivity = active;
+    this.changed('goalActivity', active ? { active: true, goalId: this._currentGoalId } : { active: false });
+  }
+
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
     this.uiPhase = 'closed';
+    this.emitGoalActivity();
 
     // Flush any pending history persist before the window goes away
     if (this.persistTimer) {
@@ -2110,6 +2139,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async runChatTask(userText: string): Promise<void> {
     if (this.uiPhase === 'closed') return;
     this.uiPhase = 'busy';
+    this.emitGoalActivity();
     await this.setInputDisabled(true);
     // Long-op accent halo on the send button so the user sees the agent is
     // working even when the activity bubble scrolls off-screen (Doherty).
@@ -2220,6 +2250,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     }
 
     this.uiPhase = this.windowId ? 'idle' : 'closed';
+    this.emitGoalActivity();
     if (this.windowId) await this.setInputDisabled(false);
   }
 
