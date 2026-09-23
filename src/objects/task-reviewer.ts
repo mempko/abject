@@ -152,9 +152,16 @@ export class TaskReviewer extends Abject {
     if (this.reviewPoll) clearInterval(this.reviewPoll);
   }
 
-  private async drainDurableReviews(): Promise<void> {
+  /**
+   * @param recoverLegacy Also recover proposals left by the older learning
+   *   model. The initial drain from onInit passes false: the Factory registers
+   *   this object in the registry only after init returns, and AgentAbject
+   *   gates recovery on finding TaskReviewer there, so an attempt during init
+   *   is rejected. The 30 s poll runs after registration and recovers then.
+   */
+  private async drainDurableReviews(recoverLegacy = true): Promise<void> {
     if (!this.goalManagerId || this.inFlight || this.preparingReview || !this.underDailyCap()) return;
-    if (!this.recoveredLegacyReviews) await this.recoverLegacyReviews().catch(err => log.warn(`Legacy learning recovery deferred: ${String(err)}`));
+    if (recoverLegacy && !this.recoveredLegacyReviews) await this.recoverLegacyReviews().catch(err => log.warn(`Legacy learning recovery deferred: ${String(err)}`));
     await this.drainLearningDecisions();
     if (this.inFlight) return;
     const pending = await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {}));
@@ -249,7 +256,7 @@ export class TaskReviewer extends Abject {
 
     this.reviewPoll = setInterval(() => { void this.drainDurableReviews().catch(err => log.warn(String(err))); }, 30000);
     this.reviewPoll.unref?.();
-    void this.drainDurableReviews().catch(err => log.warn(String(err)));
+    void this.drainDurableReviews(false).catch(err => log.warn(String(err)));
     log.info('TaskReviewer registered; reviewing on goal completion + standalone-task cadence');
   }
 
