@@ -21,6 +21,7 @@ import type {
   FrontendToBackendMsg,
   FontMetricsMsg,
   ClientDiagnosticMsg,
+  FrontendFocusMsg,
   HelloMsg,
   InputMsg,
   EndWindowDragMsg,
@@ -3072,6 +3073,21 @@ IMPORTANT:
         // invisible in abject.log. Log them here so deployment debugging works.
         const d = msg as ClientDiagnosticMsg;
         log.warn(`[backend-ui] clientDiagnostic: gate=${d.gate} detail=${d.detail} clientId=${clientId}`);
+        break;
+      }
+
+      case 'frontendFocus': {
+        // Mobile carousel pick: the user explicitly selected a surface
+        // client-side. Sync server-side focus (and owner focus events) with
+        // that selection so later setFocused replays describe what the user
+        // is actually looking at instead of a stale first window.
+        const f = msg as FrontendFocusMsg;
+        const target = this.surfaces.get(f.surfaceId);
+        if (!target) {
+          log.warn(`[backend-ui] frontendFocus: unknown surface=${f.surfaceId} clientId=${clientId}`);
+          break;
+        }
+        this.handleFocus(target.objectId, f.surfaceId);
         break;
       }
 

@@ -2390,6 +2390,10 @@ export class FrontendClient {
             this.closeWindowForSurface(chip);
             this.compositor.cardFlickClose(chip);
           } else if (at.cardId) {
+            // The user explicitly chose this window. Sync backend focus so
+            // a later replay (reconnect) lands on their selection instead of
+            // whichever surface the backend last focused.
+            this.sendRaw({ type: 'frontendFocus', surfaceId: at.cardId });
             this.compositor.exitCardOverview(at.cardId);
           } else if (this.compositor.isInGestureHandle(cy)) {
             // Tap the handle to leave the overview without picking a card.

@@ -567,6 +567,13 @@ export interface ClientDiagnosticMsg extends WsEnvelope {
   detail: string;
 }
 
+/** P7: the mobile client reports the user's explicit surface selection
+ * (e.g. a carousel pick) so backend focus stays in agreement with it. */
+export interface FrontendFocusMsg extends WsEnvelope {
+  type: 'frontendFocus';
+  surfaceId: string;
+}
+
 /** P6: client handshake — identifies which bundle is running. */
 export interface HelloMsg extends WsEnvelope {
   type: 'hello';
@@ -723,6 +730,7 @@ export type FrontendToBackendMsg =
   | DisplayResizedMsg
   | FontMetricsMsg
   | ClientDiagnosticMsg
+  | FrontendFocusMsg
   | HelloMsg
   | GlobalShortcutMsg
   | AudioEventMsg

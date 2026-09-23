@@ -4381,6 +4381,12 @@ export class Compositor {
   }
 
   setMobileFocusSurface(surfaceId: string): void {
+    if (this.mobileFocusedSurfaceId === surfaceId) {
+      // Unchanged focus: keep the user's current view (zoom, pan, scroll)
+      // exactly as it is. Repeated setFocused for the surface already shown
+      // made the mobile client visibly reset ("refresh") on every arrival.
+      return;
+    }
     this.mobileFocusedSurfaceId = surfaceId;
     this.resetMobileZoom();
     if (this.mobileView !== MobileViewState.CARD_OVERVIEW) {
