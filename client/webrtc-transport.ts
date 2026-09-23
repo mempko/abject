@@ -45,6 +45,16 @@ export class WebRTCClientTransport implements ClientTransport {
 
   private closed = false;
   private reconnectAttempt = 0;
+  /**
+   * Pending reconnect timer. Only one reconnect chain may exist at a time:
+   * every failure path funnels through scheduleReconnect, and a second call
+   * while a timer is pending is a no-op. Without this, a stale peer's
+   * onDisconnect and a fresh signaling onConnect could each start their own
+   * handshake, and the desktop (which treats any new offer from a paired
+   * peer as "the old transport is stale") would tear down the healthy
+   * session on every offer, reconnecting the phone every couple of seconds.
+   */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
 
   constructor(opts: WebRTCTransportOptions) {
     if (!opts.pairing && !opts.reconnect) {
@@ -84,10 +94,27 @@ export class WebRTCClientTransport implements ClientTransport {
 
   close(): void {
     this.closed = true;
-    void this.peer?.disconnect();
-    void this.signaling?.disconnect();
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.teardownCurrent();
+  }
+
+  /**
+   * Drop the current peer and signaling client. References are cleared
+   * BEFORE disconnect() runs: PeerTransport fires onDisconnect on a local
+   * disconnect too, and every handler below checks that it still belongs
+   * to the current peer/signaling before acting, so a torn-down instance
+   * can never schedule a reconnect of its own.
+   */
+  private teardownCurrent(): void {
+    const peer = this.peer;
+    const signaling = this.signaling;
     this.peer = undefined;
     this.signaling = undefined;
+    if (peer) void peer.disconnect().catch(() => {});
+    if (signaling) void signaling.disconnect().catch(() => {});
   }
 
   get ready(): boolean {
@@ -107,6 +134,10 @@ export class WebRTCClientTransport implements ClientTransport {
 
   private async openPeerConnection(): Promise<void> {
     if (this.closed) return;
+    // Single-flight: a peer or signaling client already in progress means a
+    // connection attempt is underway. Its own success/failure path decides
+    // what happens next; starting a parallel attempt would only race it.
+    if (this.peer || this.signaling) return;
     const remote = this.remoteInfo();
     console.log(`[webrtc-transport] connecting to ${remote.peerId.slice(0, 16)}… via ${remote.signalingUrl}`);
 
@@ -123,10 +154,29 @@ export class WebRTCClientTransport implements ClientTransport {
 
     signaling.on({
       onConnect: () => {
+        // A torn-down signaling client can still fire (its socket may open
+        // after teardownCurrent ran); it no longer speaks for this transport.
+        if (this.signaling !== signaling || this.closed) return;
         signaling.register(this.identity!.peerId,
           this.identity!.publicSigningKeyJwk,
           this.identity!.publicExchangeKeyJwk,
           'remote-ui-client');
+        // The signaling socket is persistent and fires onConnect again on
+        // every reconnect of its own (server ping timeout, network blip,
+        // phone waking up). An established DataChannel does not need
+        // signaling at all, so a later onConnect only re-registers: the
+        // desktop treats any fresh offer from a paired peer as "the old
+        // transport is stale" and drops the live session, so re-offering
+        // over a healthy DataChannel produced a perpetual reconnect loop.
+        // A peer still negotiating may have lost its answer with the old
+        // socket; that one is replaced by a fresh offer.
+        const current = this.peer;
+        if (current) {
+          if (current.isEncrypted) return;
+          console.log('[webrtc-transport] signaling reconnected mid-handshake; re-offering');
+          this.peer = undefined;
+          void current.disconnect().catch(() => {});
+        }
         // Fetch ICE servers (STUN + TURN relay creds) from the signaling
         // server, then initiate the SDP offer. TURN lets the DataChannel
         // form even on symmetric-NAT cell networks where direct fails.
@@ -135,10 +185,12 @@ export class WebRTCClientTransport implements ClientTransport {
             const servers = await signaling.requestIceServers();
             if (servers.length > 0) this.iceServers = servers;
           } catch { /* fall back to default STUN */ }
+          if (this.signaling !== signaling || this.closed || this.peer) return;
           await this.initiatePeerHandshake(remote);
         })();
       },
       onSdpAnswer: (fromPeerId, sdp) => {
+        if (this.signaling !== signaling) return;
         if (fromPeerId === remote.peerId && this.peer) {
           void this.peer.handleSdpAnswer(sdp).catch((err) => {
             console.warn('[webrtc-transport] handleSdpAnswer failed:', err);
@@ -146,6 +198,7 @@ export class WebRTCClientTransport implements ClientTransport {
         }
       },
       onIceCandidate: (fromPeerId, candidate) => {
+        if (this.signaling !== signaling) return;
         if (fromPeerId === remote.peerId && this.peer) {
           void this.peer.handleIceCandidate(candidate).catch(() => { /* ignore */ });
         }
@@ -175,19 +228,28 @@ export class WebRTCClientTransport implements ClientTransport {
     });
     this.peer = peer;
 
-    peer.onRawMessage((data) => this.msgHandler?.(data));
+    // Every handler checks it still belongs to the current peer: a peer that
+    // teardownCurrent or a mid-handshake re-offer replaced keeps firing
+    // events (PeerTransport reports its own local disconnect), and those
+    // must not disturb the peer that replaced it.
+    peer.onRawMessage((data) => {
+      if (this.peer !== peer) return;
+      this.msgHandler?.(data);
+    });
 
     peer.on({
       onConnect: () => {
+        if (this.peer !== peer) return;
         // PeerTransport's onConnect fires after the encrypted handshake.
-        void this.sendPairOrReconnect();
+        void this.sendPairOrReconnect(peer);
       },
       onDisconnect: (reason) => {
+        if (this.peer !== peer) return;
         console.log(`[webrtc-transport] peer disconnected: ${reason ?? 'unknown'}`);
-        this.peer = undefined;
         this.scheduleReconnect();
       },
       onError: (err) => {
+        if (this.peer !== peer) return;
         console.warn('[webrtc-transport] peer error:', err);
       },
     });
@@ -195,16 +257,17 @@ export class WebRTCClientTransport implements ClientTransport {
     try {
       await peer.connect('webrtc');
     } catch (err) {
+      if (this.peer !== peer) return;
       this.scheduleReconnect(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
-  private async sendPairOrReconnect(): Promise<void> {
-    if (!this.peer) return;
+  private async sendPairOrReconnect(peer: PeerTransport): Promise<void> {
+    if (this.peer !== peer) return;
     try {
       if (this.opts.pairing) {
         const p = this.opts.pairing.payload;
-        await this.peer.sendRaw(JSON.stringify({
+        await peer.sendRaw(JSON.stringify({
           type: 'pair',
           token: p.token,
           clientName: this.opts.pairing.clientName,
@@ -224,13 +287,15 @@ export class WebRTCClientTransport implements ClientTransport {
         // sends `reconnect` instead of `pair` (the token is single-use).
         this.opts = { reconnect: { desktop } };
       } else {
-        await this.peer.sendRaw(JSON.stringify({ type: 'reconnect' }));
+        await peer.sendRaw(JSON.stringify({ type: 'reconnect' }));
         const d = this.opts.reconnect!.desktop;
         touchLastConnected(d.peerId);
       }
+      if (this.peer !== peer) return;
       this.reconnectAttempt = 0;
       this.fireOpen();
     } catch (err) {
+      if (this.peer !== peer) return;
       console.warn('[webrtc-transport] sendPairOrReconnect failed:', err);
       this.scheduleReconnect(err instanceof Error ? err : new Error(String(err)));
     }
@@ -251,17 +316,21 @@ export class WebRTCClientTransport implements ClientTransport {
     if (this.closed) return;
     if (err) console.warn('[webrtc-transport] reconnect after error:', err.message);
 
-    // Tear down the previous peer/signaling before retrying.
-    void this.peer?.disconnect().catch(() => {});
-    this.peer = undefined;
-    void this.signaling?.disconnect().catch(() => {});
-    this.signaling = undefined;
+    // Tear down the previous peer/signaling before retrying. References are
+    // cleared before disconnect() runs, so the torn-down peer's own
+    // onDisconnect (fired on a local disconnect) is ignored by its guard
+    // instead of re-entering here and starting a second chain.
+    this.teardownCurrent();
+
+    // Single-flight: one pending reconnect at a time.
+    if (this.reconnectTimer !== undefined) return;
 
     this.reconnectAttempt++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt - 1), 30_000);
     console.log(`[webrtc-transport] reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
 
-    setTimeout(() => {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
       if (this.closed) return;
       void this.openPeerConnection();
     }, delay);
