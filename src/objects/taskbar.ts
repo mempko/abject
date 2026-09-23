@@ -392,8 +392,9 @@ can restore windows from the sidebar.
     }
     const sysRowStartIdx = specs.length;
     if (!collapsed) {
-      // Chat (opens ChatBrowser overview)
-      specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCAC', 'Chat'), style: rowStyle('Chat') });
+      // Chat (opens ChatBrowser overview). A rebuild creates fresh widgets, so
+      // the row is born in the busy look when a chat is already working.
+      specs.push({ type: 'button', windowId: this.windowId!, text: this.chatRowText(this.chatBusy), style: { ...rowStyle('Chat'), ...this.chatRowStyle(this.chatBusy) } });
       // Peers is meaningful only for shared/public (including joined) workspaces.
       if (showPeers) {
         specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDC65', 'Peers'), style: rowStyle('Peers') });
@@ -465,10 +466,6 @@ can restore windows from the sidebar.
       const chatBtnId = widgetIds[idx++];
       this.chatBtnId = chatBtnId;
       this.systemButtons.set(chatBtnId, this.chatBrowserId!);
-      // Rebuild creates fresh widgets; re-apply any busy pulse in effect.
-      if (this.chatBusy) {
-        try { this.send(event(this.id, chatBtnId, 'update', { busy: true })); } catch { /* widget gone */ }
-      }
       if (showPeers) this.systemButtons.set(widgetIds[idx++], this.peersViewerId!);
       if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
       this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
@@ -572,16 +569,42 @@ can restore windows from the sidebar.
    * inactive), so click-away and close are reflected and every open app shows.
    */
   /**
-   * Apply/clear the chat row's busy pulse on the `goalActivity` aspect.
-   * Uses the standard widget long-op affordance (`update { busy }`), which
-   * pulses an accent halo around the button without blocking clicks.
+   * Apply/clear the chat row's busy indicator on the `goalActivity` aspect.
+   *
+   * The indicator is deliberately static (accent ink + a trailing dot), not
+   * the widget `busy` halo: that halo is a 60 fps tween, and every frame
+   * re-renders the whole sidebar dock (~3000 bus messages/s measured), for
+   * the full duration of a goal. A static look costs one redraw per
+   * transition and stays fully clickable.
    */
   private setChatBusy(busy: boolean): void {
     if (this.chatBusy === busy) return;
     this.chatBusy = busy;
     if (this.chatBtnId) {
-      try { this.send(event(this.id, this.chatBtnId, 'update', { busy })); } catch { /* widget gone */ }
+      try {
+        this.send(event(this.id, this.chatBtnId, 'update', {
+          text: this.chatRowText(busy),
+          style: this.chatRowStyle(busy),
+        }));
+      } catch { /* widget gone */ }
     }
+  }
+
+  /** Chat row label; the trailing dot marks a chat that is working on a goal. */
+  private chatRowText(busy: boolean): string {
+    const icon = '💬';
+    if (this.compact) return icon;
+    return busy ? `${icon} Chat ●` : `${icon} Chat`;
+  }
+
+  /**
+   * Ink for the chat row: accent while busy, primary when idle. In compact
+   * (icon-only) mode the tooltip carries the state since there is no label.
+   */
+  private chatRowStyle(busy: boolean): Record<string, unknown> {
+    const style: Record<string, unknown> = { color: busy ? this.theme.accent : this.theme.textPrimary };
+    if (this.compact) style.tooltip = busy ? 'Chat ● working' : 'Chat';
+    return style;
   }
 
   private async refreshOpenStates(): Promise<void> {

@@ -1082,6 +1082,7 @@ export class Chat extends Abject {
     if (!goal) {
       this._currentGoalId = undefined;
       this.liveGoals.delete(activeGoalId);
+      this.emitGoalActivity();
       await this.persistActiveGoal(undefined);
       return;
     }
@@ -1770,9 +1771,10 @@ A single successful creation goal is a complete turn. End it with **done**.
    * chat icon pulses while work is in flight.
    */
   private emitGoalActivity(): void {
-    const active = this.uiPhase === 'busy' || this._currentGoalId !== undefined;
+    const active = this.isGoalActive();
     if (this.lastGoalActivity === active) return;
     this.lastGoalActivity = active;
+    this.refreshWindowTitle();
     this.changed('goalActivity', active ? { active: true, goalId: this._currentGoalId } : { active: false });
   }
 
@@ -1828,9 +1830,27 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   // ─── Conversation identity helpers ──────────────────────────────────
 
+  /** True while a turn is running or this conversation owns an active goal. */
+  private isGoalActive(): boolean {
+    return this.uiPhase === 'busy' || this._currentGoalId !== undefined;
+  }
+
+  /**
+   * Window title: chat glyph + conversation title, plus a trailing dot while
+   * a goal is running (the same mark the taskbar's chat row shows).
+   */
   private formatWindowTitle(title?: string): string {
     const t = (title ?? this.conversationTitle ?? 'Chat').trim();
-    return `\uD83D\uDCAC  ${t || 'Chat'}`;
+    const base = `\uD83D\uDCAC  ${t || 'Chat'}`;
+    return this.isGoalActive() ? `${base} \u25CF` : base;
+  }
+
+  /** Push the current title (with or without the busy dot) to the window. */
+  private refreshWindowTitle(): void {
+    if (!this.windowId) return;
+    try {
+      this.send(request(this.id, this.windowId, 'setTitle', { title: this.formatWindowTitle() }));
+    } catch { /* window gone */ }
   }
 
   private notifyRectChanged(): void {

@@ -47,6 +47,14 @@ export class ChatManager extends Abject {
 
   private conversations: Map<string, ConversationRuntime> = new Map();
 
+  /**
+   * Chat Abjects currently working on a goal. The outgoing `goalActivity`
+   * aspect is the union over every chat, so one conversation going idle
+   * cannot clear the indicator while another is still busy.
+   */
+  private busyChats: Set<AbjectId> = new Set();
+  private lastGoalActivity?: boolean;
+
   private persistTimer?: ReturnType<typeof setTimeout>;
 
   constructor() {
@@ -317,10 +325,13 @@ export class ChatManager extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
       // goalActivity from a child Chat (a turn is running or a goal this
-      // conversation owns is active) → forward verbatim so UI surfaces
-      // (ChatBrowser → taskbar) can pulse the chat icon.
+      // conversation owns is active) → fold into the per-chat busy set and
+      // re-emit the aggregate on transitions so UI surfaces (ChatBrowser →
+      // taskbar) can mark the chat icon.
       if (aspect === 'goalActivity') {
-        this.changed('goalActivity', value ?? {});
+        const active = !!(value as { active?: boolean } | undefined)?.active;
+        if (active) this.busyChats.add(fromId); else this.busyChats.delete(fromId);
+        this.emitGoalActivity();
         return;
       }
       // `messageAdded` → bump that conversation's lastActiveAt
@@ -509,6 +520,14 @@ export class ChatManager extends Abject {
     }
   }
 
+  /** Emit the aggregate `goalActivity` aspect when it flips. */
+  private emitGoalActivity(): void {
+    const active = this.busyChats.size > 0;
+    if (this.lastGoalActivity === active) return;
+    this.lastGoalActivity = active;
+    this.changed('goalActivity', { active });
+  }
+
   private async removeConversation(conversationId: string): Promise<boolean> {
     const c = this.conversations.get(conversationId);
     if (!c) return false;
@@ -531,6 +550,10 @@ export class ChatManager extends Abject {
       } catch { /* best effort */ }
     }
 
+    if (c.chatId) {
+      this.busyChats.delete(c.chatId);
+      this.emitGoalActivity();
+    }
     this.conversations.delete(conversationId);
     await this.persistRoster();
     this.changed('conversationDeleted', { conversationId });
