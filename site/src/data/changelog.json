@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.10.10",
+    "date": "2026-09-24",
+    "title": "Steadier Answers, Smarter Budgets, Fallback Routes",
+    "summary": "This release makes agents more honest about what they actually finished and more careful about how much context they spend. It also lets you set a backup model per tier so work keeps moving when a provider stumbles.",
+    "highlights": [
+      "Task results that are just a bare acknowledgement (a lone \"done\" with nothing behind it) are now caught; the scrum master either synthesizes a real answer from the work or escalates instead of passing the empty result to Chat.",
+      "Per-tier fallback routes: each model tier can name a backup provider and model, and the Settings panel now has generalized rows for these auxiliary models.",
+      "Context-budget estimates are anchored on the provider's measured prompt token count rather than a local guess, so agents trim history based on what the model actually saw."
+    ],
+    "fixes": [
+      "Gemini and OpenAI input token counts are now reported net of cached prompt tokens, so usage and budget numbers no longer double-count cache hits."
+    ]
+  },
+  {
     "version": "0.10.9",
     "date": "2026-09-23",
     "title": "A steadier bridge between phone and desktop",
