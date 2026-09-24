@@ -98,6 +98,9 @@ const STORAGE_KEY_TIER_CODE_EFFORT = 'global-settings:tierCodeEffort';
 // Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
 const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
 const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
+// Optional tier-fallback model: stands in for any tier whose own model has failed (outage cover)
+const STORAGE_KEY_FALLBACK_PROVIDER = 'global-settings:tierFallbackProvider';
+const STORAGE_KEY_FALLBACK_MODEL = 'global-settings:tierFallbackModel';
 // Prompt-cache keepalive toggle (default off — pings spend real money)
 const STORAGE_KEY_CACHE_KEEPALIVE = 'global-settings:cacheKeepalive';
 
@@ -139,7 +142,41 @@ const STORAGE_KEY_TIER_PRESETS = 'global-settings:tierPresets';
 interface TierPreset {
   routing: Partial<Record<ModelTierName, { provider: string; model: string; effort?: string }>>;
   vision: { provider: string; model: string } | null;
+  /** Optional so presets saved before the row existed still load. */
+  fallback?: { provider: string; model: string } | null;
 }
+
+/**
+ * The two optional single-model rows under the tiers: which model stands in
+ * on image-bearing steps when a tier's model is text-only, and which stands
+ * in for any tier whose own model has failed. Same row shape, same
+ * persistence, same preset handling; only the label, the storage keys, and
+ * the default pick differ.
+ */
+type AuxRowKey = 'vision' | 'fallback';
+interface AuxRowSpec {
+  label: string;
+  storageProvider: string;
+  storageModel: string;
+  /** Land on the first vision-capable model when nothing better is selected. */
+  preferVision: boolean;
+  /** How the save-time credential toast names the row. */
+  toastName: string;
+}
+const AUX_ROWS: Record<AuxRowKey, AuxRowSpec> = {
+  vision: { label: 'Vision', storageProvider: STORAGE_KEY_VISION_PROVIDER, storageModel: STORAGE_KEY_VISION_MODEL, preferVision: true, toastName: 'Vision fallback' },
+  fallback: { label: 'Fallback', storageProvider: STORAGE_KEY_FALLBACK_PROVIDER, storageModel: STORAGE_KEY_FALLBACK_MODEL, preferVision: false, toastName: 'Tier fallback' },
+};
+const AUX_ROW_KEYS: AuxRowKey[] = ['vision', 'fallback'];
+/** One aux row's widgets and the intended model id (same stale-label protection as the tier rows). */
+interface AuxRowState {
+  providerSelectId?: AbjectId;
+  modelSelectId?: AbjectId;
+  capLabelId?: AbjectId;
+  desiredModelId: string | null;
+}
+type AuxModel = { provider: string | null; model: string | null };
+const emptyAuxModels = (): Record<AuxRowKey, AuxModel> => ({ vision: { provider: null, model: null }, fallback: { provider: null, model: null } });
 
 // Legacy keys for migration
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -213,15 +250,12 @@ export class GlobalSettings extends Abject {
    */
   private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null, code: null };
 
-  // Optional vision-fallback row: provider dropdown (with a leading 'None'),
-  // model dropdown, capability label, and the intended model id (same
-  // stale-label protection as the tier rows).
-  private visionProviderSelectId?: AbjectId;
-  private visionModelSelectId?: AbjectId;
-  private visionCapLabelId?: AbjectId;
-  private visionDesiredModelId: string | null = null;
-  /** Provider-dropdown label meaning "no vision fallback configured". */
-  private static readonly VISION_NONE_LABEL = 'None';
+  // Optional aux rows (vision substitute, tier fallback): provider dropdown
+  // (with a leading 'None'), model dropdown, capability label, and the
+  // intended model id, keyed by row.
+  private auxRows: Record<AuxRowKey, AuxRowState> = { vision: { desiredModelId: null }, fallback: { desiredModelId: null } };
+  /** Provider-dropdown label meaning "this row is not configured". */
+  private static readonly AUX_NONE_LABEL = 'None';
 
   // Prompt-cache keepalive: LLMObject pings large prompt prefixes between
   // agent steps so provider caches stay warm. Off by default (it spends
@@ -422,7 +456,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.dep('GlobalSettings'), 'hide', {});
 
 ### What It Manages
-- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
+- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, an optional tier fallback model (stands in when a tier\'s own model fails), and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
 - Auth tab: optional HTTP basic auth for the UI server
 - Permissions tab: category sub-tabs — Filesystem (allowed paths, read-only mode), Shell (enable + command allow/deny), Web (enable + domain allow/deny), Objects (capability enforcement mode)
 - Skills & MCP tab: installed skills (SKILL.md files) and the skills/MCP catalog browser
@@ -453,7 +487,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       fast: { provider: null, model: null, effort: null },
       code: { provider: null, model: null, effort: null },
     };
-    const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
+    const aux = emptyAuxModels();
 
     if (this.storageId) {
       // Per-provider credential keys derived from each description's
@@ -485,12 +519,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
         );
       }
-      visionFallback.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
-      );
-      visionFallback.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
-      );
+      for (const key of AUX_ROW_KEYS) {
+        aux[key].provider = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageProvider })
+        );
+        aux[key].model = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageModel })
+        );
+      }
       this.cacheKeepaliveEnabled = (await this.request<boolean | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CACHE_KEEPALIVE })
       )) === true;
@@ -597,7 +633,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const hasAnyConfig = Object.keys(credentials).length > 0;
     const hasTierConfig = TIER_NAMES.some(t => tierRouting[t].provider);
     if ((hasAnyConfig || hasTierConfig) && this.llmId) {
-      await this.configureProviders(credentials, tierRouting, visionFallback);
+      await this.configureProviders(credentials, tierRouting, aux);
       log.info('Loaded saved provider configuration');
     } else {
       await this.show();
@@ -633,7 +669,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async configureProviders(
     credentials: Partial<Record<LLMProviderName, string>>,
     tierRouting: Record<ModelTierName, TierRoutingRow>,
-    visionFallback?: { provider: string | null; model: string | null },
+    aux?: Record<AuxRowKey, AuxModel>,
   ): Promise<void> {
     if (!this.llmId) return;
 
@@ -653,15 +689,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (value) credMap[id] = value;
     }
 
+    // null clears a previously-set row; undefined leaves it untouched
+    const vision = aux === undefined
+      ? undefined
+      : (aux.vision.provider && aux.vision.model ? { provider: aux.vision.provider, model: aux.vision.model } : null);
+    // One fallback model covers every tier: outage cover, not per-tier routing.
+    const fallback = aux === undefined
+      ? undefined
+      : (aux.fallback.provider && aux.fallback.model ? { provider: aux.fallback.provider, model: aux.fallback.model } : null);
+    const tierFallbacks = fallback === undefined
+      ? undefined
+      : (fallback ? Object.fromEntries(TIER_NAMES.map(tier => [tier, [fallback]])) : null);
+
     await this.request(request(this.id, this.llmId, 'configure', {
       credentials: credMap,
       tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
-      // null clears a previously-set fallback; undefined leaves it untouched
-      visionFallback: visionFallback === undefined
-        ? undefined
-        : (visionFallback.provider && visionFallback.model
-          ? { provider: visionFallback.provider, model: visionFallback.model }
-          : null),
+      tierFallbacks,
+      visionFallback: vision,
       cacheKeepalive: { enabled: this.cacheKeepaliveEnabled },
     }));
   }
@@ -846,16 +890,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return;
       }
 
-      // Vision-fallback row dropdowns
-      if (fromId === this.visionProviderSelectId && aspect === 'change') {
-        await this.refreshVisionModelOptions();
-        const provider = await this.visionSelectedProvider();
-        if (provider) void this.refreshProviderModels(provider);
-        return;
-      }
-      if (fromId === this.visionModelSelectId && aspect === 'change') {
-        await this.onVisionModelChanged();
-        return;
+      // Aux row (vision substitute, tier fallback) dropdowns
+      for (const key of AUX_ROW_KEYS) {
+        const row = this.auxRows[key];
+        if (fromId === row.providerSelectId && aspect === 'change') {
+          await this.refreshAuxModelOptions(key);
+          const provider = await this.auxSelectedProvider(key);
+          if (provider) void this.refreshProviderModels(provider);
+          return;
+        }
+        if (fromId === row.modelSelectId && aspect === 'change') {
+          await this.onAuxModelChanged(key);
+          return;
+        }
       }
 
       // Tier preset buttons
@@ -1311,7 +1358,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       fast: { provider: null, model: null },
       code: { provider: null, model: null },
     };
-    const savedVisionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
+    const savedAux = emptyAuxModels();
     if (this.storageId) {
       for (const tier of TIER_NAMES) {
         savedTierRouting[tier].provider = await this.request<string | null>(
@@ -1324,12 +1371,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
         );
       }
-      savedVisionFallback.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
-      );
-      savedVisionFallback.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
-      );
+      for (const key of AUX_ROW_KEYS) {
+        savedAux[key].provider = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageProvider })
+        );
+        savedAux[key].model = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageModel })
+        );
+      }
     }
 
     this.savedPresets = await this.loadSavedPresets();
@@ -1595,7 +1644,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // ── 3 · Model Tiers (card) ──
     const tiersCard = await this.sectionCard(cId, '3 · Model Tiers',
-      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.', 86);
+      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only. The optional Fallback row names a model that stands in for any tier whose own model fails (outage cover; the switch is recorded in the LLM ledger).', 86);
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
     for (let i = 0; i < TIER_NAMES.length; i++) {
@@ -1715,97 +1764,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
     }
 
-    // ── Vision fallback row ──
-    // Optional substitute model for image-bearing steps when a tier's model
-    // is text-only. 'None' disables it. Same row shape as the tiers.
-    {
-      this.visionDesiredModelId = savedVisionFallback.model;
-
-      const visionRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: tiersCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
-        widgetId: visionRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const { widgetIds: [visionLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Vision',
-            style: { color: this.theme.textHeading, fontSize: 13 } },
-        ]})
-      );
-      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
-        widgetId: visionLabelId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 65, height: 32 },
-      }));
-
-      const providerIds = this.providerIds();
-      const savedProvider = savedVisionFallback.provider;
-      const providerOptions = [GlobalSettings.VISION_NONE_LABEL, ...this.providerLabels()];
-      const savedProviderIdx = savedProvider ? providerIds.indexOf(savedProvider) : -1;
-      const { widgetIds: [visionProviderSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'select', windowId: this.windowId,
-            options: providerOptions,
-            selectedIndex: savedProviderIdx >= 0 ? savedProviderIdx + 1 : 0 },
-        ]})
-      );
-      this.visionProviderSelectId = visionProviderSelectId;
-      await this.request(request(this.id, visionProviderSelectId, 'addDependent', {}));
-      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
-        widgetId: visionProviderSelectId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 120, height: 32 },
-      }));
-
-      const visionActiveProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
-      const visionModelList = visionActiveProvider ? (this.providerModelCache.get(visionActiveProvider) ?? []) : [];
-      const visionModelOptions = visionActiveProvider
-        ? (visionModelList.length > 0 ? visionModelList.map(m => m.name) : ['(no models)'])
-        : ['(none)'];
-      let visionModelIdx = 0;
-      if (savedVisionFallback.model && visionModelList.length > 0) {
-        const idx = visionModelList.findIndex(m => m.id === savedVisionFallback.model);
-        if (idx >= 0) visionModelIdx = idx;
-      }
-
-      const { widgetIds: [visionModelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'select', windowId: this.windowId,
-            options: visionModelOptions,
-            selectedIndex: visionModelIdx },
-        ]})
-      );
-      this.visionModelSelectId = visionModelSelectId;
-      await this.request(request(this.id, visionModelSelectId, 'addDependent', {}));
-      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
-        widgetId: visionModelSelectId,
-        sizePolicy: { horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const visionCap = visionActiveProvider
-        ? this.capabilityLabelFor(visionActiveProvider, visionModelOptions[visionModelIdx] ?? '')
-        : { text: '', color: this.theme.textTertiary };
-      const { widgetIds: [visionCapLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: visionCap.text,
-            style: { color: visionCap.color, fontSize: 11 } },
-        ]})
-      );
-      this.visionCapLabelId = visionCapLabelId;
-      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
-        widgetId: visionCapLabelId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 62, height: 32 },
-      }));
+    // ── Aux rows ──
+    // Vision: substitute model for image-bearing steps when a tier's model
+    // is text-only. Fallback: substitute for any tier whose own model has
+    // failed. 'None' disables either. Same row shape as the tiers.
+    for (const key of AUX_ROW_KEYS) {
+      await this.renderAuxRow(key, tiersCard, savedAux[key]);
     }
 
     // ── Cache keepalive row ──
@@ -1867,8 +1831,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const p = savedTierRouting[tier].provider;
       if (p && this.providerDescById.has(p)) toPrefetch.add(p);
     }
-    if (savedVisionFallback.provider && this.providerDescById.has(savedVisionFallback.provider)) {
-      toPrefetch.add(savedVisionFallback.provider);
+    for (const key of AUX_ROW_KEYS) {
+      const p = savedAux[key].provider;
+      if (p && this.providerDescById.has(p)) toPrefetch.add(p);
     }
     for (const p of toPrefetch) {
       void this.refreshProviderModels(p);
@@ -2067,9 +2032,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.tierEffortSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
-    this.visionProviderSelectId = undefined;
-    this.visionModelSelectId = undefined;
-    this.visionCapLabelId = undefined;
+    for (const key of AUX_ROW_KEYS) {
+      this.auxRows[key] = { desiredModelId: this.auxRows[key].desiredModelId };
+    }
     this.cacheKeepaliveCheckboxId = undefined;
     this.presetSelectId = undefined;
     this.presetNameInputId = undefined;
@@ -2186,8 +2151,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.saveBtnId, this.providerSelectorId, this.credentialInputId, this.credentialToggleId,
       ...Object.values(this.tierProviderSelectIds),
       ...Object.values(this.tierModelSelectIds),
-      this.visionProviderSelectId,
-      this.visionModelSelectId,
+      ...AUX_ROW_KEYS.flatMap(key => [this.auxRows[key].providerSelectId, this.auxRows[key].modelSelectId]),
       this.presetSelectId,
       this.presetApplyBtnId,
       this.presetSaveBtnId,
@@ -2219,7 +2183,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const visionModel = desc.models.find(m => m.vision === true);
       out.push({
         name: `${desc.label} defaults`,
-        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null },
+        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null, fallback: null },
       });
     }
     return out;
@@ -2287,21 +2251,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         routing[tier] = { provider: providerName, model: info ? info.id : modelName, ...(effort ? { effort } : {}) };
       }
     }
-    let vision: TierPreset['vision'] = null;
-    if (this.visionProviderSelectId && this.visionModelSelectId) {
-      const provider = await this.visionSelectedProvider();
-      if (provider) {
-        const modelName = await this.request<string>(
-          request(this.id, this.visionModelSelectId, 'getValue', {})
-        );
-        if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
-          const modelList = this.providerModelCache.get(provider) ?? [];
-          const info = modelList.find(m => m.name === modelName);
-          vision = { provider, model: info ? info.id : modelName };
-        }
-      }
-    }
-    return { routing, vision };
+    const vision = await this.readAuxRow('vision');
+    const fallback = await this.readAuxRow('fallback');
+    return {
+      routing,
+      vision: vision.provider && vision.model ? { provider: vision.provider, model: vision.model } : null,
+      fallback: fallback.provider && fallback.model ? { provider: fallback.provider, model: fallback.model } : null,
+    };
   }
 
   /**
@@ -2326,14 +2282,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       await this.refreshTierModelOptions(tier);
       void this.refreshProviderModels(entry.provider);
     }
-    if (this.visionProviderSelectId) {
-      const providerOptions = [GlobalSettings.VISION_NONE_LABEL, ...providerLabels];
-      const vIdx = preset.vision ? providerIds.indexOf(preset.vision.provider) : -1;
-      await this.request(request(this.id, this.visionProviderSelectId, 'update', {
+    for (const key of AUX_ROW_KEYS) {
+      const row = this.auxRows[key];
+      if (!row.providerSelectId) continue;
+      const wanted = preset[key] ?? null;
+      const providerOptions = [GlobalSettings.AUX_NONE_LABEL, ...providerLabels];
+      const vIdx = wanted ? providerIds.indexOf(wanted.provider) : -1;
+      await this.request(request(this.id, row.providerSelectId, 'update', {
         options: providerOptions, selectedIndex: vIdx >= 0 ? vIdx + 1 : 0,
       }));
-      this.visionDesiredModelId = vIdx >= 0 ? (preset.vision?.model ?? null) : null;
-      await this.refreshVisionModelOptions();
+      row.desiredModelId = vIdx >= 0 ? (wanted?.model ?? null) : null;
+      await this.refreshAuxModelOptions(key);
     }
     await this.saveSettings();
   }
@@ -2537,11 +2496,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       } catch { /* widget gone */ }
     }
 
-    // Same for the vision-fallback row
-    if (this.visionProviderSelectId) {
+    // Same for the aux rows
+    for (const key of AUX_ROW_KEYS) {
+      if (!this.auxRows[key].providerSelectId) continue;
       try {
-        if (await this.visionSelectedProvider() === name) {
-          await this.refreshVisionModelOptions();
+        if (await this.auxSelectedProvider(key) === name) {
+          await this.refreshAuxModelOptions(key);
         }
       } catch { /* widget gone */ }
     }
@@ -2796,74 +2756,203 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     } catch { /* widget gone */ }
   }
 
-  // ── Vision-fallback row ───────────────────────────────────────────
+  // ── Aux rows (vision substitute, tier fallback) ───────────────────
 
-  /** The vision row's selected provider id, or null when set to 'None'. */
-  private async visionSelectedProvider(): Promise<LLMProviderName | null> {
-    if (!this.visionProviderSelectId) return null;
-    const label = await this.request<string>(
-      request(this.id, this.visionProviderSelectId, 'getValue', {})
+  /**
+   * Render one aux row under the tiers: label, provider dropdown with a
+   * leading 'None', model dropdown, capability label. Same row shape as the
+   * tiers; 'None' disables the row.
+   */
+  private async renderAuxRow(key: AuxRowKey, tiersCard: AbjectId, saved: AuxModel): Promise<void> {
+    const spec = AUX_ROWS[key];
+    const row = this.auxRows[key];
+    row.desiredModelId = saved.model;
+
+    const rowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: tiersCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
     );
-    if (label === GlobalSettings.VISION_NONE_LABEL) return null;
+    await this.request(request(this.id, tiersCard, 'addLayoutChild', {
+      widgetId: rowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: spec.label,
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 65, height: 32 },
+    }));
+
+    const providerIds = this.providerIds();
+    const savedProvider = saved.provider;
+    const providerOptions = [GlobalSettings.AUX_NONE_LABEL, ...this.providerLabels()];
+    const savedProviderIdx = savedProvider ? providerIds.indexOf(savedProvider) : -1;
+    const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'select', windowId: this.windowId,
+          options: providerOptions,
+          selectedIndex: savedProviderIdx >= 0 ? savedProviderIdx + 1 : 0 },
+      ]})
+    );
+    row.providerSelectId = providerSelectId;
+    await this.request(request(this.id, providerSelectId, 'addDependent', {}));
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: providerSelectId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 120, height: 32 },
+    }));
+
+    const activeProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
+    const modelList = activeProvider ? (this.providerModelCache.get(activeProvider) ?? []) : [];
+    const modelOptions = activeProvider
+      ? (modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'])
+      : ['(none)'];
+    let modelIdx = 0;
+    if (saved.model && modelList.length > 0) {
+      const idx = modelList.findIndex(m => m.id === saved.model);
+      if (idx >= 0) modelIdx = idx;
+    }
+
+    const { widgetIds: [modelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'select', windowId: this.windowId,
+          options: modelOptions,
+          selectedIndex: modelIdx },
+      ]})
+    );
+    row.modelSelectId = modelSelectId;
+    await this.request(request(this.id, modelSelectId, 'addDependent', {}));
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: modelSelectId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const cap = activeProvider
+      ? this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '')
+      : { text: '', color: this.theme.textTertiary };
+    const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: cap.text,
+          style: { color: cap.color, fontSize: 11 } },
+      ]})
+    );
+    row.capLabelId = capLabelId;
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: capLabelId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 62, height: 32 },
+    }));
+  }
+
+  /**
+   * Read an aux row as saved settings would see it: provider id plus model
+   * id (falling back to the visible name when the model list has not
+   * arrived). Also refreshes the row's intended model id, so a later
+   * option-list refresh keeps what the user picked.
+   */
+  private async readAuxRow(key: AuxRowKey): Promise<AuxModel> {
+    const row = this.auxRows[key];
+    const out: AuxModel = { provider: null, model: null };
+    if (!row.providerSelectId || !row.modelSelectId) return out;
+    const provider = await this.auxSelectedProvider(key);
+    if (!provider) {
+      row.desiredModelId = null;
+      return out;
+    }
+    const modelName = await this.request<string>(
+      request(this.id, row.modelSelectId, 'getValue', {})
+    );
+    if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
+      const modelList = this.providerModelCache.get(provider) ?? [];
+      const info = modelList.find(m => m.name === modelName);
+      out.provider = provider;
+      out.model = info ? info.id : modelName;
+      row.desiredModelId = out.model;
+    }
+    return out;
+  }
+
+  /** An aux row's selected provider id, or null when set to 'None'. */
+  private async auxSelectedProvider(key: AuxRowKey): Promise<LLMProviderName | null> {
+    const row = this.auxRows[key];
+    if (!row.providerSelectId) return null;
+    const label = await this.request<string>(
+      request(this.id, row.providerSelectId, 'getValue', {})
+    );
+    if (label === GlobalSettings.AUX_NONE_LABEL) return null;
     return this.idForLabel(label) ?? null;
   }
 
-  /** Rebuild the vision row's model options after its provider changed or models arrived. */
-  private async refreshVisionModelOptions(): Promise<void> {
-    if (!this.visionModelSelectId) return;
-    const provider = await this.visionSelectedProvider();
+  /** Rebuild an aux row's model options after its provider changed or models arrived. */
+  private async refreshAuxModelOptions(key: AuxRowKey): Promise<void> {
+    const row = this.auxRows[key];
+    if (!row.modelSelectId) return;
+    const provider = await this.auxSelectedProvider(key);
 
     if (!provider) {
       await this.request(
-        request(this.id, this.visionModelSelectId, 'update', { options: ['(none)'], selectedIndex: 0 })
+        request(this.id, row.modelSelectId, 'update', { options: ['(none)'], selectedIndex: 0 })
       );
-      await this.updateVisionCapLabel('', this.theme.textTertiary);
+      await this.updateAuxCapLabel(key, '', this.theme.textTertiary);
       return;
     }
 
     const currentLabel = await this.request<string>(
-      request(this.id, this.visionModelSelectId, 'getValue', {})
+      request(this.id, row.modelSelectId, 'getValue', {})
     );
     const modelList = this.providerModelCache.get(provider) ?? [];
     const options = modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'];
 
-    // Same intended-id preservation as the tier rows, then a vision-friendly
-    // default: this row exists to pick a vision model, so land on the first
-    // one rather than the list head when there is no better selection.
-    const desiredIdx = this.visionDesiredModelId
-      ? modelList.findIndex(m => m.id === this.visionDesiredModelId)
+    // Same intended-id preservation as the tier rows. The vision row exists
+    // to pick a vision model, so it lands on the first one rather than the
+    // list head when there is no better selection.
+    const desiredIdx = row.desiredModelId
+      ? modelList.findIndex(m => m.id === row.desiredModelId)
       : -1;
     let keepIdx = desiredIdx >= 0 ? desiredIdx : options.indexOf(currentLabel);
-    if (keepIdx < 0) keepIdx = modelList.findIndex(m => m.vision === true);
+    if (keepIdx < 0 && AUX_ROWS[key].preferVision) keepIdx = modelList.findIndex(m => m.vision === true);
     const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
 
     await this.request(
-      request(this.id, this.visionModelSelectId, 'update', { options, selectedIndex })
+      request(this.id, row.modelSelectId, 'update', { options, selectedIndex })
     );
     const cap = this.capabilityLabelFor(provider, options[selectedIndex] ?? '');
-    await this.updateVisionCapLabel(cap.text, cap.color);
+    await this.updateAuxCapLabel(key, cap.text, cap.color);
   }
 
-  /** The user picked a vision-fallback model: remember the id + repaint the label. */
-  private async onVisionModelChanged(): Promise<void> {
-    if (!this.visionModelSelectId) return;
-    const provider = await this.visionSelectedProvider();
+  /** The user picked an aux-row model: remember the id + repaint the label. */
+  private async onAuxModelChanged(key: AuxRowKey): Promise<void> {
+    const row = this.auxRows[key];
+    if (!row.modelSelectId) return;
+    const provider = await this.auxSelectedProvider(key);
     if (!provider) return;
     try {
       const modelName = await this.request<string>(
-        request(this.id, this.visionModelSelectId, 'getValue', {})
+        request(this.id, row.modelSelectId, 'getValue', {})
       );
       const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
-      this.visionDesiredModelId = info?.id ?? null;
+      row.desiredModelId = info?.id ?? null;
       const cap = this.capabilityLabelFor(provider, modelName);
-      await this.updateVisionCapLabel(cap.text, cap.color);
+      await this.updateAuxCapLabel(key, cap.text, cap.color);
     } catch { /* widget gone */ }
   }
 
-  private async updateVisionCapLabel(text: string, color: string): Promise<void> {
-    if (!this.visionCapLabelId) return;
+  private async updateAuxCapLabel(key: AuxRowKey, text: string, color: string): Promise<void> {
+    const capLabelId = this.auxRows[key].capLabelId;
+    if (!capLabelId) return;
     try {
-      await this.request(request(this.id, this.visionCapLabelId, 'update', {
+      await this.request(request(this.id, capLabelId, 'update', {
         text,
         style: { color, fontSize: 11 },
       }));
@@ -4383,25 +4472,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
-    // Read the optional vision-fallback row
-    const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
-    if (this.visionProviderSelectId && this.visionModelSelectId) {
-      const provider = await this.visionSelectedProvider();
-      if (provider) {
-        const modelName = await this.request<string>(
-          request(this.id, this.visionModelSelectId, 'getValue', {})
-        );
-        if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
-          const modelList = this.providerModelCache.get(provider) ?? [];
-          const modelInfo = modelList.find(m => m.name === modelName);
-          visionFallback.provider = provider;
-          visionFallback.model = modelInfo ? modelInfo.id : modelName;
-          this.visionDesiredModelId = visionFallback.model;
-        }
-      } else {
-        this.visionDesiredModelId = null;
-      }
-    }
+    // Read the optional aux rows (vision substitute, tier fallback)
+    const aux = emptyAuxModels();
+    for (const key of AUX_ROW_KEYS) aux[key] = await this.readAuxRow(key);
 
     // Validate: at least one tier must have a valid config
     const hasAnyTier = TIER_NAMES.some(t => tierRouting[t].provider && tierRouting[t].model);
@@ -4440,12 +4513,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
-    // Same credential check for the vision fallback's provider
-    if (visionFallback.provider) {
-      const desc = this.descById(visionFallback.provider);
-      if (desc && desc.credentialMode === 'apiKey' && !this.credentialValues[visionFallback.provider]) {
+    // Same credential check for each aux row's provider
+    for (const key of AUX_ROW_KEYS) {
+      const provider = aux[key].provider;
+      if (!provider) continue;
+      const desc = this.descById(provider);
+      if (desc && desc.credentialMode === 'apiKey' && !this.credentialValues[provider]) {
         await this.setStatus(
-          `Vision fallback uses ${desc.label} but no API key provided.`,
+          `${AUX_ROWS[key].toastName} uses ${desc.label} but no API key provided.`,
           this.theme.statusErrorBright,
         );
         await this.setSaveControlsDisabled(false);
@@ -4476,19 +4551,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Persist tier routing
       await this.persistTierRouting(tierRouting);
 
-      // Persist the vision fallback ('None' clears the saved keys)
-      if (visionFallback.provider && visionFallback.model) {
-        await this.request(request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_VISION_PROVIDER, value: visionFallback.provider,
-        }));
-        await this.request(request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_VISION_MODEL, value: visionFallback.model,
-        }));
-      } else {
-        try {
-          await this.request(request(this.id, this.storageId, 'delete', { key: STORAGE_KEY_VISION_PROVIDER }));
-          await this.request(request(this.id, this.storageId, 'delete', { key: STORAGE_KEY_VISION_MODEL }));
-        } catch { /* nothing saved yet */ }
+      // Persist each aux row ('None' clears the saved keys)
+      for (const key of AUX_ROW_KEYS) {
+        const { provider, model } = aux[key];
+        const { storageProvider, storageModel } = AUX_ROWS[key];
+        if (provider && model) {
+          await this.request(request(this.id, this.storageId, 'set', { key: storageProvider, value: provider }));
+          await this.request(request(this.id, this.storageId, 'set', { key: storageModel, value: model }));
+        } else {
+          try {
+            await this.request(request(this.id, this.storageId, 'delete', { key: storageProvider }));
+            await this.request(request(this.id, this.storageId, 'delete', { key: storageModel }));
+          } catch { /* nothing saved yet */ }
+        }
       }
 
       // Persist the cache-keepalive opt-in
@@ -4497,8 +4572,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
     }
 
-    // Configure all providers, tier routing, and the vision fallback
-    await this.configureProviders(this.credentialValues, tierRouting, visionFallback);
+    // Configure all providers, tier routing, and the aux rows
+    await this.configureProviders(this.credentialValues, tierRouting, aux);
 
     log.info('Saved provider settings with per-tier routing');
     await this.setStatus('Settings saved!');
@@ -4513,8 +4588,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const p = tierRouting[tier].provider;
       if (p && this.providerDescById.has(p)) prefetch.add(p);
     }
-    if (visionFallback.provider && this.providerDescById.has(visionFallback.provider)) {
-      prefetch.add(visionFallback.provider);
+    for (const key of AUX_ROW_KEYS) {
+      const p = aux[key].provider;
+      if (p && this.providerDescById.has(p)) prefetch.add(p);
     }
     for (const p of prefetch) {
       void this.refreshProviderModels(p, { force: true });

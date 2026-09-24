@@ -33,6 +33,7 @@ import {
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
+import { isContextOverflowError } from '../llm/provider.js';
 import {
   ModelPricing,
   estimateCostUsd,
@@ -73,6 +74,42 @@ export interface CompressResult {
 }
 
 export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
+
+/**
+ * Ordered substitutes per tier, tried when the tier's own model has failed
+ * after its provider's retries. Outage cover, not routing: a candidate only
+ * runs once the primary has thrown, the switch is logged and recorded on
+ * the ledger entry, and the next call starts from the primary again.
+ */
+export type TierFallbacks = Partial<Record<ModelTier, TierConfig[]>>;
+
+/** Drop malformed entries and copy the rest, so a bad settings payload cannot leave a half-usable table behind. */
+function normalizeTierFallbacks(input: TierFallbacks | null | undefined): TierFallbacks {
+  const out: TierFallbacks = {};
+  if (!input) return out;
+  for (const tier of ['smart', 'balanced', 'fast', 'code'] as ModelTier[]) {
+    const list = input[tier];
+    if (!Array.isArray(list)) continue;
+    const kept = list
+      .filter((c): c is TierConfig => !!c && typeof c.provider === 'string' && c.provider.length > 0 && typeof c.model === 'string' && c.model.length > 0)
+      .map(c => ({ provider: c.provider, model: c.model, ...(c.effort ? { effort: c.effort } : {}) }));
+    if (kept.length > 0) out[tier] = kept;
+  }
+  return out;
+}
+
+/** One concrete place a request can run: a registered provider plus the tier's model/effort overrides. */
+interface ResolvedRoute {
+  provider: LLMProvider;
+  modelOverride?: string;
+  effortOverride?: EffortLevel;
+}
+
+/** Whether a failed attempt may still be retried elsewhere; both flip once the caller has seen anything. */
+interface AttemptProgress {
+  emittedChars: number;
+  killed: boolean;
+}
 
 /**
  * The effective model behind one tier, with capabilities. `vision` is
@@ -225,6 +262,12 @@ export interface LLMLedgerEntry {
    * how most callers pick a model.
    */
   tier?: ModelTier;
+  /**
+   * `provider/model` this call stood in for, when it ran on a tier fallback
+   * because the tier's own model had failed. Absent on ordinary calls, so
+   * "how often did the fallback carry us" is one filter over the ledger.
+   */
+  fallbackOf?: string;
   /** Reasoning effort the call ran at. Drives token spend on reasoning models. */
   effort?: EffortLevel;
   /** The caller's output cap, for reading alongside a truncated finishReason. */
@@ -454,6 +497,7 @@ export class LLMObject extends Abject {
   private providers: Map<string, LLMProvider> = new Map();
   private defaultProvider?: string;
   private tierRouting: TierRouting = {};
+  private tierFallbacks: TierFallbacks = {};
   /** Optional vision substitute for image-bearing steps on text-only tiers. */
   private visionFallback?: TierConfig;
   private httpClientId?: AbjectId;
@@ -821,9 +865,10 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'setTierRouting',
-                description: 'Set per-tier provider, model, and optional reasoning-effort routing',
+                description: 'Set per-tier provider, model, and optional reasoning-effort routing, plus optional per-tier fallback models tried when the tier\'s own model fails',
                 parameters: [
                   { name: 'tierRouting', type: { kind: 'reference', reference: 'TierRouting' }, description: 'Mapping from tier to { provider, model, effort? } — effort (none/minimal/low/medium/high/xhigh/max) overrides the provider default for requests routed through that tier' },
+                  { name: 'tierFallbacks', type: { kind: 'reference', reference: 'TierFallbacks' }, description: 'Mapping from tier to an ordered list of { provider, model, effort? } substitutes. A substitute runs only after the tier\'s own model has thrown (its provider\'s retries included) and before any output was streamed; the switch is logged and the ledger entry carries fallbackOf. Omit to leave unchanged, null to clear.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -1063,17 +1108,22 @@ export class LLMObject extends Abject {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider: providerName, onBehalfOf } = m.payload as LLMQueryPayload;
       this.checkPromptSize(messages);
-      const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
-      const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
 
       const callerId = m.routing.from;
       const correlationId = m.header.messageId;
 
+      // One attempt on one route. The chunk events always carry the
+      // caller's correlation id; only the ledger id differs per attempt, so
+      // a fallback shows up as its own call, named for what it stood in for.
+      const attemptStream = async (route: ResolvedRoute, ledgerId: string, fallbackOf: string | undefined, progress: AttemptProgress) => {
+      const { provider } = route;
+      const effectiveOptions = this.applyRouting(options, route.modelOverride, route.effortOverride);
+
       // If provider doesn't support streaming, fall back to complete
       if (!provider.stream) {
-        const result = await this.complete(messages, options, providerName, callerId, correlationId, onBehalfOf);
+        const result = await this.completeAttempt(route, messages, options, callerId, ledgerId, onBehalfOf, fallbackOf);
         // 'length' is the provider-agnostic signal for a truncated response.
-        return { content: result.content, execution: result.execution, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
+        return { content: result.content, execution: result.execution, usage: result.usage, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
@@ -1081,9 +1131,9 @@ export class LLMObject extends Abject {
       const start = Date.now();
 
       const activeReq = await this.trackRequestStart(
-        correlationId, callerId, 'stream', provider.name,
+        ledgerId, callerId, 'stream', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, true, messages,
-        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens },
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens, fallbackOf },
         onBehalfOf,
       );
 
@@ -1122,7 +1172,8 @@ export class LLMObject extends Abject {
       try {
         for await (const chunk of this.meteredStream(provider, messages, effectiveOptions)) {
           if (activeReq.killed) {
-            log.info(`Request ${correlationId} killed during streaming`);
+            log.info(`Request ${ledgerId} killed during streaming`);
+            progress.killed = true;
             break;
           }
           lastChunkAt = Date.now();
@@ -1131,6 +1182,7 @@ export class LLMObject extends Abject {
           if (chunk.usage) usage = chunk.usage;
           if (chunk.execution) execution = chunk.execution;
           activeReq.outputChars = fullContent.length;
+          progress.emittedChars = fullContent.length;
           // Send each chunk as an event back to the requester
           this.send(event(this.id, callerId, 'llmChunk', {
             correlationId,
@@ -1142,7 +1194,7 @@ export class LLMObject extends Abject {
         const elapsed = Date.now() - start;
         const errMsg = err instanceof Error ? err.message : String(err);
         log.error(`${provider.name} stream | ${elapsed}ms | ${errMsg}`);
-        this.trackRequestError(correlationId, errMsg);
+        this.trackRequestError(ledgerId, errMsg);
         throw err;
       } finally {
         this.cancelTimer(keepaliveTimer);
@@ -1170,9 +1222,29 @@ export class LLMObject extends Abject {
         ? 'unknown (no finish frame — possible truncation)'
         : (stopReason ?? 'unknown');
       log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${reasonNote}${tokenSummary}`);
-      this.trackRequestEnd(correlationId, fullContent, usage, stopReason);
-      this.trackCacheWarmth(providerName, options, messages, usage);
+      this.trackRequestEnd(ledgerId, fullContent, usage, stopReason);
+      this.trackCacheWarmth(provider.name, effectiveOptions, messages, usage);
       return { content: fullContent, stopReason, usage, execution };
+      };
+
+      // Primary first, then each configured fallback in order. A fallback
+      // is only tried while the caller has seen nothing: once chunks have
+      // gone out, a second stream would duplicate them, so the error stands.
+      const routes = this.routesFor(providerName, options?.tier);
+      for (let i = 0; i < routes.length; i++) {
+        const route = routes[i];
+        const ledgerId = i === 0 ? correlationId : `${correlationId}:fallback${i}`;
+        const fallbackOf = i === 0 ? undefined : this.describeRoute(routes[0], options);
+        const progress: AttemptProgress = { emittedChars: 0, killed: false };
+        try {
+          return await attemptStream(route, ledgerId, fallbackOf, progress);
+        } catch (err) {
+          const next = routes[i + 1];
+          if (!next || !this.canFallBack(err, progress)) throw err;
+          log.warn(`${this.describeRoute(route, options)} failed for tier ${options?.tier ?? 'default'} (${err instanceof Error ? err.message : String(err)}); falling back to ${this.describeRoute(next, options)}`);
+        }
+      }
+      throw new Error('No LLM route available');
     });
 
     this.on('listProviders', async () => {
@@ -1192,6 +1264,7 @@ export class LLMObject extends Abject {
       const config = msg.payload as {
         credentials?: Record<string, string>;
         tierRouting?: TierRouting;
+        tierFallbacks?: TierFallbacks | null;
         visionFallback?: TierConfig | null;
         cacheKeepalive?: { enabled: boolean };
       };
@@ -1211,13 +1284,15 @@ export class LLMObject extends Abject {
     });
 
     this.on('setTierRouting', async (msg: AbjectMessage) => {
-      const { tierRouting, visionFallback } = msg.payload as {
+      const { tierRouting, tierFallbacks, visionFallback } = msg.payload as {
         tierRouting: TierRouting;
+        tierFallbacks?: TierFallbacks | null;
         visionFallback?: TierConfig | null;
       };
       this.tierRouting = { ...tierRouting };
+      if (tierFallbacks !== undefined) this.tierFallbacks = normalizeTierFallbacks(tierFallbacks);
       if (visionFallback !== undefined) this.visionFallback = visionFallback ?? undefined;
-      log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)} visionFallback=${JSON.stringify(this.visionFallback ?? null)}`);
+      log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)} fallbacks=${JSON.stringify(this.tierFallbacks)} visionFallback=${JSON.stringify(this.visionFallback ?? null)}`);
       return true;
     });
 
@@ -1511,6 +1586,7 @@ export class LLMObject extends Abject {
   async configure(config: {
     credentials?: Record<string, string>;
     tierRouting?: TierRouting;
+    tierFallbacks?: TierFallbacks | null;
     visionFallback?: TierConfig | null;
     cacheKeepalive?: { enabled: boolean };
   }): Promise<void> {
@@ -1568,6 +1644,12 @@ export class LLMObject extends Abject {
       log.info(`Tier routing configured: ${JSON.stringify(this.tierRouting)}`);
     }
 
+    // Tier fallbacks: undefined leaves them untouched, null clears them
+    if (config.tierFallbacks !== undefined) {
+      this.tierFallbacks = normalizeTierFallbacks(config.tierFallbacks);
+      log.info(`Tier fallbacks configured: ${JSON.stringify(this.tierFallbacks)}`);
+    }
+
     // Vision fallback: undefined leaves it untouched, null clears it
     if (config.visionFallback !== undefined) {
       this.visionFallback = config.visionFallback ?? undefined;
@@ -1595,19 +1677,46 @@ export class LLMObject extends Abject {
     requestId?: string,
     onBehalfOf?: string,
   ): Promise<LLMCompletionResult> {
-    const { provider, modelOverride, effortOverride } = this.resolveProviderAndModel(providerName, options?.tier);
-    const effectiveOptions = this.applyRouting(options, modelOverride, effortOverride);
+    // Primary first, then each configured fallback in order (see the
+    // stream handler for the same loop with the streaming caveat).
+    const routes = this.routesFor(providerName, options?.tier);
+    const baseId = requestId ?? `internal-${Date.now()}`;
+    for (let i = 0; i < routes.length; i++) {
+      const route = routes[i];
+      const ledgerId = i === 0 ? baseId : `${baseId}:fallback${i}`;
+      const fallbackOf = i === 0 ? undefined : this.describeRoute(routes[0], options);
+      try {
+        return await this.completeAttempt(route, messages, options, callerId, ledgerId, onBehalfOf, fallbackOf);
+      } catch (err) {
+        const next = routes[i + 1];
+        if (!next || !this.canFallBack(err, { emittedChars: 0, killed: false })) throw err;
+        log.warn(`${this.describeRoute(route, options)} failed for tier ${options?.tier ?? 'default'} (${err instanceof Error ? err.message : String(err)}); falling back to ${this.describeRoute(next, options)}`);
+      }
+    }
+    throw new Error('No LLM route available');
+  }
+
+  private async completeAttempt(
+    route: ResolvedRoute,
+    messages: LLMMessage[],
+    options: LLMCompletionOptions | undefined,
+    callerId: AbjectId | undefined,
+    trackId: string,
+    onBehalfOf: string | undefined,
+    fallbackOf: string | undefined,
+  ): Promise<LLMCompletionResult> {
+    const { provider } = route;
+    const effectiveOptions = this.applyRouting(options, route.modelOverride, route.effortOverride);
 
     const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
     log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${effectiveOptions?.model ?? 'provider-default'}${effectiveOptions?.effort ? ` effort=${effectiveOptions.effort}` : ''} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 
     // Track active request
-    const trackId = requestId ?? `internal-${Date.now()}`;
     if (callerId) {
       await this.trackRequestStart(trackId, callerId, 'complete', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, false, messages,
-        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens },
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens, fallbackOf },
         onBehalfOf);
     }
 
@@ -1644,6 +1753,52 @@ export class LLMObject extends Abject {
     } finally {
       if (keepaliveTimer) this.cancelTimer(keepaliveTimer);
     }
+  }
+
+  // ── Tier fallback ─────────────────────────────────────────────────────
+
+  /**
+   * Where a request may run, in order: the route tier routing picks, then
+   * the tier's configured fallbacks. An explicit provider name pins the
+   * request to that provider (the caller chose it deliberately, as the
+   * vision substitute does), so it gets no fallbacks. Candidates whose
+   * provider is not registered, or that name the primary itself, are
+   * dropped rather than tried.
+   */
+  private routesFor(providerName: string | undefined, tier: ModelTier | undefined): ResolvedRoute[] {
+    const primary = this.resolveProviderAndModel(providerName, tier);
+    if (providerName) return [primary];
+    // Mirror resolveProviderAndModel: an unrouted code tier rides smart.
+    const effectiveTier = tier === 'code' && !this.tierRouting.code ? 'smart' : tier;
+    const configured = effectiveTier ? this.tierFallbacks[effectiveTier] ?? [] : [];
+    const primaryModel = this.modelFor(primary.provider, this.applyRouting(undefined, primary.modelOverride, primary.effortOverride));
+    const routes: ResolvedRoute[] = [primary];
+    const seen = new Set([`${primary.provider.name}/${primaryModel}`]);
+    for (const candidate of configured) {
+      const provider = this.providers.get(candidate.provider);
+      if (!provider) continue;
+      const key = `${provider.name}/${candidate.model}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      routes.push({ provider, modelOverride: candidate.model, effortOverride: candidate.effort });
+    }
+    return routes;
+  }
+
+  /**
+   * Whether an attempt's failure leaves room for another route. Length
+   * rejections are the caller's to fix by compacting, not ours to route
+   * around; a kill is the user's decision; anything already streamed to the
+   * caller would be sent twice by a second attempt; and a pause means stop.
+   */
+  private canFallBack(err: unknown, progress: AttemptProgress): boolean {
+    if (this._paused || progress.killed || progress.emittedChars > 0) return false;
+    return !isContextOverflowError(err);
+  }
+
+  /** `provider/model` for logs and the ledger's fallbackOf. */
+  private describeRoute(route: ResolvedRoute, options: LLMCompletionOptions | undefined): string {
+    return `${route.provider.name}/${this.modelFor(route.provider, this.applyRouting(options, route.modelOverride, route.effortOverride))}`;
   }
 
   // ── Conversation compression ──────────────────────────────────────────
@@ -2090,7 +2245,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     inputChars: number,
     streaming: boolean,
     messages?: LLMMessage[],
-    routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number },
+    routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number; fallbackOf?: string },
     onBehalfOf?: string,
   ): Promise<LLMLedgerEntry> {
     const senderName = await this.resolveCallerName(callerId);
@@ -2114,6 +2269,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       killed: false,
       status: 'active',
       tier: routing?.tier,
+      ...(routing?.fallbackOf ? { fallbackOf: routing.fallbackOf } : {}),
       effort: routing?.effort,
       maxTokens: routing?.maxTokens,
     };
