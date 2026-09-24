@@ -270,7 +270,9 @@ export class GeminiProvider extends BaseLLMProvider {
         content: text,
         finishReason: this.mapFinishReason(candidate.finishReason),
         usage: {
-          inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
+          // promptTokenCount includes the cached content; inputTokens is the
+          // uncached remainder under this codebase's ledger convention.
+          inputTokens: Math.max(0, (data.usageMetadata?.promptTokenCount ?? 0) - (data.usageMetadata?.cachedContentTokenCount ?? 0)),
           outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,
           cacheReadTokens: data.usageMetadata?.cachedContentTokenCount,
         },

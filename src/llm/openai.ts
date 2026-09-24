@@ -159,6 +159,21 @@ interface OpenAIResponse {
 }
 
 /**
+ * The part of the prompt the model actually processed fresh. OpenAI's
+ * `prompt_tokens` already includes the cached and cache-written pieces that
+ * `prompt_tokens_details` breaks out, whereas this codebase's ledger and
+ * pricing add those pieces back on top of `inputTokens`. Netting them out
+ * here keeps one convention across providers and stops cached prompts from
+ * being counted (and priced) twice.
+ */
+function uncachedPromptTokens(
+  promptTokens: number,
+  details?: { cached_tokens?: number; cache_write_tokens?: number },
+): number {
+  return Math.max(0, promptTokens - (details?.cached_tokens ?? 0) - (details?.cache_write_tokens ?? 0));
+}
+
+/**
  * OpenAI provider.
  */
 export class OpenAIProvider extends BaseLLMProvider {
@@ -517,7 +532,9 @@ export class OpenAIProvider extends BaseLLMProvider {
         content: choice.message.content,
         finishReason: choice.finish_reason === 'stop' ? 'stop' : 'length',
         usage: {
-          inputTokens: data.usage.prompt_tokens,
+          // prompt_tokens is the whole prompt, cached pieces included; the
+          // ledger and pricing treat inputTokens as the uncached remainder.
+          inputTokens: uncachedPromptTokens(data.usage.prompt_tokens, data.usage.prompt_tokens_details),
           outputTokens: data.usage.completion_tokens,
           cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
           cacheWriteTokens: data.usage.prompt_tokens_details?.cache_write_tokens,
@@ -718,7 +735,7 @@ export class OpenAIProvider extends BaseLLMProvider {
 
           if (event.usage) {
             usage = {
-              inputTokens: event.usage.prompt_tokens ?? 0,
+              inputTokens: uncachedPromptTokens(event.usage.prompt_tokens ?? 0, event.usage.prompt_tokens_details),
               outputTokens: event.usage.completion_tokens ?? 0,
               cacheReadTokens: event.usage.prompt_tokens_details?.cached_tokens,
               cacheWriteTokens: event.usage.prompt_tokens_details?.cache_write_tokens,
