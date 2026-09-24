@@ -49,7 +49,7 @@ import { safeStringify } from '../core/format.js';
 import {
   deriveContractEdges, validateDataFlow, transitiveDependentCounts,
 } from '../core/task-graph.js';
-import { looksLikeUngroundedClaim } from '../core/claims.js';
+import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement } from '../core/claims.js';
 
 const log = new Log('ScrumMaster');
 
@@ -165,6 +165,13 @@ export class ScrumMaster extends Abject {
   }
   /** Optional. Used by review_scrum auto-recall, save_knowledge, lookup_knowledge. */
   private knowledgeBaseId?: AbjectId;
+  /**
+   * What synthesis returns when it has nothing better: the LLM was
+   * unavailable or answered empty. Callers that can do better than shipping
+   * this to the user (the fast path can escalate to a review scrum) compare
+   * against it.
+   */
+  private static readonly SYNTHESIS_FALLBACK = 'Sprint complete.';
   /** Used for fast-tier synthesis calls (complete_goal markdown formatting). */
   private llmId?: AbjectId;
 
@@ -429,7 +436,7 @@ export class ScrumMaster extends Abject {
                 return true;
               });
               if (completed) return;
-              log.info(`quick_dispatch goal ${goalId.slice(0, 8)} finished with an ungrounded claim — upgrading to a review scrum`);
+              log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: the fast path could not stand behind the task result — upgrading to a review scrum`);
               this.forceFullScrum.add(goalId);
             }
           } else {
@@ -1655,7 +1662,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     } else {
       synthesis = await this.synthesizeCompletionText(goalId, hint).catch((err) => {
         log.warn(`auto-synthesis failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-        return 'Sprint complete.';
+        return ScrumMaster.SYNTHESIS_FALLBACK;
       });
     }
 
@@ -1784,12 +1791,12 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
    */
   private async synthesizeCompletionText(goalId: string, hint?: string): Promise<string> {
     if (!this.llmId || !this.goalManagerId) {
-      return hint && hint.length > 0 ? hint : 'Sprint complete.';
+      return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
     }
 
     const goal = await this.fetchGoalForSynthesis(goalId);
     if (!goal) {
-      return hint && hint.length > 0 ? hint : 'Sprint complete.';
+      return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
     }
 
     const record = verificationRecordOf(goal.scratchpad ?? {});
@@ -1833,11 +1840,11 @@ Rules:
 
     try {
       const text = await this.fastComplete(prompt);
-      if (!text) return hint && hint.length > 0 ? hint : 'Sprint complete.';
+      if (!text) return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
       return await this.groundSynthesis(text, record);
     } catch (err) {
       log.warn(`synthesizeCompletionText LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
-      return hint && hint.length > 0 ? hint : 'Sprint complete.';
+      return hint && hint.length > 0 ? hint : ScrumMaster.SYNTHESIS_FALLBACK;
     }
   }
 
@@ -2115,17 +2122,43 @@ Rules:
    * action or state asserted with no evidence cited); the caller then runs a
    * review scrum instead.
    */
+  /**
+   * Close a quick-dispatched goal with its single task's result. Returns
+   * false when the fast path cannot stand behind the result and a review
+   * scrum should weigh it instead.
+   *
+   * The worker's result is the user's whole answer here (Chat renders a
+   * goal result verbatim), so it gets the same treatment the planned path
+   * gives a completion: a result that reads as an unverified claim goes to
+   * review, and a result that carries no answer ("Done.", or nothing at
+   * all, because the worker stored its findings on the scratchpad and
+   * closed with an acknowledgement) is synthesized from the goal's data by
+   * the same fast-tier synthesis complete_goal uses.
+   */
   private async completeOneShotGoal(goalId: string, taskId: string): Promise<boolean> {
     if (!this.goalManagerId) return true;
     const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.goalManagerId, 'getGoal', { goalId }),
     ).catch(() => null);
-    // completeTask mirrors the agent's result to this scratchpad key; use it
-    // verbatim as the goal result (the creator composes the user-facing reply).
-    const result = goal?.scratchpad?.[`tasks/${taskId}/result`] ?? 'Done.';
-    const text = typeof result === 'string' ? result : safeStringify(result, 4000);
+    // completeTask mirrors the agent's result to this scratchpad key.
+    const mirrored = goal?.scratchpad?.[`tasks/${taskId}/result`];
+    const text = mirrored === undefined ? '' : typeof mirrored === 'string' ? mirrored : safeStringify(mirrored, 4000);
     if (looksLikeUngroundedClaim(text)) return false;
-    await this.recordCompletionPlan(goalId, text);
+
+    let result: unknown = mirrored;
+    let resultText = text;
+    if (looksLikeBareAcknowledgement(text)) {
+      const synthesis = await this.synthesizeCompletionText(goalId);
+      if (synthesis === ScrumMaster.SYNTHESIS_FALLBACK) {
+        log.warn(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" and synthesis was unavailable`);
+        return false;
+      }
+      log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" — synthesized the answer from the goal's data (${synthesis.length} chars)`);
+      result = synthesis;
+      resultText = synthesis;
+    }
+
+    await this.recordCompletionPlan(goalId, resultText);
     await this.request(request(this.id, this.goalManagerId, 'completeGoal', { goalId, result }));
     log.info(`quick_dispatch complete: goal ${goalId.slice(0, 8)} finished in one task (no planning scrum)`);
     return true;

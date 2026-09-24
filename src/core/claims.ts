@@ -92,3 +92,27 @@ export function hasEvidenceMarkers(text: string): boolean {
 export function looksLikeUngroundedClaim(text: string): boolean {
   return looksLikeClaim(text) && !hasEvidenceMarkers(text);
 }
+
+/**
+ * A reply that only says the work happened: "Done.", "OK", "Task complete".
+ * No content, no figures, nothing the user asked for.
+ */
+const ACKNOWLEDGEMENT_SHAPE =
+  /^(?:ok(?:ay)?|done|finished|complete[d]?|success(?:ful)?|(?:task|all|that'?s|it'?s) (?:is )?(?:done|complete[d]?|finished|set)|no problem|sure)[.!]*$/i;
+
+/**
+ * True when a result carries no answer: empty, a bare acknowledgement, or a
+ * few words with no figure in them. A worker that stored its findings
+ * elsewhere and closed with "Done." has delivered nothing to the user, and
+ * the text alone cannot tell "Done." from an answer, so the shape has to.
+ * Deliberately loose on the short side: a three-word reply to a real
+ * question is re-synthesized from the goal's data, which costs one cheap
+ * call and never loses the answer.
+ */
+export function looksLikeBareAcknowledgement(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return true;
+  if (ACKNOWLEDGEMENT_SHAPE.test(trimmed)) return true;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  return words.length <= 3 && !/\d/.test(trimmed);
+}
