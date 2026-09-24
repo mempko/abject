@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.11.0",
+    "date": "2026-09-24",
+    "title": "Clearer routing, steadier long thoughts",
+    "summary": "This release makes Chat better at handling questions about your system and keeps long-running agent work from being cut off while a model is still thinking.",
+    "highlights": [
+      "Chat now answers questions about your system by starting a goal instead of handing them off as a background job, so the answers are more complete and you can follow their progress. You can still ask for a background job when you want one."
+    ],
+    "fixes": [
+      "Agents taking long thinking steps no longer set off the stall timer on the task that called them. Keepalive signals from the model are now passed back to the caller, so slow but healthy work isn't mistaken for a hang."
+    ]
+  },
+  {
     "version": "0.10.10",
     "date": "2026-09-24",
     "title": "Steadier Answers, Smarter Budgets, Fallback Routes",
