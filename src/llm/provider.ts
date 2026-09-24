@@ -833,6 +833,79 @@ export function conversationTextChars(msgs: SizedMessage[]): number {
   return msgs.reduce((sum, m) => sum + messageTextChars(m), 0);
 }
 
+/**
+ * Everything the model read on one call: uncached input plus what it read
+ * from and wrote to the prompt cache. Providers report `inputTokens` net of
+ * the cache pieces (the pricing convention this codebase keeps), so the
+ * prompt's real size is the sum. Undefined when the provider reported
+ * nothing usable.
+ */
+export function promptTokensOf(
+  usage: { inputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined,
+): number | undefined {
+  if (!usage || typeof usage.inputTokens !== 'number') return undefined;
+  const total = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+  return total > 0 ? total : undefined;
+}
+
+/**
+ * What the provider measured for the prompt it was last sent, and which
+ * messages that measurement covered. The next budget check starts from the
+ * measured count and only estimates what was added since, instead of
+ * guessing the whole conversation at a fixed chars-per-token.
+ */
+export interface ContextAnchor {
+  /** Prompt tokens as reported (see promptTokensOf). */
+  promptTokens: number;
+  /** Leading messages the measurement covered, exactly as sent. */
+  prefixCount: number;
+  /** Their text chars at send time — how we tell the prefix is still intact. */
+  prefixChars: number;
+}
+
+/** Bounds on how far a measured chars-per-token ratio may pull the estimate from the fixed guess. */
+const ANCHOR_RATIO_MIN = 0.5;
+const ANCHOR_RATIO_MAX = 3;
+
+/**
+ * Size of a conversation in budget chars, anchored on the last measurement.
+ *
+ * Three bases, best first:
+ * - `measured`: the anchored prefix is untouched, so its cost is the
+ *   provider's own count; only the messages appended since are estimated.
+ * - `calibrated`: the prefix changed (elision, compaction, a rebuilt prompt),
+ *   so the measurement no longer maps onto specific messages, but the
+ *   density it revealed — how many budget chars one real char of this
+ *   conversation costs — still does. Bounded so a misreporting route cannot
+ *   swing the estimate more than a few times either way.
+ * - `chars`: no anchor; the fixed chars-per-token guess.
+ *
+ * Token counts convert back to chars at `charsPerToken` so the result
+ * compares against the char budgets the caller already derives from the
+ * model's window with the same constant; the constant cancels out for the
+ * measured part.
+ */
+export function anchoredConversationChars(
+  msgs: SizedMessage[],
+  anchor: ContextAnchor | undefined,
+  charsPerToken: number,
+): { chars: number; basis: 'measured' | 'calibrated' | 'chars' } {
+  require(charsPerToken > 0, 'charsPerToken must be positive');
+  const rawChars = conversationTextChars(msgs);
+  if (!anchor || anchor.promptTokens <= 0 || anchor.prefixChars <= 0 || anchor.prefixCount <= 0) {
+    return { chars: rawChars, basis: 'chars' };
+  }
+  const measuredChars = anchor.promptTokens * charsPerToken;
+  if (msgs.length >= anchor.prefixCount) {
+    const prefixCharsNow = conversationTextChars(msgs.slice(0, anchor.prefixCount));
+    if (prefixCharsNow === anchor.prefixChars) {
+      return { chars: Math.round(measuredChars + (rawChars - prefixCharsNow)), basis: 'measured' };
+    }
+  }
+  const ratio = Math.min(ANCHOR_RATIO_MAX, Math.max(ANCHOR_RATIO_MIN, measuredChars / anchor.prefixChars));
+  return { chars: Math.round(rawChars * ratio), basis: 'calibrated' };
+}
+
 /** Shrink one message's text content to roughly `target` chars in place. */
 export function truncateMessageTo(msg: SizedMessage, target: number): void {
   if (typeof msg.content === 'string') {

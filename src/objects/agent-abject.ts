@@ -25,7 +25,8 @@ import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
-import { truncateText, conversationTextChars, enforceConversationCharBudget, isContextOverflowError } from '../llm/provider.js';
+import { truncateText, conversationTextChars, enforceConversationCharBudget, isContextOverflowError, promptTokensOf, anchoredConversationChars } from '../llm/provider.js';
+import type { ContextAnchor } from '../llm/provider.js';
 import type { TierCapabilities } from './llm-object.js';
 import { Log } from '../core/timed-log.js';
 
@@ -383,6 +384,14 @@ interface QueuedTask {
   data?: Record<string, unknown>;
 }
 
+/** What one think-step call returns from the LLM object's `stream`. */
+interface LLMThinkResult {
+  content: string;
+  stopReason?: string;
+  execution?: ExecutionProvenance;
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
+}
+
 interface TaskEntry {
   knowledgeScopes?: string[];
   refreshKnowledgePrompt?: boolean;
@@ -481,6 +490,14 @@ interface TaskEntry {
    *  this task's lifetime. Not reset: a task needing this twice has an
    *  oversized part that compaction cannot reach. */
   overflowRecoveries?: number;
+  /**
+   * What the model reported for the prompt it was last sent. The next budget
+   * check starts from that measured count and estimates only what was added
+   * since, so the soft/hard thresholds track real tokens instead of a fixed
+   * chars-per-token guess. Not checkpointed: a resumed task simply starts
+   * from the char estimate again until its first call lands.
+   */
+  contextAnchor?: ContextAnchor;
   /** Actions 2..N from a multi-action LLM response, drained in order by the thinking phase without an LLM round-trip between them. Replaced on every parse; discarded on failure or max-steps. */
   pendingActions?: AgentAction[];
 }
@@ -3991,11 +4008,14 @@ The registered object must implement these handlers to participate in the agent 
         });
 
     this.streamingEntries.set(streamRequest.header.messageId, entry);
-    let llmResult: { content: string; stopReason?: string; execution?: ExecutionProvenance };
+    // What is being sent, so the provider's count can be pinned to it.
+    const sent = { count: task.llmMessages.length, chars: conversationTextChars(task.llmMessages) };
+    let llmResult: LLMThinkResult;
     try {
-      llmResult = await this.request<{ content: string; stopReason?: string; execution?: ExecutionProvenance }>(streamRequest, 120000);
+      llmResult = await this.request<LLMThinkResult>(streamRequest, 120000);
       task.execution = llmResult.execution;
       this.markConversationObserved(entry);
+      this.anchorContext(entry, sent, llmResult.usage);
     } catch (err) {
       if (!isContextOverflowError(err)) throw err;
       // The budget estimate was wrong for this model — characters are only a
@@ -5220,7 +5240,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     original: ReturnType<typeof request>,
     budget: { soft: number; hard: number; windowTokens?: number },
     cause: unknown,
-  ): Promise<{ content: string; stopReason?: string; execution?: ExecutionProvenance }> {
+  ): Promise<LLMThinkResult> {
     const used = (entry.overflowRecoveries ?? 0) + 1;
     entry.overflowRecoveries = used;
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
@@ -5241,14 +5261,28 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       messages: entry.state.llmMessages.map(({ retainedPage: _page, elided: _elided, ...message }) => message),
     });
     this.streamingEntries.set(retry.header.messageId, entry);
+    const sent = { count: entry.state.llmMessages.length, chars: conversationTextChars(entry.state.llmMessages) };
     try {
-      const result = await this.request<{ content: string; stopReason?: string; execution?: ExecutionProvenance }>(retry, 120000);
+      const result = await this.request<LLMThinkResult>(retry, 120000);
       entry.state.execution = result.execution;
       this.markConversationObserved(entry);
+      this.anchorContext(entry, sent, result.usage);
       return result;
     } finally {
       this.streamingEntries.delete(retry.header.messageId);
     }
+  }
+
+  /**
+   * Pin the provider's prompt count to the messages it was sent. A call that
+   * reported no usage leaves the previous anchor in place: a stale anchor
+   * still calibrates better than no anchor, and the prefix check keeps it
+   * from being trusted as an exact count once the messages under it change.
+   */
+  private anchorContext(entry: TaskEntry, sent: { count: number; chars: number }, usage: LLMThinkResult['usage']): void {
+    const promptTokens = promptTokensOf(usage);
+    if (promptTokens === undefined || sent.count === 0 || sent.chars === 0) return;
+    entry.contextAnchor = { promptTokens, prefixCount: sent.count, prefixChars: sent.chars };
   }
 
   /**
@@ -5327,13 +5361,21 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       task.llmMessages = [...pinned, ...recent];
     }
 
+    // Size against the budget from the provider's own count where one is
+    // pinned to the current messages (see contextAnchor); characters alone
+    // are only a proxy, and the model's tokenizer is the authority on how
+    // much of the window this conversation actually occupies.
+    const measure = () => anchoredConversationChars(task.llmMessages, entry.contextAnchor, AgentAbject.CHARS_PER_TOKEN);
+
     // 2. Soft threshold — cheap deterministic elision, no LLM call. Bulky
     //    action results in the middle region become stubs that say how much
     //    was removed and how to get it back. Doing this first is what keeps
     //    the expensive summarizer from running at all in most conversations:
     //    elision reclaims the same bytes for nothing, and a stub the agent
     //    can reverse loses less than a summary it cannot.
-    if (conversationTextChars(task.llmMessages) > softBudget) {
+    const before = measure();
+    if (before.chars > softBudget) {
+      log.info(`trimConversation: ${before.chars} budget chars (${before.basis}; raw ${conversationTextChars(task.llmMessages)}) over soft ${softBudget} — eliding`);
       this.elideMiddleObservations(entry, pinnedCount);
     }
 
@@ -5342,9 +5384,11 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     //    messages with the fast tier, folds the middle into the running
     //    structured summary, and falls back to deterministic truncation
     //    internally.
-    if (conversationTextChars(task.llmMessages) <= hardBudget) {
+    const after = measure();
+    if (after.chars <= hardBudget) {
       return;
     }
+    log.info(`trimConversation: ${after.chars} budget chars (${after.basis}; raw ${conversationTextChars(task.llmMessages)}) over hard ${hardBudget} — compacting`);
 
     try {
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
