@@ -5968,10 +5968,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     }
   }
 
-  protected override onProgressBubble(_msg: AbjectMessage): void {
-    const taskId=(_msg.payload as {taskId?:string})?.taskId;
+  protected override onProgressBubble(msg: AbjectMessage): void {
+    const taskId=(msg.payload as {taskId?:string})?.taskId;
     if(!taskId)return;
-    if (!this.goalManagerId) return;
     const now = Date.now();
     for (const entry of this.taskEntries.values()) {
       // Don't emit progress for terminal entries — they're done. Without this,
@@ -5982,6 +5981,33 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // released early by the reviewer, so this loop stays small.
       if (entry.state.id!==taskId)continue;
       if (entry.state.phase === 'done' || entry.state.phase === 'error') continue;
+
+      // Relay the beat to whoever started this task, so its own stall timer
+      // survives a long step. The caller's timer is a wall clock that only a
+      // phase change resets, and one think can outlast it on its own: a
+      // reasoning model spends minutes on hidden tokens before it emits a
+      // visible one. The chunk-driven relay in the llmChunk handler cannot
+      // cover that, because reasoning deltas never arrive as chunks — this
+      // path is fed by the LLM object's keepalive, which fires precisely
+      // when the stream is alive and quiet. Shares the chunk relay's
+      // per-entry throttle so both sources together stay at one beat a
+      // second, and skips the sender so two objects cannot echo each other.
+      if (entry.callerId !== this.id
+        && msg.routing.from !== entry.callerId
+        && now - (entry.lastStreamProgressTs ?? 0) > 1000) {
+        entry.lastStreamProgressTs = now;
+        try {
+          this.send(event(this.id, entry.callerId, 'progress', {
+            phase: 'streaming',
+            message: 'LLM thinking...',
+          }));
+        } catch { /* bus may be gone */ }
+      }
+
+      // The goal-progress echo below needs a goal; the relay above does not.
+      // A chat's routing turn runs with no goal at all, which is exactly the
+      // task whose caller was left without a heartbeat.
+      if (!this.goalManagerId) continue;
       const goalId = entry.goalId ?? entry.incomingGoalId;
       if (!goalId) continue;
       const last = this.lastGoalProgressTs.get(goalId) ?? 0;
