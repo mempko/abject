@@ -47,6 +47,11 @@ export interface WindowConfig {
    * mouseleave to the hovered widget that summoned them.
    */
   focusOnCreate?: boolean;
+  /**
+   * Scene ops this window wears while focused (WidgetManager's focus
+   * decoration), in px from the window's top-left corner (+y down).
+   */
+  focusDecoration?: Array<Record<string, unknown>> | null;
 }
 
 /**
@@ -90,6 +95,10 @@ export class WindowAbject extends Abject {
   private hoveredTitleButton?: TitleButtonKind;
 
   private windowFocused = false;
+  /** Scene ops worn while focused (px from the top-left corner); null = none. */
+  private focusDecoration: Array<Record<string, unknown>> | null = null;
+  /** Whether the focus decoration is currently in the scene. */
+  private decorationShown = false;
   private destroying = false;
   private rendering = false;
   private renderScheduled = false;
@@ -180,9 +189,26 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) } (intensity is a LINEAR MULTIPLIER on the light color — 1 = full strength, keys 0.8-1.6, fills 0.3-0.6 — NOT watts/lumens; over 10 is rejected because it renders every lit mesh pure white. Use range for reach, not intensity). Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). LAYERS: the window\'s own content is the BACKMOST 2D layer; a kind:"canvas" node is a 2D drawing layer in the scene — params { width, height, commands (standard 2D draw commands; an update replaces the batch and repaints; the layer starts transparent), opacity?, radius? }. Canvas layers slice meshes by z: meshes behind draw under, meshes in front draw over — 2D and 3D stack in any order (put HUD/text on a canvas node in front of the meshes). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas"|"particles", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere"|"ring" (ring: flat annulus facing the viewer), color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) } (intensity is a LINEAR MULTIPLIER on the light color — 1 = full strength, keys 0.8-1.6, fills 0.3-0.6 — NOT watts/lumens; over 10 is rejected because it renders every lit mesh pure white. Use range for reach, not intensity). Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Particles params (kind:\'particles\', an emitter simulated client-side): { rate? (per second, streams while > 0: the desktop redraws while it streams, so set rate 0 or remove it when idle), burst? (count emitted once on add, again whenever burstKey changes), burstKey?, lifetime? (ms), speed?:[min,max] px/s, direction?:[x,y,z], spread? (cone radians), gravity? (px/s², +y down), size?:[min,max] px, color?, colorEnd?, shape?:"glow"|"square", emitterSize?:[w,h,d], maxParticles? }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse"|"shake"|"flash"|"float" (shake: decaying jolt; flash: emissive to params.color and back; float: slow drift and sway), channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). LAYERS: the window\'s own content is the BACKMOST 2D layer; a kind:"canvas" node is a 2D drawing layer in the scene — params { width, height, commands (standard 2D draw commands; an update replaces the batch and repaints; the layer starts transparent), opacity?, radius? }. Canvas layers slice meshes by z: meshes behind draw under, meshes in front draw over — 2D and 3D stack in any order (put HUD/text on a canvas node in front of the meshes). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
                 parameters: [
                   { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'effect',
+                description: 'Play a slab effect on this window (visual only, animated client-side). effect: a registered or built-in name (materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec (see WidgetManager registerWindowEffect). ANY abject may call this.',
+                parameters: [
+                  { name: 'effect', type: { kind: 'reference', reference: 'string | SlabEffectSpec' }, description: 'Effect name or inline spec' },
+                  { name: 'color', type: { kind: 'primitive', primitive: 'string' }, description: 'Override light colour (CSS or $token)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setModal',
+                description: 'Mark this window modal (or not): while it shows, every other window recedes into depth and dims.',
+                parameters: [
+                  { name: 'modal', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true while modal' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -238,6 +264,7 @@ export class WindowAbject extends Abject {
     this.uiServerId = config.uiServerId;
     this.title = config.title;
     this.rect = { ...config.rect };
+    this.focusDecoration = config.focusDecoration ?? null;
     this.chromeless = config.chromeless ?? false;
     this.transparent = config.transparent ?? false;
     this.closable = config.closable ?? true;
@@ -365,6 +392,31 @@ export class WindowAbject extends Abject {
       );
     });
 
+    // WidgetManager pushes the desktop's focus decoration (scene ops).
+    this.on('setFocusDecoration', async (msg: AbjectMessage) => {
+      const { ops } = msg.payload as { ops: Array<Record<string, unknown>> | null };
+      if (this.decorationShown) await this.removeFocusDecoration();
+      this.focusDecoration = Array.isArray(ops) && ops.length > 0 ? ops : null;
+      await this.syncFocusDecoration();
+      return true;
+    });
+
+    this.on('effect', async (msg: AbjectMessage) => {
+      const { effect, color } = msg.payload as { effect: unknown; color?: string };
+      contractRequire(this.surfaceId !== undefined, 'effect: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'surfaceEffect', { surfaceId: this.surfaceId, effect, ...(color ? { color } : {}) })
+      );
+    });
+
+    this.on('setModal', async (msg: AbjectMessage) => {
+      const { modal } = msg.payload as { modal: boolean };
+      contractRequire(this.surfaceId !== undefined, 'setModal: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'setSurfaceModal', { surfaceId: this.surfaceId, modal: modal === true })
+      );
+    });
+
     this.on('setSlabTransform', async (msg: AbjectMessage) => {
       const { rotation, z } = msg.payload as { rotation?: [number, number, number]; z?: number };
       contractRequire(this.surfaceId !== undefined, 'setSlabTransform: window has no surface yet');
@@ -458,6 +510,7 @@ export class WindowAbject extends Abject {
     this.on('focus', async (msg: AbjectMessage) => {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       this.windowFocused = focused;
+      void this.syncFocusDecoration();
 
       // Focus is shown with a static accent border + a soft compositor halo,
       // so no continuous shimmer animation is needed (avoids repainting the
@@ -526,6 +579,7 @@ export class WindowAbject extends Abject {
       const moved = x !== this.rect.x || y !== this.rect.y;
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;
       this.rect = { x, y, width, height };
+      if (sizeChanged && this.decorationShown) void this.placeFocusDecoration();
 
       // Update the actual UIServer surface so it matches the new rect
       if (this.surfaceId) {
@@ -824,6 +878,68 @@ by re-matching title/owner.
       if (Math.abs(x - centers[kind]) <= half) return kind;
     }
     return undefined;
+  }
+
+  // ── Focus decoration ───────────────────────────────────────────────
+  // The focused window wears WidgetManager's focus decoration: scene ops in
+  // px from the window's top-left corner, hung under one root group so they
+  // are added on focus and removed on blur with a single op each. Chromeless
+  // and transparent windows (docks, scrims, tooltips) wear none.
+
+  private static readonly DECORATION_ROOT = 'focus-deco';
+
+  private async syncFocusDecoration(): Promise<void> {
+    const want = this.windowFocused && !!this.focusDecoration && !this.chromeless && !this.transparent;
+    if (want && !this.decorationShown) await this.addFocusDecoration();
+    else if (!want && this.decorationShown) await this.removeFocusDecoration();
+  }
+
+  private async addFocusDecoration(): Promise<void> {
+    if (!this.surfaceId || !this.focusDecoration) return;
+    const root = WindowAbject.DECORATION_ROOT;
+    const prefix = (id: unknown) => `${root}:${String(id)}`;
+    const ops: Array<Record<string, unknown>> = [
+      {
+        op: 'add', id: root, kind: 'group',
+        transform: { position: [-this.rect.width / 2, -this.rect.height / 2, 0] },
+        params: { occlude: false },
+      },
+    ];
+    for (const raw of this.focusDecoration) {
+      const op: Record<string, unknown> = { ...raw, id: prefix(raw.id) };
+      if (op.op === 'add') op.parentId = raw.parentId !== undefined ? prefix(raw.parentId) : root;
+      ops.push(op);
+    }
+    this.decorationShown = true;
+    try {
+      await this.request(request(this.id, this.uiServerId, 'scene', {
+        surfaceId: this.surfaceId, ops, contributorId: this.id,
+      }));
+    } catch {
+      this.decorationShown = false;
+    }
+  }
+
+  private async placeFocusDecoration(): Promise<void> {
+    if (!this.surfaceId) return;
+    await this.request(request(this.id, this.uiServerId, 'scene', {
+      surfaceId: this.surfaceId,
+      ops: [{
+        op: 'update', id: WindowAbject.DECORATION_ROOT,
+        transform: { position: [-this.rect.width / 2, -this.rect.height / 2, 0] },
+      }],
+      contributorId: this.id,
+    })).catch(() => {});
+  }
+
+  private async removeFocusDecoration(): Promise<void> {
+    this.decorationShown = false;
+    if (!this.surfaceId) return;
+    await this.request(request(this.id, this.uiServerId, 'scene', {
+      surfaceId: this.surfaceId,
+      ops: [{ op: 'remove', id: WindowAbject.DECORATION_ROOT }],
+      contributorId: this.id,
+    })).catch(() => {});
   }
 
   /**

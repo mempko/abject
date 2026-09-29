@@ -34,6 +34,10 @@ import { SceneStore, VocabNode } from './gl/scene.js';
 import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneColor, hasCustomGeometry } from './gl/scene-types.js';
 import { getGeometry, customGeometry, Geometry } from './gl/primitives.js';
 import { cubicBezier, STANDARD, LINEAR, EMPHASIZE } from './motion.js';
+import {
+  SlabEffectSpec, SlabMotionConfig, MotionTrack, BUILTIN_SLAB_EFFECTS, DEFAULT_SLAB_MOTION,
+  sampleTrack, channelNeutral,
+} from './gl/slab-motion.js';
 import { EasingCurve } from '../core/theme-data.js';
 import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert, mat4LookAt, mat4Ortho, mat4TransformPoint, vec3 } from './gl/math.js';
 import { rayFromScreen, raySurfaceHit, rayMeshHit, rayCustomMeshHit, Ray } from './gl/picking.js';
@@ -386,6 +390,50 @@ interface SurfaceGlState {
   userZ?: number;
   lastMoveX?: number;
   lastMoveY?: number;
+  // ── Motion (client-side, visual only; see "Motion" in Compositor) ──
+  /** True once the slab has been on screen (its first appearance plays the open transition). */
+  seen?: boolean;
+  /** Running slab effects (lifecycle transitions and owner-played effects). */
+  effects?: SlabEffectRun[];
+  /** Surface is a modal: while it shows, every other slab recedes. */
+  modal?: boolean;
+  /** Eased 0..1 recede amount (other windows while a modal shows). */
+  recede?: number;
+}
+
+/** One playing slab effect: its spec, clock, resolved colours and particles. */
+interface SlabEffectRun {
+  spec: SlabEffectSpec;
+  /** performance.now() it starts (may lie ahead: staggered transitions hold their first frame). */
+  start: number;
+  curve: EasingCurve;
+  rim: RGBA;
+  aura: RGBA;
+  scan: RGBA;
+  particle: RGBA;
+  /** Particles seeded at play time, px from the slab centre (velocities px/s). */
+  particles?: Array<{ x: number; y: number; z: number; vx: number; vy: number; vz: number; size: number; square: boolean }>;
+}
+
+/** A slab still animating after its surface went away (closed) or hid (minimized). */
+interface SlabGhost {
+  surface: Surface;
+  state: SurfaceGlState;
+  run: SlabEffectRun;
+  kind: 'close' | 'minimize';
+}
+
+/** The composite of every effect running on a slab this frame. */
+interface SlabPose {
+  dx: number; dy: number; dz: number;
+  rx: number; ry: number; rz: number;
+  sx: number; sy: number;
+  opacity: number; dim: number;
+  rim?: RGBA;
+  auras: Array<{ color: RGBA; spread: number }>;
+  scans: Array<{ color: RGBA; pos: number }>;
+  bursts: SlabEffectRun[];
+  moving: boolean;
 }
 
 /**
@@ -654,6 +702,9 @@ export class Compositor {
    * Destroy a surface.
    */
   destroySurface(surfaceId: string): boolean {
+    this.lastDestroyed = this.surfaces.get(surfaceId);
+    // A sink still in flight shares this surface's texture, which is about to go.
+    this.ghosts = this.ghosts.filter((g) => !(g.kind === 'minimize' && g.surface.id === surfaceId));
     const deleted = this.surfaces.delete(surfaceId);
     // Never leave the mobile view pointed at a destroyed surface: renderMobile
     // would otherwise draw an empty frame (black screen) instead of the
@@ -670,7 +721,20 @@ export class Compositor {
         if (region.surfaceId === surfaceId) this.videoRegions.delete(videoId);
       }
       const glState = this.surfaceGl.get(surfaceId);
-      if (glState?.texture) this.renderer.deleteTexture(glState.texture);
+      const surface = this.lastDestroyed;
+      this.lastDestroyed = undefined;
+      // A visible slab dematerializes: its ghost keeps the texture until the
+      // fold finishes (drawGhosts frees it). The surface itself is gone, so
+      // input and hit-testing no longer see it.
+      const close = surface && this.hasMotion(surface)
+        ? this.resolveEffect(this.slabMotionConfig.transitions.close) : undefined;
+      if (close && glState?.texture && surface && surface.visible && surface.drawn
+          && !this.isWorkspaceFiltered(surface)) {
+        const run = this.makeRun(close, performance.now(), surface.rect.width, surface.rect.height);
+        this.ghosts.push({ surface, state: glState, run, kind: 'close' });
+      } else if (glState?.texture) {
+        this.renderer.deleteTexture(glState.texture);
+      }
       this.surfaceGl.delete(surfaceId);
       this.sceneStore.removeForSurface(surfaceId);
       this.sortSurfaces();
@@ -690,6 +754,8 @@ export class Compositor {
       if (entry.texture) this.renderer.deleteTexture(entry.texture);
     }
     this.canvasLayers.clear();
+    for (const g of this.ghosts) if (g.kind === 'close' && g.state.texture) this.renderer.deleteTexture(g.state.texture);
+    this.ghosts = [];
     this.surfaceGl.clear();
     this.sceneStore.clear();
     this.worldKeys.clear();
@@ -1117,6 +1183,281 @@ export class Compositor {
     this.needsRender = true;
   }
 
+  // ── Motion ─────────────────────────────────────────────────────────────
+  //
+  // Client-side, visual-only slab motion. Effects are declarative specs
+  // (src/ui/gl/slab-motion.ts): tracks for offsets, rotation, scale, opacity
+  // and dim, plus rim / aura / scan-line light and particle bursts. The
+  // window lifecycle (open, close, minimize, restore, workspace-in) plays
+  // whichever effects the motion config names, and owners play effects on
+  // demand (surfaceEffect). The config is data pushed by the backend
+  // (WidgetManager is its authority), so any Abject can register effects or
+  // replace the transitions. Nothing here changes geometry the backend
+  // knows: picking follows the animated model matrix, and closed slabs leave
+  // the input path at once (their ghosts are drawn, never hit).
+
+  private slabMotionConfig: SlabMotionConfig = DEFAULT_SLAB_MOTION;
+  /** Particle emitter simulations, keyed `${surfaceKey}/${nodeId}`. */
+  private particleStates = new Map<string, {
+    ps: Array<{ x: number; y: number; z: number; vx: number; vy: number; vz: number; age: number; size: number }>;
+    acc: number; last: number; burstKey: unknown; burstDone: boolean;
+  }>();
+  private touchedParticles = new Set<string>();
+  private ghosts: SlabGhost[] = [];
+  /** The surface being destroyed, handed from destroySurface to its ghost. */
+  private lastDestroyed?: Surface;
+
+  /** Replace the motion configuration (named effects, transitions, modal style). */
+  setSlabMotion(config: SlabMotionConfig): void {
+    this.slabMotionConfig = config;
+    this.needsRender = true;
+  }
+
+  /** Slabs that take part in lifecycle motion (tooltips and passthrough layers stay instant). */
+  private hasMotion(surface: Surface): boolean {
+    return !this.mobileMode && !surface.transparent && !surface.inputPassthrough
+      && surface.rect.height >= this.slabMotionConfig.minHeight;
+  }
+
+  /** An effect by name (registered, then built-in) or inline spec. */
+  private resolveEffect(ref: string | SlabEffectSpec | null | undefined): SlabEffectSpec | undefined {
+    if (!ref) return undefined;
+    if (typeof ref === 'string') return this.slabMotionConfig.effects[ref] ?? BUILTIN_SLAB_EFFECTS[ref];
+    return ref;
+  }
+
+  /** Start an effect run: resolve its colours and seed its particles. */
+  private makeRun(spec: SlabEffectSpec, start: number, w: number, h: number, color?: string): SlabEffectRun {
+    const living = this.sceneTheme?.colors.accentSecondary ?? '#5be5a0';
+    const pick = (c?: string) => parseCssColor(resolveSceneColor(color ?? c ?? living, this.sceneTheme));
+    const run: SlabEffectRun = {
+      spec,
+      start,
+      curve: this.easingOf(spec.easing ?? 'standard'),
+      rim: pick(spec.rim?.color),
+      aura: pick(spec.aura?.color),
+      scan: pick(spec.scan?.color),
+      particle: pick(spec.particles?.color),
+    };
+    if (spec.particles) run.particles = this.seedParticles(spec.particles, w, h);
+    return run;
+  }
+
+  private seedParticles(p: NonNullable<SlabEffectSpec['particles']>, w: number, h: number): NonNullable<SlabEffectRun['particles']> {
+    const out: NonNullable<SlabEffectRun['particles']> = [];
+    const count = Math.max(0, Math.min(400, p.count ?? 48));
+    const [smin, smax] = p.speed ?? [70, 270];
+    const [zmin, zmax] = p.size ?? [2, 5.5];
+    for (let i = 0; i < count; i++) {
+      let x = 0, y = 0, nx = 0, ny = 0;
+      if ((p.from ?? 'edges') === 'edges') {
+        const edge = Math.floor(Math.random() * 4);
+        const u = Math.random() - 0.5;
+        if (edge === 0) { x = u * w; y = -h / 2; ny = -1; }
+        else if (edge === 1) { x = w / 2; y = u * h; nx = 1; }
+        else if (edge === 2) { x = u * w; y = h / 2; ny = 1; }
+        else { x = -w / 2; y = u * h; nx = -1; }
+      } else {
+        const a = Math.random() * Math.PI * 2;
+        nx = Math.cos(a); ny = Math.sin(a);
+      }
+      const speed = smin + Math.random() * (smax - smin);
+      const shape = p.shape ?? 'mixed';
+      out.push({
+        x, y, z: 0,
+        vx: nx * speed + (Math.random() - 0.5) * 60,
+        vy: ny * speed + (Math.random() - 0.5) * 60,
+        vz: 40 + Math.random() * 160,
+        size: zmin + Math.random() * (zmax - zmin),
+        square: shape === 'square' || (shape === 'mixed' && Math.random() < 0.5),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Play an effect on a surface's slab: a registered or built-in name, or an
+   * inline spec. `color` (CSS or $token) overrides the effect's light colours.
+   * Unknown names are ignored.
+   */
+  surfaceEffect(surfaceId: string, effect: string | SlabEffectSpec, color?: string): void {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface) return;
+    const spec = this.resolveEffect(effect);
+    if (!spec) return;
+    const state = this.glState(surfaceId);
+    (state.effects ??= []).push(this.makeRun(spec, performance.now(), surface.rect.width, surface.rect.height, color));
+    this.needsRender = true;
+  }
+
+  /** Mark or unmark a surface as modal (every other slab recedes while it shows). */
+  setSurfaceModal(surfaceId: string, modal: boolean): void {
+    if (!this.surfaces.has(surfaceId)) return;
+    this.glState(surfaceId).modal = modal;
+    this.needsRender = true;
+  }
+
+  /** Evaluate a set of effect runs into one pose (offsets add, factors multiply). */
+  private evalPose(runs: SlabEffectRun[], now: number, cx: number, cy: number): SlabPose {
+    const pose: SlabPose = {
+      dx: 0, dy: 0, dz: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, opacity: 1, dim: 1,
+      auras: [], scans: [], bursts: [], moving: false,
+    };
+    for (const run of runs) {
+      const spec = run.spec;
+      const t = Math.max(0, Math.min(1, (now - run.start) / spec.duration));
+      if (t < 1) pose.moving = true;
+      const e = cubicBezier(run.curve, t);
+      const val = (ch: keyof SlabEffectSpec): number | undefined => {
+        const tr = spec[ch] as MotionTrack | undefined;
+        return tr === undefined ? undefined : sampleTrack(tr, t, e, channelNeutral(ch));
+      };
+      pose.dx += val('x') ?? 0;
+      pose.dy += val('y') ?? 0;
+      pose.dz += val('z') ?? 0;
+      pose.rx += val('rotateX') ?? 0;
+      pose.ry += val('rotateY') ?? 0;
+      pose.rz += val('rotateZ') ?? 0;
+      const sc = val('scale') ?? 1;
+      pose.sx *= sc * (val('scaleX') ?? 1);
+      pose.sy *= sc * (val('scaleY') ?? 1);
+      pose.opacity *= val('opacity') ?? 1;
+      pose.dim *= val('dim') ?? 1;
+      if (spec.toward) {
+        const k = sampleTrack(spec.toward.amount, t, e, 0);
+        if (spec.toward.x !== undefined) pose.dx += (spec.toward.x - cx) * k;
+        if (spec.toward.y !== undefined) pose.dy += (spec.toward.y - cy) * k;
+      }
+      if (spec.rim) {
+        const a = sampleTrack(spec.rim.alpha, t, e, 0);
+        if (a > 0 && (!pose.rim || a > pose.rim.a)) pose.rim = { ...run.rim, a: Math.min(1, a) };
+      }
+      if (spec.aura) {
+        const a = sampleTrack(spec.aura.alpha, t, e, 0);
+        if (a > 0) pose.auras.push({ color: { ...run.aura, a: Math.min(1, a) }, spread: spec.aura.spread ?? 36 });
+      }
+      if (spec.scan) {
+        const a = sampleTrack(spec.scan.alpha, t, e, 0);
+        const from = spec.scan.from ?? 'top';
+        const pos = from === 'top' ? e : from === 'bottom' ? 1 - e : 0.5;
+        if (a > 0) pose.scans.push({ color: { ...run.scan, a: Math.min(1, a) }, pos });
+      }
+      if (run.particles && t < 1) pose.bursts.push(run);
+    }
+    return pose;
+  }
+
+  /** Recede toward the modal style while any modal shows (eased per slab). */
+  private stepRecede(state: SurfaceGlState, anyModal: boolean, pose: SlabPose): void {
+    const target = anyModal && !state.modal ? 1 : 0;
+    const r = state.recede ?? 0;
+    const next = Math.abs(target - r) < 0.01 ? target : r + (target - r) * 0.2;
+    state.recede = next;
+    if (next !== target) pose.moving = true;
+    const m = this.slabMotionConfig.modal;
+    pose.dz -= m.z * next;
+    pose.dim *= 1 - (1 - m.dim) * next;
+  }
+
+  /** Draw a pose's auras: soft light BEHIND the slab (call before drawing it). */
+  private drawPoseAuras(
+    pose: SlabPose, cx: number, cy: number, z: number, w: number, h: number,
+    rot: number[], viewProj: Mat4,
+  ): void {
+    for (const aura of pose.auras) {
+      const pad = aura.spread;
+      this.renderer.drawGlow({
+        model: mat4TRS(cx, cy, z - 0.4, rot[0], rot[1], rot[2], w + pad * 2, h + pad * 2, 1),
+        viewProj,
+        quadWidth: w + pad * 2, quadHeight: h + pad * 2,
+        halfWidth: w / 2, halfHeight: h / 2,
+        radius: 0,
+        color: aura.color,
+        a1: 0.9, sigma1: pad / 6,
+        a2: 0.5, sigma2: pad / 2.2,
+      });
+    }
+  }
+
+  /** Draw a pose's scan lines and particles IN FRONT of the slab (call after drawing it). */
+  private drawPoseLights(
+    pose: SlabPose, now: number, cx: number, cy: number, z: number, w: number, h: number,
+    rot: number[], viewProj: Mat4,
+  ): void {
+    for (const scan of pose.scans) {
+      const y = cy - h / 2 + h * scan.pos;
+      const qw = w + 60;
+      const qh = 40;
+      this.renderer.drawGlow({
+        model: mat4TRS(cx, y, z + 1, rot[0], rot[1], rot[2], qw, qh, 1),
+        viewProj,
+        quadWidth: qw, quadHeight: qh,
+        halfWidth: w / 2, halfHeight: 1,
+        radius: 0,
+        color: scan.color,
+        a1: 1, sigma1: 1.2,
+        a2: 0.55, sigma2: 7,
+      });
+    }
+    for (const run of pose.bursts) {
+      const t = Math.max(0, Math.min(1, (now - run.start) / run.spec.duration));
+      const secs = Math.max(0, (now - run.start) / 1000);
+      const gravity = run.spec.particles?.gravity ?? 90;
+      const fade = 1 - t;
+      for (const p of run.particles ?? []) {
+        const px = cx + p.x + p.vx * secs;
+        const py = cy + p.y + p.vy * secs + 0.5 * gravity * secs * secs;
+        const pz = z + p.z + p.vz * secs;
+        const q = p.square ? p.size * 2 + 2 : p.size * 6;
+        this.renderer.drawGlow({
+          model: mat4TRS(px, py, pz, 0, 0, secs * 3, q, q, 1),
+          viewProj,
+          quadWidth: q, quadHeight: q,
+          halfWidth: p.square ? p.size : 0.5, halfHeight: p.square ? p.size : 0.5,
+          radius: p.square ? 0 : 0.5,
+          color: run.particle,
+          a1: fade, sigma1: p.square ? 0.4 : p.size * 0.9,
+        });
+      }
+    }
+  }
+
+  /** Draw slabs that are closing or minimizing; drops the finished ones. */
+  private drawGhosts(now: number): boolean {
+    if (this.ghosts.length === 0) return false;
+    const keep: SlabGhost[] = [];
+    for (const g of this.ghosts) {
+      const done = now - g.run.start >= g.run.spec.duration;
+      if (done || !g.state.texture) {
+        if (g.kind === 'close' && g.state.texture) this.renderer.deleteTexture(g.state.texture);
+        continue;
+      }
+      keep.push(g);
+      const { rect } = g.surface;
+      const bx = rect.x + rect.width / 2;
+      const by = rect.y + rect.height / 2;
+      const pose = this.evalPose([g.run], now, bx, by);
+      const cx = bx + pose.dx;
+      const cy = by + pose.dy;
+      const z = g.state.lift + pose.dz;
+      const w = rect.width * pose.sx;
+      const h = rect.height * pose.sy;
+      const rot = [pose.rx, pose.ry, pose.rz];
+      const cam = this.windowCamera(cx, cy, z);
+      this.drawPoseAuras(pose, cx, cy, z, w, h, rot, cam.viewProj);
+      this.renderer.drawSurface({
+        model: mat4TRS(cx, cy, z, rot[0], rot[1], rot[2], w, h, 1),
+        viewProj: cam.viewProj, texture: g.state.texture,
+        width: rect.width, height: rect.height, radius: 0,
+        dim: pose.dim, opacity: pose.opacity,
+        rimColor: pose.rim, rimWidth: 2.5,
+      });
+      this.drawPoseLights(pose, now, cx, cy, z, w, h, rot, cam.viewProj);
+    }
+    this.ghosts = keep;
+    return keep.length > 0;
+  }
+
   /**
    * Abject-requested slab transform: tilt/float a window in the scene.
    * Purely visual; picking follows automatically via the model matrix.
@@ -1147,6 +1488,22 @@ export class Compositor {
   setVisible(surfaceId: string, visible: boolean): void {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
+      if (surface.visible !== visible && surface.drawn && this.hasMotion(surface)
+          && !this.isWorkspaceFiltered(surface)) {
+        const state = this.glState(surfaceId);
+        const now = performance.now();
+        const { width, height } = surface.rect;
+        // Hiding plays the minimize transition on a ghost; showing plays the
+        // restore transition (dropping a minimize still in flight).
+        this.ghosts = this.ghosts.filter((g) => !(g.kind === 'minimize' && g.surface === surface));
+        const minimize = this.resolveEffect(this.slabMotionConfig.transitions.minimize);
+        const restore = this.resolveEffect(this.slabMotionConfig.transitions.restore);
+        if (!visible && state.texture && minimize) {
+          this.ghosts.push({ surface, state, run: this.makeRun(minimize, now, width, height), kind: 'minimize' });
+        } else if (visible && restore) {
+          (state.effects ??= []).push(this.makeRun(restore, now, width, height));
+        }
+      }
       surface.visible = visible;
       this.needsRender = true;
     }
@@ -1168,7 +1525,26 @@ export class Compositor {
    * will be hidden from rendering and hit-testing.
    */
   setActiveWorkspace(workspaceId: string | undefined): void {
+    const changed = this.activeWorkspaceId !== workspaceId;
     this.activeWorkspaceId = workspaceId;
+    const enter = changed && workspaceId
+      ? this.resolveEffect(this.slabMotionConfig.transitions.workspaceIn) : undefined;
+    if (enter) {
+      // The incoming workspace's windows play the workspace-in transition
+      // one after another, back to front.
+      const now = performance.now();
+      let i = 0;
+      for (const surface of this.sortedSurfaces) {
+        if (surface.workspaceId !== workspaceId || !surface.visible || !surface.drawn) continue;
+        if (!this.hasMotion(surface)) continue;
+        const state = this.glState(surface.id);
+        state.effects = [
+          ...(state.effects ?? []),
+          this.makeRun(enter, now + i * this.slabMotionConfig.stagger, surface.rect.width, surface.rect.height),
+        ];
+        i++;
+      }
+    }
     this.needsRender = true;
   }
 
@@ -2034,6 +2410,7 @@ export class Compositor {
     this.overlay.draw();
     this.pruneCustomMeshes();
     this.pruneCanvasLayers();
+    this.pruneParticles();
   }
 
   /**
@@ -2066,8 +2443,9 @@ export class Compositor {
   /**
    * Theme-derived chrome values. The design casts hard print shadows: ink
    * under resting windows (lighter, so stacks stay calm) and the palette's
-   * accent under the focused one, which also gets a living-light rim and aura.
-   * Defaults hold until the first scene theme arrives.
+   * accent under the focused one (with its accent title band, that is the
+   * whole focus treatment: no glow). Defaults hold until the first scene
+   * theme arrives.
    */
   private chromeColors(): {
     glow: RGBA; radius: number;
@@ -2093,6 +2471,15 @@ export class Compositor {
 
     const chrome = this.chromeColors();
     let animating = false;
+    const now = performance.now();
+    // Any modal up? Everything else recedes behind it.
+    let anyModal = false;
+    for (const s of this.sortedSurfaces) {
+      if (s.visible && s.drawn && !this.isWorkspaceFiltered(s) && this.surfaceGl.get(s.id)?.modal) {
+        anyModal = true;
+        break;
+      }
+    }
 
     // World-scope nodes behind the windows (desktop décor, roaming pets).
     this.drawWorldNodes('back');
@@ -2103,6 +2490,22 @@ export class Compositor {
 
       const state = this.glState(surface.id);
       const focused = surface.id === this.focusedSurfaceId;
+      // First appearance plays the open transition.
+      if (!state.seen) {
+        state.seen = true;
+        const open = this.hasMotion(surface) ? this.resolveEffect(this.slabMotionConfig.transitions.open) : undefined;
+        if (open && !state.effects?.length) {
+          (state.effects ??= []).push(this.makeRun(open, now, surface.rect.width, surface.rect.height));
+        }
+      }
+      const baseCx = surface.rect.x + surface.rect.width / 2;
+      const baseCy = surface.rect.y + surface.rect.height / 2;
+      const motion = this.evalPose(state.effects ?? [], now, baseCx, baseCy);
+      if (state.effects?.length) {
+        state.effects = state.effects.filter((r) => now - r.start < r.spec.duration);
+      }
+      this.stepRecede(state, anyModal, motion);
+      if (motion.moving) animating = true;
 
       // Ease the focus lift and spring-settle the drag tilt.
       const liftTarget = focused ? Compositor.FOCUS_LIFT : 0;
@@ -2116,11 +2519,17 @@ export class Compositor {
       if (Math.abs(state.tiltX) > 0.0005 || Math.abs(state.tiltY) > 0.0005) animating = true;
       else { state.tiltX = 0; state.tiltY = 0; }
 
-      const { rect } = surface;
-      const cx = rect.x + rect.width / 2;
-      const cy = rect.y + rect.height / 2;
-      const rot = state.userRotation ?? [0, 0, 0];
-      const z = state.lift + (state.userZ ?? 0);
+      const rect = {
+        x: surface.rect.x,
+        y: surface.rect.y,
+        width: surface.rect.width * motion.sx,
+        height: surface.rect.height * motion.sy,
+      };
+      const cx = baseCx + motion.dx;
+      const cy = baseCy + motion.dy;
+      const userRot = state.userRotation ?? [0, 0, 0];
+      const rot: [number, number, number] = [userRot[0] + motion.rx, userRot[1] + motion.ry, userRot[2] + motion.rz];
+      const z = state.lift + (state.userZ ?? 0) + motion.dz;
       const model = mat4TRS(
         cx, cy, z,
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
@@ -2159,45 +2568,29 @@ export class Compositor {
           halfWidth: rect.width / 2, halfHeight: rect.height / 2,
           radius,
           color: focused ? chrome.block.focus : chrome.block.rest,
-          a1: 1, sigma1: 0.4,
+          a1: motion.opacity, sigma1: 0.4,
         });
-        // Eldritch variant: the focused slab also leaks a faint phosphor
-        // light around its edges (print below, something alive within).
-        if (focused) {
-          const pad = 40;
-          const auraModel = mat4TRS(
-            cx, cy, z - 0.5,
-            state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
-            rect.width + pad * 2, rect.height + pad * 2, 1,
-          );
-          this.renderer.drawGlow({
-            model: auraModel, viewProj: cam.viewProj,
-            quadWidth: rect.width + pad * 2, quadHeight: rect.height + pad * 2,
-            halfWidth: rect.width / 2, halfHeight: rect.height / 2,
-            radius,
-            color: chrome.glow,
-            a1: 0.35, sigma1: 7,
-            a2: 0.18, sigma2: 18,
-          });
-        }
       }
+      const tilt = [state.tiltX + rot[0], state.tiltY + rot[1], rot[2]];
+      this.drawPoseAuras(motion, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj);
 
       this.drawSurfaceSlab(surface, state, model, {
         radius,
-        dim: 1,
-        opacity: 1,
-        rim: focused && !surface.transparent
-          ? { ...chrome.glow, a: chrome.glow.a * 0.9 }
-          : undefined,
+        dim: motion.dim,
+        opacity: motion.opacity,
+        // Focus is carried by the accent title band and the accent print
+        // shadow; a rim only shows while an effect asks for one.
+        rim: motion.rim,
         viewProj: cam.viewProj,
       });
+      this.drawPoseLights(motion, now, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj);
 
       // Scene-vocabulary nodes ride the window's UNSCALED frame (the slab
       // model bakes in the window's px size, which would distort meshes).
       const frame = mat4TRS(
         cx, cy, z,
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
-        1, 1, 1,
+        motion.sx, motion.sy, Math.min(motion.sx, motion.sy),
       );
       // The window's subtree is drawn through the same window camera as the
       // slab (see above), so its depth converges into the window rather than
@@ -2227,6 +2620,10 @@ export class Compositor {
       // intra-window stacking between occluded and pop-out content is unchanged.
       this.drawVocabNodes(surface, frame, 'overlay', cam);
     }
+
+    // Closing / minimizing slabs, drawn over the live ones.
+    this.renderer.clearDepth();
+    if (this.drawGhosts(now)) animating = true;
 
     // World-scope nodes above the windows sit over every window's 3D content,
     // so give them a fresh depth range rather than testing against the last
@@ -2728,7 +3125,16 @@ export class Compositor {
       canvasEntries = canvasEntries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
     }
 
-    if (entries.length === 0 && canvasEntries.length === 0) return;
+    // Particle emitters follow the same layer/pass filters.
+    let particleEntries = nodes
+      .filter((n) => n.kind === 'particles')
+      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
+      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
+    if (pass) {
+      particleEntries = particleEntries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
+    }
+
+    if (entries.length === 0 && canvasEntries.length === 0 && particleEntries.length === 0) return;
 
     // Transparent meshes draw last, back-to-front, so they composite correctly.
     // nodeCameraDepth is -(distance^2) — LARGER means NEARER — so back-to-front
@@ -2789,8 +3195,123 @@ export class Compositor {
       }
     }
 
+    // Particles draw last in the pass (glowing light over the solids).
+    for (const p of particleEntries) {
+      if (this.drawParticleNode(key, p.node, p.rp, surfaceModel, cam)) this.needsRender = true;
+    }
+
     if (stencilled) this.renderer.endStencilClip();
     if (scissored) this.renderer.clearScissor();
+  }
+
+  /**
+   * Simulate and draw one particle emitter (kind 'particles'), in the node's
+   * local px space: `rate` particles/s stream continuously, `burst` emits
+   * once on add and again whenever `burstKey` changes. Each particle flies
+   * along `direction` within a `spread` cone at a `speed` in [min, max],
+   * falls with `gravity`, and fades from `color` toward `colorEnd` over its
+   * `lifetime`. Returns true while the emitter still has something to draw.
+   */
+  private drawParticleNode(
+    key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera,
+  ): boolean {
+    const id = `${key}/${node.id}`;
+    this.touchedParticles.add(id);
+    const now = performance.now();
+    let st = this.particleStates.get(id);
+    if (!st) {
+      st = { ps: [], acc: 0, last: now, burstKey: undefined, burstDone: false };
+      this.particleStates.set(id, st);
+    }
+    const dt = Math.min(0.1, Math.max(0, (now - st.last) / 1000));
+    st.last = now;
+
+    const lifetime = ((rp.lifetime as number) ?? 1500) / 1000;
+    const max = Math.min(1000, (rp.maxParticles as number) ?? 300);
+    const [smin, smax] = (rp.speed as [number, number]) ?? [20, 60];
+    const [zmin, zmax] = (rp.size as [number, number]) ?? [2, 4];
+    const spread = (rp.spread as number) ?? Math.PI / 6;
+    const dir = (rp.direction as [number, number, number]) ?? [0, -1, 0];
+    const box = (rp.emitterSize as [number, number, number]) ?? [0, 0, 0];
+    const gravity = (rp.gravity as number) ?? 0;
+    const square = rp.shape === 'square';
+
+    const spawn = (n: number) => {
+      const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+      const d = [dir[0] / len, dir[1] / len, dir[2] / len];
+      // Two axes perpendicular to d for the spread cone.
+      const up = Math.abs(d[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+      const a = [d[1] * up[2] - d[2] * up[1], d[2] * up[0] - d[0] * up[2], d[0] * up[1] - d[1] * up[0]];
+      const al = Math.hypot(a[0], a[1], a[2]) || 1;
+      const u = [a[0] / al, a[1] / al, a[2] / al];
+      const v = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
+      for (let i = 0; i < n && st!.ps.length < max; i++) {
+        const theta = Math.random() * spread;
+        const phi = Math.random() * Math.PI * 2;
+        const st2 = Math.sin(theta), ct = Math.cos(theta);
+        const vx = d[0] * ct + (u[0] * Math.cos(phi) + v[0] * Math.sin(phi)) * st2;
+        const vy = d[1] * ct + (u[1] * Math.cos(phi) + v[1] * Math.sin(phi)) * st2;
+        const vz = d[2] * ct + (u[2] * Math.cos(phi) + v[2] * Math.sin(phi)) * st2;
+        const speed = smin + Math.random() * (smax - smin);
+        st!.ps.push({
+          x: (Math.random() - 0.5) * box[0], y: (Math.random() - 0.5) * box[1], z: (Math.random() - 0.5) * box[2],
+          vx: vx * speed, vy: vy * speed, vz: vz * speed,
+          age: 0, size: zmin + Math.random() * (zmax - zmin),
+        });
+      }
+    };
+
+    const burst = (rp.burst as number) ?? 0;
+    if (burst > 0 && (!st.burstDone || st.burstKey !== rp.burstKey)) {
+      spawn(burst);
+      st.burstDone = true;
+      st.burstKey = rp.burstKey;
+    }
+    const rate = (rp.rate as number) ?? 0;
+    if (rate > 0) {
+      st.acc += rate * dt;
+      const n = Math.floor(st.acc);
+      st.acc -= n;
+      spawn(n);
+    }
+
+    const world = this.sceneStore.worldMatrix(node, surfaceModel);
+    const c0 = parseCssColor(resolveSceneColor((rp.color as string) ?? '$accentSecondary', this.sceneTheme));
+    const c1 = rp.colorEnd ? parseCssColor(resolveSceneColor(rp.colorEnd as string, this.sceneTheme)) : c0;
+    const opacity = (rp.opacity as number) ?? 1;
+    const alive: typeof st.ps = [];
+    for (const p of st.ps) {
+      p.age += dt;
+      if (p.age >= lifetime) continue;
+      p.vy += gravity * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+      alive.push(p);
+      const k = p.age / lifetime;
+      const w = mat4TransformPoint(world, vec3(p.x, p.y, p.z));
+      const q = square ? p.size * 2 + 2 : p.size * 6;
+      this.renderer.drawGlow({
+        model: mat4TRS(w.x, w.y, w.z, 0, 0, square ? p.age * 3 : 0, q, q, 1),
+        viewProj: cam.viewProj,
+        quadWidth: q, quadHeight: q,
+        halfWidth: square ? p.size : 0.5, halfHeight: square ? p.size : 0.5,
+        radius: square ? 0 : 0.5,
+        color: {
+          r: c0.r + (c1.r - c0.r) * k, g: c0.g + (c1.g - c0.g) * k, b: c0.b + (c1.b - c0.b) * k,
+          a: (c0.a + (c1.a - c0.a) * k) * opacity,
+        },
+        a1: 1 - k, sigma1: square ? 0.4 : p.size * 0.9,
+      });
+    }
+    st.ps = alive;
+    return alive.length > 0 || rate > 0;
+  }
+
+  /** Drop simulation state for emitters that were not drawn this frame. */
+  private pruneParticles(): void {
+    for (const id of this.particleStates.keys()) {
+      if (!this.touchedParticles.has(id)) this.particleStates.delete(id);
+    }
+    this.touchedParticles.clear();
   }
 
   /** Draw one resolved mesh entry (shared by the plain and sliced paths). */
@@ -3118,6 +3639,38 @@ export class Compositor {
       if (preset === 'pulse') {
         const k = (p.scale as number) ?? 1.15; const cur = this.vecOf(node, 'scale');
         return [{ ...base, channel: 'scale', from: cur, to: cur.map((v) => v * k), duration: dur, loop: true, yoyo: true, curve: EMPHASIZE }];
+      }
+      if (preset === 'shake') {
+        // A decaying jolt along x (params.axis x|y|z, params.amplitude px).
+        const amp = (p.amplitude as number) ?? 10;
+        const ai = (p.axis as string) === 'y' ? 1 : (p.axis as string) === 'z' ? 2 : 0;
+        const cur = this.vecOf(node, 'position');
+        const at = (k: number) => { const v = [...cur]; v[ai] += amp * k; return v; };
+        return [{
+          ...base, channel: 'position', from: cur, to: cur, duration: (p.duration as number) ?? 450,
+          loop: false, yoyo: false, curve: LINEAR,
+          path: [cur, at(1), at(-0.8), at(0.55), at(-0.3), at(0.12), cur],
+        }];
+      }
+      if (preset === 'flash') {
+        // Emissive up to params.color (default the living light) and back.
+        const cur = this.vecOf(node, 'emissive');
+        const to = this.channelValue('emissive', (p.color as string) ?? '$accentSecondary');
+        const up = Math.round(((p.duration as number) ?? 600) * 0.25);
+        return [
+          { ...base, channel: 'emissive', from: cur, to, duration: up, loop: false, yoyo: false, curve: DECELERATE },
+          { ...base, start: base.start + up, channel: 'emissive', from: to, to: cur, duration: ((p.duration as number) ?? 600) - up, loop: false, yoyo: false, curve: STANDARD },
+        ];
+      }
+      if (preset === 'float') {
+        // A slow drift with a gentle turn: bob plus a small yaw sway.
+        const amp = (p.amplitude as number) ?? 8;
+        const pos = this.vecOf(node, 'position');
+        const rot = this.vecOf(node, 'rotation');
+        return [
+          { ...base, channel: 'position', from: pos, to: [pos[0], pos[1] - amp, pos[2]], duration: dur * 2, loop: true, yoyo: true, curve: STANDARD },
+          { ...base, channel: 'rotation', from: [rot[0], rot[1] - 0.12, rot[2]], to: [rot[0], rot[1] + 0.12, rot[2]], duration: dur * 3.3, loop: true, yoyo: true, curve: STANDARD },
+        ];
       }
       if (preset === 'orbit') {
         const cur = this.vecOf(node, 'position');

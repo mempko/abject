@@ -6,7 +6,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
@@ -40,6 +40,9 @@ const TEXT_EXTS = new Set([
 /** Max characters of a text file rendered in the preview. */
 const MAX_TEXT_CHARS = 200_000;
 
+/** Arrowing through files flashes once, not once per file. */
+const ARRIVAL_FLASH_GAP_MS = 1500;
+
 export class FileViewer extends Abject {
   private fileSystemId?: AbjectId;
   private widgetManagerId?: AbjectId;
@@ -48,6 +51,8 @@ export class FileViewer extends Abject {
   private titleLabelId?: AbjectId;
   private contentScrollId?: AbjectId;
   private contentWidgetIds: AbjectId[] = [];
+  /** When the last arrival flash played. */
+  private lastArrivalFlashAt = 0;
 
   constructor() {
     super({
@@ -191,6 +196,9 @@ export class FileViewer extends Abject {
 
   async openFile(path: string): Promise<boolean> {
     if (!this.fileSystemId) return false;
+    // A fresh window plays its own open transition; an open one flashes
+    // when the new file arrives.
+    const freshWindow = !this.windowId;
     if (!this.windowId) {
       await this.show();
     } else {
@@ -222,9 +230,28 @@ export class FileViewer extends Abject {
       }
     } catch (err) {
       log.warn(`Failed to preview ${path}:`, err instanceof Error ? err.message : String(err));
-      await this.addContentLabel(`Could not open "${name}".`, { color: this.theme.statusError });
+      await this.addContentLabel(
+        emptyStateMarkdown(
+          `Could not open "${name}"`,
+          'It may have been moved or removed. Press Refresh in Files and select it again.',
+        ),
+        { ...emptyStateStyle(this.theme), color: this.theme.statusError },
+        120,
+      );
+      this.playEffect('glitch');
+      return true;
+    }
+    if (!freshWindow && Date.now() - this.lastArrivalFlashAt >= ARRIVAL_FLASH_GAP_MS) {
+      this.lastArrivalFlashAt = Date.now();
+      this.playEffect('flash');
     }
     return true;
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   private async renderImage(path: string, mime: string): Promise<void> {

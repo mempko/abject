@@ -92,3 +92,25 @@ export function eyeSigilOps(prefix: string, at: [number, number, number], size =
 export function removeSigilOps(prefix: string): SceneOp[] {
   return [{ op: 'remove', id: `${prefix}-sigil` }];
 }
+
+/**
+ * A slow living-light stream rising off an eye sigil added with
+ * `eyeSigilOps(prefix, ...)`: a child of the sigil group, so removing the
+ * sigil removes the stream too. Motes drift up and toward the viewer, fading
+ * as they pass the title rule (they draw over the chrome, unclipped). Update
+ * the `${prefix}-stream` node's `params.rate` to start or stop it without
+ * rebuilding the eye (a stream with rate > 0 keeps the desktop redrawing, so
+ * set it to 0 whenever the thing it shows is idle).
+ */
+export function sigilStreamOps(prefix: string, size: number, rate: number): SceneOp[] {
+  return [{
+    op: 'add', id: `${prefix}-stream`, parentId: `${prefix}-sigil`, kind: 'particles',
+    transform: { position: [0, -size * 0.25, 4] },
+    params: {
+      rate, lifetime: 1600, speed: [8, 18], direction: [0, -1, 0.5], spread: 0.55,
+      gravity: -4, size: [1.2, 2.4], color: '$accentSecondary', shape: 'glow',
+      maxParticles: 24, occlude: false,
+    },
+  }];
+}
+

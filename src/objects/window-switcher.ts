@@ -101,7 +101,8 @@ export class WindowSwitcherAbject extends Abject {
 
     await this.refreshEntries();
     if (this.entries.length === 0) {
-      // Nothing to switch to; do nothing rather than open an empty modal.
+      // Nothing to switch to: say so with a toast rather than open an empty modal.
+      await this.notify('No open windows to switch to', 'info', 2000);
       return false;
     }
 
@@ -118,6 +119,10 @@ export class WindowSwitcherAbject extends Abject {
         zIndex: 9001,
       }),
     );
+
+    // The switcher owns the user's attention while it shows: the desktop
+    // recedes behind it. closeSwitcher lifts it on every close path.
+    await this.setModal(this.windowId, true);
 
     await this.request(request(this.id, this.windowId, 'addDependent', {}));
 
@@ -189,6 +194,7 @@ export class WindowSwitcherAbject extends Abject {
     this.hintLabelId = undefined;
     this.headerLabelId = undefined;
     this.entries = [];
+    await this.setModal(wid, false);
     try {
       await this.request(
         request(this.id, this.widgetManagerId, 'destroyWindowAbject', { windowId: wid }),
@@ -197,11 +203,25 @@ export class WindowSwitcherAbject extends Abject {
     return true;
   }
 
+  /** Mark the switcher window modal (the rest of the desktop recedes) or not. */
+  private async setModal(windowId: AbjectId, modal: boolean): Promise<void> {
+    try {
+      await this.setWindowModal(windowId, modal);
+    } catch { /* window gone; closing it clears the flag anyway */ }
+  }
+
   private async activateWindow(entry: OpenWindowEntry): Promise<void> {
+    // Close first so the desktop comes forward, then raise the chosen window
+    // and flash it in the hand's colour: the eye lands where the choice went.
+    await this.closeSwitcher();
     if (this.windowManagerId) {
       this.send(event(this.id, this.windowManagerId, 'raiseWindow', { surfaceId: entry.surfaceId }));
     }
-    await this.closeSwitcher();
+    if (entry.windowId) {
+      try {
+        this.playWindowEffect(entry.windowId, 'flash', '$accent');
+      } catch { /* window gone */ }
+    }
   }
 
   private async refreshEntries(): Promise<void> {

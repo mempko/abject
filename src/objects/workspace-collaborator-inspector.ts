@@ -16,7 +16,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import type { WorkspaceMemberInfo } from './workspace-share-registry.js';
-import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { sectionHeaderStyle, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('WorkspaceCollaboratorInspector');
 
@@ -25,6 +25,9 @@ const WORKSPACE_COLLABORATOR_INSPECTOR_INTERFACE: InterfaceId =
 
 const WIN_W = 880;
 const WIN_H = 560;
+
+/** Scene node id of the working particle stream along the status line. */
+const WORK_STREAM_ID = 'collaborator-inspector-work';
 
 const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
@@ -64,6 +67,8 @@ type LabelSpec = {
   text: string;
   style: Record<string, unknown>;
   height?: number;
+  /** Index of the detail-pane section card this row lives in (none: the pane itself). */
+  group?: number;
 };
 
 type ButtonSpec = {
@@ -73,9 +78,20 @@ type ButtonSpec = {
   text: string;
   style: Record<string, unknown>;
   action: string;
+  /** Index of the detail-pane section card this button lives in. */
+  group?: number;
 };
 
 type DetailSpec = LabelSpec | ButtonSpec;
+
+/** One section card of the detail pane (WidgetManager createSection). */
+interface DetailSection {
+  title: string;
+  description?: string;
+  hintHeight?: number;
+  /** A danger zone: destructive rule and title. */
+  danger?: boolean;
+}
 
 export class WorkspaceCollaboratorInspector extends Abject {
   private widgetManagerId?: AbjectId;
@@ -97,6 +113,8 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
   private detailWidgetIds: AbjectId[] = [];
   private detailButtonIds: Map<AbjectId, string> = new Map();
+  /** Tail of the detail-pane rebuild queue (rebuilds run one at a time). */
+  private detailRebuildChain: Promise<void> = Promise.resolve();
 
   // Cached data
   private workspaces: JoinedWorkspaceInfo[] = [];
@@ -107,6 +125,11 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
   private selectedWorkspaceIndex = -1;
   private selectedMemberIndex = -1;
+
+  /** True once the working stream node is in the window's scene. */
+  private workStreamAdded = false;
+  /** Requests in flight that the working stream expresses (refresh, ping, reconcile). */
+  private workInFlight = 0;
 
   constructor() {
     super({
@@ -315,6 +338,73 @@ export class WorkspaceCollaboratorInspector extends Abject {
     this.detailPaneId = undefined;
     this.detailWidgetIds = [];
     this.detailButtonIds.clear();
+    this.workStreamAdded = false;
+    this.workInFlight = 0;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Feedback: slab effects and the working stream
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Play a slab effect on the inspector window (visual only, fire and forget). */
+  private windowEffect(effect: 'shake' | 'flash'): void {
+    if (!this.windowId) return;
+    this.request(request(this.id, this.windowId, 'effect', { effect }))
+      .catch(() => { /* effects are decoration */ });
+  }
+
+  /** Say what failed on the status line and shake. */
+  private async reportFailure(text: string): Promise<void> {
+    this.windowEffect('shake');
+    if (!this.statusLabelId) return;
+    try {
+      await this.request(request(this.id, this.statusLabelId, 'update', {
+        text, style: { color: this.theme.statusError, fontSize: 11 },
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  /**
+   * Run `work` with a gentle living-light stream rising off the status line,
+   * so a network round-trip reads as alive. The stream flows only while some
+   * work is in flight; `rate: 0` lets its last particles fade.
+   */
+  private async whileWorking<T>(work: () => Promise<T>): Promise<T> {
+    this.workInFlight++;
+    if (this.workInFlight === 1) await this.setWorkStream(true);
+    try {
+      return await work();
+    } finally {
+      this.workInFlight = Math.max(0, this.workInFlight - 1);
+      if (this.workInFlight === 0) await this.setWorkStream(false);
+    }
+  }
+
+  private async setWorkStream(on: boolean): Promise<void> {
+    if (!this.windowId) return;
+    try {
+      if (on) {
+        const rect = await this.request<{ width: number; height: number }>(
+          request(this.id, this.windowId, 'getRect', {})
+        );
+        // Status line: the root VBox's last row (16px tall, 8px bottom margin).
+        const position: [number, number, number] = [0, rect.height / 2 - 16, 6];
+        const params = {
+          rate: 16, lifetime: 1300, speed: [10, 28], direction: [0, -1, 0.25], spread: 0.5,
+          gravity: -8, size: [1.5, 3], color: '$accentSecondary', shape: 'glow',
+          emitterSize: [Math.max(40, rect.width - 40), 2, 0], maxParticles: 60,
+        };
+        const op = this.workStreamAdded
+          ? { op: 'update', id: WORK_STREAM_ID, transform: { position }, params }
+          : { op: 'add', id: WORK_STREAM_ID, kind: 'particles', transform: { position }, params };
+        await this.request(request(this.id, this.windowId, 'scene', { ops: [op] }));
+        this.workStreamAdded = true;
+      } else if (this.workStreamAdded) {
+        await this.request(request(this.id, this.windowId, 'scene', {
+          ops: [{ op: 'update', id: WORK_STREAM_ID, params: { rate: 0 } }],
+        }));
+      }
+    } catch { /* scene is decoration */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -541,7 +631,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
     if (!this.windowId) return;
 
     if (from === this.refreshBtnId && this.isClick(aspect)) {
-      await this.refresh();
+      await this.whileWorking(() => this.refresh());
       return;
     }
 
@@ -569,11 +659,20 @@ export class WorkspaceCollaboratorInspector extends Abject {
   private async handleDetailAction(action: string): Promise<void> {
     const ws = this.selectedWorkspace();
     if (!ws || !this.shareRegistryId) return;
+    const shareRegistryId = this.shareRegistryId;
+    const label = ws.name && ws.name !== ws.workspaceId ? ws.name : ws.workspaceId;
 
     try {
       if (action === 'leave') {
+        const confirmed = await this.confirm({
+          title: 'Leave workspace',
+          message: `Leave "${label}"? It stays with its owner; you can join again with an invite link.`,
+          confirmLabel: 'Leave',
+          destructive: true,
+        });
+        if (!confirmed) return;
         await this.request(
-          request(this.id, this.shareRegistryId, 'leaveWorkspace', {
+          request(this.id, shareRegistryId, 'leaveWorkspace', {
             workspaceId: ws.workspaceId,
             peerId: ws.ownerPeerId,
           })
@@ -584,25 +683,33 @@ export class WorkspaceCollaboratorInspector extends Abject {
       }
 
       if (action === 'reconcile') {
-        await this.request(
-          request(this.id, this.shareRegistryId, 'reconcileCatalog', {
-            workspaceId: ws.workspaceId,
-            peerId: ws.ownerPeerId,
-          })
-        );
-        await this.loadSelectedWorkspace();
+        await this.whileWorking(async () => {
+          await this.request(
+            request(this.id, shareRegistryId, 'reconcileCatalog', {
+              workspaceId: ws.workspaceId,
+              peerId: ws.ownerPeerId,
+            })
+          );
+          await this.loadSelectedWorkspace();
+        });
+        // The catalog is current again.
+        this.windowEffect('flash');
         return;
       }
 
       if (action === 'ping') {
-        await this.fetchPresence();
-        await this.measureAllLatencies();
-        await this.rebuildMemberList();
-        await this.rebuildDetailPane();
-        await this.updateStatus();
+        await this.whileWorking(async () => {
+          await this.fetchPresence();
+          await this.measureAllLatencies();
+          await this.rebuildMemberList();
+          await this.rebuildDetailPane();
+          await this.updateStatus();
+        });
       }
     } catch (err) {
       log.warn('Detail action failed:', err);
+      const verb = action === 'leave' ? 'leave' : action === 'reconcile' ? 'reconcile the catalog of' : 'ping';
+      await this.reportFailure(`Could not ${verb} ${label}. The owner may be offline.`);
     }
   }
 
@@ -810,13 +917,27 @@ export class WorkspaceCollaboratorInspector extends Abject {
         ? 'No shared or joined workspaces.'
         : `${this.workspaces.length} workspace(s) \u2022 ${this.members.length} member(s), ${online} online \u2022 ${this.catalogItems.length} catalog item(s) \u2022 ${this.backlogGoals.length} shared goal(s)`;
     try {
-      await this.request(request(this.id, this.statusLabelId, 'update', { text }));
+      // Restore the meta colour (a reported failure may have tinted the line).
+      await this.request(request(this.id, this.statusLabelId, 'update', {
+        text, style: { color: this.theme.textMeta, fontSize: 11 },
+      }));
     } catch {
       /* widget gone */
     }
   }
 
-  private async rebuildDetailPane(): Promise<void> {
+  /**
+   * Rebuild the detail pane, one rebuild at a time. Handlers interleave, and
+   * a rebuild lays its cards out over several round-trips, so a second
+   * rebuild waits for the first rather than clearing the pane mid-layout.
+   */
+  private rebuildDetailPane(): Promise<void> {
+    const run = this.detailRebuildChain.then(() => this.rebuildDetailPaneNow());
+    this.detailRebuildChain = run.catch(() => { /* the next rebuild starts clean */ });
+    return run;
+  }
+
+  private async rebuildDetailPaneNow(): Promise<void> {
     if (!this.detailPaneId || !this.windowId) return;
 
     for (const wid of this.detailWidgetIds) {
@@ -837,22 +958,21 @@ export class WorkspaceCollaboratorInspector extends Abject {
     const windowId = this.windowId;
     const specs: DetailSpec[] = [];
 
-    // Section headers carry the kit mark; `title` is user text (a workspace name) and keeps its case.
-    const heading = (text: string): void => {
-      specs.push({
-        type: 'label',
-        windowId,
-        rect: r0,
-        text: sectionHeaderText(this.theme, text),
-        style: { ...sectionHeaderStyle(this.theme) },
-        height: 22,
-      });
+    // Section cards group the pane (like the settings windows): `section`
+    // opens a card and every row pushed after it lands inside, until the next
+    // one. The card carries the kit header; `title` is user text (a workspace
+    // name), sits above the cards and keeps its case.
+    const sections: DetailSection[] = [];
+    let group: number | undefined;
+    const section = (text: string, description?: string, hintHeight?: number, danger = false): void => {
+      sections.push({ title: text, description, hintHeight, danger });
+      group = sections.length - 1;
     };
     const title = (text: string): void => {
-      specs.push({ type: 'label', windowId, rect: r0, text, style: { ...sectionHeaderStyle(this.theme, 14) }, height: 22 });
+      specs.push({ type: 'label', windowId, rect: r0, text, style: { ...sectionHeaderStyle(this.theme, 14) }, height: 22, group });
     };
     const empty = (text: string): void => {
-      specs.push({ type: 'label', windowId, rect: r0, text, style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
+      specs.push({ type: 'label', windowId, rect: r0, text, style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true }, group });
     };
     const line = (text: string): void => {
       specs.push({
@@ -861,6 +981,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
         rect: r0,
         text,
         style: { color: this.theme.textDescription, fontSize: 11, wordWrap: true },
+        group,
       });
     };
 
@@ -879,6 +1000,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
       });
     } else {
       title(ws.name && ws.name !== ws.workspaceId ? ws.name : ws.workspaceId);
+      section('Workspace');
       line(`Workspace ID: ${ws.workspaceId}`);
       line(ws.ownerPeerId ? `Owner peer: ${ws.ownerPeerId}` : 'Owner: this peer (hosted locally)');
       if (ws.registryId) line(`Registry: ${ws.registryId}`);
@@ -890,7 +1012,8 @@ export class WorkspaceCollaboratorInspector extends Abject {
           ? this.members[this.selectedMemberIndex]
           : undefined;
 
-      heading('Members');
+      // Members, with their primary action: ping them for presence and latency.
+      section('Members');
       if (this.members.length === 0) {
         empty('No active members yet. Peers who join this workspace appear here.');
       } else {
@@ -900,9 +1023,18 @@ export class WorkspaceCollaboratorInspector extends Abject {
           line(`${m.peerName || m.peerId} \u2014 ${presence}, ${lat}`);
         }
       }
+      specs.push({
+        type: 'button',
+        windowId,
+        rect: r0,
+        text: 'Ping members',
+        style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
+        action: 'ping',
+        group,
+      });
 
       if (member) {
-        heading('Selected member');
+        section('Selected member');
         line(`Peer ID: ${member.peerId}`);
         line(`Presence: ${member.online ? 'online' : 'offline'}`);
         line(
@@ -913,7 +1045,8 @@ export class WorkspaceCollaboratorInspector extends Abject {
         if (member.joinedAt) line(`Joined: ${new Date(member.joinedAt).toLocaleString()}`);
       }
 
-      heading(`Catalog (${this.catalogItems.length})`);
+      // Catalog, with its primary action: pull the latest from the owner.
+      section(`Catalog (${this.catalogItems.length})`);
       if (this.catalogItems.length === 0) {
         empty('No catalog items visible yet. Reconcile the catalog to pull the latest.');
       } else {
@@ -923,8 +1056,17 @@ export class WorkspaceCollaboratorInspector extends Abject {
           line(desc ? `${name} \u2014 ${desc}` : name);
         }
       }
+      specs.push({
+        type: 'button',
+        windowId,
+        rect: r0,
+        text: 'Reconcile catalog',
+        style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
+        action: 'reconcile',
+        group,
+      });
 
-      heading(`Shared goals backlog (${this.backlogGoals.length})`);
+      section(`Shared goals backlog (${this.backlogGoals.length})`);
       if (this.backlogGoals.length === 0) {
         empty('No active shared goals.');
       } else {
@@ -933,23 +1075,9 @@ export class WorkspaceCollaboratorInspector extends Abject {
         }
       }
 
-      specs.push({
-        type: 'button',
-        windowId,
-        rect: r0,
-        text: 'Ping members',
-        style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
-        action: 'ping',
-      });
-      specs.push({
-        type: 'button',
-        windowId,
-        rect: r0,
-        text: 'Reconcile catalog',
-        style: { fontSize: 12 },
-        action: 'reconcile',
-      });
+      // Leaving is destructive, so it closes the pane in its own card.
       if (ws.ownerPeerId) {
+        section('Danger zone', 'Leave this workspace. It stays with its owner; you can join again with an invite link.', 34, true);
         specs.push({
           type: 'button',
           windowId,
@@ -957,6 +1085,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
           text: 'Leave workspace',
           style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder },
           action: 'leave',
+          group,
         });
       }
     }
@@ -973,11 +1102,29 @@ export class WorkspaceCollaboratorInspector extends Abject {
       request(this.id, this.widgetManagerId!, 'create', { specs: createSpecs })
     );
 
-    const children: Record<string, unknown>[] = [];
+    // Lay the rows out in order. A run of rows sharing a group goes into that
+    // group's card, created (and appended to the pane) when its first row
+    // comes up, so cards and loose rows keep the order they were pushed in.
+    const paneId = this.detailPaneId;
+    let target: AbjectId = paneId;
+    let targetGroup: number | undefined;
+    let children: Record<string, unknown>[] = [];
+    const flush = async (): Promise<void> => {
+      if (children.length === 0) return;
+      await this.request(request(this.id, target, 'addLayoutChildren', { children }));
+      children = [];
+    };
     for (let i = 0; i < specs.length; i++) {
       const spec = specs[i];
       const wid = widgetIds[i];
       if (!wid) continue;
+      if (spec.group !== targetGroup) {
+        await flush();
+        targetGroup = spec.group;
+        target = spec.group === undefined
+          ? paneId
+          : await this.createDetailSection(paneId, windowId, sections[spec.group]);
+      }
       if (spec.type === 'button') {
         this.detailButtonIds.set(wid, spec.action);
         this.send(request(this.id, wid, 'addDependent', {}));
@@ -995,12 +1142,37 @@ export class WorkspaceCollaboratorInspector extends Abject {
         });
       }
     }
+    await flush();
+  }
 
-    if (children.length > 0) {
-      await this.request(
-        request(this.id, this.detailPaneId, 'addLayoutChildren', { children })
-      );
+  /**
+   * Create one detail-pane section card (WidgetManager createSection) at the
+   * end of the pane and return its layout id, where its rows go. The card is
+   * tracked with the detail widgets, so a rebuild destroys it (and, with it,
+   * its title and hint).
+   */
+  private async createDetailSection(
+    paneId: AbjectId,
+    windowId: AbjectId,
+    s: DetailSection,
+  ): Promise<AbjectId> {
+    const { sectionId, titleId } = await this.request<{ sectionId: AbjectId; titleId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: paneId,
+        windowId,
+        title: s.title,
+        ...(s.description ? { description: s.description, hintHeight: s.hintHeight ?? 18 } : {}),
+      })
+    );
+    this.detailWidgetIds.push(sectionId);
+    if (s.danger) {
+      // Destructive rule and title (theme slots, so they re-skin).
+      try {
+        await this.request(request(this.id, sectionId, 'update', { style: { borderColor: this.theme.destructiveBorder } }));
+        await this.request(request(this.id, titleId, 'update', { style: { color: this.theme.statusError } }));
+      } catch { /* decoration only */ }
     }
+    return sectionId;
   }
 }
 

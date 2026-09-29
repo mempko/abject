@@ -34,6 +34,8 @@ const TAB_LABELS = ['Agents', 'Watchers', 'Sessions'];
 /** Scene node prefix for the "an agent is at work" eye sigil. */
 const SIGIL_PREFIX = 'agent-browser-working';
 const SIGIL_SIZE = 26;
+/** Minimum gap between trigger-failure glitches, so a failing loop reads as one signal. */
+const TRIGGER_GLITCH_GAP_MS = 3000;
 
 /** Per-tab empty states: [list empty, nothing selected]. */
 const TAB_EMPTY: Array<[string, string, string, string]> = [
@@ -112,6 +114,8 @@ export class AgentBrowser extends Abject {
   private sessionStoreId?: AbjectId;
   private watches: WatchInfo[] = [];
   private selectedIndex = -1;
+  /** When the last trigger-failure glitch played. */
+  private lastTriggerGlitchAt = 0;
 
   constructor() {
     super({
@@ -562,12 +566,32 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     return [width / 2 - 12 - SIGIL_SIZE / 2 - 4, -height / 2 + 36 + 12 + 16, 8];
   }
 
+  /**
+   * The working sigil plus a gentle thinking stream rising from its pupil.
+   * The emitter is a child of the sigil group, so it lives and dies with the
+   * sigil: it streams only while an agent is at work.
+   */
+  private workingSigilOps(): Array<Record<string, unknown>> {
+    return [
+      ...eyeSigilOps(SIGIL_PREFIX, this.sigilAnchor(), SIGIL_SIZE),
+      {
+        op: 'add', id: `${SIGIL_PREFIX}-thought`, parentId: `${SIGIL_PREFIX}-sigil`, kind: 'particles',
+        transform: { position: [0, -SIGIL_SIZE * 0.2, 4] },
+        params: {
+          rate: 9, lifetime: 1300, speed: [10, 26], direction: [0, -1, 0.2], spread: 0.55,
+          gravity: -6, size: [1.2, 2.4], color: '$accentSecondary', shape: 'glow',
+          emitterSize: [SIGIL_SIZE * 0.2, 2, 0], maxParticles: 40,
+        },
+      },
+    ];
+  }
+
   private async updateSigil(): Promise<void> {
     if (!this.windowId) return;
     const want = this.anyAgentWorking();
     if (want === this.sigilShown) return;
     this.sigilShown = want;
-    const ops = want ? eyeSigilOps(SIGIL_PREFIX, this.sigilAnchor(), SIGIL_SIZE) : removeSigilOps(SIGIL_PREFIX);
+    const ops = want ? this.workingSigilOps() : removeSigilOps(SIGIL_PREFIX);
     try {
       await this.request(request(this.id, this.windowId, 'scene', { ops }));
     } catch (err) {
@@ -582,9 +606,15 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     if (prev && prev.width === width && prev.height === height) return;
     try {
       await this.request(request(this.id, this.windowId, 'scene', {
-        ops: [...removeSigilOps(SIGIL_PREFIX), ...eyeSigilOps(SIGIL_PREFIX, this.sigilAnchor(), SIGIL_SIZE)],
+        ops: [...removeSigilOps(SIGIL_PREFIX), ...this.workingSigilOps()],
       }));
     } catch { /* window may be gone */ }
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   private async loadSessions(): Promise<void> {
@@ -852,6 +882,12 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
 
     // TriggerManager events -- refresh the watchers tab on rule activity
     if (fromId === this.triggerManagerId) {
+      // A failing watcher is an error the Watchers tab exists to surface.
+      if (aspect === 'triggerFailed' && this.activeTab === 1
+          && Date.now() - this.lastTriggerGlitchAt >= TRIGGER_GLITCH_GAP_MS) {
+        this.lastTriggerGlitchAt = Date.now();
+        this.playEffect('glitch');
+      }
       if (aspect === 'triggerFired' || aspect === 'triggerFailed'
           || aspect === 'triggerAdded' || aspect === 'triggerRemoved'
           || aspect === 'triggerUpdated') {
@@ -900,7 +936,8 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         if (s.status === 'running') await this.request(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: s.attempt === 1 ? s.id : `${s.id}:attempt-${s.attempt}` }));
         else await this.request(request(this.id, this.agentAbjectId, 'resumeTask', { id: s.id, expectedRevision: s.revision }));
         await this.loadSessions(); await this.rebuildList();
-      } catch (err) { await this.notify(String(err), 'error'); }
+        this.playEffect('flash', '$accent');
+      } catch (err) { this.playEffect('shake'); await this.notify(String(err), 'error'); }
       return;
     }
     if (this.selectedIndex < 0) return;
@@ -924,9 +961,11 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
           watch.enabled = !watch.enabled;
           await this.rebuildList();
           await this.showDetailForSelection();
+          this.playEffect('flash', '$accent');
           await this.notify(`${watch.kind === 'trigger' ? 'Trigger' : 'Watch'} ${watch.enabled ? 'enabled' : 'disabled'}`, 'success');
         } catch (err) {
           log.warn('Failed to toggle watch:', err);
+          this.playEffect('shake');
           await this.notify('Toggle failed', 'error');
         } finally {
           if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: false }));
@@ -940,8 +979,17 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     if (this.activeTab === 2 && this.agentAbjectId) {
       const s = this.sessions[this.selectedIndex];
       if (!s) return;
-      await this.request(request(this.id, this.agentAbjectId, 'forkTask', { id: s.id, newId: `${s.id}:fork-${Date.now()}` }));
-      await this.loadSessions(); await this.rebuildList();
+      try {
+        await this.request(request(this.id, this.agentAbjectId, 'forkTask', { id: s.id, newId: `${s.id}:fork-${Date.now()}` }));
+        await this.loadSessions(); await this.rebuildList();
+        this.playEffect('flash');
+        await this.notify('Forked a fresh attempt', 'success');
+      } catch (err) {
+        log.warn('Failed to fork session:', err);
+        this.playEffect('shake');
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.notify(`Fork failed: ${msg.slice(0, 80)}`, 'error');
+      }
       return;
     }
     if (this.selectedIndex < 0) return;
@@ -949,7 +997,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     // Watchers tab: TriggerManager rules can be removed directly.
     if (this.activeTab === 1) {
       const watch = this.watches[this.selectedIndex];
-      if (!watch || watch.kind !== 'trigger') return;
+      if (!watch) return;
+      if (watch.kind !== 'trigger') {
+        // A legacy watch belongs to its watcher object, which removes it.
+        this.playEffect('shake');
+        await this.notify(`This watch belongs to ${watch.watcherName}. Press Edit to open it and remove the watch there.`, 'info');
+        return;
+      }
       const confirmed = await this.confirm({
         title: 'Delete Trigger',
         message: `Delete trigger rule "${watch.taskDescription}"? This cannot be undone.`,
@@ -969,6 +1023,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         await this.notify('Trigger deleted', 'success');
       } catch (err) {
         log.warn('Failed to delete trigger:', err);
+        this.playEffect('shake');
         await this.notify('Delete failed', 'error');
       }
       return;
@@ -991,6 +1046,8 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
 
     if (!isUserCreated) {
       log.info(`Cannot delete system agent "${agent.name}"`);
+      this.playEffect('shake');
+      await this.notify(`"${agent.name}" is a system agent. Only agents you created can be deleted.`, 'info');
       return;
     }
 
@@ -1036,6 +1093,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       await this.notify(`Agent "${agent.name}" deleted`, 'success');
     } catch (err) {
       log.warn('Failed to delete agent:', err);
+      this.playEffect('shake');
       const msg = err instanceof Error ? err.message : String(err);
       await this.notify(`Delete failed: ${msg.slice(0, 80)}`, 'error');
     }

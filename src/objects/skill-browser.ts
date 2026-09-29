@@ -11,7 +11,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { SkillInfo, SkillConfig } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
-import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('SkillBrowser');
 
@@ -42,6 +42,10 @@ export class SkillBrowser extends Abject {
   private customEnvRows: Array<{ nameId: AbjectId; valueId: AbjectId }> = [];
   private addVarBtnId?: AbjectId;
   private saveConfigBtnId?: AbjectId;
+  /** Grouped cards in the detail pane (destroying one takes its rows with it). */
+  private detailSectionIds: AbjectId[] = [];
+  /** The Configuration card's variable list, where Add Variable appends its rows. */
+  private envListId?: AbjectId;
 
   // State
   private allSkills: SkillInfo[] = [];
@@ -159,6 +163,9 @@ pane shows details, configuration, and actions for the selected skill.
       // SkillRegistry changed
       if (fromId === this.skillRegistryId) {
         await this.refreshSkillList();
+        // A new skill landed on disk: celebrate its arrival once.
+        const reason = (value as { reason?: string } | undefined)?.reason;
+        if (aspect === 'skillsChanged' && reason === 'installed') this.windowEffect('burst');
         return;
       }
 
@@ -193,7 +200,16 @@ pane shows details, configuration, and actions for the selected skill.
 
       // Save Config button
       if (fromId === this.saveConfigBtnId && aspect === 'click') {
-        await this.saveSkillConfig();
+        try {
+          await this.saveSkillConfig();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`Saving skill config failed: ${msg}`);
+          this.windowEffect('shake');
+          await this.notify(`Could not save config: ${msg.slice(0, 80)}`, 'error');
+          return;
+        }
+        this.windowEffect('flash', '$accent');
         // Flash button text as confirmation
         await this.request(request(this.id, this.saveConfigBtnId, 'update', { text: 'Saved!' }));
         this.setTimer(() => {
@@ -208,12 +224,28 @@ pane shows details, configuration, and actions for the selected skill.
       const action = this.detailButtonIds.get(fromId);
       if (action && aspect === 'click' && this.skillRegistryId && this.selectedIndex >= 0) {
         const skill = this.allSkills[this.selectedIndex];
-        if (action === 'enable') {
-          await this.request(request(this.id, this.skillRegistryId, 'enableSkill', { name: skill.name }));
-        } else if (action === 'disable') {
-          await this.request(request(this.id, this.skillRegistryId, 'disableSkill', { name: skill.name }));
-        } else if (action === 'uninstall') {
-          await this.request(request(this.id, this.skillRegistryId, 'uninstallSkill', { name: skill.name }));
+        try {
+          if (action === 'enable') {
+            const result = await this.request<{ mcpStatus?: string; error?: string } | undefined>(
+              request(this.id, this.skillRegistryId, 'enableSkill', { name: skill.name }));
+            if (result?.mcpStatus === 'error') {
+              // Enabled, but its MCP server did not start: that is a failure to see.
+              this.windowEffect('shake');
+              await this.notify(`${skill.name} is enabled but its server failed: ${(result.error ?? 'unknown error').slice(0, 80)}`, 'error');
+            } else {
+              // The skill is live now: flash in the living light.
+              this.windowEffect('flash');
+            }
+          } else if (action === 'disable') {
+            await this.request(request(this.id, this.skillRegistryId, 'disableSkill', { name: skill.name }));
+          } else if (action === 'uninstall') {
+            await this.request(request(this.id, this.skillRegistryId, 'uninstallSkill', { name: skill.name }));
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`Skill ${action} failed for ${skill.name}: ${msg}`);
+          this.windowEffect('shake');
+          await this.notify(`Could not ${action} ${skill.name}: ${msg.slice(0, 80)}`, 'error');
         }
         await this.refreshSkillList();
       }
@@ -308,6 +340,17 @@ pane shows details, configuration, and actions for the selected skill.
     this.scanButtonId = undefined;
     this.detailLabelIds = [];
     this.detailButtonIds.clear();
+    this.detailSectionIds = [];
+    this.envListId = undefined;
+  }
+
+  /**
+   * Play a one-shot slab effect on the window (visual only). Fire and forget:
+   * a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   // ─── Data ───────────────────────────────────────────────────────
@@ -384,15 +427,40 @@ pane shows details, configuration, and actions for the selected skill.
     if (this.saveConfigBtnId) {
       this.send(request(this.id, this.saveConfigBtnId, 'destroy', {}));
     }
+    // Cards last: each takes any nested rows (the variable list, button rows) with it.
+    for (const id of this.detailSectionIds) {
+      this.send(request(this.id, id, 'destroy', {}));
+    }
     this.detailLabelIds = [];
     this.detailButtonIds.clear();
     this.configInputIds.clear();
     this.customEnvRows = [];
     this.addVarBtnId = undefined;
     this.saveConfigBtnId = undefined;
+    this.detailSectionIds = [];
+    this.envListId = undefined;
   }
 
-  private async addDetailLabel(text: string, secondary = false, style?: Record<string, unknown>): Promise<AbjectId> {
+  /**
+   * A grouped card in the detail pane (WidgetManager createSection: ruled
+   * panel, sigil title, optional hint). Returns the card's layout id: add the
+   * section's rows to it. Inside the scrollable pane the card sizes to its
+   * content.
+   */
+  private async addSection(title: string, description?: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: this.detailPaneId!,
+        windowId: this.windowId,
+        title,
+        ...(description ? { description, hintHeight } : {}),
+      }),
+    );
+    this.detailSectionIds.push(sectionId);
+    return sectionId;
+  }
+
+  private async addDetailLabel(text: string, secondary = false, style?: Record<string, unknown>, parentId?: AbjectId): Promise<AbjectId> {
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         {
@@ -410,7 +478,7 @@ pane shows details, configuration, and actions for the selected skill.
     );
     const lines = Math.max(1, Math.ceil(text.length / 45));
     const lineHeight = secondary ? 16 : 18;
-    await this.addToLayout(this.detailPaneId!, labelId, { vertical: 'fixed' },
+    await this.addToLayout(parentId ?? this.detailPaneId!, labelId, { vertical: 'fixed' },
       { height: Math.max(lineHeight, lines * lineHeight) });
     this.detailLabelIds.push(labelId);
     return labelId;
@@ -428,7 +496,7 @@ pane shows details, configuration, and actions for the selected skill.
     return labelId;
   }
 
-  private async addDetailButton(text: string, actionKey: string, style?: Record<string, unknown>): Promise<AbjectId> {
+  private async addDetailButton(text: string, actionKey: string, style?: Record<string, unknown>, parentId?: AbjectId): Promise<AbjectId> {
     const { widgetIds: [btnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         {
@@ -444,7 +512,7 @@ pane shows details, configuration, and actions for the selected skill.
       ]}),
     );
     await this.addDep(btnId);
-    await this.addToLayout(this.detailPaneId!, btnId, { vertical: 'fixed', horizontal: 'fixed' },
+    await this.addToLayout(parentId ?? this.detailPaneId!, btnId, { vertical: 'fixed', horizontal: 'fixed' },
       { width: 120, height: 28 });
     this.detailButtonIds.set(btnId, actionKey);
     return btnId;
@@ -460,24 +528,24 @@ pane shows details, configuration, and actions for the selected skill.
         'No skills installed',
         'Skills teach agents new abilities. Add one by hand as shown below, or install from the catalog.',
       ));
-      await this.addDetailLabel(sectionHeaderText(this.theme, 'Add a skill by hand'), false, { ...sectionHeaderStyle(this.theme, 12) });
+      const byHand = await this.addSection('Add a skill by hand');
       await this.addDetailLabel(
         'To install a skill, create a subdirectory with a SKILL.md file ' +
         'inside the skills/ folder of your data directory ' +
         '(e.g. .abjects/skills/my-skill/SKILL.md).',
-        true, { color: this.theme.textSecondary },
+        true, { color: this.theme.textSecondary }, byHand,
       );
-      await this.addDetailLabel('');
-      await this.addDetailLabel('SKILL.md uses YAML frontmatter:', true, { color: this.theme.textSecondary });
+      await this.addDetailLabel('', false, undefined, byHand);
+      await this.addDetailLabel('SKILL.md uses YAML frontmatter:', true, { color: this.theme.textSecondary }, byHand);
       await this.addDetailLabel(
         '---\nname: my-skill\ndescription: What this skill does\n---\nInstructions for the agent...',
-        true, { fontFamily: 'mono', fontSize: 11 },
+        true, { fontFamily: 'mono', fontSize: 11 }, byHand,
       );
-      await this.addDetailLabel('');
+      await this.addDetailLabel('', false, undefined, byHand);
       await this.addDetailLabel(
         'Compatible with Claude Code and OpenClaw SKILL.md formats. ' +
         'Click "Scan Skills" after adding files.',
-        true, { color: this.theme.textSecondary },
+        true, { color: this.theme.textSecondary }, byHand,
       );
       return;
     }
@@ -495,23 +563,30 @@ pane shows details, configuration, and actions for the selected skill.
     const skill = this.allSkills[this.selectedIndex];
 
     await this.addDetailLabel(skill.name, false, { fontSize: 15, fontWeight: 'bold', color: this.theme.textHeading });
-    await this.addDetailLabel(sectionHeaderText(this.theme, 'Details'), false, { ...sectionHeaderStyle(this.theme, 12) });
-    await this.addDetailLabel(`Source: ${skill.source}`, true);
-    if (skill.version) await this.addDetailLabel(`Version: ${skill.version}`, true);
-    await this.addDetailLabel(skill.description || '(no description)', true);
-    if (skill.allowedTools?.length) await this.addDetailLabel(`Tools: ${skill.allowedTools.join(', ')}`, true);
-    if (skill.requiredBins?.length) await this.addDetailLabel(`Requires: ${skill.requiredBins.join(', ')}`, true);
+
+    // ── About: what the skill is and whether it is running, with the toggle
+    // that changes that (enabling is this card's primary step).
+    const about = await this.addSection('About');
+    await this.addDetailLabel(`Source: ${skill.source}`, true, undefined, about);
+    if (skill.version) await this.addDetailLabel(`Version: ${skill.version}`, true, undefined, about);
+    await this.addDetailLabel(skill.description || '(no description)', true, undefined, about);
+    if (skill.allowedTools?.length) await this.addDetailLabel(`Tools: ${skill.allowedTools.join(', ')}`, true, undefined, about);
+    if (skill.requiredBins?.length) await this.addDetailLabel(`Requires: ${skill.requiredBins.join(', ')}`, true, undefined, about);
     if (skill.mcpStatus === 'error') {
-      await this.addDetailLabel(`Status: Error`, true, { color: this.theme.statusErrorBright });
+      await this.addDetailLabel(`Status: Error`, true, { color: this.theme.statusErrorBright }, about);
     } else {
       await this.addDetailLabel(`Status: ${skill.enabled ? 'Enabled' : 'Disabled'}`, true,
-        { color: skill.enabled ? this.theme.statusSuccess : this.theme.textMeta });
+        { color: skill.enabled ? this.theme.statusSuccess : this.theme.textMeta }, about);
     }
-    if (skill.error) await this.addDetailLabel(`Error: ${skill.error}`, true, { color: this.theme.statusErrorBright });
-    if (skill.configFile) await this.addDetailLabel(`Config file: ${skill.configFile}`, true);
+    if (skill.error) await this.addDetailLabel(`Error: ${skill.error}`, true, { color: this.theme.statusErrorBright }, about);
+    if (skill.configFile) await this.addDetailLabel(`Config file: ${skill.configFile}`, true, undefined, about);
+    const toggleLabel = skill.enabled ? 'Disable' : 'Enable';
+    // Enabling is the primary step; disabling is an ordinary secondary action.
+    await this.addDetailButton(toggleLabel, skill.enabled ? 'disable' : 'enable', skill.enabled ? {} : undefined, about);
 
-    // ── Configuration section (always shown) ──
-    await this.addDetailLabel(sectionHeaderText(this.theme, 'Configuration'), false, { ...sectionHeaderStyle(this.theme, 12) });
+    // ── Configuration: environment variables and credentials (always shown) ──
+    const config = await this.addSection('Configuration',
+      'Variables and credentials this skill runs with. Save Config applies them.', 34);
 
     // Load current config from SkillRegistry
     let currentConfig: SkillConfig = { env: {} };
@@ -529,9 +604,19 @@ pane shows details, configuration, and actions for the selected skill.
       for (const k of Object.keys(currentConfig.env)) envVarNames.add(k);
     }
 
+    // The variables sit in their own list inside the card, so rows that Add
+    // Variable appends land above the card's buttons.
+    const envListId = await this.wm('createNestedVBox', {
+      parentLayoutId: config,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 4,
+      autoSize: true,
+    }) as AbjectId;
+    this.envListId = envListId;
+
     // Create label + masked text input for each known env var
     for (const envName of envVarNames) {
-      await this.addDetailLabel(envName, true);
+      await this.addDetailLabel(envName, true, undefined, envListId);
       const savedValue = currentConfig.env?.[envName] ?? '';
       const { widgetIds: [inputId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -539,22 +624,29 @@ pane shows details, configuration, and actions for the selected skill.
         ]}),
       );
       await this.addDep(inputId);
-      await this.addToLayout(this.detailPaneId!, inputId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
+      await this.addToLayout(envListId, inputId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
       this.configInputIds.set(inputId, envName);
     }
 
     if (envVarNames.size === 0) {
-      await this.addDetailLabel('No environment variables declared.', true, { color: this.theme.textSecondary });
+      await this.addDetailLabel('No environment variables declared.', true, { color: this.theme.textSecondary }, envListId);
     }
 
-    // "Add Variable" button (secondary; Save Config is this section's primary)
+    // Button row: "Add Variable" (secondary) and Save Config, this card's primary.
+    const configButtonRow = await this.wm('createNestedHBox', {
+      parentLayoutId: config,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 8,
+    }) as AbjectId;
+    await this.addToLayout(config, configButtonRow, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
+
     const { widgetIds: [addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'button', windowId: this.windowId, text: 'Add Variable' },
       ]}),
     );
     await this.addDep(addBtnId);
-    await this.addToLayout(this.detailPaneId!, addBtnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
+    await this.addToLayout(configButtonRow, addBtnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
     this.addVarBtnId = addBtnId;
 
     // Save Config button
@@ -565,18 +657,18 @@ pane shows details, configuration, and actions for the selected skill.
       ]}),
     );
     await this.addDep(saveBtnId);
-    await this.addToLayout(this.detailPaneId!, saveBtnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
+    await this.addToLayout(configButtonRow, saveBtnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
     this.saveConfigBtnId = saveBtnId;
+    await this.request(request(this.id, configButtonRow, 'addLayoutSpacer', {}));
 
-    await this.addDetailLabel(sectionHeaderText(this.theme, 'Actions'), false, { ...sectionHeaderStyle(this.theme, 12) });
-    const toggleLabel = skill.enabled ? 'Disable' : 'Enable';
-    // Enabling is the primary step; disabling is an ordinary secondary action.
-    await this.addDetailButton(toggleLabel, skill.enabled ? 'disable' : 'enable', skill.enabled ? {} : undefined);
+    // ── Danger zone: uninstalling removes the skill from disk ──
+    const danger = await this.addSection('Danger zone',
+      'Uninstalling removes this skill and its files from disk.');
     await this.addDetailButton('Uninstall', 'uninstall', {
       background: this.theme.destructiveBg,
       color: this.theme.destructiveText,
       borderColor: this.theme.destructiveBorder,
-    });
+    }, danger);
   }
 
   /** Add a new custom env var row (name input + value input). */
@@ -592,10 +684,10 @@ pane shows details, configuration, and actions for the selected skill.
     await this.addDep(nameId);
     await this.addDep(valueId);
 
-    // Insert before the Add Variable button by adding to the layout
-    // (scrollable vbox appends at the end, but that's fine -- user sees them above buttons after rebuild)
-    await this.addToLayout(this.detailPaneId, nameId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
-    await this.addToLayout(this.detailPaneId, valueId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
+    // Rows join the Configuration card's variable list, above its buttons.
+    const listId = this.envListId ?? this.detailPaneId;
+    await this.addToLayout(listId, nameId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
+    await this.addToLayout(listId, valueId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 28 });
 
     this.customEnvRows.push({ nameId, valueId });
   }

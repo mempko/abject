@@ -334,6 +334,14 @@ export class DataBrowser extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private async refreshCollections(): Promise<void> {
+    if (!this.collectionStoreId && this.collectionsHintId) {
+      // Say why the list stays empty rather than leaving a blank pane.
+      try {
+        await this.request(request(this.id, this.collectionsHintId, 'update', {
+          text: 'The collection store is unavailable here, so there is nothing to browse or query.',
+        }));
+      } catch { /* widget gone */ }
+    }
     if (!this.collectionStoreId || !this.listWidgetId) return;
     try {
       const infos = await this.request<CollectionInfo[]>(
@@ -358,11 +366,23 @@ export class DataBrowser extends Abject {
     }
   }
 
-  private async runQuery(): Promise<void> {
+  /**
+   * Run the SQL in the editor. `explicit` is true when the user pressed Run,
+   * so the arrival of results flashes the window; a preview from a list
+   * selection lands quietly. Errors shake the window either way.
+   */
+  private async runQuery(explicit = false): Promise<void> {
     if (!this.collectionStoreId || !this.sqlInputId) return;
     const sql = await this.request<string>(request(this.id, this.sqlInputId, 'getValue', {}));
-    if (!sql || sql.trim().length === 0) return;
+    if (!sql || sql.trim().length === 0) {
+      if (explicit) {
+        await this.setStatus('Write a query first', this.theme.statusError);
+        this.windowEffect('shake');
+      }
+      return;
+    }
 
+    await this.setStatus('Running...');
     const started = Date.now();
     try {
       const { columns, rows, capped } = await this.request<{
@@ -374,11 +394,22 @@ export class DataBrowser extends Abject {
       let status = `${rows.length}${capped ? '+' : ''} row${rows.length === 1 ? '' : 's'} in ${ms}ms`;
       if (rows.length > shown) status += ` (showing first ${shown})`;
       await this.setStatus(status);
+      if (explicit) this.windowEffect('flash');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.setResults('**Query error**\n\n```\n' + msg + '\n```');
-      await this.setStatus('');
+      await this.setStatus('Query failed', this.theme.statusError);
+      this.windowEffect('shake');
     }
+  }
+
+  /**
+   * Play a one-shot slab effect on the window (visual only). Fire and forget:
+   * a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   private formatResults(columns: string[], rows: unknown[][]): string {
@@ -415,10 +446,11 @@ export class DataBrowser extends Abject {
     } catch { /* widget gone */ }
   }
 
-  private async setStatus(text: string): Promise<void> {
+  /** Status line beside Run; failures show in the error colour, all else muted. */
+  private async setStatus(text: string, color: string = this.theme.textTertiary): Promise<void> {
     if (!this.statusLabelId) return;
     try {
-      await this.request(request(this.id, this.statusLabelId, 'update', { text }));
+      await this.request(request(this.id, this.statusLabelId, 'update', { text, style: { color } }));
     } catch { /* widget gone */ }
   }
 
@@ -440,7 +472,7 @@ export class DataBrowser extends Abject {
     }
 
     if (fromId === this.runBtnId && aspect === 'click') {
-      await this.runQuery();
+      await this.runQuery(true);
       return;
     }
 

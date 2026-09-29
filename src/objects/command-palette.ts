@@ -19,7 +19,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle } from './ui-kit.js';
 
 const COMMAND_PALETTE_INTERFACE: InterfaceId = 'abjects:command-palette' as InterfaceId;
 
@@ -50,6 +50,7 @@ const CHAT_ENTRY_ID = 'palette:new-chat' as AbjectId;
 const PALETTE_WIDTH = 520;
 const PALETTE_HEIGHT = 380;
 const SEARCH_HEIGHT = 44;
+const PALETTE_HINT = '\u2191\u2193 to move \u00B7 Enter to open \u00B7 Esc to close';
 
 export class CommandPaletteAbject extends Abject {
   private widgetManagerId?: AbjectId;
@@ -60,6 +61,7 @@ export class CommandPaletteAbject extends Abject {
   private searchInputId?: AbjectId;
   private resultsListId?: AbjectId;
   private headerLabelId?: AbjectId;
+  private hintLabelId?: AbjectId;
 
   private chatManagerId?: AbjectId;
   private query = '';
@@ -121,6 +123,7 @@ export class CommandPaletteAbject extends Abject {
           // Launch the highlighted result (Enter), not just the first.
           const entry = this.filtered[this.selectedIndex] ?? this.filtered[0];
           if (entry) await this.activateEntry(entry);
+          else this.playEffect('shake');
           return;
         }
         this.query = String(value ?? '');
@@ -191,6 +194,10 @@ export class CommandPaletteAbject extends Abject {
       }),
     );
 
+    // The palette owns the user's attention while it shows: the desktop
+    // recedes behind it. closePalette lifts it on every close path.
+    await this.setModal(this.windowId, true);
+
     await this.request(request(this.id, this.windowId, 'addDependent', {}));
 
     this.rootLayoutId = await this.request<AbjectId>(
@@ -223,11 +230,17 @@ export class CommandPaletteAbject extends Abject {
             selectedIndex: this.filtered.length > 0 ? 0 : -1,
             itemHeight: 36,
           },
+          {
+            type: 'label',
+            windowId: this.windowId,
+            text: PALETTE_HINT,
+            style: { ...hintStyle(this.theme, 11), wordWrap: false, selectable: false },
+          },
         ],
       }),
     );
 
-    [this.headerLabelId, this.searchInputId, this.resultsListId] = widgetIds;
+    [this.headerLabelId, this.searchInputId, this.resultsListId, this.hintLabelId] = widgetIds;
 
     await this.request(request(this.id, this.searchInputId, 'addDependent', {}));
     await this.request(request(this.id, this.resultsListId, 'addDependent', {}));
@@ -237,6 +250,7 @@ export class CommandPaletteAbject extends Abject {
         { widgetId: this.headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: this.searchInputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: SEARCH_HEIGHT } },
         { widgetId: this.resultsListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.hintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 16 } },
       ],
     }));
 
@@ -263,8 +277,10 @@ export class CommandPaletteAbject extends Abject {
     this.searchInputId = undefined;
     this.resultsListId = undefined;
     this.headerLabelId = undefined;
+    this.hintLabelId = undefined;
     this.query = '';
     this.filtered = [];
+    await this.setModal(wid, false);
     try {
       await this.request(
         request(this.id, this.widgetManagerId, 'destroyWindowAbject', { windowId: wid }),
@@ -273,33 +289,62 @@ export class CommandPaletteAbject extends Abject {
     return true;
   }
 
-  private async activateEntry(entry: PaletteEntry): Promise<void> {
-    if (entry.action === 'chat') {
-      await this.startChat(entry.query ?? this.query);
-      await this.closePalette();
-      return;
-    }
-    this.send(event(this.id, entry.id, 'show', {}));
-    await this.closePalette();
+  /** Mark the palette window modal (the rest of the desktop recedes) or not. */
+  private async setModal(windowId: AbjectId, modal: boolean): Promise<void> {
+    try {
+      await this.setWindowModal(windowId, modal);
+    } catch { /* window gone; closing it clears the flag anyway */ }
   }
 
-  /** Spawn a fresh chat conversation seeded with the typed query. */
-  private async startChat(prompt: string): Promise<void> {
-    const text = prompt.trim();
-    if (!text) return;
+  /** Play a one-shot slab effect on the open palette (visual only). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    try {
+      this.playWindowEffect(this.windowId, effect, color);
+    } catch { /* window gone */ }
+  }
+
+  private async activateEntry(entry: PaletteEntry): Promise<void> {
+    if (entry.action === 'chat') {
+      const text = (entry.query ?? this.query).trim();
+      const chatId = await this.startChat(text);
+      if (!chatId) {
+        // The chat could not start: keep the palette (and the typed text) up.
+        this.playEffect('shake');
+        return;
+      }
+      // Step aside first so the new chat window arrives in front, not receded.
+      await this.closePalette();
+      try {
+        await this.request(request(this.id, chatId, 'sendMessage', { message: text }), 10000);
+      } catch { /* the chat exists; its own window reports what happened */ }
+      return;
+    }
+    // Close (lifting the modal depth) before the chosen window shows, so it
+    // arrives at full depth instead of receded behind the palette.
+    await this.closePalette();
+    this.send(event(this.id, entry.id, 'show', {}));
+  }
+
+  /**
+   * Spawn a fresh chat conversation titled with the typed query. Returns the
+   * new chat's id, or undefined when no conversation could be created.
+   */
+  private async startChat(text: string): Promise<AbjectId | undefined> {
+    if (!text) return undefined;
     if (!this.chatManagerId) {
       this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
     }
-    if (!this.chatManagerId) return;
+    if (!this.chatManagerId) return undefined;
     try {
       const res = await this.request<{ conversationId: string; chatId: AbjectId }>(
         request(this.id, this.chatManagerId, 'newConversation', { title: text.slice(0, 60) }),
         10000,
       );
-      if (res?.chatId) {
-        await this.request(request(this.id, res.chatId, 'sendMessage', { message: text }), 10000);
-      }
-    } catch { /* chat manager unavailable */ }
+      return res?.chatId || undefined;
+    } catch {
+      return undefined; /* chat manager unavailable */
+    }
   }
 
   // ── Search / filter ─────────────────────────────────────────────────

@@ -18,7 +18,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { Tween, fadeIn as motionFadeIn, fadeOut as motionFadeOut } from '../ui/motion.js';
@@ -219,9 +219,14 @@ export class NotificationCenter extends Abject {
       const { aspect } = m.payload as { aspect: string };
       const fromId = m.routing.from;
       if (aspect === 'click' && fromId === this.viewerClearBtnId) {
+        if (this.history.length === 0) return;
         this.history = [];
         this.changed('historyChanged', { count: 0 });
         await this.refreshViewer();
+        // Applied: a hand-coloured flash on the viewer.
+        if (this.viewerWindowId) {
+          this.playWindowEffect(this.viewerWindowId, 'flash', '$accent');
+        }
       }
     });
   }
@@ -336,6 +341,9 @@ export class NotificationCenter extends Abject {
       })).catch(() => {});
     }
 
+    // Arrival: the card lights up in its level's colour (errors also shake).
+    this.playArrivalEffect(windowId, level);
+
     // Fade in.
     toast.fadeIn = motionFadeIn(180, (a) => {
       toast.alpha = a;
@@ -349,6 +357,21 @@ export class NotificationCenter extends Abject {
 
     this.toasts.push(toast);
 
+  }
+
+  /**
+   * One-shot slab light on a fresh toast (toasts are transparent, so no open
+   * transition plays; this is their arrival). Good news and info wear the
+   * living light, warnings brass, errors shake in red.
+   */
+  private playArrivalEffect(windowId: AbjectId, level: NotificationLevel): void {
+    const fx: Array<{ effect: string; color?: string }> =
+      level === 'error' ? [{ effect: 'shake', color: '$statusError' }, { effect: 'flash', color: '$statusError' }]
+      : level === 'warning' ? [{ effect: 'flash', color: '$statusWarning' }]
+      : [{ effect: 'flash' }];
+    for (const f of fx) {
+      try { this.send(event(this.id, windowId, 'effect', f)); } catch { /* window gone */ }
+    }
   }
 
   private async dismissToast(toast: ActiveToast, immediate = false): Promise<void> {
@@ -558,6 +581,10 @@ export class NotificationCenter extends Abject {
     try {
       await this.request(request(this.id, this.viewerListId, 'update', { style: { visible: !empty } }));
       await this.request(request(this.id, this.viewerEmptyLabelId, 'update', { style: { visible: empty } }));
+      // Clear is live only while there is something to clear.
+      if (this.viewerClearBtnId) {
+        await this.request(request(this.id, this.viewerClearBtnId, 'update', { style: { disabled: empty } }));
+      }
     } catch { /* widgets gone */ }
   }
 

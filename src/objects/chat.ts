@@ -19,7 +19,7 @@ import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { buildGoalRows, type GoalNode } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
 import { chromeCase } from '../core/theme-data.js';
-import { sectionHeaderText, livingStyle, eyeSigilOps, removeSigilOps, type SceneOp } from './ui-kit.js';
+import { sectionHeaderText, livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps } from './ui-kit.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Chat');
@@ -54,6 +54,8 @@ const COMPOSER_HINT_CLARIFY = `\u21B5  Answer to continue the goal   \u00B7   ${
 const STATUS_STRIP_H = 18;
 const CHAT_EYE_PREFIX = 'chat-eye';
 const CHAT_EYE_SIZE = 18;
+/** Motes per second rising off the eye while the chat is working. */
+const CHAT_STREAM_RATE = 6;
 /** Leading mark on the activity header (the kit's sigil ring). */
 const THINKING_TEXT = '\u25C9 Thinking\u2026';
 
@@ -137,6 +139,7 @@ interface ObjectSummary {
 
 type UiPhase = 'closed' | 'idle' | 'busy';
 
+
 interface ChatConstructorArgs {
   conversationId?: string;
   title?: string;
@@ -174,8 +177,19 @@ export class Chat extends Abject {
   private stopBtnId?: AbjectId;
   /** True while the composer shows goal controls (Pause/Resume + Stop). */
   private goalControlsActive = false;
+  private _goalPaused = false;
   /** True while the current goal is paused (input unlocked for interjections). */
-  private goalPaused = false;
+  private get goalPaused(): boolean { return this._goalPaused; }
+  private set goalPaused(paused: boolean) {
+    if (paused === this._goalPaused) return;
+    this._goalPaused = paused;
+    // A paused goal is resting: the thinking stream rests with it.
+    void this.syncThinkingStream();
+  }
+  /** Rate the eye's thinking stream was last given (0 = resting or no eye). */
+  private streamRate = 0;
+  /** Goal the user asked to stop: its failure is their doing, not an error. */
+  private stopRequestedGoalId?: string;
   /**
    * The scrum master paused the goal to ask the user a question (ask_user).
    * The next typed message answers it and auto-resumes the goal — unlike a
@@ -1121,12 +1135,18 @@ export class Chat extends Abject {
     this.recordGoalOutcome(goalId, entry.title, status, status === 'completed' ? result : error);
     this.scheduleActivityRefresh();
     if (goalId !== this._currentGoalId) return;
+    const userStopped = this.stopRequestedGoalId === goalId;
+    this.stopRequestedGoalId = undefined;
     this._currentGoalId = undefined;
     this.emitGoalActivity();
     await this.persistActiveGoal(undefined);
     await this.exitGoalControls();
     await this.removeActivityBubble();
     await this.deliverLateGoalOutcome({ status, result, error, goalId });
+    // The job lands: a burst on success, a glitch when it fell over (a stop
+    // the user asked for is their own doing and plays nothing).
+    if (status === 'completed') this.playEffect('burst');
+    else if (!userStopped) this.playEffect('glitch');
   }
 
   /**
@@ -1856,9 +1876,37 @@ A single successful creation goal is a complete turn. End it with **done**.
     const want = this.isGoalActive();
     if (want === this.eyeShown) return;
     this.eyeShown = want;
+    // The eye opens with its thinking stream (resting while a goal is
+    // paused); removing the sigil takes the stream with it.
+    this.streamRate = want ? this.wantedStreamRate() : 0;
     await this.sendEyeOps(want
-      ? eyeSigilOps(CHAT_EYE_PREFIX, this.eyePosition(), CHAT_EYE_SIZE)
+      ? [
+        ...eyeSigilOps(CHAT_EYE_PREFIX, this.eyePosition(), CHAT_EYE_SIZE),
+        ...sigilStreamOps(CHAT_EYE_PREFIX, CHAT_EYE_SIZE, this.streamRate),
+      ]
       : removeSigilOps(CHAT_EYE_PREFIX));
+  }
+
+  /** The stream flows while the eye is open and the work is not paused. */
+  private wantedStreamRate(): number {
+    return this.eyeShown && !this._goalPaused ? CHAT_STREAM_RATE : 0;
+  }
+
+  /** Start or rest the eye's thinking stream on pause/resume transitions. */
+  private async syncThinkingStream(): Promise<void> {
+    if (!this.windowId || !this.eyeShown) return;
+    const rate = this.wantedStreamRate();
+    if (rate === this.streamRate) return;
+    this.streamRate = rate;
+    await this.sendEyeOps([{ op: 'update', id: `${CHAT_EYE_PREFIX}-stream`, params: { rate } }]);
+  }
+
+  /** Play a one-shot slab effect on the chat window (visual only). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    try {
+      this.playWindowEffect(this.windowId, effect, color);
+    } catch { /* window gone */ }
   }
 
   private async sendEyeOps(ops: SceneOp[]): Promise<void> {
@@ -1900,6 +1948,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.sendBtnId = undefined;
     this.statusStripId = undefined;
     this.eyeShown = false;
+    this.streamRate = 0;
     this.stopBtnId = undefined;
     this.goalControlsActive = false;
     this.messageLabelIds = [];
@@ -2021,6 +2070,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async handleFileUploaded(name: string, mimeType: string, base64: string): Promise<void> {
     if (!this.fileSystemId) {
       await this.appendBubble('error', 'Upload', 'No filesystem available to store the file.', false);
+      this.playEffect('shake');
       return;
     }
     const safeName = name.replace(/[/\\]/g, '_');
@@ -2034,6 +2084,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     } catch (err) {
       log.warn(`[Chat] failed to store upload ${safeName}:`, err);
       await this.appendBubble('error', 'Upload', `Failed to store "${safeName}".`, false);
+      this.playEffect('shake');
       return;
     }
 
@@ -2051,6 +2102,8 @@ A single successful creation goal is a complete turn. End it with **done**.
       attachment: { path, name: safeName, mimeType, kind, injected: false },
     });
     this.schedulePersist();
+    // Saved: a hand-coloured flash as the attachment lands.
+    this.playEffect('flash', '$accent');
   }
 
   /**
@@ -2346,6 +2399,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         const errorText = (result.error ?? 'Unknown error').slice(0, 200);
         const note = result.maxStepsReached ? ' (step limit reached)' : '';
         await this.appendBubble('error', 'Error', errorText + note, false);
+        this.playEffect('glitch');
         await this.notify(
           result.maxStepsReached ? 'Agent stopped: step limit reached' : 'Agent error',
           'error',
@@ -2356,6 +2410,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       if (!this._currentGoalId) await this.removeActivityBubble();
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendBubble('error', 'Error', errMsg.slice(0, 200), false);
+      this.playEffect('glitch');
       await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
     } finally {
       if (this.sendBtnId) {
@@ -2492,7 +2547,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       const ok = await this.request<boolean>(
         request(this.id, this.goalManagerId, 'pauseGoal', { goalId })
       ).catch(() => false);
-      if (!ok) return;
+      if (!ok) { this.playEffect('shake'); return; }
       this.goalPaused = true;
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
       if (this.textInputId) {
@@ -2504,7 +2559,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       const ok = await this.request<boolean>(
         request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
       ).catch(() => false);
-      if (!ok) return;
+      if (!ok) { this.playEffect('shake'); return; }
       this.goalPaused = false;
       this.clarificationPending = false;
       try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
@@ -2520,9 +2575,14 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async handleStopClick(): Promise<void> {
     const goalId = this._currentGoalId;
     if (!goalId || !this.goalManagerId) return;
-    await this.request(
+    this.stopRequestedGoalId = goalId;
+    const ok = await this.request<boolean>(
       request(this.id, this.goalManagerId, 'stopGoal', { goalId })
-    ).catch(() => undefined);
+    ).catch(() => false);
+    if (ok === false) {
+      if (this.stopRequestedGoalId === goalId) this.stopRequestedGoalId = undefined;
+      this.playEffect('shake');
+    }
   }
 
   /**
@@ -2559,6 +2619,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     ).catch(() => false);
     if (!ok) {
       await this.appendBubble('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
+      this.playEffect('shake');
       return;
     }
     if (this.clarificationPending && this.goalPaused) {

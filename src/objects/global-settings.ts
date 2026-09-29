@@ -747,7 +747,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       return this.hide();
     });
 
-    this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('windowCloseRequested', async (msg: AbjectMessage) => {
+      // Closing an open permission prompt answers it: deny. Every other
+      // close (the settings window) hides the settings window as before.
+      const { windowId } = (msg.payload ?? {}) as { windowId?: AbjectId };
+      if (windowId && windowId === this._promptWindowId) {
+        this._pendingPermissionPrompt?.resolve('deny');
+        return;
+      }
+      await this.hide();
+    });
 
     this.on('getState', async () => {
       return { visible: !!this.windowId };
@@ -989,11 +998,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Filesystem: add path
       if (fromId === this.fsAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.fsPathInputId!, 'getValue', {}));
-        if (val && !this.fsAllowedPaths.includes(val)) {
+        const added = !!val && !this.fsAllowedPaths.includes(val);
+        if (added) {
           this.fsAllowedPaths.push(val);
           await this.updateStringList(this.fsPathListId!, this.fsAllowedPaths);
           await this.request(request(this.id, this.fsPathInputId!, 'update', { text: '' }));
         }
+        await this.listAddFeedback(val, added);
         return;
       }
       if (fromId === this.fsRemoveBtnId && aspect === 'click') {
@@ -1017,11 +1028,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Shell: add allowed command
       if (fromId === this.shellAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.shellCmdInputId!, 'getValue', {}));
-        if (val && !this.shellAllowedCmds.includes(val)) {
+        const added = !!val && !this.shellAllowedCmds.includes(val);
+        if (added) {
           this.shellAllowedCmds.push(val);
           await this.updateStringList(this.shellCmdListId!, this.shellAllowedCmds);
           await this.request(request(this.id, this.shellCmdInputId!, 'update', { text: '' }));
         }
+        await this.listAddFeedback(val, added);
         return;
       }
       if (fromId === this.shellRemoveBtnId && aspect === 'click') {
@@ -1035,11 +1048,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Shell: add denied command
       if (fromId === this.shellDeniedAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.shellDeniedInputId!, 'getValue', {}));
-        if (val && !this.shellDeniedCmds.includes(val)) {
+        const added = !!val && !this.shellDeniedCmds.includes(val);
+        if (added) {
           this.shellDeniedCmds.push(val);
           await this.updateStringList(this.shellDeniedListId!, this.shellDeniedCmds);
           await this.request(request(this.id, this.shellDeniedInputId!, 'update', { text: '' }));
         }
+        await this.listAddFeedback(val, added);
         return;
       }
       if (fromId === this.shellDeniedRemoveBtnId && aspect === 'click') {
@@ -1085,11 +1100,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Web: add allowed domain
       if (fromId === this.webAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.webDomainInputId!, 'getValue', {}));
-        if (val && !this.webAllowedDomains.includes(val)) {
+        const added = !!val && !this.webAllowedDomains.includes(val);
+        if (added) {
           this.webAllowedDomains.push(val);
           await this.updateStringList(this.webDomainListId!, this.webAllowedDomains);
           await this.request(request(this.id, this.webDomainInputId!, 'update', { text: '' }));
         }
+        await this.listAddFeedback(val, added);
         return;
       }
       if (fromId === this.webRemoveBtnId && aspect === 'click') {
@@ -1103,11 +1120,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Web: add denied domain
       if (fromId === this.webDeniedAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.webDeniedInputId!, 'getValue', {}));
-        if (val && !this.webDeniedDomains.includes(val)) {
+        const added = !!val && !this.webDeniedDomains.includes(val);
+        if (added) {
           this.webDeniedDomains.push(val);
           await this.updateStringList(this.webDeniedListId!, this.webDeniedDomains);
           await this.request(request(this.id, this.webDeniedInputId!, 'update', { text: '' }));
         }
+        await this.listAddFeedback(val, added);
         return;
       }
       if (fromId === this.webDeniedRemoveBtnId && aspect === 'click') {
@@ -1272,45 +1291,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   /**
-   * A styled card for one settings section: rounded panel with an
-   * accent-colored numbered title and a wrap-friendly description. Returns
-   * the card's layout id — add the section's rows to IT, not to the tab
-   * container. autoSize lets the ScrollableVBox measure the card.
+   * A grouped card for one settings section (WidgetManager createSection:
+   * ruled panel, sigil title, wrap-friendly hint). Returns the card's layout
+   * id: add the section's rows to IT, not to the tab container. Cards size to
+   * their content inside a ScrollableVBox; `expanding` fills a plain VBox.
    */
   private async sectionCard(parentId: AbjectId, title: string, description: string, descriptionHeight = 18, expanding = false): Promise<AbjectId> {
-    // autoSize cards hug their content (right inside a ScrollableVBox);
-    // expanding cards fill the parent's remaining space (right in a plain
-    // VBox viewport where inner lists should stretch on resize).
-    const cardId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
         parentLayoutId: parentId,
-        ...(expanding ? {} : { autoSize: true }),
-        margins: { top: 14, right: 16, bottom: 14, left: 16 },
-        spacing: 8,
-        style: { background: this.theme.inputBg, borderColor: this.theme.windowBorder, borderWidth: shapeOf(this.theme).ruleWidth, radius: this.theme.widgetRadius },
+        windowId: this.windowId,
+        title,
+        description,
+        hintHeight: descriptionHeight,
+        expanding,
       })
     );
-    // Shared kit header (mark + chrome case) over a kit hint.
-    const { widgetIds: [titleId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId,
-          text: sectionHeaderText(this.theme, title),
-          style: sectionHeaderStyle(this.theme, 14) },
-        { type: 'label', windowId: this.windowId, text: description,
-          style: hintStyle(this.theme) },
-      ]})
-    );
-    await this.request(request(this.id, cardId, 'addLayoutChild', {
-      widgetId: titleId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 20 },
-    }));
-    await this.request(request(this.id, cardId, 'addLayoutChild', {
-      widgetId: descId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: descriptionHeight },
-    }));
-    return cardId;
+    return sectionId;
   }
 
   /** Build Skills & MCP tab content into skillsContainerId. */
@@ -2175,6 +2172,43 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   /**
+   * Play a slab effect on a window (visual only, fire and forget): the
+   * settings window by default, or a prompt window. `color` overrides the
+   * effect's light (a $token), e.g. '$accent' for the hand's own edits.
+   */
+  private windowEffect(effect: 'shake' | 'flash' | 'pulse', color?: string, windowId = this.windowId): void {
+    if (!windowId) return;
+    this.request(request(this.id, windowId, 'effect', { effect, ...(color ? { color } : {}) }))
+      .catch(() => { /* effects are decoration */ });
+  }
+
+  /** Invalid input or a failure: status in the given colour plus a shake. */
+  private async rejectWith(text: string, color = this.theme.statusErrorBright): Promise<void> {
+    this.windowEffect('shake');
+    await this.setStatus(text, color);
+  }
+
+  /**
+   * Feedback for a list-editor Add: a hand-coloured flash when the value
+   * joined the (unsaved) list, a shake when it was empty or already there.
+   */
+  private async listAddFeedback(value: string | null | undefined, added: boolean): Promise<void> {
+    if (added) {
+      this.windowEffect('flash', '$accent');
+      return;
+    }
+    await this.rejectWith(value ? 'Already in the list.' : 'Type a value first.', this.theme.statusWarning);
+  }
+
+  /** Mark a permission prompt modal (or release it). Best effort. */
+  private async setPromptModal(windowId: AbjectId | undefined, modal: boolean): Promise<void> {
+    if (!windowId) return;
+    try {
+      await this.request(request(this.id, windowId, 'setModal', { modal }));
+    } catch { /* window gone or no surface yet */ }
+  }
+
+  /**
    * Toggle masked state on a text input and update its toggle button label.
    */
   private async toggleMask(inputId: AbjectId, toggleId: AbjectId): Promise<void> {
@@ -2359,7 +2393,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
     const preset = name ? this.resolvePreset(name) : undefined;
     if (!preset) {
-      await this.setStatus('Pick a preset to apply.', this.theme.statusWarning);
+      await this.rejectWith('Pick a preset to apply.', this.theme.statusWarning);
       return;
     }
     await this.applyTierPreset(preset);
@@ -2371,17 +2405,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, this.presetNameInputId, 'getValue', {})
     ))?.trim();
     if (!name) {
-      await this.setStatus('Give the preset a name first.', this.theme.statusWarning);
+      await this.rejectWith('Give the preset a name first.', this.theme.statusWarning);
       return;
     }
     const preset = await this.readCurrentTierSelections();
     if (Object.keys(preset.routing).length === 0) {
-      await this.setStatus('Configure at least one tier before saving a preset.', this.theme.statusWarning);
+      await this.rejectWith('Configure at least one tier before saving a preset.', this.theme.statusWarning);
       return;
     }
     this.savedPresets[name] = preset;
-    await this.persistSavedPresets();
+    try {
+      await this.persistSavedPresets();
+    } catch {
+      await this.rejectWith(`Could not save preset '${name}'.`);
+      return;
+    }
     await this.refreshPresetOptions();
+    this.windowEffect('flash');
     await this.setStatus(`Preset '${name}' saved.`, this.theme.statusSuccess);
   }
 
@@ -2391,7 +2431,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, this.presetSelectId, 'getValue', {})
     );
     if (!name || !this.savedPresets[name]) {
-      await this.setStatus('Only saved presets can be deleted (built-ins stay).', this.theme.statusWarning);
+      await this.rejectWith('Only saved presets can be deleted (built-ins stay).', this.theme.statusWarning);
       return;
     }
     delete this.savedPresets[name];
@@ -3149,31 +3189,38 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const enabled = !!checked;
 
     if (enabled && (!username || !password)) {
-      await this.setStatus('Username and password are required.', this.theme.statusErrorBright);
+      await this.rejectWith('Username and password are required.');
       return;
     }
 
-    // Persist to storage
-    if (this.storageId) {
-      await this.request(
-        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_ENABLED, value: String(enabled) })
-      );
-      await this.request(
-        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_USER, value: username })
-      );
-      await this.request(
-        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_PASS, value: password })
-      );
-    }
+    try {
+      // Persist to storage
+      if (this.storageId) {
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_ENABLED, value: String(enabled) })
+        );
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_USER, value: username })
+        );
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_PASS, value: password })
+        );
+      }
 
-    // Apply to BackendUI (updates config, clears sessions, disconnects frontend)
-    if (this.uiServerId) {
-      await this.request(
-        request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
-      );
+      // Apply to BackendUI (updates config, clears sessions, disconnects frontend)
+      if (this.uiServerId) {
+        await this.request(
+          request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
+        );
+      }
+    } catch (err) {
+      log.warn('Failed to save auth settings:', err);
+      await this.rejectWith('Could not save auth settings.');
+      return;
     }
 
     log.info(`Auth settings saved (enabled=${enabled})`);
+    this.windowEffect('flash');
     await this.setStatus(enabled ? 'Auth enabled. Reconnecting...' : 'Auth disabled.');
   }
 
@@ -3577,14 +3624,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const { widgetIds: [noteId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
           { type: 'label', windowId: this.windowId,
-            text: emptyStateMarkdown('Nothing listed yet', 'Type an entry above and press Add.'),
-            style: { ...emptyStateStyle(this.theme), fontSize: 12, align: 'left' } },
+            text: 'Nothing listed yet. Type an entry above and press Add.',
+            style: { color: this.theme.textSecondary, fontSize: 12 } },
         ]})
       );
       await this.request(request(this.id, cardId, 'addLayoutChild', {
         widgetId: noteId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 40 },
+        preferredSize: { height: 20 },
       }));
       this.listEmptyNoteIds.set(listId, noteId);
       await this.syncListEmptyState(listId, items.length === 0);
@@ -3610,6 +3657,22 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * Persist permission state to Storage and propagate to target objects.
    */
   private async savePermissions(): Promise<void> {
+    if (!this.storageId) return;
+
+    try {
+      await this.persistAndPropagatePermissions();
+    } catch (err) {
+      log.warn('Failed to save permissions:', err);
+      await this.rejectWith('Could not save permissions.');
+      return;
+    }
+    log.info('Permissions saved and propagated');
+    this.windowEffect('flash');
+    await this.setStatus('Permissions saved!');
+  }
+
+  /** Write every permission setting to Storage and push it to the capabilities. */
+  private async persistAndPropagatePermissions(): Promise<void> {
     if (!this.storageId) return;
 
     await this.request(request(this.id, this.storageId, 'set', {
@@ -3642,8 +3705,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     await this.saveObjectPermissions();
     await this.propagatePermissions();
-    log.info('Permissions saved and propagated');
-    await this.setStatus('Permissions saved!');
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -3814,6 +3875,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // window must be.
       await this.fitPromptToLayout();
 
+      // A question that blocks work owns the desktop until it is answered:
+      // every other window recedes, and the prompt pulses once for attention.
+      await this.setPromptModal(windowId, true);
+      this.windowEffect('pulse', undefined, windowId);
+
       // Announce to mirroring surfaces (terminal clients) via WidgetManager;
       // they answer with a `respond` message back to us.
       const options = groups.flatMap(g => g.options.map(o => ({ id: o.id, label: o.label })));
@@ -3858,6 +3924,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this._promptDialogId = undefined;
       this._promptDecisions = [];
       this._promptButtons.clear();
+      await this.setPromptModal(this._promptWindowId, false);
       if (this._promptWindowId && this.widgetManagerId) {
         try {
           await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
@@ -3993,7 +4060,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const val = await this.request<string>(request(this.id, inputId, 'getValue', {}));
     const parsed = parseObjectPermEntry(val ?? '');
     if (!parsed) {
-      await this.setStatus('Use the form "ObjectName: command"');
+      await this.rejectWith('Use the form "ObjectName: command"', this.theme.statusWarning);
       return;
     }
     const record = this.objectPermissions.get(parsed.objectName) ?? { allow: [], deny: [] };
@@ -4004,6 +4071,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.refreshObjectPermLists();
     await this.updateStringList(listId, this.objectPermEntries(kind));
     await this.request(request(this.id, inputId, 'update', { text: '' }));
+    this.windowEffect('flash', '$accent');
   }
 
   private async removeObjectPermEntry(kind: 'allow' | 'deny', listId: AbjectId): Promise<void> {
@@ -4201,6 +4269,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         }));
       }
 
+      // Modal for the question's lifetime, with one pulse for attention.
+      await this.setPromptModal(windowId, true);
+      this.windowEffect('pulse', undefined, windowId);
+
       const stopBeating = this.awaitingHuman(`permission: ${skillName}`);
       let decision: string;
       try {
@@ -4244,6 +4316,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       return { decision: 'deny' };
     } finally {
       this._pendingPermissionPrompt = undefined;
+      await this.setPromptModal(this._promptWindowId, false);
       if (this._promptWindowId && this.widgetManagerId) {
         try {
           await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
@@ -4284,7 +4357,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   /** Drop every project back to asking, and clear the standing allow rules. */
   private async takeTheWheel(): Promise<void> {
     const brokerId = await this.discoverDep('PermissionBroker');
-    if (!brokerId) { await this.setStatus('No permission broker is running'); return; }
+    if (!brokerId) { await this.rejectWith('No permission broker is running'); return; }
     const ok = await this.confirm({
       title: 'Take the wheel?',
       message:
@@ -4296,9 +4369,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     try {
       const r = await this.request<{ projectsReset: number; rulesCleared: number }>(
         request(this.id, brokerId, 'takeTheWheel', {}), 60_000);
+      this.windowEffect('flash');
       await this.setStatus(`${r.projectsReset} project(s) back to ask, ${r.rulesCleared} allow rule(s) cleared`);
     } catch (err) {
-      await this.setStatus(`Could not reset: ${err instanceof Error ? err.message : String(err)}`);
+      await this.rejectWith(`Could not reset: ${err instanceof Error ? err.message : String(err)}`);
     }
     await this.refreshAutonomyStatus();
   }
@@ -4551,7 +4625,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Validate: at least one tier must have a valid config
     const hasAnyTier = TIER_NAMES.some(t => tierRouting[t].provider && tierRouting[t].model);
     if (!hasAnyTier) {
-      await this.setStatus('Configure at least one model tier.', this.theme.statusErrorBright);
+      await this.rejectWith('Configure at least one model tier.');
       await this.setSaveControlsDisabled(false);
       return;
     }
@@ -4576,10 +4650,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
       if (!this.credentialValues[provider]) {
         const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
-        await this.setStatus(
-          `${tierLabel} tier uses ${desc.label} but no API key provided.`,
-          this.theme.statusErrorBright,
-        );
+        await this.rejectWith(`${tierLabel} tier uses ${desc.label} but no API key provided.`);
         await this.setSaveControlsDisabled(false);
         return;
       }
@@ -4591,63 +4662,71 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (!provider) continue;
       const desc = this.descById(provider);
       if (desc && desc.credentialMode === 'apiKey' && !this.credentialValues[provider]) {
-        await this.setStatus(
-          `${AUX_ROWS[key].toastName} uses ${desc.label} but no API key provided.`,
-          this.theme.statusErrorBright,
-        );
+        await this.rejectWith(`${AUX_ROWS[key].toastName} uses ${desc.label} but no API key provided.`);
         await this.setSaveControlsDisabled(false);
         return;
       }
     }
 
-    // Persist credentials to storage. Per-provider keys derived from
-    // each description's storageSuffix; CLI providers contribute nothing
-    // (their auth lives in the binary).
-    if (this.storageId) {
-      for (const desc of this.providerDescriptions) {
-        if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
-        const value = this.credentialValues[desc.id];
-        if (value) {
-          await this.request(
-            request(this.id, this.storageId, 'set', { key: storageKeyFor(desc.storageSuffix), value })
-          );
+    // Persist and apply. A failure here re-enables the controls and says so,
+    // rather than leaving the form disabled with no word.
+    try {
+      // Persist credentials to storage. Per-provider keys derived from
+      // each description's storageSuffix; CLI providers contribute nothing
+      // (their auth lives in the binary).
+      if (this.storageId) {
+        for (const desc of this.providerDescriptions) {
+          if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
+          const value = this.credentialValues[desc.id];
+          if (value) {
+            await this.request(
+              request(this.id, this.storageId, 'set', { key: storageKeyFor(desc.storageSuffix), value })
+            );
+          }
         }
-      }
-      await this.request(
-        request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_AI_ACTIVE_PROVIDER,
-          value: this.activeAiProvider,
-        })
-      );
+        await this.request(
+          request(this.id, this.storageId, 'set', {
+            key: STORAGE_KEY_AI_ACTIVE_PROVIDER,
+            value: this.activeAiProvider,
+          })
+        );
 
-      // Persist tier routing
-      await this.persistTierRouting(tierRouting);
+        // Persist tier routing
+        await this.persistTierRouting(tierRouting);
 
-      // Persist each aux row ('None' clears the saved keys)
-      for (const key of AUX_ROW_KEYS) {
-        const { provider, model } = aux[key];
-        const { storageProvider, storageModel } = AUX_ROWS[key];
-        if (provider && model) {
-          await this.request(request(this.id, this.storageId, 'set', { key: storageProvider, value: provider }));
-          await this.request(request(this.id, this.storageId, 'set', { key: storageModel, value: model }));
-        } else {
-          try {
-            await this.request(request(this.id, this.storageId, 'delete', { key: storageProvider }));
-            await this.request(request(this.id, this.storageId, 'delete', { key: storageModel }));
-          } catch { /* nothing saved yet */ }
+        // Persist each aux row ('None' clears the saved keys)
+        for (const key of AUX_ROW_KEYS) {
+          const { provider, model } = aux[key];
+          const { storageProvider, storageModel } = AUX_ROWS[key];
+          if (provider && model) {
+            await this.request(request(this.id, this.storageId, 'set', { key: storageProvider, value: provider }));
+            await this.request(request(this.id, this.storageId, 'set', { key: storageModel, value: model }));
+          } else {
+            try {
+              await this.request(request(this.id, this.storageId, 'delete', { key: storageProvider }));
+              await this.request(request(this.id, this.storageId, 'delete', { key: storageModel }));
+            } catch { /* nothing saved yet */ }
+          }
         }
+
+        // Persist the cache-keepalive opt-in
+        await this.request(request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_CACHE_KEEPALIVE, value: this.cacheKeepaliveEnabled,
+        }));
       }
 
-      // Persist the cache-keepalive opt-in
-      await this.request(request(this.id, this.storageId, 'set', {
-        key: STORAGE_KEY_CACHE_KEEPALIVE, value: this.cacheKeepaliveEnabled,
-      }));
+      // Configure all providers, tier routing, and the aux rows
+      await this.configureProviders(this.credentialValues, tierRouting, aux);
+    } catch (err) {
+      log.warn('Failed to save provider settings:', err);
+      await this.rejectWith(`Could not save settings: ${err instanceof Error ? err.message.slice(0, 80) : String(err)}`);
+      await this.setSaveControlsDisabled(false);
+      return;
     }
 
-    // Configure all providers, tier routing, and the aux rows
-    await this.configureProviders(this.credentialValues, tierRouting, aux);
-
     log.info('Saved provider settings with per-tier routing');
+    // Keys saved, providers configured: the window lights up.
+    this.windowEffect('flash');
     await this.setStatus('Settings saved!');
     await this.setSaveControlsDisabled(false);
 

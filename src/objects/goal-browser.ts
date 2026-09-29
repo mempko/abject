@@ -15,7 +15,7 @@ import type { Goal, GoalId } from './goal-manager.js';
 import { buildGoalRows, type GoalRow, type GoalNode } from './goal-tree.js';
 import {
   livingStyle, emptyStateMarkdown, emptyStateStyle,
-  eyeSigilOps, removeSigilOps, type SceneOp,
+  eyeSigilOps, removeSigilOps, sigilStreamOps, type SceneOp,
 } from './ui-kit.js';
 
 const log = new Log('GoalBrowser');
@@ -31,6 +31,13 @@ const STATUS_H = 22;
 const EMPTY_H = 96;
 const EYE_PREFIX = 'goal-browser-eye';
 const EYE_SIZE = 20;
+/** Motes per second rising off the eye while goals run. */
+const STREAM_RATE = 6;
+/** Same-effect plays closer together than this collapse into one. */
+const EFFECT_COALESCE_MS = 450;
+/** After Stop All, the resulting goal failures are the user's own doing. */
+const STOP_ALL_QUIET_MS = 5000;
+
 
 /** Minimal task info extracted from TupleSpace scan results. */
 interface TaskInfo {
@@ -62,6 +69,14 @@ export class GoalBrowser extends Abject {
   /** Eye sigil shown while any goal is running. */
   private eyeShown = false;
   private eyeWinSize?: { width: number; height: number };
+  /** Last play time per effect name (coalesces bursts of goal events). */
+  private effectLastAt = new Map<string, number>();
+  /** Goals the user stopped from this window: their failure is not an error. */
+  private userStoppedGoals = new Set<GoalId>();
+  /** Until this time, goal failures follow the user's Stop All. */
+  private stopAllQuietUntil = 0;
+  /** Last enabled state pushed to the bottom-bar buttons ("stop|clear"). */
+  private buttonState?: string;
 
   /** Local peer id; remote goals (creatorPeerId !== local) render a badge and lose sprint actions. */
   private localPeerId = '';
@@ -364,6 +379,8 @@ Click the arrow to expand/collapse a goal.
     this.emptyShown = undefined;
     this.eyeShown = false;
     this.eyeWinSize = undefined;
+    this.buttonState = undefined;
+    this.userStoppedGoals.clear();
     this.goals = [];
     this.tasksByGoal.clear();
     this.expandedGoals.clear();
@@ -485,6 +502,17 @@ Click the arrow to expand/collapse a goal.
       this.send(event(this.id, this.statusLabelId, 'update', { text, style }));
     }
 
+    // Bottom bar: Stop All is live while any goal is live (running or
+    // paused); Clear is live while finished goals remain to clear.
+    const live = this.goals.some(g => g.status === 'active' || g.status === 'paused');
+    const finished = done + failed > 0;
+    const buttonState = `${live}|${finished}`;
+    if (buttonState !== this.buttonState) {
+      this.buttonState = buttonState;
+      if (this.stopAllBtnId) this.send(event(this.id, this.stopAllBtnId, 'update', { style: { disabled: !live } }));
+      if (this.clearBtnId) this.send(event(this.id, this.clearBtnId, 'update', { style: { disabled: !finished } }));
+    }
+
     const empty = this.goals.length === 0;
     if (this.scrollAreaId && this.emptyLabelId && empty !== this.emptyShown) {
       this.emptyShown = empty;
@@ -521,11 +549,30 @@ Click the arrow to expand/collapse a goal.
         } catch { /* fall back to the default size */ }
       }
       this.eyeShown = true;
-      await this.sendEyeOps(eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE));
+      // The eye opens with a thinking stream; both go when the last goal settles.
+      await this.sendEyeOps([
+        ...eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE),
+        ...sigilStreamOps(EYE_PREFIX, EYE_SIZE, STREAM_RATE),
+      ]);
     } else {
       this.eyeShown = false;
       await this.sendEyeOps(removeSigilOps(EYE_PREFIX));
     }
+  }
+
+  /**
+   * Play a one-shot slab effect on the window (visual only). Repeats of the
+   * same effect within EFFECT_COALESCE_MS collapse into one, so a batch of
+   * goals settling together reads as a single beat.
+   */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    const now = Date.now();
+    if (now - (this.effectLastAt.get(effect) ?? 0) < EFFECT_COALESCE_MS) return;
+    this.effectLastAt.set(effect, now);
+    try {
+      this.playWindowEffect(this.windowId, effect, color);
+    } catch { /* window gone */ }
   }
 
   private async sendEyeOps(ops: SceneOp[]): Promise<void> {
@@ -586,10 +633,12 @@ Click the arrow to expand/collapse a goal.
       // Identity resolved -- the widget's action glyphs outlive one rebuild.
       const target = this.goals.find(g => g.id === goalId);
       if (this.isRemoteGoal(target?.creatorPeerId)) {
+        this.playEffect('shake');
         await this.notify('This goal belongs to another peer and is read-only here.', 'info');
         return;
       }
 
+      let outcome: unknown;
       if (action === 'stop') {
         const goal = this.goals.find(g => g.id === goalId);
         const confirmed = await this.confirm({
@@ -599,10 +648,16 @@ Click the arrow to expand/collapse a goal.
           destructive: true,
         });
         if (!confirmed) return;
-        await this.request(request(this.id, this.goalManagerId, 'stopGoal', { goalId })).catch(() => undefined);
+        this.userStoppedGoals.add(goalId);
+        outcome = await this.request(request(this.id, this.goalManagerId, 'stopGoal', { goalId })).catch(() => false);
       } else {
         const method = action === 'pause' ? 'pauseGoal' : 'resumeGoal';
-        await this.request(request(this.id, this.goalManagerId, method, { goalId })).catch(() => undefined);
+        outcome = await this.request(request(this.id, this.goalManagerId, method, { goalId })).catch(() => false);
+      }
+      // GoalManager answers false (or fails) when the goal refused the change.
+      if (outcome === false) {
+        this.userStoppedGoals.delete(goalId);
+        this.playEffect('shake');
       }
 
       // Refresh the goal row so the controls reflect the new status.
@@ -625,6 +680,7 @@ Click the arrow to expand/collapse a goal.
         destructive: true,
       });
       if (!confirmed) return;
+      this.stopAllQuietUntil = Date.now() + STOP_ALL_QUIET_MS;
       this.send(event(this.id, this.stopAllBtnId, 'update', { busy: true }));
       try {
         this.send(request(this.id, this.goalObserverId!, 'failAllGoals', {}));
@@ -632,6 +688,7 @@ Click the arrow to expand/collapse a goal.
         this.tasksByGoal.clear();
         this.expandedGoals.clear();
         await this.rebuildTree();
+        this.playEffect('flash', '$accent');
         await this.notify('All active goals stopped', 'success');
       } finally {
         this.send(event(this.id, this.stopAllBtnId, 'update', { busy: false }));
@@ -651,10 +708,13 @@ Click the arrow to expand/collapse a goal.
       if (this.goalManagerId) {
         this.send(request(this.id, this.goalManagerId, 'clearCompleted', {}));
       }
-      this.goals = [];
-      this.tasksByGoal.clear();
-      this.expandedGoals.clear();
+      // Clear takes the finished goals only; live ones stay in view.
+      this.goals = this.goals.filter(g => g.status === 'active' || g.status === 'paused');
+      const kept = new Set(this.goals.map(g => g.id));
+      for (const id of [...this.tasksByGoal.keys()]) if (!kept.has(id)) this.tasksByGoal.delete(id);
+      for (const id of [...this.expandedGoals]) if (!kept.has(id)) this.expandedGoals.delete(id);
       await this.rebuildTree();
+      this.playEffect('flash', '$accent');
       return;
     }
 
@@ -693,9 +753,15 @@ Click the arrow to expand/collapse a goal.
               this.tasksByGoal.set(goalId, tasks);
               // Surface goal-level outcomes as toasts (Goal-Gradient + Zeigarnik).
               // Skip the noisier task-level events.
+              // Slab effects mark top-level outcomes only: a sub-goal settling
+              // is a step inside the job (its root may still replan and land).
               if (aspect === 'goalCompleted' && goal) {
+                if (!goal.parentId) this.playEffect('burst');
                 await this.notify(`Goal completed: ${goal.title}`, 'success');
               } else if (aspect === 'goalFailed' && goal) {
+                // A failure the user asked for (Stop / Stop All) is no error.
+                const userStopped = this.userStoppedGoals.delete(goalId) || Date.now() < this.stopAllQuietUntil;
+                if (!userStopped && !goal.parentId) this.playEffect('glitch');
                 await this.notify(`Goal failed: ${goal.title}`, 'error');
               }
             } catch { /* goal may be gone */ }

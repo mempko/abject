@@ -10,10 +10,10 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
 
@@ -36,6 +36,12 @@ export class ChatBrowser extends Abject {
   private rootLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
   private newChatBtnId?: AbjectId;
+  /** Section header ("N chats"), restyled while a chat is working. */
+  private headerLabelId?: AbjectId;
+  /** Conversation count behind the header text. */
+  private chatCount = 0;
+  /** Aggregate goalActivity from ChatManager: some chat is working. */
+  private anyChatWorking = false;
 
   private refreshTimer?: ReturnType<typeof setTimeout>;
   /** Single-flight guards: at most one refresh (fetch + rebuild) runs at a
@@ -121,6 +127,11 @@ export class ChatBrowser extends Abject {
       // verbatim; the taskbar pulses the chat icon while active.
       if (aspect === 'goalActivity') {
         this.changed('goalActivity', value ?? {});
+        const working = !!(value && typeof value === 'object' && (value as { active?: boolean }).active);
+        if (working !== this.anyChatWorking) {
+          this.anyChatWorking = working;
+          this.refreshHeader();
+        }
         return;
       }
 
@@ -169,14 +180,20 @@ export class ChatBrowser extends Abject {
     if (!this.chatManagerId) return;
     try {
       await this.request(request(this.id, this.chatManagerId, 'newConversation', {}), 5000);
-    } catch (err) { log.warn(`newConversation failed: ${String(err)}`); }
+    } catch (err) {
+      log.warn(`newConversation failed: ${String(err)}`);
+      this.playEffect('shake');
+    }
   }
 
   private async requestShowConversation(conversationId: string): Promise<void> {
     if (!this.chatManagerId) return;
     try {
       await this.request(request(this.id, this.chatManagerId, 'showConversation', { conversationId }), 5000);
-    } catch (err) { log.warn(`showConversation failed: ${String(err)}`); }
+    } catch (err) {
+      log.warn(`showConversation failed: ${String(err)}`);
+      this.playEffect('shake');
+    }
   }
 
   private async requestDeleteConversation(conversationId: string): Promise<void> {
@@ -186,8 +203,39 @@ export class ChatBrowser extends Abject {
       await this.notify('Conversation deleted', 'success');
     } catch (err) {
       log.warn(`deleteConversation failed: ${String(err)}`);
+      this.playEffect('shake');
       await this.notify('Delete failed', 'error');
     }
+  }
+
+  /** Play a one-shot slab effect on the open overview window (visual only). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    try {
+      this.playWindowEffect(this.windowId, effect, color);
+    } catch { /* window gone */ }
+  }
+
+  // ─── Header ────────────────────────────────────────────────────────
+
+  /** Header text: the chat count, plus "working" while a chat is busy. */
+  private headerText(): string {
+    const count = this.chatCount === 1 ? '1 chat' : `${this.chatCount} chats`;
+    return sectionHeaderText(this.theme, this.anyChatWorking ? `${count} \u00B7 working` : count);
+  }
+
+  /** Heading style at rest; the living light while a chat is working. */
+  private headerStyle(): Record<string, unknown> {
+    const base = { ...sectionHeaderStyle(this.theme, 14), align: 'left', wordWrap: false, selectable: false };
+    return this.anyChatWorking ? { ...base, color: livingStyle(this.theme).color } : base;
+  }
+
+  /** Push the header's text and style (on working-state flips). */
+  private refreshHeader(): void {
+    if (!this.headerLabelId) return;
+    try {
+      this.send(event(this.id, this.headerLabelId, 'update', { text: this.headerText(), style: this.headerStyle() }));
+    } catch { /* widget gone */ }
   }
 
   /**
@@ -288,6 +336,7 @@ export class ChatBrowser extends Abject {
     this.rootLayoutId = undefined;
     this.listWidgetId = undefined;
     this.newChatBtnId = undefined;
+    this.headerLabelId = undefined;
     this.changed('visibility', false);
     return true;
   }
@@ -322,6 +371,7 @@ export class ChatBrowser extends Abject {
         } catch { /* best effort */ }
         this.listWidgetId = undefined;
         this.newChatBtnId = undefined;
+        this.headerLabelId = undefined;
         await this.populate(rows);
       }
     } finally {
@@ -343,11 +393,12 @@ export class ChatBrowser extends Abject {
       })
     );
 
+    this.chatCount = rows.length;
     const headerSpecs: Array<Record<string, unknown>> = [
       {
         type: 'label', windowId: this.windowId,
-        text: sectionHeaderText(this.theme, rows.length === 1 ? '1 chat' : `${rows.length} chats`),
-        style: { ...sectionHeaderStyle(this.theme, 14), align: 'left', wordWrap: false, selectable: false },
+        text: this.headerText(),
+        style: this.headerStyle(),
       },
       {
         type: 'button', windowId: this.windowId, text: '+ New chat',
@@ -363,6 +414,7 @@ export class ChatBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'create', { specs: headerSpecs })
     );
     const titleLabelId = headerIds[0];
+    this.headerLabelId = titleLabelId;
     this.newChatBtnId = headerIds[1];
 
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {

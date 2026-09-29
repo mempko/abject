@@ -48,6 +48,12 @@ const WIN_H = 500;
 const EYE_PREFIX = 'llm-monitor-eye';
 /** Eye sigil ring diameter (px). */
 const EYE_SIZE = 26;
+/** Node id of the living-light stream that flows into The Eye while calls are in flight. */
+const EYE_STREAM_ID = `${EYE_PREFIX}-stream`;
+/** How far left of the eye the stream starts (px); motes fade out as they reach the pupil. */
+const EYE_STREAM_REACH = 110;
+/** Minimum gap between failure effects, so a burst of failed calls reads as one event. */
+const FAILURE_FX_GAP_MS = 1500;
 const DETAIL_W = 650;
 const DETAIL_H = 500;
 
@@ -256,6 +262,10 @@ export class LLMMonitor extends Abject {
   private eyeShown = false;
   /** Last known main window size, for anchoring the sigil to the header's right edge. */
   private eyeWinSize?: { width: number; height: number };
+  /** Particle rate last sent to The Eye's stream (0 = no stream in the scene). */
+  private eyeStreamRate = 0;
+  /** When the last failure effect played, for coalescing bursts of failed calls. */
+  private lastFailureFxAt = 0;
 
   constructor() {
     super({
@@ -365,6 +375,9 @@ export class LLMMonitor extends Abject {
       ) {
         if (this.windowId) {
           this.scheduleRefresh();
+          if (aspect === 'requestError') this.signalFailedCall(value);
+          // Pausing holds every model call: ask for attention once.
+          if (aspect === 'paused') this.windowEffect('pulse', '$statusWarning');
         }
       }
     });
@@ -434,6 +447,7 @@ export class LLMMonitor extends Abject {
     this.windowId = undefined;
     this.eyeShown = false;
     this.eyeWinSize = undefined;
+    this.eyeStreamRate = 0;
     this.clearViewTracking();
     this.changed('visibility', false);
     return true;
@@ -618,13 +632,18 @@ export class LLMMonitor extends Abject {
    * sortable per-model table. Unlike the request tabs this one is a table
    * widget rather than hand-reconciled rows — the data is a small aggregate
    * that is cheap to re-send whole, and the widget brings its own sorting.
+   *
+   * The tab groups its controls into cards the way the system settings
+   * window does: Spend (the figures), Retention (how long the ledger keeps
+   * calls) and a Danger zone holding Clear ledger. The cards stack in a
+   * scrollable body, each sized to its content.
    */
   private async buildStatsTab(): Promise<void> {
     const spendBox = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId!,
-        margins: { top: 4, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
+        margins: { top: 4, right: 0, bottom: 4, left: 0 },
+        spacing: 10,
       })
     );
     await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
@@ -659,26 +678,31 @@ export class LLMMonitor extends Abject {
     this.statsChartId = chartId;
     this.statsTableId = tableId;
 
-    await this.request(request(this.id, spendBox, 'addLayoutChildren', {
+    // ── Spend card: totals, the per-day bars, and the per-model table ──
+    // The table has a fixed height here: a scrolling body gives an expanding
+    // child no stable height to fill, and the table scrolls its own rows.
+    const spendCard = await this.sectionCard(spendBox, 'Spend');
+    await this.request(request(this.id, spendCard, 'addLayoutChildren', {
       children: [
         { widgetId: summaryId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: noteId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 16 } },
         { widgetId: chartId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 110 } },
-        { widgetId: tableId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: tableId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 180 } },
       ],
     }));
 
-    // Footer: clearing the ledger is destructive and rare, so it lives here
-    // rather than in the window-wide control bar.
-    const footerId = await this.request<AbjectId>(
+    // ── Retention card: the policy inputs, Apply, and the window they produce ──
+    const retentionCard = await this.sectionCard(spendBox, 'Retention',
+      'How long the ledger keeps calls. Zero days or calls means no limit; zero prompts stores no prompt text.');
+    const retentionRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: spendBox,
+        parentLayoutId: retentionCard,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 6,
       })
     );
-    await this.request(request(this.id, spendBox, 'addLayoutChild', {
-      widgetId: footerId,
+    await this.request(request(this.id, retentionCard, 'addLayoutChild', {
+      widgetId: retentionRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 26 },
     }));
@@ -695,7 +719,7 @@ export class LLMMonitor extends Abject {
             { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
             { type: 'button', windowId: this.windowId!, text: 'Apply', style: { fontSize: 10, background: this.theme.actionBg, color: this.theme.actionText } },
             { type: 'button', windowId: this.windowId!, text: 'Clear ledger', style: { fontSize: 10, ...destructiveFillStyle(this.theme) } },
-            { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 10, color: this.theme.sectionLabel, fontStyle: 'italic' } },
+            { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 10, color: this.theme.sectionLabel, fontStyle: 'italic', wordWrap: true } },
           ],
         })
       );
@@ -707,7 +731,7 @@ export class LLMMonitor extends Abject {
     this.footerNoteId = footerNoteId;
     await this.addDep(applyId);
     await this.addDep(resetId);
-    await this.request(request(this.id, footerId, 'addLayoutChildren', {
+    await this.request(request(this.id, retentionRowId, 'addLayoutChildren', {
       children: [
         { widgetId: keepLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 62, height: 24 } },
         { widgetId: daysInputId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 44, height: 24 } },
@@ -716,10 +740,43 @@ export class LLMMonitor extends Abject {
         { widgetId: bodiesLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 96, height: 24 } },
         { widgetId: bodyDaysInputId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 44, height: 24 } },
         { widgetId: applyId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 54, height: 24 } },
-        { widgetId: resetId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 84, height: 24 } },
-        { widgetId: footerNoteId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 24 } },
       ],
     }));
+    await this.request(request(this.id, retentionRowId, 'addLayoutSpacer', {}));
+    // The note says what window the totals above cover; it wraps to two lines.
+    await this.request(request(this.id, retentionCard, 'addLayoutChild', {
+      widgetId: footerNoteId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // ── Danger zone: clearing the ledger is destructive and rare, so it
+    // stands apart from the retention policy rather than beside Apply.
+    const dangerCard = await this.sectionCard(spendBox, 'Danger zone',
+      'Clearing throws away every recorded call with its prompts, tokens and cost; spend totals restart from zero.');
+    await this.request(request(this.id, dangerCard, 'addLayoutChild', {
+      widgetId: resetId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 100, height: 26 },
+    }));
+  }
+
+  /**
+   * A grouped card for one section of the Stats tab (WidgetManager
+   * createSection: ruled panel, sigil title, optional hint). Returns the
+   * card's layout id: add the section's rows to it. Inside the scrollable
+   * tab body the card sizes to its content.
+   */
+  private async sectionCard(parentId: AbjectId, title: string, description?: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: parentId,
+        windowId: this.windowId,
+        title,
+        ...(description ? { description, hintHeight } : {}),
+      })
+    );
+    return sectionId;
   }
 
   /**
@@ -817,7 +874,7 @@ export class LLMMonitor extends Abject {
       'Finished calls land here. Press View on a row to read its full prompt and output.',
     ));
 
-    await this.updateEye(activeRequests.length > 0);
+    await this.updateEye(activeRequests.length);
   }
 
   /**
@@ -1002,12 +1059,18 @@ export class LLMMonitor extends Abject {
   /** Read the retention inputs and push the policy to the LLM object. */
   private async applyRetention(): Promise<void> {
     if (!this.llmObjectId) return;
+    // A field holding something other than a whole number is skipped, and
+    // the window shakes so the rejected value does not pass unnoticed.
+    let rejected = false;
     const read = async (widgetId?: AbjectId): Promise<number | undefined> => {
       if (!widgetId) return undefined;
       try {
         const v = await this.request<string>(request(this.id, widgetId, 'getValue', {}));
-        const n = parseInt(String(v ?? '').trim(), 10);
-        return Number.isFinite(n) && n >= 0 ? n : undefined;
+        const raw = String(v ?? '').trim();
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 0) return n;
+        if (raw.length > 0) rejected = true;
+        return undefined;
       } catch {
         return undefined;
       }
@@ -1025,12 +1088,15 @@ export class LLMMonitor extends Abject {
       payload.keepText = resident > 0;
       payload.residentTextEntries = resident;
     }
+    if (rejected) this.windowEffect('shake');
     if (Object.keys(payload).length === 0) return;
 
     try {
       await this.request(request(this.id, this.llmObjectId, 'setLedgerRetention', payload));
+      if (!rejected) this.windowEffect('flash', '$accent');
     } catch (err) {
       log.warn('Failed to set ledger retention:', err);
+      this.windowEffect('shake');
     }
     this.lastRetentionJson = undefined;
     this.lastStatsRowsJson = undefined;
@@ -1458,11 +1524,23 @@ export class LLMMonitor extends Abject {
 
   /**
    * The Eye opens while any LLM request is in flight and closes when the
-   * last one settles. One scene batch per transition; all motion is client-side.
+   * last one settles. While it is open, a thin stream of living light flows
+   * along the control bar into the pupil, denser the more calls are in
+   * flight. The stream is a child of the sigil, so closing the eye removes
+   * it and the desktop can rest. Scene traffic happens only on transitions
+   * (open, close, a change in the in-flight count); all motion is client-side.
    */
-  private async updateEye(active: boolean): Promise<void> {
+  private async updateEye(activeCount: number): Promise<void> {
     if (!this.windowId) return;
-    const want = active;
+    const want = activeCount > 0;
+    if (want && this.eyeShown) {
+      const rate = LLMMonitor.eyeStreamRateFor(activeCount);
+      if (rate !== this.eyeStreamRate) {
+        this.eyeStreamRate = rate;
+        await this.sendEyeOps([{ op: 'update', id: EYE_STREAM_ID, params: { rate } }]);
+      }
+      return;
+    }
     if (want === this.eyeShown) return;
     if (want) {
       if (!this.eyeWinSize) {
@@ -1474,11 +1552,87 @@ export class LLMMonitor extends Abject {
         } catch { /* fall back to the default size */ }
       }
       this.eyeShown = true;
-      await this.sendEyeOps(eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE));
+      this.eyeStreamRate = LLMMonitor.eyeStreamRateFor(activeCount);
+      await this.sendEyeOps([
+        ...eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE),
+        this.eyeStreamOp(this.eyeStreamRate),
+      ]);
     } else {
       this.eyeShown = false;
+      this.eyeStreamRate = 0;
       await this.sendEyeOps(removeSigilOps(EYE_PREFIX));
     }
+  }
+
+  /**
+   * Motes per second for the stream into The Eye: a steady trickle for one
+   * call, thickening with each concurrent call up to a cap.
+   */
+  private static eyeStreamRateFor(activeCount: number): number {
+    if (activeCount <= 0) return 0;
+    return Math.min(36, 12 + (activeCount - 1) * 6);
+  }
+
+  /**
+   * The living-light stream: an emitter left of the eye (in the sigil's
+   * local space) aimed straight at the pupil. Speed times lifetime is about
+   * the reach, so each mote fades out as it arrives and the light reads as
+   * drawn into the eye.
+   */
+  private eyeStreamOp(rate: number): SceneOp {
+    return {
+      op: 'add', id: EYE_STREAM_ID, parentId: `${EYE_PREFIX}-sigil`, kind: 'particles',
+      transform: { position: [-EYE_STREAM_REACH, 0, 0] },
+      params: {
+        rate,
+        lifetime: 1250,
+        speed: [EYE_STREAM_REACH * 0.72, EYE_STREAM_REACH * 0.9],
+        direction: [1, 0, 0],
+        spread: 0.06,
+        emitterSize: [8, 5, 2],
+        size: [1.1, 2.3],
+        color: '$accentSecondary',
+        shape: 'glow',
+        maxParticles: 80,
+      },
+    };
+  }
+
+  /**
+   * A call just failed. Budget refusals ask for attention (the goal's spend
+   * cap was reached); any other failure flashes the error light and glitches
+   * the window, and the eye's inner ring flashes with it while it is open.
+   * Bursts of failures coalesce into one effect.
+   */
+  private signalFailedCall(value: unknown): void {
+    if (!this.windowId) return;
+    const now = Date.now();
+    if (now - this.lastFailureFxAt < FAILURE_FX_GAP_MS) return;
+    this.lastFailureFxAt = now;
+    const error = String((value as { error?: unknown } | undefined)?.error ?? '');
+    // GoalManager's refusals read "Goal token budget exhausted", "Goal cost
+    // budget exhausted ...", or "Goal budget unavailable".
+    if (/\bgoal\b.*\bbudget (exhausted|unavailable)/i.test(error)) {
+      this.windowEffect('pulse', '$statusWarning');
+      return;
+    }
+    this.windowEffect('flash', '$statusError');
+    this.windowEffect('glitch', '$statusError');
+    if (this.eyeShown) {
+      void this.sendEyeOps([{
+        op: 'animate', id: `${EYE_PREFIX}-sigil-inner`,
+        params: { preset: 'flash', color: '$statusError', duration: 700 },
+      }]);
+    }
+  }
+
+  /**
+   * Play a one-shot slab effect on the main window (visual only). Fire and
+   * forget: a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   private async sendEyeOps(ops: SceneOp[]): Promise<void> {
@@ -1511,6 +1665,7 @@ export class LLMMonitor extends Abject {
           await this.request(request(this.id, this.llmObjectId, 'pause', {}));
         } catch (err) {
           log.warn('Failed to pause LLM:', err);
+          this.windowEffect('shake');
         }
         await this.refreshView();
       }
@@ -1523,6 +1678,7 @@ export class LLMMonitor extends Abject {
           await this.request(request(this.id, this.llmObjectId, 'unpause', {}));
         } catch (err) {
           log.warn('Failed to unpause LLM:', err);
+          this.windowEffect('shake');
         }
         await this.refreshView();
       }
@@ -1541,10 +1697,20 @@ export class LLMMonitor extends Abject {
 
     if (fromId === this.clearLedgerBtnId) {
       if (this.llmObjectId) {
+        // Every total on every tab is rolled up from the ledger, so clearing
+        // it is irreversible: confirm first.
+        const confirmed = await this.confirm({
+          title: 'Clear Ledger',
+          message: 'Throw away every recorded call, with its prompts, tokens and cost? Spend totals restart from zero.',
+          confirmLabel: 'Clear ledger',
+          destructive: true,
+        });
+        if (!confirmed) return;
         try {
           await this.request(request(this.id, this.llmObjectId, 'clearLedger', {}));
         } catch (err) {
           log.warn('Failed to clear the ledger:', err);
+          this.windowEffect('shake');
         }
         this.lastStatsRowsJson = undefined;
         this.lastStatsDaysJson = undefined;
@@ -1593,6 +1759,7 @@ export class LLMMonitor extends Abject {
         }
       } catch (err) {
         log.warn('Failed to fetch request detail:', err);
+        this.windowEffect('shake');
       }
       return;
     }
@@ -1638,6 +1805,8 @@ export class LLMMonitor extends Abject {
 - Retention lives on the Stats tab: how many days to keep everything (prompts and completions included), an optional hard call ceiling, and how many recent prompts to hold in memory (0 stops storing prompt text at all). "Clear ledger" throws away every recorded call, and with it every total rolled up from them.
 - The ledger persists across restarts, so yesterday's spend is still there tomorrow. The stats line describes exactly the retained window, which the Spend tab footer names.
 - Pause/Unpause buttons to control the LLM object.
+- The Eye: while any call is in flight an eye sigil opens at the right of the control bar with a stream of light flowing into it, thicker the more calls run at once; it closes when the last call settles. A failed call flashes the window in the error colour and glitches it; a call refused by a goal's budget pulses it instead; pausing pulses it once.
+- Clear ledger asks for confirmation before throwing anything away.
 - Flicker-free updates: rows are fixed slots whose cells update in place, so re-sorting or new arrivals never rebuild the list.
 - Auto-refreshes every 2 seconds and on LLM state change events (event-driven refreshes are debounced).
 

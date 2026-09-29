@@ -21,6 +21,8 @@ const SCHEDULER_BROWSER_INTERFACE: InterfaceId = 'abjects:scheduler-browser';
 
 const WIN_W = 580;
 const WIN_H = 400;
+/** Minimum gap between fire pulses, so a fast interval reads as a heartbeat, not a strobe. */
+const FIRE_PULSE_GAP_MS = 4000;
 
 
 export class SchedulerBrowser extends Abject {
@@ -46,6 +48,8 @@ export class SchedulerBrowser extends Abject {
 
   private entries: ScheduleEntry[] = [];
   private selectedIndex = -1;
+  /** When the last fire pulse played. */
+  private lastFirePulseAt = 0;
 
   constructor() {
     super({
@@ -387,6 +391,7 @@ Use the Enable/Disable button to switch a schedule on or off, Delete to remove i
     this.detailEmptyShown = undefined;
     this.entries = [];
     this.selectedIndex = -1;
+    this.lastFirePulseAt = 0;
     this.changed('visibility', false);
     return true;
   }
@@ -514,6 +519,12 @@ Use the Enable/Disable button to switch a schedule on or off, Delete to remove i
     } catch { /* widgets may be gone */ }
   }
 
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
+  }
+
   // -- Actions (shared by detail-pane buttons and inline row actions) --
 
   private async doToggle(entry: ScheduleEntry): Promise<void> {
@@ -527,9 +538,11 @@ Use the Enable/Disable button to switch a schedule on or off, Delete to remove i
       entry.enabled = !entry.enabled;
       await this.rebuildList();
       await this.showDetail();
+      this.playEffect('flash', '$accent');
       await this.notify(`Schedule ${entry.enabled ? 'enabled' : 'disabled'}`, 'success');
     } catch (err) {
       log.warn('Failed to toggle schedule:', err);
+      this.playEffect('shake');
       await this.notify('Toggle failed', 'error');
     }
   }
@@ -555,6 +568,7 @@ Use the Enable/Disable button to switch a schedule on or off, Delete to remove i
       await this.notify('Schedule deleted', 'success');
     } catch (err) {
       log.warn('Failed to delete schedule:', err);
+      this.playEffect('shake');
       await this.notify('Delete failed', 'error');
     }
   }
@@ -602,6 +616,14 @@ Use the Enable/Disable button to switch a schedule on or off, Delete to remove i
 
     // Scheduler events -- refresh
     if (fromId === this.schedulerId) {
+      // A new schedule arrives with a flash; a firing schedule is work
+      // starting now, so it pulses (throttled for short intervals).
+      if (aspect === 'scheduleAdded') {
+        this.playEffect('flash');
+      } else if (aspect === 'scheduleFired' && Date.now() - this.lastFirePulseAt >= FIRE_PULSE_GAP_MS) {
+        this.lastFirePulseAt = Date.now();
+        this.playEffect('pulse');
+      }
       if (aspect === 'scheduleAdded' || aspect === 'scheduleRemoved' ||
           aspect === 'scheduleUpdated' || aspect === 'scheduleFired') {
         await this.loadEntries();

@@ -136,3 +136,12 @@ Two lights: `theme.accent` is the human hand (actions, focus, selection) and `th
 ### Focus Management
 
 `WindowAbject` tracks `focusedChildId`. Tab key cycles through focusable widgets (layouts implement `getFocusableWidgets()` recursively for nested containers). Focused widgets render a flat accent frame (no glow) for visual feedback.
+
+### Extending the UI (custom widget types, motion, particles)
+
+Everything here is open to any Abject, including user-built ScriptableAbjects:
+
+- **Custom widget types.** `WidgetManager.registerWidgetType({ type, description, params?, factoryId? })` adds a type every Abject can create through the normal `create({ specs: [{ type, windowId, ... }] })`. The factory handles `createWidget({ spec, windowId, rect, theme, uiServerId })` and returns the AbjectId of a widget that speaks the widget protocol: `render({ surfaceId, ox, oy })` returns draw commands, `update({ rect?, ... })`, `handleInput(input)` returns `{ consumed }`, optional `setFocused` / `getValue` / `updateTheme` / `destroy`. It repaints by sending `childDirty({ widgetId })` to its window. `listWidgetTypes()` lists built-in and registered types.
+- **Slab motion.** Window effects and lifecycle transitions are declarative specs (`src/ui/gl/slab-motion.ts`). Use `windowEffect`, `registerWindowEffect`, `listWindowEffects`, `setWindowTransitions`, `setModalStyle`, `setWindowModal`, `getMotion` and `resetMotion` on WidgetManager, or `effect` / `setModal` on a Window. The compositor evaluates them client-side; geometry and input never change.
+- **Focus decoration.** `setFocusDecoration({ ops })` sets the scene ops the focused window wears (default: a 3D eye sigil in the title band).
+- **Scene vocabulary.** A `particles` emitter node, a `ring` primitive, and the `shake` / `flash` / `float` animate presets join the window `scene` vocabulary.

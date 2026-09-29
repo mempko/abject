@@ -34,6 +34,8 @@ const KNOWLEDGE_BROWSER_INTERFACE: InterfaceId = 'abjects:knowledge-browser';
 
 const WIN_W = 900;
 const WIN_H = 540;
+/** Minimum gap between arrival flashes, so a curation pass reads as one signal. */
+const ARRIVAL_FLASH_GAP_MS = 1500;
 
 /** A node in the pattern language map. Ghost nodes are dangling link names. */
 interface GraphNode {
@@ -115,6 +117,8 @@ export class KnowledgeBrowser extends Abject {
   private activeTab = 0;
   private searchQuery = '';
   private showArchived = false;
+  /** When the last new-entry flash played. */
+  private lastArrivalFlashAt = 0;
 
   constructor() {
     super({
@@ -567,6 +571,7 @@ export class KnowledgeBrowser extends Abject {
     this.activeTab = 0;
     this.searchQuery = '';
     this.showArchived = false;
+    this.lastArrivalFlashAt = 0;
     this.changed('visibility', false);
     return true;
   }
@@ -714,6 +719,7 @@ export class KnowledgeBrowser extends Abject {
     try {
       const reviewerId = await this.discoverDep('TaskReviewer');
       if (!reviewerId) {
+        this.playEffect('shake');
         await this.notify('Reviewer not available', 'warning');
         return;
       }
@@ -721,16 +727,26 @@ export class KnowledgeBrowser extends Abject {
       const reply = await this.request<{ started: boolean; message?: string }>(
         request(this.id, reviewerId, 'curate', {})
       );
+      // Started: the request landed (hand-coloured, the user asked for it).
+      // Not started: the reviewer turned it away.
+      this.playEffect(reply.started ? 'flash' : 'shake', reply.started ? '$accent' : undefined);
       await this.notify(
         reply.message ?? (reply.started ? 'Curation started' : 'Curation did not start'),
         reply.started ? 'info' : 'warning'
       );
     } catch (err) {
+      this.playEffect('shake');
       const msg = err instanceof Error ? err.message : String(err);
       await this.notify(`Curate failed: ${msg.slice(0, 80)}`, 'error');
     } finally {
       this.send(event(this.id, this.curateBtnId, 'update', { busy: false }));
     }
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1254,6 +1270,7 @@ export class KnowledgeBrowser extends Abject {
 
       const entry = this.filteredEntries.find(e => e.id === this.selectedId);
       if (entry && this.isRemoteEntry(entry)) {
+        this.playEffect('shake');
         await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
         return;
       }
@@ -1265,6 +1282,7 @@ export class KnowledgeBrowser extends Abject {
         if (res && res.success === false) {
           throw new Error(res.error ?? 'entry no longer exists');
         }
+        this.playEffect('flash');
         await this.notify(entry ? `Restored "${entry.title}"` : 'Entry restored', 'success');
         await this.loadEntries();
         const restored = this.filteredEntries.find(e => e.id === this.selectedId);
@@ -1275,6 +1293,7 @@ export class KnowledgeBrowser extends Abject {
           await this.showEmptyState(true);
         }
       } catch (err) {
+        this.playEffect('shake');
         const msg = err instanceof Error ? err.message : String(err);
         await this.notify(`Restore failed: ${msg.slice(0, 80)}`, 'error');
       } finally {
@@ -1313,6 +1332,7 @@ export class KnowledgeBrowser extends Abject {
 
       const entry = this.filteredEntries.find(e => e.id === this.selectedId);
       if (entry && this.isRemoteEntry(entry)) {
+        this.playEffect('shake');
         await this.notify('This entry belongs to another peer and is read-only here.', 'warning');
         return;
       }
@@ -1348,6 +1368,7 @@ export class KnowledgeBrowser extends Abject {
         await this.showEmptyState(true);
         await this.loadEntries();
       } catch (err) {
+        this.playEffect('shake');
         const msg = err instanceof Error ? err.message : String(err);
         await this.notify(`Forget failed: ${msg.slice(0, 80)}`, 'error');
       } finally {
@@ -1359,6 +1380,12 @@ export class KnowledgeBrowser extends Abject {
     // KnowledgeBase events
     if (fromId === this.knowledgeBaseId) {
       if (aspect === 'entryAdded' || aspect === 'entryUpdated' || aspect === 'entryRemoved') {
+        // New knowledge saved (by an agent, the reviewer or curation) arrives
+        // in the living light; a burst of saves reads as one flash.
+        if (aspect === 'entryAdded' && Date.now() - this.lastArrivalFlashAt >= ARRIVAL_FLASH_GAP_MS) {
+          this.lastArrivalFlashAt = Date.now();
+          this.playEffect('flash');
+        }
         await this.loadEntries();
         if (this.graphActive()) await this.loadGraph();
         if (this.selectedId && aspect === 'entryUpdated') {

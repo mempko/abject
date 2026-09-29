@@ -7,6 +7,7 @@
  * commands over WebSocket to the thin browser FrontendClient.
  */
 
+import { validateSlabEffectSpec, type SlabEffectSpec, type SlabMotionConfig } from '../src/ui/gl/slab-motion.js';
 import {
   AbjectId,
   AbjectMessage,
@@ -155,6 +156,8 @@ export interface SurfaceState {
   sceneContributors: Map<string, AbjectId>;
   /** Abject-requested slab transform (tilt/float), replayed on reconnect. */
   slabTransform?: { rotation?: [number, number, number]; z?: number };
+  /** Surface is modal (see setSurfaceModal); replayed on reconnect. */
+  modal?: boolean;
   workspaceId?: string;
   title?: string;
 }
@@ -300,6 +303,8 @@ export class BackendUI extends Abject {
   private focusGlowRadius?: number;
   /** Active workspace's palette subset for the 3D scene (replayed on reconnect). */
   private sceneTheme?: SceneTheme;
+  /** Desktop motion configuration (from WidgetManager); replayed on reconnect. */
+  private slabMotion?: SlabMotionConfig;
   /**
    * World-scope scene nodes (the global scene graph beyond windows), keyed by
    * owning abject. Positions are workspace px; nodes live until removed or
@@ -519,6 +524,33 @@ export class BackendUI extends Abject {
                     type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } },
                     description: 'Scene operations (validated; invalid batches are rejected with the vocabulary)',
                   },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'surfaceEffect',
+                description: 'Play a slab effect on your window, animated client-side (visual only: geometry and input are unchanged). effect: a registered or built-in effect name (built-ins: materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec (see WidgetManager "motion"). color: optional CSS color or $token overriding the effect\'s light colours.',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Your surface' },
+                  { name: 'effect', type: { kind: 'reference', reference: 'string | SlabEffectSpec' }, description: 'Effect name or inline spec' },
+                  { name: 'color', type: { kind: 'primitive', primitive: 'string' }, description: 'CSS color or $token', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSurfaceModal',
+                description: 'Mark your surface modal (or not). While a modal surface shows, every other window recedes into depth and dims (the style is part of the motion config).',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Your surface' },
+                  { name: 'modal', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true while the surface is modal' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSlabMotion',
+                description: 'Replace the desktop motion configuration (named effects, window transitions, modal style). WidgetManager owns this; call its motion methods instead.',
+                parameters: [
+                  { name: 'config', type: { kind: 'reference', reference: 'SlabMotionConfig' }, description: 'Full motion configuration' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -946,6 +978,52 @@ export class BackendUI extends Abject {
       if (!theme || typeof theme !== 'object' || !theme.colors) return false;
       this.sceneTheme = theme;
       this.sendToFrontend({ type: 'setSceneTheme', theme: theme as unknown as Record<string, unknown> });
+      return true;
+    });
+
+    this.on('surfaceEffect', async (msg: AbjectMessage) => {
+      const { surfaceId, effect, color } = msg.payload as {
+        surfaceId: string; effect: string | SlabEffectSpec; color?: string;
+      };
+      if (typeof effect === 'string') {
+        contractRequire(effect.length > 0, 'surfaceEffect: effect name is empty');
+      } else {
+        const problems = validateSlabEffectSpec(effect);
+        contractRequire(problems.length === 0, `surfaceEffect: invalid effect spec: ${problems.join('; ')}`);
+      }
+      contractRequire(color === undefined || typeof color === 'string', 'surfaceEffect: color must be a string');
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      contractRequire(state.objectId === msg.routing.from, 'surfaceEffect: caller does not own the surface');
+      // Transient by design: not retained, not replayed on reconnect.
+      this.sendToFrontend({
+        type: 'surfaceEffect', surfaceId,
+        effect: effect as string | Record<string, unknown>,
+        ...(color ? { color } : {}),
+      });
+      return true;
+    });
+
+    this.on('setSurfaceModal', async (msg: AbjectMessage) => {
+      const { surfaceId, modal } = msg.payload as { surfaceId: string; modal: boolean };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      contractRequire(state.objectId === msg.routing.from, 'setSurfaceModal: caller does not own the surface');
+      state.modal = modal === true;
+      this.sendToFrontend({ type: 'setSurfaceModal', surfaceId, modal: state.modal });
+      return true;
+    });
+
+    this.on('setSlabMotion', async (msg: AbjectMessage) => {
+      const { config } = msg.payload as { config: SlabMotionConfig };
+      contractRequire(!!config && typeof config === 'object' && !!config.transitions && !!config.effects,
+        'setSlabMotion: config needs effects and transitions');
+      for (const [name, spec] of Object.entries(config.effects)) {
+        const problems = validateSlabEffectSpec(spec);
+        contractRequire(problems.length === 0, `setSlabMotion: effect "${name}": ${problems.join('; ')}`);
+      }
+      this.slabMotion = config;
+      this.sendToFrontend({ type: 'setSlabMotion', config: config as unknown as Record<string, unknown> });
       return true;
     });
 
@@ -3475,7 +3553,13 @@ IMPORTANT:
         theme: this.sceneTheme as unknown as Record<string, unknown>,
       }, clientId);
     }
+    if (this.slabMotion) {
+      this.sendToClient({ type: 'setSlabMotion', config: this.slabMotion as unknown as Record<string, unknown> }, clientId);
+    }
     for (const state of this.surfaces.values()) {
+      if (state.modal) {
+        this.sendToClient({ type: 'setSurfaceModal', surfaceId: state.surfaceId, modal: true }, clientId);
+      }
       if (state.slabTransform) {
         this.sendToClient({
           type: 'setSurfaceTransform',

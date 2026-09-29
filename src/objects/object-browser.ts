@@ -37,7 +37,10 @@ function destructiveFillStyle(theme: ThemeData): { background: string; color: st
   return { background: theme.destructiveBg, color: theme.destructiveText, borderColor: theme.destructiveBorder };
 }
 
-/** Text of the Send Message section header in the method detail pane. */
+/**
+ * Marker for where the Send Message section starts in the method detail
+ * pane's label specs (the section itself renders as a Send message card).
+ */
 function sendSectionText(theme: ThemeData): string {
   return sectionHeaderText(theme, 'Send Message');
 }
@@ -113,6 +116,10 @@ export class ObjectBrowser extends Abject {
   private msgParamInputIds: Map<string, AbjectId> = new Map(); // param name → input widget
   private msgSendBtnId?: AbjectId;
   private msgResponseLabelId?: AbjectId;
+  /** The layout holding msgResponseLabelId (a card, or pane 4 itself). */
+  private msgResponseLayoutId?: AbjectId;
+  /** Grouped cards in pane 4 (destroying one takes its rows with it). */
+  private pane4SectionIds: AbjectId[] = [];
 
   // ── Navigation ──
   private tabs: InvestigationTab[] = [];
@@ -409,6 +416,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
     this.msgParamInputIds.clear();
     this.msgSendBtnId = undefined;
     this.msgResponseLabelId = undefined;
+    this.msgResponseLayoutId = undefined;
+    this.pane4SectionIds = [];
   }
 
   // ── Tab management ────────────────────────────────────────────────
@@ -891,6 +900,9 @@ Pane 4: Detail view with signature, status, source, send-message form,
     if (this.msgSendBtnId) allIds.push(this.msgSendBtnId);
     if (this.msgResponseLabelId) allIds.push(this.msgResponseLabelId);
 
+    // Cards last: each takes its rows with it.
+    allIds.push(...this.pane4SectionIds);
+
     for (const id of allIds) {
       this.send(request(this.id, id, 'destroy', {}));
     }
@@ -899,6 +911,26 @@ Pane 4: Detail view with signature, status, source, send-message form,
     this.msgParamInputIds.clear();
     this.msgSendBtnId = undefined;
     this.msgResponseLabelId = undefined;
+    this.msgResponseLayoutId = undefined;
+    this.pane4SectionIds = [];
+  }
+
+  /**
+   * A grouped card in pane 4 (WidgetManager createSection: ruled panel, sigil
+   * title, optional hint). Returns the card's layout id: add the section's
+   * rows to it. Inside the scrollable pane the card sizes to its content.
+   */
+  private async addPane4Section(title: string, description?: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: this.pane4LayoutId!,
+        windowId: this.windowId,
+        title,
+        ...(description ? { description, hintHeight } : {}),
+      })
+    );
+    this.pane4SectionIds.push(sectionId);
+    return sectionId;
   }
 
   private async addPane4Label(text: string, isSecondary = false, style?: Record<string, unknown>): Promise<AbjectId> {
@@ -1013,6 +1045,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     }
 
     // ── Build label specs ──
+    // Identity labels head the pane; the Status card holds the live facts.
     type LabelSpec = { text: string; isSecondary: boolean; style?: Record<string, unknown> };
     const labelSpecs: LabelSpec[] = [];
 
@@ -1022,27 +1055,22 @@ Pane 4: Detail view with signature, status, source, send-message form,
       labelSpecs.push({ text: reg.manifest.description, isSecondary: true });
     }
 
-    labelSpecs.push({ text: `Instances: ${regs.length}`, isSecondary: true });
-
     if (tags.length > 0) {
       labelSpecs.push({ text: `Tags: ${tags.join(', ')}`, isSecondary: true });
     }
+
+    const statusSpecs: LabelSpec[] = [];
+    statusSpecs.push({ text: `Instances: ${regs.length}`, isSecondary: true });
 
     const stateText = reg.status?.state ?? 'running';
     const stateColor = stateText === 'error' ? this.theme.statusError
       : stateText === 'stopped' ? this.theme.textMeta
       : livingStyle(this.theme).color;
-    labelSpecs.push({ text: sectionHeaderText(this.theme, 'Status'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
-    labelSpecs.push({ text: `State: ${stateText}`, isSecondary: true, style: { color: stateColor } });
+    statusSpecs.push({ text: `State: ${stateText}`, isSecondary: true, style: { color: stateColor } });
 
     if (reg.status?.errorCount !== undefined && reg.status.errorCount > 0) {
-      labelSpecs.push({ text: `Errors: ${reg.status.errorCount}`, isSecondary: true, style: { color: this.theme.statusError } });
+      statusSpecs.push({ text: `Errors: ${reg.status.errorCount}`, isSecondary: true, style: { color: this.theme.statusError } });
     }
-
-    labelSpecs.push({ text: sectionHeaderText(this.theme, 'Actions'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
-
-    // Response label placeholder (last)
-    const responseLabelIndex = labelSpecs.length + /* buttons below */ 0; // tracked after buttons
 
     // ── Build button specs ──
     type BtnSpec = { text: string; actionKey: string; style?: Record<string, unknown> };
@@ -1068,8 +1096,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
       }
     }
 
-    // ── Batch create all labels + buttons + response label ──
-    const allLabelTexts = [...labelSpecs, { text: '', isSecondary: true }]; // last = response label
+    // ── Batch create all labels + response label + buttons ──
+    const allLabelTexts = [...labelSpecs, ...statusSpecs, { text: '', isSecondary: true }]; // last = response label
     const labelCreateSpecs = allLabelTexts.map(ls => ({
       type: 'label',
       windowId: this.windowId!,
@@ -1102,7 +1130,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     const btnIds = widgetIds.slice(allLabelTexts.length);
 
     // Track widgets
-    const contentLabelIds = labelIds.slice(0, labelSpecs.length);
+    const contentLabelIds = labelIds.slice(0, labelSpecs.length + statusSpecs.length);
     this.msgResponseLabelId = labelIds[labelIds.length - 1];
     for (const id of contentLabelIds) this.pane4LabelIds.push(id);
     this.pane4LabelIds.push(this.msgResponseLabelId);
@@ -1111,31 +1139,59 @@ Pane 4: Detail view with signature, status, source, send-message form,
       this.pane4ButtonIds.set(btnIds[i], btnSpecs[i].actionKey);
     }
 
-    // ── Batch add to layout ──
-    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
-
-    for (let i = 0; i < allLabelTexts.length; i++) {
-      const ls = allLabelTexts[i];
-      const text = ls.text;
+    // ── Lay out: identity labels, then Status, Actions and Danger zone cards ──
+    type LayoutChild = { widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> };
+    // Cards are narrower than the pane (their own margins), so their labels
+    // wrap sooner.
+    const labelChild = (widgetId: AbjectId, ls: LabelSpec, charsPerLine: number): LayoutChild => {
       const lineHeight = ls.isSecondary ? 16 : 18;
-      const lines = Math.max(1, Math.ceil(text.length / 40));
-      layoutChildren.push({
-        widgetId: labelIds[i],
+      const lines = Math.max(1, Math.ceil(ls.text.length / charsPerLine));
+      return {
+        widgetId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: Math.max(lineHeight, lines * lineHeight) },
-      });
-    }
-
-    for (const btnId of btnIds) {
-      layoutChildren.push({
-        widgetId: btnId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width: 160, height: 26 },
-      });
-    }
+      };
+    };
+    const buttonChild = (widgetId: AbjectId): LayoutChild => ({
+      widgetId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 160, height: 26 },
+    });
 
     await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', {
-      children: layoutChildren,
+      children: labelSpecs.map((ls, i) => labelChild(labelIds[i], ls, 40)),
+    }));
+
+    const statusCard = await this.addPane4Section('Status');
+    await this.request(request(this.id, statusCard, 'addLayoutChildren', {
+      children: statusSpecs.map((ls, i) => labelChild(labelIds[labelSpecs.length + i], ls, 34)),
+    }));
+
+    // Deleting is destructive, so it stands apart in a Danger zone card.
+    const actionIdx = btnSpecs.map((_, i) => i).filter(i => btnSpecs[i].actionKey !== 'deleteObject');
+    const dangerIdx = btnSpecs.map((_, i) => i).filter(i => btnSpecs[i].actionKey === 'deleteObject');
+
+    let actionsCard: AbjectId | undefined;
+    if (actionIdx.length > 0) {
+      actionsCard = await this.addPane4Section('Actions');
+      await this.request(request(this.id, actionsCard, 'addLayoutChildren', {
+        children: actionIdx.map(i => buttonChild(btnIds[i])),
+      }));
+    }
+    let dangerCard: AbjectId | undefined;
+    if (dangerIdx.length > 0) {
+      dangerCard = await this.addPane4Section('Danger zone', 'Deleting stops this object for good.');
+      await this.request(request(this.id, dangerCard, 'addLayoutChildren', {
+        children: dangerIdx.map(i => buttonChild(btnIds[i])),
+      }));
+    }
+
+    // Action feedback reads under the buttons that produced it.
+    this.msgResponseLayoutId = actionsCard ?? dangerCard ?? this.pane4LayoutId;
+    await this.request(request(this.id, this.msgResponseLayoutId!, 'addLayoutChild', {
+      widgetId: this.msgResponseLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 16 },
     }));
 
     // Fire-and-forget addDependent for buttons so ObjectBrowser receives click events
@@ -1193,9 +1249,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
       labelSpecs.push({ text: `Interface: ${method.iface.id}`, isSecondary: true });
     }
 
-    // Find Implementors / Senders buttons, under their own section header
+    // Find Implementors / Senders buttons, grouped in an Explore card
     if (method.type === 'method') {
-      labelSpecs.push({ text: sectionHeaderText(this.theme, 'Explore'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
       navBtnSpecs.push({ text: 'Find Implementors', actionKey: `implementors:${method.name}` });
       navBtnSpecs.push({ text: 'Find Senders', actionKey: `senders:${method.name}` });
     }
@@ -1257,7 +1312,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     }
 
     // We'll build specs in this order for easy index mapping:
-    // [preSendLabels] [navBtns] [sendSectionLabel "Send Message"] [paramLabel+input pairs] [sendBtn] [responseLabel]
+    // [preSendLabels] [navBtns] [paramLabel+input pairs] [sendBtn] [responseLabel]
     const batchSpecs: WidgetSpec[] = [];
 
     // Track indices for mapping
@@ -1281,8 +1336,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
       });
     }
 
-    // Send section
-    let sendSectionLabelIndex = -1;
+    // Send section (its title is the Send message card's header)
     // paramLabelIndices[i] = index of label for inputSpecs[i]
     const paramLabelIndices: number[] = [];
     const inputIndices: number[] = [];
@@ -1290,14 +1344,6 @@ Pane 4: Detail view with signature, status, source, send-message form,
     let responseLabelIndex = -1;
 
     if (hasSendSection) {
-      sendSectionLabelIndex = batchSpecs.length;
-      batchSpecs.push({
-        type: 'label', windowId: this.windowId!,
-        rect: { x: 0, y: 0, width: 0, height: 0 },
-        text: sendSectionText(this.theme),
-        style: { ...sectionHeaderStyle(this.theme, 12) },
-      });
-
       if (inputSpecs.length === 1 && inputSpecs[0].paramName === '__raw_json__') {
         // raw json: label then input
         paramLabelIndices.push(batchSpecs.length);
@@ -1369,7 +1415,6 @@ Pane 4: Detail view with signature, status, source, send-message form,
       this.pane4ButtonIds.set(widgetIds[i], navBtnSpecs[i - navBtnStart].actionKey);
     }
     if (hasSendSection) {
-      this.pane4LabelIds.push(widgetIds[sendSectionLabelIndex]);
       for (let i = 0; i < paramLabelIndices.length; i++) {
         this.pane4LabelIds.push(widgetIds[paramLabelIndices[i]]);
         const inputId = widgetIds[inputIndices[i]];
@@ -1380,8 +1425,9 @@ Pane 4: Detail view with signature, status, source, send-message form,
       this.pane4LabelIds.push(this.msgResponseLabelId);
     }
 
-    // ── Batch add to layout ──
-    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+    // ── Lay out: header labels, then the Explore and Send message cards ──
+    type LayoutChild = { widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> };
+    const layoutChildren: LayoutChild[] = [];
 
     // Pre-send labels
     for (let i = preSendLabelStart; i < navBtnStart; i++) {
@@ -1396,51 +1442,57 @@ Pane 4: Detail view with signature, status, source, send-message form,
       });
     }
 
-    // Nav buttons
-    for (let i = 0; i < navBtnSpecs.length; i++) {
-      layoutChildren.push({
-        widgetId: widgetIds[navBtnStart + i],
-        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width: 160, height: 26 },
-      });
+    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', {
+      children: layoutChildren,
+    }));
+
+    // Explore card: the cross-reference buttons
+    if (navBtnSpecs.length > 0) {
+      const exploreCard = await this.addPane4Section('Explore');
+      const navChildren: LayoutChild[] = [];
+      for (let i = 0; i < navBtnSpecs.length; i++) {
+        navChildren.push({
+          widgetId: widgetIds[navBtnStart + i],
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: 160, height: 26 },
+        });
+      }
+      await this.request(request(this.id, exploreCard, 'addLayoutChildren', { children: navChildren }));
     }
 
-    // Send section
+    // Send message card: one field per parameter, the send button (this
+    // card's primary action) and the response under it. Cards are narrower
+    // than the pane (their own margins), so their labels wrap sooner.
     if (hasSendSection) {
-      layoutChildren.push({
-        widgetId: widgetIds[sendSectionLabelIndex],
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 22 },
-      });
+      const sendCard = await this.addPane4Section('Send message');
+      const sendChildren: LayoutChild[] = [];
       for (let i = 0; i < inputSpecs.length; i++) {
         const paramLabelText = batchSpecs[paramLabelIndices[i]].text ?? '';
-        const paramLines = Math.max(1, Math.ceil(paramLabelText.length / 40));
-        layoutChildren.push({
+        const paramLines = Math.max(1, Math.ceil(paramLabelText.length / 34));
+        sendChildren.push({
           widgetId: widgetIds[paramLabelIndices[i]],
           sizePolicy: { vertical: 'fixed' },
           preferredSize: { height: Math.max(16, paramLines * 16) },
         });
-        layoutChildren.push({
+        sendChildren.push({
           widgetId: widgetIds[inputIndices[i]],
           sizePolicy: { vertical: 'fixed' },
           preferredSize: { height: 30 },
         });
       }
-      layoutChildren.push({
+      sendChildren.push({
         widgetId: widgetIds[sendBtnIndex],
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 180, height: 26 },
       });
-      layoutChildren.push({
+      sendChildren.push({
         widgetId: widgetIds[responseLabelIndex],
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 16 },
       });
+      await this.request(request(this.id, sendCard, 'addLayoutChildren', { children: sendChildren }));
+      this.msgResponseLayoutId = sendCard;
     }
-
-    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', {
-      children: layoutChildren,
-    }));
 
     // Fire-and-forget addDependent for nav buttons and send button
     for (let i = 0; i < navBtnSpecs.length; i++) {
@@ -1964,6 +2016,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     }
     if (!this.factoryId) {
       await this.showFeedback('Error: Factory not found');
+      this.windowEffect('shake');
       return;
     }
 
@@ -1984,9 +2037,11 @@ Pane 4: Detail view with signature, status, source, send-message form,
     try {
       await this.request(request(this.id, this.factoryId, 'kill', { objectId: targetId }));
       await this.showFeedback('Deleted');
+      this.windowEffect('flash', '$accent');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Error: ${msg.slice(0, 50)}`);
+      this.windowEffect('shake');
     }
 
     // Refresh and navigate back
@@ -2009,6 +2064,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     const source = (obj as unknown as { source?: string }).source;
     if (!source) {
       await this.showFeedback('No source to clone');
+      this.windowEffect('shake');
       return;
     }
 
@@ -2032,6 +2088,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     }
     if (!this.factoryId) {
       await this.showFeedback('Error: Factory not found');
+      this.windowEffect('shake');
       return;
     }
 
@@ -2039,6 +2096,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     const targetRegistryId = await this.findTargetRegistryForClone();
     if (!targetRegistryId) {
       await this.showFeedback('Error: no local workspace found');
+      this.windowEffect('shake');
       return;
     }
 
@@ -2069,9 +2127,11 @@ Pane 4: Detail view with signature, status, source, send-message form,
       }
 
       await this.showFeedback('Cloned to workspace');
+      this.windowEffect('flash');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Clone error: ${msg.slice(0, 50)}`);
+      this.windowEffect('shake');
     }
 
     await this.readCatalogSnapshot();
@@ -2121,6 +2181,15 @@ Pane 4: Detail view with signature, status, source, send-message form,
     return undefined;
   }
 
+  /**
+   * Play a one-shot slab effect on the browser window (visual only). Fire
+   * and forget: a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
+  }
+
   /** Show feedback text in the response label, resizing to fit. */
   private async showFeedback(text: string): Promise<void> {
     if (this.msgResponseLabelId && this.pane4LayoutId) {
@@ -2133,7 +2202,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
           totalLines += Math.max(1, Math.ceil((line.length || 1) / 35));
         }
         const height = Math.max(16, totalLines * 16);
-        await this.request(request(this.id, this.pane4LayoutId, 'updateLayoutChild', {
+        await this.request(request(this.id, this.msgResponseLayoutId ?? this.pane4LayoutId, 'updateLayoutChild', {
           widgetId: this.msgResponseLabelId,
           preferredSize: { height },
         }));
@@ -2175,6 +2244,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         payload = rawValue ? JSON.parse(rawValue) : {};
       } catch {
         await this.showFeedback('Error: invalid JSON payload');
+        this.windowEffect('shake');
         return;
       }
     } else {
@@ -2195,6 +2265,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         if (rawValue === '' && paramDecl.optional) continue;
         if (rawValue === '' && !paramDecl.optional) {
           await this.showFeedback(`Error: "${paramDecl.name}" is required`);
+          this.windowEffect('shake');
           return;
         }
 
@@ -2202,6 +2273,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         const parsed = this.parseParamValue(rawValue, paramDecl.type);
         if (parsed.error) {
           await this.showFeedback(`Error in "${paramDecl.name}": ${parsed.error}`);
+          this.windowEffect('shake');
           return;
         }
         payload[paramDecl.name] = parsed.value;
@@ -2221,10 +2293,13 @@ Pane 4: Detail view with signature, status, source, send-message form,
       );
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       await this.showFeedback(`Response: ${resultStr}`);
+      // The object answered: flash in the living light.
+      this.windowEffect('flash');
       await this.notify(`${methodName} returned ${resultStr.length > 60 ? resultStr.slice(0, 57) + '...' : resultStr}`, 'success');
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Error: ${errMsg}`);
+      this.windowEffect('shake');
       await this.notify(`${methodName} failed: ${errMsg.slice(0, 80)}`, 'error');
     } finally {
       if (this.msgSendBtnId) {

@@ -51,6 +51,7 @@ import type {
   VideoControlMsg,
 } from '../server/ws-protocol.js';
 import type { BackdropControl } from './backdrop.js';
+import type { SlabEffectSpec, SlabMotionConfig } from '../src/ui/gl/slab-motion.js';
 import { widgetFont, titleFont, codeFont, DEFAULT_THEME } from '../src/objects/widgets/widget-types.js';
 import type { ClientTransport } from './transport.js';
 import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
@@ -1083,6 +1084,15 @@ export class FrontendClient {
         break;
       }
 
+      case 'surfaceEffect':
+        this.compositor.surfaceEffect(msg.surfaceId, msg.effect as string | SlabEffectSpec, msg.color);
+        break;
+      case 'setSurfaceModal':
+        this.compositor.setSurfaceModal(msg.surfaceId, msg.modal);
+        break;
+      case 'setSlabMotion':
+        this.compositor.setSlabMotion(msg.config as unknown as SlabMotionConfig);
+        break;
       case 'setSurfaceTransform':
         this.compositor.setSurfaceTransform(msg.surfaceId, { rotation: msg.rotation, z: msg.z });
         break;

@@ -26,6 +26,9 @@ const PATH_H = 22;
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
 
+/** Uploads landing within this window celebrate once, not once per file. */
+const UPLOAD_BURST_GAP_MS = 1500;
+
 export class FileManager extends Abject {
   private fileSystemId?: AbjectId;
   private widgetManagerId?: AbjectId;
@@ -50,6 +53,8 @@ export class FileManager extends Abject {
   private selectedPath?: string;
   private selectedName = '';
   private selectedIsDir = false;
+  /** When the last upload burst played (a multi-file drop bursts once). */
+  private lastUploadBurstAt = 0;
 
   constructor() {
     super({
@@ -253,6 +258,7 @@ export class FileManager extends Abject {
     this.selectedName = '';
     this.selectedIsDir = false;
     this.entries = [];
+    this.lastUploadBurstAt = 0;
     this.changed('visibility', false);
     return true;
   }
@@ -301,6 +307,10 @@ export class FileManager extends Abject {
     if (this.pathLabelId) {
       await this.request(request(this.id, this.pathLabelId, 'update', { text: dir }));
     }
+    // Up has nowhere to go from the root.
+    if (this.upBtnId) {
+      await this.request(request(this.id, this.upBtnId, 'update', { disabled: dir === '/' }));
+    }
   }
 
   private emptyText(dir: string): string {
@@ -331,6 +341,12 @@ export class FileManager extends Abject {
         this.request(request(this.id, this.emptyLabelId, 'update', { style: { visible: empty } })),
       ]);
     } catch { /* widgets may be gone */ }
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   // ── Events ──────────────────────────────────────────────────────────
@@ -395,11 +411,17 @@ export class FileManager extends Abject {
     });
     if (name === null) return;
     const clean = name.trim().replace(/[/\\]/g, '_');
-    if (!clean) return;
+    if (!clean) {
+      this.playEffect('shake');
+      await this.notify('A folder needs a name', 'info');
+      return;
+    }
     try {
       await this.request(request(this.id, this.fileSystemId, 'mkdir', { path: this.joinPath(clean) }), 15000);
       await this.loadDir(this.currentDir);
+      this.playEffect('flash');
     } catch (err) {
+      this.playEffect('shake');
       await this.notify(`Could not create folder: ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`, 'error');
     }
   }
@@ -407,7 +429,7 @@ export class FileManager extends Abject {
   private async renameSelected(): Promise<void> {
     if (!this.fileSystemId) return;
     const target = this.actionTarget();
-    if (!target) { await this.notify('Select a file, or open a folder, to rename', 'info'); return; }
+    if (!target) { this.playEffect('shake'); await this.notify('Select a file, or open a folder, to rename', 'info'); return; }
     const newName = await this.prompt({
       title: target.isDir ? 'Rename folder' : 'Rename file',
       message: `Rename "${target.name}"`,
@@ -424,7 +446,9 @@ export class FileManager extends Abject {
       await this.notify(`Renamed to "${clean}"`, 'success');
       // If we renamed the folder we're inside, drop to its parent listing.
       await this.loadDir(target.path === this.currentDir ? parent : this.currentDir);
+      this.playEffect('flash');
     } catch (err) {
+      this.playEffect('shake');
       await this.notify(`Rename failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`, 'error');
     }
   }
@@ -457,13 +481,14 @@ export class FileManager extends Abject {
       await this.request(request(this.id, this.fileViewerId, 'openFile', { path }), 30000);
     } catch (err) {
       log.warn(`openFile ${path} failed:`, err instanceof Error ? err.message : String(err));
+      this.playEffect('shake');
     }
   }
 
   private async deleteSelected(): Promise<void> {
     if (!this.fileSystemId) return;
     const target = this.actionTarget();
-    if (!target) { await this.notify('Select a file, or open a folder, to delete', 'info'); return; }
+    if (!target) { this.playEffect('shake'); await this.notify('Select a file, or open a folder, to delete', 'info'); return; }
     const confirmed = await this.confirm({
       title: target.isDir ? 'Delete folder?' : 'Delete file?',
       message: target.isDir
@@ -481,6 +506,7 @@ export class FileManager extends Abject {
       // If we deleted the folder we're inside, drop to its parent listing.
       await this.loadDir(target.path === this.currentDir ? this.parentOf(this.currentDir) : this.currentDir);
     } catch (err) {
+      this.playEffect('shake');
       await this.notify(`Delete failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`, 'error');
     } finally {
       if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: false }));
@@ -494,8 +520,14 @@ export class FileManager extends Abject {
     try {
       await this.request(request(this.id, this.fileSystemId, 'writeFileBytes', { path, base64 }), 30000);
       await this.loadDir(this.currentDir);
+      // An upload landing is a completion; a multi-file drop bursts once.
+      if (Date.now() - this.lastUploadBurstAt >= UPLOAD_BURST_GAP_MS) {
+        this.lastUploadBurstAt = Date.now();
+        this.playEffect('burst');
+      }
     } catch (err) {
       log.warn(`store upload ${safeName} failed:`, err instanceof Error ? err.message : String(err));
+      this.playEffect('shake');
       await this.notify(`Failed to add "${safeName}"`, 'error');
     }
   }

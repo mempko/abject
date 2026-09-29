@@ -17,7 +17,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { require as requireContract, requireNonEmpty } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import { chromeCase } from '../core/theme-data.js';
@@ -282,6 +282,8 @@ export class WebBrowserViewer extends Abject {
       this.pendingHandoff = { msg, pageId, reason, timer, resolveOn: resolveOn ?? 'handback' };
 
       await this.updateControlUi();
+      // An agent is asking for the human hand: the window pulses for attention.
+      this.playEffect('pulse', '$accent');
       this.changed('humanControlRequested', { pageId, reason });
       return DEFERRED_REPLY;
     });
@@ -659,7 +661,11 @@ export class WebBrowserViewer extends Abject {
       );
       page.url = url;
       await this.updateUrlLabel();
-    } catch { /* nothing to go back/forward to — leave the page as is */ }
+    } catch {
+      // Nothing to go back/forward to: the page stays as is, and the window
+      // shakes so the press visibly registered.
+      this.playEffect('shake');
+    }
     this.lastShotDataUri = undefined;
     await this.refreshScreenshot();
   }
@@ -679,6 +685,8 @@ export class WebBrowserViewer extends Abject {
     await this.restartRefreshTimer(CONTROL_REFRESH_INTERVAL_MS);
     this.lastShotDataUri = undefined; // redraw so the control-mode border appears
     await this.refreshScreenshot();
+    // The human hand takes the page.
+    this.playEffect('flash', '$accent');
     const page = this.pages[this.selectedPageIndex];
     this.changed('humanControlStarted', { pageId: page?.pageId });
   }
@@ -698,7 +706,15 @@ export class WebBrowserViewer extends Abject {
     await this.restartRefreshTimer(REFRESH_INTERVAL_MS);
     this.lastShotDataUri = undefined; // redraw so the control-mode border clears
     await this.refreshScreenshot();
+    // Control returns to the live feed (and to the waiting agent, if any).
+    this.playEffect('flash');
     if (!hadHandoff) this.changed('humanControlEnded', { completed: true });
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   /**

@@ -27,6 +27,7 @@ import {
 import {
   SCENE_NODE_KINDS, MESH_PRIMITIVES, LIGHT_TYPES, DRAW_MODES,
   ANIM_PRESETS, ANIM_CHANNELS, SCENE_THEME_TOKENS, MAX_LIGHT_INTENSITY,
+  validateSceneOps, normalizeSceneOps,
 } from '../ui/gl/scene-types.js';
 import { MAX_MESH_LIGHTS } from '../ui/gl/shaders.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
@@ -79,6 +80,12 @@ import {
   fontStacks,
 } from './widgets/widget-types.js';
 import { shapeOf } from '../core/theme-data.js';
+import { sectionHeaderText, sectionHeaderStyle, hintStyle } from './ui-kit.js';
+import {
+  BUILTIN_SLAB_EFFECTS, DEFAULT_SLAB_MOTION, RESERVED_EFFECT_NAMES,
+  validateSlabEffectSpec, validateTransitions,
+  type SlabEffectSpec, type SlabMotionConfig, type SlabTransitions,
+} from '../ui/gl/slab-motion.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
 
@@ -134,6 +141,15 @@ export class WidgetManager extends Abject {
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   /** Abjects that asked for activeThemeChanged events (see subscribeActiveTheme). */
   private activeThemeSubscribers = new Set<AbjectId>();
+  /** Widget types registered by Abjects (type -> factory), usable by every Abject via create. */
+  private customWidgetTypes = new Map<string, { factoryId: AbjectId; owner: AbjectId; description: string; params?: string }>();
+  /**
+   * Scene ops the focused window wears (px from its top-left corner). Data,
+   * replaceable by any Abject via setFocusDecoration; null wears nothing.
+   */
+  private focusDecoration: Array<Record<string, unknown>> | null = defaultFocusDecoration();
+  /** Desktop motion configuration (named effects, transitions, modal style). */
+  private slabMotion: SlabMotionConfig = { ...DEFAULT_SLAB_MOTION, effects: {} };
   /**
    * The currently active workspace. System-level widgets (workspace switcher,
    * global toolbar, etc. — anything not tagged to a workspace) use this
@@ -436,6 +452,131 @@ export class WidgetManager extends Abject {
                   { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to query' },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createSection',
+                description: 'Create a grouped settings section (a card): a ruled panel with a sigil section header (chrome case) and an optional hint line, laid out inside a parent layout. Add the section\'s own rows to the returned sectionId (a VBox), not to the parent. Number sections in the title for step-by-step forms ("1 · Credentials"). Inside a ScrollableVBox the card sizes to its content; pass expanding: true to fill a plain VBox instead. Returns { sectionId, titleId, hintId? }.',
+                parameters: [
+                  { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Layout to place the section in' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window the section belongs to' },
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Section title' },
+                  { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'One-line hint under the title', optional: true },
+                  { name: 'hintHeight', type: { kind: 'primitive', primitive: 'number' }, description: 'Hint height px (default 18; raise for wrapped hints)', optional: true },
+                  { name: 'expanding', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Fill the parent instead of sizing to content', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Row spacing (default 8)', optional: true },
+                ],
+                returns: { kind: 'reference', reference: '{ sectionId: string, titleId: string, hintId?: string }' },
+              },
+              {
+                name: 'registerWidgetType',
+                description: 'Register a new widget type any Abject can then create with create({ specs: [{ type, windowId, ...props }] }), placed in layouts like a built-in. The factory Abject (default: the caller) must handle createWidget({ spec, windowId, rect, theme, uiServerId }) and return the AbjectId of a widget Abject that speaks the widget protocol: render({ surfaceId, ox, oy, viewportClip? }) -> draw commands in window coordinates offset by (ox, oy); update({ rect?, text?, style?, ... }) (rect arrives when its layout places it); handleInput(input) -> { consumed } (mouse coords are widget-local; keydown when focused); optional setFocused({ focused }), getValue(), updateTheme(theme), destroy(). To repaint, send an event childDirty({ widgetId: its own id }) to its windowId; report changes with changed(aspect, value) to dependents, as built-ins do. The type name must not shadow a built-in.',
+                parameters: [
+                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'New type name (letters, digits, - and _)' },
+                  { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'What it is, shown by listWidgetTypes' },
+                  { name: 'params', type: { kind: 'primitive', primitive: 'string' }, description: 'The spec props it accepts, for other authors', optional: true },
+                  { name: 'factoryId', type: { kind: 'primitive', primitive: 'string' }, description: 'Factory Abject (default: caller)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'unregisterWidgetType',
+                description: 'Remove a widget type you registered. Existing widgets of that type keep working.',
+                parameters: [
+                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Type name' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listWidgetTypes',
+                description: 'Every widget type create accepts: the built-ins and the ones Abjects registered (with description, params and factory), so you can build with and on each other\'s widgets.',
+                parameters: [],
+                returns: { kind: 'reference', reference: '{ builtin: string[], registered: Array<{ type, description, params?, factoryId }> }' },
+              },
+              {
+                name: 'setFocusDecoration',
+                description: 'Set the 3D decoration the focused window wears, desktop-wide: scene ops (the window scene vocabulary: add/animate ops of mesh, group, light, canvas or particles nodes) positioned in px from the window\'s TOP-LEFT corner (+x right, +y down, +z toward the viewer); they are hung under one group that is drawn over the chrome (occlude:false), added when a window gains focus and removed when it loses it. Use one-shot animate ops (a looping one keeps the desktop redrawing). Pass null for none. The default is a 3D eye sigil that opens in the title band. Chromeless and transparent windows wear none.',
+                parameters: [
+                  { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Decoration ops, or null' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getFocusDecoration',
+                description: 'The current focus decoration ops (null for none), to read and build on.',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'SceneOp[] | null' },
+              },
+              {
+                name: 'windowEffect',
+                description: 'Play a slab effect on a window (visual only, animated client-side: geometry and input are unchanged). effect: a registered or built-in name (materialize, dematerialize, sink, shake, flash, pulse, burst, glitch) or an inline SlabEffectSpec. Built-ins follow the design: shake/glitch for errors and rejection, flash for arrival or success, pulse for attention, burst for completion. ANY abject may call this on any window it can name.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId' },
+                  { name: 'effect', type: { kind: 'reference', reference: 'string | SlabEffectSpec' }, description: 'Effect name or inline spec' },
+                  { name: 'color', type: { kind: 'primitive', primitive: 'string' }, description: 'Override light colour (CSS or $token)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setWindowModal',
+                description: 'Mark a window modal (or not). While a modal window shows, every other window recedes into depth and dims (see setModalStyle).',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId' },
+                  { name: 'modal', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true while modal' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'registerWindowEffect',
+                description: 'Register (or replace) a named slab effect any abject can then play with windowEffect or use as a window transition. A registered name shadows a built-in of the same name. Register again at init: registrations live for the session. SlabEffectSpec: { duration (ms), easing?, x?/y?/z? (px), rotateX?/rotateY?/rotateZ? (rad), scale?/scaleX?/scaleY?/opacity?/dim? (factors), toward?: { x?, y?, amount }, rim?: { color?, alpha }, aura?: { color?, alpha, spread? }, scan?: { color?, alpha, from?: top|bottom|middle }, particles?: { count?, color?, from?: edges|center, speed?: [min,max], size?: [min,max], gravity?, shape?: glow|square|mixed } }. A track is a number, [from, to] over eased time, { stops: [[t, v], ...] }, or { wave: { amplitude, cycles, decay? } }.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Effect name' },
+                  { name: 'spec', type: { kind: 'reference', reference: 'SlabEffectSpec' }, description: 'The effect' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'unregisterWindowEffect',
+                description: 'Remove a registered slab effect (a built-in of the same name shows through again). Transitions naming it fall back to the defaults.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Effect name' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listWindowEffects',
+                description: 'The slab effects available: built-in and registered, name to spec (registered ones shadow built-ins). Read these to build on them.',
+                parameters: [],
+                returns: { kind: 'reference', reference: '{ builtin: Record<string, SlabEffectSpec>, registered: Record<string, SlabEffectSpec> }' },
+              },
+              {
+                name: 'setWindowTransitions',
+                description: 'Choose which effect plays on each window lifecycle moment, desktop-wide: { open?, close?, minimize?, restore?, workspaceIn? }, each an effect name, an inline spec, or null for none. Omitted keys keep their current value. Defaults: materialize, dematerialize, sink, materialize, materialize.',
+                parameters: [
+                  { name: 'transitions', type: { kind: 'reference', reference: 'Partial<SlabTransitions>' }, description: 'Transitions to change' },
+                  { name: 'stagger', type: { kind: 'primitive', primitive: 'number' }, description: 'ms between windows on workspaceIn', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setModalStyle',
+                description: 'How every other window reacts while a modal window shows: { z (px pushed back), dim (brightness factor, 1 = none) }.',
+                parameters: [
+                  { name: 'z', type: { kind: 'primitive', primitive: 'number' }, description: 'px away from the viewer', optional: true },
+                  { name: 'dim', type: { kind: 'primitive', primitive: 'number' }, description: 'Brightness factor 0..1', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getMotion',
+                description: 'The current desktop motion configuration: { effects (registered), transitions, modal, stagger, minHeight }.',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'SlabMotionConfig' },
+              },
+              {
+                name: 'resetMotion',
+                description: 'Restore the default transitions and modal style and drop every registered effect.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'registerWorkspaceTheme',
@@ -1127,6 +1268,195 @@ export class WidgetManager extends Abject {
       return this.activeTheme();
     });
 
+    // ── Sections: the grouped-settings card, available to every Abject ──
+    this.on('createSection', async (msg: AbjectMessage) => {
+      const { parentLayoutId, windowId, title, description, hintHeight, expanding, spacing } = msg.payload as {
+        parentLayoutId: AbjectId; windowId: AbjectId; title: string; description?: string;
+        hintHeight?: number; expanding?: boolean; spacing?: number;
+      };
+      require(typeof parentLayoutId === 'string' && parentLayoutId.length > 0, 'createSection: parentLayoutId is required');
+      require(typeof windowId === 'string' && windowId.length > 0, 'createSection: windowId is required');
+      require(typeof title === 'string' && title.length > 0, 'createSection: title is required');
+      const theme = this.getThemeForWindow(windowId);
+      // Size to content inside a ScrollableVBox; fill a plain VBox when expanding.
+      const sectionId = await this.createNestedLayout(parentLayoutId, new VBoxLayout({
+        ownerId: parentLayoutId,
+        uiServerId: this.uiServerId!,
+        margins: { top: 14, right: 16, bottom: 14, left: 16 },
+        spacing: spacing ?? 8,
+        style: {
+          background: theme.inputBg,
+          borderColor: theme.windowBorder,
+          borderWidth: shapeOf(theme).ruleWidth,
+          radius: theme.widgetRadius,
+        },
+        theme: this.getThemeForOwner(parentLayoutId),
+      }), !expanding);
+      const titleId = await this.createWidgetFromSpec({
+        type: 'label', windowId, text: sectionHeaderText(theme, title), style: sectionHeaderStyle(theme, 14),
+      });
+      const children: Array<Record<string, unknown>> = [{
+        widgetId: titleId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 },
+      }];
+      let hintId: AbjectId | undefined;
+      if (typeof description === 'string' && description.length > 0) {
+        hintId = await this.createWidgetFromSpec({ type: 'label', windowId, text: description, style: hintStyle(theme) });
+        children.push({
+          widgetId: hintId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: hintHeight ?? 18 },
+        });
+      }
+      await this.request(request(this.id, sectionId, 'addLayoutChildren', { children }));
+      return { sectionId, titleId, ...(hintId ? { hintId } : {}) };
+    });
+
+    // ── Custom widget types (any Abject can extend the widget set) ──
+
+    this.on('registerWidgetType', async (msg: AbjectMessage) => {
+      const { type, description, params, factoryId } = msg.payload as {
+        type: string; description: string; params?: string; factoryId?: AbjectId;
+      };
+      require(typeof type === 'string' && /^[A-Za-z][\w-]{0,63}$/.test(type),
+        'registerWidgetType: type must start with a letter (letters, digits, - and _; up to 64)');
+      require(!(VALID_WIDGET_TYPES as readonly string[]).includes(type) && !(type in WIDGET_TYPE_ALIASES),
+        `registerWidgetType: "${type}" is a built-in widget type`);
+      require(typeof description === 'string' && description.length > 0, 'registerWidgetType: description is required');
+      const existing = this.customWidgetTypes.get(type);
+      require(!existing || existing.owner === msg.routing.from,
+        `registerWidgetType: "${type}" is registered by another Abject`);
+      this.customWidgetTypes.set(type, {
+        factoryId: factoryId ?? msg.routing.from,
+        owner: msg.routing.from,
+        description,
+        ...(typeof params === 'string' ? { params } : {}),
+      });
+      return true;
+    });
+
+    this.on('unregisterWidgetType', async (msg: AbjectMessage) => {
+      const { type } = msg.payload as { type: string };
+      const existing = this.customWidgetTypes.get(type);
+      if (!existing) return false;
+      require(existing.owner === msg.routing.from, `unregisterWidgetType: "${type}" is registered by another Abject`);
+      this.customWidgetTypes.delete(type);
+      return true;
+    });
+
+    this.on('listWidgetTypes', async () => ({
+      builtin: [...VALID_WIDGET_TYPES],
+      registered: [...this.customWidgetTypes.entries()].map(([type, t]) => ({
+        type, description: t.description, ...(t.params ? { params: t.params } : {}), factoryId: t.factoryId,
+      })),
+    }));
+
+    this.on('setFocusDecoration', async (msg: AbjectMessage) => {
+      const { ops } = msg.payload as { ops: Array<Record<string, unknown>> | null };
+      if (ops !== null) {
+        require(Array.isArray(ops), 'setFocusDecoration: ops must be an array of scene ops or null');
+        require(ops.every((o) => o && typeof o === 'object' && (o.op === 'add' || o.op === 'animate')),
+          'setFocusDecoration: only add and animate ops belong in a decoration');
+        const problems = validateSceneOps(normalizeSceneOps(ops));
+        require(problems.length === 0, `setFocusDecoration: ${problems.join('; ')}`);
+      }
+      this.focusDecoration = ops && ops.length > 0 ? ops : null;
+      for (const windowId of this.spawnedWindows) {
+        try { this.send(request(this.id, windowId, 'setFocusDecoration', { ops: this.focusDecoration })); } catch { /* gone */ }
+      }
+      return true;
+    });
+
+    this.on('getFocusDecoration', async () => this.focusDecoration);
+
+    // ── Slab motion (desktop-wide, data-driven; see src/ui/gl/slab-motion.ts) ──
+
+    this.on('windowEffect', async (msg: AbjectMessage) => {
+      const { windowId, effect, color } = msg.payload as { windowId: AbjectId; effect: string | SlabEffectSpec; color?: string };
+      require(typeof windowId === 'string' && windowId.length > 0, 'windowEffect: windowId is required');
+      if (typeof effect !== 'string') {
+        const problems = validateSlabEffectSpec(effect);
+        require(problems.length === 0, `windowEffect: invalid spec: ${problems.join('; ')}`);
+      }
+      return this.request<boolean>(request(this.id, windowId, 'effect', { effect, ...(color ? { color } : {}) }));
+    });
+
+    this.on('setWindowModal', async (msg: AbjectMessage) => {
+      const { windowId, modal } = msg.payload as { windowId: AbjectId; modal: boolean };
+      require(typeof windowId === 'string' && windowId.length > 0, 'setWindowModal: windowId is required');
+      return this.request<boolean>(request(this.id, windowId, 'setModal', { modal: modal === true }));
+    });
+
+    this.on('registerWindowEffect', async (msg: AbjectMessage) => {
+      const { name, spec } = msg.payload as { name: string; spec: SlabEffectSpec };
+      require(typeof name === 'string' && /^[A-Za-z][\w-]{0,63}$/.test(name),
+        'registerWindowEffect: name must start with a letter (letters, digits, - and _; up to 64)');
+      require(!RESERVED_EFFECT_NAMES.has(name), `registerWindowEffect: "${name}" is reserved`);
+      const problems = validateSlabEffectSpec(spec);
+      require(problems.length === 0, `registerWindowEffect: ${problems.join('; ')}`);
+      this.slabMotion = { ...this.slabMotion, effects: { ...this.slabMotion.effects, [name]: spec } };
+      this.pushSlabMotion();
+      return true;
+    });
+
+    this.on('unregisterWindowEffect', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      if (!(name in this.slabMotion.effects)) return false;
+      const effects = { ...this.slabMotion.effects };
+      delete effects[name];
+      // Transitions that named a now-missing effect fall back to the defaults.
+      const transitions = { ...this.slabMotion.transitions };
+      for (const k of Object.keys(transitions) as Array<keyof SlabTransitions>) {
+        const v = transitions[k];
+        if (typeof v === 'string' && !(v in effects) && !(v in BUILTIN_SLAB_EFFECTS)) {
+          transitions[k] = DEFAULT_SLAB_MOTION.transitions[k];
+        }
+      }
+      this.slabMotion = { ...this.slabMotion, effects, transitions };
+      this.pushSlabMotion();
+      return true;
+    });
+
+    this.on('listWindowEffects', async () => ({
+      builtin: { ...BUILTIN_SLAB_EFFECTS },
+      registered: { ...this.slabMotion.effects },
+    }));
+
+    this.on('setWindowTransitions', async (msg: AbjectMessage) => {
+      const { transitions, stagger } = msg.payload as { transitions: Partial<SlabTransitions>; stagger?: number };
+      require(transitions && typeof transitions === 'object', 'setWindowTransitions: transitions object is required');
+      const known = (n: string) => n in this.slabMotion.effects || n in BUILTIN_SLAB_EFFECTS;
+      const problems = validateTransitions(transitions as Record<string, unknown>, known);
+      require(problems.length === 0, `setWindowTransitions: ${problems.join('; ')}`);
+      require(stagger === undefined || (typeof stagger === 'number' && stagger >= 0 && stagger <= 1000),
+        'setWindowTransitions: stagger must be 0..1000 ms');
+      this.slabMotion = {
+        ...this.slabMotion,
+        transitions: { ...this.slabMotion.transitions, ...transitions },
+        ...(stagger !== undefined ? { stagger } : {}),
+      };
+      this.pushSlabMotion();
+      return true;
+    });
+
+    this.on('setModalStyle', async (msg: AbjectMessage) => {
+      const { z, dim } = msg.payload as { z?: number; dim?: number };
+      require(z === undefined || (typeof z === 'number' && z >= 0 && z <= 2000), 'setModalStyle: z must be 0..2000');
+      require(dim === undefined || (typeof dim === 'number' && dim >= 0 && dim <= 1), 'setModalStyle: dim must be 0..1');
+      this.slabMotion = {
+        ...this.slabMotion,
+        modal: { z: z ?? this.slabMotion.modal.z, dim: dim ?? this.slabMotion.modal.dim },
+      };
+      this.pushSlabMotion();
+      return true;
+    });
+
+    this.on('getMotion', async () => ({ ...this.slabMotion }));
+
+    this.on('resetMotion', async () => {
+      this.slabMotion = { ...DEFAULT_SLAB_MOTION, effects: {} };
+      this.pushSlabMotion();
+      return true;
+    });
+
+
     /**
      * Subscribe the caller to `activeThemeChanged` events (payload: the full
      * ThemeData) whenever the active workspace or its theme changes. Returns
@@ -1452,8 +1782,15 @@ export class WidgetManager extends Abject {
     };
   }
 
+  /** Send the motion configuration to UIServer (which retains it for reconnects). */
+  private pushSlabMotion(): void {
+    if (!this.uiServerId) return;
+    this.send(request(this.id, this.uiServerId, 'setSlabMotion', { config: this.slabMotion }));
+  }
+
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
+    this.pushSlabMotion();
     this.consoleId = await this.discoverDep('Console') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -1808,6 +2145,56 @@ A working app and a beautiful app differ in craft, not effort. Aim for "looks de
 6. **Polish.** Show hover/pressed states on interactive elements; a touch of subtle animation
    (driven by a Timer tick) brings a UI alive. Define your palette and a few small reusable draw
    helpers (e.g. a text helper, a card helper) up front so styling stays uniform across the app.
+
+### Game-grade UI: motion, particles, custom widgets (all extensible)
+
+Windows are slabs in a 3D scene, and everything below is DATA any abject can use and build on.
+
+**Window effects** (client-side, visual only: geometry, input and events never change):
+  this.call(this.dep('WidgetManager'), 'windowEffect', { windowId, effect: 'shake' })
+Built-ins: materialize, dematerialize, sink, shake, glitch (errors, rejection), flash (arrival, success),
+pulse (attention), burst (completion: particles fly off the edges). Optional color: CSS or $token.
+Or pass an inline spec instead of a name. A SlabEffectSpec is
+  { duration (ms), easing?: linear|standard|decelerate|accelerate|emphasize|[x1,y1,x2,y2],
+    x?, y?, z? (px, additive), rotateX?, rotateY?, rotateZ? (rad), scale?, scaleX?, scaleY?, opacity?, dim? (factors),
+    toward?: { x?, y?, amount }, rim?: { color?, alpha }, aura?: { color?, alpha, spread? },
+    scan?: { color?, alpha, from?: 'top'|'bottom'|'middle' },
+    particles?: { count?, color?, from?: 'edges'|'center', speed?: [min,max], size?: [min,max], gravity?, shape?: 'glow'|'square'|'mixed' } }
+where a track is a number, [from, to] (over eased time), { stops: [[t, v], ...] } or { wave: { amplitude, cycles, decay? } }.
+Build your own and share them: registerWindowEffect({ name, spec }) makes a named effect any abject can play;
+listWindowEffects() returns every built-in and registered spec to read and remix. Register at init (session-scoped).
+
+**Window lifecycle transitions** are named effects too: setWindowTransitions({ transitions: { open, close,
+minimize, restore, workspaceIn } }) takes names, inline specs, or null; setModalStyle({ z, dim }) sets how other
+windows recede while a modal is up. Mark a dialog modal with setWindowModal({ windowId, modal: true })
+(or the window's own setModal). getMotion() / resetMotion() read and restore the configuration.
+
+**Focus decoration**: the focused window wears 3D scene ops (default: an eye sigil that opens in the title
+band). setFocusDecoration({ ops }) replaces it (px from the window's top-left corner; add/animate ops only;
+prefer one-shot animations so the desktop can rest). getFocusDecoration() returns the current ops.
+
+**Scene vocabulary additions** (window 'scene' ops and world scope): primitive 'ring' (flat annulus facing
+the viewer: HUD rings, reticles); animate presets 'shake' (decaying jolt), 'flash' (emissive to params.color and
+back), 'float' (slow drift + sway); node kind 'particles', an emitter simulated client-side:
+  { op: 'add', id: 'sparks', kind: 'particles', transform: { position: [0, 40, 20] },
+    params: { rate: 30, burst?: 60, burstKey?: n, lifetime: 1200, speed: [30, 90], direction: [0, -1, 0],
+              spread: 0.6, gravity: 40, size: [2, 4], color: '$accentSecondary', colorEnd?: '$accent',
+              shape: 'glow'|'square', emitterSize?: [w, h, d], maxParticles?: 300 } }
+rate streams continuously (the desktop keeps redrawing while it does: stop it with an update rate: 0 or
+remove the node); burst emits once on add and again whenever burstKey changes.
+
+**Custom widget types**: build a widget once and every abject can create it by type.
+  this.call(this.dep('WidgetManager'), 'registerWidgetType', { type: 'gauge', description: 'Radial gauge 0..1', params: 'value, label' })
+Then create({ specs: [{ type: 'gauge', windowId, value: 0.4 }] }) works for ANY abject, in layouts like a built-in.
+The factory (the registering abject, or factoryId) handles createWidget({ spec, windowId, rect, theme, uiServerId })
+and returns the AbjectId of a widget Abject (often a new ScriptableAbject it spawns, or itself for a singleton)
+that answers the widget protocol:
+  render({ surfaceId, ox, oy }) -> draw commands in window coordinates offset by (ox, oy)
+  update({ rect?, ...props })   -> its layout sends rect when it places the widget
+  handleInput(input)            -> { consumed } (x/y are widget-local; keydown arrives while focused)
+  optional: setFocused({ focused }), getValue(), updateTheme(theme), destroy()
+Repaint by sending an event childDirty({ widgetId: <its id> }) to its windowId; report changes with
+changed(aspect, value) to dependents. listWidgetTypes() shows built-in and registered types (with params) to reuse.
 
 ### Quick Reference
 
@@ -2299,6 +2686,7 @@ await this.call(btnId, 'update', { style: { disabled: false } });
 createVBox - Vertical stack layout
 createHBox - Horizontal row layout
 createNestedVBox - Nested vertical layout inside another layout. Pass autoSize: true for auto-computed preferred height (use inside ScrollableVBox for card items).
+createSection - A grouped settings card (ruled panel + sigil header + hint) in a parent layout; add rows to the returned sectionId. The system's settings windows group their controls this way.
 createNestedHBox - Nested horizontal layout inside another layout. Pass autoSize: true for auto-computed preferred height.
 createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel). Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
 createNestedScrollableVBox - Nested scrollable vertical layout inside another layout. Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
@@ -2751,6 +3139,13 @@ async timerFired(msg) {
     for (const ownerId of deadOwners) {
       await this.destroyWindowsForOwner(ownerId);
     }
+    // Registrations die with the Abject that made them.
+    for (const [type, t] of this.customWidgetTypes) {
+      if (!this.bus.isRegistered(t.owner) || !this.bus.isRegistered(t.factoryId)) this.customWidgetTypes.delete(type);
+    }
+    for (const sub of this.activeThemeSubscribers) {
+      if (!this.bus.isRegistered(sub)) this.activeThemeSubscribers.delete(sub);
+    }
   }
 
   private async destroyWindowsForOwner(ownerId: AbjectId): Promise<number> {
@@ -2784,6 +3179,7 @@ async timerFired(msg) {
       resizable: options?.resizable,
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
+      focusDecoration: this.focusDecoration,
     });
 
     await win.init(this.bus, this.id);
@@ -2885,6 +3281,7 @@ async timerFired(msg) {
       focusOnCreate: options?.focusOnCreate,
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
+      focusDecoration: this.focusDecoration,
     });
 
     await win.init(this.bus, this.id);
@@ -3376,12 +3773,42 @@ async timerFired(msg) {
           orientation: spec.orientation, dividerPosition: spec.dividerPosition,
           minSize: spec.minSize, ...base,
         }), rect);
-      default:
+      default: {
+        const custom = this.customWidgetTypes.get(type);
+        if (custom) return this.createCustomWidget(custom, { ...spec, type }, rect, theme);
+        const customNames = [...this.customWidgetTypes.keys()];
         throw new Error(
-          `Unknown widget type in create: ${spec.type}. Valid types: ${VALID_WIDGET_TYPES.join(', ')}. ` +
+          `Unknown widget type in create: ${spec.type}. Valid types: ${VALID_WIDGET_TYPES.join(', ')}` +
+          `${customNames.length ? `; registered: ${customNames.join(', ')}` : ''}. ` +
           `Common synonyms are auto-mapped (comboBox/dropdown→select, lineEdit/textField→textInput, textEdit→textArea, progressBar→progress, range→slider).`,
         );
+      }
     }
+  }
+
+  /**
+   * Create a widget of a registered custom type: its factory Abject builds
+   * the widget (any Abject speaking the widget protocol) and returns its id;
+   * WidgetManager then tracks it exactly like a built-in (theme pushes,
+   * window placement, cleanup with its window).
+   */
+  private async createCustomWidget(
+    custom: { factoryId: AbjectId },
+    spec: Record<string, unknown> & { windowId: AbjectId },
+    rect: Rect,
+    theme: ThemeData,
+  ): Promise<AbjectId> {
+    const widgetId = await this.request<AbjectId>(request(this.id, custom.factoryId, 'createWidget', {
+      spec, windowId: spec.windowId, rect, theme, uiServerId: this.uiServerId,
+    }));
+    require(typeof widgetId === 'string' && widgetId.length > 0,
+      `createWidget for custom type "${String(spec.type)}" must return the new widget's AbjectId`);
+    this.spawnedWidgets.add(widgetId);
+    this.widgetToWindow.set(widgetId, spec.windowId);
+    if (rect.width > 0 || rect.height > 0) {
+      await this.request(request(this.id, spec.windowId, 'addChild', { widgetId, rect }));
+    }
+    return widgetId;
   }
 
   private async createTypedWidget(
@@ -3677,3 +4104,32 @@ async timerFired(msg) {
 
 // Well-known WidgetManager ID
 export const WIDGET_MANAGER_ID = 'abjects:widget-manager' as AbjectId;
+
+/**
+ * The default focus decoration: a 3D eye sigil in the title band (px from the
+ * window's top-left corner). It opens and turns once on focus, then holds
+ * still, so a focused window does not keep the desktop redrawing.
+ */
+function defaultFocusDecoration(): Array<Record<string, unknown>> {
+  const face = [Math.PI / 2, 0, 0];
+  return [
+    { op: 'add', id: 'eye', kind: 'group', transform: { position: [19, 18, 8] } },
+    {
+      op: 'add', id: 'eye-ring', parentId: 'eye', kind: 'mesh',
+      transform: { rotation: face, scale: [18, 18, 18] },
+      params: { primitive: 'torus', color: '$textPrimary', emissive: '$textPrimary', roughness: 1 },
+    },
+    {
+      op: 'add', id: 'eye-iris', parentId: 'eye', kind: 'mesh',
+      transform: { scale: [9, 9, 9] },
+      params: { primitive: 'ring', color: '$windowBg', emissive: '$windowBg' },
+    },
+    {
+      op: 'add', id: 'eye-pupil', parentId: 'eye', kind: 'mesh',
+      transform: { position: [0, 0, 2], scale: [2.4, 8, 2.4] },
+      params: { primitive: 'sphere', color: '$accentSecondary', emissive: '$accentSecondary' },
+    },
+    { op: 'animate', id: 'eye', params: { channel: 'scale', from: [1, 0.08, 1], to: [1, 1, 1], duration: 380, easing: 'decelerate' } },
+    { op: 'animate', id: 'eye-ring', params: { channel: 'rotation', from: [Math.PI / 2, Math.PI, 0], to: face, duration: 520, easing: 'decelerate' } },
+  ];
+}

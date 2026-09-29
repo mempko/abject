@@ -12,10 +12,10 @@
  * its window.
  */
 
-export const SCENE_NODE_KINDS = ['group', 'mesh', 'light', 'environment', 'canvas'] as const;
+export const SCENE_NODE_KINDS = ['group', 'mesh', 'light', 'environment', 'canvas', 'particles'] as const;
 export type SceneNodeKind = typeof SCENE_NODE_KINDS[number];
 
-export const MESH_PRIMITIVES = ['plane', 'box', 'sphere', 'cylinder', 'cone', 'torus', 'icosphere'] as const;
+export const MESH_PRIMITIVES = ['plane', 'box', 'sphere', 'cylinder', 'cone', 'torus', 'icosphere', 'ring'] as const;
 export type MeshPrimitive = typeof MESH_PRIMITIVES[number];
 
 export const LIGHT_TYPES = ['point', 'directional', 'spot'] as const;
@@ -34,7 +34,12 @@ export const DRAW_MODES = ['triangles', 'lines', 'points'] as const;
 
 /** Declarative animation channels and presets carried in an 'animate' op's params. */
 export const ANIM_CHANNELS = ['position', 'rotation', 'scale', 'color', 'emissive', 'opacity'] as const;
-export const ANIM_PRESETS = ['spin', 'orbit', 'bob', 'pulse'] as const;
+/**
+ * spin/orbit/bob/pulse loop; shake (a decaying jolt), flash (emissive to
+ * params.color, default the living light, and back) and float (a slow drift
+ * with a gentle turn) are the game-UI additions. All run client-side.
+ */
+export const ANIM_PRESETS = ['spin', 'orbit', 'bob', 'pulse', 'shake', 'flash', 'float'] as const;
 
 /**
  * Theme tokens accepted as `$token` color references in scene params.
@@ -530,6 +535,44 @@ export function validateSceneOps(ops: unknown[]): string[] {
           || (b.intensity !== undefined && typeof b.intensity !== 'number')) {
           problems.set(`${o.id}:bloom`, `'${o.id}': environment params.bloom must be true or { threshold?, intensity? }`);
         }
+      }
+    }
+
+    // Particle emitters: a continuous stream (rate) and/or a burst.
+    if (kind === 'particles') {
+      const nonNeg = (k: string, max: number) => {
+        const v = params[k];
+        if (v !== undefined && (typeof v !== 'number' || !(v >= 0) || v > max)) {
+          problems.set(`${o.id}:${k}`, `'${o.id}': particles params.${k} must be a number 0..${max}`);
+        }
+      };
+      nonNeg('rate', 500);
+      nonNeg('burst', 1000);
+      nonNeg('lifetime', 20000);
+      nonNeg('maxParticles', 1000);
+      nonNeg('spread', Math.PI);
+      for (const k of ['speed', 'size'] as const) {
+        const v = params[k];
+        if (v !== undefined && !(Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === 'number'))) {
+          problems.set(`${o.id}:${k}`, `'${o.id}': particles params.${k} must be [min, max]`);
+        }
+      }
+      for (const k of ['direction', 'emitterSize'] as const) {
+        const v = params[k];
+        if (v !== undefined && !(Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === 'number'))) {
+          problems.set(`${o.id}:${k}`, `'${o.id}': particles params.${k} must be [x, y, z]`);
+        }
+      }
+      for (const k of ['color', 'colorEnd'] as const) {
+        if (params[k] !== undefined && !isSceneColor(params[k])) {
+          problems.set(`${o.id}:${k}`, `'${o.id}': particles params.${k} must be a color or $token`);
+        }
+      }
+      if (params.shape !== undefined && params.shape !== 'glow' && params.shape !== 'square') {
+        problems.set(`${o.id}:shape`, `'${o.id}': particles params.shape must be 'glow' or 'square'`);
+      }
+      if (params.gravity !== undefined && typeof params.gravity !== 'number') {
+        problems.set(`${o.id}:gravity`, `'${o.id}': particles params.gravity must be a number (px/s², +y down)`);
       }
     }
   }

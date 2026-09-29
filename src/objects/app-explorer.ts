@@ -35,8 +35,8 @@ function destructiveFillStyle(theme: ThemeData): { background: string; color: st
 function scrimCommands(theme: ThemeData, width: number, height: number): unknown[] {
   const rect = { x: 0, y: 0, width, height };
   return [
-    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(shapeOf(theme).blockShadowColor, 0.35) } },
-    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.08), 14, 2),
+    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(theme.canvasBg, 0.14) } },
+    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.05), 14, 2),
   ];
 }
 
@@ -547,7 +547,16 @@ export class AppExplorer extends Abject {
       return this.hide();
     });
 
-    this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('windowCloseRequested', async (msg: AbjectMessage) => {
+      // The picker dialog is ours too: its close button cancels the picker
+      // and leaves the explorer open.
+      const { windowId } = (msg.payload ?? {}) as { windowId?: AbjectId };
+      if (windowId && windowId === this.pickerDialogId) {
+        this.pickerResolve?.(null);
+        return;
+      }
+      await this.hide();
+    });
 
     this.on('getState', async () => {
       return { visible: !!this.windowId };
@@ -622,6 +631,10 @@ export class AppExplorer extends Abject {
 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
+
+    // An open workspace picker belongs to this window: cancel it, which
+    // dismisses it and lifts its modal depth.
+    this.pickerResolve?.(null);
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -1236,6 +1249,7 @@ export class AppExplorer extends Abject {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           const target = this.instanceEntries[this.selectedInstanceIndex];
           if (this.isRemoteEntry(target)) {
+            this.windowEffect('shake');
             await this.notify('Shared object is read-only — clone it to get your own copy', 'warning');
           } else {
             await this.deleteObject(target.id);
@@ -1245,6 +1259,7 @@ export class AppExplorer extends Abject {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           const target = this.instanceEntries[this.selectedInstanceIndex];
           if (this.isRemoteEntry(target)) {
+            this.windowEffect('shake');
             await this.notify('Shared object is read-only — clone it to edit your own copy', 'warning');
           } else {
             await this.editSource(target.id);
@@ -1254,6 +1269,7 @@ export class AppExplorer extends Abject {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           const target = this.instanceEntries[this.selectedInstanceIndex];
           if (this.isRemoteEntry(target)) {
+            this.windowEffect('shake');
             await this.notify('Shared object is read-only — clone it to view your own copy', 'warning');
           } else {
             await this.showHistory(target.id);
@@ -1305,6 +1321,7 @@ export class AppExplorer extends Abject {
     } catch {
       ok = false; /* object may already be gone */
     }
+    if (!ok) this.windowEffect('shake');
     await this.notify(ok ? 'Object deleted' : 'Delete failed', ok ? 'success' : 'error');
 
     this.cachedObjects = await this.registryList();
@@ -1408,8 +1425,12 @@ export class AppExplorer extends Abject {
       }
 
       log.info('Cloned to local workspace');
+      this.windowEffect('flash');
+      await this.notify('Cloned to your workspace', 'success');
     } catch (err) {
       log.warn('Clone to local error:', err);
+      this.windowEffect('shake');
+      await this.notify('Clone failed', 'error');
     }
   }
 
@@ -1431,12 +1452,16 @@ export class AppExplorer extends Abject {
       const fork = await this.request<{ ok: boolean; objectId?: AbjectId; reason?: string }>(
         request(this.id, registryId, 'forkRemote', { objectId: obj.id }));
       if (fork?.ok) {
+        this.windowEffect('flash');
         await this.notify('Cloned to your workspace', 'success');
-        log.info('Cloned shared object to local workspace');        return;
+        log.info('Cloned shared object to local workspace');
+        return;
       }
+      this.windowEffect('shake');
       await this.notify(`Clone failed: ${fork?.reason ?? 'not forkable'}`, 'error');
     } catch (err) {
       log.warn('Clone shared error:', err);
+      this.windowEffect('shake');
       await this.notify('Clone failed', 'error');
     }
   }
@@ -1478,7 +1503,8 @@ export class AppExplorer extends Abject {
       allWorkspaces.map(ws => ws.name)
     );
     if (selectedIdx === null) return; // cancelled
-    const targetRegistryId = allWorkspaces[selectedIdx].registryId;
+    const target = allWorkspaces[selectedIdx];
+    const targetRegistryId = target.registryId;
 
     try {
       const spawnPayload: Record<string, unknown> = {
@@ -1507,8 +1533,12 @@ export class AppExplorer extends Abject {
       }
 
       log.info('Cloned to workspace');
+      this.windowEffect('flash');
+      await this.notify(`Cloned to ${target.name}`, 'success');
     } catch (err) {
       log.warn('Clone to workspace error:', err);
+      this.windowEffect('shake');
+      await this.notify(`Clone to ${target.name} failed`, 'error');
     }
   }
 
@@ -1626,6 +1656,12 @@ export class AppExplorer extends Abject {
       ],
     }));
 
+    // The picker owns the user's attention while it shows: every other
+    // window recedes and dims. The backdrop joins the modal layer so the
+    // full-screen scrim stays put (and keeps catching clicks) instead of
+    // receding with the windows behind it.
+    await this.setPickerModal(true);
+
     // Wait for user response
     const selectedIndex = await new Promise<number | null>((resolve) => {
       this.pickerResolve = resolve;
@@ -1638,9 +1674,30 @@ export class AppExplorer extends Abject {
 
   private pickerSelectedIndex = 0;
 
+  /** Mark the picker dialog and its backdrop modal (or lift it). */
+  private async setPickerModal(modal: boolean): Promise<void> {
+    for (const windowId of [this.pickerBackdropId, this.pickerDialogId]) {
+      if (!windowId) continue;
+      try {
+        await this.setWindowModal(windowId, modal);
+      } catch { /* window gone; closing it clears modal anyway */ }
+    }
+  }
+
+  /**
+   * Play a one-shot slab effect on the explorer window (visual only). Fire
+   * and forget: a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
+  }
+
   private async dismissWorkspacePicker(): Promise<void> {
     const wmId = this.widgetManagerId;
     if (!wmId) return;
+    // Lift the modal depth before the windows go, on every close path.
+    await this.setPickerModal(false);
     if (this.pickerDialogId) {
       try { this.send(request(this.id, wmId, 'destroyWindowAbject',
         { windowId: this.pickerDialogId })); } catch { /* gone */ }

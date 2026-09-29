@@ -76,6 +76,11 @@ export class ProcessExplorer extends Abject {
   private heapTimer?: ReturnType<typeof setInterval>;
   /** What the strip currently reads, so getState can report it as text. */
   private heapStripText: string[] = [];
+  /**
+   * Regime per isolate at the previous heap reading (source -> regime), so an
+   * isolate crossing into critical, or a worker vanishing, is seen once.
+   */
+  private heapRegimes: Map<string, string> = new Map();
 
   private searchText = '';
 
@@ -338,6 +343,7 @@ export class ProcessExplorer extends Abject {
     this.heapRowId = undefined;
     this.heapLabelIds = [];
     this.heapStripText = [];
+    this.heapRegimes.clear();
     this.stopButtons.clear();
     this.restartButtons.clear();
     this.currentRows = [];
@@ -358,7 +364,7 @@ export class ProcessExplorer extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\u2699\uFE0F Process Explorer',
+        title: 'Process Explorer',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,
@@ -597,6 +603,7 @@ export class ProcessExplorer extends Abject {
       style: { fontSize: 11, color: this.heapColor(w.regime) },
     }));
     this.heapStripText = specs.map((s) => s.text);
+    this.signalHeapChanges(watches);
 
     if (specs.length !== this.heapLabelIds.length) {
       for (const id of this.heapLabelIds) {
@@ -647,6 +654,34 @@ export class ProcessExplorer extends Abject {
     const mb = Math.round(w.sample.usedBytes / (1024 * 1024));
     const name = w.source === 'main' ? 'main' : w.source.replace('worker-', 'w');
     return `${name} ${shown}% ${mb}MB`;
+  }
+
+  /**
+   * Compare this heap reading with the previous one. An isolate that has just
+   * entered the critical regime pulses the window for attention; a worker
+   * isolate that has vanished from the readings glitches it, since every
+   * object it hosted went down with it.
+   */
+  private signalHeapChanges(watches: Array<{ source: string; regime: string }>): void {
+    const next = new Map(watches.map((w) => [w.source, w.regime] as [string, string]));
+    const hadReading = this.heapRegimes.size > 0;
+    const workerLost = hadReading
+      && [...this.heapRegimes.keys()].some((source) => source !== 'main' && !next.has(source));
+    const turnedCritical = watches.some(
+      (w) => w.regime === 'critical' && this.heapRegimes.get(w.source) !== 'critical',
+    );
+    this.heapRegimes = next;
+    if (workerLost) this.windowEffect('glitch', '$statusError');
+    else if (turnedCritical) this.windowEffect('pulse', '$statusError');
+  }
+
+  /**
+   * Play a one-shot slab effect on the window (visual only). Fire and forget:
+   * a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 
   private heapColor(regime: string): string {
@@ -886,9 +921,11 @@ export class ProcessExplorer extends Abject {
         try {
           await this.request(request(this.id, this.factoryId,
             'kill', { objectId: row.id }));
+          this.windowEffect('flash', '$accent');
           await this.notify(`Stopped "${row.name}"`, 'success');
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          this.windowEffect('shake');
           await this.notify(`Stop failed: ${msg.slice(0, 80)}`, 'error');
         } finally {
           this.send(event(this.id, fromId, 'update', { busy: false }));
@@ -908,10 +945,13 @@ export class ProcessExplorer extends Abject {
         try {
           await this.request(request(this.id, this.factoryId,
             'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
+          // The object is alive again: flash in the living light.
+          this.windowEffect('flash');
           await this.notify(`Restarted "${row.name}"`, 'success');
         } catch (err) {
           log.warn(`Failed to restart ${row.name}:`, err);
           const msg = err instanceof Error ? err.message : String(err);
+          this.windowEffect('shake');
           await this.notify(`Restart failed: ${msg.slice(0, 80)}`, 'error');
         } finally {
           this.send(event(this.id, fromId, 'update', { busy: false }));
@@ -936,6 +976,8 @@ export class ProcessExplorer extends Abject {
 - Protected system objects (Registry, Factory, Supervisor, etc.) show "protected" instead of action buttons.
 - Stop kills the object via Factory. Restart respawns it with same ID.
 - Auto-refreshes on registry changes. Manual Refresh button available.
+- Heap strip: one reading per isolate (main and each worker), coloured by pressure. The window pulses when an isolate enters the critical regime and glitches when a worker isolate disappears.
+- A successful restart flashes the window; a failed stop or restart shakes it.
 
 ### Interface ID
 \`abjects:process-explorer\``;

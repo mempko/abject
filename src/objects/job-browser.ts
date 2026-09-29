@@ -12,7 +12,7 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import type { ListItem } from './widgets/list-widget.js';
-import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { emptyStateMarkdown, emptyStateStyle, hintStyle, livingStyle } from './ui-kit.js';
 
 const log = new Log('JobBrowser');
 
@@ -20,6 +20,15 @@ const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
 
 const WIN_W = 500;
 const WIN_H = 350;
+/** Root layout margins and bottom bar height (px); the live ring anchors to them. */
+const MARGIN_X = 16;
+const MARGIN_BOTTOM = 12;
+const BAR_H = 36;
+/** Diameter of the ring that floats beside the status while jobs run. */
+const RING_SIZE = 18;
+const RING_NODE = 'job-browser-live-ring';
+/** Minimum gap between completion flashes, so a busy queue reads as one pulse of news. */
+const FLASH_GAP_MS = 1200;
 
 /** Vector icon names for job statuses; ListWidget renders via ListItem.iconName. */
 export class JobBrowser extends Abject {
@@ -32,6 +41,13 @@ export class JobBrowser extends Abject {
   private emptyLabelId?: AbjectId;
   /** Whether the empty state is showing; undefined until first applied. */
   private emptyShown?: boolean;
+  /** Live summary beside the ring in the bottom bar ("2 running · 1 queued"). */
+  private statusLabelId?: AbjectId;
+  /** Whether the floating ring is in the window's scene (only while jobs run). */
+  private ringShown = false;
+  private windowSize = { width: WIN_W, height: WIN_H };
+  /** When the last completion flash played (throttles a fast queue). */
+  private lastFlashAt = 0;
 
   /** Cached jobs in display order (oldest first). */
   private jobs: Job[] = [];
@@ -96,6 +112,11 @@ export class JobBrowser extends Abject {
       jobCount: this.jobs.length,
     }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
+      if (windowId && windowId !== this.windowId) return;
+      await this.onWindowResized(width, height);
+    });
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
@@ -145,12 +166,13 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
         resizable: true,
       })
     );
+    this.windowSize = { width: WIN_W, height: WIN_H };
 
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 12, right: 16, bottom: 12, left: 16 },
+        margins: { top: 12, right: MARGIN_X, bottom: MARGIN_BOTTOM, left: MARGIN_X },
         spacing: 8,
       })
     );
@@ -199,7 +221,26 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
       widgetId: bottomRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
+      preferredSize: { height: BAR_H },
+    }));
+
+    // Left of the bar: a slot the live ring floats in, then the live summary
+    // of what is running. The slot is an empty label so the ring never
+    // overlaps the text.
+    const { widgetIds: [ringSlotId, statusId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text: '' },
+          { type: 'label', windowId: this.windowId, text: '', style: hintStyle(this.theme) },
+        ],
+      })
+    );
+    this.statusLabelId = statusId;
+    await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: ringSlotId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: RING_SIZE + 4, height: BAR_H } },
+        { widgetId: this.statusLabelId, sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: BAR_H } },
+      ],
     }));
 
     // Spacer pushes button right
@@ -250,6 +291,10 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     this.clearBtnId = undefined;
     this.emptyLabelId = undefined;
     this.emptyShown = undefined;
+    this.statusLabelId = undefined;
+    this.ringShown = false;
+    this.windowSize = { width: WIN_W, height: WIN_H };
+    this.lastFlashAt = 0;
     this.jobs = [];
     this.changed('visibility', false);
     return true;
@@ -305,6 +350,96 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
       await this.request(request(this.id, this.listWidgetId, 'update', { items }));
     } catch { /* widget may be gone */ }
     await this.applyEmptyState(items.length === 0);
+    await this.updateStatus();
+  }
+
+  // -- Live status: summary text, Clear History availability, floating ring --
+
+  private countStatus(status: Job['status']): number {
+    return this.jobs.filter(j => j.status === status).length;
+  }
+
+  /** "2 running · 1 queued" while work is live; a done/failed tally at rest. */
+  private statusText(): string {
+    const running = this.countStatus('running');
+    const queued = this.countStatus('queued');
+    if (running > 0 || queued > 0) {
+      return [running > 0 ? `${running} running` : '', queued > 0 ? `${queued} queued` : '']
+        .filter(Boolean).join(' \u00B7 ');
+    }
+    if (this.jobs.length === 0) return '';
+    const done = this.countStatus('completed');
+    const failed = this.countStatus('failed');
+    return [`${done} done`, failed > 0 ? `${failed} failed` : ''].filter(Boolean).join(' \u00B7 ');
+  }
+
+  private async updateStatus(): Promise<void> {
+    const live = this.countStatus('running') > 0 || this.countStatus('queued') > 0;
+    try {
+      if (this.statusLabelId) {
+        await this.request(request(this.id, this.statusLabelId, 'update', {
+          text: this.statusText(),
+          style: live ? livingStyle(this.theme) : hintStyle(this.theme),
+        }));
+      }
+      // Clearing history only makes sense once there is history to clear.
+      if (this.clearBtnId) {
+        await this.request(request(this.id, this.clearBtnId, 'update', { disabled: this.jobs.length === 0 }));
+      }
+    } catch { /* widgets may be gone */ }
+    await this.updateRing();
+  }
+
+  /** Ring position: the slot at the left end of the bottom bar (px from window centre). */
+  private ringAnchor(): [number, number, number] {
+    const { width, height } = this.windowSize;
+    return [-width / 2 + MARGIN_X + RING_SIZE / 2 + 2, height / 2 - MARGIN_BOTTOM - BAR_H / 2, 6];
+  }
+
+  private ringOps(): Array<Record<string, unknown>> {
+    return [
+      {
+        op: 'add', id: RING_NODE, kind: 'mesh',
+        transform: { position: this.ringAnchor(), scale: [RING_SIZE, RING_SIZE, RING_SIZE] },
+        params: { primitive: 'ring', color: '$accentSecondary', emissive: '$accentSecondary' },
+      },
+      { op: 'animate', id: RING_NODE, params: { preset: 'float', amplitude: 3, duration: 1400 } },
+    ];
+  }
+
+  /**
+   * A slow floating ring in the living light beside the status, present only
+   * while a job is running. Its loop keeps the desktop redrawing, so it is
+   * removed the moment the queue goes idle.
+   */
+  private async updateRing(): Promise<void> {
+    if (!this.windowId) return;
+    const want = this.countStatus('running') > 0;
+    if (want === this.ringShown) return;
+    this.ringShown = want;
+    const ops = want ? this.ringOps() : [{ op: 'remove', id: RING_NODE }];
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', { ops }));
+    } catch (err) {
+      log.warn('Live ring scene update failed:', err);
+    }
+  }
+
+  private async onWindowResized(width: number, height: number): Promise<void> {
+    if (width === this.windowSize.width && height === this.windowSize.height) return;
+    this.windowSize = { width, height };
+    if (!this.ringShown || !this.windowId) return;
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', {
+        ops: [{ op: 'remove', id: RING_NODE }, ...this.ringOps()],
+      }));
+    } catch { /* window may be gone */ }
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, opts: { color?: string } = {}): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, opts.color);
   }
 
   /** Swap the list and the empty-state label in the shared layout slot. */
@@ -375,6 +510,16 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
           const job = this.jobs.find(j => j.id === jobId);
           if (job) { job.status = 'completed'; job.completedAt = Date.now(); }
           await this.rebuildList();
+          // The last job landing drains the queue: celebrate the whole batch.
+          // Otherwise a completion flashes in the living light (throttled).
+          const drained = this.countStatus('running') === 0 && this.countStatus('queued') === 0;
+          if (drained) {
+            this.playEffect('burst');
+            this.lastFlashAt = Date.now();
+          } else if (Date.now() - this.lastFlashAt >= FLASH_GAP_MS) {
+            this.playEffect('flash');
+            this.lastFlashAt = Date.now();
+          }
           break;
         }
         case 'jobFailed': {
@@ -386,6 +531,8 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
             await this.notify(`Job failed: ${job.description.slice(0, 60)}`, 'error');
           }
           await this.rebuildList();
+          // A cancellation is a deliberate stop; a real failure glitches.
+          if (data.error !== 'Cancelled') this.playEffect('glitch');
           break;
         }
         case 'historyCleared':

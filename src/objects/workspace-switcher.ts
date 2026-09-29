@@ -9,12 +9,13 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { lightenColor } from './widgets/widget-types.js';
 import { dockStyles, spaceNumeral } from './dock-style.js';
+import { livingStyle } from './ui-kit.js';
 import { parseInviteLink, type WorkspaceAccessMode } from './workspace-manager.js';
 
 const log = new Log('WorkspaceSwitcher');
@@ -25,6 +26,9 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
 const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
+
+/** How long the Add Workspace dialog lingers after success so its burst plays before it folds away. */
+const DIALOG_CELEBRATE_MS = 700;
 
 export class WorkspaceSwitcher extends Abject {
   private widgetManagerId?: AbjectId;
@@ -61,6 +65,10 @@ export class WorkspaceSwitcher extends Abject {
   // ── Add Workspace Dialog State ──────────────────────────────────────────
   private dialogWindowId?: AbjectId;
   private dialogLayoutId?: AbjectId;
+  /** The dialog body's section card (one per tab); rebuilt with the content. */
+  private dialogSectionId?: AbjectId;
+  /** Tail of the dialog render queue (renders run one at a time). */
+  private dialogRenderChain: Promise<void> = Promise.resolve();
   private dialogMode: 'create' | 'join' = 'create';
   private createNameInputId?: AbjectId;
   private createDescInputId?: AbjectId;
@@ -78,6 +86,12 @@ export class WorkspaceSwitcher extends Abject {
   private formTagsValue = '';
   private formJoinUrlValue = '';
   private dialogStatusText = '';
+  /** Whether the dialog status line reports a failure (error colour) or progress (living light). */
+  private dialogStatusIsError = false;
+  /** True while a create/join request is in flight or the dialog is closing on success. */
+  private dialogSubmitting = false;
+  /** Pending close after a success burst. */
+  private dialogCloseTimer?: ReturnType<typeof setTimeout>;
 
   constructor() {
     super({
@@ -223,6 +237,7 @@ export class WorkspaceSwitcher extends Abject {
           const idx = value as number;
           this.dialogMode = idx === 0 ? 'create' : 'join';
           this.dialogStatusText = '';
+          this.dialogStatusIsError = false;
           await this.renderDialogContent();
           return;
         }
@@ -242,10 +257,21 @@ export class WorkspaceSwitcher extends Abject {
         return;
       }
       if (fromId === this.submitBtnId) {
-        if (this.dialogMode === 'create') {
-          await this.handleCreateSubmit();
-        } else {
-          await this.handleJoinSubmit();
+        // One submission at a time: a second click while a create/join is in
+        // flight (or while the dialog celebrates) would create twice.
+        if (this.dialogSubmitting) return;
+        this.dialogSubmitting = true;
+        if (this.submitBtnId) this.send(event(this.id, this.submitBtnId, 'update', { busy: true }));
+        let closing = false;
+        try {
+          closing = this.dialogMode === 'create'
+            ? await this.handleCreateSubmit()
+            : await this.handleJoinSubmit();
+        } finally {
+          if (!closing) {
+            this.dialogSubmitting = false;
+            if (this.submitBtnId) this.send(event(this.id, this.submitBtnId, 'update', { busy: false }));
+          }
         }
         return;
       }
@@ -351,6 +377,11 @@ export class WorkspaceSwitcher extends Abject {
       return false;
     }
 
+    // Reopened while a success close was pending: keep the dialog open.
+    this.cancelTimer(this.dialogCloseTimer);
+    this.dialogCloseTimer = undefined;
+    this.dialogSubmitting = false;
+
     this.dialogMode = 'create';
     this.formNameValue = `Workspace ${this.cachedWorkspaces.length + 1}`;
     this.formDescValue = '';
@@ -358,12 +389,21 @@ export class WorkspaceSwitcher extends Abject {
     this.formJoinUrlValue = '';
     this.createAccessMode = 'local';
     this.dialogStatusText = '';
+    this.dialogStatusIsError = false;
 
     await this.renderDialogContent();
+    // The dialog owns the user's attention: every other window recedes.
+    await this.setDialogModal(true);
     return true;
   }
 
   async closeAddWorkspaceDialog(): Promise<boolean> {
+    this.cancelTimer(this.dialogCloseTimer);
+    this.dialogCloseTimer = undefined;
+    this.dialogSubmitting = false;
+    // Release the modal depth before the window folds away (closing clears
+    // it too; this keeps every close path explicit).
+    await this.setDialogModal(false);
     if (this.dialogWindowId && this.widgetManagerId) {
       try {
         await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
@@ -375,6 +415,7 @@ export class WorkspaceSwitcher extends Abject {
     }
     this.dialogWindowId = undefined;
     this.dialogLayoutId = undefined;
+    this.dialogSectionId = undefined;
     this.dialogTabBarId = undefined;
     this.createNameInputId = undefined;
     this.createDescInputId = undefined;
@@ -385,10 +426,60 @@ export class WorkspaceSwitcher extends Abject {
     this.submitBtnId = undefined;
     this.cancelBtnId = undefined;
     this.dialogStatusText = '';
+    this.dialogStatusIsError = false;
     return true;
   }
 
-  private async renderDialogContent(): Promise<void> {
+  /** Mark the Add Workspace dialog modal (or release it). Best effort. */
+  private async setDialogModal(modal: boolean): Promise<void> {
+    if (!this.dialogWindowId) return;
+    try {
+      await this.request(request(this.id, this.dialogWindowId, 'setModal', { modal }));
+    } catch { /* window gone or no surface yet */ }
+  }
+
+  /** Play a slab effect on the dialog (visual only, fire and forget). */
+  private dialogEffect(effect: 'shake' | 'burst' | 'flash'): void {
+    if (!this.dialogWindowId) return;
+    this.request(request(this.id, this.dialogWindowId, 'effect', { effect }))
+      .catch(() => { /* effects are decoration */ });
+  }
+
+  /** Show a failure on the dialog's status line and shake the dialog. */
+  private async rejectDialog(text: string): Promise<void> {
+    this.dialogStatusText = text;
+    this.dialogStatusIsError = true;
+    await this.renderDialogContent();
+    this.dialogEffect('shake');
+  }
+
+  /**
+   * The workspace landed: burst, then fold the dialog away once the particles
+   * have flown. Clicks stay ignored until then (dialogSubmitting stays set).
+   */
+  private celebrateAndClose(): void {
+    const windowId = this.dialogWindowId;
+    if (!windowId) return;
+    this.dialogEffect('burst');
+    this.cancelTimer(this.dialogCloseTimer);
+    this.dialogCloseTimer = this.setTimer(async () => {
+      this.dialogCloseTimer = undefined;
+      if (this.dialogWindowId === windowId) await this.closeAddWorkspaceDialog();
+    }, DIALOG_CELEBRATE_MS);
+  }
+
+  /**
+   * Render the dialog body, one render at a time. Handlers interleave (a tab
+   * click can land while a failed submit re-renders), and a render lays its
+   * card out over several round-trips, so a second render waits for the first.
+   */
+  private renderDialogContent(): Promise<void> {
+    const run = this.dialogRenderChain.then(() => this.renderDialogContentNow());
+    this.dialogRenderChain = run.catch(() => { /* the next render starts clean */ });
+    return run;
+  }
+
+  private async renderDialogContentNow(): Promise<void> {
     if (!this.dialogWindowId || !this.widgetManagerId) return;
 
     // Clear existing layout
@@ -396,6 +487,15 @@ export class WorkspaceSwitcher extends Abject {
       try {
         await this.request(request(this.id, this.dialogLayoutId, 'clearLayoutChildren', {}));
       } catch { /* ignored */ }
+      // The previous body card goes with its rows (a layout's destroy
+      // cascades to its children).
+      if (this.dialogSectionId) {
+        const oldSectionId = this.dialogSectionId;
+        this.dialogSectionId = undefined;
+        try {
+          await this.request(request(this.id, oldSectionId, 'destroy', {}));
+        } catch { /* already gone */ }
+      }
     } else {
       this.dialogLayoutId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId, 'createVBox', {
@@ -411,9 +511,12 @@ export class WorkspaceSwitcher extends Abject {
 
     const labelStyle = { color: t.textSecondary, fontSize: 11, fontWeight: 'bold' };
     const inputStyle = { background: lightenColor(t.windowBg, 5), color: t.textPrimary, borderColor: t.inputBorder, radius: t.tokens.radius.sm };
-    const primaryBtnStyle = { background: t.accent, color: t.actionText, radius: t.tokens.radius.sm, fontWeight: 'bold', align: 'center' };
+    // The card's primary action wears the action (red) slots.
+    const primaryBtnStyle = { background: t.actionBg, color: t.actionText, borderColor: t.actionBorder, radius: t.tokens.radius.sm, fontWeight: 'bold', align: 'center' };
     const cancelBtnStyle = { background: lightenColor(t.windowBg, 10), color: t.textPrimary, radius: t.tokens.radius.sm, align: 'center' };
-    const statusStyle = { color: this.dialogStatusText.startsWith('Error') || this.dialogStatusText.startsWith('Failed') ? t.statusError : t.accent, fontSize: 12 };
+    const statusStyle = this.dialogStatusIsError
+      ? { color: t.statusError, fontSize: 12, wordWrap: true }
+      : { ...livingStyle(t), wordWrap: true };
 
     const specs: Array<{ type: string; windowId: AbjectId; text?: string; placeholder?: string; style?: Record<string, unknown>; options?: string[]; selectedIndex?: number; tabs?: string[] }> = [];
 
@@ -496,27 +599,73 @@ export class WorkspaceSwitcher extends Abject {
     this.submitBtnId = widgetIds[curIdx++];
     this.cancelBtnId = widgetIds[curIdx++];
 
-    // Layout hierarchy
-    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize?: Record<string, number> }> = [];
     for (const wId of widgetIds) {
-      layoutChildren.push({ widgetId: wId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } });
       this.send(request(this.id, wId, 'addDependent', {}));
     }
 
+    // Layout hierarchy: the tab bar, then one section card for the active
+    // tab ("New workspace" or "Join by invite") holding its fields, the
+    // status line, and an actions row led by the primary action.
     await this.request(request(this.id, this.dialogLayoutId, 'addLayoutChildren', {
-      children: layoutChildren,
+      children: [{ widgetId: this.dialogTabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } }],
+    }));
+
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId, 'createSection', {
+        parentLayoutId: this.dialogLayoutId,
+        windowId: this.dialogWindowId,
+        title: isCreate ? 'New workspace' : 'Join by invite',
+        description: isCreate
+          ? 'Name it, describe it, and choose who can reach it.'
+          : 'Paste the invite link a peer shared with you.',
+      })
+    );
+    this.dialogSectionId = sectionId;
+
+    // Field rows: every widget between the tab bar and the status/buttons.
+    // Labels are short rows; inputs and the select keep their 32px height.
+    const fieldEnd = widgetIds.length - 2 - (this.statusLabelId ? 1 : 0);
+    const cardChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+    for (let i = 1; i < fieldEnd; i++) {
+      const isLabel = specs[i].type === 'label';
+      cardChildren.push({ widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: isLabel ? 18 : 32 } });
+    }
+    if (this.statusLabelId) {
+      cardChildren.push({ widgetId: this.statusLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } });
+    }
+    await this.request(request(this.id, sectionId, 'addLayoutChildren', { children: cardChildren }));
+
+    // Actions row (right-aligned): Cancel, then the primary action.
+    const actionsRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId, 'createNestedHBox', {
+        parentLayoutId: sectionId,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, sectionId, 'addLayoutChild', {
+      widgetId: actionsRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 40 },
+    }));
+    await this.request(request(this.id, actionsRowId, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, actionsRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 90, height: 36 } },
+        { widgetId: this.submitBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 170, height: 36 } },
+      ],
     }));
   }
 
-  private async handleCreateSubmit(): Promise<void> {
+  /** Create the workspace; true when it landed and the dialog is closing. */
+  private async handleCreateSubmit(): Promise<boolean> {
     if (!this.workspaceManagerId) {
       this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
     }
 
     if (!this.workspaceManagerId) {
-      this.dialogStatusText = 'Error: WorkspaceManager not available';
-      await this.renderDialogContent();
-      return;
+      await this.rejectDialog('Error: WorkspaceManager not available');
+      return false;
     }
 
     try {
@@ -637,16 +786,18 @@ export class WorkspaceSwitcher extends Abject {
 
       // Refresh taskbar and switcher
       this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
-      await this.closeAddWorkspaceDialog();
+      this.celebrateAndClose();
       await this.notify(`Workspace "${name}" created`, 'success');
+      return true;
     } catch (err) {
       log.warn('Failed to create workspace:', err);
-      this.dialogStatusText = `Failed: ${err instanceof Error ? err.message : String(err)}`;
-      await this.renderDialogContent();
+      await this.rejectDialog(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
   }
 
-  private async handleJoinSubmit(): Promise<void> {
+  /** Join from an invite URL; true when the join landed and the dialog is closing. */
+  private async handleJoinSubmit(): Promise<boolean> {
     let url = this.formJoinUrlValue;
     if (this.joinUrlInputId) {
       try {
@@ -662,16 +813,14 @@ export class WorkspaceSwitcher extends Abject {
     }
     url = (url ?? '').trim();
     if (!url) {
-      this.dialogStatusText = 'Error: Invite URL cannot be empty';
-      await this.renderDialogContent();
-      return;
+      await this.rejectDialog('Error: Invite URL cannot be empty');
+      return false;
     }
 
     const route = parseInviteLink(url);
     if (!route) {
-      this.dialogStatusText = 'Error: Expected abject://<ownerPeerId>/<workspaceId> or abject://join?peer=…&ws=…';
-      await this.renderDialogContent();
-      return;
+      await this.rejectDialog('Error: Expected abject://<ownerPeerId>/<workspaceId> or abject://join?peer=…&ws=…');
+      return false;
     }
 
     const { ownerPeerId, workspaceId } = route;
@@ -681,9 +830,8 @@ export class WorkspaceSwitcher extends Abject {
     }
 
     if (!this.workspaceShareRegistryId) {
-      this.dialogStatusText = 'Error: WorkspaceShareRegistry not available';
-      await this.renderDialogContent();
-      return;
+      await this.rejectDialog('Error: WorkspaceShareRegistry not available');
+      return false;
     }
 
     // A full-form link carries the route itself; register it so the join does
@@ -726,16 +874,16 @@ export class WorkspaceSwitcher extends Abject {
           }
           this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
         }
-        await this.closeAddWorkspaceDialog();
+        this.celebrateAndClose();
         await this.notify(`Successfully joined workspace ${workspaceId}`, 'success');
-      } else {
-        this.dialogStatusText = `Join rejected: ${ack.reason || 'Whitelist rejection or host denied connection'}`;
-        await this.renderDialogContent();
+        return true;
       }
+      await this.rejectDialog(`Join rejected: ${ack.reason || 'Whitelist rejection or host denied connection'}`);
+      return false;
     } catch (err) {
       log.warn('Join workspace failed:', err);
-      this.dialogStatusText = `Join failed: ${err instanceof Error ? err.message : String(err)}`;
-      await this.renderDialogContent();
+      await this.rejectDialog(`Join failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
   }
 

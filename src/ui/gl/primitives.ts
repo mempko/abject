@@ -27,6 +27,27 @@ export function planeGeometry(): Geometry {
   };
 }
 
+/**
+ * Flat ring (annulus) in the xy plane facing +z, like 'plane': outer radius
+ * 0.5, inner radius 0.36. HUD rings, sigils, targeting reticles; scale it
+ * non-uniformly for ellipses. Double-sided in practice (thin, no depth).
+ */
+export function ringGeometry(segments = 64, inner = 0.36): Geometry {
+  const p: number[] = [], n: number[] = [], uv: number[] = [], idx: number[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    const c = Math.cos(a), s = Math.sin(a);
+    p.push(c * 0.5, s * 0.5, 0, c * inner, s * inner, 0);
+    n.push(0, 0, 1, 0, 0, 1);
+    uv.push(i / segments, 0, i / segments, 1);
+  }
+  for (let i = 0; i < segments; i++) {
+    const o = i * 2;
+    idx.push(o, o + 2, o + 1, o + 1, o + 2, o + 3);
+  }
+  return { positions: new Float32Array(p), normals: new Float32Array(n), uvs: new Float32Array(uv), indices: new Uint16Array(idx) };
+}
+
 /** Unit cube, centered. */
 export function boxGeometry(): Geometry {
   const p: number[] = [];
@@ -278,7 +299,7 @@ export function customGeometry(
 
 const cache = new Map<string, Geometry>();
 
-export type PrimitiveKind = 'plane' | 'box' | 'sphere' | 'cylinder' | 'cone' | 'torus' | 'icosphere';
+export type PrimitiveKind = 'plane' | 'box' | 'sphere' | 'cylinder' | 'cone' | 'torus' | 'icosphere' | 'ring';
 
 /** Shared geometry instances by primitive name (renderer caches VAOs per instance). */
 export function getGeometry(kind: PrimitiveKind): Geometry {
@@ -290,6 +311,7 @@ export function getGeometry(kind: PrimitiveKind): Geometry {
       : kind === 'cone' ? coneGeometry()
       : kind === 'torus' ? torusGeometry()
       : kind === 'icosphere' ? icosphereGeometry()
+      : kind === 'ring' ? ringGeometry()
       : cylinderGeometry();
     cache.set(kind, g);
   }

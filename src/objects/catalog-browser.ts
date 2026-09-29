@@ -18,7 +18,7 @@ import type { MCPServerSummary } from './mcp-registry-client.js';
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
 import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
 import { Log } from '../core/timed-log.js';
-import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('CatalogBrowser');
 
@@ -73,6 +73,10 @@ export class CatalogBrowser extends Abject {
 
   private detailChildIds: AbjectId[] = [];
   private detailInstallBtnId?: AbjectId;
+  /** True while an install runs, so a second click cannot start a duplicate. */
+  private installing = false;
+  /** Bumped per install-button status, so an older reset timer leaves a newer status alone. */
+  private installStatusSeq = 0;
 
   // State
   private activeTab: Tab = 'mcp';
@@ -560,23 +564,24 @@ Browse and install skills and MCP servers from public registries.
       await this.addDetailLabel(item.subtitle, false, { color: this.theme.textSecondary, wordWrap: true, markdown: true });
     }
 
-    await this.addDetailLabel(sectionHeaderText(this.theme, 'Details'), false, { ...sectionHeaderStyle(this.theme, 12) });
+    // The facts and the Install action sit together in one Details card.
+    const details = await this.addDetailSection('Details');
 
     let installable = true;
     if (item.kind === 'mcp') {
       const server = this.mcpServers.find(s => s.name === item.key);
       if (server) {
-        if (server.version) await this.addDetailLabel(`Version: ${server.version}`, false, { color: this.theme.textSecondary, wordWrap: true });
-        if (server.repository?.url) await this.addDetailLabel(`Repo: ${server.repository.url}`, false, { color: this.theme.textSecondary, wordWrap: true });
+        if (server.version) await this.addDetailLabel(`Version: ${server.version}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
+        if (server.repository?.url) await this.addDetailLabel(`Repo: ${server.repository.url}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
         const pkg = server.packages?.find(p => !!p && !!(p.identifier ?? p.name));
         if (pkg) {
           const registry = pkg.registryType ?? pkg.registry_name ?? '?';
           const ident = pkg.identifier ?? pkg.name ?? '';
-          await this.addDetailLabel(`Package: ${registry} / ${ident}${pkg.version ? ' @ ' + pkg.version : ''}`, false, { color: this.theme.textSecondary, wordWrap: true });
+          await this.addDetailLabel(`Package: ${registry} / ${ident}${pkg.version ? ' @ ' + pkg.version : ''}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
           if (pkg.environmentVariables && pkg.environmentVariables.length > 0) {
             const required = pkg.environmentVariables.filter(e => e.isRequired).map(e => e.name);
             if (required.length > 0) {
-              await this.addDetailLabel(`Requires env: ${required.join(', ')}`, false, { color: this.theme.textSecondary, wordWrap: true });
+              await this.addDetailLabel(`Requires env: ${required.join(', ')}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
             }
           }
         } else {
@@ -587,16 +592,18 @@ Browse and install skills and MCP servers from public registries.
               `This is a remote-only MCP server (${remoteCount} endpoint${remoteCount > 1 ? 's' : ''}). Local subprocess install is not possible; remote MCP transport is not yet supported.`,
               false,
               { color: this.theme.textSecondary, wordWrap: true },
+              details,
             );
             const firstRemote = server.remotes?.[0];
             if (firstRemote?.url) {
-              await this.addDetailLabel(`Endpoint: ${firstRemote.url}`, false, { color: this.theme.textSecondary, wordWrap: true });
+              await this.addDetailLabel(`Endpoint: ${firstRemote.url}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
             }
           } else {
             await this.addDetailLabel(
               'This entry has no installable package and no remote endpoints. Nothing to install.',
               false,
               { color: this.theme.textSecondary, wordWrap: true },
+              details,
             );
           }
         }
@@ -604,24 +611,26 @@ Browse and install skills and MCP servers from public registries.
     } else {
       const hit = this.clawHubSkills.find(s => s.slug === item.key);
       if (hit) {
-        if (hit.ownerHandle) await this.addDetailLabel(`Author: ${hit.ownerHandle}`, false, { color: this.theme.textSecondary, wordWrap: true });
-        if (hit.latestVersion) await this.addDetailLabel(`Version: ${hit.latestVersion}`, false, { color: this.theme.textSecondary, wordWrap: true });
-        if (hit.channel) await this.addDetailLabel(`Channel: ${hit.channel}${hit.isOfficial ? ' (official)' : ''}`, false, { color: this.theme.textSecondary, wordWrap: true });
+        if (hit.ownerHandle) await this.addDetailLabel(`Author: ${hit.ownerHandle}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
+        if (hit.latestVersion) await this.addDetailLabel(`Version: ${hit.latestVersion}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
+        if (hit.channel) await this.addDetailLabel(`Channel: ${hit.channel}${hit.isOfficial ? ' (official)' : ''}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
         if (hit.capabilityTags && hit.capabilityTags.length > 0) {
-          await this.addDetailLabel(`Flags: ${hit.capabilityTags.join(', ')}`, false, { color: this.theme.textSecondary, wordWrap: true });
+          await this.addDetailLabel(`Flags: ${hit.capabilityTags.join(', ')}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
           if (hit.capabilityTags.includes('requires-sensitive-credentials')) {
             await this.addDetailLabel(
               'Heads-up: this skill declares that it needs sensitive credentials. Review the SKILL.md after install before enabling, and use SecretsVault for any tokens.',
               false,
               { color: this.theme.textSecondary, wordWrap: true },
+              details,
             );
           }
         }
-        await this.addDetailLabel(`Source: clawhub.ai/${hit.slug}`, false, { color: this.theme.textSecondary, wordWrap: true });
+        await this.addDetailLabel(`Source: clawhub.ai/${hit.slug}`, false, { color: this.theme.textSecondary, wordWrap: true }, details);
         await this.addDetailLabel(
           'ClawHub skills are community-published and untrusted until you review them. The bundle will be written under ~/.abjects/skills/<slug>/ but will not be enabled automatically.',
           false,
           { color: this.theme.textSecondary, wordWrap: true },
+          details,
         );
       }
     }
@@ -636,12 +645,31 @@ Browse and install skills and MCP servers from public registries.
       );
       this.detailInstallBtnId = btnId;
       await this.addDep(btnId);
-      await this.addToLayout(this.detailPaneId, btnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 30 });
+      await this.addToLayout(details, btnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 30 });
       this.detailChildIds.push(btnId);
     }
   }
 
-  private async addDetailLabel(text: string, bold = false, extraStyle: Record<string, unknown> = {}): Promise<void> {
+  /**
+   * A grouped card in the detail pane (WidgetManager createSection: ruled
+   * panel, sigil title, optional hint). Returns the card's layout id: add the
+   * section's rows to it. Inside the scrollable pane the card sizes to its
+   * content; clearing the pane destroys it along with its rows.
+   */
+  private async addDetailSection(title: string, description?: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: this.detailPaneId!,
+        windowId: this.windowId,
+        title,
+        ...(description ? { description, hintHeight } : {}),
+      }),
+    );
+    this.detailChildIds.push(sectionId);
+    return sectionId;
+  }
+
+  private async addDetailLabel(text: string, bold = false, extraStyle: Record<string, unknown> = {}, parentId?: AbjectId): Promise<void> {
     if (!this.detailPaneId || !this.widgetManagerId || !this.windowId) return;
     const { widgetIds: [id] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId, 'create', { specs: [
@@ -664,7 +692,7 @@ Browse and install skills and MCP servers from public registries.
     // Matches SkillBrowser's detail-pane sizing pattern.
     const lines = Math.max(1, Math.ceil(text.length / 45));
     const lineHeight = bold ? 20 : 18;
-    await this.addToLayout(this.detailPaneId, id, { vertical: 'fixed' },
+    await this.addToLayout(parentId ?? this.detailPaneId, id, { vertical: 'fixed' },
       { height: Math.max(lineHeight, lines * lineHeight) });
     this.detailChildIds.push(id);
   }
@@ -674,23 +702,31 @@ Browse and install skills and MCP servers from public registries.
   private async installSelected(): Promise<void> {
     if (this.selectedIndex < 0) return;
     if (!this.skillRegistryId) return;
+    if (this.installing) return;
 
     const item = this.displayItems[this.selectedIndex];
-    if (item.kind === 'mcp') {
-      const server = this.mcpServers.find(s => s.name === item.key);
-      if (!server) return;
-      await this.installMcpServer(server);
-    } else {
-      const hit = this.clawHubSkills.find(s => s.slug === item.key);
-      if (!hit) return;
-      await this.installClawHubSkill(hit);
+    this.installing = true;
+    try {
+      if (item.kind === 'mcp') {
+        const server = this.mcpServers.find(s => s.name === item.key);
+        if (!server) return;
+        await this.installMcpServer(server);
+      } else {
+        const hit = this.clawHubSkills.find(s => s.slug === item.key);
+        if (!hit) return;
+        await this.installClawHubSkill(hit);
+      }
+    } finally {
+      this.installing = false;
     }
   }
 
   private async installClawHubSkill(skill: ClawHubSkillSummary): Promise<void> {
     if (!this.skillRegistryId || !this.clawHubClientId) return;
     try {
-      await this.flashInstallStatus('Downloading…');
+      // Held until the install settles: a download can take far longer
+      // than a status flash.
+      await this.flashInstallStatus('Downloading…', false);
       const bundle = await this.request<SkillBundle>(
         request(this.id, this.clawHubClientId, 'downloadSkill', { slug: skill.slug }),
         60000,
@@ -702,8 +738,10 @@ Browse and install skills and MCP servers from public registries.
           entries: bundle.entries,
         }),
       );
+      this.windowEffect('burst');
       await this.flashInstallStatus('Installed');
     } catch (err) {
+      this.windowEffect('shake');
       await this.flashInstallStatus(`Install failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -715,6 +753,7 @@ Browse and install skills and MCP servers from public registries.
 
     const { command, args } = packageToMcpCommand(pkg);
     if (!command) {
+      this.windowEffect('shake');
       await this.flashInstallStatus('Unsupported package registry');
       return;
     }
@@ -728,25 +767,53 @@ Browse and install skills and MCP servers from public registries.
     });
 
     try {
+      await this.flashInstallStatus('Installing…', false);
       await this.request(
         request(this.id, this.skillRegistryId, 'installSkill', { name: skillName, content }),
       );
-      await this.request(
+      const enabled = await this.request<{ mcpStatus?: string; error?: string } | undefined>(
         request(this.id, this.skillRegistryId, 'enableSkill', { name: skillName }),
       );
-      await this.flashInstallStatus('Installed');
+      if (enabled?.mcpStatus === 'error') {
+        // Installed, but the server did not start: ask for attention.
+        this.windowEffect('pulse', '$statusWarning');
+        await this.flashInstallStatus('Server failed');
+        await this.notify(`${skillName} installed, but its server failed to start: ${(enabled.error ?? 'unknown error').slice(0, 80)}`, 'warning');
+      } else {
+        this.windowEffect('burst');
+        await this.flashInstallStatus('Installed');
+      }
     } catch (err) {
+      this.windowEffect('shake');
       await this.flashInstallStatus(`Install failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  private async flashInstallStatus(text: string): Promise<void> {
+  /**
+   * Show a status on the Install button. A settling status reverts to
+   * "Install" after a moment; a working status (settle false) holds until the
+   * next status replaces it.
+   */
+  private async flashInstallStatus(text: string, settle = true): Promise<void> {
     if (!this.detailInstallBtnId) return;
-    await this.request(request(this.id, this.detailInstallBtnId, 'update', { text }));
+    const seq = ++this.installStatusSeq;
+    try {
+      await this.request(request(this.id, this.detailInstallBtnId, 'update', { text }));
+    } catch { /* button rebuilt meanwhile */ }
+    if (!settle) return;
     this.setTimer(() => {
-      if (this.detailInstallBtnId) {
+      if (this.detailInstallBtnId && seq === this.installStatusSeq) {
         this.send(request(this.id, this.detailInstallBtnId, 'update', { text: 'Install' }));
       }
     }, 2500);
+  }
+
+  /**
+   * Play a one-shot slab effect on the window (visual only). Fire and forget:
+   * a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
   }
 }

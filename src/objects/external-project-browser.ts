@@ -21,7 +21,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './external-project-registry.js';
@@ -94,6 +94,11 @@ export class ExternalProjectBrowser extends Abject {
   private configProjectName = '';
 
   private grantRowId?: AbjectId;
+  /**
+   * The Configuration tab's grouped cards (and its Save row), in layout order.
+   * The tab shows and hides these containers as a whole.
+   */
+  private configSectionIds: AbjectId[] = [];
   /** Empty states: no projects (list slot) and no selection (right pane). */
   private listEmptyId?: AbjectId;
   private detailEmptyId?: AbjectId;
@@ -385,7 +390,7 @@ someone else wrote, so it is a button here rather than something granted on add.
       request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: rightPaneId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 6,
+        spacing: 10,
       }),
     );
     this.rightBodyId = rightBodyId;
@@ -393,14 +398,87 @@ someone else wrote, so it is a button here rather than something granted on add.
       widgetId: this.detailEmptyId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
-    await this.request(request(this.id, rightBodyId, 'addLayoutChildren', {
+
+    // The configuration form, grouped the way the system settings window
+    // groups its controls: one card per topic, the form-wide Save row after
+    // them, and removing the project in a card of its own at the end. Each
+    // card sizes to its content inside the scrollable body.
+    const labelRow = (id: AbjectId) => ({
+      widgetId: id, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 },
+    });
+    const fieldRow = (id: AbjectId) => ({
+      widgetId: id, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 28 },
+    });
+
+    const projectCardId = await this.sectionCard(rightBodyId, 'Project',
+      'Where it lives and what is set up. Edit any field, then press Save changes.');
+    await this.request(request(this.id, projectCardId, 'addLayoutChildren', {
       children: [
         { widgetId: this.detailsWidgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 116 } },
-        ...this.configEditorIds.map(id => ({
-          widgetId: id,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 26 },
-        })),
+        labelRow(editorIds[0]), fieldRow(this.descInputId!),
+      ],
+    }));
+
+    const commandsCardId = await this.sectionCard(rightBodyId, 'Commands',
+      'What agents run here: check runs after every edit, verify runs before work is reported done. A blank field runs nothing.', 34);
+    await this.request(request(this.id, commandsCardId, 'addLayoutChildren', {
+      children: [
+        labelRow(editorIds[2]), fieldRow(this.checkInputId!),
+        labelRow(editorIds[4]), fieldRow(this.verifyInputId!),
+        labelRow(editorIds[6]), fieldRow(this.formatInputId!),
+        labelRow(editorIds[8]), fieldRow(this.setupInputId!),
+      ],
+    }));
+
+    const pathsCardId = await this.sectionCard(rightBodyId, 'Isolation & paths',
+      'Worktree isolation gives agents a scratch checkout, and shared paths carry into it. Protected paths always ask before a write.', 34);
+    await this.request(request(this.id, pathsCardId, 'addLayoutChildren', {
+      children: [
+        labelRow(editorIds[14]), fieldRow(this.isolationSelectId!),
+        labelRow(editorIds[10]), fieldRow(this.sharedInputId!),
+        labelRow(editorIds[12]), fieldRow(this.protectedInputId!),
+      ],
+    }));
+
+    const accessCardId = await this.sectionCard(rightBodyId, 'Access & trust',
+      'A trusted project\'s CLAUDE.md / AGENTS.md join an agent\'s instructions and its commands may run. '
+      + 'Autonomy is how much runs without a prompt, capped by the workspace; standing grants live on the Grants tab.', 50);
+    await this.request(request(this.id, accessCardId, 'addLayoutChildren', {
+      children: [
+        fieldRow(this.trustedCheckId!),
+        labelRow(editorIds[16]), fieldRow(this.autonomySelectId!),
+      ],
+    }));
+
+    // Save and Revert cover every card above, so they sit below the cards.
+    const saveRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: rightBodyId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      }),
+    );
+    await this.request(request(this.id, rightBodyId, 'updateLayoutChild', {
+      widgetId: saveRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: BUTTON_ROW_H },
+    }));
+    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.revertBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 90, height: BUTTON_ROW_H } },
+        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 140, height: BUTTON_ROW_H } },
+      ],
+    }));
+
+    // Remove project joins this card once the action buttons exist (below).
+    const dangerCardId = await this.sectionCard(rightBodyId, 'Danger zone',
+      'Removing forgets the project here. Its files on disk stay exactly as they are.');
+
+    this.configSectionIds = [projectCardId, commandsCardId, pathsCardId, accessCardId, saveRowId, dangerCardId];
+
+    await this.request(request(this.id, rightBodyId, 'addLayoutChildren', {
+      children: [
         // A fixed height: an expanding child inside a scroll container has no
         // stable height to expand against, which is what let the pane clip.
         { widgetId: this.grantsWidgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 260 } },
@@ -464,9 +542,10 @@ someone else wrote, so it is a button here rather than something granted on add.
       ],
     }));
     await this.request(request(this.id, buttonRowId, 'addLayoutSpacer', {}));
-    await this.request(request(this.id, buttonRowId, 'addLayoutChildren', {
+    // Removing a project is destructive, so it lives in the Danger zone card.
+    await this.request(request(this.id, dangerCardId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.removeBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 130, height: BUTTON_ROW_H } },
+        { widgetId: this.removeBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 140, height: BUTTON_ROW_H } },
       ],
     }));
     await this.request(request(this.id, this.grantRowId, 'addLayoutChildren', {
@@ -522,6 +601,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.configDirty = false;
     this.configProjectName = '';
     this.grantRowId = undefined;
+    this.configSectionIds = [];
     this.listEmptyId = undefined;
     this.detailEmptyId = undefined;
     this.listEmptyShown = undefined;
@@ -542,6 +622,25 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.activeTab = 0;
     this.changed('visibility', false);
     return true;
+  }
+
+  /**
+   * A grouped card for one section of the configuration form (WidgetManager
+   * createSection: ruled panel, sigil title, wrap-friendly hint). Returns the
+   * card's layout id: add the section's rows to it. Cards size to their
+   * content inside the scrollable body.
+   */
+  private async sectionCard(parentId: AbjectId, title: string, description: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: parentId,
+        windowId: this.windowId,
+        title,
+        description,
+        hintHeight,
+      }),
+    );
+    return sectionId;
   }
 
   // ─── Data ───────────────────────────────────────────────────────
@@ -720,6 +819,7 @@ someone else wrote, so it is a button here rather than something granted on add.
 
     await this.rebuildEditor(project);
     await this.applyDetailEmpty(!project);
+    await this.updateActionButtons(project);
   }
 
   /**
@@ -791,7 +891,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     const reg = await this.registry();
     const project = this.current();
     if (!reg || !project) {
-      await this.notify('Select a project first', 'warning');
+      await this.reject('Select a project first');
       return;
     }
 
@@ -814,6 +914,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     const formatCommand = draft('formatCommand', project.formatCommand ?? '');
     const setupCommand = draft('setupCommand', project.setupCommand ?? '');
 
+    let saved = true;
     try {
       await this.request(request(this.id, reg, 'updateProject', {
         name: project.name,
@@ -829,7 +930,7 @@ someone else wrote, so it is a button here rather than something granted on add.
         },
       }));
     } catch (err) {
-      await this.notify(`Could not save ${project.name}: ${(err as Error).message}`, 'error');
+      await this.reject(`Could not save ${project.name}: ${(err as Error).message}`, 'error');
       return;
     }
 
@@ -850,7 +951,8 @@ someone else wrote, so it is a button here rather than something granted on add.
             trusted: wantTrusted,
           }));
         } catch (err) {
-          await this.notify(`Could not change trust: ${(err as Error).message}`, 'error');
+          saved = false;
+          await this.reject(`Could not change trust: ${(err as Error).message}`, 'error');
         }
       }
     }
@@ -860,15 +962,20 @@ someone else wrote, so it is a button here rather than something granted on add.
       try {
         const r = await this.request<{ success: boolean; error?: string }>(
           request(this.id, reg, 'setAutonomy', { name: project.name, autonomy: wantAutonomy }));
-        if (r && !r.success) await this.notify(r.error ?? 'Could not change autonomy', 'error');
+        if (r && !r.success) {
+          saved = false;
+          await this.reject(r.error ?? 'Could not change autonomy', 'error');
+        }
       } catch (err) {
-        await this.notify(`Could not change autonomy: ${(err as Error).message}`, 'error');
+        saved = false;
+        await this.reject(`Could not change autonomy: ${(err as Error).message}`, 'error');
       }
     }
 
     this.configDraft.clear();
     this.configDirty = false;
     await this.load();
+    if (saved) this.playEffect('flash');
   }
 
   /** Throw the unsaved draft away and show what the registry holds. */
@@ -880,6 +987,41 @@ someone else wrote, so it is a button here rather than something granted on add.
 
   private current(): ExternalProject | undefined {
     return this.projects.find(p => p.name === this.selected);
+  }
+
+  /** Play a slab effect on the window (visual only; one fire-and-forget message). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
+  }
+
+  /** Turn an action away: the window shakes and a toast says why. */
+  private async reject(message: string, level: 'warning' | 'error' = 'warning'): Promise<void> {
+    this.playEffect('shake');
+    await this.notify(message, level);
+  }
+
+  /**
+   * Project actions wait for a selected project, grant edits for a selected
+   * grant, and the Trust button names the toggle it performs.
+   */
+  private async updateActionButtons(project?: ExternalProject): Promise<void> {
+    const none = !project;
+    const noGrant = this.selectedRuleIndex === undefined;
+    const updates: Array<[AbjectId | undefined, Record<string, unknown>]> = [
+      [this.settingsBtnId, { disabled: none }],
+      [this.editBtnId, { disabled: none }],
+      [this.trustBtnId, { disabled: none, text: project?.trusted ? 'Untrust' : 'Trust' }],
+      [this.autonomyBtnId, { disabled: none }],
+      [this.removeBtnId, { disabled: none }],
+      [this.editGrantBtnId, { disabled: noGrant }],
+      [this.removeGrantBtnId, { disabled: noGrant }],
+    ];
+    try {
+      for (const [id, payload] of updates) {
+        if (id) await this.request(request(this.id, id, 'update', payload));
+      }
+    } catch { /* widgets may have been closed */ }
   }
 
   // ─── Events ─────────────────────────────────────────────────────
@@ -912,6 +1054,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     if (fromId === this.grantsWidgetId && (aspect === 'select' || aspect === 'selectionChanged')) {
       const raw = listSelectionValue(value);
       this.selectedRuleIndex = raw?.startsWith('rule:') ? Number(raw.slice(5)) : undefined;
+      await this.updateActionButtons(this.current());
       return;
     }
 
@@ -944,9 +1087,10 @@ someone else wrote, so it is a button here rather than something granted on add.
 
   private async updateTabVisibility(): Promise<void> {
     const configurationVisible = this.activeTab === 0;
+    // The summary list and every editor live inside the Configuration
+    // cards, so showing or hiding the cards carries them along.
     const visibility: ReadonlyArray<readonly [AbjectId | undefined, boolean]> = [
-      [this.detailsWidgetId, configurationVisible],
-      ...this.configEditorIds.map(id => [id, configurationVisible] as const),
+      ...this.configSectionIds.map(id => [id, configurationVisible] as const),
       [this.grantsWidgetId, !configurationVisible],
       [this.grantRowId, !configurationVisible],
     ];
@@ -1015,9 +1159,10 @@ someone else wrote, so it is a button here rather than something granted on add.
         // trust means; an agent-added project is the case that starts untrusted.
         trusted: true,
       }));
+      this.playEffect('flash');
       await this.notify(`Added external project "${name}"`, 'success');
     } catch (err) {
-      await this.notify(`Could not add project: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not add project: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }
@@ -1025,7 +1170,7 @@ someone else wrote, so it is a button here rather than something granted on add.
   private async editProjectSettings(): Promise<void> {
     const reg = await this.registry();
     const project = this.current();
-    if (!reg || !project) return void await this.notify('Select a project first', 'warning');
+    if (!reg || !project) return void await this.reject('Select a project first');
     const description = await this.prompt({ title: `Settings — ${project.name}`, message: 'Project description', defaultValue: project.description ?? '' });
     if (description === null) return;
     const formatCommand = await this.prompt({ title: `Format Command — ${project.name}`, message: 'Optional formatting command', defaultValue: project.formatCommand ?? '' });
@@ -1049,8 +1194,9 @@ someone else wrote, so it is a button here rather than something granted on add.
         sharedPaths: shared.split(',').map(v => v.trim()).filter(Boolean),
         protectedPaths,
       }}));
+      this.playEffect('flash');
     } catch (err) {
-      await this.notify(`Could not update settings: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not update settings: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }
@@ -1061,8 +1207,9 @@ someone else wrote, so it is a button here rather than something granted on add.
     const caller = await this.prompt({ title: 'Grant caller', message: 'Object name this rule applies to', defaultValue: existing?.caller ?? 'ExternalCreator' });
     if (!caller) return undefined;
     const kind = await this.prompt({ title: 'Grant type', message: 'Enter program, class, or exact', defaultValue: existing?.kind ?? 'program' });
-    if (!kind || !['program', 'class', 'exact'].includes(kind)) {
-      await this.notify('Grant type must be program, class, or exact', 'warning');
+    if (kind === null) return undefined;
+    if (!['program', 'class', 'exact'].includes(kind)) {
+      await this.reject('Grant type must be program, class, or exact');
       return undefined;
     }
     const previousSubject = existing?.kind === 'program' ? existing.program : existing?.kind === 'class' ? existing.effect : existing?.kind === 'exact' ? existing.command : '';
@@ -1073,7 +1220,11 @@ someone else wrote, so it is a button here rather than something granted on add.
     const oldScope = existing && existing.kind !== 'exact' ? existing.scope : undefined;
     const defaultScope = oldScope?.kind === 'project' ? 'project' : oldScope?.kind === 'path' ? 'path' : oldScope?.kind === 'anywhere' ? 'anywhere' : 'project';
     const scopeKind = await this.prompt({ title: 'Grant scope', message: 'Enter project, path, or anywhere. Project is the narrowest and safest.', defaultValue: defaultScope });
-    if (!scopeKind || !['project', 'path', 'anywhere'].includes(scopeKind)) return undefined;
+    if (scopeKind === null) return undefined;
+    if (!['project', 'path', 'anywhere'].includes(scopeKind)) {
+      await this.reject('Grant scope must be project, path, or anywhere');
+      return undefined;
+    }
     let scope: RuleScope = { kind: 'project', name: project.name };
     if (scopeKind === 'anywhere') scope = { kind: 'anywhere' };
     if (scopeKind === 'path') {
@@ -1083,7 +1234,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     }
     if (kind === 'class') {
       if (!['read', 'write', 'exec', 'network', 'dangerous'].includes(subject)) {
-        await this.notify('Unknown effect class', 'warning');
+        await this.reject('Effect class must be read, write, exec, network, or dangerous');
         return undefined;
       }
       return { kind: 'class', caller, effect: subject as 'read' | 'write' | 'exec' | 'network' | 'dangerous', scope, allow };
@@ -1092,35 +1243,38 @@ someone else wrote, so it is a button here rather than something granted on add.
   }
 
   private async addGrant(): Promise<void> {
-    if (!this.brokerId || !this.current()) return void await this.notify('Select a project first', 'warning');
+    if (!this.brokerId || !this.current()) return void await this.reject('Select a project first');
     const rule = await this.collectRule();
     if (!rule) return;
     // The broker owns the final approval, including calls that bypass this UI.
     const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'addRule', { rule }), 31 * 60 * 1000);
-    if (!result.success) await this.notify(result.error ?? 'Could not add grant', 'error');
+    if (!result.success) await this.reject(result.error ?? 'Could not add grant', 'error');
+    else this.playEffect('flash');
     await this.loadRules();
     await this.rebuildDetails();
   }
 
   private async editGrant(): Promise<void> {
-    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.notify('Select a grant first', 'warning');
+    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.reject('Select a grant first');
     const existing = this.permissionRules.find(rule => rule.index === this.selectedRuleIndex);
-    if (!existing) return void await this.notify('That grant no longer exists', 'warning');
+    if (!existing) return void await this.reject('That grant no longer exists');
     const rule = await this.collectRule(existing);
     if (!rule) return;
     const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'updateRule', { index: existing.index, rule }), 31 * 60 * 1000);
-    if (!result.success) await this.notify(result.error ?? 'Could not edit grant', 'error');
+    if (!result.success) await this.reject(result.error ?? 'Could not edit grant', 'error');
+    else this.playEffect('flash');
     this.selectedRuleIndex = undefined;
     await this.loadRules();
     await this.rebuildDetails();
   }
 
   private async removeGrant(): Promise<void> {
-    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.notify('Select a grant first', 'warning');
+    if (!this.brokerId || this.selectedRuleIndex === undefined) return void await this.reject('Select a grant first');
     const existing = this.permissionRules.find(rule => rule.index === this.selectedRuleIndex);
     if (!existing) return;
     const result = await this.request<{ success: boolean; error?: string }>(request(this.id, this.brokerId, 'removeRule', { index: existing.index }), 31 * 60 * 1000);
-    if (!result.success) await this.notify(result.error ?? 'Could not remove grant', 'error');
+    if (!result.success) await this.reject(result.error ?? 'Could not remove grant', 'error');
+    else this.playEffect('flash');
     this.selectedRuleIndex = undefined;
     await this.loadRules();
     await this.rebuildDetails();
@@ -1130,7 +1284,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     const reg = await this.registry();
     const project = this.current();
     if (!reg || !project) {
-      await this.notify('Select a project first', 'warning');
+      await this.reject('Select a project first');
       return;
     }
 
@@ -1156,8 +1310,9 @@ someone else wrote, so it is a button here rather than something granted on add.
           verifyCommand: verifyCommand || undefined,
         },
       }));
+      this.playEffect('flash');
     } catch (err) {
-      await this.notify(`Could not update: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not update: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }
@@ -1166,7 +1321,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     const reg = await this.registry();
     const project = this.current();
     if (!reg || !project) {
-      await this.notify('Select a project first', 'warning');
+      await this.reject('Select a project first');
       return;
     }
 
@@ -1187,8 +1342,9 @@ someone else wrote, so it is a button here rather than something granted on add.
         name: project.name,
         trusted: !project.trusted,
       }));
+      this.playEffect('flash');
     } catch (err) {
-      await this.notify(`Could not change trust: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not change trust: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }
@@ -1205,11 +1361,11 @@ someone else wrote, so it is a button here rather than something granted on add.
     const reg = await this.registry();
     const project = this.current();
     if (!reg || !project) {
-      await this.notify('Select a project first', 'warning');
+      await this.reject('Select a project first');
       return;
     }
     if (!project.trusted) {
-      await this.notify(`Trust ${project.name} first — an untrusted project always asks`, 'warning');
+      await this.reject(`Trust ${project.name} first: an untrusted project always asks`);
       return;
     }
 
@@ -1245,9 +1401,10 @@ someone else wrote, so it is a button here rather than something granted on add.
       const r = await this.request<{ success: boolean; error?: string }>(
         request(this.id, reg, 'setAutonomy', { name: project.name, autonomy: next }));
       if (!r?.success) {
-        await this.notify(r?.error ?? 'Could not change autonomy', 'error');
+        await this.reject(r?.error ?? 'Could not change autonomy', 'error');
         return;
       }
+      this.playEffect('flash');
       const eff = this.effective.get(project.name);
       await this.notify(
         eff && eff.cappedBy && eff.effective !== next
@@ -1255,7 +1412,7 @@ someone else wrote, so it is a button here rather than something granted on add.
           : `${project.name} is now ${next}`,
         'info');
     } catch (err) {
-      await this.notify(`Could not change autonomy: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not change autonomy: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }
@@ -1264,7 +1421,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     const reg = await this.registry();
     const project = this.current();
     if (!reg || !project) {
-      await this.notify('Select a project first', 'warning');
+      await this.reject('Select a project first');
       return;
     }
 
@@ -1280,7 +1437,7 @@ someone else wrote, so it is a button here rather than something granted on add.
       await this.request(request(this.id, reg, 'removeProject', { name: project.name }));
       this.selected = undefined;
     } catch (err) {
-      await this.notify(`Could not remove: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      await this.reject(`Could not remove: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
     await this.load();
   }

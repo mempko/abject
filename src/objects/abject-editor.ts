@@ -609,6 +609,7 @@ export class AbjectEditor extends Abject {
     if (!this.editingObjectId || !this.historyRowId || !this.historySelectId) return;
     if (!this.abjectStoreId) {
       await this.updateStatus('AbjectStore unavailable — no version history', this.theme.statusError);
+      this.windowEffect('shake');
       return;
     }
     let info: {
@@ -714,6 +715,7 @@ export class AbjectEditor extends Abject {
       await this.updateStatus(`**Previewing version from ${new Date(savedAt).toLocaleString()}** — press Restore to make it live, or Delete to drop it from history`, this.theme.statusWarning);
     } catch (err) {
       await this.updateStatus(`Could not load version: ${err instanceof Error ? err.message : String(err)}`, this.theme.statusError);
+      this.windowEffect('shake');
     }
   }
 
@@ -728,17 +730,21 @@ export class AbjectEditor extends Abject {
       if (result.success) {
         await this.loadCurrentSource();
         await this.updateStatus(`Restored version from ${new Date(version.savedAt).toLocaleString()} — it is now live and persisted`, this.theme.statusSuccess);
+        // The restored source is live again: flash in the living light.
+        this.windowEffect('flash');
         await this.notify('Version restored', 'success');
         // Refresh the history row: the replaced source is now the newest version.
         await this.closeHistory();
         await this.openHistory();
       } else {
         await this.updateStatus(`**Restore failed:** ${result.error ?? 'unknown'}`, this.theme.statusError);
+        this.windowEffect('shake');
         await this.notify(`Restore failed: ${(result.error ?? 'unknown').slice(0, 80)}`, 'error');
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.updateStatus(`**Restore failed:** ${msg}`, this.theme.statusError);
+      this.windowEffect('shake');
     }
     await this.setControlsDisabled(false);
   }
@@ -759,15 +765,18 @@ export class AbjectEditor extends Abject {
       );
       if (result.success) {
         await this.updateStatus(`Deleted version from ${new Date(version.savedAt).toLocaleString()}`, this.theme.statusNeutral);
+        this.windowEffect('flash', '$accent');
         await this.notify('Version deleted', 'success');
         // Refresh: indices shifted, and the preview was showing deleted bytes.
         await this.closeHistory();
         await this.openHistory();
       } else {
         await this.updateStatus(`**Delete failed:** ${result.error ?? 'unknown'}`, this.theme.statusError);
+        this.windowEffect('shake');
       }
     } catch (err) {
       await this.updateStatus(`**Delete failed:** ${err instanceof Error ? err.message : String(err)}`, this.theme.statusError);
+      this.windowEffect('shake');
     }
   }
 
@@ -788,6 +797,8 @@ export class AbjectEditor extends Abject {
     const source = reassembleHandlerMap(this.entries);
 
     await this.setControlsDisabled(true);
+    // Compiling can take a moment; say so while the buttons are disabled.
+    await this.updateStatus(persist ? 'Saving...' : 'Testing...', this.theme.statusNeutral);
     try {
       const result = await this.request<{ success: boolean; error?: string; errorLine?: number }>(
         request(this.id, this.editingObjectId, 'updateSource', { source })
@@ -820,20 +831,27 @@ export class AbjectEditor extends Abject {
             }
           } catch { /* persist not critical for apply */ }
           await this.updateStatus('Saved and persisted', this.theme.statusSuccess);
+          // The new source is live: flash in the living light.
+          this.windowEffect('flash');
           await this.notify('Source saved and persisted', 'success');
         } else {
           const msg = persist ? 'Applied (store unavailable)' : 'Applied (not persisted)';
           await this.updateStatus(msg, this.theme.statusSuccess);
+          // Live but not kept when a save was asked for: that needs attention.
+          if (persist) this.windowEffect('pulse', '$statusWarning');
+          else this.windowEffect('flash');
           await this.notify(msg, persist ? 'warning' : 'success');
         }
       } else {
         await this.updateStatus(`**Error:** ${result.error ?? 'Unknown'}`, this.theme.statusError);
+        this.windowEffect('shake');
         await this.highlightErrorLine(source, result.errorLine, result.error);
         await this.notify(`Compile error: ${(result.error ?? 'Unknown').slice(0, 80)}`, 'error');
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.updateStatus(`**Error:** ${msg}`, this.theme.statusError);
+      this.windowEffect('shake');
       await this.notify(`Save failed: ${msg.slice(0, 80)}`, 'error');
     }
     await this.setControlsDisabled(false);
@@ -935,6 +953,19 @@ export class AbjectEditor extends Abject {
       return;
     }
 
+    // A handler name becomes a method key in the source, so it has to be a
+    // plain identifier, and one the object does not already have.
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+      await this.updateStatus(`**${name}** is not a valid handler name: use letters, digits, _ or $, with a letter, _ or $ first`, this.theme.statusError);
+      this.windowEffect('shake');
+      return;
+    }
+    if (this.entries.some((e) => e.name === name)) {
+      await this.updateStatus(`**${name}** already exists: pick it in the list to edit it`, this.theme.statusError);
+      this.windowEffect('shake');
+      return;
+    }
+
     // Determine type from name
     const isPrivate = name.startsWith('_');
     const type: EntryType = isPrivate ? 'helper' : 'handler';
@@ -955,6 +986,15 @@ export class AbjectEditor extends Abject {
   // ── Delete Handler ───────────────────────────────────────────────────
 
   // ── Helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * Play a one-shot slab effect on the editor window (visual only). Fire and
+   * forget: a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    this.playWindowEffect(this.windowId, effect, color);
+  }
 
   private async updateStatus(text: string, color: string): Promise<void> {
     if (!this.editStatusId) return;

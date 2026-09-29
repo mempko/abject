@@ -13,7 +13,7 @@ import {
   InterfaceId,
 } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { DEFAULT_THEME, shapeOf } from '../core/theme-data.js';
 import { hatch, withAlpha } from './widgets/widget-types.js';
@@ -25,12 +25,18 @@ import { hatch, withAlpha } from './widgets/widget-types.js';
 function scrimCommands(theme: ThemeData, width: number, height: number): unknown[] {
   const rect = { x: 0, y: 0, width, height };
   return [
-    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(shapeOf(theme).blockShadowColor, 0.35) } },
-    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.08), 14, 2),
+    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(theme.canvasBg, 0.14) } },
+    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.05), 14, 2),
   ];
 }
 
 const MODAL_DIALOG_INTERFACE: InterfaceId = 'abjects:modal-dialog' as InterfaceId;
+
+/**
+ * How long the dialog holds after a confirm so its flash reads before the
+ * slab folds away (the close transition carries no effects of its own).
+ */
+const CONFIRM_FLASH_HOLD_MS = 140;
 
 export class ModalDialog extends Abject {
   private widgetManagerId?: AbjectId;
@@ -140,6 +146,7 @@ Interface: abjects:modal-dialog`;
     this.on('show', (msg: AbjectMessage) => {
       this.handleShow(msg).then(
         async (confirmed) => {
+          if (confirmed === true) await this.confirmFlash();
           await this.destroyWindows();
           this.sendDeferredReply(msg, confirmed);
           this.stop().catch(() => {});
@@ -157,6 +164,7 @@ Interface: abjects:modal-dialog`;
       this.promptMode = true;
       this.handleShow(msg).then(
         async (result) => {
+          if (typeof result === 'string') await this.confirmFlash();
           await this.destroyWindows();
           this.sendDeferredReply(msg, result);
           this.stop().catch(() => {});
@@ -242,12 +250,41 @@ Interface: abjects:modal-dialog`;
   }
 
   /**
+   * Mark (or unmark) the dialog and its backdrop modal: every other window
+   * recedes and dims while the dialog shows. The backdrop is modal too so the
+   * full-screen scrim stays flush with the display instead of receding.
+   */
+  private async setModal(modal: boolean): Promise<void> {
+    const ids = [this.backdropWindowId, this.dialogWindowId].filter((id): id is AbjectId => !!id);
+    await Promise.all(ids.map(async (windowId) => {
+      try {
+        await this.setWindowModal(windowId, modal);
+      } catch { /* window gone; closing it clears the flag anyway */ }
+    }));
+  }
+
+  /**
+   * A confirm lands: flash the dialog in the hand's colour, then hold briefly
+   * so the flash reads before the dialog folds away.
+   */
+  private async confirmFlash(): Promise<void> {
+    if (!this.dialogWindowId) return;
+    try {
+      this.playWindowEffect(this.dialogWindowId, 'flash', '$accent');
+    } catch { return; /* window gone */ }
+    await new Promise<void>((resolve) => { this.setTimer(() => resolve(), CONFIRM_FLASH_HOLD_MS); });
+  }
+
+  /**
    * Destroy dialog and backdrop windows. Awaited so the backdrop is visually
    * removed from the compositor BEFORE the deferred reply delivers the result.
+   * Every close path (confirm, cancel, escape, backdrop click, remote answer)
+   * comes through here, so the modal depth always lifts with the dialog.
    */
   private async destroyWindows(): Promise<void> {
     const wmId = this.widgetManagerId;
     if (!wmId) return;
+    await this.setModal(false);
     if (this.dialogWindowId) {
       try { this.send(request(this.id, wmId, 'destroyWindowAbject',
         { windowId: this.dialogWindowId })); } catch { /* gone */ }
@@ -325,6 +362,9 @@ Interface: abjects:modal-dialog`;
         zIndex: 5001,
       })
     );
+    // Modal (dialog and scrim) for the dialog's whole lifetime; the desktop
+    // recedes behind the scrim. destroyWindows lifts it on every close path.
+    await this.setModal(true);
 
     // 3. Build dialog content via WidgetManager
     const rootLayoutId = await this.request<AbjectId>(

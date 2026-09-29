@@ -695,6 +695,30 @@ export abstract class Abject {
   /** WidgetManager, once subscribed for active-theme pushes. */
   private _activeThemeSourceId?: AbjectId;
 
+  /**
+   * Play a slab effect on a window: visual only, animated client-side (see
+   * WidgetManager "Game-grade UI"). `effect` is a registered or built-in name
+   * (shake, glitch, flash, pulse, burst, ...) or an inline SlabEffectSpec;
+   * `color` (CSS or $token) overrides its light colours. Fire-and-forget.
+   */
+  protected playWindowEffect(windowId: AbjectId | undefined, effect: string | Record<string, unknown>, color?: string): void {
+    if (!windowId) return;
+    try {
+      this.send(event(this.id, windowId, 'effect', color ? { effect, color } : { effect }));
+    } catch { /* window gone */ }
+  }
+
+  /**
+   * Mark a window modal or not: while a modal window shows, every other
+   * window recedes into depth and dims. Best effort (a gone window is fine).
+   */
+  protected async setWindowModal(windowId: AbjectId | undefined, modal: boolean): Promise<void> {
+    if (!windowId) return;
+    try {
+      await this.request(request(this.id, windowId, 'setModal', { modal }), 2000);
+    } catch { /* window gone */ }
+  }
+
   /** Current capability facts for a busy Ask reply; overrides must not call an LLM. */
   protected async askAvailabilityContext(): Promise<string> { return ''; }
 

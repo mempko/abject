@@ -22,6 +22,9 @@ const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
 const WIN_W = 820;
 const WIN_H = 500;
 
+/** Scene node id of the discovery particle stream along the status line. */
+const DISCOVERY_STREAM_ID = 'workspace-browser-discovery';
+
 export class WorkspaceBrowser extends Abject {
   private widgetManagerId?: AbjectId;
   private shareRegistryId?: AbjectId;
@@ -58,6 +61,11 @@ export class WorkspaceBrowser extends Abject {
   private selectedPeerId?: string;
   private selectedPeerIsPrivate = false;
   private selectedWorkspaceIndex = -1;
+
+  /** Workspaces already shown to the user (ownerPeerId:workspaceId), so only arrivals flash. */
+  private knownWorkspaceKeys = new Set<string>();
+  /** True once the discovery stream node is in the window's scene. */
+  private discoveryStreamAdded = false;
 
   constructor() {
     super({
@@ -181,6 +189,69 @@ discovered, the browser rebuilds automatically if it is visible.
     this.selectedPeerId = undefined;
     this.selectedPeerIsPrivate = false;
     this.selectedWorkspaceIndex = -1;
+    this.discoveryStreamAdded = false;
+  }
+
+  /** Play a slab effect on the browser window (visual only, fire and forget). */
+  private windowEffect(effect: 'shake' | 'flash'): void {
+    if (!this.windowId) return;
+    this.request(request(this.id, this.windowId, 'effect', { effect }))
+      .catch(() => { /* effects are decoration */ });
+  }
+
+  /** Stable keys of the cached workspaces. */
+  private workspaceKeys(): Set<string> {
+    return new Set(this.cachedWorkspaces.map(w => `${w.ownerPeerId}:${w.workspaceId}`));
+  }
+
+  /**
+   * Flash when a fetch brings workspaces the user has not seen in this
+   * window yet, then remember them. The first fetch after opening only
+   * records (opening already plays its own transition).
+   */
+  private acknowledgeArrivals(announce: boolean): void {
+    if (!announce) this.knownWorkspaceKeys.clear();
+    // The known set only grows while the window is open, so a transient
+    // empty fetch (overlapping refreshes) never makes old entries look new.
+    let arrived = false;
+    for (const key of this.workspaceKeys()) {
+      if (this.knownWorkspaceKeys.has(key)) continue;
+      this.knownWorkspaceKeys.add(key);
+      arrived = true;
+    }
+    if (announce && arrived) this.windowEffect('flash');
+  }
+
+  /**
+   * A gentle living-light stream rising off the status line while discovery
+   * is in flight. It streams only while a request is out; `rate: 0` lets the
+   * last particles fade so the desktop comes back to rest.
+   */
+  private async setDiscoveryStream(on: boolean): Promise<void> {
+    if (!this.windowId) return;
+    try {
+      if (on) {
+        const rect = await this.request<{ width: number; height: number }>(
+          request(this.id, this.windowId, 'getRect', {})
+        );
+        // Status line: the root VBox's last row (16px tall, 8px bottom margin).
+        const position: [number, number, number] = [0, rect.height / 2 - 16, 6];
+        const params = {
+          rate: 16, lifetime: 1300, speed: [10, 28], direction: [0, -1, 0.25], spread: 0.5,
+          gravity: -8, size: [1.5, 3], color: '$accentSecondary', shape: 'glow',
+          emitterSize: [Math.max(40, rect.width - 40), 2, 0], maxParticles: 60,
+        };
+        const op = this.discoveryStreamAdded
+          ? { op: 'update', id: DISCOVERY_STREAM_ID, transform: { position }, params }
+          : { op: 'add', id: DISCOVERY_STREAM_ID, kind: 'particles', transform: { position }, params };
+        await this.request(request(this.id, this.windowId, 'scene', { ops: [op] }));
+        this.discoveryStreamAdded = true;
+      } else if (this.discoveryStreamAdded) {
+        await this.request(request(this.id, this.windowId, 'scene', {
+          ops: [{ op: 'update', id: DISCOVERY_STREAM_ID, params: { rate: 0 } }],
+        }));
+      }
+    } catch { /* scene is decoration */ }
   }
 
   // ── Handlers ──
@@ -288,6 +359,7 @@ discovered, the browser rebuilds automatically if it is visible.
 
     // Fetch workspaces
     await this.fetchWorkspaces();
+    this.acknowledgeArrivals(false);
 
     // Build UI
     await this.buildUI();
@@ -342,14 +414,17 @@ discovered, the browser rebuilds automatically if it is visible.
       }));
     }
     let ok = true;
-    // Trigger discovery
+    // Trigger discovery (the status line streams living light while it runs)
     if (this.shareRegistryId) {
+      await this.setDiscoveryStream(true);
       try {
         await this.request(
           request(this.id, this.shareRegistryId, 'discoverWorkspaces', { hops: 1 })
         );
       } catch {
         ok = false;
+      } finally {
+        await this.setDiscoveryStream(false);
       }
     }
 
@@ -363,6 +438,15 @@ discovered, the browser rebuilds automatically if it is visible.
       this.send(event(this.id, this.refreshBtnId, 'update', { busy: false }));
     }
     if (!ok) {
+      this.windowEffect('shake');
+      if (this.statusLabelId) {
+        try {
+          await this.request(request(this.id, this.statusLabelId, 'update', {
+            text: 'Discovery failed. Check your peer connections, then press Refresh.',
+            style: { color: this.theme.statusError, fontSize: 11 },
+          }));
+        } catch { /* widget gone */ }
+      }
       await this.notify('Workspace discovery failed', 'error');
     }
     return true;
@@ -381,6 +465,7 @@ discovered, the browser rebuilds automatically if it is visible.
 
   private async fetchAndRebuild(): Promise<void> {
     await this.fetchWorkspaces();
+    this.acknowledgeArrivals(true);
     await this.rebuildPeerList();
     if (this.selectedPeerId) {
       await this.rebuildWorkspaceList();
@@ -903,8 +988,19 @@ discovered, the browser rebuilds automatically if it is visible.
           label: `${ws.name} (${ws.ownerName || ws.ownerPeerId.slice(0, 8)})`,
         })
       );
+      // The remote workspace opened: the browser acknowledges the arrival.
+      this.windowEffect('flash');
     } catch (err) {
       log.warn('Failed to open remote browser:', err);
+      this.windowEffect('shake');
+      if (this.statusLabelId) {
+        try {
+          await this.request(request(this.id, this.statusLabelId, 'update', {
+            text: `Could not open ${ws.name}. The owner may be offline; press Refresh and try again.`,
+            style: { color: this.theme.statusError, fontSize: 11 },
+          }));
+        } catch { /* widget gone */ }
+      }
     }
   }
 }

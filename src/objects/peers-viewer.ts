@@ -237,6 +237,13 @@ export class PeersViewer extends Abject {
     return true;
   }
 
+  /** Play a slab effect on the viewer window (visual only, fire and forget). */
+  private windowEffect(effect: 'shake' | 'flash'): void {
+    if (!this.windowId) return;
+    this.request(request(this.id, this.windowId, 'effect', { effect }))
+      .catch(() => { /* effects are decoration */ });
+  }
+
   private selectedPeer(): PeerRow | undefined {
     return this.selectedPeerIndex >= 0 ? this.peers[this.selectedPeerIndex] : undefined;
   }
@@ -521,6 +528,14 @@ export class PeersViewer extends Abject {
       spacing: 8,
     }));
 
+    // Header row: a one-line hint on the left, Refresh on the right (the
+    // same idiom as the other peer windows).
+    const headerRowId = await this.request<AbjectId>(request(this.id, manager, 'createNestedHBox', {
+      parentLayoutId: this.rootLayoutId,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 8,
+    }));
+
     const created = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, manager, 'create', {
       specs: [
         { type: 'button', windowId: this.windowId, rect: EMPTY_RECT, text: 'Refresh' },
@@ -534,15 +549,27 @@ export class PeersViewer extends Abject {
           dividerPosition: 0.35,
           minSize: 180,
         },
+        {
+          type: 'label', windowId: this.windowId, rect: EMPTY_RECT,
+          text: 'Who is in the active shared workspace, and the abjects each peer exposes.',
+          style: { ...hintStyle(this.theme), wordWrap: false },
+        },
       ],
     }));
     [this.refreshButtonId, this.peerListId, this.statusLabelId, this.splitPaneId] = created.widgetIds;
+    const hintId = created.widgetIds[4];
 
     await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.peerListId }));
     await this.request(request(this.id, this.splitPaneId, 'setRightChild', { widgetId: this.detailPaneId }));
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: hintId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 28 } },
+        { widgetId: this.refreshButtonId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 90, height: 28 } },
+      ],
+    }));
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.refreshButtonId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 90, height: 28 } },
+        { widgetId: headerRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 28 } },
         { widgetId: this.splitPaneId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
         { widgetId: this.statusLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
       ],
@@ -795,6 +822,8 @@ export class PeersViewer extends Abject {
   private async handleWidgetEvent(from: AbjectId, aspect: string, payload: Record<string, unknown>): Promise<void> {
     if (from === this.refreshButtonId && this.isClick(aspect)) {
       await this.refresh();
+      // A refresh that could not load the peers says so with a shake.
+      if (this.peerLoadState === 'error' || this.catalogLoadState === 'error') this.windowEffect('shake');
       return;
     }
     const index = this.readIndex(payload);
@@ -811,6 +840,8 @@ export class PeersViewer extends Abject {
       await this.rebuildDetailPane();
       await this.loadSelectedPeerCatalog();
       await this.rebuildDetailPane();
+      // (The load above reassigns the state; read it afresh.)
+      if ((this.catalogLoadState as CatalogLoadState) === 'error') this.windowEffect('shake');
       this.checkInvariants();
       return;
     }

@@ -406,6 +406,9 @@ export type BackendToFrontendMsg =
   | SceneOpsMsg
   | SetSceneThemeMsg
   | SetSurfaceTransformMsg
+  | SurfaceEffectMsg
+  | SetSurfaceModalMsg
+  | SetSlabMotionMsg
   | AudioPlayMsg
   | AudioControlMsg
   | AudioGraphMsg
@@ -514,6 +517,28 @@ export interface SceneOpsMsg extends WsEnvelope {
 export interface SetSceneThemeMsg extends WsEnvelope {
   type: 'setSceneTheme';
   theme: Record<string, unknown>;
+}
+
+/** One-shot client-side slab effect (shake, flash, pulse, burst, modal depth). */
+export interface SurfaceEffectMsg extends WsEnvelope {
+  type: 'surfaceEffect';
+  surfaceId: string;
+  /** Effect name or inline SlabEffectSpec. */
+  effect: string | Record<string, unknown>;
+  color?: string;
+}
+
+/** Mark a surface modal (others recede while it shows). */
+export interface SetSurfaceModalMsg extends WsEnvelope {
+  type: 'setSurfaceModal';
+  surfaceId: string;
+  modal: boolean;
+}
+
+/** Desktop motion configuration (named effects, transitions, modal style). */
+export interface SetSlabMotionMsg extends WsEnvelope {
+  type: 'setSlabMotion';
+  config: Record<string, unknown>;
 }
 
 /** Abject-requested slab transform: tilt/float a window in the scene. */

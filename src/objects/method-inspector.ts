@@ -77,6 +77,10 @@ interface Session {
   msgParamInputIds: Map<string, AbjectId>;
   msgSendBtnId?: AbjectId;
   msgResponseLabelId?: AbjectId;
+  /** The layout holding msgResponseLabelId (the Send message card). */
+  msgResponseLayoutId?: AbjectId;
+  /** Grouped cards in the detail pane (destroying one takes its rows with it). */
+  detailSectionIds: AbjectId[];
 
   /** Every event-bearing widget in this session, for routing 'changed' events. */
   widgetIds: Set<AbjectId>;
@@ -224,7 +228,11 @@ owner. Clicking ? again on the same object raises its existing window.
           windowId: existing.windowId,
         }));
       } catch { /* window gone — fall through to rebuild */ }
-      if (this.sessions.has(existing.windowId)) return;
+      if (this.sessions.has(existing.windowId)) {
+        // Asked for again: point the user at the inspector already open.
+        this.windowEffect(existing.windowId, 'pulse');
+        return;
+      }
     }
 
     // Read the target's interface live via its introspect 'describe' handler.
@@ -266,6 +274,7 @@ owner. Clicking ? again on the same object raises its existing window.
       detailLabelIds: [],
       detailButtonIds: new Map(),
       msgParamInputIds: new Map(),
+      detailSectionIds: [],
       widgetIds: new Set(),
     };
 
@@ -351,8 +360,10 @@ owner. Clicking ? again on the same object raises its existing window.
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2) + offset);
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2) + offset);
 
+    // Titled as an inspector so it never reads as the inspected object's own
+    // window in the title bar or a window switcher.
     const windowId = await wm('createWindowAbject', {
-      title: session.targetName,
+      title: `Inspect: ${session.targetName}`,
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;
@@ -487,11 +498,36 @@ owner. Clicking ? again on the same object raises its existing window.
       session.widgetIds.delete(id);
       this.send(request(this.id, id, 'destroy', {}));
     }
+    // Cards last: each takes its rows with it.
+    for (const id of session.detailSectionIds) {
+      this.send(request(this.id, id, 'destroy', {}));
+    }
     session.detailLabelIds = [];
     session.detailButtonIds.clear();
     session.msgParamInputIds.clear();
     session.msgSendBtnId = undefined;
     session.msgResponseLabelId = undefined;
+    session.msgResponseLayoutId = undefined;
+    session.detailSectionIds = [];
+  }
+
+  /**
+   * A grouped card in the detail pane (WidgetManager createSection: ruled
+   * panel, sigil title, optional hint). Returns the card's layout id: add the
+   * section's rows to it. Inside the scrollable pane the card sizes to its
+   * content.
+   */
+  private async addDetailSection(session: Session, title: string, description?: string, hintHeight = 18): Promise<AbjectId> {
+    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+      request(this.id, this.widgetManagerId!, 'createSection', {
+        parentLayoutId: session.detailLayoutId!,
+        windowId: session.windowId,
+        title,
+        ...(description ? { description, hintHeight } : {}),
+      })
+    );
+    session.detailSectionIds.push(sectionId);
+    return sectionId;
   }
 
   private async rebuildDetail(session: Session): Promise<void> {
@@ -565,11 +601,8 @@ owner. Clicking ? again on the same object raises its existing window.
     if (session.iface) {
       labels.push({ text: `Interface: ${session.iface.id}`, secondary: true });
     }
-    if (method.type === 'method') {
-      labels.push({ text: sectionHeaderText(this.theme, 'Explore'), secondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
-    }
 
-    // Cross-reference buttons (methods only).
+    // Cross-reference buttons (methods only), grouped in an Explore card.
     const navBtns: Array<{ text: string; action: string }> = [];
     if (method.type === 'method') {
       navBtns.push({ text: 'Find Implementors', action: `implementors:${method.name}` });
@@ -610,14 +643,12 @@ owner. Clicking ? again on the same object raises its existing window.
       specs.push({ type: 'button', windowId: win, text: b.text, style: { fontSize: 11 } });
     }
 
-    let sendHeaderIdx = -1;
+    // The Send message card's header titles the form, so it has no label of its own.
     const paramLabelIdx: number[] = [];
     const inputIdx: number[] = [];
     let sendBtnIdx = -1;
     let responseIdx = -1;
     if (hasSend) {
-      sendHeaderIdx = specs.length;
-      specs.push({ type: 'label', windowId: win, text: sectionHeaderText(this.theme, 'Send Message'), style: { ...sectionHeaderStyle(this.theme, 12) } });
       for (const ins of inputSpecs) {
         paramLabelIdx.push(specs.length);
         specs.push({ type: 'label', windowId: win, text: ins.label, style: { fontSize: 12, wordWrap: true, color: this.theme.textSecondary } });
@@ -638,7 +669,6 @@ owner. Clicking ? again on the same object raises its existing window.
     for (let i = labelStart; i < navStart; i++) session.detailLabelIds.push(widgetIds[i]);
     for (let i = 0; i < navBtns.length; i++) session.detailButtonIds.set(widgetIds[navStart + i], navBtns[i].action);
     if (hasSend) {
-      session.detailLabelIds.push(widgetIds[sendHeaderIdx]);
       for (let i = 0; i < inputSpecs.length; i++) {
         session.detailLabelIds.push(widgetIds[paramLabelIdx[i]]);
         session.msgParamInputIds.set(inputSpecs[i].paramName, widgetIds[inputIdx[i]]);
@@ -648,28 +678,42 @@ owner. Clicking ? again on the same object raises its existing window.
       session.detailLabelIds.push(session.msgResponseLabelId);
     }
 
-    // ── Layout ──
-    const children: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+    // ── Layout: header labels, then the Explore and Send message cards ──
+    type LayoutChild = { widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> };
+    const children: LayoutChild[] = [];
     for (let i = labelStart; i < navStart; i++) {
       const l = labels[i - labelStart];
       const lh = l.secondary ? 16 : 18;
       const lines = Math.max(1, Math.ceil(l.text.length / 40));
       children.push({ widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(lh, lines * lh) } });
     }
-    for (let i = 0; i < navBtns.length; i++) {
-      children.push({ widgetId: widgetIds[navStart + i], sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 160, height: 26 } });
-    }
-    if (hasSend) {
-      children.push({ widgetId: widgetIds[sendHeaderIdx], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } });
-      for (let i = 0; i < inputSpecs.length; i++) {
-        const lblLines = Math.max(1, Math.ceil(inputSpecs[i].label.length / 40));
-        children.push({ widgetId: widgetIds[paramLabelIdx[i]], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(16, lblLines * 16) } });
-        children.push({ widgetId: widgetIds[inputIdx[i]], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 30 } });
-      }
-      children.push({ widgetId: widgetIds[sendBtnIdx], sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 180, height: 26 } });
-      children.push({ widgetId: widgetIds[responseIdx], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
-    }
     await this.request(request(this.id, session.detailLayoutId!, 'addLayoutChildren', { children }));
+
+    if (navBtns.length > 0) {
+      const exploreCard = await this.addDetailSection(session, 'Explore');
+      const navChildren: LayoutChild[] = [];
+      for (let i = 0; i < navBtns.length; i++) {
+        navChildren.push({ widgetId: widgetIds[navStart + i], sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 160, height: 26 } });
+      }
+      await this.request(request(this.id, exploreCard, 'addLayoutChildren', { children: navChildren }));
+    }
+
+    if (hasSend) {
+      // One field per parameter, the send button (this card's primary action)
+      // and the response under it. Cards are narrower than the pane (their own
+      // margins), so their labels wrap sooner.
+      const sendCard = await this.addDetailSection(session, 'Send message');
+      const sendChildren: LayoutChild[] = [];
+      for (let i = 0; i < inputSpecs.length; i++) {
+        const lblLines = Math.max(1, Math.ceil(inputSpecs[i].label.length / 34));
+        sendChildren.push({ widgetId: widgetIds[paramLabelIdx[i]], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(16, lblLines * 16) } });
+        sendChildren.push({ widgetId: widgetIds[inputIdx[i]], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 30 } });
+      }
+      sendChildren.push({ widgetId: widgetIds[sendBtnIdx], sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 180, height: 26 } });
+      sendChildren.push({ widgetId: widgetIds[responseIdx], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+      await this.request(request(this.id, sendCard, 'addLayoutChildren', { children: sendChildren }));
+      session.msgResponseLayoutId = sendCard;
+    }
 
     // ── Wire events ──
     for (let i = 0; i < navBtns.length; i++) await this.addDep(session, widgetIds[navStart + i]);
@@ -829,12 +873,14 @@ owner. Clicking ? again on the same object raises its existing window.
       session.editorId = editorId;
     }
     if (!editorId) {
+      this.windowEffect(session.windowId, 'shake');
       await this.notify('No source editor available', 'error');
       return;
     }
     try {
       await this.request(request(this.id, editorId, 'show', { objectId: session.targetId }));
     } catch {
+      this.windowEffect(session.windowId, 'shake');
       await this.notify('Could not open the source editor', 'error');
     }
   }
@@ -850,7 +896,11 @@ owner. Clicking ? again on the same object raises its existing window.
       let raw = '';
       try { raw = (await this.request<string>(request(this.id, rawJsonInputId, 'getValue', {})) ?? '').trim(); } catch { raw = ''; }
       try { payload = raw ? JSON.parse(raw) : {}; }
-      catch { await this.showFeedback(session, 'Error: invalid JSON payload'); return; }
+      catch {
+        await this.showFeedback(session, 'Error: invalid JSON payload');
+        this.windowEffect(session.windowId, 'shake');
+        return;
+      }
     } else {
       for (const p of paramDecls) {
         const inputId = session.msgParamInputIds.get(p.name);
@@ -858,9 +908,17 @@ owner. Clicking ? again on the same object raises its existing window.
         let raw = '';
         try { raw = (await this.request<string>(request(this.id, inputId, 'getValue', {})) ?? '').trim(); } catch { raw = ''; }
         if (raw === '' && p.optional) continue;
-        if (raw === '' && !p.optional) { await this.showFeedback(session, `Error: "${p.name}" is required`); return; }
+        if (raw === '' && !p.optional) {
+          await this.showFeedback(session, `Error: "${p.name}" is required`);
+          this.windowEffect(session.windowId, 'shake');
+          return;
+        }
         const parsed = this.parseParamValue(raw, p.type);
-        if (parsed.error) { await this.showFeedback(session, `Error in "${p.name}": ${parsed.error}`); return; }
+        if (parsed.error) {
+          await this.showFeedback(session, `Error in "${p.name}": ${parsed.error}`);
+          this.windowEffect(session.windowId, 'shake');
+          return;
+        }
         payload[p.name] = parsed.value;
       }
     }
@@ -873,15 +931,27 @@ owner. Clicking ? again on the same object raises its existing window.
       const result = await this.request(request(this.id, session.targetId, session.selected.name, payload));
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       await this.showFeedback(session, `Response: ${resultStr}`);
+      // The object answered: flash in the living light.
+      this.windowEffect(session.windowId, 'flash');
       await this.notify(`${session.selected.name} returned ${resultStr.length > 60 ? resultStr.slice(0, 57) + '...' : resultStr}`, 'success');
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(session, `Error: ${errMsg}`);
+      this.windowEffect(session.windowId, 'shake');
       await this.notify(`${session.selected.name} failed: ${errMsg.slice(0, 80)}`, 'error');
     } finally {
       if (session.msgSendBtnId) this.send(event(this.id, session.msgSendBtnId, 'update', { busy: false }));
       await this.setWidgetDisabled(session.msgSendBtnId, false);
     }
+  }
+
+  /**
+   * Play a one-shot slab effect on an inspector window (visual only). Fire
+   * and forget: a window that closed meanwhile simply misses it.
+   */
+  private windowEffect(windowId: AbjectId | undefined, effect: string, color?: string): void {
+    if (!windowId || !this.sessions.has(windowId)) return;
+    this.playWindowEffect(windowId, effect, color);
   }
 
   private async setWidgetDisabled(id: AbjectId | undefined, disabled: boolean): Promise<void> {
@@ -896,7 +966,7 @@ owner. Clicking ? again on the same object raises its existing window.
       const explicitLines = text.split('\n');
       let totalLines = 0;
       for (const line of explicitLines) totalLines += Math.max(1, Math.ceil((line.length || 1) / 35));
-      await this.request(request(this.id, session.detailLayoutId, 'updateLayoutChild', {
+      await this.request(request(this.id, session.msgResponseLayoutId ?? session.detailLayoutId, 'updateLayoutChild', {
         widgetId: session.msgResponseLabelId, preferredSize: { height: Math.max(16, totalLines * 16) },
       }));
     } catch { /* gone */ }
