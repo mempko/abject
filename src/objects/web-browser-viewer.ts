@@ -20,6 +20,8 @@ import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as requireContract, requireNonEmpty } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
+import { chromeCase } from '../core/theme-data.js';
+import { fontStacks } from './widgets/widget-types.js';
 
 const WEB_BROWSER_VIEWER_INTERFACE: InterfaceId = 'abjects:web-browser-viewer';
 
@@ -316,6 +318,7 @@ export class WebBrowserViewer extends Abject {
       return true;
     }
 
+    await this.fetchTheme();
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
@@ -348,12 +351,12 @@ export class WebBrowserViewer extends Abject {
           { type: 'button', windowId: this.windowId, text: '◀' },
           { type: 'button', windowId: this.windowId, text: '▶' },
           { type: 'button', windowId: this.windowId, text: '⟳' },
-          { type: 'label', windowId: this.windowId, text: '', style: { color: '#8b8fa3', fontSize: 11 } },
-          { type: 'button', windowId: this.windowId, text: 'Take Control' },
-          { type: 'label', windowId: this.windowId, text: '', style: { color: '#e8b45a', fontSize: 12 } },
-          { type: 'button', windowId: this.windowId, text: 'Take Control' },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textSecondary, fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: 'Take Control', style: this.primaryStyle() },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.statusWarning, fontSize: 12 } },
+          { type: 'button', windowId: this.windowId, text: 'Take Control', style: this.primaryStyle() },
           { type: 'button', windowId: this.windowId, text: 'Dismiss' },
-          { type: 'label', windowId: this.windowId, text: 'No browser pages open', style: { color: '#6b7084', fontSize: 11 } },
+          { type: 'label', windowId: this.windowId, text: 'No browser pages open', style: { color: this.theme.textMeta, fontSize: 11 } },
         ],
       })
     );
@@ -381,8 +384,8 @@ export class WebBrowserViewer extends Abject {
     const urlRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 4, bottom: 0, left: 0 },
-        spacing: 6,
+        margins: { top: 0, right: 8, bottom: 0, left: 8 },
+        spacing: 8,
       })
     );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
@@ -404,8 +407,8 @@ export class WebBrowserViewer extends Abject {
     this.bannerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
-        margins: { top: 2, right: 4, bottom: 2, left: 8 },
-        spacing: 6,
+        margins: { top: 2, right: 8, bottom: 2, left: 8 },
+        spacing: 8,
       })
     );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
@@ -759,7 +762,7 @@ export class WebBrowserViewer extends Abject {
       try {
         if (this.pendingHandoff) {
           await this.request(request(this.id, this.bannerLabelId!, 'update', {
-            text: `⚠ ${this.pendingHandoff.reason}`,
+            text: `\u25B2 ${this.pendingHandoff.reason}`,
           }));
           await this.request(request(this.id, this.bannerTakeBtnId!, 'update', {
             text: this.controlMode ? 'Done, hand back' : 'Take Control',
@@ -1018,16 +1021,21 @@ export class WebBrowserViewer extends Abject {
   private async updateStatusLabel(): Promise<void> {
     if (!this.statusLabelId) return;
     let statusText: string;
+    // Human control reads in red; a live page feed glows; idle is muted.
+    let color: string;
     if (this.controlMode) {
-      statusText = 'You are in control — mouse and keyboard go to the page';
+      statusText = 'You are in control: mouse and keyboard go to the page';
+      color = this.theme.accent;
     } else if (this.pages.length === 0) {
       statusText = 'No browser pages open';
+      color = this.theme.textMeta;
     } else {
       statusText = `${this.pages.length} page${this.pages.length > 1 ? 's' : ''} open | Refresh ${this.refreshIntervalMs / 1000}s`;
+      color = this.theme.accentSecondary;
     }
     try {
       await this.request(
-        request(this.id, this.statusLabelId, 'update', { text: statusText })
+        request(this.id, this.statusLabelId, 'update', { text: statusText, style: { color } })
       );
     } catch { /* widget gone */ }
   }
@@ -1145,7 +1153,7 @@ export class WebBrowserViewer extends Abject {
 
       const commands: unknown[] = [];
       if (rectChanged || controlChanged) {
-        commands.push({ type: 'clear', params: { color: '#1a1a2e' } });
+        commands.push({ type: 'clear', params: { color: this.theme.windowBg } });
       }
       commands.push({
         type: 'imageUrl',
@@ -1158,7 +1166,7 @@ export class WebBrowserViewer extends Abject {
           type: 'rect',
           params: {
             x: drawX - 2, y: drawY - 2, width: dw + 4, height: dh + 4,
-            stroke: '#e8b45a', lineWidth: 2,
+            stroke: this.theme.statusWarning, lineWidth: 2,
           },
         });
       }
@@ -1188,25 +1196,43 @@ export class WebBrowserViewer extends Abject {
       const cx = Math.floor(canvasSize.width / 2);
       const cy = Math.floor(canvasSize.height / 2);
 
-      await this.request(
-        request(this.id, this.canvasId, 'draw', {
-          commands: [
-            { type: 'clear', params: { color: '#1a1a2e' } },
-            {
-              type: 'text',
-              params: {
-                x: cx, y: cy,
-                text: text ?? 'No browser pages open',
-                font: '13px sans-serif',
-                fill: '#6b7084',
-                align: 'center',
-                baseline: 'middle',
-              },
-            },
-          ],
-        })
-      );
+      const t = this.theme;
+      const { body, display } = fontStacks(t);
+      const commands: unknown[] = [{ type: 'clear', params: { color: t.windowBg } }];
+      if (text) {
+        commands.push({
+          type: 'text',
+          params: { x: cx, y: cy, text, font: `13px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
+        });
+      } else {
+        // Empty state: a closed ring sigil (nothing is being watched), then
+        // what appears here and how to get it.
+        const ringY = cy - 44;
+        commands.push(
+          { type: 'circle', params: { cx, cy: ringY, radius: 18, stroke: t.textSecondary, lineWidth: 2 } },
+          { type: 'circle', params: { cx, cy: ringY, radius: 10, stroke: t.accent, lineWidth: 1.5 } },
+          { type: 'line', params: { x1: cx - 5, y1: ringY, x2: cx + 5, y2: ringY, stroke: t.textSecondary, lineWidth: 2 } },
+          {
+            type: 'text',
+            params: { x: cx, y: cy, text: chromeCase(t, 'No pages open'), font: `bold 14px ${display}`, fill: t.textSecondary, align: 'center', baseline: 'middle' },
+          },
+          {
+            type: 'text',
+            params: { x: cx, y: cy + 24, text: 'Pages that agents browse for you appear here, live.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
+          },
+          {
+            type: 'text',
+            params: { x: cx, y: cy + 42, text: 'Ask in Chat to look something up online, then watch or take control.', font: `12px ${body}`, fill: t.textTertiary, align: 'center', baseline: 'middle' },
+          },
+        );
+      }
+      await this.request(request(this.id, this.canvasId, 'draw', { commands }));
     } catch { /* canvas gone */ }
+  }
+
+  /** Red primary-action style (Take Control). */
+  private primaryStyle(): Record<string, unknown> {
+    return { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder };
   }
 
   protected override askPrompt(_question: string): string {

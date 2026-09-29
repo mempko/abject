@@ -11,7 +11,7 @@ import { request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { lightenColor } from './widgets/widget-types.js';
+import { dockStyles, type DockLauncher } from './dock-style.js';
 
 const log = new Log('GlobalToolbar');
 
@@ -326,37 +326,32 @@ LLMMonitor (The Eye).
     }));
 
     // "Grimoire index" styling: flat, borderless, left-aligned rows (matches
-    // the Abjects rail) rather than boxed pills.
+    // the Abjects rail) rather than boxed pills. Constructivist themes get the
+    // red header block and geometric launcher glyphs (see dock-style.ts).
     const compact = this.compact;
-    const ghostBg = lightenColor(this.theme.windowBg, 5);
-    const appStyle = {
-      background: ghostBg, flat: true,
-      color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-      align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
-    };
-    const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
-    const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
-    const chevron = this.collapsed ? '\u25B8' : '\u25BE';
-    const row = (icon: string, label: string) => (compact ? icon : `${icon} ${label}`);
+    const dock = dockStyles(this.theme, compact);
+    const gearStyle = dock.gear;
+    const headerStyle = dock.header;
+    const row = (key: DockLauncher, label: string) => dock.rowText(key, label);
     // Compact rows are icon-only, so the label moves into a hover tooltip.
-    const rowStyle = (label: string) => (compact ? { ...appStyle, tooltip: label } : appStyle);
+    const rowStyle = (label: string, key?: DockLauncher) => dock.rowStyle(label, key);
 
     // Batch create all widgets: header button, gear button, action buttons.
     // Compact mode drops the gear from the header (no horizontal room).
     const specs: Array<Record<string, unknown>> = [
-      { type: 'button', windowId: this.windowId, text: compact ? '\u2699' : `${chevron} System`, style: compact ? { ...headerStyle, tooltip: 'System' } : headerStyle },
+      { type: 'button', windowId: this.windowId, text: compact ? '\u2699' : dock.headerText('System', this.collapsed), style: compact ? { ...headerStyle, tooltip: 'System' } : headerStyle },
     ];
     if (!compact) {
-      specs.push({ type: 'button', windowId: this.windowId, text: '\u2699', style: gearStyle });
+      specs.push({ type: 'button', windowId: this.windowId, text: '', style: gearStyle });
     }
     const rowStartIdx = specs.length;
     if (!this.collapsed) {
       specs.push(
-        { type: 'button', windowId: this.windowId, text: row('\uD83C\uDF10', 'Network'), style: rowStyle('Network') },
-        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDD0D', 'Explorer'), style: rowStyle('Explorer') },
-        { type: 'button', windowId: this.windowId, text: row('\u2699\uFE0F', 'Procs'), style: rowStyle('Procs') },
-        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDC41', 'The Eye'), style: rowStyle('The Eye') },
-        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDD14', 'Notifications'), style: rowStyle('Notifications') },
+        { type: 'button', windowId: this.windowId, text: row('network', 'Network'), style: rowStyle('Network', 'network') },
+        { type: 'button', windowId: this.windowId, text: row('explorer', 'Explorer'), style: rowStyle('Explorer', 'explorer') },
+        { type: 'button', windowId: this.windowId, text: row('procs', 'Procs'), style: rowStyle('Procs', 'procs') },
+        { type: 'button', windowId: this.windowId, text: row('eye', 'The Eye'), style: rowStyle('The Eye', 'eye') },
+        { type: 'button', windowId: this.windowId, text: row('notifications', 'Notifications'), style: rowStyle('Notifications', 'notifications') },
       );
     }
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(

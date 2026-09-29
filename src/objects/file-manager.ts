@@ -1,7 +1,7 @@
 /**
  * FileManager -- browse, upload, and remove files in the workspace
- * FileSystem (~/.abject/ws-<id>/files). A toolbar (Up / Add / Delete /
- * Refresh) sits above a scrollable list of the current directory. Selecting
+ * FileSystem (~/.abject/ws-<id>/files). A toolbar (Up / Add / New Folder /
+ * Rename / Delete / Refresh) sits above a scrollable list of the current directory. Selecting
  * a folder navigates into it; selecting a file opens it in the FileViewer.
  */
 
@@ -11,7 +11,9 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
+import type { IconName } from '../ui/icons.js';
 import type { FileInfo } from './capabilities/filesystem.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('FileManager');
 
@@ -39,6 +41,9 @@ export class FileManager extends Abject {
   private renameBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
   private refreshBtnId?: AbjectId;
+  private emptyLabelId?: AbjectId;
+  /** Whether the empty state is showing; undefined until first applied. */
+  private emptyShown?: boolean;
 
   private currentDir = '/';
   private entries: FileInfo[] = [];
@@ -126,8 +131,8 @@ export class FileManager extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        spacing: 8,
       })
     );
 
@@ -144,14 +149,16 @@ export class FileManager extends Abject {
       preferredSize: { height: TOOLBAR_H },
     }));
 
+    // Toolbar groups: navigate | create (Add is the one primary) | modify
+    // (Delete is destructive) | refresh at the far right.
     const { widgetIds: btnIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: '⬆ Up', style: { fontSize: 12 } },
-          { type: 'button', windowId: this.windowId, text: '＋ Add', style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          { type: 'button', windowId: this.windowId, text: 'Up', style: { fontSize: 12 } },
+          { type: 'button', windowId: this.windowId, text: 'Add', style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           { type: 'button', windowId: this.windowId, text: 'New Folder', style: { fontSize: 12 } },
           { type: 'button', windowId: this.windowId, text: 'Rename', style: { fontSize: 12 } },
-          { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12 } },
+          { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
           { type: 'button', windowId: this.windowId, text: 'Refresh', style: { fontSize: 12 } },
         ],
       })
@@ -162,22 +169,26 @@ export class FileManager extends Abject {
     this.renameBtnId = btnIds[3];
     this.deleteBtnId = btnIds[4];
     this.refreshBtnId = btnIds[5];
-    await this.request(request(this.id, this.toolbarId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.upBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 56, height: 30 } },
-        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 30 } },
-        { widgetId: this.newFolderBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 92, height: 30 } },
-        { widgetId: this.renameBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 70, height: 30 } },
-        { widgetId: this.deleteBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 64, height: 30 } },
-        { widgetId: this.refreshBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 72, height: 30 } },
-      ],
-    }));
+    const fixedBtn = (widgetId: AbjectId, width: number) =>
+      ({ widgetId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width, height: 30 } });
+    const toolbarGroups = [
+      [fixedBtn(this.upBtnId, 52)],
+      [fixedBtn(this.addBtnId, 68), fixedBtn(this.newFolderBtnId, 92)],
+      [fixedBtn(this.renameBtnId, 70), fixedBtn(this.deleteBtnId, 64)],
+      [fixedBtn(this.refreshBtnId, 72)],
+    ];
+    // Stretch spacers between groups: small gaps, the widest before Refresh.
+    const gapStretch = [1, 1, 3];
+    for (let i = 0; i < toolbarGroups.length; i++) {
+      if (i > 0) await this.request(request(this.id, this.toolbarId, 'addLayoutSpacer', { stretch: gapStretch[i - 1] }));
+      await this.request(request(this.id, this.toolbarId, 'addLayoutChildren', { children: toolbarGroups[i] }));
+    }
     for (const id of btnIds) this.send(request(this.id, id, 'addDependent', {}));
 
     // Path / breadcrumb label.
     const { widgetIds: [pathId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'label', windowId: this.windowId, text: this.currentDir, style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: false } }],
+        specs: [{ type: 'label', windowId: this.windowId, text: this.currentDir, style: { fontSize: 11, color: this.theme.textMeta, wordWrap: false, fontFamily: 'mono' } }],
       })
     );
     this.pathLabelId = pathId;
@@ -200,6 +211,22 @@ export class FileManager extends Abject {
     }));
     this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
 
+    // Empty state: shares the list's slot, shown while a folder has no entries.
+    const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'label', windowId: this.windowId,
+          text: this.emptyText(this.currentDir),
+          style: emptyStateStyle(this.theme),
+        }],
+      })
+    );
+    this.emptyLabelId = emptyId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.emptyLabelId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     await this.loadDir(this.currentDir);
 
     this.changed('visibility', true);
@@ -220,6 +247,8 @@ export class FileManager extends Abject {
     this.renameBtnId = undefined;
     this.deleteBtnId = undefined;
     this.refreshBtnId = undefined;
+    this.emptyLabelId = undefined;
+    this.emptyShown = undefined;
     this.selectedPath = undefined;
     this.selectedName = '';
     this.selectedIsDir = false;
@@ -254,25 +283,54 @@ export class FileManager extends Abject {
 
     const items: ListItem[] = [];
     if (dir !== '/') {
-      items.push({ label: '⬆  ..', value: '..' });
+      items.push({ label: '..', value: '..', iconName: 'chevronUp' });
     }
     for (const info of infos) {
       if (info.isDirectory) {
-        items.push({ label: `📁  ${info.name}`, value: info.path });
+        items.push({ label: info.name, value: info.path, iconName: 'folder', iconColor: this.theme.accent });
       } else {
-        items.push({ label: `${this.fileGlyph(info.name)}  ${info.name}`, value: info.path, secondary: formatSize(info.size) });
+        items.push({ label: info.name, value: info.path, secondary: formatSize(info.size), iconName: this.fileIcon(info.name) });
       }
     }
 
     await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+    if (infos.length === 0 && this.emptyLabelId) {
+      await this.request(request(this.id, this.emptyLabelId, 'update', { text: this.emptyText(dir) }));
+    }
+    await this.applyEmptyState(infos.length === 0);
     if (this.pathLabelId) {
       await this.request(request(this.id, this.pathLabelId, 'update', { text: dir }));
     }
   }
 
-  private fileGlyph(name: string): string {
+  private emptyText(dir: string): string {
+    if (dir === '/') {
+      return emptyStateMarkdown(
+        'No files here yet',
+        'Files you add, and files agents save for this workspace, appear here. Press Add to upload from your computer, drop files onto this window, or press New Folder to organize.',
+      );
+    }
+    return emptyStateMarkdown(
+      'This folder is empty',
+      'Press Add or drop files onto this window to put files here. Press Up to return to the parent folder.',
+    );
+  }
+
+  private fileIcon(name: string): IconName {
     const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
-    return IMAGE_EXTS.has(ext) ? '🖼' : '📄';
+    return IMAGE_EXTS.has(ext) ? 'grid' : 'list';
+  }
+
+  /** Swap the list and the empty-state label in the shared layout slot. */
+  private async applyEmptyState(empty: boolean): Promise<void> {
+    if (!this.listWidgetId || !this.emptyLabelId || this.emptyShown === empty) return;
+    this.emptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.emptyLabelId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
   }
 
   // ── Events ──────────────────────────────────────────────────────────

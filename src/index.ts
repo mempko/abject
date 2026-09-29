@@ -160,6 +160,9 @@ export {
   EDGE_SIZE,
   MIDNIGHT_BLOOM,
   ARCANE_GRIMOIRE,
+  AGITPROP,
+  RED_WEDGE,
+  DEFAULT_THEME,
 } from './objects/widgets/widget-types.js';
 export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig, ThemeData } from './objects/widgets/widget-types.js';
 

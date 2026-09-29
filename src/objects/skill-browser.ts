@@ -11,6 +11,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { SkillInfo, SkillConfig } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('SkillBrowser');
 
@@ -234,6 +235,7 @@ pane shows details, configuration, and actions for the selected skill.
     }
     if (!this.widgetManagerId) return;
     if (this.windowId) return;
+    await this.fetchTheme();
 
     this.windowId = await this.wm('createWindowAbject', {
       title: 'Installed Skills',
@@ -338,7 +340,7 @@ pane shows details, configuration, and actions for the selected skill.
         badge: {
           text: state === 'off' ? 'Off' : state === 'err' ? 'Error' : 'On',
           color: state === 'off'
-            ? this.theme.statusNeutral
+            ? this.theme.textMeta
             : state === 'err'
               ? this.theme.statusError
               : this.theme.statusSuccess,
@@ -414,14 +416,26 @@ pane shows details, configuration, and actions for the selected skill.
     return labelId;
   }
 
-  private async addDetailButton(text: string, actionKey: string): Promise<AbjectId> {
+  /** A centered empty-state note in the detail pane. */
+  private async addEmptyState(markdown: string): Promise<AbjectId> {
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: markdown, style: emptyStateStyle(this.theme) },
+      ]}),
+    );
+    await this.addToLayout(this.detailPaneId!, labelId, { vertical: 'fixed' }, { height: 90 });
+    this.detailLabelIds.push(labelId);
+    return labelId;
+  }
+
+  private async addDetailButton(text: string, actionKey: string, style?: Record<string, unknown>): Promise<AbjectId> {
     const { widgetIds: [btnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         {
           type: 'button',
           windowId: this.windowId,
           text,
-          style: {
+          style: style ?? {
             background: this.theme.actionBg,
             color: this.theme.actionText,
             borderColor: this.theme.actionBorder,
@@ -442,55 +456,62 @@ pane shows details, configuration, and actions for the selected skill.
 
     // Empty state
     if (this.allSkills.length === 0) {
-      await this.addDetailLabel('No skills installed', false, { fontSize: 14 });
-      await this.addDetailLabel('');
+      await this.addEmptyState(emptyStateMarkdown(
+        'No skills installed',
+        'Skills teach agents new abilities. Add one by hand as shown below, or install from the catalog.',
+      ));
+      await this.addDetailLabel(sectionHeaderText(this.theme, 'Add a skill by hand'), false, { ...sectionHeaderStyle(this.theme, 12) });
       await this.addDetailLabel(
         'To install a skill, create a subdirectory with a SKILL.md file ' +
         'inside the skills/ folder of your data directory ' +
         '(e.g. .abjects/skills/my-skill/SKILL.md).',
-        true,
+        true, { color: this.theme.textSecondary },
       );
       await this.addDetailLabel('');
-      await this.addDetailLabel('SKILL.md uses YAML frontmatter:', true);
+      await this.addDetailLabel('SKILL.md uses YAML frontmatter:', true, { color: this.theme.textSecondary });
       await this.addDetailLabel(
         '---\nname: my-skill\ndescription: What this skill does\n---\nInstructions for the agent...',
-        true, { fontFamily: 'monospace', fontSize: 11 },
+        true, { fontFamily: 'mono', fontSize: 11 },
       );
       await this.addDetailLabel('');
       await this.addDetailLabel(
         'Compatible with Claude Code and OpenClaw SKILL.md formats. ' +
         'Click "Scan Skills" after adding files.',
-        true,
+        true, { color: this.theme.textSecondary },
       );
       return;
     }
 
     // No selection
     if (this.selectedIndex < 0 || this.selectedIndex >= this.allSkills.length) {
-      await this.addDetailLabel('Select a skill from the list.', true);
+      await this.addEmptyState(emptyStateMarkdown(
+        'No skill selected',
+        'Select a skill on the left to see its details, set its environment variables, and enable or disable it.',
+      ));
       return;
     }
 
     // Show selected skill details
     const skill = this.allSkills[this.selectedIndex];
 
-    await this.addDetailLabel(skill.name, false, { fontSize: 15, fontWeight: 'bold' });
+    await this.addDetailLabel(skill.name, false, { fontSize: 15, fontWeight: 'bold', color: this.theme.textHeading });
+    await this.addDetailLabel(sectionHeaderText(this.theme, 'Details'), false, { ...sectionHeaderStyle(this.theme, 12) });
     await this.addDetailLabel(`Source: ${skill.source}`, true);
     if (skill.version) await this.addDetailLabel(`Version: ${skill.version}`, true);
     await this.addDetailLabel(skill.description || '(no description)', true);
     if (skill.allowedTools?.length) await this.addDetailLabel(`Tools: ${skill.allowedTools.join(', ')}`, true);
     if (skill.requiredBins?.length) await this.addDetailLabel(`Requires: ${skill.requiredBins.join(', ')}`, true);
     if (skill.mcpStatus === 'error') {
-      await this.addDetailLabel(`Status: Error`, true, { color: '#ff6666' });
+      await this.addDetailLabel(`Status: Error`, true, { color: this.theme.statusErrorBright });
     } else {
-      await this.addDetailLabel(`Status: ${skill.enabled ? 'Enabled' : 'Disabled'}`, true);
+      await this.addDetailLabel(`Status: ${skill.enabled ? 'Enabled' : 'Disabled'}`, true,
+        { color: skill.enabled ? this.theme.statusSuccess : this.theme.textMeta });
     }
-    if (skill.error) await this.addDetailLabel(`Error: ${skill.error}`, true, { color: '#ff6666' });
+    if (skill.error) await this.addDetailLabel(`Error: ${skill.error}`, true, { color: this.theme.statusErrorBright });
     if (skill.configFile) await this.addDetailLabel(`Config file: ${skill.configFile}`, true);
 
     // ── Configuration section (always shown) ──
-    await this.addDetailLabel('');
-    await this.addDetailLabel('Configuration', false, { fontSize: 14, fontWeight: 'bold' });
+    await this.addDetailLabel(sectionHeaderText(this.theme, 'Configuration'), false, { ...sectionHeaderStyle(this.theme, 12) });
 
     // Load current config from SkillRegistry
     let currentConfig: SkillConfig = { env: {} };
@@ -526,7 +547,7 @@ pane shows details, configuration, and actions for the selected skill.
       await this.addDetailLabel('No environment variables declared.', true, { color: this.theme.textSecondary });
     }
 
-    // "Add Variable" button
+    // "Add Variable" button (secondary; Save Config is this section's primary)
     const { widgetIds: [addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'button', windowId: this.windowId, text: 'Add Variable' },
@@ -547,10 +568,15 @@ pane shows details, configuration, and actions for the selected skill.
     await this.addToLayout(this.detailPaneId!, saveBtnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
     this.saveConfigBtnId = saveBtnId;
 
-    await this.addDetailLabel('');
+    await this.addDetailLabel(sectionHeaderText(this.theme, 'Actions'), false, { ...sectionHeaderStyle(this.theme, 12) });
     const toggleLabel = skill.enabled ? 'Disable' : 'Enable';
-    await this.addDetailButton(toggleLabel, skill.enabled ? 'disable' : 'enable');
-    await this.addDetailButton('Uninstall', 'uninstall');
+    // Enabling is the primary step; disabling is an ordinary secondary action.
+    await this.addDetailButton(toggleLabel, skill.enabled ? 'disable' : 'enable', skill.enabled ? {} : undefined);
+    await this.addDetailButton('Uninstall', 'uninstall', {
+      background: this.theme.destructiveBg,
+      color: this.theme.destructiveText,
+      borderColor: this.theme.destructiveBorder,
+    });
   }
 
   /** Add a new custom env var row (name input + value input). */

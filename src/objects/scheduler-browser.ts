@@ -13,6 +13,7 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ScheduleEntry } from './scheduler.js';
 import type { ListItem } from './widgets/list-widget.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('SchedulerBrowser');
 
@@ -36,6 +37,12 @@ export class SchedulerBrowser extends Abject {
   private detailMetaId?: AbjectId;
   private toggleBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
+  private listEmptyId?: AbjectId;
+  private detailEmptyId?: AbjectId;
+  private btnRowId?: AbjectId;
+  /** Which empty states are showing; undefined until first applied. */
+  private listEmptyShown?: boolean;
+  private detailEmptyShown?: boolean;
 
   private entries: ScheduleEntry[] = [];
   private selectedIndex = -1;
@@ -118,7 +125,7 @@ export class SchedulerBrowser extends Abject {
 ### Schedule Management
 SchedulerBrowser shows all registered schedule entries with their status,
 interval/time, last run, and next run. Select an entry to see details.
-Use Toggle to enable/disable, Delete to remove.
+Use the Enable/Disable button to switch a schedule on or off, Delete to remove it.
 
 ### Interface ID
 \`abjects:scheduler-browser\``;
@@ -156,8 +163,8 @@ Use Toggle to enable/disable, Delete to remove.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        spacing: 8,
       })
     );
 
@@ -200,6 +207,37 @@ Use Toggle to enable/disable, Delete to remove.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Empty states: one shares the list's slot, one stands in for the
+    // detail pane while nothing is selected.
+    const { widgetIds: [listEmptyId, detailEmptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          {
+            type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'No schedules yet',
+              'Recurring and one-time tasks appear here. Ask in Chat for something like "every morning at 9, summarize my news" to create one.',
+            ),
+            style: emptyStateStyle(this.theme),
+          },
+          {
+            type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'Select a schedule',
+              'Pick one from the list to see when it runs, the job it performs, and to enable, disable or delete it.',
+            ),
+            style: emptyStateStyle(this.theme),
+          },
+        ],
+      })
+    );
+    this.listEmptyId = listEmptyId;
+    this.detailEmptyId = detailEmptyId;
+    await this.request(request(this.id, leftLayoutId, 'addLayoutChild', {
+      widgetId: this.listEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Right pane: outer VBox with scrollable detail + buttons at bottom
     const rightOuterId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedVBox', {
@@ -209,12 +247,17 @@ Use Toggle to enable/disable, Delete to remove.
       })
     );
 
+    await this.request(request(this.id, rightOuterId, 'addLayoutChild', {
+      widgetId: this.detailEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Scrollable detail area (expanding)
     this.detailLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedScrollableVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 12, bottom: 4, left: 12 },
-        spacing: 6,
+        spacing: 8,
       })
     );
 
@@ -231,7 +274,7 @@ Use Toggle to enable/disable, Delete to remove.
           { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
             style: { fontSize: 11, color: this.theme.textPrimary, wordWrap: true }, readOnly: true },
           { type: 'label', windowId: this.windowId, text: '',
-            style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true } },
+            style: { fontSize: 11, color: this.theme.textMeta, wordWrap: true } },
         ],
       })
     );
@@ -256,7 +299,7 @@ Use Toggle to enable/disable, Delete to remove.
     }));
 
     // Action buttons (fixed at bottom)
-    const btnRowId = await this.request<AbjectId>(
+    const btnRowId = this.btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedHBox', {
         windowId: this.windowId,
         margins: { top: 0, right: 12, bottom: 8, left: 12 },
@@ -267,8 +310,14 @@ Use Toggle to enable/disable, Delete to remove.
     const { widgetIds: btnIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: 'Toggle' },
-          { type: 'button', windowId: this.windowId, text: 'Delete' },
+          {
+            type: 'button', windowId: this.windowId, text: 'Toggle',
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
+          },
+          {
+            type: 'button', windowId: this.windowId, text: 'Delete',
+            style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder },
+          },
         ],
       })
     );
@@ -302,6 +351,7 @@ Use Toggle to enable/disable, Delete to remove.
 
     // Populate
     await this.loadEntries();
+    await this.applyDetailEmpty(true);
 
     this.changed('visibility', true);
     return true;
@@ -330,6 +380,11 @@ Use Toggle to enable/disable, Delete to remove.
     this.detailMetaId = undefined;
     this.toggleBtnId = undefined;
     this.deleteBtnId = undefined;
+    this.listEmptyId = undefined;
+    this.detailEmptyId = undefined;
+    this.btnRowId = undefined;
+    this.listEmptyShown = undefined;
+    this.detailEmptyShown = undefined;
     this.entries = [];
     this.selectedIndex = -1;
     this.changed('visibility', false);
@@ -368,7 +423,10 @@ Use Toggle to enable/disable, Delete to remove.
       secondary: timing,
       badge: {
         text: entry.enabled ? 'On' : 'Off',
-        color: entry.enabled ? this.theme.statusSuccess : this.theme.statusNeutral,
+        // An armed schedule is live work: it glows in the living light.
+        color: entry.enabled
+          ? this.theme.accentSecondary
+          : this.theme.statusNeutral,
       },
     };
   }
@@ -385,12 +443,39 @@ Use Toggle to enable/disable, Delete to remove.
     try {
       await this.request(request(this.id, this.listWidgetId, 'update', { items }));
     } catch { /* widget may be gone */ }
+    await this.applyListEmpty(items.length === 0);
+  }
+
+  /** Swap the list and its empty-state label. */
+  private async applyListEmpty(empty: boolean): Promise<void> {
+    if (!this.listWidgetId || !this.listEmptyId || this.listEmptyShown === empty) return;
+    this.listEmptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.listEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
+  }
+
+  /** Swap the detail pane (and its buttons) with the "select a schedule" state. */
+  private async applyDetailEmpty(empty: boolean): Promise<void> {
+    if (!this.detailLayoutId || !this.detailEmptyId || !this.btnRowId || this.detailEmptyShown === empty) return;
+    this.detailEmptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.detailLayoutId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.btnRowId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.detailEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
   }
 
   private async showDetail(): Promise<void> {
     const entry = this.entries[this.selectedIndex];
     if (!entry) {
       await this.updateDetail('Select a schedule', '', '', '');
+      await this.applyDetailEmpty(true);
       return;
     }
 
@@ -411,6 +496,10 @@ Use Toggle to enable/disable, Delete to remove.
     const meta = `Last run: ${lastRun} | Next run: ${nextRun} | ID: ${entry.id}`;
 
     await this.updateDetail(entry.description, desc, code, meta);
+    if (this.toggleBtnId) {
+      this.send(event(this.id, this.toggleBtnId, 'update', { text: entry.enabled ? 'Disable' : 'Enable' }));
+    }
+    await this.applyDetailEmpty(false);
   }
 
   private async updateDetail(title: string, desc: string, code: string, meta: string): Promise<void> {
@@ -462,6 +551,7 @@ Use Toggle to enable/disable, Delete to remove.
       this.selectedIndex = -1;
       await this.loadEntries();
       await this.updateDetail('Select a schedule', '', '', '');
+      await this.applyDetailEmpty(true);
       await this.notify('Schedule deleted', 'success');
     } catch (err) {
       log.warn('Failed to delete schedule:', err);

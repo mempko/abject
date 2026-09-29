@@ -6,7 +6,8 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, gradientRect } from './widget-types.js';
+import { inkFrame } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export interface CheckboxWidgetConfig extends WidgetConfig {
   checked?: boolean;
@@ -20,105 +21,65 @@ export class CheckboxWidget extends WidgetAbject {
     this.checked = config.checked ?? false;
   }
 
+  /**
+   * A square ink frame; checked fills solid red
+   * with a paper tick drawn with square caps. Focus reddens the frame.
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-
+    const theme = this.theme;
+    const shape = shapeOf(theme);
+    const font = buildFont(style, theme);
     const boxSize = 16;
-    const boxY = oy + (h - boxSize) / 2;
+    const boxY = Math.round(oy + (h - boxSize) / 2);
+    const box = { x: ox, y: boxY, width: boxSize, height: boxSize };
 
-    // Reduce opacity when disabled
     if (this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
     }
 
-    // Focus ring glow
-    if (this.focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: ox, y: boxY, width: boxSize, height: boxSize, fill: 'transparent', stroke: this.theme.inputBorderFocus, radius: 2 },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-
-    // Checkbox box — checked state gets a diagonal accent gradient so the
-    // tick sits on a lit surface rather than a flat chip.
     if (this.checked) {
-      const checkedBg = style.background ?? this.theme.checkboxCheckedBg;
-      const g = this.theme.tokens.surface.gradient;
-      commands.push(...gradientRect(surfaceId, {
-        x: ox, y: boxY, width: boxSize, height: boxSize, radii: 2,
-        gradient: { x0: ox, y0: boxY, x1: ox + boxSize, y1: boxY + boxSize, stops: [
-          { offset: 0, color: lightenColor(checkedBg, 18 * g) },
-          { offset: 1, color: checkedBg },
-        ] },
-        stroke: style.borderColor ?? this.theme.checkboxBorder,
-      }));
+      commands.push({ type: 'rect', surfaceId, params: { ...box, fill: style.background ?? theme.checkboxCheckedBg } });
     } else {
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox,
-          y: boxY,
-          width: boxSize,
-          height: boxSize,
-          fill: 'transparent',
-          stroke: style.borderColor ?? this.theme.checkboxBorder,
-          radius: 2,
-        },
-      });
+      commands.push({ type: 'rect', surfaceId, params: { ...box, fill: theme.inputBg } });
     }
+    const frameColor = this.focused && !this.disabled
+      ? shape.blockFocusColor
+      : (style.borderColor ?? theme.checkboxBorder);
+    commands.push(...inkFrame(surfaceId, box, frameColor, shape.ruleWidth));
 
-    // Checkmark (polygon)
     if (this.checked) {
-      const cx = ox;
-      const cy = boxY;
       commands.push({
-        type: 'polygon',
-        surfaceId,
+        type: 'polygon', surfaceId,
         params: {
           points: [
-            { x: cx + 3, y: cy + 8 },
-            { x: cx + 6, y: cy + 12 },
-            { x: cx + 13, y: cy + 4 },
+            { x: ox + 4, y: boxY + 8 },
+            { x: ox + 7, y: boxY + 11 },
+            { x: ox + 12, y: boxY + 5 },
           ],
-          stroke: this.theme.checkmarkColor,
-          lineWidth: 2,
+          stroke: theme.checkmarkColor,
+          lineWidth: 2.5,
+          lineCap: 'square',
+          lineJoin: 'miter',
           closePath: false,
         },
       });
     }
 
-    // Label text to the right of the checkbox
     commands.push({
-      type: 'text',
-      surfaceId,
+      type: 'text', surfaceId,
       params: {
-        x: ox + boxSize + 8,
-        y: oy + h / 2,
-        text: this.text,
-        font,
-        fill: style.color ?? this.theme.textTertiary,
-        baseline: 'middle',
+        x: ox + boxSize + 8, y: oy + h / 2, text: this.text, font,
+        fill: style.color ?? theme.textPrimary, baseline: 'middle',
       },
     });
 
-    // Close disabled alpha save
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
-
     return commands;
   }
 

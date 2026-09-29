@@ -13,9 +13,20 @@ import { Log } from '../core/timed-log.js';
 import {
   ThemePreset,
   DEFAULT_THEME_ID,
+  shapeOf,
 } from '../core/theme-data.js';
+import {
+  sectionHeaderStyle,
+  sectionHeaderText,
+  hintStyle,
+  emptyStateMarkdown,
+  emptyStateStyle,
+} from './ui-kit.js';
 
 const log = new Log('SETTINGS');
+
+/** Row height for an empty-state markdown label (title, gap, one hint line). */
+const EMPTY_STATE_HEIGHT = 64;
 
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
@@ -162,6 +173,40 @@ export class Settings extends Abject {
     this.setupHandlers();
   }
 
+
+  /** Destructive text on the window ground (destructiveText is meant for the destructive face). */
+  private dangerTextColor(): string {
+    return this.theme.statusError;
+  }
+
+  /**
+   * Section header label spec from the shared kit.
+   */
+  private headerSpec(text: string, size = 13, color?: string): Record<string, unknown> {
+    const style = sectionHeaderStyle(this.theme, size);
+    return { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, text), style: color ? { ...style, color } : style };
+  }
+
+  /** Helper-text label spec (kit hint style). */
+  private hintSpec(text: string): Record<string, unknown> {
+    return { type: 'label', windowId: this.windowId, text, style: hintStyle(this.theme) };
+  }
+
+  /**
+   * Empty-state label spec: the kit's markdown empty state (title plus what
+   * to do next). Lay it out at EMPTY_STATE_HEIGHT.
+   */
+  private emptySpec(title: string, hint: string): Record<string, unknown> {
+    return { type: 'label', windowId: this.windowId, text: emptyStateMarkdown(title, hint), style: emptyStateStyle(this.theme) };
+  }
+
+  /** One-line explanation of an access mode, shown under the mode select. */
+  private accessModeHint(mode: string): string {
+    if (mode === 'public') return 'Public: any peer can reach the objects you tick below.';
+    if (mode === 'shared') return 'Shared: invited peers collaborate on every object here.';
+    return 'Local: this workspace stays on this desktop only.';
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.storageId = await this.requireDep('Storage');
@@ -225,8 +270,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
   }
 
   /** Shared styling for section "cards" (theme-tracked surface + border). */
-  private cardStyle(): { background: string; borderColor: string; radius: number } {
-    return { background: this.theme.buttonBg, borderColor: this.theme.divider, radius: 8 };
+  private cardStyle(): { background: string; borderColor: string; radius: number; borderWidth?: number } {
+    return { background: this.theme.buttonBg, borderColor: this.theme.windowBorder, radius: this.theme.widgetRadius, borderWidth: shapeOf(this.theme).ruleWidth };
   }
 
   /**
@@ -574,8 +619,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Batch-create all General tab header widgets
     const { widgetIds: [sectionHeaderId, descLabelId, nameLabelId, nameInputId, descInputLabelId, descInputId, tagsLabelId, tagsInputId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Workspace', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Configure this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Workspace', 15),
+        this.hintSpec('Name and describe this workspace so peers can find it.'),
         { type: 'label', windowId: this.windowId, text: 'Workspace Name', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'Workspace name', text: currentName },
         { type: 'label', windowId: this.windowId, text: 'Description', style: { color: this.theme.textHeading, fontSize: 13 } },
@@ -741,8 +786,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'shared' ? 1 : 0;
     const { widgetIds: [sectionHeaderId, descLabelId, accessLabelId, accessSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Control who can access this workspace over the network.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Access Control', 15),
+        this.hintSpec('Control who can access this workspace over the network.'),
         { type: 'label', windowId: this.windowId, text: 'Access Mode', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'select', windowId: this.windowId, options: ['Local', 'Shared', 'Public'], selectedIndex: accessModeIndex },
       ] })
@@ -752,22 +797,38 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.trackTabWidget(accessLabelId);
     this.accessModeSelectId = this.trackTabWidget(accessSelectId);
 
-    // Section header
+    // The mode controls sit in a section card (like General's Workspace card)
+    // with a hint naming what the chosen mode means.
+    const modeParent: AbjectId = this.trackTabWidget(await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+          parentLayoutId: cId,
+          autoSize: true,
+          margins: { top: 12, right: 14, bottom: 12, left: 14 },
+          spacing: 6,
+          style: this.cardStyle(),
+        })
+      ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: modeParent,
+      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
+    }));
+
+    // Section header
+    await this.request(request(this.id, modeParent, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
 
     // Description
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, modeParent, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
     // Access Mode label
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, modeParent, 'addLayoutChild', {
       widgetId: accessLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -775,10 +836,20 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     // Access Mode select dropdown
     await this.request(request(this.id, this.accessModeSelectId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, modeParent, 'addLayoutChild', {
       widgetId: this.accessModeSelectId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [modeHintId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [this.hintSpec(this.accessModeHint(currentAccessMode))] })
+    );
+    this.trackTabWidget(modeHintId);
+    await this.request(request(this.id, modeParent, 'addLayoutChild', {
+      widgetId: modeHintId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 18 },
     }));
 
     // ── Whitelist container (always present; populated only for Private mode) ──
@@ -803,7 +874,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       const itemCount = this.invitedPeersRevokeButtons.size;
       const baseHeight = 1 + 8 + 20 + 8 + 18 + 8 + 32 + 8 + 32 + 8 + 16 + 8 + 18 + 8;
       const itemsHeight = itemCount === 0
-        ? 18  // "no peers" label
+        ? EMPTY_STATE_HEIGHT  // "no peers" empty state
         : (itemCount * 26) + ((itemCount - 1) * 8);
       await this.request(request(this.id, cId, 'updateLayoutChild', {
         widgetId: this.whitelistContainerId,
@@ -883,10 +954,10 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       : 'Hosted by another peer — access is managed by its owner.';
     const { widgetIds: [headerId, descId, statusId, ownerId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'This workspace is shared with you by another peer.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: '\uD83D\uDC65 Joined shared workspace', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: ownerText, style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Access Control', 15),
+        this.hintSpec('This workspace is shared with you by another peer.'),
+        this.headerSpec('Joined shared workspace'),
+        this.hintSpec(ownerText),
       ] })
     );
 
@@ -917,8 +988,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Allowed Contacts', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'Select which contacts can access this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Allowed Contacts'),
+        this.hintSpec('Select which contacts can access this workspace.'),
       ] })
     );
     this.whitelistWidgetIds.push(divId, headerLabelId, descId);
@@ -965,14 +1036,14 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     if (contacts.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No contacts available. Add contacts in Global Settings.', style: { color: this.theme.textDescription, fontSize: 12 } },
+          this.emptySpec('No contacts yet', 'Add contacts in Global Settings, then choose who may enter here.'),
         ] })
       );
       this.whitelistWidgetIds.push(emptyLabelId);
       await this.request(request(this.id, containerId, 'addLayoutChild', {
         widgetId: emptyLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: EMPTY_STATE_HEIGHT },
       }));
     } else {
       for (const contact of contacts) {
@@ -1065,8 +1136,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Share & Invite', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'Share this link with peers or invite them by Peer ID to access this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Share & Invite'),
+        this.hintSpec('Send peers the link, or invite one by Peer ID.'),
       ] })
     );
     this.whitelistWidgetIds.push(divId, headerLabelId, descId);
@@ -1105,7 +1176,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [linkInputId, copyBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, text: this.shareLinkText, placeholder: 'Share link' },
-        { type: 'button', windowId: this.windowId, text: 'Copy Link', style: { background: this.theme.accent, color: '#ffffff' } },
+        { type: 'button', windowId: this.windowId, text: 'Copy Link', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ] })
     );
     this.whitelistWidgetIds.push(linkInputId, copyBtnId);
@@ -1178,7 +1249,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Whitelisted/Invited Peers list header
     const { widgetIds: [peersHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Invited Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 12 } },
+        this.headerSpec('Invited Peers', 12),
       ] })
     );
     this.whitelistWidgetIds.push(peersHeaderId);
@@ -1201,14 +1272,14 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     if (whitelist.length === 0) {
       const { widgetIds: [noPeersId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No peers invited yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
+          this.emptySpec('No peers invited yet', 'Invite a peer above; they appear here and can be revoked at any time.'),
         ] })
       );
       this.whitelistWidgetIds.push(noPeersId);
       await this.request(request(this.id, containerId, 'addLayoutChild', {
         widgetId: noPeersId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: EMPTY_STATE_HEIGHT },
       }));
     } else {
       for (const peerId of whitelist) {
@@ -1230,7 +1301,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
         const { widgetIds: [peerLabelId, revokeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Revoke', style: { background: this.theme.buttonBg, color: this.theme.destructiveText ?? '#e06c75', fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Revoke', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder, fontSize: 11 } },
           ] })
         );
         this.whitelistWidgetIds.push(peerLabelId, revokeBtnId);
@@ -1322,12 +1393,12 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Exposed Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'All workspace abjects are shared automatically with members.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'Objects you create here become available to everyone you invite, with', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'no list to maintain. System objects belonging to this desktop (Taskbar,', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'Settings, Storage and other infrastructure) always stay local.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'Switch to Public to choose individual objects instead.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Exposed Objects'),
+        this.hintSpec('All workspace abjects are shared automatically with members.'),
+        this.hintSpec('Objects you create here become available to everyone you invite, with'),
+        this.hintSpec('no list to maintain. System objects belonging to this desktop (Taskbar,'),
+        this.hintSpec('Settings, Storage and other infrastructure) always stay local.'),
+        this.hintSpec('Switch to Public to choose individual objects instead.'),
       ] })
     );
     this.exposedWidgetIds.push(...widgetIds);
@@ -1359,10 +1430,10 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: '\u26A0 Nothing is shared yet', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'This workspace is Public but no objects have been chosen, so remote', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'peers can reach its registry and nothing else. Tick the objects below', style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'and save to share them.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Nothing is shared yet'),
+        this.hintSpec('This workspace is Public but no objects have been chosen, so remote'),
+        this.hintSpec('peers can reach its registry and nothing else. Tick the objects below'),
+        this.hintSpec('and save to share them.'),
       ] })
     );
     this.exposedWidgetIds.push(...widgetIds);
@@ -1385,8 +1456,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Exposed Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'Select which objects remote peers can access.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Exposed Objects'),
+        this.hintSpec('Select which objects remote peers can access.'),
       ] })
     );
     this.exposedWidgetIds.push(divId, headerLabelId, descId);
@@ -1476,14 +1547,16 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     if (registryObjects.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No objects in workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+          this.accessSearchText
+            ? this.emptySpec('No matches', 'No object name contains that text. Clear the search to see them all.')
+            : this.emptySpec('No objects yet', 'Objects you create in this workspace appear here, ready to share.'),
         ] })
       );
       this.exposedWidgetIds.push(emptyLabelId);
       await this.request(request(this.id, containerId, 'addLayoutChild', {
         widgetId: emptyLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: EMPTY_STATE_HEIGHT },
       }));
     } else {
       for (const obj of registryObjects) {
@@ -1869,7 +1942,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
         autoSize: true,
         margins: { top: 12, right: 14, bottom: 12, left: 14 },
         spacing: 6,
-        style: { background: this.theme.buttonBg, borderColor: this.theme.destructiveBorder, radius: 8 },
+        style: { background: this.theme.buttonBg, borderColor: this.theme.destructiveBorder, radius: this.theme.widgetRadius, borderWidth: shapeOf(this.theme).ruleWidth },
       })
     ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -1898,8 +1971,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Section header + description
     const { widgetIds: [headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Danger Zone', style: { color: this.theme.destructiveText, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: dangerDesc, style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Danger Zone', 15, this.dangerTextColor()),
+        this.hintSpec(dangerDesc),
       ] })
     );
     this.trackTabWidget(headerLabelId);
@@ -2139,11 +2212,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Section header + description + active-theme label.
     const { widgetIds: [headerId, descId, activeLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Theme',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId,
-          text: 'Choose how this workspace looks. Changes apply immediately.',
-          style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Theme', 15),
+        this.hintSpec('Choose how this workspace looks. Changes apply immediately.'),
         { type: 'label', windowId: this.windowId, text: `Active: ${activeName}`,
           style: { color: this.theme.textMeta, fontSize: 12 } },
       ] })
@@ -2178,8 +2248,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       const { widgetIds: [divId, userHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
           { type: 'divider', windowId: this.windowId },
-          { type: 'label', windowId: this.windowId, text: 'Your themes',
-            style: { color: this.theme.sectionLabel, fontSize: 12, fontWeight: 'bold' } },
+          this.headerSpec('Your themes', 12),
         ] })
       );
       this.trackTabWidget(divId);
@@ -2365,8 +2434,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     const { widgetIds: [headerId, descId, enableId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Web Access', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Serve chosen abjects over HTTP. The gateway itself is turned on in the Web Gateway window.', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+        this.headerSpec('Web Access', 15),
+        this.hintSpec('Serve chosen abjects over HTTP. The gateway itself is turned on in the Web Gateway window.'),
         { type: 'checkbox', windowId: this.windowId, text: 'Serve this workspace over HTTP', checked: config.enabled === true },
       ] }));
     this.webEnableCheckboxId = this.trackTabWidget(enableId);
@@ -2377,12 +2446,22 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: this.webEnableCheckboxId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 26 } }));
 
     const objects = await this.webExposableObjects();
+    if (objects.length > 0) {
+      const { widgetIds: [objHeaderId, objHintId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          this.headerSpec('Served Abjects'),
+          this.hintSpec('Authenticated needs an API token; Public is open to anyone.'),
+        ] }));
+      this.trackTabWidget(objHeaderId); this.trackTabWidget(objHintId);
+      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: objHeaderId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } }));
+      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: objHintId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } }));
+    }
     if (objects.length === 0) {
       const { widgetIds: [noneId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No abjects here can be exposed yet. Create one first.', style: { color: this.theme.textDescription, fontSize: 12 } }] }));
+          this.emptySpec('Nothing to serve yet', 'Create an abject in this workspace, then tick it here to serve it over HTTP.')] }));
       this.trackTabWidget(noneId);
-      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: noneId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } }));
+      await this.request(request(this.id, cId, 'addLayoutChild', { widgetId: noneId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: EMPTY_STATE_HEIGHT } }));
     }
     for (const obj of objects) {
       const entry = config.entries[obj.name];
@@ -2445,7 +2524,9 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       await this.request(request(this.id, exposureId, 'setConfig', { config: { enabled, entries } }));
       if (this.webStatusLabelId) await this.request(request(this.id, this.webStatusLabelId, 'update', { text: `Saved. ${Object.keys(entries).length} abject(s) exposed.` }));
     } catch (err) {
-      if (this.webStatusLabelId) await this.request(request(this.id, this.webStatusLabelId, 'update', { text: `Save failed: ${err instanceof Error ? err.message.slice(0, 60) : ''}` }));
+      if (this.webStatusLabelId) {
+        await this.request(request(this.id, this.webStatusLabelId, 'update', { text: `Save failed: ${err instanceof Error ? err.message.slice(0, 60) : ''}`, style: { color: this.theme.statusError } }));
+      }
     }
   }
 }

@@ -21,7 +21,8 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
+import { fontStacks, inkFrame, squareMark } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export type SelectOption = string | { label: string; value: string };
 
@@ -36,7 +37,6 @@ export interface SelectWidgetConfig extends WidgetConfig {
 const MAX_VISIBLE_OPTIONS = 8;
 const SCROLLBAR_WIDTH = 6;
 const SEARCH_HEIGHT = 30;
-const SEARCH_FONT = '12px "Spectral", Georgia, "Times New Roman", serif';
 
 export class SelectWidget extends WidgetAbject {
   private labels: string[];
@@ -169,88 +169,68 @@ export class SelectWidget extends WidgetAbject {
 
   // ── Rendering ─────────────────────────────────────────────────────
 
+  /**
+   * A square paper field in an ink rule with a solid
+   * triangle in a ruled arrow cell (inverted while open). The dropdown is a
+   * square print block with a hard offset shadow; the hovered option is an
+   * ink band with inverse text, and the chosen option carries a red square.
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-    const radius = style.radius ?? this.theme.widgetRadius;
+    const theme = this.theme;
+    const shape = shapeOf(theme);
+    const font = buildFont(style, theme);
+    const radius = style.radius ?? 0;
     const labels = this.labels;
     const selectedIndex = this.selectedIndex;
     const selectedText = labels[selectedIndex] ?? '';
+    const rule = shape.ruleWidth;
+    const fieldBg = style.background ?? theme.selectBg;
+    const frameColor = style.borderColor ?? theme.buttonBorder;
+    const arrowW = 26;
 
-    // Reduce opacity when disabled
     if (this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
     }
 
-    // Focus ring glow
-    if (this.focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.selectBg, stroke: this.theme.inputBorderFocus, radius },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
+    const field = { x: ox, y: oy, width: w, height: h };
+    commands.push({ type: 'rect', surfaceId, params: { ...field, fill: fieldBg, radius } });
+
+    // Arrow cell: ruled off on the left, inverted to an ink block while open.
+    const cellX = ox + w - arrowW;
+    if (this.expanded) {
+      commands.push({ type: 'rect', surfaceId, params: { x: cellX, y: oy, width: arrowW, height: h, fill: theme.textPrimary } });
+    } else {
+      commands.push({ type: 'rect', surfaceId, params: { x: cellX, y: oy, width: rule, height: h, fill: frameColor } });
     }
-
-    // Collapsed: button-like appearance
+    const acx = cellX + arrowW / 2 + rule / 2;
+    const acy = oy + h / 2;
     commands.push({
-      type: 'rect',
-      surfaceId,
+      type: 'polygon', surfaceId,
       params: {
-        x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? this.theme.selectBg,
-        stroke: style.borderColor ?? this.theme.buttonBorder,
-        radius,
+        points: this.expanded
+          ? [{ x: acx - 5, y: acy + 3 }, { x: acx + 5, y: acy + 3 }, { x: acx, y: acy - 4 }]
+          : [{ x: acx - 5, y: acy - 3 }, { x: acx + 5, y: acy - 3 }, { x: acx, y: acy + 4 }],
+        fill: this.expanded ? theme.windowBg : theme.selectArrow,
+        closePath: true,
       },
     });
 
-    // Selected text — clipped to the widget minus the arrow zone, so a long
-    // value can't paint over the arrow or bleed onto neighboring widgets.
+    const focusFrame = this.focused && !this.disabled;
+    commands.push(...inkFrame(surfaceId, field, focusFrame ? shape.blockFocusColor : frameColor, focusFrame ? Math.max(2, rule) : rule));
+
     commands.push({ type: 'save', surfaceId, params: {} });
+    commands.push({ type: 'clip', surfaceId, params: { x: ox, y: oy, width: Math.max(0, w - arrowW), height: h } });
     commands.push({
-      type: 'clip',
-      surfaceId,
-      params: { x: ox, y: oy, width: Math.max(0, w - 26), height: h },
-    });
-    commands.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: ox + 8,
-        y: oy + h / 2,
-        text: selectedText,
-        font,
-        fill: style.color ?? this.theme.textSecondary,
-        baseline: 'middle',
-      },
+      type: 'text', surfaceId,
+      params: { x: ox + 8, y: oy + h / 2, text: selectedText, font, fill: style.color ?? theme.textPrimary, baseline: 'middle' },
     });
     commands.push({ type: 'restore', surfaceId, params: {} });
 
-    // Down arrow (polygon triangle)
-    commands.push({
-      type: 'polygon',
-      surfaceId,
-      params: {
-        points: [
-          { x: ox + w - 20, y: oy + h / 2 - 3 },
-          { x: ox + w - 10, y: oy + h / 2 - 3 },
-          { x: ox + w - 15, y: oy + h / 2 + 3 },
-        ],
-        fill: this.theme.selectArrow,
-      },
-    });
-
-    // Expanded dropdown
     if (this.expanded) {
       const optionHeight = h;
       const rows = this.filteredRows();
@@ -259,117 +239,50 @@ export class SelectWidget extends WidgetAbject {
       const dropdownH = searchH + listH;
       const dropTop = oy + h;
       const listTop = dropTop + searchH;
+      const drop = { x: ox, y: dropTop, width: w, height: dropdownH };
+      const shadowOffset = 4;
 
-      // Dropdown shadow
-      commands.push({ type: 'save', surfaceId, params: {} });
+      // Hard print shadow, then the face and its ink rule.
       commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.dropdownShadow, blur: 8, offsetY: 2 },
+        type: 'rect', surfaceId,
+        params: { x: ox + shadowOffset, y: dropTop + shadowOffset, width: w, height: dropdownH, fill: shape.blockShadowColor },
       });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox, y: dropTop, width: w, height: dropdownH,
-          fill: style.background ?? this.theme.selectBg,
-          radius: 2,
-        },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
+      commands.push({ type: 'rect', surfaceId, params: { ...drop, fill: fieldBg } });
 
-      // Dropdown background (without shadow)
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox, y: dropTop, width: w, height: dropdownH,
-          fill: style.background ?? this.theme.selectBg,
-          stroke: style.borderColor ?? this.theme.buttonBorder,
-          radius: 2,
-        },
-      });
-
-      // Filter box (styled like ListWidget's built-in search)
       if (searchH > 0) {
         const sx = ox + 4;
         const sy = dropTop + 3;
         const sw = w - 8;
         const sh = SEARCH_HEIGHT - 6;
-
+        const filterFont = `12px ${fontStacks(theme).body}`;
+        const sr = { x: sx, y: sy, width: sw, height: sh };
+        commands.push({ type: 'rect', surfaceId, params: { ...sr, fill: theme.inputBg } });
+        commands.push(...inkFrame(surfaceId, sr, theme.inputBorder, 1));
+        commands.push({ type: 'rect', surfaceId, params: { x: sx, y: sy, width: 3, height: sh, fill: theme.inputBorderFocus } });
         commands.push({
-          type: 'rect',
-          surfaceId,
+          type: 'text', surfaceId,
           params: {
-            x: sx, y: sy, width: sw, height: sh,
-            fill: this.theme.windowBg,
-            stroke: this.theme.inputBorderFocus,
-            radius: 4,
+            x: sx + 8, y: sy + sh / 2,
+            text: this.filterText || '\u{1F50D} Type to filter...',
+            font: filterFont,
+            fill: this.filterText ? theme.textPrimary : theme.textPlaceholder,
+            baseline: 'middle',
           },
         });
-
-        if (this.filterText) {
-          commands.push({
-            type: 'text',
-            surfaceId,
-            params: {
-              x: sx + 6, y: sy + sh / 2,
-              text: this.filterText,
-              font: SEARCH_FONT,
-              fill: this.theme.textPrimary,
-              baseline: 'middle',
-            },
-          });
-        } else {
-          commands.push({
-            type: 'text',
-            surfaceId,
-            params: {
-              x: sx + 6, y: sy + sh / 2,
-              text: '\u{1F50D} Type to filter...',
-              font: SEARCH_FONT,
-              fill: this.theme.textPlaceholder,
-              baseline: 'middle',
-            },
-          });
-        }
-
-        // Text cursor — typing goes to the filter whenever the dropdown is open
         const beforeCursor = this.filterText.substring(0, this.filterCursor);
-        const cursorX = sx + 6 + (beforeCursor.length > 0
-          ? await this.measureText(surfaceId, beforeCursor, SEARCH_FONT)
+        const cursorX = sx + 8 + (beforeCursor.length > 0
+          ? await this.measureText(surfaceId, beforeCursor, filterFont)
           : 0);
-        commands.push({
-          type: 'line',
-          surfaceId,
-          params: {
-            x1: cursorX, y1: sy + 4,
-            x2: cursorX, y2: sy + sh - 4,
-            stroke: this.theme.cursor,
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: Math.round(cursorX), y: sy + 4, width: 2, height: sh - 8, fill: theme.cursor } });
       }
 
-      // Clip option rows to the dropdown viewport so scrolled rows don't bleed out
       commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'clip',
-        surfaceId,
-        params: { x: ox, y: listTop, width: w, height: listH },
-      });
+      commands.push({ type: 'clip', surfaceId, params: { x: ox, y: listTop, width: w, height: listH } });
 
       if (rows.length === 0) {
         commands.push({
-          type: 'text',
-          surfaceId,
-          params: {
-            x: ox + 8,
-            y: listTop + optionHeight / 2,
-            text: 'No matches',
-            font,
-            fill: this.theme.textPlaceholder,
-            baseline: 'middle',
-          },
+          type: 'text', surfaceId,
+          params: { x: ox + 8, y: listTop + optionHeight / 2, text: 'No matches', font, fill: theme.textPlaceholder, baseline: 'middle' },
         });
       }
 
@@ -378,29 +291,20 @@ export class SelectWidget extends WidgetAbject {
         if (optY + optionHeight <= listTop || optY >= listTop + listH) continue;
         const optionIndex = rows[r];
         const isHovered = this.hoveredRow === r;
+        const isSelected = optionIndex === selectedIndex;
 
         if (isHovered) {
-          commands.push({
-            type: 'rect',
-            surfaceId,
-            params: {
-              x: ox + 1, y: optY, width: w - 2, height: optionHeight,
-              fill: this.theme.selectHover,
-            },
-          });
+          commands.push({ type: 'rect', surfaceId, params: { x: ox, y: optY, width: w, height: optionHeight, fill: theme.textPrimary } });
         }
-
+        if (isSelected) {
+          commands.push(...squareMark(surfaceId, ox + 9, optY + optionHeight / 2, 6, theme.accent));
+        }
         commands.push({
-          type: 'text',
-          surfaceId,
+          type: 'text', surfaceId,
           params: {
-            x: ox + 8,
-            y: optY + optionHeight / 2,
-            text: labels[optionIndex],
-            font,
-            fill: optionIndex === selectedIndex
-              ? (style.color ?? this.theme.textPrimary)
-              : (style.color ?? this.theme.textSecondary),
+            x: ox + 18, y: optY + optionHeight / 2,
+            text: labels[optionIndex], font,
+            fill: isHovered ? theme.windowBg : (style.color ?? (isSelected ? theme.textPrimary : theme.textSecondary)),
             baseline: 'middle',
           },
         });
@@ -408,37 +312,22 @@ export class SelectWidget extends WidgetAbject {
 
       commands.push({ type: 'restore', surfaceId, params: {} });
 
-      // Scrollbar when the option list overflows the viewport
       const maxScroll = this.maxScrollOffset(rows.length);
       if (maxScroll > 0) {
         const contentH = rows.length * optionHeight;
         const trackX = ox + w - SCROLLBAR_WIDTH - 2;
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: {
-            x: trackX, y: listTop, width: SCROLLBAR_WIDTH, height: listH,
-            fill: this.theme.scrollbarTrack, radius: 3,
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: trackX, y: listTop, width: SCROLLBAR_WIDTH, height: listH, fill: theme.scrollbarTrack } });
         const thumbH = Math.max(20, (listH / contentH) * listH);
         const thumbY = listTop + (this.scrollOffset / maxScroll) * (listH - thumbH);
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: {
-            x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbH,
-            fill: this.theme.scrollbarThumb, radius: 3,
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: trackX, y: thumbY, width: SCROLLBAR_WIDTH, height: thumbH, fill: theme.scrollbarThumb } });
       }
+
+      commands.push(...inkFrame(surfaceId, drop, frameColor, rule));
     }
 
-    // Close disabled alpha save
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
-
     return commands;
   }
 

@@ -16,7 +16,8 @@
 import { event } from '../../core/message.js';
 import type { AbjectMessage } from '../../core/types.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
+import { widgetFont, DEFAULT_LINE_HEIGHT, inkFrame } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 import { wrapText, estimateWrappedLineCount } from './word-wrap.js';
 import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
 import { parseMarkdown } from './markdown.js';
@@ -277,14 +278,37 @@ export class TextInputWidget extends WidgetAbject {
     return this.buildSingleLineDrawCommands(surfaceId, ox, oy);
   }
 
+  /**
+   * Input frame: a paper field in an ink rule. Focus reddens
+   * the rule (via borderColor) and adds a solid 4 px bar on the left edge,
+   * inside the rect.
+   */
+  private inputFrame(
+    surfaceId: string, ox: number, oy: number, w: number, h: number, borderColor: string, radius: number,
+  ): unknown[] {
+    const rect = { x: ox, y: oy, width: w, height: h };
+    const cmds: unknown[] = [
+      { type: 'rect', surfaceId, params: { ...rect, fill: this.style.background ?? this.theme.inputBg, radius } },
+      ...inkFrame(surfaceId, rect, borderColor, shapeOf(this.theme).ruleWidth),
+    ];
+    if (this.focused && !this.disabled) {
+      cmds.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: 4, height: h, fill: this.theme.inputBorderFocus } });
+    }
+    return cmds;
+  }
+
+  /** Text caret: a solid 2 px square bar. */
+  private caret(surfaceId: string, x: number, top: number, bottom: number): unknown {
+    return { type: 'rect', surfaceId, params: { x: Math.round(x), y: top, width: 2, height: Math.max(0, bottom - top), fill: this.theme.cursor } };
+  }
+
   private async buildSingleLineDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     this.lastSurfaceId = surfaceId;
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-    const radius = style.radius ?? this.theme.widgetRadius;
+    const font = buildFont(style, this.theme);
     const focused = this.focused;
 
     // Reduce opacity when disabled
@@ -295,37 +319,7 @@ export class TextInputWidget extends WidgetAbject {
 
     // Focus glow shadow (skip when disabled)
     const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
-    if (focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox, y: oy, width: w, height: h,
-          fill: style.background ?? this.theme.inputBg,
-          stroke: borderColor,
-          radius,
-        },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-
-    // Border rect (drawn without shadow)
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? this.theme.inputBg,
-        stroke: borderColor,
-        radius,
-      },
-    });
+    commands.push(...this.inputFrame(surfaceId, ox, oy, w, h, borderColor, style.radius ?? 0));
 
     // Clip to prevent text overflow
     commands.push({ type: 'save', surfaceId, params: {} });
@@ -339,7 +333,7 @@ export class TextInputWidget extends WidgetAbject {
       ? (this.masked ? '\u2022'.repeat(this.text.length) : this.text)
       : '';
     const textPadding = 8;
-    const textFont = style.fontSize ? font : WIDGET_FONT;
+    const textFont = style.fontSize ? font : widgetFont(this.theme);
 
     // Selection highlight
     const sel = this.getSelection();
@@ -401,20 +395,12 @@ export class TextInputWidget extends WidgetAbject {
       const beforeCursor = this.masked
         ? '\u2022'.repeat(cursorPos)
         : this.text.substring(0, cursorPos);
-      const cursorFont = style.fontSize ? font : WIDGET_FONT;
+      const cursorFont = style.fontSize ? font : widgetFont(this.theme);
       const measuredWidth = beforeCursor.length > 0
         ? await this.measureText(surfaceId, beforeCursor, cursorFont)
         : 0;
       const cursorX = ox + textPadding + measuredWidth;
-      commands.push({
-        type: 'line',
-        surfaceId,
-        params: {
-          x1: cursorX, y1: oy + 4,
-          x2: cursorX, y2: oy + h - 4,
-          stroke: this.theme.cursor,
-        },
-      });
+      commands.push(this.caret(surfaceId, cursorX, oy + 4, oy + h - 4));
     }
 
     commands.push({ type: 'restore', surfaceId, params: {} });
@@ -433,12 +419,11 @@ export class TextInputWidget extends WidgetAbject {
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-    const radius = style.radius ?? this.theme.widgetRadius;
+    const font = buildFont(style, this.theme);
     const focused = this.focused;
     const textPadding = 8;
     const lineHeight = DEFAULT_LINE_HEIGHT;
-    const textFont = style.fontSize ? font : WIDGET_FONT;
+    const textFont = style.fontSize ? font : widgetFont(this.theme);
     const maxWidth = w - textPadding * 2;
 
     // Reduce opacity when disabled
@@ -449,37 +434,7 @@ export class TextInputWidget extends WidgetAbject {
 
     // Focus glow shadow (skip when disabled)
     const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
-    if (focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox, y: oy, width: w, height: h,
-          fill: style.background ?? this.theme.inputBg,
-          stroke: borderColor,
-          radius,
-        },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-
-    // Border rect
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? this.theme.inputBg,
-        stroke: borderColor,
-        radius,
-      },
-    });
+    commands.push(...this.inputFrame(surfaceId, ox, oy, w, h, borderColor, style.radius ?? 0));
 
     // Clip
     commands.push({ type: 'save', surfaceId, params: {} });
@@ -609,15 +564,7 @@ export class TextInputWidget extends WidgetAbject {
           : 0);
         const cursorTop = oy + topPad + visLine * lineHeight + 2;
         const cursorBottom = cursorTop + lineHeight - 4;
-        commands.push({
-          type: 'line',
-          surfaceId,
-          params: {
-            x1: cursorX, y1: cursorTop,
-            x2: cursorX, y2: cursorBottom,
-            stroke: this.theme.cursor,
-          },
-        });
+        commands.push(this.caret(surfaceId, cursorX, cursorTop, cursorBottom));
       }
     }
 
@@ -697,7 +644,6 @@ export class TextInputWidget extends WidgetAbject {
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const radius = style.radius ?? this.theme.widgetRadius;
     const focused = this.focused;
     const textPadding = 8;
     const fontSize = style.fontSize ?? 14;
@@ -705,19 +651,7 @@ export class TextInputWidget extends WidgetAbject {
 
     // Border + optional focus glow (mirrors the single-line path).
     const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
-    if (focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({ type: 'shadow', surfaceId, params: { color: this.theme.inputBorderFocus, blur: 6 } });
-      commands.push({
-        type: 'rect', surfaceId,
-        params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.inputBg, stroke: borderColor, radius },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-    commands.push({
-      type: 'rect', surfaceId,
-      params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.inputBg, stroke: borderColor, radius },
-    });
+    commands.push(...this.inputFrame(surfaceId, ox, oy, w, h, borderColor, style.radius ?? 0));
 
     // Clip to the input bounds.
     commands.push({ type: 'save', surfaceId, params: {} });
@@ -730,7 +664,7 @@ export class TextInputWidget extends WidgetAbject {
           type: 'text', surfaceId,
           params: {
             x: ox + textPadding, y: oy + h / 2, text: this.placeholder,
-            font: style.fontSize ? buildFont(style) : WIDGET_FONT,
+            font: style.fontSize ? buildFont(style, this.theme) : widgetFont(this.theme),
             fill: this.theme.textPlaceholder, baseline: 'middle',
           },
         });
@@ -741,14 +675,7 @@ export class TextInputWidget extends WidgetAbject {
         // giant caret until the first keystroke.
         const topPad = 6;
         const caretH = fontSize + 8;
-        commands.push({
-          type: 'line', surfaceId,
-          params: {
-            x1: ox + textPadding, y1: oy + topPad + 2,
-            x2: ox + textPadding, y2: oy + topPad + caretH - 2,
-            stroke: this.theme.cursor,
-          },
-        });
+        commands.push(this.caret(surfaceId, ox + textPadding, oy + topPad + 2, oy + topPad + caretH - 2));
       }
       commands.push({ type: 'restore', surfaceId, params: {} });
       this.checkAndEmitMdResize(fontSize + 8);
@@ -765,7 +692,7 @@ export class TextInputWidget extends WidgetAbject {
     const lineCommands = await renderRichTextCommands(layout, {
       surfaceId, ox, oy, width: w, height: h,
       theme: this.theme,
-      drawableUrl: (u) => this.imageResolver.drawableUrl(u),
+      drawableUrl: u => this.imageResolver.drawableUrl(u),
       yShift: topPad, textPadding,
       selection: sel,
       measure: (t, font) => this.measureText(surfaceId, t, font),
@@ -778,10 +705,7 @@ export class TextInputWidget extends WidgetAbject {
     if (focused) {
       const cur = await this.cursorXYFromSource(layout, surfaceId, ox, oy, topPad, textPadding, this.cursorPos);
       if (cur) {
-        commands.push({
-          type: 'line', surfaceId,
-          params: { x1: cur.x, y1: cur.top + 2, x2: cur.x, y2: cur.top + cur.height - 2, stroke: this.theme.cursor },
-        });
+        commands.push(this.caret(surfaceId, cur.x, cur.top + 2, cur.top + cur.height - 2));
       }
     }
 
@@ -838,7 +762,7 @@ export class TextInputWidget extends WidgetAbject {
       if (lastEnd >= 0 && pos > lastEnd && pos <= this.nextLineSourceStart(lines, i)) {
         const tail = this.text.substring(lastEnd, pos).replace(/\n/g, '');
         const font = line.runs.length ? line.runs[line.runs.length - 1].font
-          : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+          : (this.style.fontSize ? buildFont(this.style, this.theme) : widgetFont(this.theme));
         const tw = tail.length > 0 ? await this.measureText(surfaceId, tail, font) : 0;
         return { x: runX + tw, top: lineTop, height: line.height };
       }
@@ -858,7 +782,7 @@ export class TextInputWidget extends WidgetAbject {
       if (lastEnd >= 0 && pos > lastEnd) {
         const tail = this.text.substring(lastEnd, pos).replace(/\n/g, '');
         const font = last.runs.length ? last.runs[last.runs.length - 1].font
-          : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+          : (this.style.fontSize ? buildFont(this.style, this.theme) : widgetFont(this.theme));
         if (tail.length > 0) runX += await this.measureText(surfaceId, tail, font);
       }
       return { x: runX, top: lineTop, height: last.height };
@@ -979,7 +903,7 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     const textPadding = 8;
-    const cursorFont = this.style.fontSize ? buildFont(this.style) : WIDGET_FONT;
+    const cursorFont = this.style.fontSize ? buildFont(this.style, this.theme) : widgetFont(this.theme);
 
     if (this.wordWrap && !this.masked && this.cachedWrappedLines) {
       const lineHeight = DEFAULT_LINE_HEIGHT;

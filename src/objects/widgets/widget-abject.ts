@@ -25,14 +25,14 @@ import {
   WidgetStyle,
   WidgetType,
   ThemeData,
-  ARCANE_GRIMOIRE,
+  DEFAULT_THEME,
   WIDGET_INTERFACE,
-  WIDGET_FONT,
-  BODY_FONT_STACK,
-  DISPLAY_FONT_STACK,
-  MONO_FONT_STACK,
+  fontStacks,
+  widgetFont,
   withAlpha,
+  inkFrame,
 } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 import { Tween, pulse as motionPulse } from '../../ui/motion.js';
 
 /**
@@ -129,13 +129,14 @@ export function remapStyleColors(style: WidgetStyle, oldT: ThemeData, newT: Them
  * Build a CSS font string from a WidgetStyle, selecting the Arcane Grimoire font
  * stack named by `style.fontFamily` (body serif by default).
  */
-export function buildFont(style: WidgetStyle): string {
+export function buildFont(style: WidgetStyle, theme?: ThemeData): string {
   const weight = style.fontWeight ?? 'normal';
   const size = style.fontSize ?? 14;
+  const stacks = fontStacks(theme);
   const stack =
-    style.fontFamily === 'display' ? DISPLAY_FONT_STACK
-    : style.fontFamily === 'mono' ? MONO_FONT_STACK
-    : BODY_FONT_STACK;
+    style.fontFamily === 'display' ? stacks.display
+    : style.fontFamily === 'mono' ? stacks.mono
+    : stacks.body;
   return `${weight} ${size}px ${stack}`;
 }
 
@@ -262,7 +263,7 @@ export abstract class WidgetAbject extends Abject {
     this.ownerId = config.ownerId;
     this.href = config.href ?? '';
     this.uiServerId = config.uiServerId;
-    this.theme = config.theme ?? ARCANE_GRIMOIRE;
+    this.theme = config.theme ?? DEFAULT_THEME;
     this.syncDisabledVisible();
 
     this.setupWidgetHandlers();
@@ -430,67 +431,38 @@ export abstract class WidgetAbject extends Abject {
   }
 
   /**
-   * Build the long-op pulse halo drawn around a busy widget.
-   * Pulses between 0.25 and 0.65 alpha so it's visible without screaming.
+   * Build the long-op pulse drawn around a busy widget: a phosphor frame in
+   * the living light (accentSecondary) with a soft glow of the same colour.
+   * Its opacity steps with the pulse; the frame stays inside the widget rect.
    */
   protected buildBusyPulse(surfaceId: string, ox: number, oy: number): unknown[] {
-    const r = this.style.radius ?? this.theme.widgetRadius;
-    const alpha = 0.25 + this.busyPulseValue * 0.4;
-    const blur = 8 + this.busyPulseValue * 6;
+    const alpha = 0.35 + Math.round(this.busyPulseValue * 3) / 3 * 0.65;
+    const light = withAlpha(this.theme.accentSecondary, alpha);
     return [
       { type: 'save', surfaceId, params: {} },
-      {
-        type: 'shadow',
+      { type: 'shadow', surfaceId, params: { color: light, blur: 8, offsetY: 0 } },
+      ...inkFrame(
         surfaceId,
-        params: { color: this.theme.tokens.glow.accent.color, blur, offsetY: 0 },
-      },
-      {
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox,
-          y: oy,
-          width: this.rect.width,
-          height: this.rect.height,
-          stroke: withAlpha(this.theme.accent, alpha),
-          lineWidth: 1.5,
-          radius: r,
-        },
-      },
+        { x: ox, y: oy, width: this.rect.width, height: this.rect.height },
+        light,
+        shapeOf(this.theme).ruleWidth,
+      ),
       { type: 'restore', surfaceId, params: {} },
     ];
   }
 
   /**
    * Build the generic keyboard-focus ring drawn around the widget rect.
-   * Subclasses can override for custom shapes; the default is a 2-px
-   * inset rect at the widget's radius.
+   * Subclasses can override for custom shapes; the default is a flat 2 px
+   * frame on the widget edge in the hand's colour (theme.accent), no glow.
    */
   protected buildFocusRing(surfaceId: string, ox: number, oy: number): unknown[] {
-    const r = this.style.radius ?? this.theme.widgetRadius;
-    const inset = 1; // pull the ring 1 px inside the widget bounds
-    return [
-      { type: 'save', surfaceId, params: {} },
-      {
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.tokens.glow.accent.color, blur: this.theme.tokens.glow.accent.blur, offsetY: 0 },
-      },
-      {
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox + inset,
-          y: oy + inset,
-          width: this.rect.width - inset * 2,
-          height: this.rect.height - inset * 2,
-          stroke: this.theme.accent,
-          lineWidth: 2,
-          radius: Math.max(0, r - 1),
-        },
-      },
-      { type: 'restore', surfaceId, params: {} },
-    ];
+    return inkFrame(
+      surfaceId,
+      { x: ox, y: oy, width: this.rect.width, height: this.rect.height },
+      this.theme.accent,
+      2,
+    );
   }
 
   /**
@@ -543,9 +515,16 @@ export abstract class WidgetAbject extends Abject {
    * (throttled) table fetch and then falls back to a per-call UIServer
    * request, which itself estimates when no client has reported metrics.
    */
+  /**
+   * Set when a measureText answer came from the remote path, which may be an
+   * estimate. Widgets that cache text layouts clear it before a layout pass
+   * and, if it is set afterwards, treat that layout as provisional.
+   */
+  protected measuredWithoutMetrics = false;
+
   protected async measureText(surfaceId: string, text: string, font?: string): Promise<number> {
     if (!text) return 0;
-    const resolvedFont = font ?? WIDGET_FONT;
+    const resolvedFont = font ?? widgetFont(this.theme);
 
     let width = localFontMetrics.measure(text, resolvedFont);
     if (width !== null) return width;
@@ -558,6 +537,9 @@ export abstract class WidgetAbject extends Abject {
     width = localFontMetrics.measure(text, resolvedFont);
     if (width !== null) return width;
 
+    // The remote answer may be a character-count estimate (no client has
+    // reported metrics yet); callers that cache layouts re-measure later.
+    this.measuredWithoutMetrics = true;
     return this.request<number>(
       request(this.id, this.uiServerId, 'measureText', {
         surfaceId,

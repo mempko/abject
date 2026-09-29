@@ -7,8 +7,27 @@
     <title>Abject</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Spectral:wght@400;500;600&family=Spline+Sans+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Spectral:wght@400;500;600&family=Spline+Sans+Mono:wght@400;600&family=Oswald:wght@400;500;600;700&family=PT+Sans:ital,wght@0,400;0,700;1,400;1,700&family=PT+Sans+Narrow:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
+      /* Red Sigil shell (the default palette, shown before the theme arrives):
+         void ground, bone type, dim-bone rules, blood red for the hand,
+         phosphor for the living. Square corners, hard black print shadows. */
+      :root {
+        --paper: #06070a;
+        --card: #101115;
+        --ink: #e7e1ce;
+        --ink-soft: #a8a292;
+        --rule: #8d8778;
+        --shade: #000000;
+        --living: #5be5a0;
+        --red: #d32f22;
+        --red-deep: #a3241a;
+        --ochre: #c9a45c;
+        --cream: #f6efdb;
+        --display: "Oswald", "PT Sans Narrow", "Arial Narrow", Impact, sans-serif;
+        --body: "PT Sans", "Helvetica Neue", Arial, sans-serif;
+        --mono: "JetBrains Mono", "Spline Sans Mono", ui-monospace, monospace;
+      }
       * {
         margin: 0;
         padding: 0;
@@ -18,44 +37,19 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
-        background: #05060a;
-        font-family: "Spectral", Georgia, "Times New Roman", serif;
+        background: var(--paper);
+        font-family: var(--body);
+        color: var(--ink);
       }
-      /* Abyss background layers — sigil blooms rising from the void, hidden
-         until landing. Tinted to the Arcane Grimoire rune-green + violet. */
-      body::before {
-        content: '';
-        position: fixed;
-        inset: 0;
-        z-index: 0;
-        pointer-events: none;
-        background:
-          radial-gradient(ellipse 80% 60% at 50% 108%, rgba(91, 229, 160, 0.05) 0%, transparent 60%),
-          radial-gradient(ellipse 50% 50% at 10% 80%, rgba(139, 123, 255, 0.04) 0%, transparent 50%),
-          radial-gradient(ellipse 40% 40% at 90% 70%, rgba(91, 229, 160, 0.035) 0%, transparent 50%),
-          radial-gradient(ellipse 60% 30% at 50% -5%, rgba(139, 123, 255, 0.025) 0%, transparent 50%),
-          radial-gradient(ellipse 130% 95% at 50% 50%, transparent 52%, rgba(0, 0, 0, 0.6) 100%);
-        opacity: 0;
-        transition: opacity 1.5s ease-in;
-      }
-      body.landed::before {
-        opacity: 1;
-        animation: abyss-breathe 12s ease-in-out infinite;
-      }
-      @keyframes abyss-breathe {
-        0%, 100% { opacity: 0.7; }
-        50% { opacity: 1; }
-      }
-      /* Film-grain veil — a faint fractal-noise overlay that gives the ink void
-         a tactile, vellum-like texture. Sits above the blooms, below the app. */
+      /* Faint print grain over the ground, below the app. */
       body::after {
         content: '';
         position: fixed;
         inset: 0;
         z-index: 0;
         pointer-events: none;
-        opacity: 0.035;
-        mix-blend-mode: overlay;
+        opacity: 0.03;
+        mix-blend-mode: screen;
         background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
       }
       #abyss-bg {
@@ -71,7 +65,7 @@
         height: 100%;
         transform: translateY(40px);
         opacity: 0;
-        transition: transform 0.8s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.6s ease-out;
+        transition: transform 0.45s cubic-bezier(0.2, 0.9, 0.2, 1), opacity 0.3s steps(3, end);
       }
       #app.landed {
         transform: translateY(0);
@@ -82,13 +76,32 @@
         touch-action: none;  /* prevent browser gestures on canvas */
       }
 
+      /* Shared shell pieces */
+      .login-card, .pair-card {
+        background: var(--card);
+        border: 2px solid var(--rule);
+        border-radius: 0;
+        box-shadow: 6px 6px 0 var(--shade);
+        position: relative;
+      }
+      /* Red corner block: the poster motif on every card. */
+      .login-card::before, .pair-card::before {
+        content: '';
+        position: absolute;
+        top: -2px;
+        left: -2px;
+        width: 44px;
+        height: 10px;
+        background: var(--red);
+      }
+
       /* Login overlay */
       #login-overlay {
         display: none;
         position: fixed;
         inset: 0;
         z-index: 10000;
-        background: #05060a;
+        background: var(--paper);
         align-items: center;
         justify-content: center;
       }
@@ -96,65 +109,81 @@
         display: flex;
       }
       .login-card {
-        background: #0f1018;
-        border: 1px solid #1f2030;
-        border-radius: 12px;
-        padding: 2rem;
+        padding: 2.25rem 2rem 2rem;
         width: 340px;
-        box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+        max-width: calc(100vw - 2rem);
       }
       .login-card h1 {
-        color: #f2f0e6;
-        font-family: "Fraunces", "Spectral", Georgia, serif;
-        font-size: 1.5rem;
-        font-weight: 600;
-        letter-spacing: 0.01em;
+        color: var(--ink);
+        font-family: var(--display);
+        font-size: 1.9rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        line-height: 1;
         margin-bottom: 1.5rem;
-        text-align: center;
+        padding-bottom: 0.6rem;
+        border-bottom: 2px solid var(--rule);
       }
       .login-card label {
         display: block;
-        color: #9a98a8;
-        font-size: 0.8rem;
+        color: var(--ink);
+        font-family: var(--display);
+        font-size: 0.75rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
         margin-bottom: 0.3rem;
       }
       .login-card input {
         width: 100%;
         padding: 0.55rem 0.75rem;
         margin-bottom: 1rem;
-        background: #07080e;
-        border: 1px solid #1c1d2b;
-        border-radius: 6px;
-        color: #e8e6dc;
-        font-size: 0.9rem;
-        font-family: inherit;
+        background: var(--paper);
+        border: 2px solid var(--rule);
+        border-radius: 0;
+        color: var(--ink);
+        font-size: 0.95rem;
+        font-family: var(--body);
         outline: none;
-        transition: border-color 0.15s, box-shadow 0.15s;
+        box-shadow: inset 0 0 0 0 var(--red);
+        transition: box-shadow 0.08s linear;
       }
       .login-card input:focus {
-        border-color: #5be5a0;
-        box-shadow: 0 0 0 3px rgba(91, 229, 160, 0.12);
+        border-color: var(--red);
+        box-shadow: inset 4px 0 0 var(--red);
       }
       .login-card button {
         width: 100%;
-        padding: 0.6rem;
-        background: #5be5a0;
-        border: none;
-        border-radius: 6px;
-        color: #05060a;
-        font-size: 0.9rem;
+        padding: 0.65rem;
+        background: var(--red);
+        border: 2px solid var(--red);
+        border-radius: 0;
+        color: var(--cream);
+        font-family: var(--display);
+        font-size: 1rem;
         font-weight: 600;
-        font-family: inherit;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
         cursor: pointer;
-        transition: filter 0.15s;
+        box-shadow: 4px 4px 0 var(--shade);
+        transition: transform 0.05s linear, box-shadow 0.05s linear, background 0.1s linear;
       }
       .login-card button:hover {
-        filter: brightness(1.08);
+        background: var(--red-deep);
+      }
+      .login-card button:active {
+        transform: translate(4px, 4px);
+        box-shadow: 0 0 0 var(--shade);
+      }
+      .login-card button:focus-visible {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
       }
       .login-error {
-        color: #ff8097;
-        font-size: 0.8rem;
-        text-align: center;
+        color: var(--red);
+        font-weight: 700;
+        font-size: 0.85rem;
         margin-bottom: 0.75rem;
         min-height: 1.2em;
       }
@@ -169,38 +198,58 @@
         align-items: center;
         justify-content: center;
         pointer-events: none;
-        transition: opacity 0.4s ease-out;
+        transition: opacity 0.3s steps(4, end);
       }
       #connecting-overlay.hidden {
         opacity: 0;
         pointer-events: none;
       }
       #connecting-overlay.landed .connecting-logo {
-        transform: translateY(-60px);
+        transform: translateX(-60px);
         opacity: 0;
       }
       #connecting-overlay.landed .connecting-status {
         opacity: 0;
       }
       .connecting-logo {
-        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
-        font-size: 1.6rem;
-        font-weight: 600;
-        color: #e8e6dc;
-        margin-bottom: 1.25rem;
-        text-shadow: 0 0 40px rgba(91, 229, 160, 0.12);
-        transition: transform 0.7s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s ease-out;
+        position: relative;
+        font-family: var(--display);
+        font-size: 3rem;
+        font-weight: 700;
+        line-height: 1;
+        letter-spacing: 0.04em;
+        color: var(--paper);
+        background: var(--ink);
+        padding: 0.35rem 1.1rem 0.45rem 1.6rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 8px 8px 0 var(--red);
+        transition: transform 0.45s cubic-bezier(0.7, 0, 0.3, 1), opacity 0.35s steps(3, end);
+      }
+      /* Red wedge driving into the ink block. */
+      .connecting-logo::before {
+        content: '';
+        position: absolute;
+        left: -0.5rem;
+        top: 0;
+        bottom: 0;
+        width: 1.5rem;
+        background: var(--red);
+        clip-path: polygon(0 0, 100% 50%, 0 100%);
       }
       .connecting-logo .accent {
-        color: #5be5a0;
-        text-shadow: 0 0 30px rgba(91, 229, 160, 0.35);
+        color: var(--red);
       }
       .connecting-status {
-        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
-        font-size: 0.8rem;
-        color: #5e5c70;
-        letter-spacing: 0.1em;
-        transition: opacity 0.3s ease-out;
+        font-family: var(--display);
+        font-size: 0.85rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        color: var(--ink);
+        background: var(--card);
+        border: 2px solid var(--rule);
+        padding: 0.3rem 0.8rem;
+        letter-spacing: 0.22em;
+        transition: opacity 0.2s steps(2, end);
       }
       .connecting-dots::after {
         content: '';
@@ -216,25 +265,31 @@
       .connecting-reset {
         margin-top: 2.5rem;
         padding: 0.55rem 1.1rem;
-        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
-        font-size: 0.78rem;
-        letter-spacing: 0.08em;
-        color: #cfcfdc;
-        background: transparent;
-        border: 1px solid rgba(207, 207, 220, 0.25);
-        border-radius: 4px;
+        font-family: var(--display);
+        font-size: 0.8rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        color: var(--ink);
+        background: var(--card);
+        border: 2px solid var(--rule);
+        border-radius: 0;
+        box-shadow: 4px 4px 0 var(--shade);
         cursor: pointer;
         pointer-events: auto;
         opacity: 0;
-        transition: opacity 0.4s ease-out, border-color 0.2s, color 0.2s;
+        transition: opacity 0.3s steps(3, end), background 0.1s linear, color 0.1s linear;
       }
       .connecting-reset.visible {
         opacity: 1;
       }
-      .connecting-reset:hover, .connecting-reset:focus {
-        color: #5be5a0;
-        border-color: rgba(91, 229, 160, 0.5);
-        outline: none;
+      .connecting-reset:hover {
+        color: var(--paper);
+        background: var(--ink);
+      }
+      .connecting-reset:focus {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
       }
 
       /* Pair prompt overlay (shown for p2p-default builds with no pairing) */
@@ -243,94 +298,115 @@
         position: fixed;
         inset: 0;
         z-index: 10001;
-        background: #05060a;
+        background: var(--paper);
         align-items: center;
         justify-content: center;
         padding: 1.5rem;
       }
       #pair-prompt-overlay.visible { display: flex; }
       .pair-card {
-        background: #0f1018;
-        border: 1px solid #1f2030;
-        border-radius: 14px;
-        padding: 2rem 1.75rem;
+        padding: 2.25rem 1.75rem 2rem;
         max-width: 420px;
         width: 100%;
-        box-shadow: 0 12px 48px rgba(0,0,0,0.55);
-        font-family: "Spectral", Georgia, serif;
+        font-family: var(--body);
       }
       .pair-card .pair-logo {
-        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
-        font-size: 1.4rem;
-        font-weight: 600;
-        color: #e8e6dc;
-        text-align: center;
-        margin-bottom: 0.4rem;
+        display: inline-block;
+        font-family: var(--display);
+        font-size: 1.5rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        color: var(--paper);
+        background: var(--ink);
+        padding: 0.15rem 0.7rem 0.25rem;
+        box-shadow: 4px 4px 0 var(--red);
+        margin-bottom: 0.6rem;
       }
-      .pair-card .pair-logo .accent { color: #5be5a0; }
+      .pair-card .pair-logo .accent { color: var(--red); }
       .pair-card h2 {
-        color: #f2f0e6;
-        font-family: "Fraunces", "Spectral", Georgia, serif;
-        font-size: 1.25rem;
-        font-weight: 600;
-        text-align: center;
+        color: var(--ink);
+        font-family: var(--display);
+        font-size: 1.5rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
         margin: 0.6rem 0 0.4rem;
+        padding-bottom: 0.4rem;
+        border-bottom: 2px solid var(--rule);
       }
       .pair-card .pair-message {
-        color: #ff8097;
+        color: var(--red);
+        font-weight: 700;
         font-size: 0.85rem;
-        text-align: center;
         margin: 0 0 0.75rem;
         min-height: 1.2em;
       }
       .pair-card ol {
-        color: #b0b2c8;
-        font-size: 0.9rem;
+        color: var(--ink);
+        font-size: 0.95rem;
         line-height: 1.55;
         padding-left: 1.25rem;
         margin: 0.75rem 0 1rem;
       }
       .pair-card ol li { margin-bottom: 0.4rem; }
+      .pair-card ol li::marker {
+        color: var(--red);
+        font-family: var(--display);
+        font-weight: 700;
+      }
       .pair-card .pair-hint {
-        color: #6a6c84;
-        font-size: 0.75rem;
-        text-align: center;
+        color: var(--ink-soft);
+        font-size: 0.8rem;
         margin-top: 1rem;
         line-height: 1.5;
       }
       .pair-card .pair-hint code {
-        background: #14161f;
-        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
+        background: var(--paper);
+        font-family: var(--mono);
         padding: 0.1rem 0.35rem;
-        border-radius: 3px;
+        border: 1px solid var(--rule);
+        border-radius: 0;
         font-size: 0.72rem;
-        color: #c4c2b8;
+        color: var(--ink);
       }
       .pair-card .pair-actions {
         display: flex;
         flex-direction: column;
-        gap: 0.5rem;
+        gap: 0.75rem;
         margin: 0.75rem 0 0.25rem;
       }
       .pair-card .pair-btn {
         width: 100%;
         padding: 0.75rem;
-        background: #5be5a0;
-        border: none;
-        border-radius: 8px;
-        color: #05060a;
-        font-size: 0.95rem;
+        background: var(--red);
+        border: 2px solid var(--red);
+        border-radius: 0;
+        color: var(--cream);
+        font-family: var(--display);
+        font-size: 1rem;
         font-weight: 600;
-        font-family: inherit;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
         cursor: pointer;
-        transition: filter 0.15s, transform 0.05s;
+        box-shadow: 4px 4px 0 var(--shade);
+        transition: transform 0.05s linear, box-shadow 0.05s linear, background 0.1s linear;
       }
-      .pair-card .pair-btn:hover { filter: brightness(0.95); }
-      .pair-card .pair-btn:active { transform: scale(0.98); }
+      .pair-card .pair-btn:hover { background: var(--red-deep); }
+      .pair-card .pair-btn:active {
+        transform: translate(4px, 4px);
+        box-shadow: 0 0 0 var(--shade);
+      }
+      .pair-card .pair-btn:focus-visible {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
+      }
       .pair-card .pair-btn.secondary {
-        background: transparent;
-        color: #b0b2c8;
-        border: 1px solid #2a2c42;
+        background: var(--card);
+        color: var(--ink);
+      }
+      .pair-card .pair-btn.secondary:hover {
+        background: var(--ink);
+        color: var(--paper);
       }
 
       /* QR scanner overlay (fullscreen video) */
@@ -339,7 +415,7 @@
         position: fixed;
         inset: 0;
         z-index: 10002;
-        background: #000;
+        background: var(--paper);
         flex-direction: column;
         align-items: center;
         justify-content: center;
@@ -356,9 +432,9 @@
         width: min(70vw, 280px);
         height: min(70vw, 280px);
         transform: translate(-50%, -50%);
-        border: 2px solid #5be5a0;
-        border-radius: 12px;
-        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+        border: 4px solid var(--red);
+        border-radius: 0;
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
         pointer-events: none;
       }
       .qr-scanner-hint {
@@ -366,51 +442,74 @@
         top: max(1.5rem, env(safe-area-inset-top));
         left: 50%;
         transform: translateX(-50%);
-        color: #e8e6dc;
-        font-family: "Spectral", Georgia, serif;
-        font-size: 0.9rem;
+        color: var(--ink);
+        font-family: var(--display);
+        font-size: 0.85rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
         text-align: center;
-        background: rgba(0, 0, 0, 0.5);
-        padding: 0.5rem 0.9rem;
-        border-radius: 999px;
+        background: var(--card);
+        border: 2px solid var(--rule);
+        box-shadow: 4px 4px 0 var(--red);
+        padding: 0.45rem 0.9rem;
+        border-radius: 0;
+        max-width: calc(100vw - 2rem);
       }
       .qr-scanner-cancel {
         position: absolute;
         bottom: max(1.5rem, env(safe-area-inset-bottom));
         left: 50%;
         transform: translateX(-50%);
-        background: #1a1b2e;
-        color: #e2e4f0;
-        border: 1px solid #2a2c42;
-        border-radius: 999px;
-        padding: 0.6rem 1.5rem;
-        font-family: inherit;
-        font-size: 0.9rem;
+        background: var(--red);
+        color: var(--cream);
+        border: 2px solid var(--rule);
+        border-radius: 0;
+        box-shadow: 4px 4px 0 var(--shade);
+        padding: 0.6rem 1.6rem;
+        font-family: var(--display);
+        font-size: 0.95rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
         cursor: pointer;
       }
+      .qr-scanner-cancel:focus-visible {
+        outline: 2px solid var(--cream);
+        outline-offset: 3px;
+      }
 
-      /* Floating mobile palette button — the touch equivalent of desktop
+      /* Floating mobile palette button: the touch equivalent of desktop
          Cmd/Ctrl+K. Shown only on mobile once authenticated. */
       #mobile-palette-btn {
         position: fixed;
-        right: 18px;
-        bottom: 18px;
+        right: 20px;
+        bottom: 20px;
         width: 52px;
         height: 52px;
-        border-radius: 50%;
-        border: 1px solid #2a2c42;
-        background: rgba(26, 27, 46, 0.92);
-        color: #e2e4f0;
+        border-radius: 0;
+        border: 2px solid var(--rule);
+        background: var(--red);
+        color: var(--cream);
         font-size: 1.45rem;
+        font-weight: 700;
         line-height: 1;
         display: flex;
         align-items: center;
         justify-content: center;
         z-index: 500;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+        box-shadow: 4px 4px 0 var(--shade);
         -webkit-tap-highlight-color: transparent;
         touch-action: manipulation;
         cursor: pointer;
+      }
+      #mobile-palette-btn:active {
+        transform: translate(4px, 4px);
+        box-shadow: 0 0 0 var(--shade);
+      }
+      #mobile-palette-btn:focus-visible {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
       }
       #mobile-palette-btn[hidden] {
         display: none;
@@ -433,7 +532,7 @@
     </div>
     <div id="connecting-overlay">
       <div class="connecting-logo"><span class="accent">{abject}</span></div>
-      <div class="connecting-status">Descending into the depths<span class="connecting-dots"></span></div>
+      <div class="connecting-status">Assembling the workspace<span class="connecting-dots"></span></div>
       <button id="connecting-reset-btn" type="button" class="connecting-reset" hidden>
         Reset and re-pair
       </button>
@@ -452,7 +551,7 @@
           <button id="pair-scan-btn" class="pair-btn" type="button">Scan QR with camera</button>
         </div>
         <div class="pair-hint">
-          Or scan with your phone's camera app — the link <code>?pair=…</code> opens this browser and pairs once.
+          Or scan with your phone's camera app: the link <code>?pair=…</code> opens this browser and pairs once.
         </div>
       </div>
     </div>

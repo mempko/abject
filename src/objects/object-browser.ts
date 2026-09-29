@@ -21,12 +21,26 @@ import {
   TypeDeclaration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import type { ThemeData } from '../core/theme-data.js';
+import {
+  sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle,
+} from './ui-kit.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ObjectBrowser');
 import type { CatalogSnapshot, CatalogRegistrySource } from './object-catalog.js';
+
+/** Filled destructive button style from the theme's destructive slots. */
+function destructiveFillStyle(theme: ThemeData): { background: string; color: string; borderColor: string } {
+  return { background: theme.destructiveBg, color: theme.destructiveText, borderColor: theme.destructiveBorder };
+}
+
+/** Text of the Send Message section header in the method detail pane. */
+function sendSectionText(theme: ThemeData): string {
+  return sectionHeaderText(theme, 'Send Message');
+}
 
 const OBJECT_BROWSER_INTERFACE: InterfaceId = 'abjects:object-browser' as InterfaceId;
 
@@ -557,7 +571,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
     // Create window
     this.windowId = await wm('createWindowAbject', {
-      title: '\uD83D\uDD0D Abject Explorer',
+      title: 'Abject Explorer',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;
@@ -675,17 +689,40 @@ Pane 4: Detail view with signature, status, source, send-message form,
     await this.addDep(this.pane2ListId);
     await this.addDep(this.pane3ListId);
 
+    // Column headers over the Kinds and Methods panes: each list sits in a
+    // detached VBox under a kit section header naming what the column holds.
+    const { widgetIds: [pane2HeaderId, pane3HeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Object Kinds'), style: sectionHeaderStyle(this.theme, 12) },
+        { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Methods & Events'), style: sectionHeaderStyle(this.theme, 12) },
+      ]})
+    );
+    const pane2BoxId = await wm('createDetachedVBox', {
+      windowId: this.windowId,
+      margins: { top: 6, right: 0, bottom: 0, left: 6 },
+      spacing: 4,
+    }) as AbjectId;
+    await this.addToLayout(pane2BoxId, pane2HeaderId, { vertical: 'fixed' }, { height: 22 });
+    await this.addToLayout(pane2BoxId, this.pane2ListId, { vertical: 'expanding' });
+    const pane3BoxId = await wm('createDetachedVBox', {
+      windowId: this.windowId,
+      margins: { top: 6, right: 0, bottom: 0, left: 6 },
+      spacing: 4,
+    }) as AbjectId;
+    await this.addToLayout(pane3BoxId, pane3HeaderId, { vertical: 'fixed' }, { height: 22 });
+    await this.addToLayout(pane3BoxId, this.pane3ListId, { vertical: 'expanding' });
+
     // Pane 4: Detail (detached scrollable vbox, right child of rightSplit)
     this.pane4LayoutId = await wm('createDetachedScrollableVBox', {
       windowId: this.windowId,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
+      margins: { top: 8, right: 12, bottom: 8, left: 12 },
+      spacing: 6,
     }) as AbjectId;
 
     // Wire nested split pane children
     await this.request(request(this.id, this.leftSplitId, 'setLeftChild', { widgetId: this.pane1VBoxId }));
-    await this.request(request(this.id, this.leftSplitId, 'setRightChild', { widgetId: this.pane2ListId }));
-    await this.request(request(this.id, this.rightSplitId, 'setLeftChild', { widgetId: this.pane3ListId }));
+    await this.request(request(this.id, this.leftSplitId, 'setRightChild', { widgetId: pane2BoxId }));
+    await this.request(request(this.id, this.rightSplitId, 'setLeftChild', { widgetId: pane3BoxId }));
     await this.request(request(this.id, this.rightSplitId, 'setRightChild', { widgetId: this.pane4LayoutId }));
     await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.leftSplitId }));
     await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.rightSplitId }));
@@ -832,7 +869,10 @@ Pane 4: Detail view with signature, status, source, send-message form,
     } else if (state.selectedKind) {
       await this.rebuildPane4KindOverview();
     } else {
-      await this.addPane4Label('Select a category and object kind to browse.', true);
+      await this.addPane4EmptyState(emptyStateMarkdown(
+        'Nothing selected',
+        'Choose a scope on the left, then an object kind to see its description, status and actions. Pick a method to read its signature and send it a message.',
+      ));
     }
   }
 
@@ -881,6 +921,18 @@ Pane 4: Detail view with signature, status, source, send-message form,
     const lineHeight = isSecondary ? 16 : 18;
     await this.addToLayout(this.pane4LayoutId!, labelId, { vertical: 'fixed' },
       { height: Math.max(lineHeight, lines * lineHeight) });
+    this.pane4LabelIds.push(labelId);
+    return labelId;
+  }
+
+  /** A centered empty-state note in the detail pane. */
+  private async addPane4EmptyState(markdown: string): Promise<AbjectId> {
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: markdown, style: emptyStateStyle(this.theme) },
+      ]})
+    );
+    await this.addToLayout(this.pane4LayoutId!, labelId, { vertical: 'fixed' }, { height: 110 });
     this.pane4LabelIds.push(labelId);
     return labelId;
   }
@@ -976,14 +1028,18 @@ Pane 4: Detail view with signature, status, source, send-message form,
       labelSpecs.push({ text: `Tags: ${tags.join(', ')}`, isSecondary: true });
     }
 
-    labelSpecs.push({ text: '\u2500\u2500\u2500 Status', isSecondary: true });
-    labelSpecs.push({ text: `State: ${reg.status?.state ?? 'running'}`, isSecondary: true });
+    const stateText = reg.status?.state ?? 'running';
+    const stateColor = stateText === 'error' ? this.theme.statusError
+      : stateText === 'stopped' ? this.theme.textMeta
+      : livingStyle(this.theme).color;
+    labelSpecs.push({ text: sectionHeaderText(this.theme, 'Status'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
+    labelSpecs.push({ text: `State: ${stateText}`, isSecondary: true, style: { color: stateColor } });
 
     if (reg.status?.errorCount !== undefined && reg.status.errorCount > 0) {
-      labelSpecs.push({ text: `Errors: ${reg.status.errorCount}`, isSecondary: true });
+      labelSpecs.push({ text: `Errors: ${reg.status.errorCount}`, isSecondary: true, style: { color: this.theme.statusError } });
     }
 
-    labelSpecs.push({ text: '\u2500\u2500\u2500 Actions', isSecondary: true });
+    labelSpecs.push({ text: sectionHeaderText(this.theme, 'Actions'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
 
     // Response label placeholder (last)
     const responseLabelIndex = labelSpecs.length + /* buttons below */ 0; // tracked after buttons
@@ -999,7 +1055,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
     } else {
       if (hasSource) {
         if (editorId) {
-          btnSpecs.push({ text: 'Edit Source', actionKey: 'editSource' });
+          btnSpecs.push({ text: 'Edit Source', actionKey: 'editSource',
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } });
         }
         if (!isSystem) {
           btnSpecs.push({ text: 'Clone', actionKey: 'cloneObject' });
@@ -1007,7 +1064,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
       }
       if (!isSystem) {
         btnSpecs.push({ text: 'Delete', actionKey: 'deleteObject',
-          style: { background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } });
+          style: { ...destructiveFillStyle(this.theme) } });
       }
     }
 
@@ -1022,6 +1079,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         fontSize: ls.isSecondary ? 12 : 13,
         wordWrap: true,
         selectable: true,
+        ...(ls.isSecondary ? { color: this.theme.textSecondary } : {}),
         ...(ls.style ?? {}),
       },
     }));
@@ -1119,10 +1177,10 @@ Pane 4: Detail view with signature, status, source, send-message form,
         return `${p.name}: ${typeStr}`;
       }).join(', ');
 
-      labelSpecs.push({ text: `(${paramStr})`, isSecondary: true });
+      labelSpecs.push({ text: `(${paramStr})`, isSecondary: true, style: { fontFamily: 'mono' } });
 
       if (method.decl.returns) {
-        labelSpecs.push({ text: `\u2192 ${this.formatType(method.decl.returns)}`, isSecondary: true });
+        labelSpecs.push({ text: `\u2192 ${this.formatType(method.decl.returns)}`, isSecondary: true, style: { fontFamily: 'mono' } });
       }
 
       if (method.decl.description) {
@@ -1135,11 +1193,9 @@ Pane 4: Detail view with signature, status, source, send-message form,
       labelSpecs.push({ text: `Interface: ${method.iface.id}`, isSecondary: true });
     }
 
-    // Divider
-    labelSpecs.push({ text: '\u2500\u2500\u2500', isSecondary: true });
-
-    // Find Implementors / Senders buttons
+    // Find Implementors / Senders buttons, under their own section header
     if (method.type === 'method') {
+      labelSpecs.push({ text: sectionHeaderText(this.theme, 'Explore'), isSecondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
       navBtnSpecs.push({ text: 'Find Implementors', actionKey: `implementors:${method.name}` });
       navBtnSpecs.push({ text: 'Find Senders', actionKey: `senders:${method.name}` });
     }
@@ -1149,7 +1205,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     if (method.type === 'method' && regs.length > 0) {
       hasSendSection = true;
       sendBtnText = `Send to ${regs[0].manifest.name}`;
-      labelSpecs.push({ text: '\u2500\u2500\u2500 Send Message', isSecondary: true });
+      labelSpecs.push({ text: sendSectionText(this.theme), isSecondary: true });
 
       const params = method.decl?.parameters ?? [];
       if (params.length === 0) {
@@ -1183,7 +1239,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
     // Split labelSpecs into pre-send and send-section parts
     const sendSectionStart = hasSendSection
-      ? labelSpecs.findIndex(l => l.text === '\u2500\u2500\u2500 Send Message')
+      ? labelSpecs.findIndex(l => l.text === sendSectionText(this.theme))
       : -1;
 
     const preSendLabels = sendSectionStart >= 0 ? labelSpecs.slice(0, sendSectionStart) : labelSpecs.slice(0, hasSendSection ? -1 : labelSpecs.length);
@@ -1211,7 +1267,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: ls.text,
-        style: { fontSize: ls.isSecondary ? 12 : 13, wordWrap: true, selectable: true, ...(ls.style ?? {}) },
+        style: { fontSize: ls.isSecondary ? 12 : 13, wordWrap: true, selectable: true, ...(ls.isSecondary ? { color: this.theme.textSecondary } : {}), ...(ls.style ?? {}) },
       });
     }
 
@@ -1238,8 +1294,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
       batchSpecs.push({
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
-        text: '\u2500\u2500\u2500 Send Message',
-        style: { fontSize: 12, wordWrap: true },
+        text: sendSectionText(this.theme),
+        style: { ...sectionHeaderStyle(this.theme, 12) },
       });
 
       if (inputSpecs.length === 1 && inputSpecs[0].paramName === '__raw_json__') {
@@ -1249,7 +1305,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
           type: 'label', windowId: this.windowId!,
           rect: { x: 0, y: 0, width: 0, height: 0 },
           text: 'payload (JSON)',
-          style: { fontSize: 12, wordWrap: true },
+          style: { fontSize: 12, wordWrap: true, color: this.theme.textSecondary },
         });
         inputIndices.push(batchSpecs.length);
         batchSpecs.push({
@@ -1271,7 +1327,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
             type: 'label', windowId: this.windowId!,
             rect: { x: 0, y: 0, width: 0, height: 0 },
             text: pl?.text ?? inputSpecs[i].paramName,
-            style: { fontSize: 12, wordWrap: true },
+            style: { fontSize: 12, wordWrap: true, color: this.theme.textSecondary },
           });
           inputIndices.push(batchSpecs.length);
           batchSpecs.push({
@@ -1354,7 +1410,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
       layoutChildren.push({
         widgetId: widgetIds[sendSectionLabelIndex],
         sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 16 },
+        preferredSize: { height: 22 },
       });
       for (let i = 0; i < inputSpecs.length; i++) {
         const paramLabelText = batchSpecs[paramLabelIndices[i]].text ?? '';
@@ -1427,15 +1483,15 @@ Pane 4: Detail view with signature, status, source, send-message form,
       type: 'label', windowId: this.windowId!,
       rect: { x: 0, y: 0, width: 0, height: 0 },
       text: headerText,
-      style: { fontSize: 13, wordWrap: true, fontWeight: 'bold', fontSize2: 14 },
+      style: { ...sectionHeaderStyle(this.theme, 13), wordWrap: true },
     });
 
     if (btnNames.length === 0) {
       specs.push({
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
-        text: 'No implementors found.',
-        style: { fontSize: 12, wordWrap: true },
+        text: emptyStateMarkdown('No implementors found', 'Nothing in this scope declares this method. Widen the scope on the left to search further.'),
+        style: emptyStateStyle(this.theme),
       });
     } else {
       for (const name of btnNames) {
@@ -1461,7 +1517,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
     if (btnNames.length === 0) {
       this.pane4LabelIds.push(widgetIds[1]);
-      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 90 } });
     } else {
       for (let i = 0; i < btnNames.length; i++) {
         const btnId = widgetIds[1 + i];
@@ -1506,15 +1562,15 @@ Pane 4: Detail view with signature, status, source, send-message form,
       type: 'label', windowId: this.windowId!,
       rect: { x: 0, y: 0, width: 0, height: 0 },
       text: headerText,
-      style: { fontSize: 13, wordWrap: true, fontWeight: 'bold' },
+      style: { ...sectionHeaderStyle(this.theme, 13), wordWrap: true },
     });
 
     if (btnNames.length === 0) {
       specs.push({
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
-        text: 'No senders found.',
-        style: { fontSize: 12, wordWrap: true },
+        text: emptyStateMarkdown('No senders found', 'No object source in this scope mentions this method. Widen the scope on the left to search further.'),
+        style: emptyStateStyle(this.theme),
       });
     } else {
       for (const name of btnNames) {
@@ -1540,7 +1596,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
 
     if (btnNames.length === 0) {
       this.pane4LabelIds.push(widgetIds[1]);
-      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 90 } });
     } else {
       for (let i = 0; i < btnNames.length; i++) {
         const btnId = widgetIds[1 + i];

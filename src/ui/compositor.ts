@@ -472,7 +472,7 @@ export class Compositor {
   private activeWorkspaceId?: string;
   // Focused window gets an accent rim + bloom and lifts toward the camera.
   private focusedSurfaceId?: string;
-  private focusGlowColor = 'rgba(91, 229, 160, 0.55)'; // Arcane rune-green default
+  private focusGlowColor = 'rgba(91, 229, 160, 0.45)'; // Red Sigil living light
   private focusGlowRadius = 7; // window corner radius, so the halo matches the window
   private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
   private static IMAGE_CACHE_MAX = 100;
@@ -2057,14 +2057,33 @@ export class Compositor {
     this.invViewProj = mat4Invert(this.viewProj);
   }
 
+  /** A scene-theme colour by token name, or the fallback before any theme arrives. */
+  private sceneColor(token: string, fallback: string): string {
+    return this.sceneTheme?.colors[token] ?? fallback;
+  }
+
   /** Theme-derived chrome values with arcane defaults pre-theme. */
-  private chromeColors(): { shadow: RGBA; glow: RGBA; radius: number; depth: number } {
+  /**
+   * Theme-derived chrome values. The design casts hard print shadows: ink
+   * under resting windows (lighter, so stacks stay calm) and the palette's
+   * accent under the focused one, which also gets a living-light rim and aura.
+   * Defaults hold until the first scene theme arrives.
+   */
+  private chromeColors(): {
+    glow: RGBA; radius: number;
+    block: { offset: number; rest: RGBA; focus: RGBA };
+  } {
     const t = this.sceneTheme;
+    const shape = t?.shape;
+    const rest = parseCssColor(shape?.blockShadowColor ?? t?.shadow.color ?? 'rgba(0,0,0,0.9)');
     return {
-      shadow: parseCssColor(t?.shadow.color ?? 'rgba(0,0,0,0.55)'),
       glow: parseCssColor(t?.glow.focusColor ?? this.focusGlowColor),
-      radius: t?.windowRadius ?? this.focusGlowRadius,
-      depth: t?.surface.gradient ?? 1,
+      radius: t?.windowRadius ?? 0,
+      block: {
+        offset: shape?.blockShadowOffset ?? 6,
+        rest: { ...rest, a: rest.a * 0.45 },
+        focus: parseCssColor(shape?.blockFocusColor ?? t?.colors.accent ?? '#d32f22'),
+      },
     };
   }
 
@@ -2123,47 +2142,49 @@ export class Compositor {
       const radius = surface.transparent ? 0 : Math.min(chrome.radius, rect.width / 2, rect.height / 2);
 
       if (!surface.transparent) {
-        // Soft shadow beneath the slab — deeper when focused (depth scaled
-        // by the theme's surface treatment; flat themes get flat desktops).
-        const shadowSigma = (focused ? 16 : 9) * Math.max(0.25, chrome.depth);
-        const pad = shadowSigma * 4;
-        const shadowModel = mat4TRS(
-          cx, cy + (focused ? 12 : 7), z - 1,
+        // Constructivist print shadow: a solid, unblurred slab offset
+        // down-right (red under the focused window, ink under the rest).
+        // The sub-pixel sigma turns the glow shader into a hard-edged fill.
+        const off = chrome.block.offset;
+        const bw = rect.width + 2;
+        const bh = rect.height + 2;
+        const blockModel = mat4TRS(
+          cx + off, cy + off, z - 1,
           state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
-          rect.width + pad * 2, rect.height + pad * 2, 1,
+          bw + 4, bh + 4, 1,
         );
         this.renderer.drawGlow({
-          model: shadowModel, viewProj: cam.viewProj,
-          quadWidth: rect.width + pad * 2, quadHeight: rect.height + pad * 2,
-          halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
+          model: blockModel, viewProj: cam.viewProj,
+          quadWidth: bw + 4, quadHeight: bh + 4,
+          halfWidth: rect.width / 2, halfHeight: rect.height / 2,
           radius,
-          color: chrome.shadow,
-          a1: focused ? 0.55 : 0.4, sigma1: shadowSigma,
+          color: focused ? chrome.block.focus : chrome.block.rest,
+          a1: 1, sigma1: 0.4,
         });
-
-        // Focus bloom: the accent halo around the focused slab.
+        // Eldritch variant: the focused slab also leaks a faint phosphor
+        // light around its edges (print below, something alive within).
         if (focused) {
-          const pad2 = 56;
-          const glowModel = mat4TRS(
+          const pad = 40;
+          const auraModel = mat4TRS(
             cx, cy, z - 0.5,
             state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
-            rect.width + pad2 * 2, rect.height + pad2 * 2, 1,
+            rect.width + pad * 2, rect.height + pad * 2, 1,
           );
           this.renderer.drawGlow({
-            model: glowModel, viewProj: cam.viewProj,
-            quadWidth: rect.width + pad2 * 2, quadHeight: rect.height + pad2 * 2,
-            halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
+            model: auraModel, viewProj: cam.viewProj,
+            quadWidth: rect.width + pad * 2, quadHeight: rect.height + pad * 2,
+            halfWidth: rect.width / 2, halfHeight: rect.height / 2,
             radius,
             color: chrome.glow,
-            a1: 0.5, sigma1: 5,
-            a2: 0.3, sigma2: 12,
+            a1: 0.35, sigma1: 7,
+            a2: 0.18, sigma2: 18,
           });
         }
       }
 
       this.drawSurfaceSlab(surface, state, model, {
         radius,
-        dim: focused || surface.transparent ? 1 : 0.93,
+        dim: 1,
         opacity: 1,
         rim: focused && !surface.transparent
           ? { ...chrome.glow, a: chrome.glow.a * 0.9 }
@@ -3345,27 +3366,32 @@ export class Compositor {
 
     const SZ = Compositor.SCROLLBAR_SIZE;
     const M = Compositor.SCROLLBAR_MARGIN;
+    // Constructivist themes: an ink track and a square red thumb.
+    // An ink track and a square accent thumb.
+    const trackColor = 'rgba(0,0,0,0.25)';
+    const thumbColor = this.sceneColor('accent', '#d32f22');
+    const thumbRadius = 0;
 
     if (needV) {
       // Track
-      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillStyle = trackColor;
       ctx.fillRect(this.width - SZ - M, M, SZ, this.height - 2 * M - (needH ? SZ + M : 0));
       // Thumb
       const trackH = this.height - 2 * M - (needH ? SZ + M : 0);
       const thumbH = Math.max(24, (this.height / ws.height) * trackH);
       const thumbY = M + (this.scrollY / (ws.height - this.height)) * (trackH - thumbH);
-      ctx.fillStyle = 'rgba(180,180,200,0.6)';
-      this.roundRectOn(ctx, this.width - SZ - M, thumbY, SZ, thumbH, 4);
+      ctx.fillStyle = thumbColor;
+      this.roundRectOn(ctx, this.width - SZ - M, thumbY, SZ, thumbH, thumbRadius);
       ctx.fill();
     }
     if (needH) {
-      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillStyle = trackColor;
       ctx.fillRect(M, this.height - SZ - M, this.width - 2 * M - (needV ? SZ + M : 0), SZ);
       const trackW = this.width - 2 * M - (needV ? SZ + M : 0);
       const thumbW = Math.max(24, (this.width / ws.width) * trackW);
       const thumbX = M + (this.scrollX / (ws.width - this.width)) * (trackW - thumbW);
-      ctx.fillStyle = 'rgba(180,180,200,0.6)';
-      this.roundRectOn(ctx, thumbX, this.height - SZ - M, thumbW, SZ, 4);
+      ctx.fillStyle = thumbColor;
+      this.roundRectOn(ctx, thumbX, this.height - SZ - M, thumbW, SZ, thumbRadius);
       ctx.fill();
     }
   }
@@ -3558,9 +3584,9 @@ export class Compositor {
     const pillH = 4;
     const x = (this.width - pillW) / 2;
     ctx.fillStyle = this.mobileView === MobileViewState.CARD_OVERVIEW
-      ? 'rgba(139,139,255,0.6)'
-      : 'rgba(160,160,190,0.4)';
-    this.roundRectOn(ctx, x, y - pillH / 2, pillW, pillH, pillH / 2);
+      ? this.sceneColor('accent', '#d32f22')
+      : this.sceneColor('textSecondary', '#a8a292');
+    this.roundRectOn(ctx, x, y - pillH / 2, pillW, pillH, 0);
     ctx.fill();
   }
 
@@ -3642,8 +3668,8 @@ export class Compositor {
 
     const n = this.mobileCardOrder.length;
     if (n === 0) {
-      overlayCtx.fillStyle = '#666680';
-      overlayCtx.font = '16px "Spectral", Georgia, serif';
+      overlayCtx.fillStyle = this.sceneColor('textSecondary', '#666680');
+      overlayCtx.font = `16px ${this.sceneTheme?.fonts?.body ?? '"PT Sans", sans-serif'}`;
       overlayCtx.textAlign = 'center';
       overlayCtx.textBaseline = 'middle';
       overlayCtx.fillText('No windows', this.width / 2, availH / 2);
@@ -3689,9 +3715,10 @@ export class Compositor {
         viewProj: this.viewProj,
         quadWidth: w + pad * 2, quadHeight: h + pad * 2,
         halfWidth: w / 2, halfHeight: h / 2,
-        radius: 8,
+        radius: Math.min(8, chrome.radius),
         color: { r: 0, g: 0, b: 0, a: 0.5 * alpha },
-        a1: 1, sigma1: (isActive ? 24 : 12) / 2,
+        a1: 1, sigma1: 0.4,
+        offsetX: chrome.block.offset, offsetY: chrome.block.offset - 6,
       });
 
       // Card frame fill behind transparent content (sharp rounded rect via
@@ -3701,16 +3728,16 @@ export class Compositor {
         viewProj: this.viewProj,
         quadWidth: w, quadHeight: h,
         halfWidth: w / 2, halfHeight: h / 2,
-        radius: 8,
-        color: { r: 13 / 255, g: 13 / 255, b: 20 / 255, a: alpha },
+        radius: Math.min(8, chrome.radius),
+        color: { ...parseCssColor(this.sceneColor('windowBg', '#0d0d14')), a: alpha },
         a1: 1, sigma1: 0.4,
       });
 
       this.drawSurfaceSlab(surface, state, model, {
-        radius: 8,
+        radius: Math.min(8, chrome.radius),
         dim: 1,
         opacity: alpha,
-        rim: isActive ? { ...chrome.glow, a: 0.8 * alpha } : undefined,
+        rim: isActive ? { ...chrome.block.focus, a: 0.8 * alpha } : undefined,
       });
 
       // Scene-vocabulary nodes on the CENTRED card. The deck used to draw
@@ -3744,21 +3771,22 @@ export class Compositor {
 
       // Title below the card (active card sits unrotated, so 2D chrome aligns).
       overlayCtx.globalAlpha = alpha;
-      overlayCtx.fillStyle = isActive ? '#c8c8ff' : '#666680';
-      overlayCtx.font = '13px "Spectral", Georgia, serif';
+      overlayCtx.fillStyle = isActive ? this.sceneColor('textPrimary', '#c8c8ff') : this.sceneColor('textSecondary', '#666680');
+      overlayCtx.font = `600 13px ${this.sceneTheme?.fonts?.display ?? '"Oswald", sans-serif'}`;
       overlayCtx.textAlign = 'center';
       overlayCtx.textBaseline = 'top';
-      const label = (surface.title || surface.id.slice(0, 12)).slice(0, 22);
+      const rawLabel = (surface.title || surface.id.slice(0, 12)).slice(0, 22);
+      const label = rawLabel.toLocaleUpperCase();
       overlayCtx.fillText(label, x + w / 2, y + h + 8);
 
       // Close chip on the active card (only if the window may be closed).
       if (isActive && surface.closable) {
         const chip = this.cardCloseChipRect(x, y, w);
-        overlayCtx.fillStyle = 'rgba(20,20,34,0.9)';
+        overlayCtx.fillStyle = this.sceneColor('windowBg', 'rgba(20,20,34,0.9)');
         overlayCtx.beginPath();
         overlayCtx.arc(chip.cx, chip.cy, chip.r, 0, Math.PI * 2);
         overlayCtx.fill();
-        overlayCtx.strokeStyle = '#8b8bff';
+        overlayCtx.strokeStyle = this.sceneColor('accent', '#8b8bff');
         overlayCtx.lineWidth = 1.5;
         overlayCtx.beginPath();
         overlayCtx.moveTo(chip.cx - 4, chip.cy - 4);

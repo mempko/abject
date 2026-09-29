@@ -73,10 +73,12 @@ import {
   LayoutStyle,
   Rect,
   ThemeData,
-  ARCANE_GRIMOIRE,
+  DEFAULT_THEME,
   SizeInput,
   coerceRect,
+  fontStacks,
 } from './widgets/widget-types.js';
+import { shapeOf } from '../core/theme-data.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
 
@@ -119,7 +121,7 @@ const WIDGET_TYPE_ALIASES: Record<string, string> = {
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
-  private defaultTheme: ThemeData = ARCANE_GRIMOIRE;
+  private defaultTheme: ThemeData = DEFAULT_THEME;
   /**
    * Objects allowed to answer dialogs remotely via `respondDialog`.
    * Registered by bootstrap and then sealed BEFORE workspaces spawn, so no
@@ -130,6 +132,8 @@ export class WidgetManager extends Abject {
   /** Open dialog id -> the AbjectId whose `respond` handler resolves it. */
   private openDialogRoutes: Map<string, AbjectId> = new Map();
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
+  /** Abjects that asked for activeThemeChanged events (see subscribeActiveTheme). */
+  private activeThemeSubscribers = new Set<AbjectId>();
   /**
    * The currently active workspace. System-level widgets (workspace switcher,
    * global toolbar, etc. — anything not tagged to a workspace) use this
@@ -1046,14 +1050,20 @@ export class WidgetManager extends Abject {
       const { objectId, workspaceId } = msg.payload as { objectId: AbjectId; workspaceId: string };
       this.objectWorkspaces.set(objectId, workspaceId);
       // Retroactively tag any existing windows owned by this object
+      let ownsWindows = false;
       for (const [windowId, owner] of this.windowOwners.entries()) {
         if (owner === objectId) {
+          ownsWindows = true;
           const surfaceId = this.windowSurfaces.get(windowId);
           if (surfaceId) {
             await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId, workspaceId }));
           }
         }
       }
+      // Those windows were born wearing the active (or default) theme; move
+      // them onto their workspace's theme if it is already known.
+      const wsTheme = this.workspaceThemes.get(workspaceId)?.theme;
+      if (ownsWindows && wsTheme) this.propagateWorkspaceTheme(workspaceId, wsTheme);
     });
 
     this.on('registerWorkspaceTheme', async (msg: AbjectMessage) => {
@@ -1077,6 +1087,9 @@ export class WidgetManager extends Abject {
       } catch { /* may not support dependents */ }
 
       this.workspaceThemes.set(workspaceId, { themeId, theme });
+      // Windows this workspace opened before its Theme registered (restored
+      // at boot) were born wearing the default theme; re-skin them now.
+      this.propagateWorkspaceTheme(workspaceId, theme);
 
       // If this is the active workspace, immediately push its theme to
       // system-level UI so it re-skins on first registration too.
@@ -1111,6 +1124,18 @@ export class WidgetManager extends Abject {
      * accent colors they bake into label styles at build time.
      */
     this.on('getActiveTheme', async () => {
+      return this.activeTheme();
+    });
+
+    /**
+     * Subscribe the caller to `activeThemeChanged` events (payload: the full
+     * ThemeData) whenever the active workspace or its theme changes. Returns
+     * the current active theme. Pushes go only to callers not tagged to a
+     * workspace (system-scoped Abjects, which wear the active one's theme);
+     * Abject.fetchTheme subscribes every object and lets this filter decide.
+     */
+    this.on('subscribeActiveTheme', async (msg: AbjectMessage) => {
+      this.activeThemeSubscribers.add(msg.routing.from);
       return this.activeTheme();
     });
 
@@ -1238,17 +1263,7 @@ export class WidgetManager extends Abject {
         }
         if (changedWorkspaceId) {
           const newTheme = value as ThemeData;
-          // Propagate to widgets/windows in this workspace
-          for (const id of this.spawnedWidgets) {
-            if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
-              try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
-            }
-          }
-          for (const id of this.spawnedWindows) {
-            if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
-              try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
-            }
-          }
+          this.propagateWorkspaceTheme(changedWorkspaceId, newTheme);
           // If this is the active workspace's theme, also re-skin system-level
           // UI (workspace switcher, global toolbar — anything untagged) so
           // the whole frame flips colour together.
@@ -1567,6 +1582,20 @@ export class WidgetManager extends Abject {
     return this.activeTheme();
   }
 
+  /** Send `updateTheme` to every widget and window tagged to a workspace. */
+  private propagateWorkspaceTheme(workspaceId: string, theme: ThemeData): void {
+    for (const id of this.spawnedWidgets) {
+      if (this.getWorkspaceForWidgetOrWindow(id) === workspaceId) {
+        try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
+      }
+    }
+    for (const id of this.spawnedWindows) {
+      if (this.getWorkspaceForWidgetOrWindow(id) === workspaceId) {
+        try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
+      }
+    }
+  }
+
   /**
    * Send `updateTheme` to every widget and window that is NOT tagged to a
    * workspace (workspace switcher, global toolbar, modal dialogs, taskbar,
@@ -1585,6 +1614,14 @@ export class WidgetManager extends Abject {
       }
     }
     this.pushSceneTheme(theme);
+    // System-scoped Abjects (Settings, Peer Network, Process Explorer, ...)
+    // cache the active theme through Abject.fetchTheme and bake its colors
+    // into the widget specs they build; keep that cache current.
+    for (const sub of this.activeThemeSubscribers) {
+      // Workspace-tagged objects follow their own workspace's Theme.
+      if (this.objectWorkspaces.has(sub)) continue;
+      try { this.send(event(this.id, sub, 'activeThemeChanged', theme)); } catch { this.activeThemeSubscribers.delete(sub); }
+    }
   }
 
   /**
@@ -1625,6 +1662,19 @@ export class WidgetManager extends Abject {
         blur: theme.tokens.elevation.level2.blur,
         offsetY: theme.tokens.elevation.level2.offsetY,
       },
+      shape: (() => {
+        const sh = shapeOf(theme);
+        return {
+          shadowStyle: sh.shadowStyle,
+          blockShadowOffset: sh.blockShadowOffset,
+          blockShadowColor: sh.blockShadowColor,
+          blockFocusColor: sh.blockFocusColor,
+          ruleWidth: sh.ruleWidth,
+          ornament: sh.ornament,
+          backdrop: sh.backdrop,
+        };
+      })(),
+      fonts: { ...fontStacks(theme) },
     };
     this.send(request(this.id, this.uiServerId, 'setSceneTheme', { theme: sceneTheme }));
   }
@@ -1729,7 +1779,7 @@ A working app and a beautiful app differ in craft, not effort. Aim for "looks de
    \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\`. The COLORS are
    TOP-LEVEL fields on that object — \`theme.accent\`, \`theme.accentSecondary\`, \`theme.textPrimary\`,
    \`theme.windowBg\`, \`theme.statusError\`, … — NOT under \`theme.tokens\`, which holds only the
-   non-color scales (\`space\`, \`type\`, \`radius\`, \`motion\`, \`easing\`, \`elevation\`, \`glow\`, \`surface\`).
+   non-color scales (\`space\`, \`type\`, \`radius\`, \`motion\`, \`easing\`, \`elevation\`, \`glow\`, \`surface\`, \`shape\`).
    Reading \`theme.tokens.accent\` yields \`undefined\`, and an \`undefined\` fill is SILENTLY IGNORED by
    the canvas — every shape then paints in whatever color was last set (usually black) with no error
    anywhere. **Chrome always uses theme tokens** — text, buttons, panels, on-screen keys,
@@ -1737,17 +1787,24 @@ A working app and a beautiful app differ in craft, not effort. Aim for "looks de
    in the user's desktop, not a foreign color scheme. Reach for hand-picked hex ONLY for genuine
    *illustration/content* the theme can't express (a game's character art, a chart's data series, a
    themed scene) — and even there design a small, consistent palette, never ad-hoc per-element colors.
-2. **Create depth — avoid flat fills.** Back the window with a subtle vertical gradient
-   (\`linearGradient\`) or layered panels rather than one solid color; use rgba/alpha for soft
-   overlays, glows, and muted secondary text. Group related content into cards: a panel rect with a
-   slightly lifted background, rounded corners, and a faint border or shadow.
+2. **Design in the system's language.** Every theme is a colour palette of ONE design (read
+   \`designNotes\` from \`getActiveTheme\` for the full description). Flat solid fills and square
+   corners (radius 0); ruled frames (\`tokens.shape.ruleWidth\` px); depth from hard offset print
+   shadows (a solid \`$shadowColor\` rect offset ~5px down-right behind a panel, no blur). Two lights:
+   \`$accent\` is the human hand (the primary action, focus, selection, structural marks) and
+   \`$accentSecondary\` is the living light, reserved for things that are alive or thinking (running
+   work, live data, AI activity); it is the only colour that glows (a soft shadow in it). Titles in the
+   display face, UPPERCASE and letter-spaced. Geometric accents: a diagonal wedge, a bar, rings, the
+   eye sigil (a ring with a vertical slit pupil). Structure stays still; the living breathes.
 3. **Typography hierarchy.** Give titles, body, and captions distinct sizes AND weights (e.g. bold
-   22–34px title, 14–16px body, 11–12px muted caption). Pick a font that fits the app's character
-   and use it consistently. Don't render everything at one size/weight.
+   22–34px title, 14–16px body, 11–12px muted caption). Use the theme's faces: the font strings in
+   \`theme.tokens.type\` (\`display\`, \`body\`, \`code\`) are loaded and measured; build canvas fonts
+   from them (e.g. \`\`600 22px \${theme.tokens.type.display.font}\`\`). Don't render everything at one
+   size/weight.
 4. **Spacing & alignment.** Consistent padding, generous whitespace, and a clear grid. Align edges;
-   give interactive targets room. Rounded corners (a consistent radius) on cards/buttons.
-5. **Accent with purpose.** The accent color marks the primary action / current selection /
-   highlight — used sparingly. Use semantic colors (success green, error red) only for state.
+   give interactive targets room. Corners are square: \`theme.widgetRadius\` is 0.
+5. **Accent with purpose.** \`$accent\` marks the primary action / current selection, used boldly but
+   once per area. Use status colors only for state.
 6. **Polish.** Show hover/pressed states on interactive elements; a touch of subtle animation
    (driven by a Timer tick) brings a UI alive. Define your palette and a few small reusable draw
    helpers (e.g. a text helper, a card helper) up front so styling stays uniform across the app.
@@ -2252,7 +2309,7 @@ createDetachedScrollableVBox - Detached scrollable vertical layout (not auto-add
 ### Styled Containers (cards & panels)
 
 Every layout factory accepts an optional \`style\`: { background, borderColor, borderWidth, radius }.
-With a style set, the layout paints a rounded background and/or border spanning its full rect
+With a style set, the layout paints a background (corners follow the theme radius unless you pass \`radius\`) and/or border spanning its full rect
 before its children draw, so a plain VBox/HBox becomes a card or panel. The layout's \`margins\`
 act as the card's inner padding. With no \`style\`, the layout stays invisible (positioning only).
 Change a card's look at runtime with this.call(layoutId, 'update', { style: { background, borderColor, radius } }).

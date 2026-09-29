@@ -18,6 +18,7 @@ import type { MCPServerSummary } from './mcp-registry-client.js';
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
 import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('CatalogBrowser');
 
@@ -542,13 +543,13 @@ Browse and install skills and MCP servers from public registries.
     await this.clearDetailPane();
 
     if (this.selectedIndex < 0 || this.selectedIndex >= this.displayItems.length) {
-      await this.addDetailLabel(
-        this.activeTab === 'mcp'
-          ? 'Select an MCP server to see details.'
-          : 'Select a skill to see details.',
-        false,
-        { color: this.theme.textSecondary, wordWrap: true },
-      );
+      const what = this.activeTab === 'mcp' ? 'MCP server' : 'skill';
+      const md = this.displayItems.length === 0
+        ? (this.searchQuery.trim()
+          ? emptyStateMarkdown('No matches', `Nothing in the catalog matches "${this.searchQuery.trim()}". Try a shorter search.`)
+          : emptyStateMarkdown('Catalog is loading', 'Entries appear here once the catalog answers. Press Refresh to fetch it again.'))
+        : emptyStateMarkdown(`No ${what} selected`, `Select a ${what} on the left to see what it does and install it.`);
+      await this.addDetailLabel(md, false, { ...emptyStateStyle(this.theme) });
       return;
     }
 
@@ -558,6 +559,8 @@ Browse and install skills and MCP servers from public registries.
     if (item.subtitle) {
       await this.addDetailLabel(item.subtitle, false, { color: this.theme.textSecondary, wordWrap: true, markdown: true });
     }
+
+    await this.addDetailLabel(sectionHeaderText(this.theme, 'Details'), false, { ...sectionHeaderStyle(this.theme, 12) });
 
     let installable = true;
     if (item.kind === 'mcp') {

@@ -19,6 +19,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
 
 const COMMAND_PALETTE_INTERFACE: InterfaceId = 'abjects:command-palette' as InterfaceId;
 
@@ -58,6 +59,7 @@ export class CommandPaletteAbject extends Abject {
   private rootLayoutId?: AbjectId;
   private searchInputId?: AbjectId;
   private resultsListId?: AbjectId;
+  private headerLabelId?: AbjectId;
 
   private chatManagerId?: AbjectId;
   private query = '';
@@ -98,6 +100,7 @@ export class CommandPaletteAbject extends Abject {
     // workspace-local Abjects merged with the global fallback in one call.
     this.registryId = await this.discoverDep('Registry') ?? undefined;
     this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
+    await this.fetchTheme();
   }
 
   private setupHandlers(): void {
@@ -193,8 +196,8 @@ export class CommandPaletteAbject extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 12, right: 12, bottom: 12, left: 12 },
-        spacing: 10,
+        margins: { top: 16, right: 16, bottom: 16, left: 16 },
+        spacing: 8,
       }),
     );
 
@@ -202,9 +205,15 @@ export class CommandPaletteAbject extends Abject {
       request(this.id, this.widgetManagerId, 'create', {
         specs: [
           {
+            type: 'label',
+            windowId: this.windowId,
+            text: sectionHeaderText(this.theme, 'Open Anything'),
+            style: sectionHeaderStyle(this.theme, 14),
+          },
+          {
             type: 'textInput',
             windowId: this.windowId,
-            placeholder: 'Search Abjects…',
+            placeholder: 'Type to search objects, or ask a question to start a chat…',
             text: '',
           },
           {
@@ -218,13 +227,14 @@ export class CommandPaletteAbject extends Abject {
       }),
     );
 
-    [this.searchInputId, this.resultsListId] = widgetIds;
+    [this.headerLabelId, this.searchInputId, this.resultsListId] = widgetIds;
 
     await this.request(request(this.id, this.searchInputId, 'addDependent', {}));
     await this.request(request(this.id, this.resultsListId, 'addDependent', {}));
 
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
+        { widgetId: this.headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: this.searchInputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: SEARCH_HEIGHT } },
         { widgetId: this.resultsListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
       ],
@@ -252,6 +262,7 @@ export class CommandPaletteAbject extends Abject {
     this.rootLayoutId = undefined;
     this.searchInputId = undefined;
     this.resultsListId = undefined;
+    this.headerLabelId = undefined;
     this.query = '';
     this.filtered = [];
     try {
@@ -330,7 +341,7 @@ export class CommandPaletteAbject extends Abject {
       const text = this.query.trim();
       this.filtered = [{
         id: CHAT_ENTRY_ID,
-        name: `💬  Chat about “${text}”`,
+        name: `◉  Chat about “${text}”`,
         description: 'Start a new conversation',
         action: 'chat',
         query: text,

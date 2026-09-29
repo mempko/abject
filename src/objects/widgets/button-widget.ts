@@ -1,14 +1,16 @@
 /**
  * ButtonWidget — a clickable button with centered text.
  *
- * Renders a rounded rectangle with centered label text.
+ * Renders a flat print block with centered label text.
  * Consumes mousedown events and fires a 'click' change notification.
  */
 
 import { AbjectId } from '../../core/types.js';
 import { request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, darkenColor, withAlpha, gradientRect } from './widget-types.js';
+import { darkenColor, fontStacks, raisedBlock } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
+import { iconCommands, isIconName } from '../../ui/icons.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
@@ -22,151 +24,165 @@ export class ButtonWidget extends WidgetAbject {
     super(config);
   }
 
+  /**
+   * A flat print block. Secondary buttons are a paper
+   * face with an ink rule and a small hard shadow; primary buttons are a red
+   * face in the display face. Press sinks the face into its shadow; hover
+   * inverts. Flat buttons are bare rows: an ink band on hover and a red
+   * block at the left edge when active (borderColor set).
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-    const radius = style.radius ?? this.theme.widgetRadius;
-    const tokens = this.theme.tokens;
+    const theme = this.theme;
+    const shape = shapeOf(theme);
+    const radius = style.radius ?? 0;
+    const baseFill = style.background ?? theme.buttonBg;
+    const isPrimary = baseFill === theme.actionBg || baseFill === theme.accent;
+    const live = !this.disabled;
+    const hovered = this.hovered && live;
+    const pressed = this.pressed && live;
 
-    // A button is treated as "primary" when its caller assigned the action
-    // color as the background — used for Save/Send/Apply etc. Primary buttons
-    // get an accent glow on hover; secondary buttons just lighten.
-    const baseFill = style.background ?? this.theme.buttonBg;
-    const isPrimary = baseFill === this.theme.actionBg || baseFill === this.theme.accent;
+    const size = style.fontSize ?? 14;
+    const font = isPrimary
+      ? `600 ${size}px ${fontStacks(theme).display}`
+      : buildFont(style, theme);
 
-    let fill = baseFill;
-    if (this.hovered && !this.disabled) {
-      fill = isPrimary ? lightenColor(fill, 12) : lightenColor(fill, 25);
-    }
-    if (this.pressed && !this.disabled) {
-      // Press = quick darken; the scale wrap below adds a tactile shrink.
-      fill = darkenColor(fill, 12);
-    }
-
-    // Reduce opacity when disabled
     if (this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
     }
 
-    // Press scale: shrink to 0.96 around the button's center for tactile feedback (Doherty).
-    if (this.pressed && !this.disabled) {
-      const cx = ox + w / 2;
-      const cy = oy + h / 2;
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({ type: 'translate', surfaceId, params: { x: cx, y: cy } });
-      commands.push({ type: 'scale', surfaceId, params: { x: 0.96, y: 0.96 } });
-      commands.push({ type: 'translate', surfaceId, params: { x: -cx, y: -cy } });
-    }
+    let face = { x: ox, y: oy, width: w, height: h };
+    let textColor = style.color ?? (isPrimary ? theme.actionText : theme.buttonText);
 
-    // Focus ring glow
-    if (this.focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: ox, y: oy, width: w, height: h, fill, stroke: this.theme.inputBorderFocus, radius },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-
-    // Hover glow for primary buttons — accent halo (Von Restorff).
-    if (isPrimary && this.hovered && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: tokens.glow.accent.color, blur: tokens.glow.accent.blur },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: ox, y: oy, width: w, height: h, fill, radius },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
+    // Flat rows show the active marker only when borderColor stands apart
+    // from the row's own fill (closed rows set the two equal).
+    const hasMarker = !!style.flat && !!style.borderColor && style.borderColor !== baseFill;
 
     if (style.flat) {
-      // Flat variant for sidebar/toolbar rows: a quiet fill with no depth
-      // treatment and no implicit border, so stacked rows read as a list
-      // rather than a pile of raised chips. An explicit borderColor (e.g.
-      // the active-item accent outline) still draws.
+      let fill: string | undefined = style.background;
+      if (hovered || pressed) {
+        fill = theme.textPrimary;
+        textColor = theme.windowBg;
+      }
+      if (fill) {
+        commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill, radius } });
+      }
+      if (hasMarker) {
+        // Active row marker: a solid block flush with the left edge.
+        commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: 4, height: h, fill: style.borderColor } });
+      }
+    } else {
+      const block = raisedBlock(surfaceId, face, shape.blockShadowColor, 3, pressed);
+      commands.push(...block.commands);
+      face = block.face;
+      let fill = baseFill;
+      if (hovered) {
+        if (isPrimary) {
+          fill = darkenColor(baseFill, 36);
+        } else if (style.background) {
+          fill = darkenColor(baseFill, 18);
+        } else {
+          fill = theme.textPrimary;
+          textColor = theme.windowBg;
+        }
+      }
+      const lw = shape.ruleWidth;
+      const stroke = style.borderColor ?? (isPrimary ? theme.actionBorder : theme.buttonBorder);
       commands.push({
-        type: 'rect',
-        surfaceId,
+        type: 'rect', surfaceId,
+        params: { x: face.x, y: face.y, width: face.width, height: face.height, fill, radius },
+      });
+      commands.push({
+        type: 'rect', surfaceId,
         params: {
-          x: ox, y: oy, width: w, height: h, fill, radius,
-          ...(style.borderColor ? { stroke: style.borderColor } : {}),
+          x: face.x + lw / 2, y: face.y + lw / 2,
+          width: Math.max(0, face.width - lw), height: Math.max(0, face.height - lw),
+          stroke, lineWidth: lw, radius,
         },
       });
-    } else {
-      // Soft top-to-bottom gradient for depth — kept gentle (matching the tab
-      // bar treatment) so rows of buttons read as calm surfaces, not pills.
-      // Intensity is theme-driven: tokens.surface.gradient of 0 means flat.
-      const surface = tokens.surface;
-      commands.push(...gradientRect(surfaceId, {
-        x: ox, y: oy, width: w, height: h, radii: radius,
-        gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
-          { offset: 0, color: lightenColor(fill, 4 * surface.gradient) },
-          { offset: 1, color: darkenColor(fill, 6 * surface.gradient) },
-        ] },
-        stroke: style.borderColor ?? this.theme.buttonBorder,
-      }));
-      // Top bevel derived from the button's own fill, so dark buttons stay
-      // quiet while bright primary buttons still catch a little light.
-      if (surface.bevel > 0) {
-        commands.push({
-          type: 'line',
-          surfaceId,
-          params: {
-            x1: ox + radius, y1: oy + 1, x2: ox + w - radius, y2: oy + 1,
-            stroke: withAlpha(lightenColor(fill, 55), surface.bevel), lineWidth: 1,
-          },
-        });
-      }
     }
 
-    // Truncate text with ellipsis if it exceeds button width (with padding)
-    const padding = 8;
-    const maxTextWidth = w - padding * 2;
-    const displayText = await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font);
-
-    const align = style.align ?? 'center';
-    const textX = align === 'center' ? ox + w / 2
-      : align === 'right' ? ox + w - padding
-      : ox + padding;
-    commands.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: textX,
-        y: oy + h / 2,
-        text: displayText,
-        font,
-        fill: style.color ?? this.theme.buttonText,
-        align,
-        baseline: 'middle',
-      },
-    });
-
-    // Close press-scale wrapper (must close *before* any disabled-alpha restore).
-    if (this.pressed && !this.disabled) {
-      commands.push({ type: 'restore', surfaceId, params: {} });
+    if (this.focused && live) {
+      const lw = 2;
+      commands.push({
+        type: 'rect', surfaceId,
+        params: {
+          x: face.x + lw / 2, y: face.y + lw / 2,
+          width: Math.max(0, face.width - lw), height: Math.max(0, face.height - lw),
+          stroke: shape.blockFocusColor, lineWidth: lw, radius,
+        },
+      });
     }
 
-    // Close disabled alpha save
+    commands.push(...await this.labelCommands(
+      surfaceId, face, font, textColor, style.align ?? 'center', hasMarker ? 4 : 0,
+    ));
+
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
+    return commands;
+  }
 
+  /**
+   * The button's label inside `area`: optional vector icon (style.icon) then
+   * the text, truncated with an ellipsis to fit. With no text the icon is
+   * centered. `leftPad` reserves room for a leading marker.
+   */
+  private async labelCommands(
+    surfaceId: string,
+    area: { x: number; y: number; width: number; height: number },
+    font: string,
+    color: string,
+    align: 'left' | 'center' | 'right',
+    leftPad: number,
+  ): Promise<unknown[]> {
+    const commands: unknown[] = [];
+    const padding = 8;
+    const cy = area.y + area.height / 2;
+    const icon = this.style.icon && isIconName(this.style.icon) ? this.style.icon : undefined;
+    const iconSize = icon ? Math.max(10, Math.min(16, area.height - 10)) : 0;
+    const iconGap = icon && this.text ? 7 : 0;
+    const iconSpan = iconSize + iconGap;
+
+    const maxTextWidth = area.width - padding * 2 - leftPad - iconSpan;
+    const displayText = this.text
+      ? await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font)
+      : '';
+    const textW = icon && displayText && align !== 'left'
+      ? await this.measureText(surfaceId, displayText, font)
+      : 0;
+
+    // Left edge of the icon+text group for each alignment.
+    let groupX: number;
+    if (align === 'left') groupX = area.x + padding + leftPad;
+    else if (align === 'right') groupX = area.x + area.width - padding - iconSpan - textW;
+    else groupX = area.x + leftPad / 2 + (area.width - leftPad - (iconSpan + textW)) / 2;
+
+    if (icon) {
+      commands.push(...iconCommands(icon, {
+        surfaceId,
+        x: Math.round(groupX), y: Math.round(cy - iconSize / 2), size: iconSize,
+        color, caps: shapeOf(this.theme).iconCaps,
+      }));
+    }
+    if (displayText) {
+      const textX = icon ? groupX + iconSpan
+        : align === 'center' ? area.x + area.width / 2 + leftPad / 2
+        : align === 'right' ? area.x + area.width - padding
+        : area.x + padding + leftPad;
+      commands.push({
+        type: 'text', surfaceId,
+        params: {
+          x: textX, y: cy, text: displayText, font, fill: color,
+          align: icon ? 'left' : align, baseline: 'middle',
+        },
+      });
+    }
     return commands;
   }
 

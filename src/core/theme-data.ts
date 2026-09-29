@@ -98,6 +98,41 @@ export interface SurfaceTokens {
   gloss: number;
 }
 
+/**
+ * Shape language: the structural (non-colour) character of the design: how
+ * shadows are cast, how heavy the rules are, how chrome titles are set, which
+ * ornament vocabulary chrome draws, and which desktop backdrop the client
+ * paints. The design fixes these; every palette carries them in
+ * `tokens.shape`. Optional on DesignTokens for themes stored before it
+ * existed: read it through `shapeOf(theme)`, which fills in the constants.
+ */
+export interface ShapeTokens {
+  /** 'soft' = blurred elevation shadows + accent glow halos; 'block' = hard offset print shadows, no blur. */
+  shadowStyle: 'soft' | 'block';
+  /** Offset (px, down-right) of a block shadow. */
+  blockShadowOffset: number;
+  /** Block shadow colour for resting windows and raised widgets. */
+  blockShadowColor: string;
+  /** Block shadow colour for the focused window. */
+  blockFocusColor: string;
+  /** Weight (px) of structural rules: window frames, button and input borders. */
+  ruleWidth: number;
+  /** Case transform for system chrome titles and section labels (never user text). */
+  titleCase: 'none' | 'upper';
+  /** Letter spacing (px) for chrome titles and section labels. */
+  titleTracking: number;
+  /**
+   * Ornament vocabulary chrome draws: none; Constructivist wedges, bands and
+   * bars; or 'sigil', the Constructivist vocabulary plus eldritch marks (eye
+   * sigils, phosphor light on living things).
+   */
+  ornament: 'none' | 'constructivist' | 'sigil';
+  /** Line cap/join style for vector icons. */
+  iconCaps: 'round' | 'square';
+  /** Desktop backdrop the client paints behind the windows. */
+  backdrop: 'abyss' | 'constructivist' | 'sigil';
+}
+
 export interface DesignTokens {
   space: SpaceTokens;
   type: TypeTokens;
@@ -107,6 +142,8 @@ export interface DesignTokens {
   elevation: ElevationTokens;
   glow: GlowTokens;
   surface: SurfaceTokens;
+  /** Optional; read via shapeOf(), which supplies the design's constants. */
+  shape?: ShapeTokens;
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────────
@@ -198,73 +235,79 @@ export interface ThemeData {
   // Centralized scales for spacing, typography, radius, motion, elevation, glow.
   // New widgets should read from tokens; legacy fields above remain for compatibility.
   tokens: DesignTokens;
+
+  /**
+   * Optional prose describing the theme's visual language, for anything that
+   * designs UI to match the desktop (LLM-authored apps read it through
+   * WidgetManager.getActiveTheme). Absent on older themes.
+   */
+  designNotes?: string;
 }
 
-// Layout/motion tokens are shared across themes — colour is the variable, not
-// the spacing scale. Defined once and reused via spread on every preset.
-const SHARED_TOKENS: DesignTokens = {
-  space: {
-    none: 0,
-    xxs: 2,
-    xs: 4,
-    sm: 6,
-    md: 8,
-    lg: 12,
-    xl: 16,
-    xxl: 24,
-    xxxl: 32,
-  },
-  type: {
-    caption:    { font: '"Spectral", Georgia, serif',                 size: 11, weight: '400', lineHeight: 14 },
-    body:       { font: '"Spectral", Georgia, serif',                 size: 14, weight: '400', lineHeight: 20 },
-    bodyStrong: { font: '"Spectral", Georgia, serif',                 size: 14, weight: '600', lineHeight: 20 },
-    title:      { font: '"Fraunces", "Spectral", Georgia, serif',     size: 14, weight: '600', lineHeight: 18 },
-    display:    { font: '"Fraunces", "Spectral", Georgia, serif',     size: 19, weight: '600', lineHeight: 24 },
-    code:       { font: '"Spline Sans Mono", "JetBrains Mono", monospace', size: 13, weight: '400', lineHeight: 18 },
-  },
-  radius: {
-    sm: 4,
-    md: 8,
-    lg: 12,
-    pill: 999,
-  },
-  motion: {
-    fast: 120,
-    base: 200,
-    slow: 320,
-    shimmer: 3000,
-  },
-  easing: {
-    standard:   [0.4, 0.0, 0.2, 1.0],
-    accelerate: [0.4, 0.0, 1.0, 1.0],
-    decelerate: [0.0, 0.0, 0.2, 1.0],
-    emphasize:  [0.2, 0.0, 0.0, 1.0],
-  },
-  elevation: {
-    level0: { blur: 0,  offsetY: 0, color: 'rgba(0,0,0,0)' },
-    level1: { blur: 8,  offsetY: 2, color: 'rgba(0,0,0,0.35)' },
-    level2: { blur: 18, offsetY: 6, color: 'rgba(0,0,0,0.5)' },
-    level3: { blur: 32, offsetY: 12, color: 'rgba(0,0,0,0.65)' },
-  },
-  glow: {
-    focus:  { blur: 18, color: 'rgba(57, 255, 142, 0.55)' },
-    accent: { blur: 10, color: 'rgba(57, 255, 142, 0.35)' },
-    danger: { blur: 14, color: 'rgba(255, 77, 106, 0.5)' },
-  },
-  surface: {
-    gradient: 1,
-    bevel: 0.25,
-    gloss: 0.16,
-  },
+// ── The design ─────────────────────────────────────────────────────────────
+//
+// ONE visual language for the whole system; a theme is only a colour palette
+// of it. Red Sigil, "eldritch agitprop": a Constructivist poster used as a
+// containment diagram for something from beyond. Structure is the poster
+// (grid, heavy rules, square corners, condensed UPPERCASE display titling,
+// hard offset print shadows, wedges); what it contains is eldritch (void
+// depth, eye sigils, living light). Two lights: `accent` is the human hand
+// (primary actions, focus, selection, structural marks); `accentSecondary`
+// is the living light, reserved for things that are alive or thinking
+// (running work, AI activity, live data, links), and it is the only colour
+// that glows.
+
+const DESIGN_BODY = '"PT Sans", "Helvetica Neue", Arial, sans-serif';
+const DESIGN_DISPLAY = '"Oswald", "PT Sans Narrow", "Arial Narrow", sans-serif';
+const DESIGN_MONO = '"JetBrains Mono", "Spline Sans Mono", monospace';
+
+/** The design's shape language (colours are filled in per palette by shapeOf). */
+const DESIGN_SHAPE: ShapeTokens = {
+  shadowStyle: 'block',
+  blockShadowOffset: 6,
+  blockShadowColor: 'rgba(0,0,0,0.9)',
+  blockFocusColor: '#d32f22',
+  ruleWidth: 2,
+  titleCase: 'upper',
+  titleTracking: 1.2,
+  ornament: 'sigil',
+  iconCaps: 'square',
+  backdrop: 'sigil',
 };
 
-/** Perfectly flat surfaces — for accessibility and minimalist themes. */
+type ThemeLike = {
+  accent?: string;
+  shadowColor?: string;
+  tokens?: { shape?: Partial<ShapeTokens> };
+} | undefined;
+
+/**
+ * The shape language for a theme: the design's constants with the print
+ * shadow in the palette's shadow colour and the focus print in its accent.
+ * Fields a theme sets explicitly in `tokens.shape` win.
+ */
+export function shapeOf(theme: ThemeLike): ShapeTokens {
+  return {
+    ...DESIGN_SHAPE,
+    ...(theme?.shadowColor ? { blockShadowColor: theme.shadowColor } : {}),
+    ...(theme?.accent ? { blockFocusColor: theme.accent } : {}),
+    ...(theme?.tokens?.shape ?? {}),
+  };
+}
+
+/** Apply the design's chrome title case to a string (display only). */
+export function chromeCase(_theme: ThemeLike, text: string): string {
+  return text.toLocaleUpperCase();
+}
+
+/** Perfectly flat surfaces: the design has no gradients, bevels, or gloss. */
 export const FLAT_SURFACE: SurfaceTokens = { gradient: 0, bevel: 0, gloss: 0 };
 
-// Local hex→rgba (theme-data.ts stays import-free to avoid a cycle with
-// widget-types.ts, which re-exports from here).
-function glowRgba(hex: string, alpha: number): string {
-  const c = hex.replace('#', '');
+// Local hex to rgba (theme-data.ts stays import-free to avoid a cycle with
+// widget-types.ts, which re-exports from here). Non-hex input passes through.
+function glowRgba(color: string, alpha: number): string {
+  if (!color.startsWith('#')) return color;
+  const c = color.replace('#', '');
   const full = c.length === 3 ? c.split('').map((ch) => ch + ch).join('') : c;
   const r = parseInt(full.slice(0, 2), 16);
   const g = parseInt(full.slice(2, 4), 16);
@@ -272,21 +315,84 @@ function glowRgba(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-// Build the shared design tokens with the focus/accent glow halos tinted to a
-// theme's own accent, so the focus glow matches each theme rather than leaking
-// the shared green. Danger keeps the conventional red error glow.
-function tokensWithGlow(accent: string): DesignTokens {
+/** Non-colour scales shared by every palette. */
+const DESIGN_TOKENS: DesignTokens = {
+  space: { none: 0, xxs: 2, xs: 4, sm: 6, md: 8, lg: 12, xl: 16, xxl: 24, xxxl: 32 },
+  type: {
+    caption:    { font: DESIGN_BODY,    size: 11, weight: '400', lineHeight: 14 },
+    body:       { font: DESIGN_BODY,    size: 14, weight: '400', lineHeight: 20 },
+    bodyStrong: { font: DESIGN_BODY,    size: 14, weight: '700', lineHeight: 20 },
+    title:      { font: DESIGN_DISPLAY, size: 15, weight: '600', lineHeight: 18 },
+    display:    { font: DESIGN_DISPLAY, size: 22, weight: '700', lineHeight: 26 },
+    code:       { font: DESIGN_MONO,    size: 13, weight: '400', lineHeight: 18 },
+  },
+  radius: { sm: 0, md: 0, lg: 0, pill: 999 },
+  motion: { fast: 90, base: 150, slow: 240, shimmer: 2400 },
+  easing: {
+    standard:   [0.4, 0.0, 0.2, 1.0],
+    accelerate: [0.4, 0.0, 1.0, 1.0],
+    decelerate: [0.0, 0.0, 0.2, 1.0],
+    emphasize:  [0.2, 0.0, 0.0, 1.0],
+  },
+  elevation: {
+    level0: { blur: 0, offsetY: 0, color: 'rgba(0,0,0,0)' },
+    level1: { blur: 0, offsetY: 3, color: 'rgba(0,0,0,0.9)' },
+    level2: { blur: 0, offsetY: 5, color: 'rgba(0,0,0,0.9)' },
+    level3: { blur: 0, offsetY: 7, color: 'rgba(0,0,0,0.9)' },
+  },
+  glow: {
+    focus:  { blur: 10, color: 'rgba(91, 229, 160, 0.45)' },
+    accent: { blur: 8,  color: 'rgba(91, 229, 160, 0.40)' },
+    danger: { blur: 6,  color: 'rgba(255, 74, 58, 0.55)' },
+  },
+  surface: FLAT_SURFACE,
+  shape: DESIGN_SHAPE,
+};
+
+const DESIGN_NOTES = `Red Sigil design language (every theme is a colour palette of it): eldritch agitprop,
+a Constructivist poster used as a containment diagram for something from beyond. Ground: $canvasBg /
+$windowBg, type: $textPrimary. TWO LIGHTS: $accent is the human hand (primary actions, focus, selection,
+structural accents); $accentSecondary is the living light, reserved for things that are alive or thinking
+(running work, live data, AI activity, links). Structure is flat and square (radius 0) with ruled frames
+and hard offset print shadows (a solid $shadowColor rect offset ~5px down-right, no blur). Only living
+things glow: a soft $accentSecondary shadow on active elements. Titles and labels: display face,
+UPPERCASE, letter-spaced. Marks: sigils (a ring with a vertical slit pupil = the eye; concentric rings;
+triangles; a diagonal wedge). Motion: structure is still, the living breathes (slow pulse). Keep body text
+horizontal and legible; put the energy in geometry and light around it.`;
+
+/** A theme's colour slots: everything but the design's shared tokens. */
+export type ThemePalette = Omit<ThemeData, 'tokens' | 'designNotes' | 'windowRadius' | 'widgetRadius'>
+  & Partial<Pick<ThemeData, 'windowRadius' | 'widgetRadius'>>;
+
+/** Build a theme from a palette: the one design, in these colours. */
+export function palette(p: ThemePalette): ThemeData {
+  const shadow = p.shadowColor;
   return {
-    ...SHARED_TOKENS,
-    glow: {
-      focus:  { blur: 18, color: glowRgba(accent, 0.5) },
-      accent: { blur: 10, color: glowRgba(accent, 0.32) },
-      danger: SHARED_TOKENS.glow.danger,
+    ...p,
+    windowRadius: 0,
+    widgetRadius: 0,
+    tokens: {
+      ...DESIGN_TOKENS,
+      elevation: {
+        level0: DESIGN_TOKENS.elevation.level0,
+        level1: { blur: 0, offsetY: 3, color: shadow },
+        level2: { blur: 0, offsetY: 5, color: shadow },
+        level3: { blur: 0, offsetY: 7, color: shadow },
+      },
+      glow: {
+        focus:  { blur: 10, color: glowRgba(p.accentSecondary, 0.45) },
+        accent: { blur: 8,  color: glowRgba(p.accentSecondary, 0.40) },
+        danger: { blur: 6,  color: glowRgba(p.statusError, 0.55) },
+      },
+      shape: { ...DESIGN_SHAPE, blockShadowColor: shadow, blockFocusColor: p.accent },
     },
+    designNotes: DESIGN_NOTES,
   };
 }
 
-export const ARCANE_GRIMOIRE: ThemeData = {
+// ── Palettes ───────────────────────────────────────────────────────────────
+
+export const ARCANE_GRIMOIRE: ThemeData = palette({
   canvasBg: '#05060a',
   windowBg: '#13141f',
   titleBarBg: '#1c1f2e',
@@ -320,8 +426,6 @@ export const ARCANE_GRIMOIRE: ThemeData = {
   sliderFill: '#8b7bff',
   sliderThumb: '#8b7bff',
   sliderThumbBorder: '#2a2b3d',
-  windowRadius: 7,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -368,13 +472,9 @@ export const ARCANE_GRIMOIRE: ThemeData = {
   dropdownShadow: 'rgba(0,0,0,0.55)',
 
   // ── Links ──
-  linkColor: '#8b7bff',
+  linkColor: '#8b7bff',});
 
-  // ── Design Tokens ──
-  tokens: tokensWithGlow('#5be5a0'),
-};
-
-export const MIDNIGHT_BLOOM: ThemeData = {
+export const MIDNIGHT_BLOOM: ThemeData = palette({
   canvasBg: '#030308',
   windowBg: '#16162a',
   titleBarBg: '#1e1e34',
@@ -408,8 +508,6 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   sliderFill: '#9b59ff',
   sliderThumb: '#9b59ff',
   sliderThumbBorder: '#2a2a3a',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -455,14 +553,10 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   dropdownShadow: 'rgba(0,0,0,0.4)',
 
   // ── Links ──
-  linkColor: '#6ea8fe',
-
-  // ── Design Tokens ──
-  tokens: tokensWithGlow('#39ff8e'),
-};
+  linkColor: '#6ea8fe',});
 
 // ── Paper (light) ──────────────────────────────────────────────────────────
-export const PAPER_LIGHT: ThemeData = {
+export const PAPER_LIGHT: ThemeData = palette({
   canvasBg: '#ece8df',
   windowBg: '#faf7f1',
   titleBarBg: '#ede9df',
@@ -496,8 +590,6 @@ export const PAPER_LIGHT: ThemeData = {
   sliderFill: '#a05bd9',
   sliderThumb: '#a05bd9',
   sliderThumbBorder: '#ffffff',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -527,12 +619,10 @@ export const PAPER_LIGHT: ThemeData = {
   scrollbarThumbHover: 'rgba(0,0,0,0.3)',
   shadowColor: 'rgba(50,40,30,0.18)',
   dropdownShadow: 'rgba(50,40,30,0.15)',
-  linkColor: '#1f4fc4',
-  tokens: tokensWithGlow('#4a4ad9'),
-};
+  linkColor: '#1f4fc4',});
 
 // ── High Contrast ──────────────────────────────────────────────────────────
-export const HIGH_CONTRAST: ThemeData = {
+export const HIGH_CONTRAST: ThemeData = palette({
   canvasBg: '#000000',
   windowBg: '#000000',
   titleBarBg: '#0a0a0a',
@@ -566,8 +656,6 @@ export const HIGH_CONTRAST: ThemeData = {
   sliderFill: '#ffd700',
   sliderThumb: '#ffd700',
   sliderThumbBorder: '#ffffff',
-  windowRadius: 4,
-  widgetRadius: 4,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -597,12 +685,10 @@ export const HIGH_CONTRAST: ThemeData = {
   scrollbarThumbHover: 'rgba(255,255,255,0.8)',
   shadowColor: 'rgba(0,0,0,0.95)',
   dropdownShadow: 'rgba(0,0,0,0.9)',
-  linkColor: '#00e5ff',
-  tokens: { ...tokensWithGlow('#ffd700'), surface: FLAT_SURFACE },
-};
+  linkColor: '#00e5ff',});
 
 // ── Sunset ─────────────────────────────────────────────────────────────────
-export const SUNSET: ThemeData = {
+export const SUNSET: ThemeData = palette({
   canvasBg: '#1a0f10',
   windowBg: '#2a1820',
   titleBarBg: '#3a1f28',
@@ -636,8 +722,6 @@ export const SUNSET: ThemeData = {
   sliderFill: '#ff6b9d',
   sliderThumb: '#ff6b9d',
   sliderThumbBorder: '#3a2530',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -667,12 +751,10 @@ export const SUNSET: ThemeData = {
   scrollbarThumbHover: 'rgba(255,180,84,0.4)',
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
-  linkColor: '#ffd29a',
-  tokens: tokensWithGlow('#ffb454'),
-};
+  linkColor: '#ffd29a',});
 
 // ── Ocean ──────────────────────────────────────────────────────────────────
-export const OCEAN: ThemeData = {
+export const OCEAN: ThemeData = palette({
   canvasBg: '#040814',
   windowBg: '#0c1a2e',
   titleBarBg: '#13243d',
@@ -706,8 +788,6 @@ export const OCEAN: ThemeData = {
   sliderFill: '#5b9bd5',
   sliderThumb: '#5b9bd5',
   sliderThumbBorder: '#1a2c44',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -737,12 +817,10 @@ export const OCEAN: ThemeData = {
   scrollbarThumbHover: 'rgba(58,224,216,0.4)',
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
-  linkColor: '#7ab8d9',
-  tokens: tokensWithGlow('#3ae0d8'),
-};
+  linkColor: '#7ab8d9',});
 
 // ── Monochrome ─────────────────────────────────────────────────────────────
-export const MONOCHROME: ThemeData = {
+export const MONOCHROME: ThemeData = palette({
   canvasBg: '#0d0d0d',
   windowBg: '#1a1a1a',
   titleBarBg: '#222222',
@@ -776,8 +854,6 @@ export const MONOCHROME: ThemeData = {
   sliderFill: '#909090',
   sliderThumb: '#909090',
   sliderThumbBorder: '#2a2a2a',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -807,12 +883,10 @@ export const MONOCHROME: ThemeData = {
   scrollbarThumbHover: 'rgba(255,255,255,0.32)',
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
-  linkColor: '#a0a0c0',
-  tokens: { ...tokensWithGlow('#c0c0c0'), surface: FLAT_SURFACE },
-};
+  linkColor: '#a0a0c0',});
 
 // ── Dracula ────────────────────────────────────────────────────────────────
-export const DRACULA: ThemeData = {
+export const DRACULA: ThemeData = palette({
   canvasBg: '#181924',
   windowBg: '#282a36',
   titleBarBg: '#343746',
@@ -846,8 +920,6 @@ export const DRACULA: ThemeData = {
   sliderFill: '#bd93f9',
   sliderThumb: '#bd93f9',
   sliderThumbBorder: '#44475a',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -877,12 +949,10 @@ export const DRACULA: ThemeData = {
   scrollbarThumbHover: 'rgba(189,147,249,0.45)',
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
-  linkColor: '#8be9fd',
-  tokens: tokensWithGlow('#ff79c6'),
-};
+  linkColor: '#8be9fd',});
 
 // ── Solarized Light ────────────────────────────────────────────────────────
-export const SOLARIZED_LIGHT: ThemeData = {
+export const SOLARIZED_LIGHT: ThemeData = palette({
   canvasBg: '#fdf6e3',
   windowBg: '#fbf2da',
   titleBarBg: '#eee8d5',
@@ -916,8 +986,6 @@ export const SOLARIZED_LIGHT: ThemeData = {
   sliderFill: '#6c71c4',
   sliderThumb: '#6c71c4',
   sliderThumbBorder: '#fdf6e3',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -947,13 +1015,11 @@ export const SOLARIZED_LIGHT: ThemeData = {
   scrollbarThumbHover: 'rgba(0,43,54,0.3)',
   shadowColor: 'rgba(50,40,30,0.18)',
   dropdownShadow: 'rgba(50,40,30,0.15)',
-  linkColor: '#268bd2',
-  tokens: tokensWithGlow('#268bd2'),
-};
+  linkColor: '#268bd2',});
 
 // ── Rosé Pine ────────────────────────────────────────────────────────────────
 // Muted, elegant: a dusky violet-grey base lit by soft rose, iris, and gold.
-export const ROSE_PINE: ThemeData = {
+export const ROSE_PINE: ThemeData = palette({
   canvasBg: '#16141f',
   windowBg: '#1f1d2e',
   titleBarBg: '#26233a',
@@ -987,8 +1053,6 @@ export const ROSE_PINE: ThemeData = {
   sliderFill: '#c4a7e7',
   sliderThumb: '#c4a7e7',
   sliderThumbBorder: '#403d52',
-  windowRadius: 8,
-  widgetRadius: 6,
   titleBarHeight: 36,
   titleButtonSize: 24,
   titleButtonMargin: 6,
@@ -1018,11 +1082,238 @@ export const ROSE_PINE: ThemeData = {
   scrollbarThumbHover: 'rgba(235,188,186,0.4)',
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
-  linkColor: '#9ccfd8',
-  tokens: tokensWithGlow('#ebbcba'),
-};
+  linkColor: '#9ccfd8',});
 
 // ── Theme catalogue ────────────────────────────────────────────────────────
+
+/** Paper, ink, and red: the agitprop poster. */
+export const AGITPROP: ThemeData = palette({
+  canvasBg: '#e3d8bd',
+  windowBg: '#f1e9d6',
+  titleBarBg: '#e3d8bd',
+  accent: '#c8201a',
+  accentSecondary: '#16130f',
+  accentTertiary: '#d0901a',
+  textPrimary: '#16130f',
+  textSecondary: '#4a443b',
+  textTertiary: '#7a7264',
+  textPlaceholder: '#a0977f',
+  buttonBg: '#f1e9d6',
+  buttonBorder: '#16130f',
+  buttonText: '#16130f',
+  inputBg: '#faf5e9',
+  inputBorder: '#16130f',
+  inputBorderFocus: '#c8201a',
+  windowBorder: '#16130f',
+  divider: '#c3b699',
+  resizeGrip: '#16130f',
+  progressTrack: '#ddd1b4',
+  progressFill: '#c8201a',
+  cursor: '#c8201a',
+  checkboxCheckedBg: '#c8201a',
+  checkboxBorder: '#16130f',
+  checkmarkColor: '#f6efdf',
+  selectBg: '#faf5e9',
+  selectHover: '#e6dcc4',
+  selectArrow: '#16130f',
+  selectionBg: 'rgba(200, 32, 26, 0.22)',
+  sliderTrack: '#ddd1b4',
+  sliderFill: '#16130f',
+  sliderThumb: '#c8201a',
+  sliderThumbBorder: '#16130f',
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
+  titleButtonHoverBg: '#f1e9d6',
+  titleCloseHoverBg: '#c8201a',
+
+  actionBg: '#c8201a',
+  actionText: '#f6efdf',
+  actionBorder: '#16130f',
+
+  // Red type on a paper face: destructiveText doubles as plain warning text
+  // on windowBg across the system, so it must read on paper.
+  destructiveBg: '#f1e9d6',
+  destructiveText: '#c8201a',
+  destructiveBorder: '#c8201a',
+
+  activeItemBg: '#e0d3b4',
+  activeItemBorder: '#c8201a',
+
+  statusSuccess: '#2f6b3a',
+  statusError: '#c8201a',
+  statusErrorBright: '#e0342a',
+  statusWarning: '#9a6206',
+  statusNeutral: '#7a7264',
+  statusInfo: '#2b4f7e',
+
+  textHeading: '#16130f',
+  textDescription: '#3a352d',
+  textMeta: '#6b6456',
+  sectionLabel: '#16130f',
+
+  scrollbarTrack: 'rgba(22,19,15,0.06)',
+  scrollbarThumb: 'rgba(22,19,15,0.55)',
+  scrollbarThumbHover: 'rgba(200,32,26,0.85)',
+
+  shadowColor: 'rgba(22,19,15,0.9)',
+  dropdownShadow: 'rgba(22,19,15,0.9)',
+
+  linkColor: '#c8201a',
+});
+
+/** The same poster printed on black: ink ground, cream type, red wedge. */
+export const RED_WEDGE: ThemeData = palette({
+  canvasBg: '#0e0c0a',
+  windowBg: '#1b1815',
+  titleBarBg: '#26221d',
+  accent: '#e0342a',
+  accentSecondary: '#ede4cf',
+  accentTertiary: '#d99a1e',
+  textPrimary: '#ede4cf',
+  textSecondary: '#b3a88f',
+  textTertiary: '#7d7462',
+  textPlaceholder: '#554d40',
+  buttonBg: '#1b1815',
+  buttonBorder: '#ede4cf',
+  buttonText: '#ede4cf',
+  inputBg: '#12100e',
+  inputBorder: '#8f8672',
+  inputBorderFocus: '#e0342a',
+  windowBorder: '#ede4cf',
+  divider: '#3a342c',
+  resizeGrip: '#ede4cf',
+  progressTrack: '#2c2721',
+  progressFill: '#e0342a',
+  cursor: '#e0342a',
+  checkboxCheckedBg: '#e0342a',
+  checkboxBorder: '#ede4cf',
+  checkmarkColor: '#ede4cf',
+  selectBg: '#12100e',
+  selectHover: '#2c2721',
+  selectArrow: '#ede4cf',
+  selectionBg: 'rgba(224, 52, 42, 0.30)',
+  sliderTrack: '#2c2721',
+  sliderFill: '#ede4cf',
+  sliderThumb: '#e0342a',
+  sliderThumbBorder: '#ede4cf',
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
+  titleButtonHoverBg: '#1b1815',
+  titleCloseHoverBg: '#e0342a',
+
+  actionBg: '#e0342a',
+  actionText: '#f6efdf',
+  actionBorder: '#e0342a',
+
+  destructiveBg: '#1b1815',
+  destructiveText: '#ff6a5c',
+  destructiveBorder: '#e0342a',
+
+  activeItemBg: '#332d26',
+  activeItemBorder: '#e0342a',
+
+  statusSuccess: '#7fb37a',
+  statusError: '#e0342a',
+  statusErrorBright: '#ff5a4d',
+  statusWarning: '#d99a1e',
+  statusNeutral: '#7d7462',
+  statusInfo: '#7ea3cc',
+
+  textHeading: '#f6efdf',
+  textDescription: '#cfc5ad',
+  textMeta: '#978d78',
+  sectionLabel: '#ede4cf',
+
+  scrollbarTrack: 'rgba(237,228,207,0.05)',
+  scrollbarThumb: 'rgba(237,228,207,0.45)',
+  scrollbarThumbHover: 'rgba(224,52,42,0.9)',
+
+  shadowColor: 'rgba(0,0,0,0.9)',
+  dropdownShadow: 'rgba(0,0,0,0.9)',
+
+  linkColor: '#ff6a5c',
+});
+
+
+/** Blood red, phosphor green, bone on void: the default theme. */
+export const RED_SIGIL: ThemeData = palette({
+  canvasBg: '#06070a',
+  windowBg: '#101115',
+  titleBarBg: '#191a1f',
+  accent: '#d32f22',
+  accentSecondary: '#5be5a0',
+  accentTertiary: '#c9a45c',
+  textPrimary: '#e7e1ce',
+  textSecondary: '#a8a292',
+  textTertiary: '#5f5c54',
+  textPlaceholder: '#48463f',
+  buttonBg: '#15161b',
+  buttonBorder: '#5c594f',
+  buttonText: '#e7e1ce',
+  inputBg: '#0a0b0e',
+  inputBorder: '#3f3d37',
+  inputBorderFocus: '#d32f22',
+  windowBorder: '#8d8778',
+  divider: '#26262b',
+  resizeGrip: '#6c695f',
+  progressTrack: '#1b1c21',
+  progressFill: '#5be5a0',
+  cursor: '#d32f22',
+  checkboxCheckedBg: '#d32f22',
+  checkboxBorder: '#8d8778',
+  checkmarkColor: '#f3ecd8',
+  selectBg: '#0a0b0e',
+  selectHover: '#1d1e24',
+  selectArrow: '#e7e1ce',
+  selectionBg: 'rgba(211, 47, 34, 0.32)',
+  sliderTrack: '#1b1c21',
+  sliderFill: '#e7e1ce',
+  sliderThumb: '#d32f22',
+  sliderThumbBorder: '#e7e1ce',
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
+  titleButtonHoverBg: '#101115',
+  titleCloseHoverBg: '#d32f22',
+
+  actionBg: '#d32f22',
+  actionText: '#f6efdb',
+  actionBorder: '#d32f22',
+
+  destructiveBg: '#101115',
+  destructiveText: '#ff5a48',
+  destructiveBorder: '#d32f22',
+
+  activeItemBg: '#1f2026',
+  activeItemBorder: '#d32f22',
+
+  statusSuccess: '#5be5a0',
+  statusError: '#ff4a3a',
+  statusErrorBright: '#ff6b5c',
+  statusWarning: '#d9a441',
+  statusNeutral: '#6c695f',
+  statusInfo: '#8fb8dc',
+
+  textHeading: '#f3ecd8',
+  textDescription: '#c7c1ae',
+  textMeta: '#8f8a7b',
+  sectionLabel: '#e7e1ce',
+
+  scrollbarTrack: 'rgba(231,225,206,0.04)',
+  scrollbarThumb: 'rgba(231,225,206,0.35)',
+  scrollbarThumbHover: 'rgba(211,47,34,0.9)',
+
+  shadowColor: 'rgba(0,0,0,0.9)',
+  dropdownShadow: 'rgba(0,0,0,0.9)',
+
+  linkColor: '#5be5a0',
+});
+
 
 export interface ThemePreset {
   id: string;
@@ -1032,9 +1323,15 @@ export interface ThemePreset {
   theme: ThemeData;
 }
 
-export const DEFAULT_THEME_ID = 'arcane-grimoire';
+export const DEFAULT_THEME_ID = 'red-sigil';
+
+/** The default theme's data (matches DEFAULT_THEME_ID). */
+export const DEFAULT_THEME: ThemeData = RED_SIGIL;
 
 export const BUILTIN_THEME_PRESETS: readonly ThemePreset[] = [
+  { id: 'red-sigil',      name: 'Red Sigil',      description: 'Blood red and phosphor green on the void (default)', builtin: true, theme: RED_SIGIL },
+  { id: 'agitprop',       name: 'Agitprop',       description: 'Paper, ink, and revolutionary red', builtin: true, theme: AGITPROP },
+  { id: 'red-wedge',      name: 'Red Wedge',      description: 'Cream type and red on black', builtin: true, theme: RED_WEDGE },
   { id: 'arcane-grimoire', name: 'Arcane Grimoire', description: 'Ink void with rune-green and violet sigil accents', builtin: true, theme: ARCANE_GRIMOIRE },
   { id: 'midnight-bloom', name: 'Midnight Bloom', description: 'Dark with green and purple accents', builtin: true, theme: MIDNIGHT_BLOOM },
   { id: 'paper-light',    name: 'Paper',          description: 'Warm light theme with indigo accent', builtin: true, theme: PAPER_LIGHT },
@@ -1056,9 +1353,27 @@ export function isBuiltinThemeId(id: string): boolean {
 }
 
 /**
- * Fill any missing colour slots on a partial theme with values from
- * MIDNIGHT_BLOOM. Used so user-registered themes that omit fields still render.
+ * Complete a partial user theme: missing colour slots come from the default
+ * palette and the result goes through `palette`, so a registered theme is
+ * the same design in its own colours. Token groups a caller supplies are
+ * merged over the design's (per group, so a partial group still yields a
+ * complete DesignTokens).
  */
 export function fillThemeDefaults(partial: Partial<ThemeData>): ThemeData {
-  return { ...ARCANE_GRIMOIRE, ...partial, tokens: partial.tokens ?? ARCANE_GRIMOIRE.tokens };
+  const { tokens: _t, designNotes: _d, ...colors } = { ...DEFAULT_THEME, ...partial };
+  const theme = palette(colors);
+  const t = (partial.tokens ?? {}) as Partial<DesignTokens>;
+  const base = theme.tokens;
+  theme.tokens = {
+    space:     { ...base.space,     ...(t.space     ?? {}) },
+    type:      { ...base.type,      ...(t.type      ?? {}) },
+    radius:    { ...base.radius,    ...(t.radius    ?? {}) },
+    motion:    { ...base.motion,    ...(t.motion    ?? {}) },
+    easing:    { ...base.easing,    ...(t.easing    ?? {}) },
+    elevation: { ...base.elevation, ...(t.elevation ?? {}) },
+    glow:      { ...base.glow,      ...(t.glow      ?? {}) },
+    surface:   { ...base.surface,   ...(t.surface   ?? {}) },
+    shape:     { ...shapeOf(theme), ...(t.shape     ?? {}) },
+  };
+  return theme;
 }

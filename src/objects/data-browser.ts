@@ -14,6 +14,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown } from './ui-kit.js';
 
 const log = new Log('DataBrowser');
 
@@ -38,6 +39,8 @@ export class DataBrowser extends Abject {
   private leftLayoutId?: AbjectId;
   private rightLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
+  /** Hint under the Collections header: what to do, or why the list is empty. */
+  private collectionsHintId?: AbjectId;
   private sqlInputId?: AbjectId;
   private runBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -120,7 +123,7 @@ export class DataBrowser extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '🗄 Data',
+        title: 'Data',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,
@@ -161,15 +164,23 @@ export class DataBrowser extends Abject {
         spacing: 4,
       })
     );
-    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [collectionsHeaderId, collectionsHintId, listId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'list', windowId: this.windowId, items: [], searchable: false }],
+        specs: [
+          { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Collections'), style: sectionHeaderStyle(this.theme, 12) },
+          { type: 'label', windowId: this.windowId, text: '', style: hintStyle(this.theme, 11) },
+          { type: 'list', windowId: this.windowId, items: [], searchable: false },
+        ],
       })
     );
     this.listWidgetId = listId;
-    await this.request(request(this.id, this.leftLayoutId, 'addLayoutChild', {
-      widgetId: this.listWidgetId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    this.collectionsHintId = collectionsHintId;
+    await this.request(request(this.id, this.leftLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: collectionsHeaderId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+        { widgetId: collectionsHintId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
+        { widgetId: this.listWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+      ],
     }));
 
     // Right pane: SQL editor + run row + results
@@ -181,17 +192,25 @@ export class DataBrowser extends Abject {
       })
     );
 
-    const { widgetIds: [sqlId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [queryHeaderId, sqlId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{
-          type: 'textArea', windowId: this.windowId,
-          text: 'SELECT 1',
-          monospace: true,
-          style: { syntaxHighlight: false },
-        }],
+        specs: [
+          { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'SQL Query'), style: sectionHeaderStyle(this.theme, 12) },
+          {
+            type: 'textArea', windowId: this.windowId,
+            text: 'SELECT 1',
+            monospace: true,
+            style: { syntaxHighlight: false },
+          },
+        ],
       })
     );
     this.sqlInputId = sqlId;
+    await this.request(request(this.id, this.rightLayoutId, 'addLayoutChild', {
+      widgetId: queryHeaderId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 22 },
+    }));
     await this.request(request(this.id, this.rightLayoutId, 'addLayoutChild', {
       widgetId: this.sqlInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -214,7 +233,8 @@ export class DataBrowser extends Abject {
     const { widgetIds: [runId, statusId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: 'Run' },
+          { type: 'button', windowId: this.windowId, text: 'Run',
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           { type: 'label', windowId: this.windowId, text: '',
             style: { fontSize: 11, color: this.theme.textTertiary } },
         ],
@@ -248,7 +268,7 @@ export class DataBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [{
           type: 'contentBlock', windowId: this.windowId,
-          text: 'Select a collection, or write SQL and press Run.',
+          text: emptyStateMarkdown('No results yet', 'Select a collection on the left to preview its rows, or write SQL above and press Run.'),
           style: { fontSize: 12, color: this.theme.textPrimary },
         }],
       })
@@ -298,6 +318,7 @@ export class DataBrowser extends Abject {
     this.leftLayoutId = undefined;
     this.rightLayoutId = undefined;
     this.listWidgetId = undefined;
+    this.collectionsHintId = undefined;
     this.sqlInputId = undefined;
     this.runBtnId = undefined;
     this.statusLabelId = undefined;
@@ -325,6 +346,13 @@ export class DataBrowser extends Abject {
         secondary: `${c.rowCount} row${c.rowCount === 1 ? '' : 's'}`,
       }));
       await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+      if (this.collectionsHintId) {
+        await this.request(request(this.id, this.collectionsHintId, 'update', {
+          text: infos.length === 0
+            ? 'No collections yet. They appear here when an Abject stores tabular data.'
+            : 'Select one to preview its rows.',
+        }));
+      }
     } catch (err) {
       log.warn('Failed to list collections:', err instanceof Error ? err.message : String(err));
     }

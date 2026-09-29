@@ -4,7 +4,7 @@
  * All communication is via message passing:
  *   getTheme        → returns the current ThemeData
  *   setTheme        → merges partial theme, persists, broadcasts themeChanged
- *   resetTheme      → resets to ARCANE_GRIMOIRE default
+ *   resetTheme      → resets to the default preset (Agitprop)
  *   listPresets     → built-in + user-registered ThemePresets
  *   setThemeById    → swap to a preset by id (atomic, no merge)
  *   getActiveThemeId→ id of the active preset, or 'custom' after setTheme()
@@ -18,7 +18,7 @@ import { request } from '../core/message.js';
 import { require as contractRequire } from '../core/contracts.js';
 import {
   ThemeData,
-  ARCANE_GRIMOIRE,
+  shapeOf,
   ThemePreset,
   BUILTIN_THEME_PRESETS,
   DEFAULT_THEME_ID,
@@ -47,9 +47,24 @@ function mergeTheme(current: ThemeData, partial: Partial<ThemeData>): ThemeData 
       elevation: { ...current.tokens.elevation, ...(t.elevation ?? {}) },
       glow:      { ...current.tokens.glow,      ...(t.glow      ?? {}) },
       surface:   { ...current.tokens.surface,   ...(t.surface   ?? {}) },
+      // shape is optional on stored themes: materialize it only when either
+      // side has one (shapeOf supplies the design's constants otherwise).
+      ...((current.tokens.shape || t.shape)
+        ? { shape: { ...shapeOf(current), ...(t.shape ?? {}) } }
+        : {}),
     };
   }
   return next;
+}
+
+/**
+ * A stored theme as a palette of the current design: its colour slots are
+ * kept and the structural tokens are rebuilt, so themes saved before the
+ * design existed (with their own fonts, radii, and shadows) render in it.
+ */
+function paletteOnly(stored: ThemeData): ThemeData {
+  const { tokens: _tokens, designNotes: _notes, ...colors } = stored;
+  return fillThemeDefaults(colors);
 }
 
 const THEME_INTERFACE: InterfaceId = 'abjects:theme' as InterfaceId;
@@ -58,11 +73,23 @@ const STORAGE_KEY_ACTIVE_ID = 'theme:active-id';
 const STORAGE_KEY_USER_PRESETS = 'theme:user-presets';
 const KEBAB_CASE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const CUSTOM_THEME_ID = 'custom';
+/**
+ * One-time move off the previous default. Workspaces that were sitting on the
+ * old default preset (almost always by inheritance, not choice) switch to the
+ * new default once; a later explicit pick of the old preset sticks.
+ */
+const STORAGE_KEY_DEFAULT_MIGRATION = 'theme:default-migrated-2';
+/** Presets that were the default at some point (Arcane Grimoire, then Agitprop). */
+const PREVIOUS_DEFAULT_THEME_IDS = new Set(['arcane-grimoire', 'agitprop']);
+
+function defaultTheme(): ThemeData {
+  return { ...getBuiltinThemeById(DEFAULT_THEME_ID)! };
+}
 
 export const THEME_ID = 'abjects:theme' as AbjectId;
 
 export class ThemeAbject extends Abject {
-  private currentTheme: ThemeData = { ...ARCANE_GRIMOIRE };
+  private currentTheme: ThemeData = defaultTheme();
   private activeThemeId: string = DEFAULT_THEME_ID;
   private userPresets: Map<string, ThemePreset> = new Map();
   private storageId?: AbjectId;
@@ -94,7 +121,7 @@ export class ThemeAbject extends Abject {
               },
               {
                 name: 'resetTheme',
-                description: 'Reset to the default Midnight Bloom theme',
+                description: 'Reset to the default theme (Agitprop)',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'ThemeData' },
               },
@@ -155,7 +182,9 @@ export class ThemeAbject extends Abject {
 
     this.on('setTheme', async (msg: AbjectMessage) => {
       const partial = msg.payload as Partial<ThemeData>;
-      this.currentTheme = mergeTheme(this.currentTheme, partial);
+      // Colours merge; structure stays the design's (fillThemeDefaults runs
+      // the result through palette()).
+      this.currentTheme = fillThemeDefaults(mergeTheme(this.currentTheme, partial));
       this.activeThemeId = CUSTOM_THEME_ID;
       this.applyBodyBackground();
       await this.persistTheme();
@@ -164,7 +193,7 @@ export class ThemeAbject extends Abject {
     });
 
     this.on('resetTheme', async () => {
-      this.currentTheme = { ...ARCANE_GRIMOIRE };
+      this.currentTheme = defaultTheme();
       this.activeThemeId = DEFAULT_THEME_ID;
       this.applyBodyBackground();
       await this.persistTheme();
@@ -245,7 +274,7 @@ export class ThemeAbject extends Abject {
 
       // If the removed preset was active, fall back to the default and re-broadcast.
       if (this.activeThemeId === id) {
-        this.currentTheme = { ...ARCANE_GRIMOIRE };
+        this.currentTheme = defaultTheme();
         this.activeThemeId = DEFAULT_THEME_ID;
         this.applyBodyBackground();
         await this.persistTheme();
@@ -269,7 +298,9 @@ export class ThemeAbject extends Abject {
         if (Array.isArray(savedPresets)) {
           for (const p of savedPresets) {
             if (p && typeof p.id === 'string' && !isBuiltinThemeId(p.id) && p.theme) {
-              this.userPresets.set(p.id, { ...p, builtin: false });
+              // A theme is a palette of the one design: keep the stored
+              // colours, rebuild everything structural.
+              this.userPresets.set(p.id, { ...p, builtin: false, theme: paletteOnly(p.theme) });
             }
           }
         }
@@ -284,11 +315,18 @@ export class ThemeAbject extends Abject {
           request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ACTIVE_ID })
         );
         if (typeof savedId === 'string' && savedId !== CUSTOM_THEME_ID) {
-          const preset = this.findPreset(savedId);
+          const migrated = await this.request<boolean | null>(
+            request(this.id, this.storageId, 'get', { key: STORAGE_KEY_DEFAULT_MIGRATION })
+          ).catch(() => null);
+          const effectiveId = (PREVIOUS_DEFAULT_THEME_IDS.has(savedId) && !migrated)
+            ? DEFAULT_THEME_ID
+            : savedId;
+          const preset = this.findPreset(effectiveId);
           if (preset) {
             this.currentTheme = { ...preset.theme };
             this.activeThemeId = preset.id;
             resolved = true;
+            if (effectiveId !== savedId) await this.persistTheme();
           }
         }
       } catch {
@@ -303,12 +341,22 @@ export class ThemeAbject extends Abject {
             request(this.id, this.storageId, 'get', { key: STORAGE_KEY })
           );
           if (saved && typeof saved === 'object' && 'canvasBg' in saved) {
-            this.currentTheme = mergeTheme(ARCANE_GRIMOIRE, saved);
+            this.currentTheme = paletteOnly(saved);
             this.activeThemeId = CUSTOM_THEME_ID;
           }
         } catch {
           // Storage not available or key not found — use default
         }
+      }
+
+      // Mark the default migration done for this workspace, so an explicit
+      // choice of the previous default from here on is respected.
+      try {
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_DEFAULT_MIGRATION, value: true })
+        );
+      } catch {
+        // Storage failure: migration re-runs next boot, which is harmless.
       }
     }
 
@@ -440,15 +488,23 @@ Shadow:
   shadowColor, dropdownShadow
 
 Numeric fields:
-  windowRadius: number   — border radius for windows
-  widgetRadius: number   — border radius for widgets (buttons, inputs)
+  windowRadius: number   : border radius for windows (0: the design is square)
+  widgetRadius: number   : border radius for widgets (0)
   titleBarHeight: number — height of window title bars in pixels
+
+Visual language (the same on every theme; a theme is a colour palette of one design):
+  designNotes: string    : prose describing the design; build UI to match it
+  tokens.shape           : { shadowStyle, blockShadowOffset, blockShadowColor, blockFocusColor,
+                             ruleWidth, titleCase, titleTracking, ornament, iconCaps, backdrop }
+  tokens.type.*.font     : the design's font families (display / body / code)
+  accent = the human hand (actions, focus, selection); accentSecondary = the living
+  light (things alive or thinking), the only colour that glows.
 
 ### Common Color Mapping
 - Background: theme.windowBg (panels), theme.canvasBg (canvas behind windows)
 - Text: theme.textPrimary (main), theme.textSecondary (muted), theme.textTertiary (disabled)
 - Headings: theme.textHeading, Descriptions: theme.textDescription, Meta: theme.textMeta
-- Accents/highlights: theme.accent (green), theme.accentSecondary (purple), theme.accentTertiary (red)
+- Accents/highlights: theme.accent (primary accent: red on the default Agitprop theme), theme.accentSecondary, theme.accentTertiary
 - Action buttons: theme.actionBg, theme.actionText, theme.actionBorder
 - Destructive buttons: theme.destructiveBg, theme.destructiveText, theme.destructiveBorder
 - Active items: theme.activeItemBg, theme.activeItemBorder
@@ -473,7 +529,8 @@ Numeric fields:
   const presets = await this.call(
     this.dep('Theme'), 'listPresets', {});
   // Returns: [{ id, name, description, builtin, theme }, ...]
-  // Built-ins: midnight-bloom, paper-light, high-contrast, sunset, ocean, monochrome
+  // Built-ins: agitprop (default), red-wedge, arcane-grimoire, midnight-bloom, paper-light,
+  // high-contrast, sunset, ocean, monochrome, dracula, solarized-light, rose-pine
 
   await this.call(
     this.dep('Theme'), 'setThemeById', { id: 'ocean' });
@@ -487,7 +544,8 @@ Numeric fields:
 
 User themes appear in the Appearance picker alongside built-ins. The id must
 be kebab-case and must not collide with a built-in. Missing colour fields are
-filled from the default theme so partial colour palettes still render.
+filled from the default palette, and the theme renders in the system's one
+design: a theme is a colour palette.
 
   await this.call(
     this.dep('Theme'), 'registerTheme', {
@@ -506,7 +564,7 @@ filled from the default theme so partial colour palettes still render.
 
   await this.call(
     this.dep('Theme'), 'unregisterTheme', { id: 'forest' });
-  // If 'forest' was active, the theme falls back to midnight-bloom.
+  // If 'forest' was active, the theme falls back to the default (agitprop).
 
 ### Subscribing to Theme Changes
 

@@ -28,6 +28,7 @@ import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './ext
 import type { Rule, RuleScope } from './permission-broker.js';
 import { isInside } from '../core/path-scope.js';
 import type { ListItem } from './widgets/list-widget.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 type ManagedRule = { index: number } & Rule;
 
@@ -93,6 +94,11 @@ export class ExternalProjectBrowser extends Abject {
   private configProjectName = '';
 
   private grantRowId?: AbjectId;
+  /** Empty states: no projects (list slot) and no selection (right pane). */
+  private listEmptyId?: AbjectId;
+  private detailEmptyId?: AbjectId;
+  private listEmptyShown?: boolean;
+  private detailEmptyShown?: boolean;
   private addBtnId?: AbjectId;
   private settingsBtnId?: AbjectId;
   private editBtnId?: AbjectId;
@@ -220,8 +226,8 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 6,
+        margins: { top: 12, right: 16, bottom: 12, left: 16 },
+        spacing: 8,
       }),
     );
 
@@ -229,7 +235,7 @@ someone else wrote, so it is a button here rather than something granted on add.
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 10,
+        spacing: 16,
       }),
     );
     await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
@@ -286,29 +292,32 @@ someone else wrote, so it is a button here rather than something granted on add.
     // fields to edit rather than a list to click through and a chain of modal
     // prompts to answer -- the same shape the system settings and network
     // panes use. The summary list above stays as the at-a-glance view.
+    const fieldLabel = { fontSize: 12, color: this.theme.textSecondary };
+    const primary = { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder };
+    const destructive = { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder };
     const { widgetIds: editorIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text: 'Description' },
+          { type: 'label', windowId: this.windowId, text: 'Description', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'What this project is' },
-          { type: 'label', windowId: this.windowId, text: 'Check command' },
+          { type: 'label', windowId: this.windowId, text: 'Check command', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Fast check, run after every edit' },
-          { type: 'label', windowId: this.windowId, text: 'Verify command' },
+          { type: 'label', windowId: this.windowId, text: 'Verify command', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Full verification, such as the test suite' },
-          { type: 'label', windowId: this.windowId, text: 'Format command' },
+          { type: 'label', windowId: this.windowId, text: 'Format command', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Optional formatting command' },
-          { type: 'label', windowId: this.windowId, text: 'Setup command' },
+          { type: 'label', windowId: this.windowId, text: 'Setup command', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Optional setup command' },
-          { type: 'label', windowId: this.windowId, text: 'Shared paths' },
+          { type: 'label', windowId: this.windowId, text: 'Shared paths', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Comma-separated paths isolation may share' },
-          { type: 'label', windowId: this.windowId, text: 'Protected paths' },
+          { type: 'label', windowId: this.windowId, text: 'Protected paths', style: fieldLabel },
           { type: 'textInput', windowId: this.windowId, text: '', placeholder: 'Comma-separated paths that always ask before writes' },
-          { type: 'label', windowId: this.windowId, text: 'Isolation' },
+          { type: 'label', windowId: this.windowId, text: 'Isolation', style: fieldLabel },
           { type: 'select', windowId: this.windowId, options: [...ISOLATION_MODES], selectedIndex: 0 },
-          { type: 'label', windowId: this.windowId, text: 'Autonomy requested' },
+          { type: 'label', windowId: this.windowId, text: 'Autonomy requested', style: fieldLabel },
           { type: 'select', windowId: this.windowId, options: [...AUTONOMY_LEVELS], selectedIndex: 0 },
-          { type: 'checkbox', windowId: this.windowId, checked: false, text: 'Trusted — may act here without asking every time' },
-          { type: 'button', windowId: this.windowId, text: 'Save changes' },
+          { type: 'checkbox', windowId: this.windowId, checked: false, text: 'Trusted: may act here without asking every time' },
+          { type: 'button', windowId: this.windowId, text: 'Save changes', style: primary },
           { type: 'button', windowId: this.windowId, text: 'Revert' },
         ],
       }),
@@ -332,6 +341,37 @@ someone else wrote, so it is a button here rather than something granted on add.
       widgetId: this.listWidgetId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
+
+    // Empty states: no projects yet (shares the list's slot) and nothing
+    // selected (stands in for the right pane).
+    const { widgetIds: [listEmptyId, detailEmptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          {
+            type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'No external projects yet',
+              'Register a folder on this computer so agents can read, edit and check code there with the commands and permissions you set. Press Add project to register one.',
+            ),
+            style: emptyStateStyle(this.theme),
+          },
+          {
+            type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'Select a project',
+              'Pick one from the list to edit its commands, isolation and trust, and to review the permission grants that apply to it.',
+            ),
+            style: emptyStateStyle(this.theme),
+          },
+        ],
+      }),
+    );
+    this.listEmptyId = listEmptyId;
+    this.detailEmptyId = detailEmptyId;
+    await this.request(request(this.id, leftPaneId, 'addLayoutChild', {
+      widgetId: this.listEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
     // The tab bar stays pinned as the pane header; everything that can
     // overflow lives in a scrollable body -- the same header + scroll body
     // pattern the system settings and network panes use -- so the full
@@ -349,6 +389,10 @@ someone else wrote, so it is a button here rather than something granted on add.
       }),
     );
     this.rightBodyId = rightBodyId;
+    await this.request(request(this.id, rightPaneId, 'addLayoutChild', {
+      widgetId: this.detailEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
     await this.request(request(this.id, rightBodyId, 'addLayoutChildren', {
       children: [
         { widgetId: this.detailsWidgetId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 116 } },
@@ -392,15 +436,15 @@ someone else wrote, so it is a button here rather than something granted on add.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: 'Add project…' },
+          { type: 'button', windowId: this.windowId, text: 'Add project…', style: primary },
           { type: 'button', windowId: this.windowId, text: 'Settings…' },
           { type: 'button', windowId: this.windowId, text: 'Commands…' },
           { type: 'button', windowId: this.windowId, text: 'Trust' },
           { type: 'button', windowId: this.windowId, text: 'Autonomy…' },
-          { type: 'button', windowId: this.windowId, text: 'Remove project' },
-          { type: 'button', windowId: this.windowId, text: 'Add grant…' },
+          { type: 'button', windowId: this.windowId, text: 'Remove project', style: destructive },
+          { type: 'button', windowId: this.windowId, text: 'Add grant…', style: primary },
           { type: 'button', windowId: this.windowId, text: 'Edit grant…' },
-          { type: 'button', windowId: this.windowId, text: 'Remove grant' },
+          { type: 'button', windowId: this.windowId, text: 'Remove grant', style: destructive },
         ],
       }),
     );
@@ -478,6 +522,10 @@ someone else wrote, so it is a button here rather than something granted on add.
     this.configDirty = false;
     this.configProjectName = '';
     this.grantRowId = undefined;
+    this.listEmptyId = undefined;
+    this.detailEmptyId = undefined;
+    this.listEmptyShown = undefined;
+    this.detailEmptyShown = undefined;
     this.addBtnId = undefined;
     this.settingsBtnId = undefined;
     this.editBtnId = undefined;
@@ -593,6 +641,29 @@ someone else wrote, so it is a button here rather than something granted on add.
         items: this.projects.map(p => this.formatItem(p)),
       }));
     } catch { /* widget may be gone */ }
+    const empty = this.projects.length === 0;
+    if (this.listEmptyId && this.listEmptyShown !== empty) {
+      this.listEmptyShown = empty;
+      try {
+        await Promise.all([
+          this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+          this.request(request(this.id, this.listEmptyId, 'update', { style: { visible: empty } })),
+        ]);
+      } catch { /* widgets may be gone */ }
+    }
+  }
+
+  /** Swap the right pane (tabs and body) with the "select a project" state. */
+  private async applyDetailEmpty(empty: boolean): Promise<void> {
+    if (!this.detailEmptyId || !this.tabBarId || !this.rightBodyId || this.detailEmptyShown === empty) return;
+    this.detailEmptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.tabBarId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.rightBodyId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.detailEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
   }
 
   private applicableRules(project: ExternalProject): ManagedRule[] {
@@ -622,7 +693,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     if (!this.detailsWidgetId || !this.grantsWidgetId) return;
     const project = this.current();
     const details: ListItem[] = project ? [
-      { label: `Configuration — ${project.name}`, value: 'heading', secondary: project.description || 'No description' },
+      { label: `Configuration: ${project.name}`, value: 'heading', secondary: project.description || 'No description' },
       { label: 'Root', value: 'root', secondary: project.root },
       { label: 'Check command', value: 'check', secondary: project.checkCommand || 'Not configured' },
       { label: 'Verify command', value: 'verify', secondary: project.verifyCommand || 'Not configured' },
@@ -648,6 +719,7 @@ someone else wrote, so it is a button here rather than something granted on add.
     } catch { /* widgets may have been closed */ }
 
     await this.rebuildEditor(project);
+    await this.applyDetailEmpty(!project);
   }
 
   /**

@@ -12,6 +12,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle } from './ui-kit.js';
 
 const WINDOW_SWITCHER_INTERFACE: InterfaceId = 'abjects:window-switcher' as InterfaceId;
 export const WINDOW_SWITCHER_ID = 'abjects:window-switcher' as AbjectId;
@@ -33,6 +34,7 @@ export class WindowSwitcherAbject extends Abject {
   private rootLayoutId?: AbjectId;
   private listId?: AbjectId;
   private hintLabelId?: AbjectId;
+  private headerLabelId?: AbjectId;
 
   private entries: OpenWindowEntry[] = [];
 
@@ -64,6 +66,7 @@ export class WindowSwitcherAbject extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+    await this.fetchTheme();
   }
 
   private setupHandlers(): void {
@@ -121,7 +124,7 @@ export class WindowSwitcherAbject extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        margins: { top: 16, right: 16, bottom: 16, left: 16 },
         spacing: 8,
       }),
     );
@@ -132,8 +135,14 @@ export class WindowSwitcherAbject extends Abject {
           {
             type: 'label',
             windowId: this.windowId,
-            text: 'Open windows · ↑↓ to navigate · Enter to focus · Esc to cancel',
-            style: { fontSize: 11, color: '#8b8fa3' },
+            text: sectionHeaderText(this.theme, 'Switch Window'),
+            style: sectionHeaderStyle(this.theme, 14),
+          },
+          {
+            type: 'label',
+            windowId: this.windowId,
+            text: `${this.entries.length} open · ↑↓ to navigate · Enter to focus · Esc to cancel`,
+            style: { ...hintStyle(this.theme, 11), wordWrap: false },
           },
           {
             type: 'list',
@@ -146,11 +155,12 @@ export class WindowSwitcherAbject extends Abject {
       }),
     );
 
-    [this.hintLabelId, this.listId] = widgetIds;
+    [this.headerLabelId, this.hintLabelId, this.listId] = widgetIds;
     await this.request(request(this.id, this.listId, 'addDependent', {}));
 
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
+        { widgetId: this.headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: this.hintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
         { widgetId: this.listId,      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
       ],
@@ -177,6 +187,7 @@ export class WindowSwitcherAbject extends Abject {
     this.rootLayoutId = undefined;
     this.listId = undefined;
     this.hintLabelId = undefined;
+    this.headerLabelId = undefined;
     this.entries = [];
     try {
       await this.request(

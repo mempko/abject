@@ -16,6 +16,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import type { WorkspaceMemberInfo } from './workspace-share-registry.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('WorkspaceCollaboratorInspector');
 
@@ -62,6 +63,7 @@ type LabelSpec = {
   rect: { x: number; y: number; width: number; height: number };
   text: string;
   style: Record<string, unknown>;
+  height?: number;
 };
 
 type ButtonSpec = {
@@ -633,15 +635,15 @@ export class WorkspaceCollaboratorInspector extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await wm('createWindowAbject', {
-      title: '\uD83D\uDC65 Workspace Collaborators',
+      title: 'Workspace Collaborators',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       zIndex: 200,
     });
 
     this.rootLayoutId = await wm('createVBox', {
       windowId: this.windowId,
-      margins: { top: 4, right: 4, bottom: 4, left: 4 },
-      spacing: 4,
+      margins: { top: 8, right: 8, bottom: 8, left: 8 },
+      spacing: 8,
     });
 
     const headerRowId = await wm('createNestedHBox', {
@@ -677,13 +679,13 @@ export class WorkspaceCollaboratorInspector extends Abject {
             dividerPosition: 0.4,
             minSize: 150,
           },
-          // [2] Title
+          // [2] Intro hint (the window title already names the inspector)
           {
             type: 'label',
             windowId,
             rect: r0,
-            text: 'Workspace Collaborators',
-            style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 },
+            text: 'Workspaces you share or joined, who is in them, and what they share.',
+            style: { ...hintStyle(this.theme), wordWrap: false },
           },
           // [3] Refresh
           { type: 'button', windowId, rect: r0, text: 'Refresh', style: { fontSize: 12 } },
@@ -697,7 +699,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
             windowId,
             rect: r0,
             text: '',
-            style: { color: this.theme.statusNeutral, fontSize: 11 },
+            style: { color: this.theme.textMeta, fontSize: 11 },
           },
         ],
       })
@@ -737,8 +739,8 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
     this.detailPaneId = await wm('createDetachedScrollableVBox', {
       windowId,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
+      margins: { top: 8, right: 12, bottom: 8, left: 12 },
+      spacing: 6,
     });
 
     await this.request(
@@ -783,7 +785,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
   private async rebuildMemberList(): Promise<void> {
     if (!this.memberListId) return;
     const items = this.members.map(m => {
-      const dot = m.online ? '\u25CF' : '\u25CB';
+      const dot = m.online ? '\u25C9' : '\u25A1'; // ◉ online, □ offline
       const name = m.peerName || m.peerId.slice(0, 12);
       const lat = m.latencyMs === undefined ? '' : `  ${m.latencyMs}ms`;
       return `${dot} ${name}${lat}`;
@@ -835,14 +837,22 @@ export class WorkspaceCollaboratorInspector extends Abject {
     const windowId = this.windowId;
     const specs: DetailSpec[] = [];
 
+    // Section headers carry the kit mark; `title` is user text (a workspace name) and keeps its case.
     const heading = (text: string): void => {
       specs.push({
         type: 'label',
         windowId,
         rect: r0,
-        text,
-        style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' },
+        text: sectionHeaderText(this.theme, text),
+        style: { ...sectionHeaderStyle(this.theme) },
+        height: 22,
       });
+    };
+    const title = (text: string): void => {
+      specs.push({ type: 'label', windowId, rect: r0, text, style: { ...sectionHeaderStyle(this.theme, 14) }, height: 22 });
+    };
+    const empty = (text: string): void => {
+      specs.push({ type: 'label', windowId, rect: r0, text, style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
     };
     const line = (text: string): void => {
       specs.push({
@@ -857,9 +867,18 @@ export class WorkspaceCollaboratorInspector extends Abject {
     const ws = this.selectedWorkspace();
 
     if (!ws) {
-      line('Select a workspace to inspect its collaborators.');
+      specs.push({
+        type: 'label',
+        windowId,
+        rect: r0,
+        text: this.workspaces.length === 0
+          ? emptyStateMarkdown('No shared workspaces yet', 'Share a workspace from its Settings, or join one from the Workspace Browser, and its collaborators appear here.')
+          : emptyStateMarkdown('Pick a workspace', 'Select a workspace on the left to see its members, catalog and shared goals.'),
+        style: { ...emptyStateStyle(this.theme) },
+        height: 110,
+      });
     } else {
-      heading(ws.name && ws.name !== ws.workspaceId ? ws.name : ws.workspaceId);
+      title(ws.name && ws.name !== ws.workspaceId ? ws.name : ws.workspaceId);
       line(`Workspace ID: ${ws.workspaceId}`);
       line(ws.ownerPeerId ? `Owner peer: ${ws.ownerPeerId}` : 'Owner: this peer (hosted locally)');
       if (ws.registryId) line(`Registry: ${ws.registryId}`);
@@ -873,7 +892,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
       heading('Members');
       if (this.members.length === 0) {
-        line('No active members reported.');
+        empty('No active members yet. Peers who join this workspace appear here.');
       } else {
         for (const m of this.members) {
           const presence = m.online ? 'online' : 'offline';
@@ -896,7 +915,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
       heading(`Catalog (${this.catalogItems.length})`);
       if (this.catalogItems.length === 0) {
-        line('No catalog items visible for this workspace.');
+        empty('No catalog items visible yet. Reconcile the catalog to pull the latest.');
       } else {
         for (const item of this.catalogItems) {
           const name = item.manifest?.name || item.name || item.id || '(unnamed)';
@@ -907,7 +926,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
       heading(`Shared goals backlog (${this.backlogGoals.length})`);
       if (this.backlogGoals.length === 0) {
-        line('No active shared goals.');
+        empty('No active shared goals.');
       } else {
         for (const g of this.backlogGoals) {
           line(`[${g.status || 'active'}] ${g.title || g.id || '(untitled)'}`);
@@ -919,7 +938,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
         windowId,
         rect: r0,
         text: 'Ping members',
-        style: { fontSize: 12 },
+        style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
         action: 'ping',
       });
       specs.push({
@@ -936,7 +955,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
           windowId,
           rect: r0,
           text: 'Leave workspace',
-          style: { fontSize: 12 },
+          style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder },
           action: 'leave',
         });
       }
@@ -972,7 +991,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
         children.push({
           widgetId: wid,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 18 },
+          preferredSize: { height: spec.height ?? 18 },
         });
       }
     }

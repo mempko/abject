@@ -61,7 +61,7 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `widget-types.ts` | - | Shared types (`WidgetStyle`, `SizePolicy`, `Rect`, `ThemeData`), `MIDNIGHT_BLOOM` theme, color utilities |
+| `widget-types.ts` | - | Shared types (`WidgetStyle`, `SizePolicy`, `Rect`, `ThemeData`), theme-aware font helpers (`fontStacks`, `widgetFont`, `titleFont`, `codeFont`), color utilities, and the design draw helpers (`inkFrame`, `raisedBlock`, `wedge`, `hatch`, `squareMark`) |
 | `widget-abject.ts` | `WidgetAbject` | Abstract base for all widgets. Defines `buildDrawCommands()`, `processInput()`, `getWidgetValue()`, `applyUpdate()` |
 | `window-abject.ts` | `WindowAbject` | Top-level composite. Owns UIServer surface, renders title bar, routes input to children with hit-testing, manages focus and Tab navigation |
 | `layout-abject.ts` | `LayoutAbject` | Abstract layout container. Manages child list with size policies, two-pass rendering (expanded dropdowns on top), hover tracking |
@@ -79,13 +79,13 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `button-widget.ts` | `ButtonWidget` | Rounded rect with gradient. States: normal, hovered, focused (glow), disabled. Fires `click` on mousedown or Enter/Space. Set `href` to also open URL in browser |
+| `button-widget.ts` | `ButtonWidget` | Flat print block with a hard offset shadow. States: normal, hovered (inverted), pressed (sinks into its shadow), focused (accent frame), disabled. Fires `click` on mousedown or Enter/Space. Set `href` to also open URL in browser |
 | `text-input-widget.ts` | `TextInputWidget` | Single-line input with cursor, selection, copy/cut/paste. Optional password masking. Fires `change` and `submit` |
 | `text-area-widget.ts` | `TextAreaWidget` | Multi-line editor with scrolling. Line-by-line cursor navigation, Tab inserts spaces. Optional monospace font |
 | `checkbox-widget.ts` | `CheckboxWidget` | 16x16 box with checkmark + label. Toggle on click or Space. Fires `change` with `'true'`/`'false'` |
 | `slider-widget.ts` | `SliderWidget` | Horizontal slider with draggable thumb. Configurable min/max/step. Keyboard: Arrow keys, Home/End |
 | `select-widget.ts` | `SelectWidget` | Dropdown with expandable option list. Keyboard: arrows navigate, Enter selects, Escape closes. Emits `expanded` state |
-| `tabbar-widget.ts` | `TabBarWidget` | Horizontal tabs with amber active indicator. Keyboard: ArrowLeft/Right. Fires `change` with selected index |
+| `tabbar-widget.ts` | `TabBarWidget` | Horizontal tabs (slanted, active tab a solid accent slab). Keyboard: ArrowLeft/Right. Fires `change` with selected index |
 
 ### Display Widgets
 
@@ -129,8 +129,10 @@ UIServer input event
 
 ### Theme
 
-All widgets read colors from `this.theme` (`ThemeData`). The default `ARCANE_GRIMOIRE` theme provides an ink-void palette with rune-green (`#5be5a0`) and violet sigil (`#8b7bff`) accents. The `ThemeAbject` broadcasts theme changes to all dependents.
+All widgets read colors from `this.theme` (`ThemeData`). There is one design system-wide (Red Sigil, "eldritch agitprop": square, flat, ruled, hard offset print shadows, condensed uppercase display titles); a theme is only a colour palette of it. The default palette is `RED_SIGIL`. The `ThemeAbject` broadcasts theme changes to all dependents.
+
+Two lights: `theme.accent` is the human hand (actions, focus, selection) and `theme.accentSecondary` is the living light, used only for things that are alive or thinking (busy pulses, running goals); it is the only colour that glows. Structure constants (rule weight, print shadow offset and colour, title tracking, icon caps) come from `shapeOf(theme)` in `core/theme-data.ts`, and fonts from `fontStacks(theme)` / `widgetFont` / `titleFont` / `codeFont`. Explicit caller style (radius, colours) still wins. Uppercase is applied at draw time to system chrome only (`chromeCase`), never to user-supplied text. Buttons accept an optional `style.icon` naming a vector icon from `ui/icons.ts`.
 
 ### Focus Management
 
-`WindowAbject` tracks `focusedChildId`. Tab key cycles through focusable widgets (layouts implement `getFocusableWidgets()` recursively for nested containers). Focused widgets render a glow shadow for visual feedback.
+`WindowAbject` tracks `focusedChildId`. Tab key cycles through focusable widgets (layouts implement `getFocusableWidgets()` recursively for nested containers). Focused widgets render a flat accent frame (no glow) for visual feedback.

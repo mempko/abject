@@ -18,7 +18,8 @@ import type { ContentPart } from '../llm/provider.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { buildGoalRows, type GoalNode } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
-import { lightenColor, darkenColor } from './widgets/widget-types.js';
+import { chromeCase } from '../core/theme-data.js';
+import { sectionHeaderText, livingStyle, eyeSigilOps, removeSigilOps, type SceneOp } from './ui-kit.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Chat');
@@ -47,6 +48,14 @@ const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
 const COMPOSER_HINT_GOAL = `\u21B5  Queue a note for the goal   \u00B7   ${PAUSE_GLYPH}  Pause   \u00B7   ${STOP_GLYPH}  Stop`;
 const COMPOSER_HINT_PAUSED = `\u21B5  Send note   \u00B7   ${RESUME_GLYPH}  Resume   \u00B7   ${STOP_GLYPH}  Stop`;
 const COMPOSER_HINT_CLARIFY = `\u21B5  Answer to continue the goal   \u00B7   ${STOP_GLYPH}  Stop`;
+
+// ── Status strip + eye ─────────────────────────────────────────────────
+/** Height of the status strip above the message log. */
+const STATUS_STRIP_H = 18;
+const CHAT_EYE_PREFIX = 'chat-eye';
+const CHAT_EYE_SIZE = 18;
+/** Leading mark on the activity header (the kit's sigil ring). */
+const THINKING_TEXT = '\u25C9 Thinking\u2026';
 
 // ── Attachments ────────────────────────────────────────────────────────
 /** Image MIME types the LLM vision content part accepts. */
@@ -157,6 +166,10 @@ export class Chat extends Abject {
   private inputRowId?: AbjectId;
   private textInputId?: AbjectId;
   private sendBtnId?: AbjectId;
+  /** Status strip above the log: "Ready" when idle, phosphor while working. */
+  private statusStripId?: AbjectId;
+  /** Eye sigil shown in the status strip while the chat is working. */
+  private eyeShown = false;
   /** Stop button shown next to Send while a goal is in progress. */
   private stopBtnId?: AbjectId;
   /** True while the composer shows goal controls (Pause/Resume + Stop). */
@@ -197,7 +210,7 @@ export class Chat extends Abject {
   private activityGoalWidgetId?: AbjectId;
   private activityGoalHeight = 0;
   private activityStep = 0;
-  private activityHeader = '\u25CF Thinking\u2026';
+  private activityHeader = THINKING_TEXT;
   private activityRefreshTimer?: ReturnType<typeof setTimeout>;
   /** Streamed character count for the current LLM step. Reset each phase. */
   private stepStreamChars = 0;
@@ -651,6 +664,10 @@ export class Chat extends Abject {
         if (typeof height === 'number' && height > 0) this.currentRect.height = height;
         this.notifyRectChanged();
       }
+      // Keep the eye anchored to the status strip's right end.
+      if (this.eyeShown) {
+        await this.sendEyeOps([{ op: 'update', id: `${CHAT_EYE_PREFIX}-sigil`, transform: { position: this.eyePosition() } }]);
+      }
     });
 
     this.on('windowMoved', async (msg: AbjectMessage) => {
@@ -891,7 +908,7 @@ export class Chat extends Abject {
       // phase (thinking, observing, acting) is a fresh LLM call window.
       this.stepStreamChars = 0;
       if (phase === 'thinking') {
-        this.updateActivityHeader(`\u25CF Thinking\u2026 (step ${step + 1}/${maxSteps})`);
+        this.updateActivityHeader(`${THINKING_TEXT} (step ${step + 1}/${maxSteps})`);
       } else if (phase === 'observing') {
         this.updateActivityHeader(`\u25CE Observing\u2026 (step ${step + 1}/${maxSteps})`);
       }
@@ -1511,6 +1528,23 @@ A single successful creation goal is a complete turn. End it with **done**.
       })
     );
 
+    // Status strip: a quiet "Ready" while idle, phosphor while the chat is
+    // thinking or a goal is running (the eye sigil sits at its right end).
+    const { widgetIds: [statusStripId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'label', windowId: this.windowId, text: this.statusStripText(),
+          style: this.statusStripStyle(),
+        }],
+      })
+    );
+    this.statusStripId = statusStripId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.statusStripId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: STATUS_STRIP_H },
+    }));
+
     // Scrollable VBox for message log (expanding, auto-scroll to follow new messages).
     // A bottom margin keeps the last bubble clear of the composer instead of
     // sitting flush against it (which clipped the final line).
@@ -1566,30 +1600,29 @@ A single successful creation goal is a complete turn. End it with **done**.
             style: { markdown: true },
           },
           {
+            // Secondary: a plain square button beside the input.
             type: 'button', windowId: this.windowId, text: ATTACH_GLYPH,
             style: {
-              background: this.theme.windowBg,
               color: this.theme.textSecondary,
-              borderColor: this.theme.actionBorder,
-              radius: SEND_BTN_SIZE / 2,
               fontSize: 18,
             },
           },
           {
+            // The one primary action: a solid red Send block.
             type: 'button', windowId: this.windowId, text: SEND_GLYPH,
             style: {
               background: this.theme.actionBg,
               color: this.theme.actionText,
               borderColor: this.theme.actionBorder,
-              radius: SEND_BTN_SIZE / 2,
               fontSize: 18,
+              fontWeight: 'bold',
             },
           },
           {
             type: 'label', windowId: this.windowId,
-            text: '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline',
+            text: COMPOSER_HINT_DEFAULT,
             style: {
-              color: this.theme.textTertiary,
+              color: this.theme.textMeta,
               fontSize: 11,
               wordWrap: false,
               selectable: false,
@@ -1631,6 +1664,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     this.uiPhase = 'idle';
     this.emitGoalActivity();
+    await this.syncWorkingIndicators();
 
     log.info(`[Chat ${(this.conversationId ?? this.id).slice(0, 8)}] show() historyLen=${this.conversationHistory.length} title="${this.conversationTitle ?? ''}"`);
     if (this.conversationHistory.length === 0) {
@@ -1686,7 +1720,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (this.welcomeWidgetIds.length > 0) return;
 
     const tokens = this.theme.tokens;
-    const headingText = '\u2728  Welcome to Chat';
+    const headingText = sectionHeaderText(this.theme, 'Welcome to Chat');
     const bodyText = 'Abjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents.\n\nAsk me to explore what objects exist, create new ones, fetch your email, or anything else \u2014 specialized agents pick up the work automatically.';
 
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
@@ -1714,13 +1748,13 @@ A single successful creation goal is a complete turn. End it with **done**.
           align: 'center' as const,
         },
       },
-      // Body description in a softly accent-bordered card.
+      // Body description in a ruled card.
       {
         type: 'label', windowId: this.windowId, text: bodyText,
         style: {
           color: this.theme.textSecondary,
-          background: lightenColor(this.theme.windowBg, 7),
-          borderColor: darkenColor(this.theme.accent, 46),
+          background: this.theme.inputBg,
+          borderColor: this.theme.windowBorder,
           radius: tokens.radius.lg,
           fontSize: 13,
           wordWrap: true,
@@ -1779,7 +1813,61 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (this.lastGoalActivity === active) return;
     this.lastGoalActivity = active;
     this.refreshWindowTitle();
+    void this.syncWorkingIndicators();
     this.changed('goalActivity', active ? { active: true, goalId: this._currentGoalId } : { active: false });
+  }
+
+  // ── Status strip + eye ────────────────────────────────────────────────
+
+  private statusStripText(): string {
+    return this.isGoalActive() ? `\u25C9  ${chromeCase(this.theme, 'Working')}` : chromeCase(this.theme, 'Ready');
+  }
+
+  private statusStripStyle(): Record<string, unknown> {
+    const base = { fontSize: 11, fontFamily: 'display', wordWrap: false, selectable: false };
+    return this.isGoalActive()
+      ? { ...base, ...livingStyle(this.theme, 11), fontWeight: 'bold' }
+      : { ...base, color: this.theme.textMeta, fontWeight: 'normal' };
+  }
+
+  /** Eye position: right end of the status strip, px from the window centre. */
+  private eyePosition(): [number, number, number] {
+    const w = this.currentRect?.width ?? this.currentWindowWidth;
+    const h = this.currentRect?.height ?? DEFAULT_WIN_H;
+    const sp = this.theme.tokens.space;
+    // Content starts 36px below the window top; the strip follows the top margin.
+    return [w / 2 - sp.lg - CHAT_EYE_SIZE / 2 - 4, -h / 2 + 36 + sp.md + STATUS_STRIP_H / 2, 6];
+  }
+
+  /**
+   * Bring the status strip and the eye sigil in line with the busy state.
+   * Runs only on transitions (and once per show); one label update and one
+   * scene batch each, all eye motion is client-side.
+   */
+  private async syncWorkingIndicators(): Promise<void> {
+    if (!this.windowId) return;
+    if (this.statusStripId) {
+      try {
+        this.send(event(this.id, this.statusStripId, 'update', {
+          text: this.statusStripText(), style: this.statusStripStyle(),
+        }));
+      } catch { /* widget gone */ }
+    }
+    const want = this.isGoalActive();
+    if (want === this.eyeShown) return;
+    this.eyeShown = want;
+    await this.sendEyeOps(want
+      ? eyeSigilOps(CHAT_EYE_PREFIX, this.eyePosition(), CHAT_EYE_SIZE)
+      : removeSigilOps(CHAT_EYE_PREFIX));
+  }
+
+  private async sendEyeOps(ops: SceneOp[]): Promise<void> {
+    if (!this.windowId) return;
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', { ops }));
+    } catch (err) {
+      log.warn('Failed to update the chat eye sigil:', err);
+    }
   }
 
   async hide(): Promise<boolean> {
@@ -1810,6 +1898,8 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.composerHintLabelId = undefined;
     this.textInputId = undefined;
     this.sendBtnId = undefined;
+    this.statusStripId = undefined;
+    this.eyeShown = false;
     this.stopBtnId = undefined;
     this.goalControlsActive = false;
     this.messageLabelIds = [];
@@ -1840,12 +1930,12 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   /**
-   * Window title: chat glyph + conversation title, plus a trailing dot while
+   * Window title: the conversation title, plus a trailing dot while
    * a goal is running (the same mark the taskbar's chat row shows).
    */
   private formatWindowTitle(title?: string): string {
     const t = (title ?? this.conversationTitle ?? 'Chat').trim();
-    const base = `\uD83D\uDCAC  ${t || 'Chat'}`;
+    const base = t || 'Chat';
     return this.isGoalActive() ? `${base} \u25CF` : base;
   }
 
@@ -2345,10 +2435,9 @@ A single successful creation goal is a complete turn. End it with **done**.
         request(this.id, this.widgetManagerId!, 'create', { specs: [
           { type: 'button', windowId: this.windowId, text: STOP_GLYPH,
             style: {
-              background: this.theme.windowBg,
-              color: this.theme.statusError,
-              borderColor: this.theme.statusError,
-              radius: SEND_BTN_SIZE / 2,
+              background: this.theme.destructiveBg,
+              color: this.theme.destructiveText,
+              borderColor: this.theme.destructiveBorder,
               fontSize: 16,
             } },
         ]})
@@ -2491,40 +2580,44 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   // ── Bubble styling ───────────────────────────────────────────────────
 
+  /**
+   * Flat print blocks: the user's own messages ruled in red (the human
+   * hand), the agent's ruled in bone, errors in red ink, and activity lines
+   * muted with a phosphor rule (the Other at work). Corners follow the
+   * theme radius.
+   */
   private bubbleStyleForRole(role: BubbleRole): { background: string; color: string; align: BubbleAlign; borderColor?: string } {
+    const t = this.theme;
     switch (role) {
       case 'user':
-        return {
-          background: lightenColor(this.theme.windowBg, 16),
-          color: this.theme.textPrimary,
-          align: 'right',
-          borderColor: darkenColor(this.theme.accent, 34),
-        };
+        return { background: t.inputBg, color: t.textPrimary, align: 'right', borderColor: t.accent };
       case 'assistant':
-        return {
-          background: lightenColor(this.theme.windowBg, 9),
-          color: this.theme.textPrimary,
-          align: 'left',
-          borderColor: lightenColor(this.theme.windowBg, 16),
-        };
+        return { background: t.windowBg, color: t.textPrimary, align: 'left', borderColor: t.windowBorder };
       case 'system':
-        return {
-          background: darkenColor(this.theme.windowBg, 4),
-          color: this.theme.textSecondary,
-          align: 'center',
-        };
+        return { background: t.progressTrack, color: t.textSecondary, align: 'center' };
       case 'error':
-        return {
-          background: darkenColor(this.theme.statusError, 60),
-          color: this.theme.statusError,
-          align: 'left',
-        };
+        return { background: t.inputBg, color: t.statusError, align: 'left', borderColor: t.statusError };
       case 'activity':
-        return {
-          background: lightenColor(this.theme.windowBg, 6),
-          color: this.theme.statusNeutral,
-          align: 'left',
-        };
+        return { background: t.windowBg, color: t.textSecondary, align: 'left', borderColor: t.accentSecondary };
+    }
+  }
+
+  /**
+   * Sender line above a bubble: chrome-cased name and time. The user's line
+   * carries a red mark, the agent's a sigil ring; others stay muted.
+   */
+  private senderHeader(role: BubbleRole, sender: string, ts: number): { text: string; color: string; bold: boolean } {
+    const time = this.formatTimestamp(ts);
+    const name = chromeCase(this.theme, sender);
+    switch (role) {
+      case 'user':
+        return { text: `${time}  \u00B7  ${name}  \u25A0`, color: this.theme.accent, bold: true };
+      case 'assistant':
+        return { text: `\u25C9  ${name}  \u00B7  ${time}`, color: this.theme.textSecondary, bold: true };
+      case 'error':
+        return { text: `${name}  \u00B7  ${time}`, color: this.theme.statusError, bold: true };
+      default:
+        return { text: `${name}  \u00B7  ${time}`, color: this.theme.textMeta, bold: false };
     }
   }
 
@@ -2612,15 +2705,17 @@ A single successful creation goal is a complete turn. End it with **done**.
     const shouldEmitSender = !!sender && !this.shouldGroupWithPrevious(role, sender);
     let senderLabelId: AbjectId | undefined;
     if (shouldEmitSender) {
-      const headerText = `${sender}  \u00B7  ${this.formatTimestamp(Date.now())}`;
+      const header = this.senderHeader(role, sender, Date.now());
       const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
             {
-              type: 'label', windowId: this.windowId, text: headerText,
+              type: 'label', windowId: this.windowId, text: header.text,
               style: {
-                color: this.theme.textTertiary,
+                color: header.color,
                 fontSize: 11,
+                fontFamily: 'display',
+                fontWeight: header.bold ? 'bold' : 'normal',
                 wordWrap: false,
                 selectable: false,
                 align,
@@ -2683,7 +2778,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async showActivityBubble(): Promise<void> {
     if (this.activityBubbleLabelId) return;
     this.activityStep = 0;
-    this.activityHeader = '\u25CF Thinking\u2026';
+    this.activityHeader = THINKING_TEXT;
     this.activityGoalHeight = 0;
     this.stepStreamChars = 0;
     if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
@@ -2779,7 +2874,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private composeActivityText(): string {
     const baseHeader = this.activityStep > 0
-      ? `\u25CF Thinking\u2026 (step ${this.activityStep}/${MAX_STEPS})`
+      ? `${THINKING_TEXT} (step ${this.activityStep}/${MAX_STEPS})`
       : this.activityHeader;
     // Append a streaming hint so the user sees the LLM is actively producing
     // output even when no other progress signal has fired yet. Approximate

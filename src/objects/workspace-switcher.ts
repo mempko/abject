@@ -14,6 +14,7 @@ import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { lightenColor } from './widgets/widget-types.js';
+import { dockStyles, spaceNumeral } from './dock-style.js';
 import { parseInviteLink, type WorkspaceAccessMode } from './workspace-manager.js';
 
 const log = new Log('WorkspaceSwitcher');
@@ -409,10 +410,10 @@ export class WorkspaceSwitcher extends Abject {
     const isCreate = this.dialogMode === 'create';
 
     const labelStyle = { color: t.textSecondary, fontSize: 11, fontWeight: 'bold' };
-    const inputStyle = { background: lightenColor(t.windowBg, 5), color: t.textPrimary, borderColor: t.inputBorder, radius: 4 };
-    const primaryBtnStyle = { background: t.accent, color: t.actionText, radius: 4, fontWeight: 'bold', align: 'center' };
-    const cancelBtnStyle = { background: lightenColor(t.windowBg, 10), color: t.textPrimary, radius: 4, align: 'center' };
-    const statusStyle = { color: this.dialogStatusText.startsWith('Error') || this.dialogStatusText.startsWith('Failed') ? '#ff5555' : t.accent, fontSize: 12 };
+    const inputStyle = { background: lightenColor(t.windowBg, 5), color: t.textPrimary, borderColor: t.inputBorder, radius: t.tokens.radius.sm };
+    const primaryBtnStyle = { background: t.accent, color: t.actionText, radius: t.tokens.radius.sm, fontWeight: 'bold', align: 'center' };
+    const cancelBtnStyle = { background: lightenColor(t.windowBg, 10), color: t.textPrimary, radius: t.tokens.radius.sm, align: 'center' };
+    const statusStyle = { color: this.dialogStatusText.startsWith('Error') || this.dialogStatusText.startsWith('Failed') ? t.statusError : t.accent, fontSize: 12 };
 
     const specs: Array<{ type: string; windowId: AbjectId; text?: string; placeholder?: string; style?: Record<string, unknown>; options?: string[]; selectedIndex?: number; tabs?: string[] }> = [];
 
@@ -779,16 +780,11 @@ export class WorkspaceSwitcher extends Abject {
       const labelH = 20;
 
       const compact = this.compact;
-      const ghostBg = lightenColor(this.theme.windowBg, 5);
-      const appStyle = {
-        background: ghostBg, flat: true,
-        color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-        align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
-      };
-      const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13, align: 'center' };
-      const wsActiveStyle = { ...appStyle, background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-      const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
-      const chevron = this.collapsed ? '▸' : '▾';
+      const dock = dockStyles(this.theme, compact);
+      const appStyle = dock.row;
+      const gearStyle = { ...dock.gear, align: 'center' };
+      const wsActiveStyle = { ...appStyle, ...dock.activeRow };
+      const headerStyle = dock.header;
       const showRows = !this.collapsed && hasWorkspaces;
 
       {
@@ -806,27 +802,31 @@ export class WorkspaceSwitcher extends Abject {
         }));
 
         const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
-        specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25C8' : `${chevron} Spaces`, style: compact ? { ...headerStyle, tooltip: 'Spaces' } : headerStyle });
+        specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25C8' : dock.headerText('Spaces', this.collapsed), style: compact ? { ...headerStyle, tooltip: 'Spaces' } : headerStyle });
         if (!compact) {
-          specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { ...gearStyle, tooltip: 'Add Workspace' } });
-          specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { ...gearStyle, tooltip: 'Settings' } });
+          specs.push({ type: 'button', windowId: this.windowId!, text: '', style: { ...gearStyle, icon: 'plus', tooltip: 'Add Workspace' } });
+          specs.push({ type: 'button', windowId: this.windowId!, text: '', style: { ...gearStyle, tooltip: 'Settings' } });
         }
         const rowStartIdx = specs.length;
         if (showRows) {
           for (const ws of workspaces) {
             const isActive = ws.id === this.cachedActiveWorkspaceId;
-            // A joined workspace mirrors one a peer hosts and keeps
-            // `accessMode: 'local'` by invariant, so `joined` must be checked
-            // BEFORE the mode — a mode-first test falls through to the
-            // local-only lock and hides that the space is shared.
-            const accessIcon = ws.joined
-              ? '\uD83D\uDC65'
-              : ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'shared' ? '\uD83D\uDC65' : '\uD83D\uDD12';
             const baseStyle = isActive ? wsActiveStyle : appStyle;
-            const wsTooltip = ws.joined ? `${ws.name} (joined)` : ws.name;
-            specs.push({ type: 'button', windowId: this.windowId!, text: compact ? accessIcon : `${accessIcon} ${ws.name}`, style: compact ? { ...baseStyle, tooltip: wsTooltip } : baseStyle });
+            // Spaces as large poster numerals ("01", "02"), the active one in
+            // the accent; the access mode lives in the tooltip.
+            const numeral = spaceNumeral(workspaces.indexOf(ws));
+            // A joined workspace mirrors one a peer hosts and keeps
+            // `accessMode: 'local'` by invariant, so `joined` is checked first.
+            const access = ws.joined ? 'joined' : ws.accessMode;
+            const numStyle = {
+              ...baseStyle,
+              fontFamily: 'display', fontWeight: 'bold', fontSize: 16,
+              color: isActive ? this.theme.accent : this.theme.textPrimary,
+              tooltip: `${ws.name} (${access})`,
+            };
+            specs.push({ type: 'button', windowId: this.windowId!, text: compact ? numeral : `${numeral}  ${ws.name}`, style: numStyle });
           }
-          specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\uD83D\uDD0E' : '\uD83D\uDD0E Browse', style: compact ? { ...appStyle, tooltip: 'Browse' } : appStyle });
+          specs.push({ type: 'button', windowId: this.windowId!, text: dock.rowText('browse', 'Browse'), style: dock.rowStyle('Browse', 'browse') });
         }
 
         const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(

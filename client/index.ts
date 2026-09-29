@@ -11,7 +11,7 @@
  */
 
 import { FrontendClient } from './frontend-client.js';
-import { startAbyssBg } from './abyss-bg.js';
+import { startBackdrop } from './backdrop.js';
 import { WebSocketClientTransport } from './ws-transport.js';
 import { WebRTCClientTransport } from './webrtc-transport.js';
 import { getPairingPayloadFromUrl, clearPairingParamFromUrl, type PairingPayload } from './pairing.js';
@@ -269,14 +269,14 @@ function start(): void {
   }
 
   const abyssBg = document.getElementById('abyss-bg') as HTMLCanvasElement | null;
-  const abyssControl = abyssBg ? startAbyssBg(abyssBg) : undefined;
+  const backdropControl = abyssBg ? startBackdrop(abyssBg) : undefined;
 
   const canvas = document.createElement('canvas');
   canvas.style.width = '100%';
   canvas.style.height = '100%';
   container.appendChild(canvas);
 
-  const client = new FrontendClient(canvas, abyssControl);
+  const client = new FrontendClient(canvas, backdropControl);
   pendingClient = client;
   (window as unknown as Record<string, unknown>).frontendClient = client;
 

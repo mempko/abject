@@ -168,6 +168,24 @@ void main() {
 `;
 
 /** Fullscreen overlay: blit the 2D chrome canvas over everything. */
+/**
+ * Bloom composite: the blurred glow as premultiplied light. The bright/blur
+ * targets carry alpha 1 everywhere, so compositing them as-is would add full
+ * coverage over transparent backbuffer pixels and paint the glow's dark areas
+ * as opaque black around the window (visible on any light backdrop). Coverage
+ * instead follows the glow's own brightness: no glow, no coverage.
+ */
+export const BLOOM_COMPOSITE_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uTex;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(uTex, vUv).rgb;
+  outColor = vec4(c, clamp(max(max(c.r, c.g), c.b), 0.0, 1.0));
+}
+`;
+
 export const OVERLAY_VS = `#version 300 es
 layout(location = 0) in vec2 aPos;   // fullscreen triangle in clip space
 out vec2 vUv;

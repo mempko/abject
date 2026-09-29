@@ -20,6 +20,7 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
+import { emptyStateMarkdown, emptyStateStyle, eyeSigilOps, removeSigilOps } from './ui-kit.js';
 
 const log = new Log('AgentBrowser');
 
@@ -30,10 +31,31 @@ const WIN_H = 420;
 
 const TAB_LABELS = ['Agents', 'Watchers', 'Sessions'];
 
-const AGENT_STATUS_ICONS: Record<string, string> = {
-  idle: '\u25CB',     // ○
-  busy: '\u25B8',     // ▸
-};
+/** Scene node prefix for the "an agent is at work" eye sigil. */
+const SIGIL_PREFIX = 'agent-browser-working';
+const SIGIL_SIZE = 26;
+
+/** Per-tab empty states: [list empty, nothing selected]. */
+const TAB_EMPTY: Array<[string, string, string, string]> = [
+  [
+    'No agents yet',
+    'Agents are objects that take on tasks for you. Ask in Chat to create one, for example "make an agent that tracks my reading list".',
+    'Select an agent',
+    'Pick one from the list to see what it does, whether it is working, and to edit or delete it.',
+  ],
+  [
+    'No watchers yet',
+    'Watchers run a task when something happens, such as a file changing or a message arriving. Ask in Chat to set one up, for example "when a new file lands in Files, summarize it".',
+    'Select a watcher',
+    'Pick one from the list to see what it listens for and what it does, and to enable, disable or delete it.',
+  ],
+  [
+    'No sessions yet',
+    'Each task an agent works on keeps a durable session with its outcome and usage. Sessions appear here as soon as agents start work.',
+    'Select a session',
+    'Pick one from the list to inspect its outcome and usage, pause or resume it, or fork a fresh attempt.',
+  ],
+];
 
 interface AgentInfo {
   agentId: string;
@@ -74,6 +96,15 @@ export class AgentBrowser extends Abject {
   private editBtnId?: AbjectId;
   private toggleBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
+  private listEmptyId?: AbjectId;
+  private detailEmptyId?: AbjectId;
+  private btnRowId?: AbjectId;
+  /** Which empty states are showing; undefined until first applied. */
+  private listEmptyShown?: boolean;
+  private detailEmptyShown?: boolean;
+  /** Whether the "agent at work" eye sigil is in the window's scene. */
+  private sigilShown = false;
+  private windowSize?: { width: number; height: number };
 
   private activeTab = 0;
   private agents: AgentInfo[] = [];
@@ -146,6 +177,11 @@ export class AgentBrowser extends Abject {
       watchCount: this.watches.length,
     }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
+      if (windowId && windowId !== this.windowId) return;
+      await this.onWindowResized(width, height);
+    });
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
@@ -205,10 +241,11 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        spacing: 8,
       })
     );
+    this.windowSize = { width: WIN_W, height: WIN_H };
 
     // Tab bar
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -263,6 +300,23 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Empty states: one shares the list's slot, one stands in for the
+    // detail pane while nothing is selected. Texts follow the active tab.
+    const { widgetIds: [listEmptyId, detailEmptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text: emptyStateMarkdown(TAB_EMPTY[0][0], TAB_EMPTY[0][1]), style: emptyStateStyle(this.theme) },
+          { type: 'label', windowId: this.windowId, text: emptyStateMarkdown(TAB_EMPTY[0][2], TAB_EMPTY[0][3]), style: emptyStateStyle(this.theme) },
+        ],
+      })
+    );
+    this.listEmptyId = listEmptyId;
+    this.detailEmptyId = detailEmptyId;
+    await this.request(request(this.id, leftLayoutId, 'addLayoutChild', {
+      widgetId: this.listEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Right pane: outer VBox with scrollable detail area + buttons at bottom
     const rightOuterId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedVBox', {
@@ -272,12 +326,17 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       })
     );
 
+    await this.request(request(this.id, rightOuterId, 'addLayoutChild', {
+      widgetId: this.detailEmptyId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Scrollable detail area (expanding)
     this.detailLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedScrollableVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 12, bottom: 4, left: 12 },
-        spacing: 6,
+        spacing: 8,
       })
     );
 
@@ -293,7 +352,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true } },
           // 2: metadata
           { type: 'label', windowId: this.windowId, text: '',
-            style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true } },
+            style: { fontSize: 11, color: this.theme.textMeta, wordWrap: true } },
         ],
       })
     );
@@ -316,7 +375,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     }));
 
     // Action buttons row (fixed at bottom)
-    const btnRowId = await this.request<AbjectId>(
+    const btnRowId = this.btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createDetachedHBox', {
         windowId: this.windowId,
         margins: { top: 0, right: 12, bottom: 8, left: 12 },
@@ -372,7 +431,8 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       this.send(request(this.id, this.triggerManagerId, 'addDependent', {}));
     }
 
-    // Populate
+    // Populate (agents always load so the eye sigil reflects work on any tab)
+    if (this.activeTab !== 0) await this.loadAgents();
     await this.loadTabData();
 
     this.changed('visibility', true);
@@ -409,6 +469,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     this.editBtnId = undefined;
     this.toggleBtnId = undefined;
     this.deleteBtnId = undefined;
+    this.listEmptyId = undefined;
+    this.detailEmptyId = undefined;
+    this.btnRowId = undefined;
+    this.listEmptyShown = undefined;
+    this.detailEmptyShown = undefined;
+    this.sigilShown = false;
+    this.windowSize = undefined;
     this.agents = [];
     this.watches = [];
     this.selectedIndex = -1;
@@ -426,10 +493,98 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       case 2: await this.loadSessions(); break;
     }
     for (const [id, text] of [[this.editBtnId, this.activeTab === 2 ? 'Inspect' : 'Edit'], [this.toggleBtnId, this.activeTab === 2 ? 'Resume' : 'Toggle'], [this.deleteBtnId, this.activeTab === 2 ? 'Fork' : 'Delete']] as const) {
-      if (id) await this.request(request(this.id, id, 'update', { text, disabled: false }));
+      if (id) await this.request(request(this.id, id, 'update', { text, disabled: false, style: this.buttonStyle(id) }));
+    }
+    const [listTitle, listHint, detailTitle, detailHint] = TAB_EMPTY[this.activeTab] ?? TAB_EMPTY[0];
+    if (this.listEmptyId && this.detailEmptyId) {
+      await Promise.all([
+        this.request(request(this.id, this.listEmptyId, 'update', { text: emptyStateMarkdown(listTitle, listHint) })),
+        this.request(request(this.id, this.detailEmptyId, 'update', { text: emptyStateMarkdown(detailTitle, detailHint) })),
+      ]);
     }
     await this.rebuildList();
     await this.clearDetail();
+    await this.updateSigil();
+  }
+
+  /**
+   * One primary action per tab (red), destructive Delete, the rest neutral.
+   * Agents: Edit. Watchers: Toggle. Sessions: Resume (Fork is not destructive).
+   */
+  private buttonStyle(id: AbjectId): Record<string, unknown> {
+    const t = this.theme;
+    const primary = { background: t.actionBg, color: t.actionText, borderColor: t.actionBorder };
+    const destructive = { background: t.destructiveBg, color: t.destructiveText, borderColor: t.destructiveBorder };
+    // null (not undefined) survives message serialization and resets to the default look.
+    const neutral = { background: null, color: null, borderColor: null };
+    const primaryId = this.activeTab === 0 ? this.editBtnId : this.toggleBtnId;
+    if (id === primaryId) return primary;
+    if (id === this.deleteBtnId && this.activeTab !== 2) return destructive;
+    return neutral;
+  }
+
+  // -- Empty states --
+
+  /** Swap the list and its empty-state label. */
+  private async applyListEmpty(empty: boolean): Promise<void> {
+    if (!this.listWidgetId || !this.listEmptyId || this.listEmptyShown === empty) return;
+    this.listEmptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.listEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
+  }
+
+  /** Swap the detail pane (and its buttons) with the "select an item" state. */
+  private async applyDetailEmpty(empty: boolean): Promise<void> {
+    if (!this.detailLayoutId || !this.detailEmptyId || !this.btnRowId || this.detailEmptyShown === empty) return;
+    this.detailEmptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.detailLayoutId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.btnRowId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.detailEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
+  }
+
+  // -- Eye sigil: shown while any agent is at work --
+
+  private anyAgentWorking(): boolean {
+    return this.agents.some(a => a.status === 'busy' || a.activeTasks > 0);
+  }
+
+  /** Sigil position: right end of the tab bar row (px from window centre). */
+  private sigilAnchor(): [number, number, number] {
+    const { width, height } = this.windowSize ?? { width: WIN_W, height: WIN_H };
+    return [width / 2 - 12 - SIGIL_SIZE / 2 - 4, -height / 2 + 36 + 12 + 16, 8];
+  }
+
+  private async updateSigil(): Promise<void> {
+    if (!this.windowId) return;
+    const want = this.anyAgentWorking();
+    if (want === this.sigilShown) return;
+    this.sigilShown = want;
+    const ops = want ? eyeSigilOps(SIGIL_PREFIX, this.sigilAnchor(), SIGIL_SIZE) : removeSigilOps(SIGIL_PREFIX);
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', { ops }));
+    } catch (err) {
+      log.warn('Sigil scene update failed:', err);
+    }
+  }
+
+  private async onWindowResized(width: number, height: number): Promise<void> {
+    const prev = this.windowSize;
+    this.windowSize = { width, height };
+    if (!this.sigilShown || !this.windowId) return;
+    if (prev && prev.width === width && prev.height === height) return;
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', {
+        ops: [...removeSigilOps(SIGIL_PREFIX), ...eyeSigilOps(SIGIL_PREFIX, this.sigilAnchor(), SIGIL_SIZE)],
+      }));
+    } catch { /* window may be gone */ }
   }
 
   private async loadSessions(): Promise<void> {
@@ -529,19 +684,31 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   private buildListItems(): ListItem[] {
     switch (this.activeTab) {
       case 0:
-        return this.agents.map(a => {
-          const icon = AGENT_STATUS_ICONS[a.status] ?? '\u2022';
+        // Kit marks: a working agent glows in the living light, idle ones rest.
+        return this.agents.map((a): ListItem => {
+          const working = a.status === 'busy' || a.activeTasks > 0;
           const tasks = a.activeTasks > 0 ? ` (${a.activeTasks} active)` : '';
-          return { label: `${icon} ${a.name}${tasks}`, value: a.agentId };
+          return {
+            label: `${a.name}${tasks}`, value: a.agentId,
+            iconName: working ? 'activity' : 'dot',
+            iconColor: working ? this.theme.accentSecondary : this.theme.textMeta,
+          };
         });
       case 1:
-        return this.watches.map((w, i) => {
-          const icon = w.enabled ? '\u25C9' : '\u25CB';  // ◉ or ○
+        return this.watches.map((w, i): ListItem => {
           const filter = w.kind === 'watch' && w.aspectFilter ? ` [${w.aspectFilter}]` : '';
           const fires = w.lastError ? `${w.triggerCount} fires, error` : `${w.triggerCount} fires`;
-          return { label: `${icon} ${w.targetName}${filter}`, value: String(i), secondary: fires };
+          return {
+            label: `${w.targetName}${filter}`, value: String(i), secondary: fires,
+            iconName: w.enabled ? 'eye' : 'dot',
+            iconColor: w.lastError ? this.theme.statusError : (w.enabled ? this.theme.accentSecondary : this.theme.textMeta),
+          };
         });
-      case 2: return this.sessions.map(s => ({ label: s.intent.slice(0, 100), value: s.id, secondary: `${s.agentName} · ${s.status} · attempt ${s.attempt}` }));
+      case 2: return this.sessions.map((s): ListItem => ({
+        label: s.intent.slice(0, 100), value: s.id, secondary: `${s.agentName} · ${s.status} · attempt ${s.attempt}`,
+        iconName: s.status === 'running' ? 'activity' : 'dot',
+        iconColor: s.status === 'running' ? this.theme.accentSecondary : this.theme.textMeta,
+      }));
       default:
         return [];
     }
@@ -553,12 +720,14 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     try {
       await this.request(request(this.id, this.listWidgetId, 'update', { items }));
     } catch { /* widget may be gone */ }
+    await this.applyListEmpty(items.length === 0);
   }
 
   // -- Detail pane --
 
   private async clearDetail(): Promise<void> {
     await this.updateDetail('Select an item', '', '');
+    await this.applyDetailEmpty(true);
   }
 
   private async updateDetail(title: string, desc: string, meta: string): Promise<void> {
@@ -570,6 +739,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         this.request(request(this.id, this.detailMetaId!, 'update', { text: meta })),
       ]);
     } catch { /* widgets may be gone */ }
+    if (title !== 'Select an item') await this.applyDetailEmpty(false);
   }
 
   private async showDetailForSelection(): Promise<void> {
@@ -659,11 +829,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     // AgentAbject events -- refresh agents tab
     if (fromId === this.agentAbjectId) {
       if (aspect === 'agentRegistered' || aspect === 'agentUnregistered' || aspect === 'taskPhaseChanged') {
+        // Agents stay current on every tab so the eye sigil tracks real work.
+        await this.loadAgents();
         if (this.activeTab === 0) {
-          await this.loadAgents();
           await this.rebuildList();
           if (this.selectedIndex >= 0) await this.showDetailForSelection();
         }
+        await this.updateSigil();
       }
       return;
     }
@@ -860,7 +1032,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       this.selectedIndex = -1;
       await this.loadAgents();
       await this.rebuildList();
-      await this.updateDetail('Select an item', '', '');
+      await this.clearDetail();
       await this.notify(`Agent "${agent.name}" deleted`, 'success');
     } catch (err) {
       log.warn('Failed to delete agent:', err);

@@ -13,7 +13,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { lightenColor } from './widgets/widget-types.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
 
@@ -256,7 +256,7 @@ export class ChatBrowser extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\uD83D\uDCAC  Conversations',
+        title: 'Conversations',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 210,
         resizable: true,
@@ -267,8 +267,8 @@ export class ChatBrowser extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: this.theme.tokens.space.xl, right: this.theme.tokens.space.xl, bottom: this.theme.tokens.space.xl, left: this.theme.tokens.space.xl },
-        spacing: this.theme.tokens.space.md,
+        margins: { top: 16, right: 16, bottom: 16, left: 16 },
+        spacing: 8,
       })
     );
 
@@ -334,7 +334,7 @@ export class ChatBrowser extends Abject {
   private async populate(rows: PersistedConversation[]): Promise<void> {
     if (!this.rootLayoutId || !this.windowId) return;
 
-    // Header row: title + "+ New chat"
+    // Header row: section header with the count, and "+ New chat"
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -345,8 +345,9 @@ export class ChatBrowser extends Abject {
 
     const headerSpecs: Array<Record<string, unknown>> = [
       {
-        type: 'label', windowId: this.windowId, text: 'Conversations',
-        style: { color: this.theme.textPrimary, fontSize: 14, fontWeight: 'bold', align: 'left', wordWrap: false, selectable: false },
+        type: 'label', windowId: this.windowId,
+        text: sectionHeaderText(this.theme, rows.length === 1 ? '1 chat' : `${rows.length} chats`),
+        style: { ...sectionHeaderStyle(this.theme, 14), align: 'left', wordWrap: false, selectable: false },
       },
       {
         type: 'button', windowId: this.windowId, text: '+ New chat',
@@ -355,7 +356,6 @@ export class ChatBrowser extends Abject {
           color: this.theme.actionText,
           borderColor: this.theme.actionBorder,
           fontSize: 13,
-          radius: 6,
         },
       },
     ];
@@ -453,24 +453,15 @@ export class ChatBrowser extends Abject {
 
   private async renderEmptyState(): Promise<void> {
     if (!this.rootLayoutId || !this.windowId) return;
-    const text =
-      '\u2728  **Start a conversation**\n\n' +
-      'Each chat is its own window and keeps its own history. ' +
-      'Click **+ New chat** above to begin.';
+    const text = emptyStateMarkdown(
+      'Start a conversation',
+      'Each chat is its own window and keeps its own history. Click **+ New chat** above to begin.',
+    );
     const { widgetIds: [cardId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [{
           type: 'markdown', windowId: this.windowId, text,
-          style: {
-            color: this.theme.textPrimary,
-            fontSize: 13,
-            wordWrap: true,
-            selectable: false,
-            markdown: true,
-            align: 'center',
-            background: lightenColor(this.theme.windowBg, 6),
-            radius: 12,
-          },
+          style: { ...emptyStateStyle(this.theme), selectable: false },
         }],
       })
     );

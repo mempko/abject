@@ -13,9 +13,16 @@ import {
   ObjectRegistration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { chromeCase, type ThemeData } from '../core/theme-data.js';
+import { emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+
+/** Filled destructive button style from the theme's destructive slots. */
+function destructiveFillStyle(theme: ThemeData): { background: string; color: string; borderColor: string } {
+  return { background: theme.destructiveBg, color: theme.destructiveText, borderColor: theme.destructiveBorder };
+}
 
 const log = new Log('ProcessExplorer');
 
@@ -125,13 +132,14 @@ export class ProcessExplorer extends Abject {
 
   /** Map object state → theme color. */
   private stateColor(state: string): string {
+    // Running and busy objects are alive (living light), stopped ones are
+    // idle (meta), errors stay in the error slot.
     switch (state) {
-      case 'ready': return this.theme.statusSuccess;
+      case 'ready':
+      case 'busy': return livingStyle(this.theme).color as string;
       case 'error': return this.theme.statusError;
-      case 'initializing':
-      case 'busy': return this.theme.statusWarning;
-      case 'stopped': return this.theme.statusNeutral;
-      default: return this.theme.statusNeutral;
+      case 'initializing': return this.theme.statusWarning;
+      default: return this.theme.textMeta;
     }
   }
 
@@ -491,21 +499,25 @@ export class ProcessExplorer extends Abject {
     await this.refreshHeapStrip();
 
     // ── Header row ──
+    // A solid band with inverted display type, matching the kit's table
+    // header; the insets line the columns up with the row cells below (rows
+    // pad 6px each side).
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        margins: { top: 0, right: 6, bottom: 0, left: 6 },
         spacing: 4,
+        style: { background: this.theme.textPrimary, radius: this.theme.widgetRadius },
       })
     );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 20 },
+      preferredSize: { height: 22 },
     }));
 
-    const headerStyle = { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' };
-    const headerTexts = ['Name', 'ID', 'State', 'Location', 'Actions'];
+    const headerStyle = { color: this.theme.windowBg, fontSize: 11, fontWeight: 'bold', fontFamily: 'display' };
+    const headerTexts = ['Name', 'ID', 'State', 'Location', 'Actions'].map((t) => chromeCase(this.theme, t));
     const headerWidths: Array<number | undefined> = [undefined, 70, 70, 80, 110];
 
     const { widgetIds: headerLabelIds } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -703,6 +715,23 @@ export class ProcessExplorer extends Abject {
 
     const rowH = 26;
 
+    if (filteredRows.length === 0) {
+      const text = query
+        ? emptyStateMarkdown('No matching objects', `Nothing running is named like "${this.searchText}". Clear the search to see every object.`)
+        : emptyStateMarkdown('No objects yet', 'Running Abjects appear here as they spawn. Press Refresh to check again.');
+      const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [{ type: 'label', windowId: this.windowId!, text, style: emptyStateStyle(this.theme) }],
+        })
+      );
+      await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
+        widgetId: emptyId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 80 },
+      }));
+      return;
+    }
+
     for (let i = 0; i < filteredRows.length; i++) {
       const row = filteredRows[i];
 
@@ -711,7 +740,7 @@ export class ProcessExplorer extends Abject {
           parentLayoutId: this.scrollableListId,
           margins: { top: 0, right: 6, bottom: 0, left: 6 },
           spacing: 4,
-          style: { background: this.theme.inputBg, borderColor: this.theme.inputBorder, radius: 6 },
+          style: { background: this.theme.inputBg, borderColor: this.theme.inputBorder, radius: this.theme.widgetRadius },
         })
       );
       await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
@@ -733,7 +762,7 @@ export class ProcessExplorer extends Abject {
             specs: [
               { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: this.theme.textHeading, selectable: true } },
               { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: this.theme.sectionLabel, selectable: true } },
-              { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor, selectable: true } },
+              { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor, selectable: true, ...(row.state === 'busy' ? { fontWeight: 'bold' } : {}) } },
               { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: this.theme.textMeta, selectable: true } },
             ],
           })
@@ -799,7 +828,7 @@ export class ProcessExplorer extends Abject {
         const { widgetIds: [stopBtnId, restartBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', {
             specs: [
-              { type: 'button', windowId: this.windowId!, text: 'Stop', style: { fontSize: 10, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } },
+              { type: 'button', windowId: this.windowId!, text: 'Stop', style: { fontSize: 10, ...destructiveFillStyle(this.theme) } },
               { type: 'button', windowId: this.windowId!, text: 'Restart', style: { fontSize: 10 } },
             ],
           })

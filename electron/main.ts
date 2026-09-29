@@ -124,6 +124,7 @@ function createWindow(port: number): void {
     width: 1280,
     height: 800,
     title: 'Abject',
+    backgroundColor: '#06070a',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,

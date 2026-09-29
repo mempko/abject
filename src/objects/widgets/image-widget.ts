@@ -9,6 +9,7 @@
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { request } from '../../core/message.js';
+import { hatch, inkFrame } from './widget-types.js';
 
 export interface ImageWidgetConfig extends WidgetConfig {
   url?: string;
@@ -104,8 +105,15 @@ export class ImageWidget extends WidgetAbject {
         },
       });
     } else if (this.alt) {
+      // Placeholder: a hatched, hairline-framed plate behind
+      // the alt text (only when the caller did not style a background).
+      if (!this.style.background && w > 4 && h > 4) {
+        const r = { x: ox, y: oy, width: w, height: h };
+        commands.push(...hatch(surfaceId, r, this.theme.divider, 10, 1));
+        commands.push(...inkFrame(surfaceId, r, this.theme.divider, 1));
+      }
       // Alt text fallback
-      const font = buildFont(this.style);
+      const font = buildFont(this.style, this.theme);
       commands.push({
         type: 'text',
         surfaceId,

@@ -20,7 +20,8 @@
  */
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
-import { BODY_FONT_STACK, lightenColor } from './widget-types.js';
+import { fontStacks, withAlpha, inkFrame } from './widget-types.js';
+import { shapeOf, chromeCase } from '../../core/theme-data.js';
 
 export interface TableColumnSpec {
   key: string;
@@ -45,11 +46,17 @@ const DEFAULT_ROW_HEIGHT = 26;
 const SCROLLBAR_WIDTH = 8;
 const SCROLL_STEP = 30;
 const CELL_PAD = 8;
-const BODY_FONT = `13px ${BODY_FONT_STACK}`;
-const HEADER_FONT = `600 12px ${BODY_FONT_STACK}`;
 const DOUBLE_CLICK_MS = 400;
 
 export class TableWidget extends WidgetAbject {
+  private bodyFont(): string {
+    return `13px ${fontStacks(this.theme).body}`;
+  }
+
+  private headerFont(): string {
+    return `600 12px ${fontStacks(this.theme).display}`;
+  }
+
   private columns: TableColumnSpec[] = [];
   private rowsData: Record<string, unknown>[] = [];
   private sortable: boolean;
@@ -185,17 +192,18 @@ export class TableWidget extends WidgetAbject {
     const w = this.rect.width;
     const h = this.rect.height;
     const widths = this.columnWidths(w);
+    const shape = shapeOf(this.theme);
 
     // Background
-    commands.push({
-      type: 'rect', surfaceId,
-      params: {
-        x: ox, y: oy, width: w, height: h,
-        fill: this.theme.inputBg,
-        stroke: this.theme.inputBorder,
-        radius: this.style.radius ?? this.theme.widgetRadius,
-      },
-    });
+    if (!this.style.radius) {
+      // Square paper well, solid ink header band, ink rule frame.
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.inputBg } });
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: Math.min(h, HEADER_HEIGHT), fill: this.theme.textPrimary } });
+      commands.push(...inkFrame(surfaceId, { x: ox, y: oy, width: w, height: h }, this.theme.inputBorder, shape.ruleWidth));
+    } else {
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.inputBg, stroke: this.theme.inputBorder, radius: this.style.radius } });
+      commands.push({ type: 'rect', surfaceId, params: { x: ox + 1, y: oy + 1, width: w - 2, height: Math.min(h, HEADER_HEIGHT) - 1, fill: this.theme.textPrimary } });
+    }
 
     // Header row
     {
@@ -204,35 +212,28 @@ export class TableWidget extends WidgetAbject {
         const col = this.columns[i];
         const cw = widths[i];
         const align = col.align ?? 'left';
-        let label = col.label;
+        let label = chromeCase(this.theme, col.label);
         if (this.sortKey === col.key) {
           label += this.sortDir === 1 ? ' ▲' : ' ▼';
         }
         const display = await this.truncateWithEllipsis(
-          surfaceId, label, Math.max(4, cw - CELL_PAD * 2), HEADER_FONT);
+          surfaceId, label, Math.max(4, cw - CELL_PAD * 2), this.headerFont());
         const tx = align === 'center' ? cx + cw / 2
           : align === 'right' ? cx + cw - CELL_PAD
           : cx + CELL_PAD;
+        commands.push({ type: 'save', surfaceId, params: {} }, { type: 'letterSpacing', surfaceId, params: { value: `${shape.titleTracking}px` } });
         commands.push({
           type: 'text', surfaceId,
           params: {
             x: tx, y: oy + HEADER_HEIGHT / 2,
-            text: display, font: HEADER_FONT,
-            fill: this.theme.textSecondary,
+            text: display, font: this.headerFont(),
+            fill: this.theme.windowBg,
             align, baseline: 'middle',
           },
         });
+        commands.push({ type: 'restore', surfaceId, params: {} });
         cx += cw;
       }
-      // Accent underline separating header from body
-      commands.push({
-        type: 'line', surfaceId,
-        params: {
-          x1: ox + 2, y1: oy + HEADER_HEIGHT,
-          x2: ox + w - 2, y2: oy + HEADER_HEIGHT,
-          stroke: this.theme.accent, lineWidth: 1,
-        },
-      });
     }
 
     // Body rows (clipped, scrolled, culled)
@@ -256,32 +257,16 @@ export class TableWidget extends WidgetAbject {
       const isSelected = vi === this.selectedIndex;
       const isHovered = vi === this.hoveredIndex && !isSelected;
 
-      // Zebra striping, then selection/hover on top of it
+      // Selection/hover band, then a hairline row rule
       if (isSelected) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: {
-            x: ox + 2, y: rowY, width: w - 4, height: this.rowHeight,
-            fill: this.theme.selectionBg, radius: 3,
-          },
-        });
+        // Ink band with a red block at the left.
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: rowY, width: w - 4, height: this.rowHeight, fill: this.theme.textPrimary } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: rowY, width: 5, height: this.rowHeight, fill: this.theme.accent } });
       } else if (isHovered) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: {
-            x: ox + 2, y: rowY, width: w - 4, height: this.rowHeight,
-            fill: lightenColor(this.theme.inputBg, 8), radius: 3,
-          },
-        });
-      } else if (vi % 2 === 1) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: {
-            x: ox + 2, y: rowY, width: w - 4, height: this.rowHeight,
-            fill: lightenColor(this.theme.inputBg, 4),
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: rowY, width: w - 4, height: this.rowHeight, fill: withAlpha(this.theme.textPrimary, 0.07) } });
       }
+      // Hairline row rule
+      commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: rowY + this.rowHeight - 1, width: w - 4, height: 1, fill: this.theme.divider } });
 
       let cx = ox;
       for (let i = 0; i < this.columns.length; i++) {
@@ -293,7 +278,7 @@ export class TableWidget extends WidgetAbject {
           ? this.editText + '|'
           : this.cellText(row[col.key]);
         const display = await this.truncateWithEllipsis(
-          surfaceId, raw, Math.max(4, cw - CELL_PAD * 2), BODY_FONT);
+          surfaceId, raw, Math.max(4, cw - CELL_PAD * 2), this.bodyFont());
         const tx = align === 'center' ? cx + cw / 2
           : align === 'right' ? cx + cw - CELL_PAD
           : cx + CELL_PAD;
@@ -303,8 +288,8 @@ export class TableWidget extends WidgetAbject {
             params: {
               x: cx + 2, y: rowY + 1, width: cw - 4, height: this.rowHeight - 2,
               fill: this.theme.windowBg,
-              stroke: this.theme.inputBorderFocus,
-              radius: 3,
+              stroke: this.theme.accent,
+              radius: 0,
             },
           });
         }
@@ -312,8 +297,10 @@ export class TableWidget extends WidgetAbject {
           type: 'text', surfaceId,
           params: {
             x: tx, y: rowY + this.rowHeight / 2,
-            text: display, font: BODY_FONT,
-            fill: isSelected ? this.theme.accent : this.theme.textPrimary,
+            text: display, font: this.bodyFont(),
+            fill: isSelected
+              ? (!isEditing ? this.theme.windowBg : this.theme.accent)
+              : this.theme.textPrimary,
             align, baseline: 'middle',
           },
         });
@@ -341,7 +328,7 @@ export class TableWidget extends WidgetAbject {
         type: 'rect', surfaceId,
         params: {
           x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
-          radius: 3, fill: this.theme.scrollbarThumb,
+          radius: 0, fill: this.theme.scrollbarThumb,
         },
       });
     }

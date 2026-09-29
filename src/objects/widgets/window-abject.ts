@@ -16,16 +16,18 @@ import { request, event } from '../../core/message.js';
 import {
   Rect,
   ThemeData,
-  ARCANE_GRIMOIRE,
+  DEFAULT_THEME,
   WINDOW_INTERFACE,
   TITLE_BAR_HEIGHT,
-  TITLE_FONT,
-  lightenColor,
-  withAlpha,
-  gradientRect,
+  titleFont,
+  inkFrame,
 } from './widget-types.js';
+import { shapeOf, chromeCase } from '../../core/theme-data.js';
 import { iconCommands } from '../../ui/icons.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
+
+/** The four title-bar buttons, as WindowManager names them. */
+type TitleButtonKind = 'close' | 'minimize' | 'maximize' | 'help';
 
 export interface WindowConfig {
   title: string;
@@ -50,6 +52,16 @@ export interface WindowConfig {
 /**
  * WindowAbject — a composite morph that owns a surface and contains child widgets.
  */
+/**
+ * A window title as the title band draws it: pictographic emoji are dropped
+ * (the band's eye sigil is the window's mark) and the rest is trimmed. The
+ * title itself (getTitle, the dock, the switcher) is unchanged.
+ */
+function bandTitle(title: string): string {
+  const stripped = title.replace(/[\p{Extended_Pictographic}\u{FE0F}\u{200D}]/gu, '').replace(/\s{2,}/g, ' ').trim();
+  return stripped || title;
+}
+
 export class WindowAbject extends Abject {
   private surfaceId?: string;
   private uiServerId: AbjectId;
@@ -74,6 +86,8 @@ export class WindowAbject extends Abject {
   private focusedChildId?: AbjectId;
   private focusedParentChildId?: AbjectId;  // the window's direct child (layout) that contains focusedChildId
   private hoveredChildId?: AbjectId;
+  /** Title-bar button under the pointer (drives the Constructivist hover plate). */
+  private hoveredTitleButton?: TitleButtonKind;
 
   private windowFocused = false;
   private destroying = false;
@@ -231,7 +245,7 @@ export class WindowAbject extends Abject {
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
-    this.theme = config.theme ?? ARCANE_GRIMOIRE;
+    this.theme = config.theme ?? DEFAULT_THEME;
 
     this.setupHandlers();
   }
@@ -465,6 +479,7 @@ export class WindowAbject extends Abject {
         }
         this.hoveredChildId = undefined;
       }
+      if (!focused) this.hoveredTitleButton = undefined;
 
       this.scheduleFrame();
     });
@@ -784,6 +799,137 @@ by re-matching title/owner.
     }
   }
 
+  /**
+   * Title-bar button centers, right to left: close, maximize, minimize, help.
+   * Mirrors WindowManager.detectTitleButton (the hit-test authority).
+   */
+  private titleButtonCenters(): Record<TitleButtonKind, number> {
+    const btnSize = this.theme.titleButtonSize;
+    const btnMargin = this.theme.titleButtonMargin;
+    const close = this.rect.width - btnMargin - btnSize / 2;
+    const maximize = close - btnSize - btnMargin;
+    const minimize = maximize - btnSize - btnMargin;
+    const help = minimize - btnSize - btnMargin;
+    return { close, maximize, minimize, help };
+  }
+
+  /** The title-bar button at window-local (x, y), if any. */
+  private titleButtonAt(x: number, y: number): TitleButtonKind | undefined {
+    const tbh = this.theme.titleBarHeight;
+    if (y < 0 || y >= tbh) return undefined;
+    const half = this.theme.titleButtonSize / 2;
+    if (Math.abs(y - tbh / 2) > half) return undefined;
+    const centers = this.titleButtonCenters();
+    for (const kind of ['close', 'maximize', 'minimize', 'help'] as const) {
+      if (Math.abs(x - centers[kind]) <= half) return kind;
+    }
+    return undefined;
+  }
+
+  /**
+   * Constructivist window chrome: flat paper body, a solid title band (red
+   * when focused, ink when not) with a paper wedge at its left, an upper-case
+   * tracked display title, square title buttons, and an ink frame. No wash,
+   * gradient, or glow; the compositor draws the hard block shadow.
+   */
+  private renderChrome(
+    commands: unknown[], sid: string, w: number, h: number, tbh: number, focused: boolean,
+  ): void {
+    const theme = this.theme;
+    const shape = shapeOf(theme);
+
+    if (!this.transparent) {
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: h, fill: theme.windowBg },
+      });
+    }
+
+    if (!this.chromeless) {
+      // Focused: a solid red band with the paper stripe. Resting windows
+      // recede to a quiet band in the title-bar tone with muted type and a
+      // red stripe, so one red band on screen always marks the focus.
+      const band = focused ? theme.accent : theme.titleBarBg;
+      const bandText = focused ? theme.actionText : theme.textSecondary;
+      commands.push({ type: 'rect', surfaceId: sid, params: { x: 0, y: 0, width: w, height: tbh, fill: band } });
+
+      // The eye sigil: a ring with a phosphor slit pupil, watching from the
+      // corner of every window (the thing the poster contains).
+      const ex = 19;
+      const ey = tbh / 2;
+      commands.push({
+        type: 'circle', surfaceId: sid,
+        params: { cx: ex, cy: ey, radius: 8, stroke: focused ? bandText : theme.accent, lineWidth: 2 },
+      });
+      commands.push({
+        type: 'ellipse', surfaceId: sid,
+        params: { cx: ex, cy: ey, radiusX: 2, radiusY: 5.5, fill: theme.accentSecondary },
+      });
+
+      const centers = this.titleButtonCenters();
+      const btnSize = theme.titleButtonSize;
+      const iconSize = theme.titleButtonIconSize;
+      const cy = tbh / 2;
+
+      // Title: upper-case display face with tracking, clipped short of the
+      // button cluster so long titles never run under the buttons.
+      const titleRight = Math.max(0, centers.help - btnSize / 2 - 6);
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({ type: 'clip', surfaceId: sid, params: { x: 0, y: 0, width: titleRight, height: tbh } });
+      commands.push({ type: 'letterSpacing', surfaceId: sid, params: { value: `${shape.titleTracking}px` } });
+      commands.push({
+        type: 'text',
+        surfaceId: sid,
+        params: {
+          x: 32, y: cy,
+          text: chromeCase(theme, bandTitle(this.title)), font: titleFont(theme), fill: bandText, baseline: 'middle',
+        },
+      });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
+
+      // Square buttons. Hover lays a paper plate under an ink icon; close
+      // hover inverts against the band instead (red on ink, ink on red).
+      const drawButton = (kind: TitleButtonKind, icon: 'close' | 'minimize' | 'maximize' | 'restore' | 'help') => {
+        const cx = centers[kind];
+        const hovered = this.hoveredTitleButton === kind;
+        let iconColor = bandText;
+        if (hovered) {
+          const plate = kind === 'close'
+            ? (focused ? theme.textPrimary : theme.accent)
+            : (focused ? theme.titleButtonHoverBg : theme.windowBg);
+          iconColor = kind === 'close'
+            ? (focused ? theme.windowBg : theme.actionText)
+            : theme.textPrimary;
+          commands.push({
+            type: 'rect',
+            surfaceId: sid,
+            params: { x: Math.round(cx - btnSize / 2), y: Math.round(cy - btnSize / 2), width: btnSize, height: btnSize, fill: plate },
+          });
+        }
+        commands.push(...iconCommands(icon, {
+          surfaceId: sid,
+          x: cx - iconSize / 2,
+          y: cy - iconSize / 2,
+          size: iconSize,
+          color: iconColor,
+          lineWidth: Math.max(1.5, iconSize / 8),
+          caps: shape.iconCaps,
+        }));
+      };
+      drawButton('help', 'help');
+      drawButton('minimize', 'minimize');
+      drawButton('maximize', this.maximized ? 'restore' : 'maximize');
+      drawButton('close', 'close');
+    }
+
+    if (!this.transparent) {
+      // Resting windows take a quieter frame so the focused one leads.
+      const frame = focused || this.chromeless ? theme.windowBorder : theme.textTertiary;
+      commands.push(...inkFrame(sid, { x: 0, y: 0, width: w, height: h }, frame, shape.ruleWidth));
+    }
+  }
+
   private async renderWindowInner(): Promise<void> {
     const sid = this.surfaceId!;
     const w = this.rect.width;
@@ -796,139 +942,13 @@ by re-matching title/owner.
     // Clear
     commands.push({ type: 'clear', surfaceId: sid, params: {} });
 
-    // Unfocused windows are drawn at 0.88 alpha so the focused one visually
-    // pops (Selective Attention). The wrapping save/restore guarantees the
-    // alpha never leaks into surrounding chrome.
-    const focusAlpha = focused ? 1.0 : 0.88;
+    // Windows stay fully opaque; focus is carried by the title band (accent
+    // when focused, quiet otherwise) and the compositor's print shadow.
     commands.push({ type: 'save', surfaceId: sid, params: {} });
-    commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: focusAlpha } });
+    this.renderChrome(commands, sid, w, h, tbh, focused);
 
-    if (!this.transparent) {
-      // Window shadow — deeper when focused (Selective Attention / Von Restorff)
-      const shadow = focused ? tokens.elevation.level3 : tokens.elevation.level2;
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId: sid,
-        params: { color: shadow.color, blur: shadow.blur, offsetY: shadow.offsetY },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, radius: this.theme.windowRadius },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-      // Window background with its single neutral border. Focus is signalled by
-      // the compositor's accent glow halo (drawn behind the window), so there is
-      // no separate accent border line — that would just duplicate the glow.
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
-      });
-
-      // Faint accent wash across the whole window — very subtle, gives the surface
-      // a tint of "alive" without competing with the accent line.
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: focused ? 0.04 : 0.02 } });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 1, y: 1, width: w - 2, height: h - 2, fill: this.theme.accent, radius: this.theme.windowRadius },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-
-    }
-
-    if (!this.chromeless) {
-      // Title bar — top corners rounded to match the window shell, flat
-      // bottom edge, with a barely-there vertical gradient lighting the bar
-      // from above. The accent line below carries the visual weight, so the
-      // bar itself stays quiet to avoid competing.
-      commands.push(...gradientRect(sid, {
-        x: 0, y: 0, width: w, height: tbh,
-        radii: [this.theme.windowRadius, this.theme.windowRadius, 0, 0],
-        gradient: { x0: 0, y0: 0, x1: 0, y1: tbh, stops: [
-          { offset: 0, color: lightenColor(this.theme.titleBarBg, 6 * tokens.surface.gradient) },
-          { offset: 1, color: this.theme.titleBarBg },
-        ] },
-      }));
-
-      // Title text — accent glow when focused, desaturated when not (Von
-      // Restorff). A touch of letter spacing gives the title a deliberate,
-      // engraved feel.
-      const titleColor = focused ? this.theme.textPrimary : this.theme.textSecondary;
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({ type: 'letterSpacing', surfaceId: sid, params: { value: '0.4px' } });
-      if (focused) {
-        commands.push({
-          type: 'shadow',
-          surfaceId: sid,
-          params: { color: tokens.glow.accent.color, blur: tokens.glow.accent.blur },
-        });
-      }
-      commands.push({
-        type: 'text',
-        surfaceId: sid,
-        params: {
-          x: 14, y: tbh / 2,
-          text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
-        },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-      // Close and minimize buttons — vector icons in 24×24 hit boxes (Fitts).
-      // Hovered button gets a faint accent-colored backplate.
-      const btnSize = this.theme.titleButtonSize;
-      const btnMargin = this.theme.titleButtonMargin;
-      const iconSize = this.theme.titleButtonIconSize;
-
-      const closeCx = w - btnMargin - btnSize / 2;
-      const maxCx = closeCx - btnSize - btnMargin;
-      const minCx = maxCx - btnSize - btnMargin;
-      const helpCx = minCx - btnSize - btnMargin;
-      const cy = tbh / 2;
-
-      const iconColor = focused ? this.theme.textSecondary : this.theme.textTertiary;
-      const drawButton = (cx: number, kind: 'close' | 'minimize' | 'maximize' | 'restore' | 'help') => {
-        commands.push(...iconCommands(kind, {
-          surfaceId: sid,
-          x: cx - iconSize / 2,
-          y: cy - iconSize / 2,
-          size: iconSize,
-          color: iconColor,
-        }));
-      };
-
-      // Left to right: help (?), minimize, maximize/restore, close. Close stays
-      // anchored to the right corner; the maximize button swaps to a "restore"
-      // glyph (overlapping squares) once the window is maximized.
-      drawButton(helpCx, 'help');
-      drawButton(minCx, 'minimize');
-      drawButton(maxCx, this.maximized ? 'restore' : 'maximize');
-      drawButton(closeCx, 'close');
-
-      // Title-bar divider — a single quiet hairline separating the title bar
-      // from content. Focus is carried by the accent border + compositor halo,
-      // so this stays calm: a faint accent tint when focused, plain divider when
-      // not (no bright bar, no glow).
-      const lineY = tbh;
-      commands.push({
-        type: 'line',
-        surfaceId: sid,
-        params: {
-          x1: 0, y1: lineY, x2: w, y2: lineY,
-          stroke: focused ? withAlpha(this.theme.accent, 0.28) : this.theme.divider,
-          lineWidth: 1,
-        },
-      });
-    }
-
-    // (Focused-window outer glow halo is drawn by the compositor behind the
-    // window — see Compositor.drawFocusGlow — so it can extend beyond the window
-    // edges without being clipped by the window surface or covered by content.)
+    // (The print shadow, living-light rim and aura are drawn by the
+    // compositor around the slab, so they can extend beyond the window edges.)
 
     // Resize grip — vector icon in the bottom-right corner
     if (this.resizable) {
@@ -940,6 +960,7 @@ by re-matching title/owner.
         size: gripSize,
         color: focused ? this.theme.resizeGrip : this.theme.divider,
         lineWidth: 1.25,
+        caps: shapeOf(this.theme).iconCaps,
       }));
     }
 
@@ -1009,6 +1030,10 @@ by re-matching title/owner.
   }
 
   private async handleMouseLeave(): Promise<void> {
+    if (this.hoveredTitleButton) {
+      this.hoveredTitleButton = undefined;
+      this.scheduleFrame();
+    }
     // Send mouseleave to hovered child
     if (this.hoveredChildId) {
       try {
@@ -1131,6 +1156,15 @@ by re-matching title/owner.
     // Compute global coordinates for child widgets
     const globalX = this.rect.x + (e.x ?? 0);
     const globalY = this.rect.y + (e.y ?? 0);
+
+    // Title-bar button hover plates.
+    if (!this.chromeless) {
+      const hit = this.titleButtonAt(e.x ?? 0, e.y ?? 0);
+      if (hit !== this.hoveredTitleButton) {
+        this.hoveredTitleButton = hit;
+        this.scheduleFrame();
+      }
+    }
 
     // Forward mousemove to expanded selects for hover
     for (const childId of this.expandedSelects) {

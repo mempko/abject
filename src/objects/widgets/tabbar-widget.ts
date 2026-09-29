@@ -9,7 +9,8 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, gradientRect } from './widget-types.js';
+import { fontStacks, wedge, withAlpha } from './widget-types.js';
+import { shapeOf, chromeCase } from '../../core/theme-data.js';
 
 export interface TabBarConfig extends WidgetConfig {
   tabs?: string[];
@@ -41,150 +42,112 @@ export class TabBarWidget extends WidgetAbject {
     this.closable = config.closable ?? false;
   }
 
+  /**
+   * Slanted parallelogram tabs standing on a heavy
+   * ink baseline. The active tab is a solid red slab with inverse text;
+   * labels are uppercase display type (tab labels are chrome). Hit zones are
+   * equal-width columns.
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
+    const theme = this.theme;
+    const shape = shapeOf(theme);
     const tabCount = this.tabs.length;
     if (tabCount === 0) return commands;
 
     const tabWidth = w / tabCount;
+    const rule = shape.ruleWidth;
+    const tabH = h - rule;
+    const slant = Math.min(8, tabWidth / 4);
+    const size = style.fontSize ?? 13;
+    const labelFont = `600 ${size}px ${fontStacks(theme).display}`;
+    const editFont = buildFont(style, theme);
 
-    // Reduce opacity when disabled
     if (this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
     }
 
+    commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? theme.windowBg } });
+
     for (let i = 0; i < tabCount; i++) {
       const tx = ox + i * tabWidth;
       const isActive = i === this.selectedIndex;
       const isHovered = i === this.hoveredIndex && !isActive;
+      const points = [
+        { x: tx + slant, y: oy },
+        { x: tx + tabWidth, y: oy },
+        { x: tx + tabWidth - slant, y: oy + tabH },
+        { x: tx, y: oy + tabH },
+      ];
 
-      // Tab background. The active tab rises out of the bar: top corners
-      // rounded, lit from above by a soft vertical gradient. The gradient
-      // collapses to a flat lighten(8) when the theme's surface treatment
-      // is flat, keeping the active/inactive distinction.
       if (isActive) {
-        const g = this.theme.tokens.surface.gradient;
-        commands.push(...gradientRect(surfaceId, {
-          x: tx, y: oy, width: tabWidth, height: h,
-          radii: [6, 6, 0, 0],
-          gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
-            { offset: 0, color: lightenColor(this.theme.windowBg, 8 + 6 * g) },
-            { offset: 1, color: lightenColor(this.theme.windowBg, 8 - 2 * g) },
-          ] },
-        }));
+        commands.push(...wedge(surfaceId, points, theme.accent));
       } else {
         commands.push({
-          type: 'rect',
-          surfaceId,
+          type: 'polygon', surfaceId,
           params: {
-            x: tx, y: oy, width: tabWidth, height: h,
-            fill: isHovered ? lightenColor(this.theme.windowBg, 12) : this.theme.windowBg,
+            points,
+            fill: isHovered ? withAlpha(theme.textPrimary, 0.08) : theme.windowBg,
+            stroke: theme.divider, lineWidth: 1, closePath: true,
           },
         });
       }
 
-      // Check if this tab is being renamed inline
+      const textColor = isActive ? theme.actionText : (style.color ?? theme.textPrimary);
       if (this.editingIndex === i) {
-        // Render editable text box
-        const editBg = lightenColor(this.theme.windowBg, 16);
-        const editPad = 4;
+        const editPad = 4 + slant / 2;
         commands.push({
-          type: 'rect',
-          surfaceId,
+          type: 'rect', surfaceId,
           params: {
-            x: tx + editPad, y: oy + 3, width: tabWidth - editPad * 2 - (this.closable ? 18 : 0), height: h - 6,
-            fill: editBg,
-            stroke: this.theme.accent,
-            lineWidth: 1,
+            x: tx + editPad, y: oy + 3, width: tabWidth - editPad * 2 - (this.closable ? 18 : 0), height: tabH - 6,
+            fill: theme.inputBg, stroke: theme.inputBorder, lineWidth: 1,
           },
         });
-        const displayText = this.editText + (this.cursorVisible ? '|' : '');
         commands.push({
-          type: 'text',
-          surfaceId,
+          type: 'text', surfaceId,
           params: {
-            x: tx + editPad + 4,
-            y: oy + h / 2 - 1,
-            text: displayText,
-            font,
-            fill: style.color ?? this.theme.textPrimary,
-            align: 'left',
-            baseline: 'middle',
+            x: tx + editPad + 4, y: oy + tabH / 2,
+            text: this.editText + (this.cursorVisible ? '|' : ''),
+            font: editFont, fill: theme.textPrimary, align: 'left', baseline: 'middle',
           },
         });
       } else {
-        // Tab label — shift left slightly when closable to make room for ×
         const labelCenterX = this.closable ? tx + (tabWidth - 18) / 2 : tx + tabWidth / 2;
         commands.push({
-          type: 'text',
-          surfaceId,
+          type: 'text', surfaceId,
           params: {
-            x: labelCenterX,
-            y: oy + h / 2 - 1,
-            text: this.tabs[i],
-            font,
-            fill: isActive
-              ? (style.color ?? this.theme.textPrimary)
-              : this.theme.textSecondary,
-            align: 'center',
-            baseline: 'middle',
+            x: labelCenterX, y: oy + tabH / 2,
+            text: chromeCase(theme, this.tabs[i]),
+            font: labelFont, fill: textColor, align: 'center', baseline: 'middle',
           },
         });
       }
 
-      // Close button (×) — show if closable and not the "+" tab
       if (this.closable && this.tabs[i] !== '+') {
-        const closeX = tx + tabWidth - 16;
-        const closeY = oy + h / 2 - 1;
         const isCloseHovered = i === this.hoveredCloseIndex;
         commands.push({
-          type: 'text',
-          surfaceId,
+          type: 'text', surfaceId,
           params: {
-            x: closeX,
-            y: closeY,
+            x: tx + tabWidth - 16 - slant / 2, y: oy + tabH / 2,
             text: '\u00D7',
-            font: `${11}px sans-serif`,
-            fill: isCloseHovered ? this.theme.textPrimary : this.theme.textSecondary,
-            align: 'center',
-            baseline: 'middle',
-          },
-        });
-      }
-
-      // Active tab bottom accent border
-      if (isActive) {
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: {
-            x: tx, y: oy + h - 3, width: tabWidth, height: 3,
-            fill: this.theme.accent,
+            font: `600 12px ${fontStacks(theme).body}`,
+            fill: isActive ? theme.actionText : (isCloseHovered ? theme.accent : theme.textSecondary),
+            align: 'center', baseline: 'middle',
           },
         });
       }
     }
 
-    // Full-width bottom divider line
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox, y: oy + h - 1, width: w, height: 1,
-        fill: this.theme.divider,
-      },
-    });
+    // Heavy ink baseline the tabs stand on.
+    commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy + h - rule, width: w, height: rule, fill: theme.textPrimary } });
 
-    // Close disabled alpha save
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
-
     return commands;
   }
 

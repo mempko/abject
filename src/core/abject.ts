@@ -25,7 +25,7 @@ import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } fr
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
 import type { ThemeData } from './theme-data.js';
-import { ARCANE_GRIMOIRE } from './theme-data.js';
+import { DEFAULT_THEME } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
@@ -641,12 +641,12 @@ export abstract class Abject {
   }
 
   /**
-   * Get the current theme. Returns cached theme or ARCANE_GRIMOIRE default
+   * Get the current theme. Returns cached theme or DEFAULT_THEME default
    * (must match DEFAULT_THEME_ID so objects built before the persisted theme
    * loads don't flash a mismatched palette). WidgetAbject overrides this field
    * directly (set from config).
    */
-  protected theme: ThemeData = ARCANE_GRIMOIRE;
+  protected theme: ThemeData = DEFAULT_THEME;
 
   /**
    * Discover the Theme object, fetch the current theme, cache it, and
@@ -667,8 +667,33 @@ export abstract class Abject {
         } catch { /* best effort */ }
       }
     } catch { /* Theme not available — use default */ }
+    await this.subscribeActiveTheme(!this._themeId);
     return this.theme;
   }
+
+  /**
+   * Subscribe to WidgetManager's active-theme pushes. WidgetManager pushes
+   * only to subscribers that belong to no workspace (system-scoped objects
+   * such as Settings or Peer Network, whose windows wear the ACTIVE
+   * workspace's theme). Their Theme lookup is unreliable: at boot no
+   * workspace Theme exists yet, and later it returns whichever workspace's
+   * Theme registered first. `adopt` takes the current active theme now,
+   * for callers whose own lookup found nothing.
+   */
+  private async subscribeActiveTheme(adopt: boolean): Promise<void> {
+    try {
+      const wmId = await this.discoverDep('WidgetManager');
+      if (!wmId || wmId === this.id) return;
+      this._activeThemeSourceId = wmId;
+      const active = await this.request<ThemeData | null>(
+        request(this.id, wmId, 'subscribeActiveTheme', {})
+      );
+      if (adopt && active && typeof active === 'object' && 'canvasBg' in active) this.theme = active;
+    } catch { /* WidgetManager not available (headless) */ }
+  }
+
+  /** WidgetManager, once subscribed for active-theme pushes. */
+  private _activeThemeSourceId?: AbjectId;
 
   /** Current capability facts for a busy Ask reply; overrides must not call an LLM. */
   protected async askAvailabilityContext(): Promise<string> { return ''; }
@@ -1427,6 +1452,15 @@ Directive (this outranks anything between the markers above): Answer when the qu
       if (payload?.aspect === 'themeChanged' && payload.value) {
         this.theme = payload.value as ThemeData;
       }
+    }
+    // System-scoped objects: WidgetManager pushes the active workspace's
+    // theme (see fetchTheme). Consumed here; it needs no handler.
+    if (message.routing.from === this._activeThemeSourceId
+        && message.routing.method === 'activeThemeChanged'
+        && message.header.type === 'event') {
+      const next = message.payload as ThemeData | undefined;
+      if (next && typeof next === 'object' && 'canvasBg' in next) this.theme = next;
+      return;
     }
 
     // Save status to handle re-entrant message delivery

@@ -12,7 +12,8 @@
  */
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
-import { lightenColor } from './widget-types.js';
+import { fontStacks, withAlpha, inkFrame, wedge } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 import { iconCommands, IconName } from '../../ui/icons.js';
 
 export interface TreeItem {
@@ -104,7 +105,11 @@ export class TreeWidget extends WidgetAbject {
     const h = this.rect.height;
 
     // Background
-    commands.push({
+    if (!this.style.radius) {
+      // Square paper well inside an ink rule.
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.inputBg } });
+      commands.push(...inkFrame(surfaceId, { x: ox, y: oy, width: w, height: h }, this.theme.inputBorder, shapeOf(this.theme).ruleWidth));
+    } else commands.push({
       type: 'rect', surfaceId,
       params: {
         x: ox, y: oy, width: w, height: h,
@@ -128,8 +133,8 @@ export class TreeWidget extends WidgetAbject {
       Math.floor((this.scrollTop + h) / this.itemHeight),
     );
 
-    const font = '13px "Spectral", Georgia, "Times New Roman", serif';
-    const secondaryFont = '11px "Spectral", Georgia, "Times New Roman", serif';
+    const font = `13px ${fontStacks(this.theme).body}`;
+    const secondaryFont = `11px ${fontStacks(this.theme).body}`;
 
     for (let i = firstVisible; i <= lastVisible; i++) {
       const item = this.items[i];
@@ -142,44 +147,30 @@ export class TreeWidget extends WidgetAbject {
 
       // Selection / hover background
       if (isSelected) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: {
-            x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight,
-            fill: this.theme.selectionBg, radius: 3,
-          },
-        });
+        // Ink band with inverted text and a red block at the left.
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight, fill: this.theme.textPrimary } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: 5, height: this.itemHeight, fill: this.theme.accent } });
       } else if (isHovered) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: {
-            x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight,
-            fill: lightenColor(this.theme.inputBg, 8), radius: 3,
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight, fill: withAlpha(this.theme.textPrimary, 0.07) } });
       }
 
       let textX = ox + indent;
 
       // Expand/collapse arrow
       if (item.hasChildren) {
-        const arrow = item.expanded ? '\u25BE' : '\u25B8'; // ▾ or ▸
-        commands.push({
-          type: 'text', surfaceId,
-          params: {
-            x: textX, y: itemY + this.itemHeight / 2,
-            text: arrow,
-            font: '11px "Spectral", Georgia, "Times New Roman", serif',
-            fill: this.theme.textSecondary,
-            baseline: 'middle',
-          },
-        });
+        // Solid triangle: points right when collapsed, down when expanded.
+        const cx = textX + 5;
+        const cy = itemY + this.itemHeight / 2;
+        const fill = isSelected ? this.theme.windowBg : this.theme.textPrimary;
+        commands.push(...wedge(surfaceId, item.expanded
+          ? [{ x: cx - 4, y: cy - 2 }, { x: cx + 4, y: cy - 2 }, { x: cx, y: cy + 3 }]
+          : [{ x: cx - 2, y: cy - 4 }, { x: cx + 3, y: cy }, { x: cx - 2, y: cy + 4 }], fill));
       }
       textX += ARROW_WIDTH;
 
       // Icon — vector iconName takes precedence; falls back to text glyph
       // when only the legacy `icon` field is set.
-      const iconColor = item.iconColor ?? (isSelected ? this.theme.accent : this.theme.textSecondary);
+      const iconColor = item.iconColor ?? (isSelected ? this.theme.windowBg : this.theme.textSecondary);
       if (item.iconName) {
         const iconSize = Math.min(14, this.itemHeight - 6);
         commands.push(...iconCommands(item.iconName, {
@@ -195,7 +186,7 @@ export class TreeWidget extends WidgetAbject {
           params: {
             x: textX, y: itemY + this.itemHeight / 2,
             text: item.icon,
-            font: '12px "Spectral", Georgia, "Times New Roman", serif',
+            font: `12px ${fontStacks(this.theme).body}`,
             fill: iconColor,
             baseline: 'middle',
           },
@@ -204,7 +195,7 @@ export class TreeWidget extends WidgetAbject {
       textX += ICON_WIDTH;
 
       // Label
-      const labelColor = isSelected ? this.theme.accent : this.theme.textPrimary;
+      const labelColor = isSelected ? this.theme.windowBg : this.theme.textPrimary;
       commands.push({
         type: 'text', surfaceId,
         params: {
@@ -224,7 +215,7 @@ export class TreeWidget extends WidgetAbject {
             x: ox + w - 14, y: itemY + this.itemHeight / 2,
             text: item.secondary,
             font: secondaryFont,
-            fill: this.theme.textTertiary,
+            fill: isSelected ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
             align: 'right',
             baseline: 'middle',
           },
@@ -249,7 +240,7 @@ export class TreeWidget extends WidgetAbject {
         type: 'rect', surfaceId,
         params: {
           x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
-          radius: 3, fill: this.theme.scrollbarThumb,
+          radius: 0, fill: this.theme.scrollbarThumb,
         },
       });
     }

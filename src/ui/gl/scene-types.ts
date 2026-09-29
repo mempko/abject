@@ -135,6 +135,21 @@ export interface SceneTheme {
   surface: { gradient: number; bevel: number; gloss: number };
   glow: { focusBlur: number; focusColor: string; accentBlur: number; accentColor: string };
   shadow: { color: string; blur: number; offsetY: number };
+  /**
+   * Shape language subset (mirrors tokens.shape). Optional: absent means the
+   * soft legacy chrome (blurred shadows, accent focus halo, abyss backdrop).
+   */
+  shape?: {
+    shadowStyle: 'soft' | 'block';
+    blockShadowOffset: number;
+    blockShadowColor: string;
+    blockFocusColor: string;
+    ruleWidth: number;
+    ornament: 'none' | 'constructivist' | 'sigil';
+    backdrop: 'abyss' | 'constructivist' | 'sigil';
+  };
+  /** Font families for client-drawn chrome text (overview cards). Optional. */
+  fonts?: { body: string; display: string; mono: string };
 }
 
 const TOKEN_SET = new Set<string>(SCENE_THEME_TOKENS);

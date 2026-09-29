@@ -15,6 +15,12 @@ import {
   InterfaceId,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { chromeCase, type ThemeData } from '../core/theme-data.js';
+import {
+  sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle,
+  eyeSigilOps, removeSigilOps, type SceneOp,
+} from './ui-kit.js';
+import type { WidgetStyle } from './widgets/widget-types.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
@@ -27,12 +33,21 @@ import type {
   LLMSpendReport,
 } from './llm-object.js';
 
+/** Filled destructive button style from the theme's destructive slots. */
+function destructiveFillStyle(theme: ThemeData): { background: string; color: string; borderColor: string } {
+  return { background: theme.destructiveBg, color: theme.destructiveText, borderColor: theme.destructiveBorder };
+}
+
 const log = new Log('LLMMonitor');
 
 const LLM_MONITOR_INTERFACE: InterfaceId = 'abjects:llm-monitor';
 
 const WIN_W = 880;
 const WIN_H = 500;
+/** Node-id prefix for The Eye's sigil in the main window's scene. */
+const EYE_PREFIX = 'llm-monitor-eye';
+/** Eye sigil ring diameter (px). */
+const EYE_SIZE = 26;
 const DETAIL_W = 650;
 const DETAIL_H = 500;
 
@@ -237,6 +252,11 @@ export class LLMMonitor extends Abject {
   // Detail window
   private detailWindowId?: AbjectId;
 
+  /** True while The Eye's sigil is in the main window's scene (eldritch theme, requests in flight). */
+  private eyeShown = false;
+  /** Last known main window size, for anchoring the sigil to the header's right edge. */
+  private eyeWinSize?: { width: number; height: number };
+
   constructor() {
     super({
       manifest: {
@@ -300,6 +320,16 @@ export class LLMMonitor extends Abject {
       } else {
         await this.hide();
       }
+    });
+
+    // Keep The Eye anchored to the header's right edge as the window resizes.
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { windowId, width, height } = (msg.payload ?? {}) as { windowId?: AbjectId; width?: number; height?: number };
+      if (!this.windowId || (windowId && windowId !== this.windowId)) return;
+      if (typeof width !== 'number' || typeof height !== 'number' || width <= 0 || height <= 0) return;
+      this.eyeWinSize = { width, height };
+      if (!this.eyeShown) return;
+      await this.sendEyeOps([{ op: 'update', id: `${EYE_PREFIX}-sigil`, transform: { position: this.eyePosition() } }]);
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
@@ -402,6 +432,8 @@ export class LLMMonitor extends Abject {
     );
 
     this.windowId = undefined;
+    this.eyeShown = false;
+    this.eyeWinSize = undefined;
     this.clearViewTracking();
     this.changed('visibility', false);
     return true;
@@ -485,7 +517,7 @@ export class LLMMonitor extends Abject {
             { type: 'button', windowId: this.windowId!, text: 'Unpause', style: { fontSize: 12 } },
             { type: 'button', windowId: this.windowId!, text: 'Refresh', style: { fontSize: 12 } },
             { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 11, color: this.theme.statusWarning } },
-            { type: 'label', windowId: this.windowId!, text: 'Loading stats...', style: { color: this.theme.sectionLabel, fontSize: 11 } },
+            { type: 'label', windowId: this.windowId!, text: 'Loading stats...', style: this.statsStripLabelStyle() },
           ],
         })
       );
@@ -509,11 +541,25 @@ export class LLMMonitor extends Abject {
       ],
     }));
 
-    // Stats label
+    // Stats header strip: the window-wide totals sit in a framed band so
+    // they read as the headline of everything below.
+    const statsStripId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 2, right: 8, bottom: 2, left: 8 },
+        spacing: 8,
+        style: { background: this.theme.inputBg, borderColor: this.theme.inputBorder, radius: this.theme.widgetRadius },
+      })
+    );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: statsStripId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 26 },
+    }));
+    await this.request(request(this.id, statsStripId, 'addLayoutChild', {
       widgetId: this.statsLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 18 },
+      preferredSize: { height: 22 },
     }));
 
     // Tab bar
@@ -592,7 +638,7 @@ export class LLMMonitor extends Abject {
       await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
-            { type: 'label', windowId: this.windowId!, text: 'Loading spend...', style: { fontSize: 13, fontWeight: 'bold', color: this.theme.textHeading } },
+            { type: 'label', windowId: this.windowId!, text: 'Loading spend...', style: sectionHeaderStyle(this.theme) },
             { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 11, color: this.theme.sectionLabel } },
             {
               type: 'chart', windowId: this.windowId!, kind: 'bar',
@@ -615,7 +661,7 @@ export class LLMMonitor extends Abject {
 
     await this.request(request(this.id, spendBox, 'addLayoutChildren', {
       children: [
-        { widgetId: summaryId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 } },
+        { widgetId: summaryId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
         { widgetId: noteId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 16 } },
         { widgetId: chartId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 110 } },
         { widgetId: tableId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
@@ -647,8 +693,8 @@ export class LLMMonitor extends Abject {
             { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
             { type: 'label', windowId: this.windowId!, text: 'prompts in memory', style: { fontSize: 10, color: this.theme.sectionLabel } },
             { type: 'input', windowId: this.windowId!, text: '', style: { fontSize: 10 } },
-            { type: 'button', windowId: this.windowId!, text: 'Apply', style: { fontSize: 10 } },
-            { type: 'button', windowId: this.windowId!, text: 'Clear ledger', style: { fontSize: 10, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } },
+            { type: 'button', windowId: this.windowId!, text: 'Apply', style: { fontSize: 10, background: this.theme.actionBg, color: this.theme.actionText } },
+            { type: 'button', windowId: this.windowId!, text: 'Clear ledger', style: { fontSize: 10, ...destructiveFillStyle(this.theme) } },
             { type: 'label', windowId: this.windowId!, text: '', style: { fontSize: 10, color: this.theme.sectionLabel, fontStyle: 'italic' } },
           ],
         })
@@ -743,7 +789,7 @@ export class LLMMonitor extends Abject {
       return this.ledgerRowDesc(req, {
         time: `${elapsedSec}s`,
         timeSort: elapsedSec,
-        nameColor: req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
+        nameColor: req.streaming ? livingStyle(this.theme).color as string : this.theme.textMeta,
         actionText: 'Kill',
         isKill: true,
       });
@@ -762,8 +808,16 @@ export class LLMMonitor extends Abject {
     this.sortDescs(activeDesc, this.tabSort[0]);
     this.sortDescs(historyDesc, this.tabSort[1]);
 
-    await this.reconcileTab(0, this.activeTabListId!, activeDesc, true, 'No active requests');
-    await this.reconcileTab(1, this.historyTabListId!, historyDesc, false, 'No history yet');
+    await this.reconcileTab(0, this.activeTabListId!, activeDesc, true, emptyStateMarkdown(
+      'No requests in flight',
+      'Calls to a language model appear here while they run, with a Kill button to stop one.',
+    ));
+    await this.reconcileTab(1, this.historyTabListId!, historyDesc, false, emptyStateMarkdown(
+      'No history yet',
+      'Finished calls land here. Press View on a row to read its full prompt and output.',
+    ));
+
+    await this.updateEye(activeRequests.length > 0);
   }
 
   /**
@@ -1137,7 +1191,7 @@ export class LLMMonitor extends Abject {
    * active column carries a ▼/▲ indicator.
    */
   private async addHeaderRow(tabIndex: number, targetLayoutId: AbjectId): Promise<AbjectId> {
-    const headerStyle = { color: this.theme.sectionLabel, fontSize: 10, fontWeight: 'bold' };
+    const headerStyle = { color: this.theme.textHeading, fontSize: 10, fontWeight: 'bold', fontFamily: 'display' };
 
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -1182,7 +1236,7 @@ export class LLMMonitor extends Abject {
   }
 
   private headerText(tabIndex: number, col: SortCol): string {
-    const base = HEADER_COLUMNS.find((c) => c.col === col)!.text;
+    const base = chromeCase(this.theme, HEADER_COLUMNS.find((c) => c.col === col)!.text);
     const sort = this.tabSort[tabIndex];
     if (sort.col !== col) return base;
     return `${base} ${sort.dir === -1 ? '▼' : '▲'}`;
@@ -1204,14 +1258,14 @@ export class LLMMonitor extends Abject {
     const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId!, text, style: { fontSize: 12, color: this.theme.sectionLabel, fontStyle: 'italic' } },
+          { type: 'label', windowId: this.windowId!, text, style: emptyStateStyle(this.theme) },
         ],
       })
     );
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: emptyId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 26 },
+      preferredSize: { height: 72 },
     }));
     return emptyId;
   }
@@ -1267,7 +1321,7 @@ export class LLMMonitor extends Abject {
 
     // Action button
     const btnStyle = d.isKill
-      ? { fontSize: 10, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText }
+      ? { fontSize: 10, ...destructiveFillStyle(this.theme) }
       : { fontSize: 10 };
 
     const { widgetIds: [btnId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -1368,9 +1422,9 @@ export class LLMMonitor extends Abject {
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
             { type: 'label', windowId: this.detailWindowId, text: summaryText, style: { fontSize: 11, color: this.theme.sectionLabel } },
-            { type: 'label', windowId: this.detailWindowId, text: 'Prompt:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
+            { type: 'label', windowId: this.detailWindowId, text: sectionHeaderText(this.theme, 'Prompt'), style: sectionHeaderStyle(this.theme, 12) },
             { type: 'textArea', windowId: this.detailWindowId, text: entry.inputMessages || '(no input captured)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
-            { type: 'label', windowId: this.detailWindowId, text: 'Output:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
+            { type: 'label', windowId: this.detailWindowId, text: sectionHeaderText(this.theme, 'Output'), style: sectionHeaderStyle(this.theme, 12) },
             { type: 'textArea', windowId: this.detailWindowId, text: entry.outputContent || '(no output)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
           ],
         })
@@ -1379,12 +1433,61 @@ export class LLMMonitor extends Abject {
     await this.request(request(this.id, rootId, 'addLayoutChildren', {
       children: [
         { widgetId: summaryId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
-        { widgetId: promptLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
+        { widgetId: promptLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 } },
         { widgetId: promptAreaId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: outputLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
+        { widgetId: outputLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 } },
         { widgetId: outputAreaId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
       ],
     }));
+  }
+
+  /** Style for the totals line inside the header strip. */
+  private statsStripLabelStyle(): WidgetStyle {
+    return { color: this.theme.textPrimary, fontSize: 11, fontWeight: 'bold' };
+  }
+
+  // -- The Eye --
+
+  /** Sigil position: the right end of the control bar, in px from the window centre. */
+  private eyePosition(): [number, number, number] {
+    const w = this.eyeWinSize?.width ?? WIN_W;
+    const h = this.eyeWinSize?.height ?? WIN_H;
+    // Content starts 36px below the top; the control bar is 30px tall after an 8px margin.
+    return [w / 2 - 12 - EYE_SIZE, -h / 2 + 36 + 8 + 15, 6];
+  }
+
+  /**
+   * The Eye opens while any LLM request is in flight and closes when the
+   * last one settles. One scene batch per transition; all motion is client-side.
+   */
+  private async updateEye(active: boolean): Promise<void> {
+    if (!this.windowId) return;
+    const want = active;
+    if (want === this.eyeShown) return;
+    if (want) {
+      if (!this.eyeWinSize) {
+        try {
+          const r = await this.request<{ width: number; height: number }>(
+            request(this.id, this.windowId, 'getRect', {})
+          );
+          if (r && r.width > 0 && r.height > 0) this.eyeWinSize = { width: r.width, height: r.height };
+        } catch { /* fall back to the default size */ }
+      }
+      this.eyeShown = true;
+      await this.sendEyeOps(eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE));
+    } else {
+      this.eyeShown = false;
+      await this.sendEyeOps(removeSigilOps(EYE_PREFIX));
+    }
+  }
+
+  private async sendEyeOps(ops: SceneOp[]): Promise<void> {
+    if (!this.windowId) return;
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', { ops }));
+    } catch (err) {
+      log.warn('Failed to update The Eye sigil:', err);
+    }
   }
 
   private async hideDetail(): Promise<void> {

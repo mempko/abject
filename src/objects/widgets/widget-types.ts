@@ -3,10 +3,11 @@
  */
 
 import { AbjectId, InterfaceId } from '../../core/types.js';
+import type { ThemeData } from '../../core/theme-data.js';
 
 // Re-export ThemeData and default theme constants from core (canonical source)
 export type { ThemeData } from '../../core/theme-data.js';
-export { MIDNIGHT_BLOOM, ARCANE_GRIMOIRE } from '../../core/theme-data.js';
+export { MIDNIGHT_BLOOM, ARCANE_GRIMOIRE, AGITPROP, RED_WEDGE, DEFAULT_THEME } from '../../core/theme-data.js';
 
 // ── Interface IDs ──────────────────────────────────────────────────────────
 
@@ -34,6 +35,7 @@ export interface WidgetStyle {
   syntaxHighlight?: boolean;  // textArea only: colorize JavaScript tokens
   flat?: boolean;  // buttons only: quiet row (sidebar/toolbar item) — no depth gradient, bevel, or border; hover/press feedback only
   tooltip?: string;  // hover tooltip text, shown after a dwell via WidgetManager's tooltip service (used by icon-only buttons)
+  icon?: string;  // buttons only: a built-in vector icon name (ui/icons.ts IconName) drawn before the text; unknown names are ignored
 }
 
 export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video';
@@ -199,16 +201,51 @@ export interface Rect {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-// Font stacks for the Arcane Grimoire look: a screen-serif body, a characterful
-// display serif for titles/headings, and a refined mono. Defined once here so
-// every widget that builds an ad-hoc font string stays in the same family.
-export const BODY_FONT_STACK = '"Spectral", Georgia, "Times New Roman", serif';
-export const DISPLAY_FONT_STACK = '"Fraunces", "Spectral", Georgia, serif';
-export const MONO_FONT_STACK = '"Spline Sans Mono", "JetBrains Mono", monospace';
+// The design's three font families: a humanist sans body, a condensed display
+// face for titles and headings, and a mono. Defined once here so every widget
+// that builds an ad-hoc font string stays in the same family. Themes carry the
+// same faces in their type tokens; these are the fallbacks when no theme is at hand.
+export const BODY_FONT_STACK = '"PT Sans", "Helvetica Neue", Arial, sans-serif';
+export const DISPLAY_FONT_STACK = '"Oswald", "PT Sans Narrow", "Arial Narrow", sans-serif';
+export const MONO_FONT_STACK = '"JetBrains Mono", "Spline Sans Mono", monospace';
 
 export const WIDGET_FONT = `14px ${BODY_FONT_STACK}`;
-export const TITLE_FONT = `600 14px ${DISPLAY_FONT_STACK}`;
+export const TITLE_FONT = `600 15px ${DISPLAY_FONT_STACK}`;
 export const CODE_FONT = `13px ${MONO_FONT_STACK}`;
+
+/** The three font families a theme renders with. */
+export interface FontStacks {
+  body: string;
+  display: string;
+  mono: string;
+}
+
+/** A theme's font families, read from its type tokens. */
+export function fontStacks(theme?: ThemeData): FontStacks {
+  const t = theme?.tokens?.type;
+  return {
+    body: t?.body.font ?? BODY_FONT_STACK,
+    display: t?.display.font ?? DISPLAY_FONT_STACK,
+    mono: t?.code.font ?? MONO_FONT_STACK,
+  };
+}
+
+/** Default widget text font for a theme. */
+export function widgetFont(theme?: ThemeData): string {
+  return `14px ${fontStacks(theme).body}`;
+}
+
+/** Window title font for a theme, from its title type token. */
+export function titleFont(theme?: ThemeData): string {
+  const t = theme?.tokens?.type?.title;
+  return t ? `${t.weight} ${t.size}px ${t.font}` : TITLE_FONT;
+}
+
+/** Code font for a theme. */
+export function codeFont(theme?: ThemeData): string {
+  return `13px ${fontStacks(theme).mono}`;
+}
+
 export const DEFAULT_LINE_HEIGHT = 18;
 export const TITLE_BAR_HEIGHT = 36;
 export const EDGE_SIZE = 10;
@@ -250,7 +287,7 @@ export interface LayoutStyle {
 
 /**
  * Lighten a hex color by bumping each RGB channel. The amount is rounded so
- * fractional values (e.g. scaled by tokens.surface.gradient) stay valid hex.
+ * fractional values stay valid hex.
  */
 export function lightenColor(hex: string, amount = 20): string {
   const amt = Math.round(amount);
@@ -263,7 +300,7 @@ export function lightenColor(hex: string, amount = 20): string {
 
 /**
  * Darken a hex color by reducing each RGB channel. The amount is rounded so
- * fractional values (e.g. scaled by tokens.surface.gradient) stay valid hex.
+ * fractional values stay valid hex.
  */
 export function darkenColor(hex: string, amount = 20): string {
   const amt = Math.round(amount);
@@ -331,4 +368,97 @@ export function withAlpha(color: string, alpha: number): string {
   const g = parseInt(c.substring(2, 4), 16);
   const b = parseInt(c.substring(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+// ── Design draw vocabulary ──────────────────────────────────────────────
+//
+// Shared command builders for the design's shape language (see ShapeTokens in
+// core/theme-data.ts). Every helper stays inside the rect
+// it is given: a widget's surface slot is exactly its rect, so anything drawn
+// outside would be clipped or would paint over a neighbour.
+
+type Cmd = { type: string; surfaceId: string; params: Record<string, unknown> };
+
+/**
+ * A stroked frame whose outer edge sits exactly on the rect (canvas strokes
+ * straddle the path, so the path is inset by half the line width).
+ */
+export function inkFrame(
+  surfaceId: string,
+  r: { x: number; y: number; width: number; height: number },
+  color: string,
+  lineWidth: number,
+): Cmd[] {
+  const h = lineWidth / 2;
+  return [{
+    type: 'rect', surfaceId,
+    params: { x: r.x + h, y: r.y + h, width: Math.max(0, r.width - lineWidth), height: Math.max(0, r.height - lineWidth), stroke: color, lineWidth },
+  }];
+}
+
+/**
+ * A raised print block: a solid shadow slab offset down-right, and the face
+ * rect shrunk by the offset so both fit inside the given rect. Returns the
+ * shadow commands and the face rect the caller paints on. `pressed` sinks the
+ * face into its shadow (the design's press, in place of a scale shrink).
+ */
+export function raisedBlock(
+  surfaceId: string,
+  r: { x: number; y: number; width: number; height: number },
+  shadowColor: string,
+  offset: number,
+  pressed = false,
+): { commands: Cmd[]; face: { x: number; y: number; width: number; height: number } } {
+  const o = Math.max(0, Math.min(offset, Math.floor(Math.min(r.width, r.height) / 4)));
+  const faceW = r.width - o;
+  const faceH = r.height - o;
+  if (o === 0) return { commands: [], face: { ...r } };
+  if (pressed) {
+    return { commands: [], face: { x: r.x + o, y: r.y + o, width: faceW, height: faceH } };
+  }
+  return {
+    commands: [{
+      type: 'rect', surfaceId,
+      params: { x: r.x + o, y: r.y + o, width: faceW, height: faceH, fill: shadowColor },
+    }],
+    face: { x: r.x, y: r.y, width: faceW, height: faceH },
+  };
+}
+
+/** A filled polygon (wedges, slanted bars, triangles). */
+export function wedge(surfaceId: string, points: Array<{ x: number; y: number }>, fill: string): Cmd[] {
+  return [{ type: 'polygon', surfaceId, params: { points, fill, closePath: true } }];
+}
+
+/**
+ * Diagonal hatching (45°, rising left to right) clipped to a rect: the
+ * design's stand-in for indeterminate progress, scrims, and disabled
+ * fills. `phase` (px) slides the pattern for animation.
+ */
+export function hatch(
+  surfaceId: string,
+  r: { x: number; y: number; width: number; height: number },
+  color: string,
+  spacing = 6,
+  lineWidth = 1.5,
+  phase = 0,
+): Cmd[] {
+  const cmds: Cmd[] = [
+    { type: 'save', surfaceId, params: {} },
+    { type: 'clip', surfaceId, params: { x: r.x, y: r.y, width: r.width, height: r.height } },
+  ];
+  const start = r.x - r.height + (((phase % spacing) + spacing) % spacing) - spacing;
+  for (let x = start; x < r.x + r.width; x += spacing) {
+    cmds.push({
+      type: 'line', surfaceId,
+      params: { x1: x, y1: r.y + r.height, x2: x + r.height, y2: r.y, stroke: color, lineWidth, lineCap: 'butt' },
+    });
+  }
+  cmds.push({ type: 'restore', surfaceId, params: {} });
+  return cmds;
+}
+
+/** A solid square marker (list bullets, rule terminators, active-row tabs). */
+export function squareMark(surfaceId: string, cx: number, cy: number, size: number, fill: string): Cmd[] {
+  return [{ type: 'rect', surfaceId, params: { x: Math.round(cx - size / 2), y: Math.round(cy - size / 2), width: size, height: size, fill } }];
 }

@@ -10,7 +10,8 @@
  */
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
-import { ThemeData } from './widget-types.js';
+import { ThemeData, fontStacks, inkFrame, raisedBlock, wedge } from './widget-types.js';
+import { shapeOf, chromeCase } from '../../core/theme-data.js';
 
 export interface ThemeSwatchWidgetConfig extends WidgetConfig {
   themeId: string;
@@ -38,220 +39,76 @@ export class ThemeSwatchWidget extends WidgetAbject {
     const cmds: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
-    const pt = this.previewTheme;
 
     // ── Selection ring (uses active theme accent so it pops on any preview) ──
-    if (this.selected) {
-      cmds.push({ type: 'save', surfaceId, params: {} });
-      cmds.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.tokens.glow.accent.color, blur: 8, offsetY: 0 },
-      });
-      cmds.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox,
-          y: oy,
-          width: w,
-          height: h,
-          stroke: this.theme.accent,
-          lineWidth: 2,
-          radius: pt.windowRadius + 3,
-        },
-      });
-      cmds.push({ type: 'restore', surfaceId, params: {} });
-    } else if (this.hovered) {
-      cmds.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox,
-          y: oy,
-          width: w,
-          height: h,
-          stroke: this.theme.tokens.elevation.level1.color,
-          lineWidth: 1,
-          radius: pt.windowRadius + 3,
-        },
-      });
-    }
+    // Square ring, no glow.
+    const outer = { x: ox, y: oy, width: w, height: h };
+    if (this.selected) cmds.push(...inkFrame(surfaceId, outer, this.theme.accent, 2));
+    else if (this.hovered) cmds.push(...inkFrame(surfaceId, outer, this.theme.textPrimary, 1));
 
-    // ── Mini window body ──
+    cmds.push(...this.buildPreview(surfaceId, ox, oy));
+    return cmds;
+  }
+
+  /**
+   * Mini window in the preview theme's palette: a square print block
+   * with a hard shadow, a solid red title band with a paper wedge and caps,
+   * a diagonal red bar, and a red action block.
+   */
+  private buildPreview(surfaceId: string, ox: number, oy: number): unknown[] {
+    const cmds: unknown[] = [];
+    const w = this.rect.width;
+    const h = this.rect.height;
+    const pt = this.previewTheme;
     const inset = 5;
-    const winX = ox + inset;
-    const winY = oy + inset;
-    const winW = w - inset * 2;
-    const winH = h - inset * 2;
+    const win = { x: ox + inset, y: oy + inset, width: w - inset * 2, height: h - inset * 2 };
+    const fonts = fontStacks(pt);
+    const shape = shapeOf(pt);
+    const block = raisedBlock(surfaceId, win, shape.blockShadowColor, 3);
+    cmds.push(...block.commands);
+    const f = block.face;
     const tbH = 14;
+    cmds.push({ type: 'rect', surfaceId, params: { ...f, fill: pt.windowBg } });
 
+    // Title band: solid red with a paper wedge at the left and inverse caps.
+    cmds.push({ type: 'rect', surfaceId, params: { x: f.x, y: f.y, width: f.width, height: tbH, fill: pt.accent } });
+    cmds.push(...wedge(surfaceId, [
+      { x: f.x + 5, y: f.y }, { x: f.x + 9, y: f.y },
+      { x: f.x + 4, y: f.y + tbH }, { x: f.x, y: f.y + tbH },
+    ], pt.windowBg));
     cmds.push({
-      type: 'rect',
-      surfaceId,
+      type: 'text', surfaceId,
       params: {
-        x: winX,
-        y: winY,
-        width: winW,
-        height: winH,
-        fill: pt.windowBg,
-        stroke: pt.windowBorder,
-        lineWidth: 1,
-        radius: pt.windowRadius,
+        x: f.x + 13, y: f.y + tbH / 2, text: chromeCase(pt, this.themeName),
+        font: `600 8px ${fonts.display}`, fill: pt.actionText, baseline: 'middle', align: 'left', maxWidth: f.width - 26,
       },
     });
+    cmds.push({ type: 'rect', surfaceId, params: { x: f.x + f.width - 10, y: f.y + 4, width: 6, height: 6, fill: pt.actionText } });
 
-    // ── Title bar ──
+    // Sample content: a display numeral, a diagonal red bar, square body rules.
+    const cy = f.y + tbH + 5;
+    const cx = f.x + 7;
+    const cw = f.width - 14;
+    cmds.push({ type: 'text', surfaceId, params: { x: cx, y: cy, text: 'Aa', font: `700 13px ${fonts.display}`, fill: pt.textHeading, baseline: 'top', align: 'left' } });
+    const barX = cx + 24;
+    cmds.push(...wedge(surfaceId, [
+      { x: barX + 6, y: cy + 1 }, { x: barX + 30, y: cy + 1 },
+      { x: barX + 24, y: cy + 11 }, { x: barX, y: cy + 11 },
+    ], pt.accent));
+    cmds.push({ type: 'rect', surfaceId, params: { x: cx, y: cy + 18, width: cw * 0.85, height: 3, fill: pt.textDescription } });
+    cmds.push({ type: 'rect', surfaceId, params: { x: cx, y: cy + 25, width: cw * 0.6, height: 3, fill: pt.textDescription } });
+
+    // Sample action button: red face over a small hard shadow.
+    const btn = { x: f.x + f.width - 38, y: f.y + f.height - 21, width: 32, height: 16 };
+    const bb = raisedBlock(surfaceId, btn, shape.blockShadowColor, 2);
+    cmds.push(...bb.commands);
+    cmds.push({ type: 'rect', surfaceId, params: { ...bb.face, fill: pt.actionBg } });
     cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: winX,
-        y: winY,
-        width: winW,
-        height: tbH,
-        fill: pt.titleBarBg,
-        radius: pt.windowRadius,
-      },
-    });
-    // Cover the bottom corners of the title-bar rounded rect so it joins the body cleanly.
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: winX,
-        y: winY + tbH - 2,
-        width: winW,
-        height: 2,
-        fill: pt.titleBarBg,
-      },
+      type: 'text', surfaceId,
+      params: { x: bb.face.x + bb.face.width / 2, y: bb.face.y + bb.face.height / 2, text: 'GO', font: `600 8px ${fonts.display}`, fill: pt.actionText, baseline: 'middle', align: 'center' },
     });
 
-    // Title text (theme name), truncated visually by clipping width
-    cmds.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: winX + 6,
-        y: winY + tbH / 2,
-        text: this.themeName,
-        font: '600 9px "Spectral", Georgia, "Times New Roman", serif',
-        fill: pt.textPrimary,
-        baseline: 'middle',
-        align: 'left',
-        maxWidth: winW - 22,
-      },
-    });
-
-    // Tiny close glyph
-    cmds.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: winX + winW - 6,
-        y: winY + tbH / 2,
-        text: '✕',
-        font: '8px "Spectral", Georgia, "Times New Roman", serif',
-        fill: pt.textSecondary,
-        baseline: 'middle',
-        align: 'right',
-      },
-    });
-
-    // ── Accent line under the title bar ──
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: winX,
-        y: winY + tbH,
-        width: winW,
-        height: 1,
-        fill: pt.accent,
-      },
-    });
-
-    // ── Sample content ──
-    const contentY = winY + tbH + 6;
-    const contentX = winX + 8;
-    const contentW = winW - 16;
-
-    // Heading
-    cmds.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: contentX,
-        y: contentY,
-        text: 'Aa',
-        font: '700 12px "Spectral", Georgia, "Times New Roman", serif',
-        fill: pt.textHeading,
-        baseline: 'top',
-        align: 'left',
-      },
-    });
-
-    // Two faux body lines
-    const lineY1 = contentY + 18;
-    const lineY2 = lineY1 + 7;
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: contentX,
-        y: lineY1,
-        width: contentW * 0.85,
-        height: 3,
-        fill: pt.textDescription,
-        radius: 1.5,
-      },
-    });
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: contentX,
-        y: lineY2,
-        width: contentW * 0.6,
-        height: 3,
-        fill: pt.textDescription,
-        radius: 1.5,
-      },
-    });
-
-    // Sample action button (bottom-right)
-    const btnW = 30;
-    const btnH = 14;
-    const btnX = winX + winW - btnW - 6;
-    const btnY = winY + winH - btnH - 6;
-    cmds.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: btnX,
-        y: btnY,
-        width: btnW,
-        height: btnH,
-        fill: pt.actionBg,
-        stroke: pt.actionBorder,
-        lineWidth: 1,
-        radius: pt.widgetRadius,
-      },
-    });
-    cmds.push({
-      type: 'text',
-      surfaceId,
-      params: {
-        x: btnX + btnW / 2,
-        y: btnY + btnH / 2,
-        text: 'Go',
-        font: '700 8px "Spectral", Georgia, "Times New Roman", serif',
-        fill: pt.actionText,
-        baseline: 'middle',
-        align: 'center',
-      },
-    });
-
+    cmds.push(...inkFrame(surfaceId, f, pt.windowBorder, 1.5));
     return cmds;
   }
 

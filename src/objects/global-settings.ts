@@ -11,6 +11,8 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { chromeCase, shapeOf } from '../core/theme-data.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { LLMProviderDescription } from '../llm/provider.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 
@@ -275,6 +277,8 @@ export class GlobalSettings extends Abject {
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
+  /** Permission list id -> its empty-state note. */
+  private listEmptyNoteIds = new Map<AbjectId, AbjectId>();
   private skillBrowserBtnId?: AbjectId;
   private catalogBrowserBtnId?: AbjectId;
 
@@ -466,6 +470,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 - On first boot with no keys configured, the settings window auto-shows.
 - Changes take effect after clicking Save and are applied to the LLM object.
 - This object manages UI only; use it to show/hide the configuration window.`;
+  }
+
+  /** Display face for section titles and captions. */
+  private headerFont(): { fontFamily?: 'display' } {
+    return { fontFamily: 'display' };
   }
 
   protected override async onInit(): Promise<void> {
@@ -970,7 +979,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
             const data = JSON.parse(value as string) as { value: string; actionId: string };
             if (data.actionId === 'remove') {
               target.set(target.get().filter(x => x !== data.value));
-              await this.request(request(this.id, target.id!, 'update', { items: toListItems(target.get()) }));
+              await this.updateStringList(target.id!, target.get());
             }
           } catch { /* malformed payload */ }
         }
@@ -982,7 +991,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.fsPathInputId!, 'getValue', {}));
         if (val && !this.fsAllowedPaths.includes(val)) {
           this.fsAllowedPaths.push(val);
-          await this.request(request(this.id, this.fsPathListId!, 'update', { items: toListItems(this.fsAllowedPaths) }));
+          await this.updateStringList(this.fsPathListId!, this.fsAllowedPaths);
           await this.request(request(this.id, this.fsPathInputId!, 'update', { text: '' }));
         }
         return;
@@ -991,7 +1000,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.fsPathListId!, 'getValue', {}));
         if (sel) {
           this.fsAllowedPaths = this.fsAllowedPaths.filter(p => p !== sel);
-          await this.request(request(this.id, this.fsPathListId!, 'update', { items: toListItems(this.fsAllowedPaths) }));
+          await this.updateStringList(this.fsPathListId!, this.fsAllowedPaths);
         }
         return;
       }
@@ -1010,7 +1019,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.shellCmdInputId!, 'getValue', {}));
         if (val && !this.shellAllowedCmds.includes(val)) {
           this.shellAllowedCmds.push(val);
-          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: toListItems(this.shellAllowedCmds) }));
+          await this.updateStringList(this.shellCmdListId!, this.shellAllowedCmds);
           await this.request(request(this.id, this.shellCmdInputId!, 'update', { text: '' }));
         }
         return;
@@ -1019,7 +1028,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.shellCmdListId!, 'getValue', {}));
         if (sel) {
           this.shellAllowedCmds = this.shellAllowedCmds.filter(c => c !== sel);
-          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: toListItems(this.shellAllowedCmds) }));
+          await this.updateStringList(this.shellCmdListId!, this.shellAllowedCmds);
         }
         return;
       }
@@ -1028,7 +1037,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.shellDeniedInputId!, 'getValue', {}));
         if (val && !this.shellDeniedCmds.includes(val)) {
           this.shellDeniedCmds.push(val);
-          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: toListItems(this.shellDeniedCmds) }));
+          await this.updateStringList(this.shellDeniedListId!, this.shellDeniedCmds);
           await this.request(request(this.id, this.shellDeniedInputId!, 'update', { text: '' }));
         }
         return;
@@ -1037,7 +1046,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.shellDeniedListId!, 'getValue', {}));
         if (sel) {
           this.shellDeniedCmds = this.shellDeniedCmds.filter(c => c !== sel);
-          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: toListItems(this.shellDeniedCmds) }));
+          await this.updateStringList(this.shellDeniedListId!, this.shellDeniedCmds);
         }
         return;
       }
@@ -1078,7 +1087,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.webDomainInputId!, 'getValue', {}));
         if (val && !this.webAllowedDomains.includes(val)) {
           this.webAllowedDomains.push(val);
-          await this.request(request(this.id, this.webDomainListId!, 'update', { items: toListItems(this.webAllowedDomains) }));
+          await this.updateStringList(this.webDomainListId!, this.webAllowedDomains);
           await this.request(request(this.id, this.webDomainInputId!, 'update', { text: '' }));
         }
         return;
@@ -1087,7 +1096,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.webDomainListId!, 'getValue', {}));
         if (sel) {
           this.webAllowedDomains = this.webAllowedDomains.filter(d => d !== sel);
-          await this.request(request(this.id, this.webDomainListId!, 'update', { items: toListItems(this.webAllowedDomains) }));
+          await this.updateStringList(this.webDomainListId!, this.webAllowedDomains);
         }
         return;
       }
@@ -1096,7 +1105,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.webDeniedInputId!, 'getValue', {}));
         if (val && !this.webDeniedDomains.includes(val)) {
           this.webDeniedDomains.push(val);
-          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: toListItems(this.webDeniedDomains) }));
+          await this.updateStringList(this.webDeniedListId!, this.webDeniedDomains);
           await this.request(request(this.id, this.webDeniedInputId!, 'update', { text: '' }));
         }
         return;
@@ -1105,7 +1114,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.webDeniedListId!, 'getValue', {}));
         if (sel) {
           this.webDeniedDomains = this.webDeniedDomains.filter(d => d !== sel);
-          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: toListItems(this.webDeniedDomains) }));
+          await this.updateStringList(this.webDeniedListId!, this.webDeniedDomains);
         }
         return;
       }
@@ -1278,15 +1287,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         ...(expanding ? {} : { autoSize: true }),
         margins: { top: 14, right: 16, bottom: 14, left: 16 },
         spacing: 8,
-        style: { background: this.theme.inputBg, borderColor: this.theme.windowBorder, borderWidth: 1, radius: 10 },
+        style: { background: this.theme.inputBg, borderColor: this.theme.windowBorder, borderWidth: shapeOf(this.theme).ruleWidth, radius: this.theme.widgetRadius },
       })
     );
+    // Shared kit header (mark + chrome case) over a kit hint.
     const { widgetIds: [titleId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: title,
-          style: { color: this.theme.accent, fontWeight: 'bold', fontSize: 14 } },
+        { type: 'label', windowId: this.windowId,
+          text: sectionHeaderText(this.theme, title),
+          style: sectionHeaderStyle(this.theme, 14) },
         { type: 'label', windowId: this.windowId, text: description,
-          style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+          style: hintStyle(this.theme) },
       ]})
     );
     await this.request(request(this.id, cardId, 'addLayoutChild', {
@@ -1324,8 +1335,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Installed Skills',
-          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        // One red primary per card: Browse leads, Installed is secondary.
+        { type: 'button', windowId: this.windowId, text: 'Installed Skills' },
         { type: 'button', windowId: this.windowId, text: 'Browse Skills & MCP',
           style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ]})
@@ -1589,8 +1600,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
               style: { color: this.theme.textHeading, fontSize: 13 } },
             { type: 'select', windowId: this.windowId,
               options: this.presetOptionNames(), selectedIndex: 0 },
-            { type: 'button', windowId: this.windowId, text: 'Apply', style: { fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Apply',
+              style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+            { type: 'button', windowId: this.windowId, text: 'Delete',
+              style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
           ]})
         );
       this.presetSelectId = presetSelectId;
@@ -1644,7 +1657,38 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // ── 3 · Model Tiers (card) ──
     const tiersCard = await this.sectionCard(cId, '3 · Model Tiers',
-      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only. The optional Fallback row names a model that stands in for any tier whose own model fails (outage cover; the switch is recorded in the LLM ledger).', 86);
+      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a ◉ vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only. The optional Fallback row names a model that stands in for any tier whose own model fails (outage cover; the switch is recorded in the LLM ledger).', 86);
+
+    // Column captions over the tier rows, so the unlabeled effort and
+    // capability columns say what they are.
+    {
+      const capRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: tiersCard,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
+        widgetId: capRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 16 },
+      }));
+      const captionStyle = { color: this.theme.textMeta, fontSize: 11, ...this.headerFont() };
+      const captions: Array<[string, number | undefined]> = [
+        ['Tier', 65], ['Provider', 120], ['Model', undefined], ['Reasoning', 92], ['Sees', 62],
+      ];
+      const { widgetIds: captionIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: captions.map(([text]) => (
+          { type: 'label', windowId: this.windowId, text: chromeCase(this.theme, text), style: captionStyle }
+        )) })
+      );
+      await this.request(request(this.id, capRowId, 'addLayoutChildren', {
+        children: captions.map(([, width], i) => width === undefined
+          ? { widgetId: captionIds[i], sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 16 } }
+          : { widgetId: captionIds[i], sizePolicy: { horizontal: 'fixed' }, preferredSize: { width, height: 16 } }),
+      }));
+    }
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
     for (let i = 0; i < TIER_NAMES.length; i++) {
@@ -1844,18 +1888,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async buildAuthTab(): Promise<void> {
     const cId = this.authContainerId!;
 
-    // Auth section header
-    const { widgetIds: [authHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Authentication',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: authHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
+    // The login fields live in a kit section card (header + hint).
+    const authParent: AbjectId = await this.sectionCard(cId, 'Authentication',
+      'Ask for a username and password whenever a client connects to this desktop. Saving reconnects open clients.', 34);
 
     // Load saved auth settings
     let savedAuthEnabled = false;
@@ -1877,12 +1912,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Enable auth checkbox row
     const authEnableRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: authParent,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, authParent, 'addLayoutChild', {
       widgetId: authEnableRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
@@ -1914,13 +1949,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ]})
     );
     this.authUserInputId = authUserInputId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, authParent, 'addLayoutChild', {
       widgetId: authUserLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
     await this.request(request(this.id, this.authUserInputId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, authParent, 'addLayoutChild', {
       widgetId: this.authUserInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -1933,7 +1968,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, authParent, 'addLayoutChild', {
       widgetId: authPassLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -1942,12 +1977,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Password input row (HBox: input + toggle)
     const authPassRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: authParent,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, authParent, 'addLayoutChild', {
       widgetId: authPassRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -2043,6 +2078,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.presetDeleteBtnId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.listEmptyNoteIds.clear();
     this.authCheckboxId = undefined;
     this.authUserInputId = undefined;
     this.authPassInputId = undefined;
@@ -2109,6 +2145,25 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   // ========== HELPERS ==========
+
+  /**
+   * Repaint a permission list editor's rows, then swap the list for its
+   * empty-state note when it has no entries.
+   */
+  private async updateStringList(listId: AbjectId, items: string[]): Promise<void> {
+    await this.request(request(this.id, listId, 'update', { items: toListItems(items) }));
+    await this.syncListEmptyState(listId, items.length === 0);
+  }
+
+  /** Show the empty-state note in place of an empty permission list. */
+  private async syncListEmptyState(listId: AbjectId, empty: boolean): Promise<void> {
+    const noteId = this.listEmptyNoteIds.get(listId);
+    if (!noteId) return;
+    try {
+      await this.request(request(this.id, listId, 'update', { style: { visible: !empty } }));
+      await this.request(request(this.id, noteId, 'update', { style: { visible: empty } }));
+    } catch { /* settings window closed */ }
+  }
 
   private async setStatus(text: string, color = this.theme.textDescription): Promise<void> {
     if (!this.statusLabelId) return;
@@ -2738,7 +2793,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private capabilityLabelFor(provider: LLMProviderName, modelName: string): { text: string; color: string } {
     const models = this.providerModelCache.get(provider) ?? [];
     const info = models.find(m => m.name === modelName);
-    if (info?.vision === true) return { text: '👁 vision', color: this.theme.statusSuccess };
+    if (info?.vision === true) return { text: '◉ vision', color: this.theme.statusSuccess };
     if (info?.vision === false) return { text: 'text-only', color: this.theme.textTertiary };
     return { text: '', color: this.theme.textTertiary };
   }
@@ -3517,9 +3572,28 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       preferredSize: { height: 80 },
     }));
 
+    // Empty-state note that stands in for the list while it has no entries.
+    {
+      const { widgetIds: [noteId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown('Nothing listed yet', 'Type an entry above and press Add.'),
+            style: { ...emptyStateStyle(this.theme), fontSize: 12, align: 'left' } },
+        ]})
+      );
+      await this.request(request(this.id, cardId, 'addLayoutChild', {
+        widgetId: noteId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 40 },
+      }));
+      this.listEmptyNoteIds.set(listId, noteId);
+      await this.syncListEmptyState(listId, items.length === 0);
+    }
+
     const { widgetIds: [removeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected', style: { fontSize: 12 } },
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected',
+          style: { fontSize: 12, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
       ]})
     );
     await this.request(request(this.id, removeBtnId, 'addDependent', {}));
@@ -3685,7 +3759,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           { type: 'contentBlock', windowId, text: opts.resource,
             style: {
               color: this.theme.statusWarning, fontSize: 13,
-              fontFamily: 'monospace', markdown: false,
+              fontFamily: 'mono', markdown: false,
             } },
         ]})
       );
@@ -3704,7 +3778,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const { widgetIds: [detailId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId, 'create', { specs: [
             { type: 'label', windowId, text: line,
-              style: { color: this.theme.textSecondary, fontSize: 11, fontFamily: 'monospace' } },
+              style: { color: this.theme.textSecondary, fontSize: 11, fontFamily: 'mono' } },
           ]})
         );
         await this.request(request(this.id, layoutId, 'addLayoutChild', {
@@ -3928,7 +4002,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     record[other] = record[other].filter((c) => c !== parsed.commandName);
     this.objectPermissions.set(parsed.objectName, record);
     await this.refreshObjectPermLists();
-    await this.request(request(this.id, listId, 'update', { items: toListItems(this.objectPermEntries(kind)) }));
+    await this.updateStringList(listId, this.objectPermEntries(kind));
     await this.request(request(this.id, inputId, 'update', { text: '' }));
   }
 
@@ -3943,7 +4017,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.objectPermissions.delete(parsed.objectName);
       this.staleObjectPermNames.add(parsed.objectName);
     }
-    await this.request(request(this.id, listId, 'update', { items: toListItems(this.objectPermEntries(kind)) }));
+    await this.updateStringList(listId, this.objectPermEntries(kind));
   }
 
   /** Repaint the settings list editors, if the settings window is open. */
@@ -3954,9 +4028,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     ]) {
       if (!listId) continue;
       try {
-        await this.request(request(this.id, listId, 'update', {
-          items: toListItems(this.objectPermEntries(kind)),
-        }));
+        await this.updateStringList(listId, this.objectPermEntries(kind));
       } catch { /* settings window not open */ }
     }
   }
@@ -4086,7 +4158,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const { widgetIds: [resLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId, 'create', { specs: [
           { type: 'label', windowId, text: `"${cmdName}"`,
-            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'monospace' } },
+            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'mono' } },
         ]})
       );
       await this.request(request(this.id, layoutId, 'addLayoutChild', {

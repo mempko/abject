@@ -8,7 +8,8 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { WIDGET_FONT, BODY_FONT_STACK, lightenColor } from './widget-types.js';
+import { fontStacks, withAlpha, inkFrame } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 import { iconCommands, IconName } from '../../ui/icons.js';
 
 /** A right-aligned inline action button on a rich list row. */
@@ -329,21 +330,27 @@ export class ListWidget extends WidgetAbject {
     const cmds: unknown[] = [];
     const g = this.richRowGeometry(ox, itemY, rowHeight, w, item);
 
-    // Card surface
+    // Card surface: square paper slab with an ink hairline; the
+    // selected card becomes an ink band with a red block at its left edge.
+    const card = { x: g.card.x, y: g.card.y, width: g.card.w, height: g.card.h };
     cmds.push({
       type: 'rect',
       surfaceId,
       params: {
-        x: g.card.x, y: g.card.y, width: g.card.w, height: g.card.h,
+        ...card,
         fill: isSelected
-          ? this.theme.selectionBg
+          ? this.theme.textPrimary
           : isHovered
-            ? lightenColor(this.theme.inputBg, 6)
+            ? withAlpha(this.theme.textPrimary, 0.07)
             : this.theme.inputBg,
-        stroke: isSelected ? this.theme.accent : this.theme.inputBorder,
-        radius: this.style.radius ?? this.theme.widgetRadius,
+        radius: this.style.radius ?? 0,
       },
     });
+    if (isSelected) {
+      cmds.push({ type: 'rect', surfaceId, params: { x: card.x, y: card.y, width: 5, height: card.height, fill: this.theme.accent } });
+    } else {
+      cmds.push(...inkFrame(surfaceId, card, this.theme.inputBorder, 1));
+    }
 
     // Leading badge chip
     if (item.badge && g.badge) {
@@ -353,7 +360,7 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: g.badge.x, y: g.badge.y, width: g.badge.w, height: g.badge.h,
           fill: item.badge.color ?? this.theme.accent,
-          radius: 5,
+          radius: 0,
         },
       });
       cmds.push({
@@ -362,8 +369,8 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: g.badge.x + g.badge.w / 2, y: g.badge.y + g.badge.h / 2,
           text: item.badge.text,
-          font: `600 11px ${BODY_FONT_STACK}`,
-          fill: item.badge.textColor ?? this.theme.windowBg,
+          font: `600 11px ${fontStacks(this.theme).body}`,
+          fill: item.badge.textColor ?? (!item.badge.color ? this.theme.actionText : this.theme.windowBg),
           align: 'center', baseline: 'middle',
         },
       });
@@ -384,8 +391,8 @@ export class ListWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: g.textX, y: titleTop + i * TITLE_LINE_H + TITLE_LINE_H / 2, text: line,
-          font: `13px ${BODY_FONT_STACK}`,
-          fill: isSelected ? this.theme.accent : this.theme.textPrimary,
+          font: `13px ${fontStacks(this.theme).body}`,
+          fill: isSelected ? this.theme.windowBg : this.theme.textPrimary,
           baseline: 'middle',
         },
       });
@@ -396,8 +403,8 @@ export class ListWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: g.textX, y: titleTop + g.lines.length * TITLE_LINE_H + DETAIL_LINE_H / 2, text: detailText,
-          font: `11px ${BODY_FONT_STACK}`,
-          fill: this.theme.textTertiary,
+          font: `11px ${fontStacks(this.theme).body}`,
+          fill: isSelected ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
           baseline: 'middle',
         },
       });
@@ -412,8 +419,8 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: a.x, y: a.y, width: a.w, height: a.h,
           fill: a.spec.color ?? this.theme.buttonBg,
-          stroke: a.spec.color ? lightenColor(a.spec.color, 24) : this.theme.inputBorder,
-          radius: 5,
+          stroke: a.spec.color ? this.theme.buttonBorder : this.theme.inputBorder,
+          radius: 0,
         },
       });
       cmds.push({
@@ -422,7 +429,7 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: a.x + a.w / 2, y: a.y + a.h / 2,
           text: a.spec.label,
-          font: `12px ${BODY_FONT_STACK}`,
+          font: `12px ${fontStacks(this.theme).body}`,
           fill: a.spec.textColor ?? this.theme.buttonText,
           align: 'center', baseline: 'middle',
         },
@@ -444,7 +451,11 @@ export class ListWidget extends WidgetAbject {
     const h = this.rect.height;
 
     // Background
-    commands.push({
+    if (!this.style.radius) {
+      // Square paper well inside an ink rule.
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: w, height: h, fill: this.theme.inputBg } });
+      commands.push(...inkFrame(surfaceId, { x: ox, y: oy, width: w, height: h }, this.theme.inputBorder, shapeOf(this.theme).ruleWidth));
+    } else commands.push({
       type: 'rect',
       surfaceId,
       params: {
@@ -472,9 +483,14 @@ export class ListWidget extends WidgetAbject {
           x: sx, y: sy, width: sw, height: sh,
           fill: this.theme.windowBg,
           stroke: borderColor,
-          radius: 4,
+          radius: 0,
         },
       });
+      if (this.searchFocused) {
+        // Focus: red frame plus a red bar on the left edge.
+        commands.push(...inkFrame(surfaceId, { x: sx, y: sy, width: sw, height: sh }, this.theme.accent, 2));
+        commands.push({ type: 'rect', surfaceId, params: { x: sx, y: sy, width: 4, height: sh, fill: this.theme.accent } });
+      }
 
       if (this.searchText) {
         commands.push({
@@ -483,7 +499,7 @@ export class ListWidget extends WidgetAbject {
           params: {
             x: sx + 6, y: sy + sh / 2,
             text: this.searchText,
-            font: '12px "Spectral", Georgia, "Times New Roman", serif',
+            font: `12px ${fontStacks(this.theme).body}`,
             fill: this.theme.textPrimary,
             baseline: 'middle',
           },
@@ -495,7 +511,7 @@ export class ListWidget extends WidgetAbject {
           params: {
             x: sx + 6, y: sy + sh / 2,
             text: '\u{1F50D} Search...',
-            font: '12px "Spectral", Georgia, "Times New Roman", serif',
+            font: `12px ${fontStacks(this.theme).body}`,
             fill: this.theme.textPlaceholder,
             baseline: 'middle',
           },
@@ -506,7 +522,7 @@ export class ListWidget extends WidgetAbject {
       if (this.searchFocused) {
         const beforeCursor = this.searchText.substring(0, this.searchCursorPos);
         const cursorX = sx + 6 + (beforeCursor.length > 0
-          ? await this.measureText(surfaceId, beforeCursor, '12px "Spectral", Georgia, "Times New Roman", serif')
+          ? await this.measureText(surfaceId, beforeCursor, `12px ${fontStacks(this.theme).body}`)
           : 0);
         commands.push({
           type: 'line',
@@ -514,7 +530,8 @@ export class ListWidget extends WidgetAbject {
           params: {
             x1: cursorX, y1: sy + 4,
             x2: cursorX, y2: sy + sh - 4,
-            stroke: this.theme.cursor,
+            stroke: this.theme.accent,
+            lineWidth: 2, lineCap: 'square',
           },
         });
       }
@@ -537,8 +554,8 @@ export class ListWidget extends WidgetAbject {
     const viewTop = this.scrollTop;
     const viewBottom = this.scrollTop + listH;
 
-    const font = '13px "Spectral", Georgia, "Times New Roman", serif';
-    const secondaryFont = '11px "Spectral", Georgia, "Times New Roman", serif';
+    const font = `13px ${fontStacks(this.theme).body}`;
+    const secondaryFont = `11px ${fontStacks(this.theme).body}`;
 
     for (let i = 0; i < this.filteredItems.length; i++) {
       const rowTop = tops[i];
@@ -561,25 +578,11 @@ export class ListWidget extends WidgetAbject {
 
       // Selection/hover background
       if (isSelected) {
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: {
-            x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight,
-            fill: this.theme.selectionBg,
-            radius: 3,
-          },
-        });
+        // Ink band with inverted text and a red block at the left.
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight, fill: this.theme.textPrimary } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: 5, height: this.itemHeight, fill: this.theme.accent } });
       } else if (isHovered) {
-        commands.push({
-          type: 'rect',
-          surfaceId,
-          params: {
-            x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight,
-            fill: lightenColor(this.theme.inputBg, 8),
-            radius: 3,
-          },
-        });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 2, y: itemY, width: w - 4, height: this.itemHeight, fill: withAlpha(this.theme.textPrimary, 0.07) } });
       }
 
       // Optional leading icon (status indicator). Drawn before the label so
@@ -588,7 +591,7 @@ export class ListWidget extends WidgetAbject {
       const iconPad = item.iconName ? 8 : 0;
       const textX = ox + 10 + iconSize + iconPad;
       if (item.iconName) {
-        const iconColor = item.iconColor ?? (isSelected ? this.theme.accent : this.theme.textSecondary);
+        const iconColor = item.iconColor ?? (isSelected ? this.theme.windowBg : this.theme.textSecondary);
         commands.push(...iconCommands(item.iconName, {
           surfaceId,
           x: ox + 10,
@@ -599,7 +602,7 @@ export class ListWidget extends WidgetAbject {
       }
 
       // Label + secondary as a single truncated line
-      const labelColor = isSelected ? this.theme.accent : this.theme.textPrimary;
+      const labelColor = isSelected ? this.theme.windowBg : this.theme.textPrimary;
       const maxTextWidth = w - (textX - ox) - 14;
       const secondary = item.secondary ?? '';
       const fullText = secondary ? `${item.label}  ${secondary}` : item.label;
@@ -631,7 +634,7 @@ export class ListWidget extends WidgetAbject {
             x: textX + labelPartWidth, y: itemY + this.itemHeight / 2,
             text: secondaryPart,
             font: secondaryFont,
-            fill: this.theme.textTertiary,
+            fill: isSelected ? withAlpha(this.theme.windowBg, 0.75) : this.theme.textTertiary,
             baseline: 'middle',
           },
         });
@@ -677,7 +680,7 @@ export class ListWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
-          radius: 3,
+          radius: 0,
           fill: this.theme.scrollbarThumb,
         },
       });

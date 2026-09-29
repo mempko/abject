@@ -50,7 +50,8 @@ import type {
   VideoSetupMsg,
   VideoControlMsg,
 } from '../server/ws-protocol.js';
-import type { AbyssBgControl } from './abyss-bg.js';
+import type { BackdropControl } from './backdrop.js';
+import { widgetFont, titleFont, codeFont, DEFAULT_THEME } from '../src/objects/widgets/widget-types.js';
 import type { ClientTransport } from './transport.js';
 import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
 import { computeInputDelta } from './mobile-input-delta.js';
@@ -60,11 +61,38 @@ import { computeInputDelta } from './mobile-input-delta.js';
  */
 /** Fonts to pre-measure for server-side text width computation */
 const MEASURED_FONTS = [
+  // Legacy (soft) themes: exact WIDGET_FONT / TITLE_FONT / CODE_FONT strings.
   '14px "Spectral", Georgia, "Times New Roman", serif',        // WIDGET_FONT
   '600 14px "Fraunces", "Spectral", Georgia, serif',           // TITLE_FONT
   '13px "Spline Sans Mono", "JetBrains Mono", monospace',      // CODE_FONT
   '14px system-ui',                                            // legacy WIDGET_FONT
+  // Constructivist themes: the same roles, derived from the default theme so
+  // the strings match what widgets build byte for byte.
+  widgetFont(DEFAULT_THEME),
+  titleFont(DEFAULT_THEME),
+  codeFont(DEFAULT_THEME),
 ];
+
+/**
+ * Load every Latin web-font face the page declares (all weights and styles),
+ * not just the ones measured above. Canvas text drawn with a face that has not
+ * arrived yet is painted in a fallback font and never repainted, while layout
+ * uses the real face's widths, so bold and italic runs overlapped their
+ * neighbours on first paint. Faces load lazily by default; this makes them
+ * all resident before the client reports ready.
+ */
+function preloadWebFontFaces(): Array<Promise<unknown>> {
+  if (typeof document === 'undefined' || !document.fonts) return [];
+  const loads: Array<Promise<unknown>> = [];
+  document.fonts.forEach((face) => {
+    // Google Fonts splits each face into unicode-range subsets; the Latin one
+    // covers U+0000-00FF. Other scripts still load on demand.
+    const range = face.unicodeRange ?? '';
+    if (range && !/U\+0000-00FF/i.test(range)) return;
+    if (face.status === 'unloaded') loads.push(face.load().catch(() => undefined));
+  });
+  return loads;
+}
 
 /** ASCII printable range pre-measured for every new font we see. */
 const ASCII_MIN = 32;
@@ -187,7 +215,7 @@ export class FrontendClient {
   /** Track last canvas-space mouse position for drag start */
   private lastCanvasX = 0;
   private lastCanvasY = 0;
-  private abyssBg?: AbyssBgControl;
+  private backdrop?: BackdropControl;
   private resizableSurfaces: Set<string> = new Set();
   private fileUploadProxy?: HTMLInputElement;
 
@@ -214,9 +242,9 @@ export class FrontendClient {
   /** Monotonic counter to give each upload a unique id for chunk reassembly. */
   private nextUploadSeq = 0;
 
-  constructor(canvas: HTMLCanvasElement, abyssBg?: AbyssBgControl) {
+  constructor(canvas: HTMLCanvasElement, backdrop?: BackdropControl) {
     this.canvas = canvas;
-    this.abyssBg = abyssBg;
+    this.backdrop = backdrop;
     this.compositor = new Compositor(canvas);
     // Relay compositor diagnostics (e.g. cross-origin surface taint) into the
     // backend log via the clientDiagnostic message — the browser console is
@@ -869,7 +897,7 @@ export class FrontendClient {
     const app = document.getElementById('app');
     if (app) app.classList.remove('landed');
     document.body.classList.remove('landed');
-    this.abyssBg?.setDescending(true);
+    this.backdrop?.setDescending(true);
   }
 
   private hideConnecting(): void {
@@ -884,7 +912,7 @@ export class FrontendClient {
     const app = document.getElementById('app');
     if (app) app.classList.add('landed');
     document.body.classList.add('landed');
-    this.abyssBg?.setDescending(false);
+    this.backdrop?.setDescending(false);
   }
 
   /**
@@ -917,6 +945,19 @@ export class FrontendClient {
   private shipFontMetrics(font: string): void {
     if (this.measuredFonts.has(font)) return;
     this.measuredFonts.add(font);
+    // Web fonts load lazily on first use. Measuring a face that has not
+    // arrived yet would ship the fallback font's widths, and the backend
+    // caches the first metrics it gets, so wait for the face first.
+    if (typeof document !== 'undefined' && document.fonts && !document.fonts.check(font)) {
+      document.fonts.load(font)
+        .catch(() => undefined)
+        .then(() => this.measureAndShipFont(font));
+      return;
+    }
+    this.measureAndShipFont(font);
+  }
+
+  private measureAndShipFont(font: string): void {
     const measureCanvas = document.createElement('canvas');
     const ctx = measureCanvas.getContext('2d')!;
     ctx.font = font;
@@ -938,10 +979,18 @@ export class FrontendClient {
     // attribute sessions to a deployed bundle (and a stale cached page is
     // visible in the log).
     this.sendBundleIdentity();
-    document.fonts.ready.then(() => {
-      this.sendFontMetrics();
-      this.sendRaw({ type: 'ready' });
-    });
+    // Explicitly load every pre-measured face: `fonts.ready` only covers
+    // faces something has already asked for, and nothing has drawn yet.
+    const loads = [
+      ...MEASURED_FONTS.map((f) => document.fonts.load(f).catch(() => undefined)),
+      ...preloadWebFontFaces(),
+    ];
+    Promise.all(loads)
+      .then(() => document.fonts.ready)
+      .then(() => {
+        this.sendFontMetrics();
+        this.sendRaw({ type: 'ready' });
+      });
   }
 
   private sendRaw(msg: Record<string, unknown>): void {
@@ -1026,9 +1075,13 @@ export class FrontendClient {
         }
         break;
 
-      case 'setSceneTheme':
-        this.compositor.setSceneTheme(msg.theme as unknown as SceneTheme);
+      case 'setSceneTheme': {
+        const sceneTheme = msg.theme as unknown as SceneTheme;
+        this.compositor.setSceneTheme(sceneTheme);
+        // The backdrop follows the theme: abyss or constructivist poster.
+        this.backdrop?.setTheme(sceneTheme);
         break;
+      }
 
       case 'setSurfaceTransform':
         this.compositor.setSurfaceTransform(msg.surfaceId, { rotation: msg.rotation, z: msg.z });
@@ -2053,18 +2106,38 @@ export class FrontendClient {
     // round-trip. One round-trip per unique font, not per widget render.
     this.shipFontMetrics(font);
 
-    let width = 0;
-    const surface = this.compositor.getSurface(surfaceId);
-    if (surface && text) {
-      surface.ctx.font = font;
-      width = surface.ctx.measureText(text).width;
-    }
+    const reply = () => {
+      let width = 0;
+      const surface = this.compositor.getSurface(surfaceId);
+      const ctx = surface?.ctx ?? this.measureCtx();
+      if (ctx && text) {
+        ctx.font = font;
+        width = ctx.measureText(text).width;
+      }
+      this.sendToBackend({
+        type: 'measureTextReply',
+        requestId,
+        width,
+      });
+    };
 
-    this.sendToBackend({
-      type: 'measureTextReply',
-      requestId,
-      width,
-    });
+    // A face that has not loaded yet would measure as the fallback font, and
+    // the caller lays text out with that width. Wait for the face first.
+    if (typeof document !== 'undefined' && document.fonts && !document.fonts.check(font)) {
+      document.fonts.load(font).catch(() => undefined).then(reply);
+      return;
+    }
+    reply();
+  }
+
+  private measureCanvasCtx?: CanvasRenderingContext2D | null;
+
+  /** A detached 2D context for measuring when no surface is named. */
+  private measureCtx(): CanvasRenderingContext2D | null {
+    if (this.measureCanvasCtx === undefined) {
+      this.measureCanvasCtx = document.createElement('canvas').getContext('2d');
+    }
+    return this.measureCanvasCtx;
   }
 
   private handleDisplayInfoRequest(requestId: string): void {

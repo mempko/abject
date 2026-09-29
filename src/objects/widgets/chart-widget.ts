@@ -14,7 +14,8 @@
  */
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
-import { BODY_FONT_STACK, withAlpha } from './widget-types.js';
+import { fontStacks, withAlpha, squareMark } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export type ChartKind = 'line' | 'bar' | 'area' | 'pie' | 'sparkline';
 
@@ -126,15 +127,21 @@ export class ChartWidget extends WidgetAbject {
   /** Theme-derived color ramp; per-series color overrides win. */
   private seriesColor(i: number, override?: string): string {
     if (override) return override;
-    const ramp = [
+    // Poster palette: red, ink, ochre, slate, then the status hues.
+    const poster = [
       this.theme.accent,
+      this.theme.textPrimary,
+      this.theme.accentTertiary,
+      this.theme.textSecondary,
+      this.theme.statusInfo,
       this.theme.statusSuccess,
-      this.theme.statusWarning,
-      this.theme.statusError,
-      this.theme.linkColor,
-      this.theme.statusNeutral,
     ];
-    return ramp[i % ramp.length];
+    return poster[i % poster.length];
+  }
+
+  /** A data-point marker: a small printed square. */
+  private marker(surfaceId: string, cx: number, cy: number, radius: number, fill: string): unknown[] {
+    return squareMark(surfaceId, cx, cy, Math.round(radius * 2 + 1), fill);
   }
 
   private gridOn(): boolean {
@@ -164,7 +171,7 @@ export class ChartWidget extends WidgetAbject {
         type: 'text', surfaceId,
         params: {
           x: ox + w / 2, y: oy + h / 2, text: 'no data',
-          font: `${TICK_FONT_SIZE}px ${BODY_FONT_STACK}`,
+          font: `${TICK_FONT_SIZE}px ${fontStacks(this.theme).body}`,
           fill: this.theme.textTertiary, align: 'center', baseline: 'middle',
         },
       });
@@ -186,7 +193,7 @@ export class ChartWidget extends WidgetAbject {
   // ── Cartesian (line / area / bar) ─────────────────────────────────────
 
   private buildCartesian(commands: unknown[], surfaceId: string, ox: number, oy: number, w: number, h: number): void {
-    const tickFont = `${TICK_FONT_SIZE}px ${BODY_FONT_STACK}`;
+    const tickFont = `${TICK_FONT_SIZE}px ${fontStacks(this.theme).body}`;
     const textSub = this.theme.textSecondary;
 
     // Categorical when any x is a string; band positions in first-seen order.
@@ -269,9 +276,15 @@ export class ChartWidget extends WidgetAbject {
     }
     // Baseline.
     const baseY = yPos(Math.max(lo, Math.min(hi, 0)));
+    // Heavy ink axis rules: the value axis on the left, the zero line below.
+    const rw = shapeOf(this.theme).ruleWidth;
     commands.push({
       type: 'line', surfaceId,
-      params: { x1: ox + px, y1: oy + baseY, x2: ox + px + pw, y2: oy + baseY, stroke: withAlpha(this.theme.textTertiary, 0.4), lineWidth: 1 },
+      params: { x1: ox + px, y1: oy + py, x2: ox + px, y2: oy + py + ph, stroke: this.theme.textPrimary, lineWidth: rw, lineCap: 'square' },
+    });
+    commands.push({
+      type: 'line', surfaceId,
+      params: { x1: ox + px, y1: oy + baseY, x2: ox + px + pw, y2: oy + baseY, stroke: this.theme.textPrimary, lineWidth: rw, lineCap: 'square' },
     });
 
     // X ticks.
@@ -344,7 +357,7 @@ export class ChartWidget extends WidgetAbject {
           const bh = Math.max(1, Math.abs(baseY - vy));
           commands.push({
             type: 'rect', surfaceId,
-            params: { x: ox + bx, y: oy + by, width: barW, height: bh, fill: color, radius: 2 },
+            params: { x: ox + bx, y: oy + by, width: barW, height: bh, fill: color, radius: 0 },
           });
           this.barHits.push({ bx, by, bw: barW, bh, seriesIndex: si, pointIndex: pi, x: p.x, y: p.y });
         }
@@ -376,18 +389,19 @@ export class ChartWidget extends WidgetAbject {
           });
         }
         if (pts.length === 1) {
-          commands.push({ type: 'circle', surfaceId, params: { cx: ox + pts[0].x, cy: oy + pts[0].y, radius: 3, fill: color } });
+          commands.push(...this.marker(surfaceId, ox + pts[0].x, oy + pts[0].y, 3, color));
         } else {
           commands.push({
             type: 'polygon', surfaceId,
             params: {
               points: pts.map(p => ({ x: ox + p.x, y: oy + p.y })),
-              closePath: false, stroke: color, lineWidth: 2, lineJoin: 'round', lineCap: 'round',
+              closePath: false, stroke: color, lineWidth: 2.5,
+              lineJoin: 'miter', lineCap: 'square',
             },
           });
           if (pts.length <= 40) {
             for (const p of pts) {
-              commands.push({ type: 'circle', surfaceId, params: { cx: ox + p.x, cy: oy + p.y, radius: 2.5, fill: color } });
+              commands.push(...this.marker(surfaceId, ox + p.x, oy + p.y, 2.5, color));
             }
           }
         }
@@ -404,7 +418,7 @@ export class ChartWidget extends WidgetAbject {
         const color = this.seriesColor(si, s.color);
         const itemW = 14 + estWidth(s.name) + 12;
         if (lx + itemW > px + pw) break;
-        commands.push({ type: 'rect', surfaceId, params: { x: ox + lx, y: oy + ly, width: 10, height: 10, fill: color, radius: 2 } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + lx, y: oy + ly, width: 10, height: 10, fill: color, radius: 0 } });
         commands.push({
           type: 'text', surfaceId,
           params: { x: ox + lx + 14, y: oy + ly + 5, text: s.name, font: tickFont, fill: textSub, align: 'left', baseline: 'middle' },
@@ -417,7 +431,7 @@ export class ChartWidget extends WidgetAbject {
   // ── Pie (donut) ───────────────────────────────────────────────────────
 
   private buildPie(commands: unknown[], surfaceId: string, ox: number, oy: number, w: number, h: number): void {
-    const tickFont = `${TICK_FONT_SIZE}px ${BODY_FONT_STACK}`;
+    const tickFont = `${TICK_FONT_SIZE}px ${fontStacks(this.theme).body}`;
     const s = this.series[0];
     const slices = s.points.filter(p => Number.isFinite(p.y) && p.y > 0);
     const total = slices.reduce((acc, p) => acc + p.y, 0);
@@ -448,6 +462,17 @@ export class ChartWidget extends WidgetAbject {
       for (let a = a1; a > a0; a -= step) points.push({ x: ox + cx + Math.cos(a) * rIn, y: oy + cy + Math.sin(a) * rIn });
       points.push({ x: ox + cx + Math.cos(a0) * rIn, y: oy + cy + Math.sin(a0) * rIn });
       commands.push({ type: 'polygon', surfaceId, params: { points, fill: color } });
+      if (slices.length > 1) {
+        // Paper cut between slices, like a printed segment chart.
+        commands.push({
+          type: 'line', surfaceId,
+          params: {
+            x1: ox + cx + Math.cos(a0) * rIn, y1: oy + cy + Math.sin(a0) * rIn,
+            x2: ox + cx + Math.cos(a0) * rOut, y2: oy + cy + Math.sin(a0) * rOut,
+            stroke: this.theme.windowBg, lineWidth: 2,
+          },
+        });
+      }
 
       if (frac > 0.08) {
         const mid = (a0 + a1) / 2;
@@ -472,7 +497,7 @@ export class ChartWidget extends WidgetAbject {
         const name = String(slices[pi].x);
         const itemW = 14 + estWidth(name) + 12;
         if (lx + itemW > w - 8) break;
-        commands.push({ type: 'rect', surfaceId, params: { x: ox + lx, y: oy + ly, width: 10, height: 10, fill: this.seriesColor(pi), radius: 2 } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + lx, y: oy + ly, width: 10, height: 10, fill: this.seriesColor(pi), radius: 0 } });
         commands.push({
           type: 'text', surfaceId,
           params: { x: ox + lx + 14, y: oy + ly + 5, text: name, font: tickFont, fill: this.theme.textSecondary, align: 'left', baseline: 'middle' },
@@ -510,12 +535,13 @@ export class ChartWidget extends WidgetAbject {
         type: 'polygon', surfaceId,
         params: {
           points: screen.map(p => ({ x: ox + p.x, y: oy + p.y })),
-          closePath: false, stroke: color, lineWidth: 1.5, lineJoin: 'round', lineCap: 'round',
+          closePath: false, stroke: color, lineWidth: 2,
+          lineJoin: 'miter', lineCap: 'square',
         },
       });
     }
     const last = screen[screen.length - 1];
-    commands.push({ type: 'circle', surfaceId, params: { cx: ox + last.x, cy: oy + last.y, radius: 2.5, fill: color } });
+    commands.push(...this.marker(surfaceId, ox + last.x, oy + last.y, 2.5, color));
   }
 
   // ── Input ─────────────────────────────────────────────────────────────

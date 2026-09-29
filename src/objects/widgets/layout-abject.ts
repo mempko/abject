@@ -24,7 +24,10 @@ import {
   LAYOUT_INTERFACE,
   SizeInput,
   resolveWH,
+  inkFrame,
+  raisedBlock,
 } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 const layoutLog = new Log('Layout');
 
@@ -564,6 +567,40 @@ export abstract class LayoutAbject extends WidgetAbject {
     return { type: 'rect', surfaceId, params };
   }
 
+  /** Largest block-shadow offset a card casts. */
+  private static readonly CARD_SHADOW_MAX = 4;
+
+  /**
+   * All commands for the card/panel background. Cards with an explicit
+   * `style.radius` get exactly `buildBackgroundCommand`. Other cards are
+   * square slabs: the border defaults to the
+   * theme's rule weight, and a card with both a background and a border
+   * casts a hard offset print shadow when its right and bottom margins leave
+   * room for it (so children never paint over the shadow).
+   */
+  protected buildBackgroundCommands(surfaceId: string, ox: number, oy: number): unknown[] {
+    const s = this._renderStyle as LayoutStyle;
+    if (s.radius !== undefined && s.radius > 0) {
+      const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
+      return bg ? [bg] : [];
+    }
+    if (!s.background && !s.borderColor) return [];
+    const shape = shapeOf(this.theme);
+    const outer = { x: ox, y: oy, width: this._renderRect.width, height: this._renderRect.height };
+    const cmds: unknown[] = [];
+    let face = outer;
+    const offset = Math.min(shape.blockShadowOffset, LayoutAbject.CARD_SHADOW_MAX,
+      this.margins.right, this.margins.bottom);
+    if (s.background && s.borderColor && offset >= 2) {
+      const block = raisedBlock(surfaceId, outer, shape.blockShadowColor, offset);
+      cmds.push(...block.commands);
+      face = block.face;
+    }
+    if (s.background) cmds.push({ type: 'rect', surfaceId, params: { ...face, fill: s.background } });
+    if (s.borderColor) cmds.push(...inkFrame(surfaceId, face, s.borderColor, s.borderWidth ?? shape.ruleWidth));
+    return cmds;
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     // Flush pending relayout before rendering — the render IS the frame
     // boundary, so all mutations between renders are automatically batched.
@@ -574,8 +611,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     const commands: unknown[] = [];
 
     // Card/panel background (if styled) paints first, behind all children.
-    const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
-    if (bg) commands.push(bg);
+    commands.push(...this.buildBackgroundCommands(surfaceId, ox, oy));
 
     // Forward the viewport clip from a scrolling ancestor down to children
     // (e.g. labels inside a VBox inside a ScrollableVBox). Subclasses that

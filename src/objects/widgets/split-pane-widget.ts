@@ -10,7 +10,8 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
-import { Rect, lightenColor } from './widget-types.js';
+import { Rect } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export interface SplitPaneConfig extends WidgetConfig {
   orientation?: 'horizontal' | 'vertical';
@@ -169,21 +170,18 @@ export class SplitPaneWidget extends WidgetAbject {
       } catch { /* child gone */ }
     }
 
-    // Draw divider bar
-    const divColor = this.dividerHovered || this.dragging
-      ? lightenColor(this.theme.divider, 30)
-      : this.theme.divider;
-
+    // Draw divider bar: a heavy ink rule centred in the gutter, turning into
+    // a solid red bar while hovered or dragged.
+    const d = rects.divider;
+    const active = this.dividerHovered || this.dragging;
+    const rw = active ? (this.orientation === 'horizontal' ? d.width : d.height) : Math.min(shapeOf(this.theme).ruleWidth, DIVIDER_SIZE);
+    const horiz = this.orientation === 'horizontal';
     commands.push({
       type: 'rect',
       surfaceId,
-      params: {
-        x: ox + rects.divider.x,
-        y: oy + rects.divider.y,
-        width: rects.divider.width,
-        height: rects.divider.height,
-        fill: divColor,
-      },
+      params: horiz
+        ? { x: ox + d.x + Math.floor((d.width - rw) / 2), y: oy + d.y, width: rw, height: d.height, fill: active ? this.theme.accent : this.theme.textPrimary }
+        : { x: ox + d.x, y: oy + d.y + Math.floor((d.height - rw) / 2), width: d.width, height: rw, fill: active ? this.theme.accent : this.theme.textPrimary },
     });
 
     return commands;

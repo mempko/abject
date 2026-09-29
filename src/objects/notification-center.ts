@@ -19,6 +19,8 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import { shapeOf } from '../core/theme-data.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { Tween, fadeIn as motionFadeIn, fadeOut as motionFadeOut } from '../ui/motion.js';
 import type { ListItem } from './widgets/list-widget.js';
 
@@ -164,6 +166,7 @@ export class NotificationCenter extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.uiServerId = await this.discoverDep('BackendUI') ?? undefined;
+    await this.fetchTheme();
     await this.refreshDisplaySize();
   }
 
@@ -292,6 +295,8 @@ export class NotificationCenter extends Abject {
     const labelColor = this.colorForLevel(level);
     const accent     = this.accentForLevel(level);
 
+    // Toasts lead with a solid level bar (an empty label filled with the
+    // level's accent) so the level reads at a glance.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId, 'create', {
         specs: [
@@ -305,26 +310,27 @@ export class NotificationCenter extends Abject {
               fontSize: 13,
             },
           },
+          { type: 'label', windowId, text: '', style: { background: accent, radius: 0 } },
         ],
       }),
     ).catch(() => ({ widgetIds: [] as AbjectId[] }));
 
-    const labelId = widgetIds[0];
+    const [labelId, barId] = widgetIds;
 
-    // Layout: a single VBox with an inset label. Caller sees a card with
-    // an accent stripe on the left edge (drawn by the chromeless-window
-    // accent line) and the message text indented.
+    // Square card: level bar flush on the left edge, message beside it.
     const layoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId, 'createVBox', {
+      request(this.id, this.widgetManagerId, 'createHBox', {
         windowId,
-        margins: { top: 12, right: 16, bottom: 12, left: 16 },
-        spacing: 0,
+        margins: { top: 0, right: 16, bottom: 0, left: 0 },
+        spacing: 12,
+        style: { background: this.theme.windowBg, borderColor: this.theme.windowBorder, borderWidth: shapeOf(this.theme).ruleWidth, radius: 0 },
       }),
     ).catch(() => undefined);
 
-    if (layoutId && labelId) {
+    if (layoutId && labelId && barId) {
       await this.request(request(this.id, layoutId, 'addLayoutChildren', {
         children: [
+          { widgetId: barId, sizePolicy: { vertical: 'expanding', horizontal: 'fixed' }, preferredSize: { width: 6 } },
           { widgetId: labelId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
         ],
       })).catch(() => {});
@@ -343,8 +349,6 @@ export class NotificationCenter extends Abject {
 
     this.toasts.push(toast);
 
-    // Suppress unused; level is captured via colors but not stored.
-    void accent;
   }
 
   private async dismissToast(toast: ActiveToast, immediate = false): Promise<void> {
@@ -438,7 +442,7 @@ export class NotificationCenter extends Abject {
     const rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId, 'createVBox', {
         windowId: this.viewerWindowId,
-        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        margins: { top: 12, right: 16, bottom: 12, left: 16 },
         spacing: 8,
       }),
     );
@@ -461,21 +465,62 @@ export class NotificationCenter extends Abject {
           {
             type: 'label',
             windowId: this.viewerWindowId,
-            text: 'No notifications yet.',
-            style: { color: this.theme.textTertiary, align: 'center' },
+            text: emptyStateMarkdown('No notifications yet', 'Messages from your objects and agents collect here, newest first.'),
+            style: emptyStateStyle(this.theme),
+          },
+          {
+            type: 'label',
+            windowId: this.viewerWindowId,
+            text: sectionHeaderText(this.theme, 'Recent'),
+            style: sectionHeaderStyle(this.theme),
+          },
+          {
+            type: 'label',
+            windowId: this.viewerWindowId,
+            text: `Newest first, up to ${MAX_HISTORY} kept.`,
+            style: { ...hintStyle(this.theme, 11), wordWrap: false },
           },
         ],
       }),
     );
 
-    [this.viewerClearBtnId, this.viewerListId, this.viewerEmptyLabelId] = widgetIds;
+    const [clearBtnId, listId, emptyLabelId, headerLabelId, hintLabelId] = widgetIds;
+    [this.viewerClearBtnId, this.viewerListId, this.viewerEmptyLabelId] = [clearBtnId, listId, emptyLabelId];
     await this.request(request(this.id, this.viewerClearBtnId, 'addDependent', {}));
+
+    // Header row: section title and hint on the left, Clear on the right.
+    const headerRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId, 'createNestedHBox', {
+        parentLayoutId: rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      }),
+    );
+    const headerTextId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId, 'createNestedVBox', {
+        parentLayoutId: headerRowId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 2,
+      }),
+    );
+    await this.request(request(this.id, headerTextId, 'addLayoutChildren', {
+      children: [
+        { widgetId: headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
+        { widgetId: hintLabelId,   sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 14 } },
+      ],
+    }));
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: headerTextId,          sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.viewerClearBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 80, height: 30 } },
+      ],
+    }));
 
     await this.request(request(this.id, rootLayoutId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.viewerClearBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 80, height: 30 }, alignment: 'right' },
+        { widgetId: headerRowId,         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 34 } },
         { widgetId: this.viewerListId,     sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.viewerEmptyLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 18 } },
+        { widgetId: this.viewerEmptyLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 56 } },
       ],
     }));
 
@@ -543,12 +588,13 @@ export class NotificationCenter extends Abject {
   }
 
   private accentForLevel(level: NotificationLevel): string {
+    // Good news is the living light; warnings brass; errors red.
     switch (level) {
-      case 'success': return this.theme.statusSuccess;
       case 'warning': return this.theme.statusWarning;
       case 'error':   return this.theme.statusError;
+      case 'success':
       case 'info':
-      default:        return this.theme.accent;
+      default:        return this.theme.accentSecondary;
     }
   }
 }

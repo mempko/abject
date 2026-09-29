@@ -13,6 +13,10 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Goal, GoalId } from './goal-manager.js';
 import { buildGoalRows, type GoalRow, type GoalNode } from './goal-tree.js';
+import {
+  livingStyle, emptyStateMarkdown, emptyStateStyle,
+  eyeSigilOps, removeSigilOps, type SceneOp,
+} from './ui-kit.js';
 
 const log = new Log('GoalBrowser');
 
@@ -20,6 +24,13 @@ const GOAL_BROWSER_INTERFACE: InterfaceId = 'abjects:goal-browser';
 
 const WIN_W = 550;
 const WIN_H = 400;
+
+/** Status strip height at the top of the window. */
+const STATUS_H = 22;
+/** Height of the empty-state card while there are no goals. */
+const EMPTY_H = 96;
+const EYE_PREFIX = 'goal-browser-eye';
+const EYE_SIZE = 20;
 
 /** Minimal task info extracted from TupleSpace scan results. */
 interface TaskInfo {
@@ -44,6 +55,13 @@ export class GoalBrowser extends Abject {
   private goalWidgetId?: AbjectId;
   private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
+  private statusLabelId?: AbjectId;
+  private emptyLabelId?: AbjectId;
+  /** Last empty/non-empty state pushed to the layout (avoids redundant updates). */
+  private emptyShown?: boolean;
+  /** Eye sigil shown while any goal is running. */
+  private eyeShown = false;
+  private eyeWinSize?: { width: number; height: number };
 
   /** Local peer id; remote goals (creatorPeerId !== local) render a badge and lose sprint actions. */
   private localPeerId = '';
@@ -139,6 +157,15 @@ export class GoalBrowser extends Abject {
       goalCount: this.goals.length,
     }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
+    // Keep the eye anchored to the status strip's right edge on resize.
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { windowId, width, height } = (msg.payload ?? {}) as { windowId?: AbjectId; width?: number; height?: number };
+      if (!this.windowId || (windowId && windowId !== this.windowId)) return;
+      if (typeof width !== 'number' || typeof height !== 'number' || width <= 0 || height <= 0) return;
+      this.eyeWinSize = { width, height };
+      if (!this.eyeShown) return;
+      await this.sendEyeOps([{ op: 'update', id: `${EYE_PREFIX}-sigil`, transform: { position: this.eyePosition() } }]);
+    });
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
@@ -183,7 +210,7 @@ Click the arrow to expand/collapse a goal.
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\uD83C\uDFAF Goals',
+        title: 'Goals',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,
@@ -194,10 +221,37 @@ Click the arrow to expand/collapse a goal.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 6,
+        margins: { top: 12, right: 16, bottom: 12, left: 16 },
+        spacing: 8,
       })
     );
+
+    // Status strip: running/done counts, phosphor while work is alive.
+    const { widgetIds: [statusLabelId, emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          {
+            type: 'label', windowId: this.windowId, text: 'No goals yet',
+            style: { color: this.theme.textMeta, fontSize: 12, wordWrap: false, selectable: false },
+          },
+          {
+            type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'No goals yet',
+              'Ask a chat to do something that takes several steps. Its goal and the tasks agents take on appear here live.',
+            ),
+            style: { ...emptyStateStyle(this.theme), selectable: false },
+          },
+        ],
+      })
+    );
+    this.statusLabelId = statusLabelId;
+    this.emptyLabelId = emptyLabelId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: STATUS_H },
+    }));
 
     // Scrollable area holds the goal-progress widget. The widget reports its
     // own natural height (rows word-wrap and vary in height); the ScrollableVBox
@@ -218,6 +272,15 @@ Click the arrow to expand/collapse a goal.
       })
     );
     this.goalWidgetId = goalWidgetId;
+
+    // Empty-state card sits above the tree; collapsed to zero height once
+    // there are goals to show.
+    this.emptyShown = undefined;
+    await this.request(request(this.id, this.scrollAreaId, 'addLayoutChild', {
+      widgetId: this.emptyLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: EMPTY_H },
+    }));
 
     await this.request(request(this.id, this.scrollAreaId, 'addLayoutChild', {
       widgetId: this.goalWidgetId,
@@ -248,7 +311,10 @@ Click the arrow to expand/collapse a goal.
     const { widgetIds: btnIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'button', windowId: this.windowId, text: 'Stop All' },
+          {
+            type: 'button', windowId: this.windowId, text: 'Stop All',
+            style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder },
+          },
           { type: 'button', windowId: this.windowId, text: 'Clear' },
         ],
       })
@@ -258,8 +324,8 @@ Click the arrow to expand/collapse a goal.
 
     await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.stopAllBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
-        { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
+        { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 88, height: 36 } },
+        { widgetId: this.stopAllBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 96, height: 36 } },
       ],
     }));
 
@@ -293,6 +359,11 @@ Click the arrow to expand/collapse a goal.
     this.goalWidgetId = undefined;
     this.stopAllBtnId = undefined;
     this.clearBtnId = undefined;
+    this.statusLabelId = undefined;
+    this.emptyLabelId = undefined;
+    this.emptyShown = undefined;
+    this.eyeShown = false;
+    this.eyeWinSize = undefined;
     this.goals = [];
     this.tasksByGoal.clear();
     this.expandedGoals.clear();
@@ -389,6 +460,81 @@ Click the arrow to expand/collapse a goal.
     try {
       await this.request(request(this.id, this.goalWidgetId, 'update', { rows }));
     } catch { /* widget may be gone */ }
+    await this.refreshStatus();
+  }
+
+  // -- Status strip, empty state and the eye --
+
+  /** Update the counts line, the empty-state card and the running eye. */
+  private async refreshStatus(): Promise<void> {
+    const running = this.goals.filter(g => g.status === 'active').length;
+    const done = this.goals.filter(g => g.status === 'completed').length;
+    const failed = this.goals.filter(g => g.status === 'failed').length;
+
+    if (this.statusLabelId) {
+      const parts: string[] = [];
+      if (running > 0) parts.push(`${running} running`);
+      if (done > 0) parts.push(`${done} done`);
+      if (failed > 0) parts.push(`${failed} failed`);
+      const text = parts.length > 0 ? parts.join(' · ') : this.goals.length > 0 ? `${this.goals.length} goals` : 'No goals yet';
+      const style = running > 0
+        ? { ...livingStyle(this.theme), fontWeight: 'bold' as const }
+        : failed > 0 && done === 0
+          ? { color: this.theme.statusError, fontSize: 12, fontWeight: 'normal' as const }
+          : { color: this.theme.textMeta, fontSize: 12, fontWeight: 'normal' as const };
+      this.send(event(this.id, this.statusLabelId, 'update', { text, style }));
+    }
+
+    const empty = this.goals.length === 0;
+    if (this.scrollAreaId && this.emptyLabelId && empty !== this.emptyShown) {
+      this.emptyShown = empty;
+      this.send(request(this.id, this.scrollAreaId, 'updateLayoutChild', {
+        widgetId: this.emptyLabelId,
+        preferredSize: { height: empty ? EMPTY_H : 0 },
+      }));
+    }
+
+    await this.updateEye(running > 0);
+  }
+
+  /** Eye position: right end of the status strip, px from the window centre. */
+  private eyePosition(): [number, number, number] {
+    const w = this.eyeWinSize?.width ?? WIN_W;
+    const h = this.eyeWinSize?.height ?? WIN_H;
+    // Content starts 36px below the top; the strip sits after a 12px margin.
+    return [w / 2 - 16 - EYE_SIZE, -h / 2 + 36 + 12 + STATUS_H / 2, 6];
+  }
+
+  /**
+   * The eye opens while any goal is running and closes when the last one
+   * settles. One scene batch per transition; all motion is client-side.
+   */
+  private async updateEye(active: boolean): Promise<void> {
+    if (!this.windowId || active === this.eyeShown) return;
+    if (active) {
+      if (!this.eyeWinSize) {
+        try {
+          const r = await this.request<{ width: number; height: number }>(
+            request(this.id, this.windowId, 'getRect', {})
+          );
+          if (r && r.width > 0 && r.height > 0) this.eyeWinSize = { width: r.width, height: r.height };
+        } catch { /* fall back to the default size */ }
+      }
+      this.eyeShown = true;
+      await this.sendEyeOps(eyeSigilOps(EYE_PREFIX, this.eyePosition(), EYE_SIZE));
+    } else {
+      this.eyeShown = false;
+      await this.sendEyeOps(removeSigilOps(EYE_PREFIX));
+    }
+  }
+
+  private async sendEyeOps(ops: SceneOp[]): Promise<void> {
+    if (!this.windowId) return;
+    try {
+      await this.request(request(this.id, this.windowId, 'scene', { ops }));
+    } catch (err) {
+      log.warn('Failed to update the goal eye sigil:', err);
+    }
   }
 
   // -- Event handling --

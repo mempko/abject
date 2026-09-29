@@ -27,7 +27,27 @@ export type IconName =
   | 'info'
   | 'help'
   | 'dot'
-  | 'clock';
+  | 'clock'
+  // Geometric launcher set (dock rows): built from squares, circles,
+  // triangles and bars so they read at 14-16 px.
+  | 'chat'
+  | 'users'
+  | 'target'
+  | 'list'
+  | 'brain'
+  | 'agent'
+  | 'calendar'
+  | 'globe'
+  | 'network'
+  | 'folder'
+  | 'folderOpen'
+  | 'gear'
+  | 'eye'
+  | 'bell'
+  | 'lock'
+  | 'grid'
+  | 'diamond'
+  | 'activity';
 
 export interface IconDrawOpts {
   surfaceId: string;
@@ -40,6 +60,11 @@ export interface IconDrawOpts {
   color: string;
   /** Override stroke width. Default scales with size: max(1.25, size/12). */
   lineWidth?: number;
+  /**
+   * Stroke ends and joins. 'round' (default) is the soft classic look;
+   * 'square' renders square caps and miter joins for hard-edged themes.
+   */
+  caps?: 'round' | 'square';
 }
 
 type Cmd = { type: string; surfaceId: string; params: Record<string, unknown> };
@@ -51,7 +76,18 @@ type Cmd = { type: string; surfaceId: string; params: Record<string, unknown> };
 export function iconCommands(name: IconName, opts: IconDrawOpts): Cmd[] {
   const renderer = ICONS[name];
   if (!renderer) return [];
-  return renderer(opts);
+  const cmds = renderer(opts);
+  return opts.caps === 'square' ? cmds.map(squareOff) : cmds;
+}
+
+/** Rewrite a command's stroke ends and joins to square caps + miter joins. */
+function squareOff(cmd: Cmd): Cmd {
+  const p = cmd.params;
+  if (p.stroke === undefined) return cmd;
+  const next: Record<string, unknown> = { ...p };
+  if (p.lineCap === 'round' || (cmd.type === 'line' && p.lineCap === undefined)) next.lineCap = 'square';
+  if (cmd.type === 'polygon' || cmd.type === 'rect' || p.lineJoin !== undefined) next.lineJoin = 'miter';
+  return { ...cmd, params: next };
 }
 
 const defaultLineWidth = (size: number) => Math.max(1.25, size / 12);
@@ -95,6 +131,26 @@ const polygon = (
   type: 'polygon',
   surfaceId,
   params: { points, fill, closePath: true },
+});
+
+const filledRect = (
+  surfaceId: string,
+  x: number, y: number, width: number, height: number,
+  fill: string,
+): Cmd => ({
+  type: 'rect',
+  surfaceId,
+  params: { x, y, width, height, fill },
+});
+
+const polyline = (
+  surfaceId: string,
+  points: Array<{ x: number; y: number }>,
+  stroke: string, lineWidth: number, closePath: boolean,
+): Cmd => ({
+  type: 'polygon',
+  surfaceId,
+  params: { points, stroke, lineWidth, lineCap: 'round', lineJoin: 'round', closePath },
 });
 
 type Renderer = (opts: IconDrawOpts) => Cmd[];
@@ -320,6 +376,201 @@ const clockIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
   ];
 };
 
+// ── Geometric launcher set ──────────────────────────────────────────────
+// Each glyph is a small composition of solid primitives (squares, circles,
+// triangles, bars) in the spirit of a Constructivist poster: few shapes,
+// heavy weights, readable at 14-16 px. Coordinates are fractions of `size`.
+
+/** Map fractional box coordinates to absolute ones for a renderer. */
+const at = (x: number, y: number, size: number) => (fx: number, fy: number) => ({ x: x + size * fx, y: y + size * fy });
+
+const chatIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const p = at(x, y, size);
+  return [
+    filledRect(surfaceId, x + size * 0.14, y + size * 0.18, size * 0.72, size * 0.48, color),
+    polygon(surfaceId, [p(0.24, 0.64), p(0.48, 0.64), p(0.24, 0.88)], color),
+  ];
+};
+
+const usersIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  return [
+    // Rear figure (right), then the front figure overlapping it.
+    circle(surfaceId, x + size * 0.68, y + size * 0.3, size * 0.11, color),
+    filledRect(surfaceId, x + size * 0.54, y + size * 0.47, size * 0.32, size * 0.33, color),
+    circle(surfaceId, x + size * 0.36, y + size * 0.34, size * 0.13, color),
+    filledRect(surfaceId, x + size * 0.16, y + size * 0.54, size * 0.4, size * 0.32, color),
+  ];
+};
+
+const targetIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const cx = x + size / 2, cy = y + size / 2;
+  return [
+    circle(surfaceId, cx, cy, size * 0.4, undefined, color, lw),
+    circle(surfaceId, cx, cy, size * 0.24, undefined, color, lw),
+    circle(surfaceId, cx, cy, size * 0.09, color),
+  ];
+};
+
+const listIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = Math.max(lineWidth ?? defaultLineWidth(size), size * 0.1);
+  const out: Cmd[] = [];
+  for (const fy of [0.24, 0.5, 0.76]) {
+    const cy = y + size * fy;
+    out.push(filledRect(surfaceId, x + size * 0.12, cy - size * 0.07, size * 0.14, size * 0.14, color));
+    out.push(filledRect(surfaceId, x + size * 0.34, cy - lw / 2, size * 0.54, lw, color));
+  }
+  return out;
+};
+
+const brainIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const cy = y + size * 0.5;
+  // Two lobes split by a central bar: knowledge as a bicameral circle.
+  return [
+    circle(surfaceId, x + size * 0.36, cy, size * 0.25, undefined, color, lw),
+    circle(surfaceId, x + size * 0.64, cy, size * 0.25, undefined, color, lw),
+    line(surfaceId, x + size * 0.5, y + size * 0.2, x + size * 0.5, y + size * 0.8, color, lw),
+    circle(surfaceId, x + size * 0.36, cy, size * 0.08, color),
+  ];
+};
+
+const agentIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const cx = x + size / 2;
+  return [
+    line(surfaceId, cx, y + size * 0.14, cx, y + size * 0.3, color, lw),
+    circle(surfaceId, cx, y + size * 0.12, size * 0.07, color),
+    rect(surfaceId, x + size * 0.2, y + size * 0.3, size * 0.6, size * 0.52, color, lw),
+    filledRect(surfaceId, x + size * 0.32, y + size * 0.46, size * 0.12, size * 0.12, color),
+    filledRect(surfaceId, x + size * 0.56, y + size * 0.46, size * 0.12, size * 0.12, color),
+    filledRect(surfaceId, x + size * 0.32, y + size * 0.66, size * 0.36, size * 0.06, color),
+  ];
+};
+
+const calendarIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  return [
+    rect(surfaceId, x + size * 0.14, y + size * 0.22, size * 0.72, size * 0.64, color, lw),
+    filledRect(surfaceId, x + size * 0.14, y + size * 0.22, size * 0.72, size * 0.18, color),
+    line(surfaceId, x + size * 0.34, y + size * 0.1, x + size * 0.34, y + size * 0.26, color, lw),
+    line(surfaceId, x + size * 0.66, y + size * 0.1, x + size * 0.66, y + size * 0.26, color, lw),
+    filledRect(surfaceId, x + size * 0.54, y + size * 0.56, size * 0.18, size * 0.18, color),
+  ];
+};
+
+const globeIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const cx = x + size / 2, cy = y + size / 2;
+  const r = size * 0.38;
+  return [
+    circle(surfaceId, cx, cy, r, undefined, color, lw),
+    { type: 'ellipse', surfaceId, params: { cx, cy, radiusX: r * 0.42, radiusY: r, stroke: color, lineWidth: lw } },
+    line(surfaceId, cx - r, cy, cx + r, cy, color, lw),
+  ];
+};
+
+const networkIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const p = at(x, y, size);
+  const a = p(0.5, 0.2), b = p(0.2, 0.78), c = p(0.8, 0.78);
+  const r = size * 0.11;
+  return [
+    line(surfaceId, a.x, a.y, b.x, b.y, color, lw),
+    line(surfaceId, b.x, b.y, c.x, c.y, color, lw),
+    line(surfaceId, c.x, c.y, a.x, a.y, color, lw),
+    circle(surfaceId, a.x, a.y, r, color),
+    circle(surfaceId, b.x, b.y, r, color),
+    circle(surfaceId, c.x, c.y, r, color),
+  ];
+};
+
+const folderIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const p = at(x, y, size);
+  return [
+    polygon(surfaceId, [p(0.12, 0.22), p(0.42, 0.22), p(0.5, 0.32), p(0.88, 0.32), p(0.88, 0.8), p(0.12, 0.8)], color),
+  ];
+};
+
+const folderOpenIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const p = at(x, y, size);
+  return [
+    polyline(surfaceId, [p(0.12, 0.8), p(0.12, 0.22), p(0.42, 0.22), p(0.5, 0.32), p(0.8, 0.32), p(0.8, 0.46)], color, lw, false),
+    polygon(surfaceId, [p(0.12, 0.8), p(0.26, 0.46), p(0.94, 0.46), p(0.8, 0.8)], color),
+  ];
+};
+
+const gearIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const cx = x + size / 2, cy = y + size / 2;
+  const out: Cmd[] = [circle(surfaceId, cx, cy, size * 0.22, undefined, color, lw * 1.4)];
+  const tooth = Math.max(lw * 1.6, size * 0.13);
+  for (let i = 0; i < 8; i++) {
+    const a = (i * Math.PI) / 4;
+    const cos = Math.cos(a), sin = Math.sin(a);
+    out.push(line(
+      surfaceId,
+      cx + cos * size * 0.28, cy + sin * size * 0.28,
+      cx + cos * size * 0.42, cy + sin * size * 0.42,
+      color, tooth, 'butt',
+    ));
+  }
+  return out;
+};
+
+const eyeIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const p = at(x, y, size);
+  // An angular lens: the eye as a hexagon around a solid pupil.
+  return [
+    polyline(surfaceId, [p(0.06, 0.5), p(0.3, 0.26), p(0.7, 0.26), p(0.94, 0.5), p(0.7, 0.74), p(0.3, 0.74)], color, lw, true),
+    circle(surfaceId, x + size / 2, y + size / 2, size * 0.14, color),
+  ];
+};
+
+const bellIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const p = at(x, y, size);
+  return [
+    polygon(surfaceId, [p(0.36, 0.18), p(0.64, 0.18), p(0.76, 0.66), p(0.24, 0.66)], color),
+    filledRect(surfaceId, x + size * 0.12, y + size * 0.66, size * 0.76, size * 0.1, color),
+    circle(surfaceId, x + size / 2, y + size * 0.86, size * 0.08, color),
+  ];
+};
+
+const lockIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = Math.max(lineWidth ?? defaultLineWidth(size), size * 0.1);
+  const p = at(x, y, size);
+  return [
+    polyline(surfaceId, [p(0.33, 0.48), p(0.33, 0.2), p(0.67, 0.2), p(0.67, 0.48)], color, lw, false),
+    filledRect(surfaceId, x + size * 0.2, y + size * 0.46, size * 0.6, size * 0.42, color),
+  ];
+};
+
+const gridIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const s = size * 0.3;
+  const a = size * 0.16, b = size * 0.54;
+  return [
+    filledRect(surfaceId, x + a, y + a, s, s, color),
+    filledRect(surfaceId, x + b, y + a, s, s, color),
+    filledRect(surfaceId, x + a, y + b, s, s, color),
+    filledRect(surfaceId, x + b, y + b, s, s, color),
+  ];
+};
+
+const diamondIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  const p = at(x, y, size);
+  return [polygon(surfaceId, [p(0.5, 0.1), p(0.9, 0.5), p(0.5, 0.9), p(0.1, 0.5)], color)];
+};
+
+const activityIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
+  // A bar chart of uneven heights: running work at a glance.
+  const w = size * 0.16;
+  const base = y + size * 0.86;
+  const bars = [[0.12, 0.4], [0.42, 0.7], [0.72, 0.52]] as const;
+  return bars.map(([fx, fh]) => filledRect(surfaceId, x + size * fx, base - size * fh, w, size * fh, color));
+};
+
 const ICONS: Record<IconName, Renderer> = {
   close: closeIcon,
   minimize: minimizeIcon,
@@ -339,4 +590,27 @@ const ICONS: Record<IconName, Renderer> = {
   help: helpIcon,
   dot: dotIcon,
   clock: clockIcon,
+  chat: chatIcon,
+  users: usersIcon,
+  target: targetIcon,
+  list: listIcon,
+  brain: brainIcon,
+  agent: agentIcon,
+  calendar: calendarIcon,
+  globe: globeIcon,
+  network: networkIcon,
+  folder: folderIcon,
+  folderOpen: folderOpenIcon,
+  gear: gearIcon,
+  eye: eyeIcon,
+  bell: bellIcon,
+  lock: lockIcon,
+  grid: gridIcon,
+  diamond: diamondIcon,
+  activity: activityIcon,
 };
+
+/** True when `name` is a built-in icon (for validating caller-supplied names). */
+export function isIconName(name: string): name is IconName {
+  return Object.prototype.hasOwnProperty.call(ICONS, name);
+}

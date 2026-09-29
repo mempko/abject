@@ -8,6 +8,10 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import {
+  sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle,
+  livingStyle, eyeSigilOps, removeSigilOps,
+} from './ui-kit.js';
 
 
 interface GatewayStatus { enabled: boolean; listening: boolean; bind: string; port: number; baseUrl: string; workspaces: number; routes: number; tokens: number; }
@@ -35,6 +39,14 @@ export class PeerNetwork extends Abject {
   // Tab state
   private tabBarId?: AbjectId;
   private tabContents: AbjectId[] = [];
+  /** Selected tab index (0 = Identity), for the live-peer eye sigil. */
+  private selectedTab = 0;
+  /** True while at least one peer connection is live. */
+  private peersLive = false;
+  /** True while the eye sigil is in the window's scene. */
+  private sigilShown = false;
+  /** Last known window size, for placing the sigil. */
+  private winSize?: { width: number; height: number };
 
   // Identity section widgets
   private nameInputId?: AbjectId;
@@ -164,6 +176,94 @@ for managing your identity, signaling servers, and contacts.
 Interface: abjects:peer-network`;
   }
 
+  /** Style for the one affirmative primary button per area (red action face). */
+  private positiveButtonStyle(): Record<string, unknown> {
+    const t = this.theme;
+    return { background: t.actionBg, color: t.actionText, borderColor: t.actionBorder };
+  }
+
+  /**
+   * Style for affirmative buttons repeated on every row (Add, Trust, Unblock,
+   * Accept). Red is kept for the one primary action per area, so row buttons
+   * are default secondary buttons.
+   */
+  private rowPositiveStyle(): Record<string, unknown> {
+    return { fontSize: 11 };
+  }
+
+  /** Section header label spec, built with the shared kit. */
+  private headerSpec(text: string, size = 13): Record<string, unknown> {
+    const t = this.theme;
+    return { type: 'label', windowId: this.windowId, text: sectionHeaderText(t, text), style: sectionHeaderStyle(t, size) };
+  }
+
+  /**
+   * Empty-state label spec plus its height: the kit markdown empty state
+   * saying what appears here and how to get it.
+   */
+  private emptySpec(title: string, hint: string): { spec: Record<string, unknown>; height: number } {
+    const t = this.theme;
+    return {
+      spec: { type: 'label', windowId: this.windowId, text: emptyStateMarkdown(title, hint), style: emptyStateStyle(t) },
+      height: 64,
+    };
+  }
+
+  /** Add a helper hint under a header. */
+  private async addHint(containerId: AbjectId, text: string, height = 18): Promise<void> {
+    const { widgetIds: [hintId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text, style: hintStyle(this.theme) },
+      ] })
+    );
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: hintId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height },
+    }));
+  }
+
+  /** Style for the remote UI status line: phosphor while enabled, muted when off. */
+  private remoteStatusStyle(enabled: boolean): Record<string, unknown> {
+    return enabled ? { ...livingStyle(this.theme) } : { color: this.theme.textMeta, fontSize: 12 };
+  }
+
+  /** Colour for a live/connected status (phosphor). */
+  private liveColor(): string {
+    return livingStyle(this.theme).color as string;
+  }
+
+  /**
+   * Show the small eye sigil beside the Identity header while at least one
+   * peer connection is live and the Identity tab is selected. Adds or removes it once per state change; motion is client-side.
+   */
+  private async syncPeerSigil(forceReposition = false): Promise<void> {
+    if (!this.windowId) { this.sigilShown = false; return; }
+    const want = this.peersLive && this.selectedTab === 0;
+    if (want === this.sigilShown && !(want && forceReposition)) return;
+    try {
+      if (!want || forceReposition) {
+        if (this.sigilShown) {
+          await this.request(request(this.id, this.windowId, 'scene', { ops: removeSigilOps('peer-live') }));
+          this.sigilShown = false;
+        }
+        if (!want) return;
+      }
+      if (!this.winSize) {
+        const rect = await this.request<{ x: number; y: number; width: number; height: number }>(
+          request(this.id, this.windowId, 'getRect', {})
+        );
+        this.winSize = { width: rect.width, height: rect.height };
+      }
+      const { width, height } = this.winSize;
+      // Title bar 36 + tab bar 36 + tab margin 20, then half the 20px header row.
+      const headerCenterY = 36 + 36 + 20 + 10;
+      const at: [number, number, number] = [width / 2 - 40, headerCenterY - height / 2, 8];
+      await this.request(request(this.id, this.windowId, 'scene', { ops: eyeSigilOps('peer-live', at, 22) }));
+      this.sigilShown = true;
+    } catch { /* scene is best effort */ }
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
@@ -197,6 +297,15 @@ Interface: abjects:peer-network`;
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
+      if (!this.windowId || (windowId && windowId !== this.windowId)) return;
+      if (typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0) {
+        this.winSize = { width, height };
+        if (this.sigilShown) await this.syncPeerSigil(true);
+      }
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
@@ -209,6 +318,8 @@ Interface: abjects:peer-network`;
             style: { visible: i === idx },
           }));
         }
+        this.selectedTab = idx;
+        await this.syncPeerSigil();
         return;
       }
 
@@ -451,11 +562,14 @@ Interface: abjects:peer-network`;
     // Create window
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\uD83C\uDF10 Peer Network',
+        title: 'Peer Network',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
       })
     );
+    this.winSize = { width: winW, height: winH };
+    this.selectedTab = 0;
+    this.sigilShown = false;
 
     // Create root VBox layout (non-scrollable — tabs handle their own scrolling)
     this.rootLayoutId = await this.request<AbjectId>(
@@ -575,7 +689,7 @@ Interface: abjects:peer-network`;
     // Display Name label
     const { widgetIds: [nameLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Display Name', style: { color: this.theme.textHeading, fontSize: 13 } },
+        this.headerSpec('Display Name'),
       ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
@@ -583,6 +697,7 @@ Interface: abjects:peer-network`;
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
+    await this.addHint(tab0, 'The name other peers see when you connect.');
 
     // Name input + Save button row
     const nameRowId = await this.request<AbjectId>(
@@ -624,7 +739,7 @@ Interface: abjects:peer-network`;
     const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
     const { widgetIds: [peerIdHeaderId, peerIdValueId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Peer ID', style: { color: this.theme.textHeading, fontSize: 13 } },
+        this.headerSpec('Peer ID'),
         { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: this.theme.textMeta, fontSize: 12, selectable: true } },
       ] })
     );
@@ -638,6 +753,7 @@ Interface: abjects:peer-network`;
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
+    await this.addHint(tab0, 'Share your identity JSON with someone so they can add you as a contact.');
 
     // Copy buttons row
     const copyRowId = await this.request<AbjectId>(
@@ -696,8 +812,8 @@ Interface: abjects:peer-network`;
     // Batch: Add Contact label + description label
     const { widgetIds: [addLabelId, addDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Add Contact', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: "Paste a peer's identity JSON.", style: { color: this.theme.textDescription, fontSize: 12 } },
+        this.headerSpec('Add Contact'),
+        { type: 'label', windowId: this.windowId, text: "Paste a peer's identity JSON (they copy it from their Identity tab).", style: hintStyle(this.theme) },
       ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
@@ -750,7 +866,7 @@ Interface: abjects:peer-network`;
     // Contacts list header
     const { widgetIds: [contactsHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Contacts', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        this.headerSpec('Contacts'),
       ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
@@ -760,28 +876,27 @@ Interface: abjects:peer-network`;
     }));
 
     if (contacts.length === 0) {
+      const empty = this.emptySpec('No contacts yet', 'Paste a peer\'s identity JSON above, or trust a peer from the Servers & Peers tab.');
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No contacts yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        ] })
+        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
       );
       await this.request(request(this.id, tab1, 'addLayoutChild', {
         widgetId: emptyLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: empty.height },
       }));
     } else {
       // Contacts as a single rich list: state badge + inline actions per row.
       const items = contacts.map((contact) => {
         const isConnected = contact.state === 'connected';
-        const stateColor = contact.state === 'connected' ? this.theme.statusSuccess
+        const stateColor = contact.state === 'connected' ? this.liveColor()
           : contact.state === 'connecting' ? this.theme.statusWarning
-          : this.theme.statusNeutral;
+          : this.theme.textMeta;
         const actions: Array<{ id: string; label: string; color?: string; textColor?: string }> = [
-          { id: 'connect', label: isConnected ? 'Disconnect' : 'Connect', color: isConnected ? undefined : '#1e3a2e' },
+          { id: 'connect', label: isConnected ? 'Disconnect' : 'Connect' },
         ];
         if (isConnected) {
-          actions.push({ id: 'introduce', label: 'Introduce', color: '#1e2a3a' });
+          actions.push({ id: 'introduce', label: 'Introduce' });
         }
         actions.push(
           { id: 'remove', label: 'Remove', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
@@ -815,7 +930,7 @@ Interface: abjects:peer-network`;
     // Signaling Server header
     const { widgetIds: [sigHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Signaling Servers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        this.headerSpec('Signaling Servers'),
       ] })
     );
     await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -823,6 +938,7 @@ Interface: abjects:peer-network`;
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
+    await this.addHint(tab2, 'A signaling server introduces peers to each other so they can connect directly.');
 
     // Signaling URL input + Connect button row
     const sigRowId = await this.request<AbjectId>(
@@ -842,7 +958,7 @@ Interface: abjects:peer-network`;
     const { widgetIds: [_signalingInputId, _signalingConnectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, placeholder: 'wss://signal.abject.world' },
-        { type: 'button', windowId: this.windowId, text: 'Connect', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess } },
+        { type: 'button', windowId: this.windowId, text: 'Connect', style: this.positiveButtonStyle() },
       ] })
     );
     this.signalingInputId = _signalingInputId;
@@ -884,9 +1000,9 @@ Interface: abjects:peer-network`;
         preferredSize: { height: 28 },
       }));
 
-      const urlColor = status === 'connected' ? this.theme.actionBg
+      const urlColor = status === 'connected' ? this.liveColor()
         : status === 'connecting' ? this.theme.statusWarning
-        : this.theme.statusErrorBright;
+        : this.theme.statusError;
       const statusText = status === 'connected' ? 'connected'
         : status === 'connecting' ? 'connecting...'
         : 'offline';
@@ -918,6 +1034,18 @@ Interface: abjects:peer-network`;
       this.signalingRemoveButtons.set(removeBtnId, url);
     }
 
+    if (signalingServers.length === 0) {
+      const empty = this.emptySpec('No signaling servers', 'Enter a server URL above and press Connect to find peers on the network.');
+      const { widgetIds: [emptySigId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
+      );
+      await this.request(request(this.id, tab2, 'addLayoutChild', {
+        widgetId: emptySigId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: empty.height },
+      }));
+    }
+
     // Signaling Peers subsection
     interface SignalingPeerInfo {
       peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string; serverUrl: string;
@@ -936,7 +1064,7 @@ Interface: abjects:peer-network`;
 
       const { widgetIds: [spHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Signaling Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          this.headerSpec('Signaling Peers'),
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -944,6 +1072,7 @@ Interface: abjects:peer-network`;
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 },
       }));
+      await this.addHint(tab2, 'Peers visible on your signaling servers. Add one to make it a contact.');
 
       this.signalingPeerAddButtons.clear();
 
@@ -967,7 +1096,7 @@ Interface: abjects:peer-network`;
         const { widgetIds: [spNameId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Add', style: this.rowPositiveStyle() },
           ] })
         );
         await this.request(request(this.id, spRowId, 'addLayoutChild', {
@@ -1023,8 +1152,8 @@ Interface: abjects:peer-network`;
       // Batch: network header + mesh status (2 adjacent labels)
       const { widgetIds: [netHeaderId, meshStatusId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Network Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-          { type: 'label', windowId: this.windowId, text: meshStatus, style: { color: this.theme.textMeta, fontSize: 11 } },
+          this.headerSpec('Network Peers'),
+          { type: 'label', windowId: this.windowId, text: meshStatus, style: livingStyle(this.theme, 11) },
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -1057,7 +1186,7 @@ Interface: abjects:peer-network`;
         const { widgetIds: [cNameId, cTagId, cBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.theme.statusSuccess, fontSize: 11, selectable: true } },
+            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.liveColor(), fontSize: 11, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
@@ -1100,8 +1229,8 @@ Interface: abjects:peer-network`;
         const { widgetIds: [npNameId, durationId, promoteBtnId, npBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.theme.statusNeutral, fontSize: 11, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Trust', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.liveColor(), fontSize: 11, selectable: true } },
+            { type: 'button', windowId: this.windowId, text: 'Trust', style: this.rowPositiveStyle() },
             { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
@@ -1130,7 +1259,30 @@ Interface: abjects:peer-network`;
         }));
         this.blockButtons.set(npBlockBtnId, netPeer.peerId);
       }
+    } else {
+      await this.addDivider(tab2);
+      const { widgetIds: [netHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [this.headerSpec('Network Peers')] })
+      );
+      await this.request(request(this.id, tab2, 'addLayoutChild', {
+        widgetId: netHeaderId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 20 },
+      }));
+      const empty = this.emptySpec('No peers connected', 'Peers appear here once you connect to a signaling server or a contact comes online.');
+      const { widgetIds: [emptyNetId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
+      );
+      await this.request(request(this.id, tab2, 'addLayoutChild', {
+        widgetId: emptyNetId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: empty.height },
+      }));
     }
+
+    // Live peer connections drive the Identity tab's eye sigil.
+    this.peersLive = connectedContacts.length > 0 || networkPeers.length > 0;
+    await this.syncPeerSigil();
 
     // Blocked Peers subsection
     let blockedPeers: string[] = [];
@@ -1147,7 +1299,7 @@ Interface: abjects:peer-network`;
 
       const { widgetIds: [blockedHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Blocked Peers', style: { color: this.theme.statusErrorBright, fontWeight: 'bold', fontSize: 13 } },
+          this.headerSpec('Blocked Peers'),
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -1173,8 +1325,8 @@ Interface: abjects:peer-network`;
         // Batch: name label + unblock button
         const { widgetIds: [bNameId, unblockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.statusNeutral, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Unblock', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.textMeta, fontSize: 12, selectable: true } },
+            { type: 'button', windowId: this.windowId, text: 'Unblock', style: this.rowPositiveStyle() },
           ] })
         );
         await this.request(request(this.id, bRowId, 'addLayoutChild', {
@@ -1210,7 +1362,7 @@ Interface: abjects:peer-network`;
     // Introductions header
     const { widgetIds: [introHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Pending Introductions', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
+        this.headerSpec('Pending Introductions'),
       ] })
     );
     await this.request(request(this.id, tab3, 'addLayoutChild', {
@@ -1218,17 +1370,17 @@ Interface: abjects:peer-network`;
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
+    await this.addHint(tab3, 'When a contact introduces you to someone they know, accept to add that peer as a contact.', 32);
 
     if (pendingIntros.length === 0) {
+      const empty = this.emptySpec('No pending introductions', 'Introductions from your connected contacts will wait here for your answer.');
       const { widgetIds: [emptyIntroId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No pending introductions.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        ] })
+        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
       );
       await this.request(request(this.id, tab3, 'addLayoutChild', {
         widgetId: emptyIntroId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: empty.height },
       }));
     } else {
       for (const intro of pendingIntros) {
@@ -1253,7 +1405,7 @@ Interface: abjects:peer-network`;
         const { widgetIds: [introLabel, acceptBtnId, rejectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Accept', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Accept', style: this.rowPositiveStyle() },
             { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
@@ -1333,7 +1485,7 @@ Interface: abjects:peer-network`;
     // ── Connected frontends header ──
     const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Connected Frontends', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
+        this.headerSpec('Connected Frontends'),
       ] })
     );
     await this.request(request(this.id, listArea, 'addLayoutChild', {
@@ -1361,15 +1513,14 @@ Interface: abjects:peer-network`;
     }
 
     if (clients.length === 0) {
+      const empty = this.emptySpec('No frontends connected', 'Browsers and paired phones showing this desktop appear here.');
       const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No frontends connected.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        ] })
+        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
       );
       await this.request(request(this.id, listArea, 'addLayoutChild', {
         widgetId: emptyId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: empty.height },
       }));
       return;
     }
@@ -1394,7 +1545,7 @@ Interface: abjects:peer-network`;
         || (c.peerId ? c.peerId.slice(0, 12) + '…' : '')
         || c.clientId;
       const relAgo = formatRelative(Date.now() - c.connectedAt);
-      const text = `[${kindLabel}] ${displayName} • ${relAgo}`;
+      const text = `${kindLabel}  /  ${displayName}  /  ${relAgo}`;
 
       const specs: Array<Record<string, unknown>> = [
         { type: 'label', windowId: this.windowId, text, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
@@ -1444,8 +1595,7 @@ Interface: abjects:peer-network`;
     // Section header
     const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Pair a Frontend',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        this.headerSpec('Pair a Frontend', 15),
       ] })
     );
     await this.request(request(this.id, tab4, 'addLayoutChild', {
@@ -1453,6 +1603,7 @@ Interface: abjects:peer-network`;
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
+    await this.addHint(tab4, 'Open this desktop on your phone: enable remote UI, then scan the pairing QR code.');
 
     let status = { enabled: false, peerId: '', signalingUrl: '', deviceLabel: '', connectedCount: 0, authorizedCount: 0 };
     if (this.remoteUIAccessId) {
@@ -1497,7 +1648,7 @@ Interface: abjects:peer-network`;
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId,
           text: formatRemoteStatus(status),
-          style: { color: this.theme.textDescription, fontSize: 12 } },
+          style: this.remoteStatusStyle(status.enabled) },
       ] })
     );
     this.remoteStatusLabelId = statusLabelId;
@@ -1540,7 +1691,7 @@ Interface: abjects:peer-network`;
     const qrImageSpec: Record<string, unknown> = {
       type: 'image', windowId: this.windowId,
       alt: this.lastQrDataUrl ? '' : 'No QR generated yet',
-      style: { background: this.theme.windowBg, color: this.theme.textTertiary, fontSize: 12, radius: 4 },
+      style: { background: this.theme.windowBg, color: this.theme.textTertiary, fontSize: 12, radius: this.theme.tokens.radius.sm },
     };
     if (this.lastQrDataUrl) qrImageSpec.url = this.lastQrDataUrl;
     const { widgetIds: [qrImageId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -1579,13 +1730,13 @@ Interface: abjects:peer-network`;
     if (!this.webGatewayId) {
       const { widgetIds: [unavailableId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Web Gateway is not available.', style: { color: this.theme.textDescription, fontSize: 12 } },
+            this.emptySpec('Web Gateway is not available', 'The HTTP gateway serves workspaces to browsers and scripts. It appears here once the gateway object is running.').spec,
         ] })
       );
       await this.request(request(this.id, tab5, 'addLayoutChild', {
         widgetId: unavailableId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 24 },
+        preferredSize: { height: 64 },
       }));
       return;
     }
@@ -1593,18 +1744,18 @@ Interface: abjects:peer-network`;
     const { widgetIds: [titleId, statusId, toggleBtnId, portLblId, portInputId, portApplyId, div1Id, routesHdrId, routesId, div2Id, tokensHdrId, tokensDescId, mintBtnId, resultId, tokensListId] } =
       await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'HTTP Gateway', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 16 } },
+          this.headerSpec('HTTP Gateway', 16),
           { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
           { type: 'button', windowId: this.windowId, text: 'Enable', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-          { type: 'label', windowId: this.windowId, text: 'Port', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          this.headerSpec('Port'),
           { type: 'textInput', windowId: this.windowId, placeholder: 'Leave empty for automatic (system finds a free port), or enter a port number' },
-          { type: 'button', windowId: this.windowId, text: 'Apply Port', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          { type: 'button', windowId: this.windowId, text: 'Apply Port' },
           { type: 'divider', windowId: this.windowId },
-          { type: 'label', windowId: this.windowId, text: 'Routes', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          this.headerSpec('Routes'),
           { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
           { type: 'divider', windowId: this.windowId },
-          { type: 'label', windowId: this.windowId, text: 'API Tokens', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-          { type: 'label', windowId: this.windowId, text: 'Authenticated routes need one of these as a Bearer token. The secret is shown once at mint time.', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+          this.headerSpec('API Tokens'),
+          { type: 'label', windowId: this.windowId, text: 'Authenticated routes need one of these as a Bearer token. The secret is shown once at mint time.', style: hintStyle(this.theme) },
           { type: 'button', windowId: this.windowId, text: 'Mint Token', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
           { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true, selectable: true } },
@@ -1650,6 +1801,9 @@ Interface: abjects:peer-network`;
           text: status.enabled
             ? `ON — ${status.baseUrl} (${status.routes} route(s) across ${status.workspaces} workspace(s))`
             : 'OFF — the HTTP listener is not running.',
+          style: status.enabled
+            ? { ...livingStyle(this.theme), wordWrap: true, selectable: true }
+            : { color: this.theme.textMeta, fontSize: 12, wordWrap: true, selectable: true },
         }));
       }
       if (this.webRoutesId) {
@@ -1693,6 +1847,8 @@ Interface: abjects:peer-network`;
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.tabBarId = undefined;
+    this.sigilShown = false;
+    this.winSize = undefined;
     this.tabContents = [];
     this.statusLabelId = undefined;
     this.nameInputId = undefined;
@@ -1766,6 +1922,7 @@ Interface: abjects:peer-network`;
       );
       await this.request(request(this.id, this.remoteStatusLabelId, 'update', {
         text: formatRemoteStatus(status),
+        style: this.remoteStatusStyle(status.enabled),
       }));
     } catch { /* best effort */ }
   }
@@ -1802,7 +1959,7 @@ Interface: abjects:peer-network`;
     );
 
     if (!name || name.trim() === '') {
-      await this.setStatus('Name cannot be empty.', this.theme.statusErrorBright);
+      await this.setStatus('Name cannot be empty.', this.theme.statusError);
       return;
     }
 
@@ -1827,10 +1984,10 @@ Interface: abjects:peer-network`;
         );
         await this.setStatus('Peer ID copied!');
       } else {
-        await this.setStatus('Clipboard not available.', this.theme.statusErrorBright);
+        await this.setStatus('Clipboard not available.', this.theme.statusError);
       }
     } catch {
-      await this.setStatus('Failed to copy Peer ID.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to copy Peer ID.', this.theme.statusError);
     }
   }
 
@@ -1857,10 +2014,10 @@ Interface: abjects:peer-network`;
         );
         await this.setStatus('Identity JSON copied!');
       } else {
-        await this.setStatus('Clipboard not available.', this.theme.statusErrorBright);
+        await this.setStatus('Clipboard not available.', this.theme.statusError);
       }
     } catch {
-      await this.setStatus('Failed to copy identity.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to copy identity.', this.theme.statusError);
     }
   }
 
@@ -1884,7 +2041,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Removed signaling server.');
     } catch {
-      await this.setStatus('Failed to remove server.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to remove server.', this.theme.statusError);
     }
   }
 
@@ -1896,7 +2053,7 @@ Interface: abjects:peer-network`;
     );
 
     if (!url || url.trim() === '') {
-      await this.setStatus('Enter a signaling server URL.', this.theme.statusErrorBright);
+      await this.setStatus('Enter a signaling server URL.', this.theme.statusError);
       return;
     }
 
@@ -1906,12 +2063,12 @@ Interface: abjects:peer-network`;
       );
       if (ok) {
         await this.refresh();
-        await this.setStatus('Connected to signaling server!', this.theme.statusSuccess);
+        await this.setStatus('Connected to signaling server!', this.liveColor());
       } else {
-        await this.setStatus('Failed to connect.', this.theme.statusErrorBright);
+        await this.setStatus('Failed to connect.', this.theme.statusError);
       }
     } catch {
-      await this.setStatus('Connection error.', this.theme.statusErrorBright);
+      await this.setStatus('Connection error.', this.theme.statusError);
     }
   }
 
@@ -1923,7 +2080,7 @@ Interface: abjects:peer-network`;
     );
 
     if (!jsonStr || jsonStr.trim() === '') {
-      await this.setStatus('Paste identity JSON.', this.theme.statusErrorBright);
+      await this.setStatus('Paste identity JSON.', this.theme.statusError);
       return;
     }
 
@@ -1936,7 +2093,7 @@ Interface: abjects:peer-network`;
       };
 
       if (!parsed.peerId || !parsed.publicSigningKey || !parsed.publicExchangeKey) {
-        await this.setStatus('Invalid identity JSON.', this.theme.statusErrorBright);
+        await this.setStatus('Invalid identity JSON.', this.theme.statusError);
         return;
       }
 
@@ -1952,7 +2109,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Contact added!');
     } catch {
-      await this.setStatus('Invalid JSON format.', this.theme.statusErrorBright);
+      await this.setStatus('Invalid JSON format.', this.theme.statusError);
     }
   }
 
@@ -1978,7 +2135,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus(wasConnected ? 'Disconnected.' : 'Connecting...');
     } catch {
-      await this.setStatus('Connection error.', this.theme.statusErrorBright);
+      await this.setStatus('Connection error.', this.theme.statusError);
     }
   }
 
@@ -1999,7 +2156,7 @@ Interface: abjects:peer-network`;
     // Find connected peers that are not the contact being introduced
     const connectedPeers = contacts.filter(c => c.state === 'connected' && c.peerId !== contactId);
     if (connectedPeers.length === 0) {
-      await this.setStatus('No other connected peers to introduce to.', this.theme.statusErrorBright);
+      await this.setStatus('No other connected peers to introduce to.', this.theme.statusError);
       return;
     }
 
@@ -2019,7 +2176,7 @@ Interface: abjects:peer-network`;
     if (introduced > 0) {
       await this.setStatus(`Introduced to ${introduced} peer(s)!`);
     } else {
-      await this.setStatus('Failed to introduce.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to introduce.', this.theme.statusError);
     }
   }
 
@@ -2033,7 +2190,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Introduction accepted!');
     } catch {
-      await this.setStatus('Failed to accept introduction.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to accept introduction.', this.theme.statusError);
     }
   }
 
@@ -2047,7 +2204,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Introduction rejected.');
     } catch {
-      await this.setStatus('Failed to reject introduction.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to reject introduction.', this.theme.statusError);
     }
   }
 
@@ -2069,7 +2226,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Peer blocked.');
     } catch {
-      await this.setStatus('Failed to block peer.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to block peer.', this.theme.statusError);
     }
   }
 
@@ -2083,7 +2240,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Peer unblocked.');
     } catch {
-      await this.setStatus('Failed to unblock peer.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to unblock peer.', this.theme.statusError);
     }
   }
 
@@ -2097,7 +2254,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Peer promoted to contact!');
     } catch {
-      await this.setStatus('Failed to promote peer.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to promote peer.', this.theme.statusError);
     }
   }
 
@@ -2140,7 +2297,7 @@ Interface: abjects:peer-network`;
       await this.refresh();
       await this.setStatus('Contact removed.');
     } catch {
-      await this.setStatus('Failed to remove contact.', this.theme.statusErrorBright);
+      await this.setStatus('Failed to remove contact.', this.theme.statusError);
     }
   }
 }

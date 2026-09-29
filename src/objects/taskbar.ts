@@ -12,7 +12,8 @@ import type { ThemeData } from '../core/theme-data.js';
 import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { lightenColor } from './widgets/widget-types.js';
+import { chromeCase } from '../core/theme-data.js';
+import { dockStyles, type DockLauncher } from './dock-style.js';
 
 const log = new Log('Taskbar');
 
@@ -364,31 +365,27 @@ can restore windows from the sidebar.
     // "Grimoire index" styling: flat, borderless, left-aligned rows rather than
     // boxed pills. Apps render in primary ink; user objects are demoted to
     // secondary so the eye lands on the built-in apps and the active entry.
+    // Constructivist themes swap in the red header block, paper rows, and
+    // geometric launcher glyphs (see dock-style.ts).
     const compact = this.compact;
-    const sectionLabelStyle = { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
-    const ghostBg = lightenColor(this.theme.windowBg, 5);
-    const appStyle = {
-      background: ghostBg, flat: true,
-      color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-      align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
-    };
+    const dock = dockStyles(this.theme, compact);
+    const sectionLabelStyle = dock.sectionLabel;
+    const appStyle = dock.row;
     // User objects use the same font/size/ink as the apps; their icon (declared
     // emoji or the default glyph) is the only distinction, so the rail is uniform.
     const objStyle = appStyle;
-    const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
-
-    const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
-    const chevron = collapsed ? '\u25B8' : '\u25BE';
-    const row = (icon: string, label: string) => (compact ? icon : `${icon} ${label}`);
+    const gearStyle = dock.gear;
+    const headerStyle = dock.header;
+    const row = (key: DockLauncher, label: string) => dock.rowText(key, label);
     // Compact rows are icon-only, so the label moves into a hover tooltip.
-    const rowStyle = (label: string) => (compact ? { ...appStyle, tooltip: label } : appStyle);
+    const rowStyle = (label: string, key?: DockLauncher) => dock.rowStyle(label, key);
 
     // [0] Header collapse-toggle button. Compact mode drops the gear from the
     // header (no horizontal room).
-    specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A0' : `${chevron} Abjects`, style: compact ? { ...headerStyle, tooltip: 'Abjects' } : headerStyle });
+    specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A0' : dock.headerText('Abjects', collapsed), style: compact ? { ...headerStyle, tooltip: 'Abjects' } : headerStyle });
     if (!compact) {
       // [1] Gear button (AppExplorer)
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '', style: gearStyle });
     }
     const sysRowStartIdx = specs.length;
     if (!collapsed) {
@@ -397,37 +394,37 @@ can restore windows from the sidebar.
       specs.push({ type: 'button', windowId: this.windowId!, text: this.chatRowText(this.chatBusy), style: { ...rowStyle('Chat'), ...this.chatRowStyle(this.chatBusy) } });
       // Peers is meaningful only for shared/public (including joined) workspaces.
       if (showPeers) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDC65', 'Peers'), style: rowStyle('Peers') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('peers', 'Peers'), style: rowStyle('Peers', 'peers') });
       }
       // Goals (optional)
       if (this.goalBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83C\uDFAF', 'Goals'), style: rowStyle('Goals') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('goals', 'Goals'), style: rowStyle('Goals', 'goals') });
       }
       // Jobs
-      specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCCB', 'Jobs'), style: rowStyle('Jobs') });
+      specs.push({ type: 'button', windowId: this.windowId!, text: row('jobs', 'Jobs'), style: rowStyle('Jobs', 'jobs') });
       // Knowledge (optional)
       if (this.knowledgeBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83E\uDDE0', 'Knowledge'), style: rowStyle('Knowledge') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('knowledge', 'Knowledge'), style: rowStyle('Knowledge', 'knowledge') });
       }
       // Agents (optional)
       if (this.agentBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83E\uDD16', 'Agents'), style: rowStyle('Agents') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('agents', 'Agents'), style: rowStyle('Agents', 'agents') });
       }
       // Schedules (optional)
       if (this.schedulerBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\u23F0', 'Schedules'), style: rowStyle('Schedules') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('schedules', 'Schedules'), style: rowStyle('Schedules', 'schedules') });
       }
       // Web (optional)
       if (this.webBrowserViewerId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83C\uDF10', 'Web'), style: rowStyle('Web') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('web', 'Web'), style: rowStyle('Web', 'web') });
       }
       // Files (optional)
       if (this.fileManagerId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCC1', 'Files'), style: rowStyle('Files') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('files', 'Files'), style: rowStyle('Files', 'files') });
       }
       // Projects — the on-disk counterpart to Files (optional)
       if (this.externalProjectBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCC2', 'Projects'), style: rowStyle('Projects') });
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('projects', 'Projects'), style: rowStyle('Projects', 'projects') });
       }
     }
 
@@ -444,7 +441,7 @@ can restore windows from the sidebar.
     const minimizedStartIdx = specs.length;
     const minimizedCount = collapsed ? 0 : this.minimizedWindows.size;
     if (minimizedCount > 0) {
-      specs.push({ type: 'label', windowId: this.windowId!, text: compact ? '\u25A1' : '\u25A1 Windows', style: sectionLabelStyle });
+      specs.push({ type: 'label', windowId: this.windowId!, text: compact ? '\u25A1' : `\u25A1 ${chromeCase(this.theme, 'Windows')}`, style: sectionLabelStyle });
       for (const [, { title }] of this.minimizedWindows) {
         specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A1' : title, style: compact ? { ...objStyle, tooltip: title } : objStyle });
       }
@@ -590,20 +587,23 @@ can restore windows from the sidebar.
     }
   }
 
-  /** Chat row label; the trailing dot marks a chat that is working on a goal. */
+  /** Chat row label; the trailing sigil marks a chat that is working on a goal. */
   private chatRowText(busy: boolean): string {
-    const icon = '💬';
-    if (this.compact) return icon;
-    return busy ? `${icon} Chat ●` : `${icon} Chat`;
+    // The vector icon rides in the style (see chatRowStyle).
+    if (this.compact) return '';
+    return busy ? 'Chat \u25C9' : 'Chat';
   }
 
   /**
-   * Ink for the chat row: accent while busy, primary when idle. In compact
+   * Chat row ink: the living light while busy, primary when idle. In compact
    * (icon-only) mode the tooltip carries the state since there is no label.
    */
   private chatRowStyle(busy: boolean): Record<string, unknown> {
-    const style: Record<string, unknown> = { color: busy ? this.theme.accent : this.theme.textPrimary };
-    if (this.compact) style.tooltip = busy ? 'Chat ● working' : 'Chat';
+    const style: Record<string, unknown> = {
+      color: busy ? this.theme.accentSecondary : this.theme.textPrimary,
+      icon: 'chat',
+    };
+    if (this.compact) style.tooltip = busy ? 'Chat \u25C9 working' : 'Chat';
     return style;
   }
 
@@ -664,8 +664,9 @@ can restore windows from the sidebar.
     // Toggle only bg/border (style updates merge), so each button keeps its
     // creation-time ink (primary for apps, secondary for objects). Active gets
     // the accent highlight; inactive restores the flat ghost row.
-    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-    const inactiveStyle = { background: lightenColor(this.theme.windowBg, 5), borderColor: this.theme.windowBg };
+    const dock = dockStyles(this.theme, this.compact);
+    const activeStyle = dock.activeRow;
+    const inactiveStyle = dock.inactiveRow;
     const style = visible ? activeStyle : inactiveStyle;
 
     for (const [btnId, tid] of this.systemButtons) {

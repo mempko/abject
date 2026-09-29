@@ -11,7 +11,8 @@
 
 import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
+import { WidgetStyle, widgetFont, codeFont, DEFAULT_LINE_HEIGHT, inkFrame } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 import { tokenizeLine, type Token, type TokenType } from './handler-parser.js';
 import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
 
@@ -235,7 +236,7 @@ export class TextAreaWidget extends WidgetAbject {
 
   /** Resolve the font used for body text (matches buildDrawCommands). */
   private bodyFont(): string {
-    return this.monospace ? CODE_FONT : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+    return this.monospace ? codeFont(this.theme) : (this.style.fontSize ? buildFont(this.style, this.theme) : widgetFont(this.theme));
   }
 
   /**
@@ -320,17 +321,21 @@ export class TextAreaWidget extends WidgetAbject {
 
   // ── Rendering ──────────────────────────────────────────────────────
 
+  /** Text caret: a solid 2 px square bar. */
+  private caret(surfaceId: string, x: number, top: number, bottom: number): unknown {
+    return { type: 'rect', surfaceId, params: { x: Math.round(x), y: top, width: 2, height: Math.max(0, bottom - top), fill: this.theme.cursor } };
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     this.lastSurfaceId = surfaceId;
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
     const style = this.style;
-    const font = buildFont(style);
-    const radius = style.radius ?? this.theme.widgetRadius;
+    const font = buildFont(style, this.theme);
     const focused = this.focused;
     const lineHeight = this.lineHeight;
-    const taFont = this.monospace ? CODE_FONT : (style.fontSize ? font : WIDGET_FONT);
+    const taFont = this.monospace ? codeFont(this.theme) : (style.fontSize ? font : widgetFont(this.theme));
 
     // Reduce opacity when disabled
     if (this.disabled) {
@@ -340,16 +345,14 @@ export class TextAreaWidget extends WidgetAbject {
 
     // Border rect
     const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? this.theme.inputBg,
-        stroke: borderColor,
-        radius,
-      },
-    });
+    // Paper field in an ink rule; focus reddens the rule and adds a 4 px
+    // bar on the left edge, inside the rect.
+    const r = { x: ox, y: oy, width: w, height: h };
+    commands.push({ type: 'rect', surfaceId, params: { ...r, fill: style.background ?? this.theme.inputBg, radius: style.radius ?? 0 } });
+    commands.push(...inkFrame(surfaceId, r, borderColor, shapeOf(this.theme).ruleWidth));
+    if (focused && !this.disabled) {
+      commands.push({ type: 'rect', surfaceId, params: { x: ox, y: oy, width: 4, height: h, fill: this.theme.inputBorderFocus } });
+    }
 
     // Clip to prevent content overflow
     commands.push({ type: 'save', surfaceId, params: {} });
@@ -485,15 +488,7 @@ export class TextAreaWidget extends WidgetAbject {
           ? await this.measureText(surfaceId, cursorLineText, taFont)
           : 0);
         const cursorY = oy + (cursorLine - scrollTop) * lineHeight + 2;
-        commands.push({
-          type: 'line',
-          surfaceId,
-          params: {
-            x1: cursorX, y1: cursorY,
-            x2: cursorX, y2: cursorY + lineHeight - 4,
-            stroke: this.theme.cursor,
-          },
-        });
+        commands.push(this.caret(surfaceId, cursorX, cursorY, cursorY + lineHeight - 4));
       }
     }
 
@@ -591,7 +586,7 @@ export class TextAreaWidget extends WidgetAbject {
         const pre = r.text.substring(0, cc - r.startCol);
         const cursorX = ox + textPadding + (pre.length > 0 ? await measure(pre) : 0);
         const cursorY = oy + (idx - scrollTop) * lineHeight + 2;
-        commands.push({ type: 'line', surfaceId, params: { x1: cursorX, y1: cursorY, x2: cursorX, y2: cursorY + lineHeight - 4, stroke: this.theme.cursor } });
+        commands.push(this.caret(surfaceId, cursorX, cursorY, cursorY + lineHeight - 4));
       }
     }
   }
@@ -657,8 +652,8 @@ export class TextAreaWidget extends WidgetAbject {
     let clickCol = 0;
     if (lineText.length > 0 && clickOffset > 0 && surfaceId) {
       const taFont = this.monospace
-        ? CODE_FONT
-        : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+        ? codeFont(this.theme)
+        : (this.style.fontSize ? buildFont(this.style, this.theme) : widgetFont(this.theme));
       const lineWidth = await this.measureText(surfaceId, lineText, taFont);
       const avgCharWidth = lineWidth / lineText.length;
       clickCol = Math.min(Math.round(clickOffset / avgCharWidth), lineText.length);

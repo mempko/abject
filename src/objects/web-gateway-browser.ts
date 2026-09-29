@@ -10,6 +10,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { request } from '../core/message.js';
 
 const WIN_W = 560, WIN_H = 520;
@@ -29,6 +30,7 @@ export class WebGatewayBrowser extends Abject {
   private tokenNameInputId?: AbjectId;
   private mintBtnId?: AbjectId;
   private tokensListId?: AbjectId;
+  private tokensEmptyId?: AbjectId;
   private secretLabelId?: AbjectId;
   private revokeButtons = new Map<AbjectId, string>();
   private tokens: TokenInfo[] = [];
@@ -85,15 +87,15 @@ export class WebGatewayBrowser extends Abject {
     this.rootLayoutId = await this.wm('createScrollableVBox', { windowId: this.windowId, margins: { top: 12, right: 12, bottom: 12, left: 12 }, spacing: 10 }) as AbjectId;
 
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId, 'create', { specs: [
-      { type: 'label', windowId: this.windowId, text: 'HTTP Gateway', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 16 } },
-      { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true, selectable: true } },
+      { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'HTTP Server'), style: sectionHeaderStyle(this.theme, 14) },
+      { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textMeta, fontSize: 12, wordWrap: true, selectable: true } },
       { type: 'button', windowId: this.windowId, text: 'Enable', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       { type: 'divider', windowId: this.windowId },
-      { type: 'label', windowId: this.windowId, text: 'Routes', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+      { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Routes'), style: sectionHeaderStyle(this.theme) },
       { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 12, wordWrap: true, selectable: true } },
       { type: 'divider', windowId: this.windowId },
-      { type: 'label', windowId: this.windowId, text: 'API Tokens', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
-      { type: 'label', windowId: this.windowId, text: 'Authenticated routes need one of these as a Bearer token. The secret is shown once.', style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+      { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'API Tokens'), style: sectionHeaderStyle(this.theme) },
+      { type: 'label', windowId: this.windowId, text: 'Authenticated routes need one of these as a Bearer token. The secret is shown once.', style: hintStyle(this.theme) },
     ] }));
     const [titleId, statusId, toggleId, div1, routesHdr, routesId, div2, tokensHdr, tokensDesc] = widgetIds;
     this.statusLabelId = statusId; this.toggleBtnId = toggleId; this.routesLabelId = routesId;
@@ -106,7 +108,7 @@ export class WebGatewayBrowser extends Abject {
     const mintRow = await this.wm('createNestedHBox', { parentLayoutId: this.rootLayoutId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 8 }) as AbjectId;
     await this.addTo(this.rootLayoutId, mintRow, { vertical: 'fixed', horizontal: 'expanding' }, { height: 32 });
     const { widgetIds: mintIds } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId, 'create', { specs: [
-      { type: 'textInput', windowId: this.windowId, placeholder: 'token name' },
+      { type: 'textInput', windowId: this.windowId, placeholder: 'Token name (e.g. my-script)' },
       { type: 'button', windowId: this.windowId, text: 'Create token', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
     ] }));
     this.tokenNameInputId = mintIds[0]; this.mintBtnId = mintIds[1];
@@ -114,12 +116,14 @@ export class WebGatewayBrowser extends Abject {
     await this.request(request(this.id, mintRow, 'addLayoutChild', { widgetId: this.tokenNameInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 30 } }));
     await this.request(request(this.id, mintRow, 'addLayoutChild', { widgetId: this.mintBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: 30 } }));
 
-    const { widgetIds: [secretId, tokensId] } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId, 'create', { specs: [
+    const { widgetIds: [secretId, tokensEmptyId, tokensId] } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId, 'create', { specs: [
       { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.statusSuccess, fontSize: 12, wordWrap: true, selectable: true } },
+      { type: 'label', windowId: this.windowId, text: emptyStateMarkdown('No API tokens yet', 'Name a token above and press Create token. Scripts and other apps send it to reach authenticated routes.'), style: { ...emptyStateStyle(this.theme), visible: false } },
       { type: 'list', windowId: this.windowId, items: [] },
     ] }));
-    this.secretLabelId = secretId; this.tokensListId = tokensId;
+    this.secretLabelId = secretId; this.tokensListId = tokensId; this.tokensEmptyId = tokensEmptyId;
     await this.addTo(this.rootLayoutId, this.secretLabelId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 20 });
+    await this.addTo(this.rootLayoutId, this.tokensEmptyId, { vertical: 'fixed', horizontal: 'expanding' }, { height: 0 });
     await this.addTo(this.rootLayoutId, this.tokensListId, { vertical: 'expanding', horizontal: 'expanding' }, { height: 120 });
 
     await this.refresh();
@@ -130,7 +134,7 @@ export class WebGatewayBrowser extends Abject {
     await this.wm('destroyWindowAbject', { windowId: this.windowId });
     this.windowId = undefined; this.rootLayoutId = undefined; this.toggleBtnId = undefined; this.statusLabelId = undefined;
     this.routesLabelId = undefined; this.tokenNameInputId = undefined; this.mintBtnId = undefined; this.tokensListId = undefined;
-    this.secretLabelId = undefined; this.revokeButtons.clear();
+    this.tokensEmptyId = undefined; this.secretLabelId = undefined; this.revokeButtons.clear();
   }
 
   private async refresh(): Promise<void> {
@@ -141,10 +145,18 @@ export class WebGatewayBrowser extends Abject {
       const routes = await this.request<RouteInfo[]>(request(this.id, gateway, 'getRoutes', {}));
       this.tokens = await this.request<TokenInfo[]>(request(this.id, gateway, 'listTokens', {}));
       if (this.statusLabelId) await this.request(request(this.id, this.statusLabelId, 'update', {
+        style: status.enabled ? livingStyle(this.theme) : { color: this.theme.textMeta, fontSize: 12 },
         text: status.enabled ? `Listening on ${status.baseUrl}\n${status.routes} route(s) across ${status.workspaces} workspace(s)` : 'Off. Enable to serve whitelisted abjects over HTTP.' }));
       if (this.toggleBtnId) await this.request(request(this.id, this.toggleBtnId, 'update', { text: status.enabled ? 'Disable' : 'Enable' }));
-      if (this.routesLabelId) await this.request(request(this.id, this.routesLabelId, 'update', {
-        text: routes.length ? routes.map(r => `${r.path}  (${r.access})`).join('\n') : 'No abjects exposed yet. Open a workspace’s Settings → Web to expose one.' }));
+      if (this.routesLabelId) await this.request(request(this.id, this.routesLabelId, 'update', routes.length
+        ? { style: { color: this.theme.textPrimary, fontSize: 12, markdown: false, align: 'left' }, text: routes.map(r => `${r.path}  (${r.access})`).join('\n') }
+        : { style: emptyStateStyle(this.theme), text: emptyStateMarkdown('No abjects exposed yet', 'Open a workspace’s Settings, then the Web tab, to expose one.') }));
+      const hasTokens = this.tokens.length > 0;
+      if (this.tokensEmptyId && this.rootLayoutId) {
+        await this.request(request(this.id, this.tokensEmptyId, 'update', { visible: !hasTokens }));
+        await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', { widgetId: this.tokensEmptyId, preferredSize: { height: hasTokens ? 0 : 56 } }));
+      }
+      if (this.tokensListId) await this.request(request(this.id, this.tokensListId, 'update', { visible: hasTokens }));
       if (this.tokensListId) await this.request(request(this.id, this.tokensListId, 'update', {
         items: this.tokens.map(t => ({ label: `${t.name}  · created ${new Date(t.createdAt).toLocaleDateString()}${t.lastUsedAt ? `, used ${new Date(t.lastUsedAt).toLocaleDateString()}` : ''}`, value: t.id })), selectedIndex: -1 }));
     } catch { /* gateway not ready */ }

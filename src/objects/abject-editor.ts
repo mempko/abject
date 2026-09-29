@@ -21,6 +21,7 @@ import {
   type HandlerEntry,
   type EntryType,
 } from './widgets/handler-parser.js';
+import { sectionHeaderStyle, sectionHeaderText } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
 
@@ -250,8 +251,8 @@ export class AbjectEditor extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 4, right: 8, bottom: 4, left: 8 },
-        spacing: 4,
+        margins: { top: 8, right: 12, bottom: 8, left: 12 },
+        spacing: 6,
       })
     );
 
@@ -267,8 +268,7 @@ export class AbjectEditor extends Abject {
           { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
             style: { syntaxHighlight: true } },
           // 3: test button (apply live without persisting)
-          { type: 'button', windowId: this.windowId, text: 'Test',
-            style: { background: this.theme.statusWarning, color: this.theme.actionText, borderColor: this.theme.statusWarning } },
+          { type: 'button', windowId: this.windowId, text: 'Test' },
           // 4: save button (apply live + persist)
           { type: 'button', windowId: this.windowId, text: 'Save',
             style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
@@ -292,17 +292,21 @@ export class AbjectEditor extends Abject {
             style: { visible: false } },
           // 12: restore-version button (hidden row initially)
           { type: 'button', windowId: this.windowId, text: 'Restore',
-            style: { visible: false, background: this.theme.statusWarning, color: this.theme.actionText, borderColor: this.theme.statusWarning } },
+            style: { visible: false, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           // 13: delete-version button (hidden row initially)
           { type: 'button', windowId: this.windowId, text: 'Delete',
-            style: { visible: false, background: this.theme.statusError, color: this.theme.actionText, borderColor: this.theme.statusError } },
+            style: { visible: false, background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
+          // 14: handler column header
+          { type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Handlers'),
+            style: sectionHeaderStyle(this.theme, 12) },
         ],
       })
     );
 
     const [splitPaneId, handlerListId, sourceEditorId,
       testBtnId, saveBtnId, cancelBtnId, addBtnId, editStatusId,
-      addInputId, addConfirmBtnId, historyBtnId, historySelectId, historyRestoreBtnId, historyDeleteBtnId] = widgetIds;
+      addInputId, addConfirmBtnId, historyBtnId, historySelectId, historyRestoreBtnId, historyDeleteBtnId,
+      handlerHeaderId] = widgetIds;
 
     this.splitPaneId = splitPaneId;
     this.handlerListId = handlerListId;
@@ -319,8 +323,23 @@ export class AbjectEditor extends Abject {
     this.historyRestoreBtnId = historyRestoreBtnId;
     this.historyDeleteBtnId = historyDeleteBtnId;
 
+    // Handler column: a kit section header over the list.
+    const handlerPaneId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createDetachedVBox', {
+        windowId: this.windowId,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, handlerPaneId, 'addLayoutChildren', {
+      children: [
+        { widgetId: handlerHeaderId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+        { widgetId: this.handlerListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+      ],
+    }));
+
     // Set up split pane children
-    await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.handlerListId }));
+    await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: handlerPaneId }));
     await this.request(request(this.id, this.splitPaneId, 'setRightChild', { widgetId: this.sourceEditorId }));
 
     // Add splitPane to root (expanding, takes most space)

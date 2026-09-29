@@ -15,7 +15,20 @@ import {
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
-import { ARCANE_GRIMOIRE } from '../core/theme-data.js';
+import { DEFAULT_THEME, shapeOf } from '../core/theme-data.js';
+import { hatch, withAlpha } from './widgets/widget-types.js';
+
+/**
+ * Full-screen backdrop behind a modal: an ink wash with faint diagonal
+ * hatching.
+ */
+function scrimCommands(theme: ThemeData, width: number, height: number): unknown[] {
+  const rect = { x: 0, y: 0, width, height };
+  return [
+    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(shapeOf(theme).blockShadowColor, 0.35) } },
+    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.08), 14, 2),
+  ];
+}
 
 const MODAL_DIALOG_INTERFACE: InterfaceId = 'abjects:modal-dialog' as InterfaceId;
 
@@ -28,7 +41,7 @@ export class ModalDialog extends Abject {
   private inputWidgetId?: AbjectId;
   private promptMode = false;
   private pendingResolve?: (result: boolean | string | null) => void;
-  private dialogTheme: ThemeData = ARCANE_GRIMOIRE;
+  private dialogTheme: ThemeData = DEFAULT_THEME;
 
   constructor() {
     super({
@@ -266,7 +279,10 @@ Interface: abjects:modal-dialog`;
       placeholder?: string;
     };
 
+    // Without an explicit theme, wear the workspace's active theme so the
+    // dialog matches the windows around it.
     if (theme) this.dialogTheme = theme;
+    else this.dialogTheme = await this.fetchTheme();
     const wmId = this.widgetManagerId!;
 
     // Get display dimensions for centering
@@ -293,9 +309,7 @@ Interface: abjects:modal-dialog`;
       })
     );
     await this.request(request(this.id, canvasId, 'draw', {
-      commands: [
-        { type: 'rect', surfaceId: 'c', params: { x: 0, y: 0, width: displayInfo.width, height: displayInfo.height, fill: 'rgba(0,0,0,0.5)' } },
-      ],
+      commands: scrimCommands(this.dialogTheme, displayInfo.width, displayInfo.height),
     }));
 
     // 2. Create dialog window at z=5001, centered
@@ -324,14 +338,14 @@ Interface: abjects:modal-dialog`;
     // Message label + confirm/cancel buttons via batch create
     const th = this.dialogTheme;
     const confirmStyle = destructive
-      ? { background: th.destructiveBg, color: th.destructiveText, borderColor: th.destructiveBorder }
-      : { background: th.actionBg, color: th.actionText, borderColor: th.actionBorder };
+      ? { background: th.destructiveBg, color: th.destructiveText, borderColor: th.destructiveBorder, fontWeight: 'bold' }
+      : { background: th.actionBg, color: th.actionText, borderColor: th.actionBorder, fontWeight: 'bold' };
 
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, wmId, 'create', {
         specs: [
-          { type: 'label', windowId: this.dialogWindowId, text: dialogMessage, style: { color: th.textPrimary, fontSize: 13, wordWrap: true } },
-          { type: 'button', windowId: this.dialogWindowId, text: cancelLabel ?? 'Cancel' },
+          { type: 'label', windowId: this.dialogWindowId, text: dialogMessage, style: { color: th.textPrimary, fontSize: 14, wordWrap: true } },
+          { type: 'button', windowId: this.dialogWindowId, text: cancelLabel ?? 'Cancel', style: { color: th.textPrimary } },
           { type: 'button', windowId: this.dialogWindowId, text: confirmLabel ?? 'Confirm', style: confirmStyle },
         ],
       })
@@ -400,7 +414,7 @@ Interface: abjects:modal-dialog`;
     await this.request(request(this.id, buttonRowId, 'addLayoutChildren', {
       children: [
         { widgetId: cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
-        { widgetId: confirmBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
+        { widgetId: confirmBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: 36 } },
       ],
     }));
 

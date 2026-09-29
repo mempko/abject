@@ -8,7 +8,7 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { request } from '../../core/message.js';
-import { Rect, gradientRect, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
+import { Rect, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
@@ -159,8 +159,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     // Card/panel background (if styled) paints OUTSIDE the clip below, so the
     // rounded border frames the whole card including the margin gutter while
     // scrolling children stay clipped to the content viewport.
-    const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
-    if (bg) commands.push(bg);
+    commands.push(...this.buildBackgroundCommands(surfaceId, ox, oy));
 
     // Clip to content area. Only the VERTICAL extent must be tight — that is
     // what hides scrolled-away rows. Horizontally nothing scrolls, so clipping
@@ -277,14 +276,15 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       const thumbHeight = sb.thumbHeight;
       const thumbY = oy + sb.thumbY;
 
-      // Scrollbar thumb with gradient
-      commands.push(...gradientRect(surfaceId, {
-        x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight, radii: 3,
-        gradient: { x0: trackX, y0: 0, x1: trackX + SCROLLBAR_WIDTH, y1: 0, stops: [
-          { offset: 0, color: this.theme.scrollbarThumb },
-          { offset: 1, color: this.theme.scrollbarThumbHover },
-        ] },
-      }));
+      // Thumb: a flat square slab, highlighted while dragged.
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
+          fill: this.scrollbarDragging ? this.theme.scrollbarThumbHover : this.theme.scrollbarThumb,
+        },
+      });
     }
 
     return commands;

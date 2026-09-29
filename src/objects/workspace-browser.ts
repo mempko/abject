@@ -12,6 +12,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 
 const log = new Log('WorkspaceBrowser');
@@ -39,6 +40,7 @@ export class WorkspaceBrowser extends Abject {
   private peerTabBarId?: AbjectId;
   private publicPeerListId?: AbjectId;
   private privatePeerListId?: AbjectId;
+  private peerEmptyLabelId?: AbjectId;
   private publicPeerEntries: string[] = [];  // ownerPeerId values
   private privatePeerEntries: string[] = [];
   private activePeerTab = 0; // 0=public, 1=private
@@ -166,6 +168,7 @@ discovered, the browser rebuilds automatically if it is visible.
     this.peerTabBarId = undefined;
     this.publicPeerListId = undefined;
     this.privatePeerListId = undefined;
+    this.peerEmptyLabelId = undefined;
     this.workspaceListId = undefined;
     this.detailPaneId = undefined;
     this.detailWidgetIds = [];
@@ -332,6 +335,12 @@ discovered, the browser rebuilds automatically if it is visible.
     if (this.refreshBtnId) {
       this.send(event(this.id, this.refreshBtnId, 'update', { busy: true }));
     }
+    if (this.statusLabelId) {
+      this.send(event(this.id, this.statusLabelId, 'update', {
+        text: 'Searching connected peers for shared workspaces...',
+        style: livingStyle(this.theme, 11),
+      }));
+    }
     let ok = true;
     // Trigger discovery
     if (this.shareRegistryId) {
@@ -375,6 +384,8 @@ discovered, the browser rebuilds automatically if it is visible.
     await this.rebuildPeerList();
     if (this.selectedPeerId) {
       await this.rebuildWorkspaceList();
+    } else {
+      await this.rebuildDetailPane();
     }
     await this.updateStatus();
   }
@@ -396,7 +407,7 @@ discovered, the browser rebuilds automatically if it is visible.
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await wm('createWindowAbject', {
-      title: '\uD83D\uDD0E Workspace Browser',
+      title: 'Workspace Browser',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       zIndex: 200,
     });
@@ -404,8 +415,8 @@ discovered, the browser rebuilds automatically if it is visible.
     // Root VBox
     this.rootLayoutId = await wm('createVBox', {
       windowId: this.windowId,
-      margins: { top: 4, right: 4, bottom: 4, left: 4 },
-      spacing: 4,
+      margins: { top: 8, right: 8, bottom: 8, left: 8 },
+      spacing: 8,
     });
 
     // Header row (auto-added to root at pos 0)
@@ -433,9 +444,10 @@ discovered, the browser rebuilds automatically if it is visible.
           // [1] Inner split pane (workspaces | detail)
           { type: 'splitPane', windowId, orientation: 'horizontal',
             dividerPosition: 0.45, minSize: 150 },
-          // [2] Title label
-          { type: 'label', windowId, rect: r0, text: 'Workspace Browser',
-            style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+          // [2] Intro hint (the window title already names the browser)
+          { type: 'label', windowId, rect: r0,
+            text: 'Workspaces that connected peers share. Pick a peer, then a workspace to browse it.',
+            style: { ...hintStyle(this.theme), wordWrap: false } },
           // [3] Refresh button
           { type: 'button', windowId, rect: r0, text: 'Refresh',
             style: { fontSize: 12 } },
@@ -450,13 +462,17 @@ discovered, the browser rebuilds automatically if it is visible.
           { type: 'list', windowId, rect: r0, items: [] },
           // [8] Status label
           { type: 'label', windowId, rect: r0, text: '',
-            style: { color: this.theme.statusNeutral, fontSize: 11 } },
+            style: { color: this.theme.textMeta, fontSize: 11 } },
+          // [9] Peer pane empty state
+          { type: 'label', windowId, rect: r0, text: '',
+            style: { ...emptyStateStyle(this.theme), visible: false } },
         ],
       })
     );
 
     const [outerSplit, innerSplit, titleLabel, refreshBtn, peerTabBar,
-      publicPeerList, privatePeerList, workspaceList, statusLabel] = widgetIds;
+      publicPeerList, privatePeerList, workspaceList, statusLabel, peerEmptyLabel] = widgetIds;
+    this.peerEmptyLabelId = peerEmptyLabel;
 
     this.outerSplitId = outerSplit;
     this.innerSplitId = innerSplit;
@@ -491,14 +507,15 @@ discovered, the browser rebuilds automatically if it is visible.
         { widgetId: this.peerTabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
         { widgetId: this.publicPeerListId, sizePolicy: { vertical: 'expanding' } },
         { widgetId: this.privatePeerListId, sizePolicy: { vertical: 'expanding' } },
+        { widgetId: this.peerEmptyLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 0 } },
       ],
     }));
 
     // Pane 3: detail pane (detached scrollable VBox)
     this.detailPaneId = await wm('createDetachedScrollableVBox', {
       windowId,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
+      margins: { top: 8, right: 12, bottom: 8, left: 12 },
+      spacing: 6,
     });
 
     // Wire split pane children
@@ -523,17 +540,31 @@ discovered, the browser rebuilds automatically if it is visible.
   }
 
   private async switchPeerTabVisibility(): Promise<void> {
+    // The active tab's list gives way to an empty-state note when it has no peers.
+    const activeEmpty = (this.activePeerTab === 0 ? this.publicPeerEntries : this.privatePeerEntries).length === 0;
     if (this.publicPeerListId) {
       try {
         await this.request(request(this.id, this.publicPeerListId, 'update', {
-          style: { visible: this.activePeerTab === 0 },
+          style: { visible: this.activePeerTab === 0 && !activeEmpty },
         }));
       } catch { /* widget gone */ }
     }
     if (this.privatePeerListId) {
       try {
         await this.request(request(this.id, this.privatePeerListId, 'update', {
-          style: { visible: this.activePeerTab === 1 },
+          style: { visible: this.activePeerTab === 1 && !activeEmpty },
+        }));
+      } catch { /* widget gone */ }
+    }
+    if (this.peerEmptyLabelId && this.peerPaneVBoxId) {
+      const text = this.activePeerTab === 0
+        ? emptyStateMarkdown('No public workspaces yet', 'Connected peers list their public workspaces here. Add contacts in Peer Network, then press Refresh.')
+        : emptyStateMarkdown('No private shares yet', 'Workspaces a peer shares with you directly appear here once you are connected.');
+      try {
+        await this.request(request(this.id, this.peerEmptyLabelId, 'update', { text, visible: activeEmpty }));
+        await this.request(request(this.id, this.peerPaneVBoxId, 'updateLayoutChild', {
+          widgetId: this.peerEmptyLabelId,
+          preferredSize: { height: activeEmpty ? 140 : 0 },
         }));
       } catch { /* widget gone */ }
     }
@@ -592,6 +623,7 @@ discovered, the browser rebuilds automatically if it is visible.
     await this.request(request(this.id, this.privatePeerListId, 'update', {
       items: privateItems, selectedIndex: privateSelected,
     }));
+    await this.switchPeerTabVisibility();
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -661,15 +693,19 @@ discovered, the browser rebuilds automatically if it is visible.
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
             { type: 'label', windowId, rect: r0,
-              text: 'Select a workspace to view details.',
-              style: { color: this.theme.statusNeutral, fontSize: 12 } },
+              text: this.cachedWorkspaces.length === 0
+                ? emptyStateMarkdown('No workspaces discovered', 'When connected peers share workspaces, they appear on the left. Press Refresh to search again.')
+                : !this.selectedPeerId
+                  ? emptyStateMarkdown('Pick a peer', 'Choose a peer on the left to see the workspaces it shares.')
+                  : emptyStateMarkdown('Pick a workspace', 'Select a workspace in the middle list to see its details and browse it.'),
+              style: emptyStateStyle(this.theme) },
           ],
         })
       );
       this.detailWidgetIds.push(placeholderId);
       await this.request(request(this.id, this.detailPaneId, 'addLayoutChildren', {
         children: [
-          { widgetId: placeholderId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+          { widgetId: placeholderId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 100 } },
         ],
       }));
       return;
@@ -697,9 +733,10 @@ discovered, the browser rebuilds automatically if it is visible.
     const specs: WidgetSpec[] = [];
 
     // Name (bold)
+    // Kit header styling; the name itself is user text, so it keeps its case
     specs.push({ type: 'label', windowId, rect: r0,
       text: ws.name,
-      style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' } });
+      style: { ...sectionHeaderStyle(this.theme, 14) } });
 
     // Description
     if (ws.description) {
@@ -737,7 +774,9 @@ discovered, the browser rebuilds automatically if it is visible.
     // Browse button
     if (ws.registryId) {
       specs.push({ type: 'button', windowId, rect: r0,
-        text: 'Browse', style: { fontSize: 12 }, action: 'browse' });
+        text: 'Browse',
+        style: { fontSize: 12, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
+        action: 'browse' });
     }
 
     // Strip action field before sending to create
@@ -811,6 +850,7 @@ discovered, the browser rebuilds automatically if it is visible.
     try {
       await this.request(request(this.id, this.statusLabelId, 'update', {
         text: statusText,
+        style: { color: this.theme.textMeta, fontSize: 11 },
       }));
     } catch { /* widget gone */ }
   }

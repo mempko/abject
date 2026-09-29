@@ -18,10 +18,27 @@ import {
   SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { shapeOf, type ThemeData } from '../core/theme-data.js';
+import { hatch, withAlpha } from './widgets/widget-types.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+
+/** Filled destructive button style from the theme's destructive slots. */
+function destructiveFillStyle(theme: ThemeData): { background: string; color: string; borderColor: string } {
+  return { background: theme.destructiveBg, color: theme.destructiveText, borderColor: theme.destructiveBorder };
+}
+
+/** Full-screen backdrop behind the picker dialog: an ink wash with faint diagonal hatching. */
+function scrimCommands(theme: ThemeData, width: number, height: number): unknown[] {
+  const rect = { x: 0, y: 0, width, height };
+  return [
+    { type: 'rect', surfaceId: 'c', params: { ...rect, fill: withAlpha(shapeOf(theme).blockShadowColor, 0.35) } },
+    ...hatch('c', rect, withAlpha(theme.textPrimary, 0.08), 14, 2),
+  ];
+}
 
 const log = new Log('AppExplorer');
 
@@ -731,12 +748,31 @@ export class AppExplorer extends Abject {
     // ── Pane 3: Detail (detached scrollable VBox) ──
     this.detailPaneId = await wm('createDetachedScrollableVBox', {
       windowId,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
+      margins: { top: 8, right: 12, bottom: 8, left: 12 },
+      spacing: 6,
     });
 
+    // Instances column: a kit section header over the instance list.
+    const { widgetIds: [instanceHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{ type: 'label', windowId, rect: r0,
+          text: sectionHeaderText(this.theme, 'Instances'), style: sectionHeaderStyle(this.theme, 12) }],
+      })
+    );
+    const instancePaneId = await wm('createDetachedVBox', {
+      windowId,
+      margins: { top: 6, right: 0, bottom: 0, left: 6 },
+      spacing: 4,
+    });
+    await this.request(request(this.id, instancePaneId, 'addLayoutChildren', {
+      children: [
+        { widgetId: instanceHeaderId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+        { widgetId: this.instanceListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+      ],
+    }));
+
     // Wire split pane children
-    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.instanceListId }));
+    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: instancePaneId }));
     await this.request(request(this.id, this.innerSplitId, 'setRightChild', { widgetId: this.detailPaneId }));
     await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.kindPaneVBoxId }));
     await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.innerSplitId }));
@@ -888,15 +924,17 @@ export class AppExplorer extends Abject {
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
             { type: 'label', windowId, rect: r0,
-              text: 'Select an instance to view details.',
-              style: { color: this.theme.sectionLabel, fontSize: 12 } },
+              text: this.selectedKindName
+                ? emptyStateMarkdown('No instance selected', 'Select an instance in the middle column to see its details and actions.')
+                : emptyStateMarkdown('Nothing selected', 'Select an object kind on the left to list its instances, then pick one to see its methods, tags and actions.'),
+              style: emptyStateStyle(this.theme) },
           ],
         })
       );
       this.detailWidgetIds.push(placeholderId);
       await this.request(request(this.id, this.detailPaneId, 'addLayoutChildren', {
         children: [
-          { widgetId: placeholderId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+          { widgetId: placeholderId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 100 } },
         ],
       }));
       return;
@@ -946,6 +984,11 @@ export class AppExplorer extends Abject {
         style: { color: this.theme.textDescription, fontSize: 11, wordWrap: true, selectable: true } });
     }
 
+    // Details section
+    const detailsHeader = sectionHeaderText(this.theme, 'Details');
+    specs.push({ type: 'label', windowId, rect: r0,
+      text: detailsHeader, style: { ...sectionHeaderStyle(this.theme, 12) } });
+
     // Version
     if (manifest.version) {
       specs.push({ type: 'label', windowId, rect: r0,
@@ -970,10 +1013,10 @@ export class AppExplorer extends Abject {
         style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true, selectable: true } });
     }
 
-    // Actions separator
+    // Actions section
+    const actionsHeader = sectionHeaderText(this.theme, 'Actions');
     specs.push({ type: 'label', windowId, rect: r0,
-      text: '─── Actions',
-      style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } });
+      text: actionsHeader, style: { ...sectionHeaderStyle(this.theme, 12) } });
 
     // Browse button (always)
     specs.push({ type: 'button', windowId, rect: r0,
@@ -992,8 +1035,8 @@ export class AppExplorer extends Abject {
       }
     } else if (remoteEntry) {
       specs.push({ type: 'label', windowId, rect: r0,
-        text: `Shared from ${this.ownerLabel(inst)} — read-only. Clone to edit your own copy.`,
-        style: { color: this.theme.sectionLabel, fontSize: 11, wordWrap: true } });
+        text: `Shared from ${this.ownerLabel(inst)}, read-only. Clone to edit your own copy.`,
+        style: { color: this.theme.textSecondary, fontSize: 11, wordWrap: true } });
       if (isForkable) {
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Clone to Local',
@@ -1017,9 +1060,18 @@ export class AppExplorer extends Abject {
           text: 'Clone to...', style: { fontSize: 12 }, action: 'cloneTo' });
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Delete',
-          style: { fontSize: 12, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText },
+          style: { fontSize: 12, ...destructiveFillStyle(this.theme) },
           action: 'delete' });
       }
+    }
+
+    // One primary action in red: editing when possible, else cloning, else browsing.
+    const buttons = specs.filter((sp): sp is ButtonSpec => sp.type === 'button');
+    const primary = buttons.find(b => b.action === 'editSource')
+      ?? buttons.find(b => b.action === 'cloneToLocal' || b.action === 'cloneShared')
+      ?? buttons.find(b => b.action === 'browse');
+    if (primary) {
+      primary.style = { ...primary.style, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder };
     }
 
     // Strip out local `action` field before sending to create
@@ -1058,7 +1110,7 @@ export class AppExplorer extends Abject {
         let height = 16;
         if (spec.text === manifest.name) height = 20;
         else if (manifest.description && spec.text === manifest.description) height = 18;
-        else if (spec.text === '─── Actions') height = 20;
+        else if (spec.text === actionsHeader || spec.text === detailsHeader) height = 22;
 
         layoutChildren.push({
           widgetId: wid,
@@ -1488,9 +1540,7 @@ export class AppExplorer extends Abject {
       })
     );
     await this.request(request(this.id, canvasId, 'draw', {
-      commands: [
-        { type: 'rect', surfaceId: 'c', params: { x: 0, y: 0, width: displayInfo.width, height: displayInfo.height, fill: 'rgba(0,0,0,0.5)' } },
-      ],
+      commands: scrimCommands(this.theme, displayInfo.width, displayInfo.height),
     }));
 
     // Dialog window

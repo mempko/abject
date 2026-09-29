@@ -12,6 +12,7 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import type { ListItem } from './widgets/list-widget.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('JobBrowser');
 
@@ -28,6 +29,9 @@ export class JobBrowser extends Abject {
   private rootLayoutId?: AbjectId;
   private listWidgetId?: AbjectId;
   private clearBtnId?: AbjectId;
+  private emptyLabelId?: AbjectId;
+  /** Whether the empty state is showing; undefined until first applied. */
+  private emptyShown?: boolean;
 
   /** Cached jobs in display order (oldest first). */
   private jobs: Job[] = [];
@@ -146,8 +150,8 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 6,
+        margins: { top: 12, right: 16, bottom: 12, left: 16 },
+        spacing: 8,
       })
     );
 
@@ -161,6 +165,25 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
 
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.listWidgetId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Empty state: shares the list's slot, shown while there are no jobs.
+    const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'label', windowId: this.windowId,
+          text: emptyStateMarkdown(
+            'No jobs yet',
+            'Background work queued by agents and objects appears here as it runs, with its status and timing. Ask in Chat for something to run and its jobs will show up.',
+          ),
+          style: emptyStateStyle(this.theme),
+        }],
+      })
+    );
+    this.emptyLabelId = emptyId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.emptyLabelId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
@@ -185,14 +208,17 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     // Clear button
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'button', windowId: this.windowId, text: 'Clear' }],
+        specs: [{
+          type: 'button', windowId: this.windowId, text: 'Clear History',
+          style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder },
+        }],
       })
     );
     this.clearBtnId = widgetIds[0];
 
     await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
+        { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: 36 } },
       ],
     }));
 
@@ -222,6 +248,8 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     this.rootLayoutId = undefined;
     this.listWidgetId = undefined;
     this.clearBtnId = undefined;
+    this.emptyLabelId = undefined;
+    this.emptyShown = undefined;
     this.jobs = [];
     this.changed('visibility', false);
     return true;
@@ -263,7 +291,7 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
 
   private statusBadge(status: string): { text: string; color: string } {
     switch (status) {
-      case 'running':   return { text: 'Running', color: this.theme.statusInfo };
+      case 'running':   return { text: 'Running', color: this.theme.accentSecondary };
       case 'completed': return { text: 'Done',    color: this.theme.statusSuccess };
       case 'failed':    return { text: 'Failed',  color: this.theme.statusError };
       default:          return { text: 'Queued',  color: this.theme.statusNeutral };
@@ -276,6 +304,19 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
     try {
       await this.request(request(this.id, this.listWidgetId, 'update', { items }));
     } catch { /* widget may be gone */ }
+    await this.applyEmptyState(items.length === 0);
+  }
+
+  /** Swap the list and the empty-state label in the shared layout slot. */
+  private async applyEmptyState(empty: boolean): Promise<void> {
+    if (!this.listWidgetId || !this.emptyLabelId || this.emptyShown === empty) return;
+    this.emptyShown = empty;
+    try {
+      await Promise.all([
+        this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.emptyLabelId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
   }
 
   // -- Events --

@@ -34,6 +34,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('MethodInspector');
 
@@ -351,7 +352,7 @@ owner. Clicking ? again on the same object raises its existing window.
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2) + offset);
 
     const windowId = await wm('createWindowAbject', {
-      title: `🔍 ${session.targetName}`,
+      title: session.targetName,
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;
@@ -359,8 +360,8 @@ owner. Clicking ? again on the same object raises its existing window.
 
     const rootLayoutId = await wm('createVBox', {
       windowId,
-      margins: { top: 6, right: 8, bottom: 6, left: 8 },
-      spacing: 4,
+      margins: { top: 8, right: 12, bottom: 8, left: 12 },
+      spacing: 6,
     }) as AbjectId;
 
     // Header (object name + description) + divider.
@@ -369,10 +370,10 @@ owner. Clicking ? again on the same object raises its existing window.
       ? (description.length > 160 ? description.slice(0, 157) + '...' : description)
       : '';
     const headerSpecs: Array<Record<string, unknown>> = [
-      { type: 'label', windowId, text: headerText, style: { fontSize: 15, fontWeight: 'bold', selectable: true } },
+      { type: 'label', windowId, text: headerText, style: { fontSize: 15, fontWeight: 'bold', color: this.theme.textHeading, selectable: true } },
     ];
     if (subText) {
-      headerSpecs.push({ type: 'label', windowId, text: subText, style: { fontSize: 12, wordWrap: true, selectable: true } });
+      headerSpecs.push({ type: 'label', windowId, text: subText, style: { fontSize: 12, color: this.theme.textSecondary, wordWrap: true, selectable: true } });
     }
     headerSpecs.push({ type: 'divider', windowId });
 
@@ -418,22 +419,34 @@ owner. Clicking ? again on the same object raises its existing window.
       widgetId: splitId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
-    const { widgetIds: [methodsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [methodsHeaderId, methodsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId, text: sectionHeaderText(this.theme, 'Methods & Events'), style: sectionHeaderStyle(this.theme, 12) },
         { type: 'list', windowId, items: [], searchable: true },
       ]})
     );
     session.methodsListId = methodsListId;
     await this.addDep(session, methodsListId);
 
+    // Methods column: a kit section header over the list.
+    const methodsPaneId = await wm('createDetachedVBox', {
+      windowId,
+      margins: { top: 6, right: 0, bottom: 0, left: 0 },
+      spacing: 4,
+    }) as AbjectId;
+    await this.request(request(this.id, methodsPaneId, 'addLayoutChildren', { children: [
+      { widgetId: methodsHeaderId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+      { widgetId: methodsListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+    ]}));
+
     const detailLayoutId = await wm('createDetachedScrollableVBox', {
       windowId,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
+      margins: { top: 6, right: 8, bottom: 6, left: 12 },
+      spacing: 6,
     }) as AbjectId;
     session.detailLayoutId = detailLayoutId;
 
-    await this.request(request(this.id, splitId, 'setLeftChild', { widgetId: methodsListId }));
+    await this.request(request(this.id, splitId, 'setLeftChild', { widgetId: methodsPaneId }));
     await this.request(request(this.id, splitId, 'setRightChild', { widgetId: detailLayoutId }));
   }
 
@@ -492,8 +505,24 @@ owner. Clicking ? again on the same object raises its existing window.
     } else if (session.selected) {
       await this.rebuildMethodDetail(session);
     } else {
-      await this.addPlainLabel(session, 'Select a method or event to inspect it.', 12);
+      await this.addEmptyState(session, emptyStateMarkdown(
+        'Nothing selected',
+        'Select a method or event on the left to see its signature, find who implements or sends it, and send it a test message.',
+      ));
     }
+  }
+
+  /** A centered empty-state note in the detail pane. */
+  private async addEmptyState(session: Session, markdown: string): Promise<void> {
+    const { widgetIds: [id] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: session.windowId, text: markdown, style: emptyStateStyle(this.theme) },
+      ]})
+    );
+    session.detailLabelIds.push(id);
+    await this.request(request(this.id, session.detailLayoutId!, 'addLayoutChild', {
+      widgetId: id, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 100 },
+    }));
   }
 
   private async addPlainLabel(session: Session, text: string, fontSize = 12): Promise<void> {
@@ -525,9 +554,10 @@ owner. Clicking ? again on the same object raises its existing window.
 
     const params = method.decl?.parameters ?? [];
     const paramStr = params.map(p => `${p.name}: ${p.type ? this.formatType(p.type) : 'any'}`).join(', ');
-    labels.push({ text: `(${paramStr})`, secondary: true });
+    // Signature lines are code: they stay monospace.
+    labels.push({ text: `(${paramStr})`, secondary: true, style: { fontFamily: 'mono' } });
     if (method.decl?.returns) {
-      labels.push({ text: `→ ${this.formatType(method.decl.returns)}`, secondary: true });
+      labels.push({ text: `→ ${this.formatType(method.decl.returns)}`, secondary: true, style: { fontFamily: 'mono' } });
     }
     if (method.decl?.description) {
       labels.push({ text: method.decl.description, secondary: true });
@@ -535,7 +565,9 @@ owner. Clicking ? again on the same object raises its existing window.
     if (session.iface) {
       labels.push({ text: `Interface: ${session.iface.id}`, secondary: true });
     }
-    labels.push({ text: '───', secondary: true });
+    if (method.type === 'method') {
+      labels.push({ text: sectionHeaderText(this.theme, 'Explore'), secondary: false, style: { ...sectionHeaderStyle(this.theme, 12) } });
+    }
 
     // Cross-reference buttons (methods only).
     const navBtns: Array<{ text: string; action: string }> = [];
@@ -571,7 +603,7 @@ owner. Clicking ? again on the same object raises its existing window.
 
     const labelStart = specs.length;
     for (const l of labels) {
-      specs.push({ type: 'label', windowId: win, text: l.text, style: { fontSize: l.secondary ? 12 : 13, wordWrap: true, selectable: true, ...(l.style ?? {}) } });
+      specs.push({ type: 'label', windowId: win, text: l.text, style: { fontSize: l.secondary ? 12 : 13, wordWrap: true, selectable: true, ...(l.secondary ? { color: this.theme.textSecondary } : {}), ...(l.style ?? {}) } });
     }
     const navStart = specs.length;
     for (const b of navBtns) {
@@ -585,10 +617,10 @@ owner. Clicking ? again on the same object raises its existing window.
     let responseIdx = -1;
     if (hasSend) {
       sendHeaderIdx = specs.length;
-      specs.push({ type: 'label', windowId: win, text: '─── Send Message', style: { fontSize: 12, wordWrap: true } });
+      specs.push({ type: 'label', windowId: win, text: sectionHeaderText(this.theme, 'Send Message'), style: { ...sectionHeaderStyle(this.theme, 12) } });
       for (const ins of inputSpecs) {
         paramLabelIdx.push(specs.length);
-        specs.push({ type: 'label', windowId: win, text: ins.label, style: { fontSize: 12, wordWrap: true } });
+        specs.push({ type: 'label', windowId: win, text: ins.label, style: { fontSize: 12, wordWrap: true, color: this.theme.textSecondary } });
         inputIdx.push(specs.length);
         specs.push({ type: 'textInput', windowId: win, placeholder: ins.placeholder, text: '' });
       }
@@ -628,7 +660,7 @@ owner. Clicking ? again on the same object raises its existing window.
       children.push({ widgetId: widgetIds[navStart + i], sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 160, height: 26 } });
     }
     if (hasSend) {
-      children.push({ widgetId: widgetIds[sendHeaderIdx], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+      children.push({ widgetId: widgetIds[sendHeaderIdx], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } });
       for (let i = 0; i < inputSpecs.length; i++) {
         const lblLines = Math.max(1, Math.ceil(inputSpecs[i].label.length / 40));
         children.push({ widgetId: widgetIds[paramLabelIdx[i]], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(16, lblLines * 16) } });
@@ -678,10 +710,12 @@ owner. Clicking ? again on the same object raises its existing window.
 
     const specs: Array<Record<string, unknown>> = [
       { type: 'button', windowId: session.windowId, text: '◀ Back', style: { fontSize: 11 } },
-      { type: 'label', windowId: session.windowId, text: header, style: { fontSize: 13, fontWeight: 'bold', wordWrap: true } },
+      { type: 'label', windowId: session.windowId, text: header, style: { ...sectionHeaderStyle(this.theme, 13), wordWrap: true } },
     ];
     if (names.length === 0) {
-      specs.push({ type: 'label', windowId: session.windowId, text: mode === 'implementors' ? 'No implementors found.' : 'No senders found.', style: { fontSize: 12, wordWrap: true } });
+      specs.push({ type: 'label', windowId: session.windowId, text: mode === 'implementors'
+        ? emptyStateMarkdown('No implementors found', 'Nothing registered declares this method.')
+        : emptyStateMarkdown('No senders found', 'No object source mentions this method.'), style: { ...emptyStateStyle(this.theme) } });
     } else {
       for (const name of names) {
         specs.push({ type: 'button', windowId: session.windowId, text: name, style: { fontSize: 11 } });
@@ -703,7 +737,7 @@ owner. Clicking ? again on the same object raises its existing window.
 
     if (names.length === 0) {
       session.detailLabelIds.push(widgetIds[2]);
-      children.push({ widgetId: widgetIds[2], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+      children.push({ widgetId: widgetIds[2], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 80 } });
     } else {
       for (let i = 0; i < names.length; i++) {
         const btnId = widgetIds[2 + i];

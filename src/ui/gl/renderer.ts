@@ -13,7 +13,7 @@ import { Mat4, mat3NormalMatrix } from './math.js';
 import { Geometry } from './primitives.js';
 import {
   QUAD_VS, SURFACE_FS, GLOW_FS, FLAT_FS,
-  OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MESH_INSTANCED_VS, MAX_MESH_LIGHTS,
+  OVERLAY_VS, OVERLAY_FS, BLOOM_COMPOSITE_FS, MESH_VS, MESH_FS, MESH_INSTANCED_VS, MAX_MESH_LIGHTS,
   BRIGHT_FS, BLUR_FS, DEPTH_VS, DEPTH_FS, SHADOW_SIZE,
 } from './shaders.js';
 
@@ -1008,7 +1008,7 @@ void main() { fragColor = vec4(1.0); }`,
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
-    const comp = this.getProgram('overlay', OVERLAY_VS, OVERLAY_FS, ['uTex']);
+    const comp = this.getProgram('bloomComposite', OVERLAY_VS, BLOOM_COMPOSITE_FS, ['uTex']);
     gl.useProgram(comp.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.bloomTex[src]);

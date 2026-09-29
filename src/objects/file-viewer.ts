@@ -9,6 +9,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
 const log = new Log('FileViewer');
 
@@ -128,36 +129,47 @@ export class FileViewer extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        spacing: 8,
       })
     );
 
     const { widgetIds: [titleId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [{
-          type: 'label', windowId: this.windowId, text: 'Select a file to preview',
-          style: { fontSize: 13, fontWeight: 'bold', color: this.theme.textSecondary, wordWrap: false },
+          type: 'label', windowId: this.windowId, text: sectionHeaderText(this.theme, 'Preview'),
+          style: { ...sectionHeaderStyle(this.theme), wordWrap: false },
         }],
       })
     );
     this.titleLabelId = titleId;
 
-    this.contentScrollId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 4, right: 4, bottom: 4, left: 4 },
-        spacing: 4,
-      })
-    );
-
-    // Root children: title (fixed) then content (expanding). The content
-    // scroll layout was auto-added expanding; insert the title above it.
+    // Root children: title (fixed) then content (expanding). Add the title
+    // first so it sits above the content scroll layout, which the nested
+    // create auto-adds (expanding) to the root.
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.titleLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 22 },
     }));
+
+    this.contentScrollId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 4, right: 4, bottom: 4, left: 4 },
+        spacing: 8,
+      })
+    );
+
+    // Empty state until a file is opened (openFile clears the content).
+    await this.addContentLabel(
+      emptyStateMarkdown(
+        'Nothing to preview yet',
+        'Select a file in Files to see it here. Text and code show in full; images show at a size that fits the window.',
+      ),
+      { ...emptyStateStyle(this.theme) },
+      WIN_H - 140,
+    );
 
     this.changed('visibility', true);
     return true;
@@ -190,9 +202,10 @@ export class FileViewer extends Abject {
     const name = path.split('/').filter(Boolean).pop() ?? path;
     const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
 
+    // The file name is user data: header face, original case.
     await this.request(request(this.id, this.titleLabelId!, 'update', {
       text: name,
-      style: { color: this.theme.textPrimary },
+      style: { color: this.theme.textHeading },
     }));
 
     // Clear any previous preview content.
@@ -209,7 +222,7 @@ export class FileViewer extends Abject {
       }
     } catch (err) {
       log.warn(`Failed to preview ${path}:`, err instanceof Error ? err.message : String(err));
-      await this.addContentLabel(`Could not open "${name}".`, { color: this.theme.textSecondary });
+      await this.addContentLabel(`Could not open "${name}".`, { color: this.theme.statusError });
     }
     return true;
   }
@@ -237,7 +250,11 @@ export class FileViewer extends Abject {
       text = text.slice(0, MAX_TEXT_CHARS) + '\n…[truncated]';
     }
     if (text.length === 0) {
-      await this.addContentLabel('(empty file)', { color: this.theme.textSecondary });
+      await this.addContentLabel(
+        emptyStateMarkdown('This file is empty', 'It has no contents yet. Anything written to it will show here when you open it again.'),
+        { ...emptyStateStyle(this.theme) },
+        120,
+      );
       return;
     }
     const lineCount = text.split('\n').length;
@@ -269,12 +286,16 @@ export class FileViewer extends Abject {
       if (info) sizeNote = ` · ${formatSize(info.size)}`;
     } catch { /* ignore */ }
     await this.addContentLabel(
-      `No preview available for .${ext || 'file'}${sizeNote}`,
-      { color: this.theme.textSecondary },
+      emptyStateMarkdown(
+        `No preview for .${ext || 'file'} files${sizeNote}`,
+        'Text, code and image files preview here. This file is stored safely and agents can still read it.',
+      ),
+      { ...emptyStateStyle(this.theme) },
+      120,
     );
   }
 
-  private async addContentLabel(text: string, style: Record<string, unknown>): Promise<void> {
+  private async addContentLabel(text: string, style: Record<string, unknown>, height = 40): Promise<void> {
     const { widgetIds: [id] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [{ type: 'label', windowId: this.windowId, text, style: { fontSize: 13, wordWrap: true, ...style } }],
@@ -284,7 +305,7 @@ export class FileViewer extends Abject {
     await this.request(request(this.id, this.contentScrollId!, 'addLayoutChild', {
       widgetId: id,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 40 },
+      preferredSize: { height },
     }));
   }
 }

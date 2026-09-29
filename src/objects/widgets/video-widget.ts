@@ -22,7 +22,7 @@ import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { request } from '../../core/message.js';
 import { parseAbjectUrl } from './markdown-image-resolver.js';
-import { withAlpha } from './widget-types.js';
+import { withAlpha, fontStacks, squareMark } from './widget-types.js';
 
 export interface VideoWidgetConfig extends WidgetConfig {
   /** URL, data: URI, abject:// reference, or a captured MediaStream id. */
@@ -206,6 +206,21 @@ export class VideoWidget extends WidgetAbject {
 
   // ── Drawing ──────────────────────────────────────────────────────────
 
+  /**
+   * Overlay chrome colours: the controls print in ink and paper from theme
+   * slots. (The letterbox black is content, not chrome.)
+   */
+  private chrome(): { band: string; glyph: string; track: string; badge: string; badgeText: string; font: string } {
+    return {
+      band: withAlpha(this.theme.textPrimary, 0.88),
+      glyph: this.theme.windowBg,
+      track: withAlpha(this.theme.windowBg, 0.3),
+      badge: this.theme.accent,
+      badgeText: this.theme.actionText,
+      font: fontStacks(this.theme).display,
+    };
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const w = this._renderRect.width;
@@ -251,23 +266,15 @@ export class VideoWidget extends WidgetAbject {
     });
 
     if (this.isStream) {
-      // LIVE badge instead of transport controls.
+      // LIVE badge: a square red block with a paper marker.
+      const c = this.chrome();
       const bx = ox + 8;
       const by = oy + 8;
-      commands.push({
-        type: 'rect', surfaceId,
-        params: { x: bx, y: by, width: 44, height: 18, fill: 'rgba(0,0,0,0.55)', radius: 9 },
-      });
-      commands.push({
-        type: 'circle', surfaceId,
-        params: { cx: bx + 11, cy: by + 9, radius: 3.5, fill: this.theme.statusError },
-      });
+      commands.push({ type: 'rect', surfaceId, params: { x: bx, y: by, width: 44, height: 18, fill: c.badge } });
+      commands.push(...squareMark(surfaceId, bx + 10, by + 9, 6, c.badgeText));
       commands.push({
         type: 'text', surfaceId,
-        params: {
-          x: bx + 19, y: by + 9, text: 'LIVE',
-          font: 'bold 10px sans-serif', fill: '#ffffff', baseline: 'middle',
-        },
+        params: { x: bx + 17, y: by + 9, text: 'LIVE', font: `bold 10px ${c.font}`, fill: c.badgeText, baseline: 'middle' },
       });
     }
 
@@ -281,10 +288,11 @@ export class VideoWidget extends WidgetAbject {
   private buildControlCommands(surfaceId: string, ox: number, oy: number, w: number, h: number): unknown[] {
     const commands: unknown[] = [];
     const barY = oy + h - CONTROLS_HEIGHT;
+    const c = this.chrome();
 
     commands.push({
       type: 'rect', surfaceId,
-      params: { x: ox, y: barY, width: w, height: CONTROLS_HEIGHT, fill: 'rgba(0,0,0,0.55)' },
+      params: { x: ox, y: barY, width: w, height: CONTROLS_HEIGHT, fill: c.band },
     });
 
     // Play/pause glyph in the leftmost 28px cell.
@@ -292,8 +300,8 @@ export class VideoWidget extends WidgetAbject {
     const cy = barY + CONTROLS_HEIGHT / 2;
     if (this.playing) {
       commands.push(
-        { type: 'rect', surfaceId, params: { x: cx - 5, y: cy - 6, width: 3.5, height: 12, fill: '#ffffff' } },
-        { type: 'rect', surfaceId, params: { x: cx + 1.5, y: cy - 6, width: 3.5, height: 12, fill: '#ffffff' } },
+        { type: 'rect', surfaceId, params: { x: cx - 5, y: cy - 6, width: 3.5, height: 12, fill: c.glyph } },
+        { type: 'rect', surfaceId, params: { x: cx + 1.5, y: cy - 6, width: 3.5, height: 12, fill: c.glyph } },
       );
     } else {
       commands.push({
@@ -304,7 +312,7 @@ export class VideoWidget extends WidgetAbject {
             { x: cx - 4, y: cy + 6 },
             { x: cx + 6, y: cy },
           ],
-          fill: '#ffffff',
+          fill: c.glyph,
         },
       });
     }
@@ -316,18 +324,17 @@ export class VideoWidget extends WidgetAbject {
     const ratio = this.duration > 0 ? Math.min(1, this.currentTime / this.duration) : 0;
     commands.push({
       type: 'rect', surfaceId,
-      params: { x: trackX, y: trackY, width: trackW, height: 4, fill: withAlpha('#ffffff', 0.25), radius: 2 },
+      params: { x: trackX, y: trackY, width: trackW, height: 4, fill: c.track, radius: 0 },
     });
     if (ratio > 0) {
       commands.push({
         type: 'rect', surfaceId,
-        params: { x: trackX, y: trackY, width: trackW * ratio, height: 4, fill: this.theme.accent, radius: 2 },
+        params: { x: trackX, y: trackY, width: trackW * ratio, height: 4, fill: this.theme.accent, radius: 0 },
       });
     }
-    commands.push({
-      type: 'circle', surfaceId,
-      params: { cx: trackX + trackW * ratio, cy: trackY + 2, radius: 5, fill: '#ffffff' },
-    });
+    // Square red thumb with a paper core.
+    commands.push(...squareMark(surfaceId, trackX + trackW * ratio, trackY + 2, 10, this.theme.accent));
+    commands.push(...squareMark(surfaceId, trackX + trackW * ratio, trackY + 2, 4, c.glyph));
 
     return commands;
   }

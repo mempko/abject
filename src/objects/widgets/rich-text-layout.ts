@@ -8,9 +8,13 @@
 import type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './markdown.js';
 import { parseInline } from './markdown.js';
 import type { ThemeData } from './widget-types.js';
+import { fontStacks } from './widget-types.js';
 import { wrapText } from './word-wrap.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
+
+/** Space reserved under a ruled heading for its rule. */
+export const HEADING_RULE_PAD = 6;
 
 export interface StyledRun {
   text: string;
@@ -38,6 +42,12 @@ export interface LayoutLine {
   codeBackground?: boolean;
   /** True for blockquote lines that need a left border. */
   quoteBorder?: boolean;
+  /**
+   * Set on the last line of a heading block when the theme rules its
+   * headings: the heading level (1-6). The renderer draws a
+   * rule in the padding reserved below that line.
+   */
+  headingRule?: number;
   /** Image data for image lines (drawn instead of `runs`). */
   image?: {
     url: string;
@@ -70,10 +80,13 @@ function buildFontForStyle(
   baseFontSize: number,
   headingScale: number,
   isBold: boolean,
+  theme?: ThemeData,
 ): string {
+  const stacks = fontStacks(theme);
+  // Headings take the display face.
   const family = style === 'code'
-    ? '"Spline Sans Mono", "JetBrains Mono", monospace'
-    : '"Spectral", Georgia, "Times New Roman", serif';
+    ? stacks.mono
+    : (headingScale > 1 ? stacks.display : stacks.body);
   const size = style === 'code' ? baseFontSize - 1 : Math.round(baseFontSize * headingScale);
   const weight = (style === 'bold' || style === 'bold-italic' || isBold) ? 'bold' : 'normal';
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
@@ -220,12 +233,13 @@ export async function layoutRichText(
     // Build word segments from all spans in this block
     const segments: WordSegment[] = [];
 
-    // Prepend the list marker: \u2022 for plain bullets, the item's own number
+    // Prepend the list marker: \u25AA for plain bullets, the item's own number
     // ("3. ") for ordered lists.
     if (block.type === 'bullet') {
-      const bulletFont = buildFontForStyle('normal', baseFontSize, 1, false);
+      const bulletFont = buildFontForStyle('normal', baseFontSize, 1, false, theme);
       segments.push({
-        text: block.marker ?? '\u2022 ',
+        // Bullets are small squares.
+        text: block.marker ?? '\u25AA ',
         font: bulletFont,
         fill: blockFill,
         sourceStart: block.sourceStart,
@@ -235,17 +249,24 @@ export async function layoutRichText(
     }
 
     for (const span of block.spans) {
-      const font = buildFontForStyle(span.style, baseFontSize, headingScale, isHeadingBold);
+      const font = buildFontForStyle(span.style, baseFontSize, headingScale, isHeadingBold, theme);
       const fill = fillForStyle(span.style, blockFill, theme);
       const segs = splitIntoSegments(span.text, font, fill, span.href, span.sourceStart, span.sourceEnd);
       segments.push(...segs);
     }
 
     // Word-wrap segments into lines
+    const linesBefore = lines.length;
     await wrapSegments(segments, availWidth, indent, lineHeight, block.type, block.type === 'blockquote', measureFn, lines, y);
 
     if (lines.length > 0) {
       y = lines[lines.length - 1].y + lines[lines.length - 1].height;
+    }
+
+    // Headings sit on a rule: reserve room for it below the heading's last line.
+    if (block.type === 'heading' && lines.length > linesBefore) {
+      lines[lines.length - 1].headingRule = block.level ?? 1;
+      y += HEADING_RULE_PAD;
     }
   }
 
@@ -303,7 +324,7 @@ async function layoutCodeBlock(
 ): Promise<void> {
   const codeFontSize = baseFontSize - 1;
   const lineHeight = codeFontSize + 4;
-  const font = `${codeFontSize}px "Spline Sans Mono", "JetBrains Mono", monospace`;
+  const font = `${codeFontSize}px ${fontStacks(theme).mono}`;
   const fill = theme.textPrimary;
   const codeText = block.spans[0]?.text ?? '';
   const codeLines = codeText.split('\n');
@@ -339,11 +360,11 @@ async function layoutCodeBlock(
   }
 }
 
-function tableFontForSpan(style: SpanStyle, size: number, isHeader: boolean): string {
+function tableFontForSpan(style: SpanStyle, size: number, isHeader: boolean, theme?: ThemeData): string {
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
   const weight = (isHeader || style === 'bold' || style === 'bold-italic') ? 'bold' : 'normal';
   // Use monospace for the whole table so fixed-width column padding still aligns.
-  return `${italic}${weight} ${size}px "Spline Sans Mono", "JetBrains Mono", monospace`;
+  return `${italic}${weight} ${size}px ${fontStacks(theme).mono}`;
 }
 
 /** Word-wrap plain text into monospace lines of at most `maxChars`. */
@@ -418,7 +439,7 @@ async function layoutTable(
 
   // Measure a single monospace char so we can budget the available width
   // in character columns.
-  const probeFont = tableFontForSpan('normal', codeFontSize, false);
+  const probeFont = tableFontForSpan('normal', codeFontSize, false, theme);
   const charPixelWidth = Math.max(1, await measureFn('M', probeFont));
   const budgetChars = Math.max(
     MIN_COL_CHARS * colCount + SEPARATOR_CHARS * (colCount - 1),
@@ -484,7 +505,7 @@ async function layoutTable(
         const runs: StyledRun[] = [];
         for (const span of cellSpans) {
           if (span.text.length === 0) continue;
-          const font = tableFontForSpan(span.style, codeFontSize, isHeader);
+          const font = tableFontForSpan(span.style, codeFontSize, isHeader, theme);
           const fill = span.style === 'link'
             ? theme.linkColor
             : span.style === 'code'
@@ -534,7 +555,7 @@ async function layoutTable(
           // Multi-line plain cell: pick the wrapped line for this index.
           const lineText = wrap.plain[li] ?? '';
           if (lineText.length > 0) {
-            const font = tableFontForSpan('normal', codeFontSize, isHeader);
+            const font = tableFontForSpan('normal', codeFontSize, isHeader, theme);
             const width = await measureFn(lineText, font);
             lineRuns.push({
               text: lineText,
@@ -552,7 +573,7 @@ async function layoutTable(
         const padChars = Math.max(0, colW - visibleLen);
         const trailing = ' '.repeat(padChars) + (isLastCol ? '' : COL_SEPARATOR);
         if (trailing.length > 0) {
-          const font = tableFontForSpan('normal', codeFontSize, isHeader);
+          const font = tableFontForSpan('normal', codeFontSize, isHeader, theme);
           const width = await measureFn(trailing, font);
           lineRuns.push({
             text: trailing,

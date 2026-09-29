@@ -21,6 +21,9 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { chromeCase } from '../core/theme-data.js';
+import { fontStacks } from './widgets/widget-types.js';
+import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
 import type { ListItem } from './widgets/list-widget.js';
@@ -81,6 +84,10 @@ export class KnowledgeBrowser extends Abject {
   private restoreBtnId?: AbjectId;
   private buttonRowId?: AbjectId;
   private emptyLabelId?: AbjectId;
+  private dividerId?: AbjectId;
+  /** Empty-state label sharing the list's slot; shown when the list is empty. */
+  private listEmptyId?: AbjectId;
+  private listEmptyShown?: boolean;
   private archivedToggleId?: AbjectId;
   private curateBtnId?: AbjectId;
 
@@ -227,8 +234,8 @@ export class KnowledgeBrowser extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        margins: { top: 12, right: 12, bottom: 12, left: 12 },
+        spacing: 8,
       })
     );
 
@@ -265,7 +272,8 @@ export class KnowledgeBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'checkbox', windowId: this.windowId, checked: this.showArchived, text: 'Show archived' },
-          { type: 'button', windowId: this.windowId, text: 'Curate' },
+          { type: 'button', windowId: this.windowId, text: 'Curate',
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
         ],
       })
     );
@@ -342,21 +350,24 @@ export class KnowledgeBrowser extends Abject {
     );
 
     // Search input
-    const { widgetIds: [searchId, listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [searchId, listId, listEmptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'textInput', windowId: this.windowId, placeholder: 'Search knowledge...' },
           { type: 'list', windowId: this.windowId, items: [], searchable: false, itemHeight: 26 },
+          { type: 'label', windowId: this.windowId, text: this.listEmptyText(), style: emptyStateStyle(this.theme) },
         ],
       })
     );
     this.searchInputId = searchId;
     this.listWidgetId = listId;
+    this.listEmptyId = listEmptyId;
 
     await this.request(request(this.id, this.leftLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: this.searchInputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 28 } },
         { widgetId: this.listWidgetId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.listEmptyId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
       ],
     }));
 
@@ -365,7 +376,7 @@ export class KnowledgeBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'createDetachedScrollableVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 12, bottom: 8, left: 12 },
-        spacing: 6,
+        spacing: 8,
       })
     );
 
@@ -384,7 +395,7 @@ export class KnowledgeBrowser extends Abject {
             style: { fontSize: 11, color: this.theme.statusNeutral } },
           // 3: metadata
           { type: 'label', windowId: this.windowId, text: '',
-            style: { fontSize: 10, color: this.theme.textTertiary, wordWrap: true } },
+            style: { fontSize: 10, color: this.theme.textMeta, wordWrap: true } },
           // 4: divider
           { type: 'divider', windowId: this.windowId },
           // 5: content (markdown, selectable)
@@ -392,13 +403,17 @@ export class KnowledgeBrowser extends Abject {
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true, selectable: true } },
           // 6: delete button
           { type: 'button', windowId: this.windowId, text: 'Forget',
-            style: { color: this.theme.statusError } },
-          // 7: restore button (archived entries only)
+            style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
+          // 7: restore button (archived entries only; the primary action there)
           { type: 'button', windowId: this.windowId, text: 'Restore',
-            style: { color: this.theme.statusSuccess } },
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           // 8: empty state
-          { type: 'label', windowId: this.windowId, text: 'Select an entry to view details',
-            style: { fontSize: 12, color: this.theme.textTertiary, align: 'center' } },
+          { type: 'label', windowId: this.windowId,
+            text: emptyStateMarkdown(
+              'Select an entry',
+              'Pick one from the list to read it in full, see its tags and links, and forget or restore it.',
+            ),
+            style: emptyStateStyle(this.theme) },
         ],
       })
     );
@@ -407,7 +422,7 @@ export class KnowledgeBrowser extends Abject {
     this.typeLabelId = detailIds[1];
     this.tagsLabelId = detailIds[2];
     this.metaLabelId = detailIds[3];
-    const dividerId = detailIds[4];
+    const dividerId = this.dividerId = detailIds[4];
     this.contentLabelId = detailIds[5];
     this.deleteBtnId = detailIds[6];
     this.restoreBtnId = detailIds[7];
@@ -532,6 +547,9 @@ export class KnowledgeBrowser extends Abject {
     this.restoreBtnId = undefined;
     this.buttonRowId = undefined;
     this.emptyLabelId = undefined;
+    this.dividerId = undefined;
+    this.listEmptyId = undefined;
+    this.listEmptyShown = undefined;
     this.archivedToggleId = undefined;
     this.curateBtnId = undefined;
     this.innerSplitId = undefined;
@@ -638,6 +656,45 @@ export class KnowledgeBrowser extends Abject {
     });
 
     await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+    await this.applyListEmpty(items.length === 0);
+  }
+
+  /** Empty-list text for the current tab and search. */
+  private listEmptyText(): string {
+    if (this.searchQuery.trim().length > 0) {
+      return emptyStateMarkdown('No matches', 'Try other words, or clear the search to see everything.');
+    }
+    const type = TAB_TYPES[this.activeTab];
+    if (type === 'pattern') {
+      return emptyStateMarkdown(
+        'No patterns yet',
+        'Patterns are reusable lessons woven from finished goals. They appear here as agents complete work.',
+      );
+    }
+    const titles: Record<string, string> = {
+      learned: 'No lessons learned yet', fact: 'No facts yet',
+      insight: 'No insights yet', reference: 'No references yet',
+    };
+    return emptyStateMarkdown(
+      type ? (titles[type] ?? 'Nothing here yet') : 'Nothing remembered yet',
+      'Agents record what they learn here as they work. Ask in Chat to remember something, for example "remember that I prefer metric units".',
+    );
+  }
+
+  /** Swap the list and its empty-state label, refreshing the text. */
+  private async applyListEmpty(empty: boolean): Promise<void> {
+    if (!this.listWidgetId || !this.listEmptyId) return;
+    try {
+      if (empty) {
+        await this.request(request(this.id, this.listEmptyId, 'update', { text: this.listEmptyText() }));
+      }
+      if (this.listEmptyShown === empty) return;
+      this.listEmptyShown = empty;
+      await Promise.all([
+        this.request(request(this.id, this.listWidgetId, 'update', { style: { visible: !empty } })),
+        this.request(request(this.id, this.listEmptyId, 'update', { style: { visible: empty } })),
+      ]);
+    } catch { /* widgets may be gone */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -692,6 +749,7 @@ export class KnowledgeBrowser extends Abject {
       this.request(request(this.id, this.tagsLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.metaLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.contentLabelId!, 'update', { style: { visible: detailVis } })),
+      ...(this.dividerId ? [this.request(request(this.id, this.dividerId, 'update', { style: { visible: detailVis } }))] : []),
       this.request(request(this.id, this.deleteBtnId!, 'update', { style: { visible: detailVis } })),
       // Restore stays hidden until showDetail() reveals it for archived entries
       this.request(request(this.id, this.restoreBtnId!, 'update', { style: { visible: false } })),
@@ -1007,22 +1065,44 @@ export class KnowledgeBrowser extends Abject {
     const cmds: Array<{ type: string; surfaceId: string; params: Record<string, unknown> }> = [];
     const c = (type: string, params: Record<string, unknown>) => cmds.push({ type, surfaceId: 'c', params });
 
+    // Red Sigil map: patterns are ring sigils on the void. The selected
+    // pattern is marked in red (the human hand); what it links to is drawn
+    // in red, what links back to it glows in the living light.
+    const { body, display } = fontStacks(t);
     c('clear', { color: t.canvasBg });
-    c('text', { x: 10, y: 16, text: 'Pattern language', fill: t.textTertiary, font: '10px sans-serif' });
+    c('text', { x: 12, y: 18, text: `\u25C9  ${chromeCase(t, 'Pattern language')}`, fill: t.textSecondary, font: `bold 11px ${display}` });
+    c('line', { x1: 12, y1: 24, x2: 52, y2: 24, stroke: t.accent, lineWidth: 2 });
 
     if (nodes.length === 0) {
       c('text', {
-        x: W / 2, y: H / 2, align: 'center',
-        text: 'No patterns yet — the language grows as goals complete',
-        fill: t.textTertiary, font: '11px sans-serif',
+        x: W / 2, y: H / 2 - 8, align: 'center',
+        text: chromeCase(t, 'No patterns yet'),
+        fill: t.textSecondary, font: `bold 13px ${display}`,
       });
+      c('text', {
+        x: W / 2, y: H / 2 + 12, align: 'center',
+        text: 'The language grows as goals complete and lessons are woven in.',
+        fill: t.textTertiary, font: `11px ${body}`,
+      });
+    }
+
+    const selIdx = nodes.findIndex(nd => !!nd.entry && nd.entry.id === this.selectedId);
+    const related = new Set<number>();
+    for (const e of edges) {
+      if (e.from === selIdx) related.add(e.to);
+      if (e.to === selIdx) related.add(e.from);
     }
 
     for (const e of edges) {
       const a = nodes[e.from], b = nodes[e.to];
-      const stroke = e.ghost ? t.textTertiary : t.divider;
+      const outgoing = selIdx >= 0 && e.from === selIdx;
+      const incoming = selIdx >= 0 && e.to === selIdx;
+      const stroke = outgoing ? t.accent
+        : incoming ? t.accentSecondary
+          : e.ghost ? t.textTertiary : t.divider;
+      const lineWidth = outgoing || incoming ? 2 : 1.2;
       if (e.ghost) c('setLineDash', { segments: [4, 4] });
-      c('line', { x1: a.sx, y1: a.sy, x2: b.sx, y2: b.sy, stroke, lineWidth: 1.2 });
+      c('line', { x1: a.sx, y1: a.sy, x2: b.sx, y2: b.sy, stroke, lineWidth });
       if (e.ghost) c('setLineDash', { segments: [] });
       // Arrowhead just outside the target node's rim
       const dx = b.sx - a.sx, dy = b.sy - a.sy;
@@ -1039,33 +1119,47 @@ export class KnowledgeBrowser extends Abject {
       });
     }
 
-    for (const nd of nodes) {
-      const selected = !!nd.entry && nd.entry.id === this.selectedId;
+    for (let i = 0; i < nodes.length; i++) {
+      const nd = nodes[i];
+      const selected = i === selIdx;
+      const isRelated = related.has(i);
       if (!nd.entry) {
+        // Unwritten pattern: a dashed ring with no eye.
         c('setLineDash', { segments: [3, 3] });
         c('circle', { cx: nd.sx, cy: nd.sy, radius: nd.r, stroke: t.textTertiary, lineWidth: 1 });
         c('setLineDash', { segments: [] });
       } else {
+        // Ring sigil: bone outer ring, red inner ring, pupil at the centre.
         if (selected) {
-          c('circle', { cx: nd.sx, cy: nd.sy, radius: nd.r + 4, stroke: t.accent, lineWidth: 2 });
+          c('circle', { cx: nd.sx, cy: nd.sy, radius: nd.r + 5, stroke: t.accent, lineWidth: 2.5 });
         }
         c('circle', {
           cx: nd.sx, cy: nd.sy, radius: nd.r,
           fill: t.windowBg,
-          stroke: selected ? t.accent : t.textHeading,
-          lineWidth: selected ? 2 : 1.4,
+          stroke: selected ? t.accent : t.textPrimary,
+          lineWidth: selected ? 2.2 : 1.6,
+        });
+        c('circle', {
+          cx: nd.sx, cy: nd.sy, radius: Math.max(3, nd.r * 0.55),
+          stroke: t.accent, lineWidth: 1.2,
+        });
+        c('circle', {
+          cx: nd.sx, cy: nd.sy, radius: selected || isRelated ? 2.5 : 1.8,
+          fill: selected || isRelated ? t.accentSecondary : t.textSecondary,
         });
       }
       const label = nd.title.length > 20 ? `${nd.title.slice(0, 19)}…` : nd.title;
       c('text', {
-        x: nd.sx, y: nd.sy + nd.r + 12, text: label, align: 'center',
-        fill: nd.entry ? (selected ? t.accent : t.textPrimary) : t.textTertiary,
-        font: selected ? 'bold 10px sans-serif' : '10px sans-serif',
+        x: nd.sx, y: nd.sy + nd.r + (selected ? 17 : 13), text: label, align: 'center',
+        fill: nd.entry
+          ? (selected ? t.accent : isRelated ? t.accentSecondary : t.textPrimary)
+          : t.textTertiary,
+        font: selected ? `bold 11px ${display}` : `10px ${display}`,
       });
       if (!nd.entry) {
         c('text', {
-          x: nd.sx, y: nd.sy + nd.r + 23, text: '(unwritten)', align: 'center',
-          fill: t.textTertiary, font: '9px sans-serif',
+          x: nd.sx, y: nd.sy + nd.r + 24, text: '(unwritten)', align: 'center',
+          fill: t.textTertiary, font: `9px ${body}`,
         });
       }
     }

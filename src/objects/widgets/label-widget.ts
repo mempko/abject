@@ -17,8 +17,10 @@ import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { wrapText } from './word-wrap.js';
 import { event } from '../../core/message.js';
 import { parseMarkdown } from './markdown.js';
+import { fontStacks } from './widget-types.js';
 import { layoutRichText, type RichTextLayout, type StyledRun } from './rich-text-layout.js';
 import { renderRichTextCommands } from './markdown-render.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export class LabelWidget extends WidgetAbject {
   // Word-wrap cache
@@ -26,12 +28,18 @@ export class LabelWidget extends WidgetAbject {
   private cachedWrapText: string = '';
   private cachedWrapWidth: number = 0;
   private cachedWrapFontSize: number | undefined = undefined;
+  private cachedWrapFont = '';
+  /** The cached wrap was measured without client metrics; redo it next pass. */
+  private cachedWrapProvisional = false;
 
   // Markdown layout cache
   private cachedRichLayout: RichTextLayout | null = null;
   private cachedRichText: string = '';
   private cachedRichWidth: number = 0;
   private cachedRichFontSize: number | undefined = undefined;
+  private cachedRichFontKey = '';
+  /** The cached rich layout was measured without client metrics; redo it next pass. */
+  private cachedRichProvisional = false;
 
   // Selection state (only used when style.selectable is true)
   private cursorPos = 0;
@@ -93,7 +101,7 @@ export class LabelWidget extends WidgetAbject {
   }
 
   private async posFromClick(clickX: number, clickY: number, surfaceId: string, ox: number, oy: number): Promise<number> {
-    const font = buildFont(this.style);
+    const font = buildFont(this.style, this.theme);
     const textPadding = 4;
     const align = this.style.align ?? 'left';
 
@@ -265,13 +273,18 @@ export class LabelWidget extends WidgetAbject {
       this.cachedWrappedLines === null ||
       this.cachedWrapText !== text ||
       this.cachedWrapWidth !== maxWidth ||
-      this.cachedWrapFontSize !== fontSize
+      this.cachedWrapFontSize !== fontSize ||
+      this.cachedWrapFont !== font ||
+      this.cachedWrapProvisional
     ) {
       const measureFn = (t: string) => this.measureText(surfaceId, t, font);
+      this.measuredWithoutMetrics = false;
       this.cachedWrappedLines = await wrapText(text, maxWidth, measureFn);
+      this.cachedWrapProvisional = this.measuredWithoutMetrics;
       this.cachedWrapText = text;
       this.cachedWrapWidth = maxWidth;
       this.cachedWrapFontSize = fontSize;
+      this.cachedWrapFont = font;
     }
     return this.cachedWrappedLines;
   }
@@ -286,18 +299,29 @@ export class LabelWidget extends WidgetAbject {
       this.cachedRichLayout === null ||
       this.cachedRichText !== text ||
       this.cachedRichWidth !== maxWidth ||
-      this.cachedRichFontSize !== fontSize
+      this.cachedRichFontSize !== fontSize ||
+      this.cachedRichFontKey !== this.richFontKey() ||
+      this.cachedRichProvisional
     ) {
       const parsed = parseMarkdown(text);
       const measureFn = (t: string, font: string) => this.measureText(surfaceId, t, font);
+      this.measuredWithoutMetrics = false;
       this.cachedRichLayout = await layoutRichText(
         parsed, maxWidth, measureFn, this.theme, fontSize, fill, this.imageResolver.resolveDims,
       );
+      this.cachedRichProvisional = this.measuredWithoutMetrics;
       this.cachedRichText = text;
       this.cachedRichWidth = maxWidth;
       this.cachedRichFontSize = fontSize;
+      this.cachedRichFontKey = this.richFontKey();
     }
     return this.cachedRichLayout;
+  }
+
+  /** The font families a rich layout was measured with (changes with the theme). */
+  private richFontKey(): string {
+    const f = fontStacks(this.theme);
+    return `${f.body}|${f.display}|${f.mono}`;
   }
 
   /**
@@ -367,7 +391,7 @@ export class LabelWidget extends WidgetAbject {
     const w = this._renderRect.width;
     const h = this._renderRect.height;
     const style = this._renderStyle;
-    const font = buildFont(style);
+    const font = buildFont(style, this.theme);
     const radius = style.radius ?? this.theme.widgetRadius;
 
     if (style.background) {
@@ -503,7 +527,7 @@ export class LabelWidget extends WidgetAbject {
           commands.push({
             type: 'line',
             surfaceId,
-            params: { x1: lineX, y1: underY, x2: lineX + lineWidth, y2: underY, stroke: fill, lineWidth: 1 },
+            params: { x1: lineX, y1: underY, x2: lineX + lineWidth, y2: underY, stroke: fill, lineWidth: 2 },
           });
         }
       }
@@ -546,6 +570,14 @@ export class LabelWidget extends WidgetAbject {
         textX = ox;
       }
 
+      // Display-face labels (section headings) get poster tracking; the
+      // text itself stays exactly as supplied.
+      // Selectable labels keep default spacing so hit-testing stays exact.
+      const tracked = style.fontFamily === 'display' && !this.style.selectable && !isLink;
+      if (tracked) {
+        commands.push({ type: 'save', surfaceId, params: {} });
+        commands.push({ type: 'letterSpacing', surfaceId, params: { value: `${shapeOf(this.theme).titleTracking * 0.5}px` } });
+      }
       commands.push({
         type: 'text',
         surfaceId,
@@ -559,6 +591,7 @@ export class LabelWidget extends WidgetAbject {
           baseline: 'middle',
         },
       });
+      if (tracked) commands.push({ type: 'restore', surfaceId, params: {} });
 
       // Underline for link labels
       if (isLink && text.length > 0) {
@@ -570,7 +603,7 @@ export class LabelWidget extends WidgetAbject {
         commands.push({
           type: 'line',
           surfaceId,
-          params: { x1: lineX, y1: lineY, x2: lineX + textWidth, y2: lineY, stroke: fill, lineWidth: 1 },
+          params: { x1: lineX, y1: lineY, x2: lineX + textWidth, y2: lineY, stroke: fill, lineWidth: 2 },
         });
       }
     }

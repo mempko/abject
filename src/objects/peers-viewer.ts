@@ -4,6 +4,9 @@ import { invariant } from '../core/contracts.js';
 import { request } from '../core/message.js';
 import type { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import type { WorkspaceMemberInfo } from './workspace-share-registry.js';
+import {
+  sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle,
+} from './ui-kit.js';
 
 const PEERS_VIEWER_INTERFACE = 'abjects:peers-viewer' as InterfaceId;
 const EMPTY_RECT = { x: 0, y: 0, width: 0, height: 0 };
@@ -178,6 +181,7 @@ export class PeersViewer extends Abject {
     if (this.windowId) return true;
     await this.ensureDependencies();
     if (!this.widgetManagerId) return false;
+    await this.fetchTheme();
 
     await this.buildUi();
     await this.refresh();
@@ -497,7 +501,7 @@ export class PeersViewer extends Abject {
     const width = 760;
     const height = 500;
     this.windowId = await this.request<AbjectId>(request(this.id, manager, 'createWindowAbject', {
-      title: '👥 Peers',
+      title: 'Peers',
       rect: {
         x: Math.max(20, Math.floor((display.width - width) / 2)),
         y: Math.max(20, Math.floor((display.height - height) / 2)),
@@ -508,20 +512,20 @@ export class PeersViewer extends Abject {
     }));
     this.rootLayoutId = await this.request<AbjectId>(request(this.id, manager, 'createVBox', {
       windowId: this.windowId,
-      margins: { top: 6, right: 6, bottom: 6, left: 6 },
-      spacing: 6,
+      margins: { top: 12, right: 12, bottom: 12, left: 12 },
+      spacing: 8,
     }));
     this.detailPaneId = await this.request<AbjectId>(request(this.id, manager, 'createDetachedScrollableVBox', {
       windowId: this.windowId,
-      margins: { top: 6, right: 8, bottom: 6, left: 8 },
-      spacing: 5,
+      margins: { top: 12, right: 16, bottom: 12, left: 16 },
+      spacing: 8,
     }));
 
     const created = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, manager, 'create', {
       specs: [
         { type: 'button', windowId: this.windowId, rect: EMPTY_RECT, text: 'Refresh' },
         { type: 'list', windowId: this.windowId, rect: EMPTY_RECT, items: [] },
-        { type: 'label', windowId: this.windowId, rect: EMPTY_RECT, text: '' },
+        { type: 'label', windowId: this.windowId, rect: EMPTY_RECT, text: '', style: { color: this.theme.textMeta, fontSize: 11 } },
         {
           type: 'splitPane',
           windowId: this.windowId,
@@ -549,13 +553,16 @@ export class PeersViewer extends Abject {
 
   private async rebuildPeerList(): Promise<void> {
     if (!this.peerListId) return;
-    const items: Array<{ label: string; value: string }> = this.peers.map(peer => {
-      const status = peer.connected ? '●' : '○';
-      return {
-        label: `${status} ${this.peerLabel(peer)} — ${peer.role} • ${peer.activity}`,
-        value: peer.peerId,
-      };
-    });
+    // Connection state rides a badge: phosphor while live, muted when offline.
+    const liveColor = livingStyle(this.theme).color as string;
+    const items: Array<{ label: string; value: string; detail?: string; badge?: { text: string; color: string } }> = this.peers.map(peer => ({
+      label: this.peerLabel(peer),
+      value: peer.peerId,
+      detail: `${peer.role}  /  ${peer.activity}`,
+      badge: peer.connected
+        ? { text: 'live', color: liveColor }
+        : { text: 'offline', color: this.theme.textMeta },
+    }));
     if (items.length === 0) {
       let label: string;
       if (this.peerLoadState === 'loading') label = 'Loading peers…';
@@ -594,27 +601,36 @@ export class PeersViewer extends Abject {
     if (generation !== this.detailRebuildGeneration) return;
 
     const peer = this.selectedPeer();
-    const lines: Array<{ text: string; heading?: boolean }> = [];
+    // heading: kit section header; empty: kit empty-state markdown; live: phosphor status.
+    const lines: Array<{ text: string; heading?: boolean; empty?: boolean; live?: boolean }> = [];
     let catalogItems: Array<{ label: string; value: string; secondary?: string }> = [];
     if (this.peerLoadState === 'loading') {
       lines.push({ text: 'Loading peers and workspace details…', heading: true });
     } else if (this.peerLoadState === 'error') {
-      lines.push({ text: 'Peer data unavailable', heading: true });
-      lines.push({ text: this.peerLoadError || 'The peer list could not be loaded. Try Refresh.' });
+      lines.push({
+        text: emptyStateMarkdown('Peer data unavailable', this.peerLoadError || 'The peer list could not be loaded. Press Refresh to try again.'),
+        empty: true,
+      });
     } else if (this.peerLoadState === 'no-shared-workspace') {
-      lines.push({ text: 'Peers unavailable for local workspaces', heading: true });
-      lines.push({ text: 'Change this workspace to Shared or Public to see peer presence.' });
+      lines.push({
+        text: emptyStateMarkdown('This workspace is local', 'Change this workspace to Shared or Public to see who else is here.'),
+        empty: true,
+      });
     } else if (!peer) {
       if (this.effectiveAccessMode() === 'public') {
-        lines.push({ text: 'No connected peers', heading: true });
-        lines.push({ text: 'Connected peers will appear here as browsing or interacting with this public workspace.' });
+        lines.push({
+          text: emptyStateMarkdown('No connected peers', 'Peers browsing or interacting with this public workspace appear here while they are connected.'),
+          empty: true,
+        });
       } else {
-        lines.push({ text: 'No invited peers', heading: true });
-        lines.push({ text: 'Peers invited to this shared workspace will appear here, including when offline.' });
+        lines.push({
+          text: emptyStateMarkdown('No invited peers', 'Invite peers to this shared workspace; they appear here, including when offline.'),
+          empty: true,
+        });
       }
     } else {
       lines.push({ text: this.peerLabel(peer), heading: true });
-      lines.push({ text: `Status: ${peer.connected ? 'Connected' : 'Disconnected'}` });
+      lines.push({ text: `Status: ${peer.connected ? 'Connected' : 'Disconnected'}`, live: peer.connected });
       lines.push({ text: `Role: ${peer.role}` });
       lines.push({ text: `Workspace activity: ${peer.activity}` });
       if (peer.joinedAt) lines.push({ text: `Joined workspace: ${new Date(peer.joinedAt).toLocaleString()}` });
@@ -655,11 +671,16 @@ export class PeersViewer extends Abject {
       type: 'label',
       windowId: this.windowId,
       rect: EMPTY_RECT,
-      text: line.text,
+      text: line.heading ? sectionHeaderText(this.theme, line.text) : line.text,
       style: line.heading
-        ? { fontSize: 13, fontWeight: 'bold', color: '#e8eef7', wordWrap: true, selectable: true }
-        : { fontSize: 11, color: '#bac4d3', wordWrap: true, selectable: true },
+        ? { ...sectionHeaderStyle(this.theme), wordWrap: true, selectable: true }
+        : line.empty
+          ? emptyStateStyle(this.theme)
+          : line.live
+            ? { ...livingStyle(this.theme), wordWrap: true, selectable: true }
+            : { ...hintStyle(this.theme), selectable: true },
     }));
+    const emptyLineIndices = new Set(lines.flatMap((line, index) => line.empty ? [index] : []));
     const specs: Array<Record<string, unknown>> = [...labelSpecs];
     const catalogListIndex = catalogItems.length > 0 ? specs.length : -1;
     if (catalogItems.length > 0) {
@@ -684,18 +705,18 @@ export class PeersViewer extends Abject {
           {
             type: 'label', windowId: this.windowId, rect: EMPTY_RECT,
             text: selectedName,
-            style: { fontSize: 12, fontWeight: 'bold', color: '#e8eef7', wordWrap: true, selectable: true },
+            style: { fontSize: 12, fontWeight: 'bold', color: this.theme.textPrimary, wordWrap: true, selectable: true },
           },
           {
             type: 'label', windowId: this.windowId, rect: EMPTY_RECT,
             text: selectedDescription,
-            style: { fontSize: 11, color: '#bac4d3', wordWrap: true, selectable: true },
+            style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true, selectable: true },
           },
         );
         specs.push({
           type: 'label', windowId: this.windowId, rect: EMPTY_RECT,
           text: `Abject ID: ${selectedId}`,
-          style: { fontSize: 10, color: '#8995a7', wordWrap: true, selectable: true },
+          style: { fontSize: 10, color: this.theme.textTertiary, wordWrap: true, selectable: true },
         });
       }
     }
@@ -721,7 +742,7 @@ export class PeersViewer extends Abject {
         : {
             widgetId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-            preferredSize: { height: index > catalogListIndex && catalogListIndex >= 0 ? 44 : 20 },
+            preferredSize: { height: emptyLineIndices.has(index) ? 72 : index > catalogListIndex && catalogListIndex >= 0 ? 44 : 20 },
           }),
     }));
   }
@@ -740,8 +761,8 @@ export class PeersViewer extends Abject {
           ? 'Active workspace is local-only.'
           : this.workspace
             ? this.effectiveAccessMode() === 'public'
-              ? `${this.workspaceLabel()} • Public • ${this.peers.filter(peer => peer.connected).length} connected • ${this.peers.filter(peer => peer.activity === 'Interacting').length} interacting`
-              : `${this.workspaceLabel()} • Shared • ${this.peers.length} invited • ${this.peers.filter(peer => peer.connected).length} connected`
+              ? `${this.workspaceLabel()}  /  Public  /  ${this.peers.filter(peer => peer.connected).length} connected  /  ${this.peers.filter(peer => peer.activity === 'Interacting').length} interacting`
+              : `${this.workspaceLabel()}  /  Shared  /  ${this.peers.length} invited  /  ${this.peers.filter(peer => peer.connected).length} connected`
             : 'No active workspace.';
     await this.request(request(this.id, this.statusLabelId, 'update', { text }));
   }

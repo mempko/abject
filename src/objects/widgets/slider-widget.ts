@@ -1,13 +1,14 @@
 /**
  * SliderWidget — a numeric range slider.
  *
- * Renders a horizontal track with a circular thumb. The active portion
+ * Renders a horizontal track with a square thumb. The active portion
  * is filled with accent color. Fires a 'change' notification with the
  * numeric value as a string.
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, gradientRect } from './widget-types.js';
+import { inkFrame } from './widget-types.js';
+import { shapeOf } from '../../core/theme-data.js';
 
 export interface SliderWidgetConfig extends WidgetConfig {
   min?: number;
@@ -17,7 +18,6 @@ export interface SliderWidgetConfig extends WidgetConfig {
 }
 
 const THUMB_RADIUS = 8;
-const TRACK_HEIGHT = 6;
 
 export class SliderWidget extends WidgetAbject {
   private min: number;
@@ -34,117 +34,67 @@ export class SliderWidget extends WidgetAbject {
     this.sliderValue = Math.max(this.min, Math.min(this.max, config.value ?? this.min));
   }
 
+  /**
+   * A thick flat track, a solid ink fill, and a red
+   * square thumb with an ink frame. Grab or focus inverts the thumb (ink
+   * face, red frame).
+   */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
-    const font = buildFont(this.style);
-
-    const trackY = oy + h / 2 - TRACK_HEIGHT / 2;
-    const trackRadius = TRACK_HEIGHT / 2;
+    const theme = this.theme;
+    const shape = shapeOf(theme);
+    const font = buildFont(this.style, theme);
+    const trackH = 8;
+    const cy = oy + h / 2;
+    const trackY = Math.round(cy - trackH / 2);
     const fraction = this.max > this.min ? (this.sliderValue - this.min) / (this.max - this.min) : 0;
     const thumbX = ox + THUMB_RADIUS + fraction * (w - THUMB_RADIUS * 2);
 
-    // Reduce opacity when disabled
     if (this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
     }
 
-    // Focus ring glow
-    if (this.focused && !this.disabled) {
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 6 },
-      });
-      commands.push({
-        type: 'circle',
-        surfaceId,
-        params: { cx: thumbX, cy: oy + h / 2, radius: THUMB_RADIUS + 2, fill: 'transparent', stroke: this.theme.inputBorderFocus },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
-    }
-
-    // Track background (full width)
     commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox, y: trackY, width: w, height: TRACK_HEIGHT,
-        fill: this.style.background ?? this.theme.sliderTrack,
-        radius: trackRadius,
-      },
+      type: 'rect', surfaceId,
+      params: { x: ox, y: trackY, width: w, height: trackH, fill: this.style.background ?? theme.sliderTrack },
     });
-
-    // Active fill (from left to thumb) — brightens toward the thumb so the
-    // filled portion reads as "charged".
     if (fraction > 0) {
-      const fillWidth = Math.max(trackRadius * 2, (w - THUMB_RADIUS * 2) * fraction + THUMB_RADIUS);
-      const fillColor = this.style.color ?? this.theme.sliderFill;
-      const g = this.theme.tokens.surface.gradient;
-      commands.push(...gradientRect(surfaceId, {
-        x: ox, y: trackY, width: fillWidth, height: TRACK_HEIGHT, radii: trackRadius,
-        gradient: { x0: ox, y0: 0, x1: ox + fillWidth, y1: 0, stops: [
-          { offset: 0, color: fillColor },
-          { offset: 1, color: lightenColor(fillColor, 20 * g) },
-        ] },
-      }));
-    }
-
-    // Thumb — radial gradient with an off-center highlight gives it a
-    // dimensional, tactile feel; a soft glow while dragging confirms the grab.
-    const thumbCy = oy + h / 2;
-    const thumbColor = this.theme.sliderThumb;
-    commands.push({ type: 'save', surfaceId, params: {} });
-    if (this.dragging && !this.disabled) {
       commands.push({
-        type: 'shadow',
-        surfaceId,
-        params: { color: this.theme.inputBorderFocus, blur: 10 },
+        type: 'rect', surfaceId,
+        params: { x: ox, y: trackY, width: Math.max(0, thumbX - ox), height: trackH, fill: this.style.color ?? theme.sliderFill },
       });
     }
-    commands.push({
-      type: 'fillStyle',
-      surfaceId,
-      params: { value: {
-        cx0: thumbX - THUMB_RADIUS * 0.35, cy0: thumbCy - THUMB_RADIUS * 0.4, r0: THUMB_RADIUS * 0.15,
-        cx1: thumbX, cy1: thumbCy, r1: THUMB_RADIUS,
-        stops: [
-          { offset: 0, color: lightenColor(thumbColor, 35 * this.theme.tokens.surface.gradient) },
-          { offset: 1, color: thumbColor },
-        ],
-      } },
-    });
-    commands.push({ type: 'beginPath', surfaceId, params: {} });
-    commands.push({ type: 'circle', surfaceId, params: { cx: thumbX, cy: thumbCy, radius: THUMB_RADIUS } });
-    commands.push({ type: 'fill', surfaceId, params: {} });
-    commands.push({ type: 'stroke', surfaceId, params: { strokeStyle: this.theme.sliderThumbBorder, lineWidth: 2 } });
-    commands.push({ type: 'restore', surfaceId, params: {} });
 
-    // Value text to the right (if there's room and label text is present)
+    const size = THUMB_RADIUS * 2;
+    const thumb = { x: Math.round(thumbX - THUMB_RADIUS), y: Math.round(cy - THUMB_RADIUS), width: size, height: size };
+    const engaged = (this.dragging || this.focused) && !this.disabled;
+    commands.push({
+      type: 'rect', surfaceId,
+      params: { ...thumb, fill: engaged ? theme.textPrimary : theme.sliderThumb },
+    });
+    commands.push(...inkFrame(
+      surfaceId, thumb,
+      engaged ? shape.blockFocusColor : theme.sliderThumbBorder,
+      shape.ruleWidth,
+    ));
+
     if (this.text) {
       commands.push({
-        type: 'text',
-        surfaceId,
+        type: 'text', surfaceId,
         params: {
-          x: ox + w / 2,
-          y: oy + h / 2 + THUMB_RADIUS + 8,
+          x: ox + w / 2, y: cy + THUMB_RADIUS + 8,
           text: `${this.text}: ${this.sliderValue}`,
-          font,
-          fill: this.theme.textSecondary,
-          align: 'center',
-          baseline: 'top',
+          font, fill: theme.textSecondary, align: 'center', baseline: 'top',
         },
       });
     }
 
-    // Close disabled alpha save
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
-
     return commands;
   }
 
