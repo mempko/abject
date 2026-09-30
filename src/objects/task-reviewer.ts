@@ -110,6 +110,8 @@ interface ReviewTaskExtra {
   completionCorrectionSent?: boolean;
   cancelled?: boolean;
   completionIssues?: string[];
+  /** Set once the goal's summary-fidelity verdict is on record. */
+  summaryFidelityRecorded?: boolean;
   assessments?: Record<string, { verdict: string; explanation?: string }>;
   applicationAssessments?: Record<string, string>;
   lastResult?: string;
@@ -612,6 +614,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!extra.goalId || !this.goalManagerId) return;
     try {
       await this.request(request(this.id, this.goalManagerId, 'writeGoalData', { goalId: extra.goalId, key: 'learning/summary-fidelity', value: fidelity }), 10000);
+      extra.summaryFidelityRecorded = true;
     } catch (err) {
       extra.completionIssues?.push(`Summary fidelity not recorded: ${String(err)}`);
     }
@@ -674,12 +677,24 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     await this.recordSummaryFidelity(extra, batch.summaryFidelity);
     const missing = (extra.records ?? []).flatMap(r => (r.predictions ?? [])
       .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
-    if (!extra.cancelled && extra.kind === 'review' && missing.length && !extra.completionIssues.length && !extra.completionCorrectionSent) {
+    // A goal review owes a verdict on the user-facing summary. Missing, it is
+    // asked for in the one correction; still missing after that, the report
+    // says so instead of recording nothing.
+    const fidelityMissing = extra.kind === 'review' && !!extra.goalId && !extra.summaryFidelityRecorded && batch.summaryFidelity === undefined;
+    if (!extra.cancelled && extra.kind === 'review' && (missing.length || fidelityMissing) && !extra.completionIssues.length && !extra.completionCorrectionSent) {
       extra.completionCorrectionSent = true;
-      const budget = Math.max(0, Math.floor(12000 / missing.length) - 160);
-      const gaps = missing.map(({ taskId, p }) => `${taskId} step ${p.step}: expected=${p.expect.slice(0, budget / 2)}; actual=${String(p.actual ?? '').slice(0, budget / 2)}`).join('\n');
-      return { accepted: false, reason: `${missing.length} predictions still lack semantic assessments:\n${gaps}\nIn your next done action, include only missing assessments in result: {assessments:[{taskId,step,verdict,explanation}]}. Compare expected and actual evidence; successful operation status does not establish the prediction. Use read_evidence with taskId and step for full observations, or unresolved with a specific evidence gap. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason. This correction is requested once; remaining gaps settle as partial.` };
+      const parts: string[] = [];
+      if (missing.length) {
+        const budget = Math.max(0, Math.floor(12000 / missing.length) - 160);
+        const gaps = missing.map(({ taskId, p }) => `${taskId} step ${p.step}: expected=${p.expect.slice(0, budget / 2)}; actual=${String(p.actual ?? '').slice(0, budget / 2)}`).join('\n');
+        parts.push(`${missing.length} predictions still lack semantic assessments:\n${gaps}\nIn your next done action, include only missing assessments in result: {assessments:[{taskId,step,verdict,explanation}]}. Compare expected and actual evidence; successful operation status does not establish the prediction. Use read_evidence with taskId and step for full observations, or unresolved with a specific evidence gap. No new reusable lesson is required. If the material cannot be assessed, include unresolvedReason.`);
+      }
+      if (fidelityMissing) {
+        parts.push('The result has no summaryFidelity verdict. Include summaryFidelity: { verdict: "consistent" | "misreported" | "unverifiable", explanation } in your next done result, comparing the user-facing result with the newest verification record.');
+      }
+      return { accepted: false, reason: `${parts.join('\n\n')}\nThis correction is requested once; remaining gaps settle as partial.` };
     }
+    if (fidelityMissing && !extra.cancelled) extra.completionIssues.push('No summaryFidelity verdict was given for the user-facing summary.');
     const report = this.learningReport(extra, extra.cancelled);
     return { accepted: true, result: report, evidence: report };
   }
