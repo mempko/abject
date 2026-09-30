@@ -7,7 +7,7 @@
  */
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
-import { request } from '../../core/message.js';
+import { request, event } from '../../core/message.js';
 import { Rect, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
@@ -25,6 +25,8 @@ export class ScrollableVBoxLayout extends VBoxLayout {
   private scrollbarDragging = false;
   /** Offset from the thumb top to the grab point, kept constant during a drag. */
   private scrollbarDragOffset = 0;
+  /** Children drawn in the last pass; one that scrolls out hears viewportCulled once. */
+  private drawnChildren = new Set<AbjectId>();
 
   constructor(config: ScrollableVBoxConfig) {
     super(config);
@@ -251,6 +253,16 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     for (const childCmds of expandedResults) {
       if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
+
+    // Children that drew last pass and were culled this pass get one notice,
+    // so anything they keep in the window's scene (a busy light) leaves too.
+    const drawn = new Set<AbjectId>(expandedChildList.map((c) => c.widgetId));
+    normalChildren.forEach((c, i) => { if (normalResults[i] !== null) drawn.add(c.widgetId); });
+    for (const id of this.drawnChildren) {
+      if (drawn.has(id) || !childRects.some((c) => c.widgetId === id)) continue;
+      try { this.send(event(this.id, id, 'viewportCulled', {})); } catch { /* child gone */ }
+    }
+    this.drawnChildren = drawn;
 
     // Draw scrollbar if content overflows
     const sb = this.scrollbarMetrics();

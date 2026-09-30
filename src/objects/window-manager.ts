@@ -278,7 +278,7 @@ export class WindowManager extends Abject {
     });
 
     // Close the window owning a surface — replays the title-bar close path.
-    // Used by the mobile card overview (flick-up-to-close).
+    // Used by the phone's Exposé view (flick-up-to-close).
     this.on('closeWindow', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId: string };
       const info = this.windows.get(surfaceId);

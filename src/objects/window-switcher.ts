@@ -26,6 +26,9 @@ interface OpenWindowEntry {
 const SWITCHER_WIDTH = 480;
 const SWITCHER_HEIGHT = 360;
 
+/** List value of the closing "Show all" row: it opens Exposé instead of one window. */
+const SHOW_ALL_VALUE = 'switcher:show-all';
+
 export class WindowSwitcherAbject extends Abject {
   private widgetManagerId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -42,7 +45,7 @@ export class WindowSwitcherAbject extends Abject {
     super({
       manifest: {
         name: 'WindowSwitcher',
-        description: 'Quick switcher for open windows. Sorted by recency (z-index). Bound to Ctrl+`/⌘+`.',
+        description: 'Quick switcher for open windows. Sorted by recency (z-index), with a closing "Show all" row that opens Exposé. Bound to Ctrl+`/⌘+`.',
         version: '1.0.0',
         interface: {
           id: WINDOW_SWITCHER_INTERFACE,
@@ -86,6 +89,10 @@ export class WindowSwitcherAbject extends Abject {
         const sel = parseSelection(value);
         if (!sel || !sel.value) return;
         if (aspect === 'selectionChanged' && sel.via !== 'click') return;
+        if (sel.value === SHOW_ALL_VALUE) {
+          await this.showAll();
+          return;
+        }
         const entry = this.entries.find((e) => e.surfaceId === sel.value);
         if (entry) await this.activateWindow(entry);
       }
@@ -146,13 +153,13 @@ export class WindowSwitcherAbject extends Abject {
           {
             type: 'label',
             windowId: this.windowId,
-            text: `${this.entries.length} open · ↑↓ to navigate · Enter to focus · Esc to cancel`,
+            text: `${this.entries.length} open · ↑↓ to navigate · Enter to focus · Esc to cancel · F3 shows all`,
             style: { ...hintStyle(this.theme, 11), wordWrap: false },
           },
           {
             type: 'list',
             windowId: this.windowId,
-            items: this.entries.map(toSwitcherItem),
+            items: [...this.entries.map(toSwitcherItem), SHOW_ALL_ITEM],
             selectedIndex: 0,
             itemHeight: 30,
           },
@@ -208,6 +215,15 @@ export class WindowSwitcherAbject extends Abject {
     try {
       await this.setWindowModal(windowId, modal);
     } catch { /* window gone; closing it clears the flag anyway */ }
+  }
+
+  /** "Show all": step aside, then spread every window in Exposé on the user's screen. */
+  private async showAll(): Promise<void> {
+    await this.closeSwitcher();
+    if (!this.widgetManagerId) return;
+    try {
+      await this.request(request(this.id, this.widgetManagerId, 'showExpose', {}));
+    } catch { /* no client to show it on */ }
   }
 
   private async activateWindow(entry: OpenWindowEntry): Promise<void> {
@@ -276,6 +292,9 @@ function toSwitcherItem(e: OpenWindowEntry): { label: string; value: string; sec
     value: e.surfaceId,
   };
 }
+
+/** The closing row: every window at once (Exposé). */
+const SHOW_ALL_ITEM = { label: 'Show all windows', value: SHOW_ALL_VALUE, secondary: 'Exposé \u00B7 F3 or Ctrl+\u2191' };
 
 function parseSelection(raw: unknown): { index: number; value: string; label: string; via?: 'click' } | null {
   if (typeof raw !== 'string') return null;

@@ -177,7 +177,9 @@ export class ListWidget extends WidgetAbject {
   }
 
   private ensureSelectedVisible(): void {
-    if (this.selectedIndex < 0) return;
+    // An unsized list (items set before its layout placed it) has nothing to
+    // scroll yet; scrolling now would leave the rows scrolled out of view.
+    if (this.selectedIndex < 0 || this.listHeight <= 0) return;
     this.ensureLayout();
     const itemTop = this._rowTops[this.selectedIndex] ?? 0;
     const itemBottom = this._rowTops[this.selectedIndex + 1] ?? itemTop;

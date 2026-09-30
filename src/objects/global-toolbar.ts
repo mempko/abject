@@ -7,11 +7,11 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { event, request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { dockStyles, type DockLauncher } from './dock-style.js';
+import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
 
 const log = new Log('GlobalToolbar');
 
@@ -52,6 +52,21 @@ export class GlobalToolbar extends Abject {
   // Cached lookup for the active workspace's NotificationCenter. Refreshed
   // on every click in case the workspace switched.
   private workspaceManagerId?: AbjectId;
+
+  /** The LLM object, whose call lifecycle lights The Eye's row. */
+  private llmId?: AbjectId;
+  /** Model calls in flight (ids from requestStarted, cleared on completed/error). */
+  private activeCalls = new Set<string>();
+  /** While lit, a slow check that drops calls whose end we never heard. */
+  private reconcileTimer?: ReturnType<typeof setInterval>;
+  /**
+   * The Eye's light: on while any model call is in flight. The off side is
+   * debounced, so an agent's back-to-back calls read as one steady light.
+   */
+  private eyeLight = new ActivityLatch(
+    (busy) => this.onEyeLight(busy),
+    { set: (fn, ms) => this.setTimer(fn, ms), cancel: (h) => this.cancelTimer(h) },
+  );
 
   constructor() {
     super({
@@ -128,6 +143,48 @@ LLMMonitor (The Eye).
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
+    await this.watchModelCalls();
+  }
+
+  /**
+   * Subscribe to the LLM object's call lifecycle (requestStarted /
+   * requestCompleted / requestError) and seed the in-flight set from its
+   * ledger, so The Eye's row lights while a model call is running. Retried
+   * from show() when the LLM object registered after us.
+   */
+  private async watchModelCalls(): Promise<void> {
+    if (this.llmId) return;
+    const id = await this.discoverDep('LLM') ?? undefined;
+    if (!id) return;
+    this.llmId = id;
+    this.send(request(this.id, id, 'addDependent', {}));
+    await this.reconcileCalls();
+  }
+
+  /** Replace the in-flight set with the LLM ledger's active calls. */
+  private async reconcileCalls(): Promise<void> {
+    if (!this.llmId) return;
+    try {
+      const res = await this.request<{ entries?: Array<{ id?: string }> }>(
+        request(this.id, this.llmId, 'getLedger', { status: 'active', limit: 500 }), 5000,
+      );
+      this.activeCalls = new Set((res?.entries ?? []).map((e) => e?.id).filter((x): x is string => typeof x === 'string'));
+    } catch { return; /* LLM busy or gone: the next lifecycle event catches us up */ }
+    this.eyeLight.set(this.activeCalls.size > 0);
+  }
+
+  private onEyeLight(busy: boolean): void {
+    this.setRowBusy(this.llmMonitorBtnId, busy);
+    this.cancelTimer(this.reconcileTimer);
+    this.reconcileTimer = busy ? this.setRecurringTimer(() => this.reconcileCalls(), 30_000) : undefined;
+  }
+
+  /** Turn a dock row's busy light on or off (one event; the row repaints once). */
+  private setRowBusy(btnId: AbjectId | undefined, busy: boolean): void {
+    if (!btnId) return;
+    try {
+      this.send(event(this.id, btnId, 'update', { busy }));
+    } catch { /* widget gone */ }
   }
 
   private setupHandlers(): void {
@@ -155,7 +212,17 @@ LLMMonitor (The Eye).
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      if (msg.routing.from === this.llmId
+        && (aspect === 'requestStarted' || aspect === 'requestCompleted' || aspect === 'requestError')) {
+        const callId = (value as { id?: string } | undefined)?.id;
+        if (callId) {
+          if (aspect === 'requestStarted') this.activeCalls.add(callId);
+          else this.activeCalls.delete(callId);
+        }
+        this.eyeLight.set(this.activeCalls.size > 0);
+        return;
+      }
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
@@ -392,6 +459,10 @@ LLMMonitor (The Eye).
     for (const btnId of widgetIds) {
       this.send(request(this.id, btnId, 'addDependent', {}));
     }
+
+    // Fresh rows are born idle: light The Eye if a model call is running.
+    if (!this.llmId) void this.watchModelCalls();
+    if (this.eyeLight.busy) this.setRowBusy(this.llmMonitorBtnId, true);
 
     return true;
     } finally {

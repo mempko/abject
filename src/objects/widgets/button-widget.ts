@@ -5,10 +5,11 @@
  * Consumes mousedown events and fires a 'click' change notification.
  */
 
-import { AbjectId } from '../../core/types.js';
-import { request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { darkenColor, fontStacks, raisedBlock } from './widget-types.js';
+import {
+  TOOLTIP_NODE_ID, TOOLTIP_DELAY_MS, TOOLTIP_AUTO_HIDE_MS, showTooltip, type PopoutSurface,
+} from './popout.js';
 import { shapeOf } from '../../core/theme-data.js';
 import { iconCommands, isIconName } from '../../ui/icons.js';
 
@@ -16,9 +17,16 @@ export class ButtonWidget extends WidgetAbject {
   private hovered = false;
   private pressed = false;
 
-  // Tooltip service plumbing (only used when style.tooltip is set)
-  private tooltipManagerId?: AbjectId;
-  private tooltipActive = false;
+  // style.tooltip: a pop-out beside the button (popout.ts) after a hover
+  // dwell, so it may cross the window edge. One per window: every tooltip
+  // in a window shares TOOLTIP_NODE_ID.
+  private tip?: PopoutSurface;
+  private tipTimer?: ReturnType<typeof setTimeout>;
+  private tipHideTimer?: ReturnType<typeof setTimeout>;
+  /** Pointer in workspace px while hovered (globalX/globalY). */
+  private tipPointer?: { x: number; y: number };
+  /** Where the button last drew, in window px. */
+  private drawnAt?: { x: number; y: number };
 
   constructor(config: WidgetConfig) {
     super(config);
@@ -32,6 +40,7 @@ export class ButtonWidget extends WidgetAbject {
    * block at the left edge when active (borderColor set).
    */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    this.drawnAt = { x: ox, y: oy };
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
@@ -189,7 +198,7 @@ export class ButtonWidget extends WidgetAbject {
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     if (input.type === 'mousedown') {
       this.pressed = true;
-      this.cancelTooltip();
+      this.hideTooltip();
       // Click fires immediately so call sites don't need to wait for mouseup;
       // the visible press animation runs in parallel and is cleared on
       // mouseup or mouseleave below.
@@ -205,9 +214,12 @@ export class ButtonWidget extends WidgetAbject {
       return { consumed: true };
     }
     if (input.type === 'mousemove') {
+      const gx = input.globalX as number | undefined;
+      const gy = input.globalY as number | undefined;
+      if (gx !== undefined && gy !== undefined) this.tipPointer = { x: gx, y: gy };
       if (!this.hovered) {
         this.hovered = true;
-        this.requestTooltip(input);
+        this.scheduleTooltip();
         await this.requestRedraw();
       }
       return { consumed: true };
@@ -216,7 +228,7 @@ export class ButtonWidget extends WidgetAbject {
       const wasInteracting = this.hovered || this.pressed;
       this.hovered = false;
       this.pressed = false;
-      this.cancelTooltip();
+      this.hideTooltip();
       if (wasInteracting) await this.requestRedraw();
       return { consumed: true };
     }
@@ -230,41 +242,54 @@ export class ButtonWidget extends WidgetAbject {
     return { consumed: false };
   }
 
-  /**
-   * Ask the WidgetManager tooltip service to show style.tooltip after a
-   * dwell, anchored just right of this button. The widget's screen origin is
-   * recovered from the event's global coordinates minus its local ones (the
-   * dispatch chain re-localizes x/y at every layer but passes globalX/globalY
-   * through untouched).
-   */
-  private requestTooltip(input: Record<string, unknown>): void {
-    const text = this.style.tooltip;
-    if (!text || this.disabled) return;
-    const globalX = input.globalX as number | undefined;
-    const globalY = input.globalY as number | undefined;
-    if (globalX === undefined || globalY === undefined) return;
-    const localX = (input.x as number | undefined) ?? 0;
-    const localY = (input.y as number | undefined) ?? 0;
-    const anchorX = globalX - localX + this.rect.width + 8;
-    const anchorY = globalY - localY + this.rect.height / 2;
-    this.tooltipActive = true;
-    void (async () => {
-      if (!this.tooltipManagerId) {
-        this.tooltipManagerId = await this.discoverDep('WidgetManager') ?? undefined;
-      }
-      // Re-check: the hover may have ended while we were discovering.
-      if (this.tooltipManagerId && this.tooltipActive) {
-        this.send(request(this.id, this.tooltipManagerId, 'requestTooltip', { text, x: anchorX, y: anchorY }));
-      }
-    })();
+  /** Show style.tooltip after a hover dwell. */
+  private scheduleTooltip(): void {
+    if (!this.style.tooltip || this.disabled) return;
+    this.cancelTimer(this.tipTimer);
+    this.tipTimer = this.setTimer(() => this.showTooltipNow(), TOOLTIP_DELAY_MS);
   }
 
-  private cancelTooltip(): void {
-    if (!this.tooltipActive) return;
-    this.tooltipActive = false;
-    if (this.tooltipManagerId) {
-      this.send(request(this.id, this.tooltipManagerId, 'cancelTooltip', {}));
+  /**
+   * The tooltip as a pop-out beside the button (below the pointer on a wide
+   * button), flipping to the side of the screen with room; it leaves on
+   * mouseleave, on press, or by itself after TOOLTIP_AUTO_HIDE_MS.
+   */
+  private async showTooltipNow(): Promise<void> {
+    this.tipTimer = undefined;
+    const text = this.style.tooltip;
+    const at = this.drawnAt;
+    if (!text || !at || !this.hovered || this.disabled) return;
+    const tip = this.tip ??= this.createPopout(TOOLTIP_NODE_ID, { interactive: false });
+    try {
+      await showTooltip(tip, {
+        text,
+        anchor: { x: at.x, y: at.y, width: this.rect.width, height: this.rect.height },
+        pointer: this.tipPointer,
+        theme: this.theme,
+        measure: (t, font) => this.measureText('', t, font),
+      });
+    } catch {
+      return; // no window to hang it on
     }
+    if (!this.hovered) {
+      void tip.hide();
+      return;
+    }
+    this.cancelTimer(this.tipHideTimer);
+    this.tipHideTimer = this.setTimer(() => this.hideTooltip(), TOOLTIP_AUTO_HIDE_MS);
+  }
+
+  private hideTooltip(): void {
+    this.cancelTimer(this.tipTimer);
+    this.tipTimer = undefined;
+    this.cancelTimer(this.tipHideTimer);
+    this.tipHideTimer = undefined;
+    if (this.tip?.isOpen) void this.tip.hide();
+  }
+
+  protected override async onStop(): Promise<void> {
+    this.hideTooltip();
+    await super.onStop();
   }
 
   protected override suppressGenericFocusRing(): boolean {

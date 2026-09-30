@@ -20,6 +20,7 @@ import {
   parseAbjectUrl,
   imageMimeForPath,
 } from './markdown-image-resolver.js';
+import { PopoutSurface, windowChannel, type PopoutOptions } from './popout.js';
 import {
   Rect,
   WidgetStyle,
@@ -33,7 +34,22 @@ import {
   inkFrame,
 } from './widget-types.js';
 import { shapeOf } from '../../core/theme-data.js';
-import { Tween, pulse as motionPulse } from '../../ui/motion.js';
+import { require as contractRequire, invariant } from '../../core/contracts.js';
+import { busyFrameOps, isDarkGround, moveBusyFrameOps, removeSceneGroupOps, type SceneOp } from '../ui-kit.js';
+
+/**
+ * A retained 3D decoration a widget hangs on its window around the rect it
+ * draws at (window px from the top-left corner). WidgetAbject adds it when
+ * the widget draws, moves it when the drawn rect moves, rebuilds it when the
+ * size changes, and removes it when the widget is culled, hidden, stops
+ * wanting it, or dies. All motion in it is client-side.
+ */
+export interface WidgetSceneDecoration {
+  /** Root node id; unique per widget (prefix it with the widget id). */
+  id: string;
+  /** Add/animate ops for a rect-centred root group around `rect`. */
+  build(rect: Rect): SceneOp[];
+}
 
 /**
  * Per-process font-metrics cache for local text measurement. One fetch from
@@ -104,24 +120,48 @@ const THEME_REMAP_KEYS: Array<keyof ThemeData> = [
   'statusSuccess', 'statusError', 'statusErrorBright', 'statusWarning', 'statusNeutral', 'statusInfo',
 ];
 
-function remapColor(color: string | undefined, oldT: ThemeData, newT: ThemeData): string | undefined {
+/** The WidgetStyle fields that carry theme colours. */
+type StyleColorField = 'background' | 'color' | 'borderColor';
+const STYLE_COLOR_FIELDS: StyleColorField[] = ['background', 'color', 'borderColor'];
+
+/**
+ * Which tokens a field most likely came from, tried first when a colour
+ * matches several tokens. Palettes share values (Agitprop's ink is its
+ * textPrimary, its accentSecondary and every border), so a bare value
+ * match is ambiguous: text reaches for text tokens, fills for surface
+ * tokens (then text, for inverted headers), borders for border tokens.
+ */
+const FIELD_TOKEN_PRIORITY: Record<StyleColorField, Array<keyof ThemeData>> = {
+  color: ['textPrimary', 'buttonText', 'textSecondary', 'textTertiary', 'actionText', 'destructiveText', 'textHeading', 'textDescription', 'textMeta', 'sectionLabel', 'linkColor'],
+  background: ['windowBg', 'titleBarBg', 'buttonBg', 'inputBg', 'selectBg', 'selectHover', 'activeItemBg', 'destructiveBg', 'progressTrack', 'sliderTrack', 'actionBg', 'textPrimary'],
+  borderColor: ['windowBorder', 'inputBorder', 'buttonBorder', 'divider', 'activeItemBorder', 'inputBorderFocus', 'actionBorder', 'destructiveBorder'],
+};
+
+/**
+ * The theme token a style colour was resolved from, or null for a literal
+ * colour (never remapped). Field priority breaks ties between tokens that
+ * share a value.
+ */
+function tokenForColor(color: string, theme: ThemeData, field: StyleColorField): keyof ThemeData | null {
+  for (const k of FIELD_TOKEN_PRIORITY[field]) if (theme[k] === color) return k;
+  for (const k of THEME_REMAP_KEYS) if (theme[k] === color) return k;
+  return null;
+}
+
+function remapColor(color: string | undefined, oldT: ThemeData, newT: ThemeData, field: StyleColorField): string | undefined {
   if (!color) return color;
-  for (const k of THEME_REMAP_KEYS) {
-    if (oldT[k] === color) {
-      const next = newT[k];
-      if (typeof next === 'string') return next;
-    }
-  }
-  return color;
+  const token = tokenForColor(color, oldT, field);
+  const next = token ? newT[token] : undefined;
+  return typeof next === 'string' ? next : color;
 }
 
 /** Remap a WidgetStyle's color fields from the old theme's tokens to the new theme's. */
 export function remapStyleColors(style: WidgetStyle, oldT: ThemeData, newT: ThemeData): WidgetStyle {
   return {
     ...style,
-    background: remapColor(style.background, oldT, newT),
-    color: remapColor(style.color, oldT, newT),
-    borderColor: remapColor(style.borderColor, oldT, newT),
+    background: remapColor(style.background, oldT, newT, 'background'),
+    color: remapColor(style.color, oldT, newT, 'color'),
+    borderColor: remapColor(style.borderColor, oldT, newT, 'borderColor'),
   };
 }
 
@@ -212,8 +252,12 @@ export interface WidgetConfig {
  * Abstract base class for all widget Abjects.
  */
 export abstract class WidgetAbject extends Abject {
+  /** How long a widget released by clearLayoutChildren waits to be re-added before it destroys itself. */
+  static readonly RELEASE_GRACE_MS = 10_000;
   protected rect: Rect;
   protected style: WidgetStyle;
+  /** Per colour field: the theme token its colour came from (null = a literal colour). */
+  private styleTokens: Partial<Record<StyleColorField, keyof ThemeData | null>> = {};
   protected text: string;
   protected ownerId: AbjectId;
   protected uiServerId: AbjectId;
@@ -233,12 +277,26 @@ export abstract class WidgetAbject extends Abject {
 
   /**
    * Long-op affordance (Doherty Threshold). Set via `update({ busy: true })`.
-   * While true, an accent halo pulses around the widget so the user knows
-   * something is happening for ops > ~200 ms with unknown duration.
+   * While true the widget wears the living light: a static frame in its 2D
+   * paint, plus a breathing 3D frame with a light running its edge that the
+   * browser animates on its own. Turning it on or off costs one repaint, so
+   * it suits long-lived status as well as short ops.
    */
   protected busy = false;
-  private busyTween?: Tween;
-  private busyPulseValue = 0;
+  /** Scene decorations in the scene now: root id -> the drawn rect they were built for. */
+  private sceneDecoShown = new Map<string, Rect>();
+  /** Where the widget last drew and can be seen (window px, clamped to its viewport); null when not drawn. */
+  private sceneDecoRect: Rect | null = null;
+  /** Rendered since it was last culled, so a cull notice only does work after a draw. */
+  private drawnSinceCull = false;
+  /** The window scene decorations hang on (asked up the owner chain on first need). */
+  private sceneWindowId?: AbjectId;
+  /** 'idle' until first needed; 'failed' when the window refused a batch (the 2D look stays). */
+  private sceneWindowState: 'idle' | 'resolving' | 'ready' | 'failed' | 'stopped' = 'idle';
+  /** Layouts (and other containers) that hold this widget now, told by event. */
+  private holdingLayouts = new Set<AbjectId>();
+  /** Pending self-destroy after a clearLayoutChildren released the last hold. */
+  private releaseTimer?: ReturnType<typeof setTimeout>;
   protected widgetType: WidgetType;
   protected override theme: ThemeData;
 
@@ -259,6 +317,7 @@ export abstract class WidgetAbject extends Abject {
     this.widgetType = config.type;
     this.rect = { ...config.rect };
     this.style = config.style ? { ...config.style } : {};
+    this.styleTokens = {};
     this.text = config.text ?? '';
     this.ownerId = config.ownerId;
     this.href = config.href ?? '';
@@ -279,10 +338,15 @@ export abstract class WidgetAbject extends Abject {
    * emitting draw commands for lines outside the visible scroll area.
    */
   protected _renderViewportClip: { top: number; bottom: number } | null = null;
+  /** Where the widget last drew (surface and surface-local origin), for showMobileKeyboard. */
+  private _lastDrawnAt?: { surfaceId: string; ox: number; oy: number };
 
   private setupWidgetHandlers(): void {
     this.on('render', async (msg: AbjectMessage) => {
-      if (!this.visible) return [];
+      if (!this.visible) {
+        this.noteCulled();
+        return [];
+      }
       // Snapshot mutable state so buildDrawCommands sees consistent values
       // across await points even when concurrent update handlers modify them.
       this._renderText = this.text;
@@ -295,6 +359,7 @@ export abstract class WidgetAbject extends Abject {
         viewportClip?: { top: number; bottom: number };
       };
       this._renderViewportClip = viewportClip ?? null;
+      this._lastDrawnAt = { surfaceId, ox, oy };
       const commands = await this.buildDrawCommands(surfaceId, ox, oy);
 
       // Generic keyboard-focus ring. Drawn AFTER the widget so it always
@@ -313,7 +378,21 @@ export abstract class WidgetAbject extends Abject {
         commands.push(...this.buildBusyPulse(surfaceId, ox, oy));
       }
 
+      // Retained 3D decorations follow the rect just drawn (sent only when
+      // something changed, so a steady repaint costs nothing here).
+      this.drawnSinceCull = true;
+      this.sceneDecoRect = this.visibleDrawnRect(ox, oy, viewportClip);
+      this.syncSceneDecorations();
+
       return commands;
+    });
+
+    // A scrolling ancestor stopped drawing this widget (scrolled out of its
+    // viewport) or a hidden container took it off screen. It hears render
+    // again when it shows.
+    this.on('viewportCulled', async () => {
+      this.noteCulled();
+      return true;
     });
 
     this.on('getValue', async () => {
@@ -326,6 +405,7 @@ export abstract class WidgetAbject extends Abject {
       this.applyCommonUpdates(updates);
       await this.applyUpdate(updates);
       if (this.visible !== oldVisible) {
+        if (!this.visible) this.noteCulled();
         this.changed('visibility', this.visible);
       }
       await this.requestRedraw();
@@ -338,9 +418,13 @@ export abstract class WidgetAbject extends Abject {
       // Reset focus-visible on every transition. Default trigger is mouse;
       // an explicit `via: 'keyboard'` opts in to the visible ring.
       this.focusVisible = focused && via === 'keyboard';
-      // Tell mobile clients to show/hide the virtual keyboard
+      // Tell mobile clients to show/hide the virtual keyboard, and where the
+      // field is (surface-local px) so a phone can keep it above the keyboard.
       if (this.wantsMobileKeyboard()) {
-        this.send(request(this.id, this.uiServerId, 'showMobileKeyboard', { show: focused }));
+        const at = this._lastDrawnAt;
+        this.send(request(this.id, this.uiServerId, 'showMobileKeyboard', at && focused
+          ? { show: focused, surfaceId: at.surfaceId, rect: { x: at.ox, y: at.oy, width: this.rect.width, height: this.rect.height } }
+          : { show: focused }));
       }
       await this.requestRedraw();
       return true;
@@ -378,10 +462,26 @@ export abstract class WidgetAbject extends Abject {
 
     this.on('updateTheme', async (msg: AbjectMessage) => {
       const newTheme = msg.payload as ThemeData;
-      // Remap any colors baked into this widget's style from the old theme's
-      // tokens to the new theme's, so styled widgets follow theme changes.
-      this.style = remapStyleColors(this.style, this.theme, newTheme);
+      // Follow theme changes with colours baked into this widget's style.
+      // Each colour field remembers the token it was resolved from (found
+      // against the theme that was current when the colour was set), so a
+      // round trip through a palette whose tokens share values (Agitprop's
+      // ink is both its text and its living light) comes back to the right
+      // token instead of whichever shared-value token matched first.
+      const next: WidgetStyle = { ...this.style };
+      for (const f of STYLE_COLOR_FIELDS) {
+        const color = this.style[f];
+        if (typeof color !== 'string') continue;
+        if (!(f in this.styleTokens)) this.styleTokens[f] = tokenForColor(color, this.theme, f);
+        const token = this.styleTokens[f];
+        const mapped = token ? newTheme[token] : undefined;
+        if (typeof mapped === 'string') next[f] = mapped;
+      }
+      this.style = next;
       this.theme = newTheme;
+      // Rebuild scene decorations on the next draw (colours or rule widths
+      // baked from the old theme follow the new one).
+      for (const [id, r] of this.sceneDecoShown) this.sceneDecoShown.set(id, { ...r, width: -1 });
       await this.requestRedraw();
       return true;
     });
@@ -391,16 +491,63 @@ export abstract class WidgetAbject extends Abject {
       return true;
     });
 
+    // Hold tracking (sent by layouts, see LayoutAbject.tellChildHold). A
+    // widget released by clearLayoutChildren destroys itself after a grace
+    // period unless some layout attaches it again first, so clearing a pane
+    // and rebuilding it with new widgets frees the old ones, while clearing
+    // and re-adding the same widgets keeps them.
+    this.on('layoutAttached', async (msg: AbjectMessage) => {
+      this.holdingLayouts.add(msg.routing.from);
+      this.cancelTimer(this.releaseTimer);
+      this.releaseTimer = undefined;
+      // Layouts learn visibility from changes, so a widget created hidden
+      // would keep its share of the space until it toggled once. Say so now,
+      // to this holder only (the same notice a visibility change sends).
+      if (!this.visible) {
+        try {
+          this.send(event(this.id, msg.routing.from, 'changed', { aspect: 'visibility', value: false }));
+        } catch { /* holder gone */ }
+      }
+      return true;
+    });
+    this.on('layoutDetached', async (msg: AbjectMessage) => {
+      this.holdingLayouts.delete(msg.routing.from);
+      return true;
+    });
+    this.on('layoutReleased', async (msg: AbjectMessage) => {
+      this.holdingLayouts.delete(msg.routing.from);
+      if (this.holdingLayouts.size === 0 && this.releaseTimer === undefined) {
+        this.releaseTimer = this.setTimer(async () => {
+          this.releaseTimer = undefined;
+          if (this.holdingLayouts.size === 0) await this.stop();
+        }, WidgetAbject.RELEASE_GRACE_MS);
+      }
+      return true;
+    });
+
     // The bus sends this when one of our events bounced off an unregistered
     // recipient. If that recipient is our owner (window/layout), we are an
     // orphan — the destroy cascade missed us. Self-destruct so animation
-    // loops (busy pulse, canvas tweens) stop instead of firing childDirty at
+    // loops (canvas tweens) stop instead of firing childDirty at
     // the dead owner forever (locally and across peers).
     this.on('recipientGone', async (msg: AbjectMessage) => {
       const { recipient } = msg.payload as { recipient?: AbjectId };
       if (recipient && recipient === this.ownerId) {
         await this.stop();
       }
+      return true;
+    });
+
+    // Pop-outs (popout.ts): input on a node this widget contributed to its
+    // window comes straight back here, and while a pop-out is open the
+    // widget listens to its window, which reports focus changes.
+    this.on('nodeInput', async (msg: AbjectMessage) => {
+      await this.handlePopoutInput((msg.payload ?? {}) as Record<string, unknown>);
+      return true;
+    });
+    this.on('windowFocus', async (msg: AbjectMessage) => {
+      const { focused } = (msg.payload ?? {}) as { focused?: boolean };
+      await this.handlePopoutWindowFocus(focused === true);
       return true;
     });
   }
@@ -431,24 +578,160 @@ export abstract class WidgetAbject extends Abject {
   }
 
   /**
-   * Build the long-op pulse drawn around a busy widget: a phosphor frame in
-   * the living light (accentSecondary) with a soft glow of the same colour.
-   * Its opacity steps with the pulse; the frame stays inside the widget rect.
+   * Input on a scene node this widget contributed to its window (a pop-out,
+   * see popout.ts): { type, nodeId, x, y, button?, deltaY?, ... } with x/y in
+   * window px. Default: ignored.
+   */
+  protected async handlePopoutInput(_input: Record<string, unknown>): Promise<void> {
+    // No contributed node takes input by default.
+  }
+
+  /** The window gained or lost focus (heard while a pop-out listens). Default: ignored. */
+  protected async handlePopoutWindowFocus(_focused: boolean): Promise<void> {
+    // Nothing to close by default.
+  }
+
+  /**
+   * A pop-out surface hanging off this widget's window (see popout.ts): a 2D
+   * layer that may reach past the window edge, for dropdown lists, tooltips,
+   * menus and pickers. Its input arrives at handlePopoutInput; while open, the
+   * window's focus changes arrive at handlePopoutWindowFocus.
+   */
+  protected createPopout(nodeId: string, options?: PopoutOptions): PopoutSurface {
+    return new PopoutSurface(windowChannel({
+      ask: <T>(to: AbjectId, method: string, payload: unknown, timeoutMs?: number) =>
+        this.request<T>(request(this.id, to, method, payload), timeoutMs),
+      tell: (to: AbjectId, method: string, payload: unknown) => this.send(request(this.id, to, method, payload)),
+      windowId: this.ownerId,
+      uiServerId: this.uiServerId,
+    }), nodeId, options);
+  }
+
+  /**
+   * The 2D half of the busy look: a faint static frame in the living light
+   * (accentSecondary), drawn once per transition. The motion (a breathing
+   * frame and a light running the edge) is the scene decoration from
+   * `sceneDecorations()`, animated by the browser, so a busy widget never
+   * repaints on a timer. The static frame is also what a screen without 3D
+   * shows.
    */
   protected buildBusyPulse(surfaceId: string, ox: number, oy: number): unknown[] {
-    const alpha = 0.35 + Math.round(this.busyPulseValue * 3) / 3 * 0.65;
-    const light = withAlpha(this.theme.accentSecondary, alpha);
-    return [
-      { type: 'save', surfaceId, params: {} },
-      { type: 'shadow', surfaceId, params: { color: light, blur: 8, offsetY: 0 } },
-      ...inkFrame(
-        surfaceId,
-        { x: ox, y: oy, width: this.rect.width, height: this.rect.height },
-        light,
-        shapeOf(this.theme).ruleWidth,
-      ),
-      { type: 'restore', surfaceId, params: {} },
-    ];
+    return inkFrame(
+      surfaceId,
+      { x: ox, y: oy, width: this.rect.width, height: this.rect.height },
+      withAlpha(this.theme.accentSecondary, 0.2),
+      shapeOf(this.theme).ruleWidth,
+    );
+  }
+
+  // ── Scene decorations (busy light, indeterminate sweeps) ──────────────
+
+  /**
+   * The retained 3D decorations this widget wants right now. The base class
+   * contributes the busy light; subclasses add their own (call super). Ids
+   * must stay stable while a decoration is wanted.
+   */
+  protected sceneDecorations(): WidgetSceneDecoration[] {
+    if (!this.busy) return [];
+    const id = `busy-${this.id}`;
+    const lineWidth = Math.max(1.5, shapeOf(this.theme).ruleWidth);
+    const glow = isDarkGround(this.theme.windowBg);
+    return [{ id, build: (rect) => busyFrameOps(id, rect, { lineWidth, glow }) }];
+  }
+
+  /**
+   * Bring the window's scene in line with `sceneDecorations()` at the rect
+   * last drawn: add what is missing, move what moved (same size), rebuild
+   * what changed size, remove what is no longer wanted. One batch, sent only
+   * when something differs. Synchronous up to the send, so batches keep the
+   * order of the state changes that caused them.
+   */
+  protected syncSceneDecorations(): void {
+    const rect = this.visible ? this.sceneDecoRect : null;
+    const want = rect ? this.sceneDecorations() : [];
+    if (this.sceneWindowState !== 'ready') {
+      // Nothing is shown before the window is known; learn it on first need.
+      if (want.length > 0 && this.sceneWindowState === 'idle') this.resolveSceneWindow();
+      return;
+    }
+    const wanted = new Set(want.map((d) => d.id));
+    contractRequire(wanted.size === want.length, 'sceneDecorations: every decoration needs its own id');
+    const ops: SceneOp[] = [];
+    for (const id of [...this.sceneDecoShown.keys()]) {
+      if (wanted.has(id)) continue;
+      ops.push(...removeSceneGroupOps(id));
+      this.sceneDecoShown.delete(id);
+    }
+    for (const d of want) {
+      const cur = this.sceneDecoShown.get(d.id);
+      const r = rect!;
+      if (cur && cur.x === r.x && cur.y === r.y && cur.width === r.width && cur.height === r.height) continue;
+      if (cur && cur.width === r.width && cur.height === r.height) {
+        ops.push(...moveBusyFrameOps(d.id, r));
+      } else {
+        if (cur) ops.push(...removeSceneGroupOps(d.id));
+        ops.push(...d.build(r));
+      }
+      this.sceneDecoShown.set(d.id, { ...r });
+    }
+    if (ops.length === 0) return;
+    this.request<boolean>(request(this.id, this.sceneWindowId!, 'scene', { ops, origin: 'topLeft' }))
+      .catch(() => {
+        // The window refused the batch or is gone: keep the 2D look only.
+        this.sceneDecoShown.clear();
+        if (this.sceneWindowState === 'ready') this.sceneWindowState = 'failed';
+      });
+  }
+
+  /**
+   * Find the window this widget draws in (the owner, or up through nested
+   * layouts), then show whatever decorations are wanted by then. Batches go
+   * straight to the window, so they keep their order and still arrive while
+   * a parent layout is being torn down. An owner that cannot answer is taken
+   * to be the window itself.
+   */
+  private resolveSceneWindow(): void {
+    this.sceneWindowState = 'resolving';
+    this.request<AbjectId>(request(this.id, this.ownerId, 'getWindowId', {}), 5000)
+      .then((id) => { this.sceneWindowId = typeof id === 'string' && id.length > 0 ? id : this.ownerId; })
+      .catch(() => { this.sceneWindowId = this.ownerId; })
+      .finally(() => {
+        if (this.sceneWindowState !== 'resolving') return; // stopped meanwhile
+        this.sceneWindowState = 'ready';
+        this.syncSceneDecorations();
+      });
+  }
+
+  /** The drawn rect clamped to a scrolling ancestor's viewport; null when nothing of it shows. */
+  private visibleDrawnRect(ox: number, oy: number, clip?: { top: number; bottom: number }): Rect | null {
+    const w = this._renderRect.width;
+    const h = this._renderRect.height;
+    if (!(w > 0 && h > 0)) return null;
+    let top = oy;
+    let bottom = oy + h;
+    if (clip) {
+      top = Math.max(top, clip.top);
+      bottom = Math.min(bottom, clip.bottom);
+    }
+    if (bottom - top < 2) return null;
+    return { x: ox, y: top, width: w, height: bottom - top };
+  }
+
+  /** The widget stopped being drawn: drop its scene decorations until it draws again. */
+  private noteCulled(): void {
+    if (!this.drawnSinceCull) return;
+    this.drawnSinceCull = false;
+    this.onCulled();
+  }
+
+  /**
+   * Hook for "no longer drawn" (scrolled out of view, or a hidden container).
+   * The base removes this widget's scene decorations; containers extend it
+   * to tell their children.
+   */
+  protected onCulled(): void {
+    this.sceneDecoRect = null;
+    this.syncSceneDecorations();
   }
 
   /**
@@ -471,7 +754,13 @@ export abstract class WidgetAbject extends Abject {
   private applyCommonUpdates(updates: Record<string, unknown>): void {
     if (updates.text !== undefined) this.text = updates.text as string;
     if (updates.href !== undefined) this.href = updates.href as string;
-    if (updates.style !== undefined) this.style = { ...this.style, ...(updates.style as WidgetStyle) };
+    if (updates.style !== undefined) {
+      const incoming = updates.style as WidgetStyle;
+      this.style = { ...this.style, ...incoming };
+      // A newly set colour is resolved to its token lazily, against the
+      // theme current until the next theme change.
+      for (const f of STYLE_COLOR_FIELDS) if (f in incoming) delete this.styleTokens[f];
+    }
     if (updates.rect !== undefined) this.rect = updates.rect as Rect;
     // Support top-level visible/disabled as shorthand for style.visible/style.disabled
     if (updates.visible !== undefined) this.style = { ...this.style, visible: updates.visible as boolean };
@@ -481,24 +770,32 @@ export abstract class WidgetAbject extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
-    this.busyTween?.cancel();
-    this.busyTween = undefined;
+    // Take our scene decorations off the window. An event, not a request:
+    // teardown never waits on a reply.
+    if (this.sceneDecoShown.size > 0 && this.sceneWindowId) {
+      const ops = [...this.sceneDecoShown.keys()].flatMap((id) => removeSceneGroupOps(id));
+      try {
+        this.bus.send(event(this.id, this.sceneWindowId, 'scene', { ops, origin: 'topLeft' }));
+      } catch { /* window already gone (its surface took the nodes with it) */ }
+    }
+    this.sceneDecoShown.clear();
+    this.sceneWindowState = 'stopped';
+    this.holdingLayouts.clear();
+    this.releaseTimer = undefined; // stop() cancels the managed timer itself
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(this.releaseTimer === undefined || this.holdingLayouts.size === 0,
+      'a widget waiting out its release grace is held by no layout');
   }
 
   private setBusy(busy: boolean): void {
     if (this.busy === busy) return;
     this.busy = busy;
-    if (busy) {
-      this.busyTween?.cancel();
-      this.busyTween = motionPulse(1100, (v) => {
-        this.busyPulseValue = v;
-        this.requestRedraw().catch(() => {});
-      }).start();
-    } else {
-      this.busyTween?.cancel();
-      this.busyTween = undefined;
-      this.busyPulseValue = 0;
-    }
+    // Off: the light leaves now. On: it appears at the last drawn rect now,
+    // and the repaint that follows every update places it exactly.
+    this.syncSceneDecorations();
   }
 
   /**

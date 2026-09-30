@@ -86,6 +86,12 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
       returns: { kind: 'object', properties: {} },
     },
     {
+      name: 'getWindowId',
+      description: 'The id of the window this layout lives in (asked up the owner chain).',
+      parameters: [],
+      returns: { kind: 'primitive', primitive: 'string' },
+    },
+    {
       name: 'getPreferredHeight',
       description: 'Total height needed to show every child: margins + children + inter-child spacing',
       parameters: [],
@@ -101,7 +107,7 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
     },
     {
       name: 'removeLayoutChild',
-      description: 'Remove a widget from this layout',
+      description: 'Remove a widget from this layout (detach only: the widget stays alive; destroy it when done)',
       parameters: [
         { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget AbjectId to remove' },
       ],
@@ -129,8 +135,10 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
     },
     {
       name: 'clearLayoutChildren',
-      description: 'Remove all children from this layout',
-      parameters: [],
+      description: 'Remove all children from this layout. Cleared widgets destroy themselves about 10 s later unless added to a layout again in the meantime (clear, then re-add the same widgets, is safe). Pass { keep: true } to keep them alive detached; removeLayoutChild detaches one widget without destroying it.',
+      parameters: [
+        { name: 'keep', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Keep the cleared widgets alive (default false: they are destroyed after the grace period unless re-added)', optional: true },
+      ],
       returns: { kind: 'primitive', primitive: 'boolean' },
     },
     {
@@ -239,6 +247,9 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     const children = this.layoutChildren;
     this.layoutChildren = [];
+    // Children stop being drawn with us: drop their scene decorations even
+    // if nothing else takes them down.
+    this.notifyCulled(children.filter((c): c is LayoutChildConfig => !isSpacer(c)).map((c) => c.widgetId));
     for (const child of children) {
       if (isSpacer(child)) continue;
       try {
@@ -247,6 +258,42 @@ export abstract class LayoutAbject extends WidgetAbject {
     }
 
     await super.onStop();
+  }
+
+  /**
+   * Tell a child how this layout now holds it, so it knows whether any
+   * layout still does: 'layoutAttached' (added), 'layoutDetached' (removed,
+   * stays alive), 'layoutReleased' (cleared: it destroys itself after a
+   * grace period unless attached again). Events, so they also work while
+   * we stop.
+   */
+  protected tellChildHold(widgetId: AbjectId, method: 'layoutAttached' | 'layoutDetached' | 'layoutReleased'): void {
+    try {
+      this.send(event(this.id, widgetId, method, {}));
+    } catch { /* child already gone */ }
+  }
+
+  /**
+   * No longer drawn (scrolled away, or hidden): pass the notice down so
+   * children drop their scene decorations too (a busy light must not float
+   * over whatever now occupies the spot). Each child acts only if it drew
+   * since its last notice, so this costs one event per child per transition.
+   */
+  protected override onCulled(): void {
+    super.onCulled();
+    this.notifyCulled(this.layoutChildren.filter((c): c is LayoutChildConfig => !isSpacer(c)).map((c) => c.widgetId));
+  }
+
+  /**
+   * Tell children they are no longer drawn. Straight onto the bus, so it
+   * works from onStop and any later teardown path alike.
+   */
+  protected notifyCulled(widgetIds: AbjectId[]): void {
+    for (const widgetId of widgetIds) {
+      try {
+        this.bus.send(event(this.id, widgetId, 'viewportCulled', {}));
+      } catch { /* child already gone */ }
+    }
   }
 
   /**
@@ -282,6 +329,13 @@ export abstract class LayoutAbject extends WidgetAbject {
   private setupLayoutHandlers(): void {
     this.on('getLayoutOverflow', async () => this.lastOverflow ?? null);
 
+    // A nested layout is its children's owner; a child that wants its window
+    // (to hang scene decorations on it) asks here, and the question climbs to
+    // the window, which answers with its own id.
+    this.on('getWindowId', async () => {
+      return this.request<AbjectId>(request(this.id, this.ownerId, 'getWindowId', {}));
+    });
+
     this.on('addLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
@@ -311,6 +365,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           alignment,
           stretch,
         });
+        this.tellChildHold(widgetId, 'layoutAttached');
       }
       // Remove widget from window's direct children to prevent double rendering.
       // When a widget (e.g. canvas) is both a window child and a layout child,
@@ -372,6 +427,7 @@ export abstract class LayoutAbject extends WidgetAbject {
             alignment: child.alignment,
             stretch: child.stretch,
           });
+          this.tellChildHold(child.widgetId, 'layoutAttached');
         }
         // Fire-and-forget: remove from window direct children + register as dependent
         this.send(
@@ -389,9 +445,16 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     this.on('removeLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      const wasChild = this.layoutChildren.some((c) => !isSpacer(c) && c.widgetId === widgetId);
       this.layoutChildren = this.layoutChildren.filter(
         (c) => isSpacer(c) || c.widgetId !== widgetId
       );
+      // No longer drawn here: its scene decorations (busy light) leave too.
+      // Detach only: the caller owns the widget's lifetime from here.
+      if (wasChild) {
+        this.notifyCulled([widgetId]);
+        this.tellChildHold(widgetId, 'layoutDetached');
+      }
       // Clear stale references to prevent handleInput to destroyed widgets
       if (this.hoveredLayoutChildId === widgetId) {
         this.hoveredLayoutChildId = undefined;
@@ -425,7 +488,18 @@ export abstract class LayoutAbject extends WidgetAbject {
       return true;
     });
 
-    this.on('clearLayoutChildren', async () => {
+    this.on('clearLayoutChildren', async (msg: AbjectMessage) => {
+      const { keep } = (msg.payload ?? {}) as { keep?: boolean };
+      // Cleared children are no longer drawn here: their scene decorations
+      // (busy lights) leave with them, even if the caller keeps them alive.
+      const clearedIds = this.layoutChildren.filter((c): c is LayoutChildConfig => !isSpacer(c)).map((c) => c.widgetId);
+      this.notifyCulled(clearedIds);
+      // Released children destroy themselves after a grace period unless a
+      // layout takes them again (clear-then-re-add keeps them); keep: true
+      // leaves them alive, detached, for the caller to manage.
+      for (const widgetId of clearedIds) {
+        this.tellChildHold(widgetId, keep === true ? 'layoutDetached' : 'layoutReleased');
+      }
       this.layoutChildren = [];
       this.hoveredLayoutChildId = undefined;
       this.focusedLayoutChildId = undefined;
@@ -501,6 +575,9 @@ export abstract class LayoutAbject extends WidgetAbject {
         }
         this.layoutDirty = true;
         this.scheduleRelayout();
+        // A hidden child takes no room: an auto-sized layout reports its new
+        // height, or its parent keeps allocating the old one.
+        this.notifyParentOfSizeChange().catch(() => {});
       }
     });
 

@@ -11,6 +11,7 @@
 import type { ThemeData } from '../core/theme-data.js';
 import { chromeCase } from '../core/theme-data.js';
 import type { IconName } from '../ui/icons.js';
+import { requireNonNegative } from '../core/contracts.js';
 
 type Style = Record<string, unknown>;
 
@@ -110,4 +111,44 @@ export function dockStyles(theme: ThemeData, compact: boolean): DockStyles {
 /** Two-digit Space numeral ("01", "02", ...) for the Spaces list. */
 export function spaceNumeral(index: number): string {
   return String(index + 1).padStart(2, '0');
+}
+
+type TimerHandle = ReturnType<typeof setTimeout>;
+
+/**
+ * Debounced activity for a dock row's busy light: on at once, off only after
+ * `offDelayMs` of quiet, so bursts of short work (back-to-back model calls,
+ * quick jobs) read as one steady light instead of a flicker of repaints.
+ * Timers go through the owning Abject's managed timers (pass its setTimer /
+ * cancelTimer) so they die with it.
+ */
+export class ActivityLatch {
+  private lit = false;
+  private offTimer?: TimerHandle;
+
+  constructor(
+    private readonly onChange: (busy: boolean) => void,
+    private readonly timers: { set(fn: () => void, ms: number): TimerHandle; cancel(h: TimerHandle | undefined): void },
+    private readonly offDelayMs = 1200,
+  ) {
+    requireNonNegative(offDelayMs, 'offDelayMs');
+  }
+
+  /** Whether the light is on (after debouncing). */
+  get busy(): boolean { return this.lit; }
+
+  /** Report the live activity state; the light follows it (off is delayed). */
+  set(active: boolean): void {
+    if (active) {
+      this.timers.cancel(this.offTimer);
+      this.offTimer = undefined;
+      if (!this.lit) { this.lit = true; this.onChange(true); }
+      return;
+    }
+    if (!this.lit || this.offTimer !== undefined) return;
+    this.offTimer = this.timers.set(() => {
+      this.offTimer = undefined;
+      if (this.lit) { this.lit = false; this.onChange(false); }
+    }, this.offDelayMs);
+  }
 }

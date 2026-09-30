@@ -8,7 +8,7 @@
  */
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
-import { request } from '../../core/message.js';
+import { request, event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import { Rect } from './widget-types.js';
 import { shapeOf } from '../../core/theme-data.js';
@@ -42,6 +42,7 @@ export class SplitPaneWidget extends WidgetAbject {
   private setupSplitPaneHandlers(): void {
     this.on('setLeftChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.holdChild(this.leftChildId, widgetId, this.rightChildId);
       this.leftChildId = widgetId;
       await this.updateChildRects();
       await this.requestRedraw();
@@ -50,6 +51,7 @@ export class SplitPaneWidget extends WidgetAbject {
 
     this.on('setRightChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.holdChild(this.rightChildId, widgetId, this.leftChildId);
       this.rightChildId = widgetId;
       await this.updateChildRects();
       await this.requestRedraw();
@@ -59,6 +61,7 @@ export class SplitPaneWidget extends WidgetAbject {
     // Aliases for vertical orientation
     this.on('setTopChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.holdChild(this.leftChildId, widgetId, this.rightChildId);
       this.leftChildId = widgetId;
       await this.updateChildRects();
       await this.requestRedraw();
@@ -67,6 +70,7 @@ export class SplitPaneWidget extends WidgetAbject {
 
     this.on('setBottomChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.holdChild(this.rightChildId, widgetId, this.leftChildId);
       this.rightChildId = widgetId;
       await this.updateChildRects();
       await this.requestRedraw();
@@ -77,6 +81,34 @@ export class SplitPaneWidget extends WidgetAbject {
     this.on('childDirty', async () => {
       await this.requestRedraw();
     });
+  }
+
+  /**
+   * Hold a new pane child and let go of the one it replaces (detach only),
+   * the way a layout tells its children (LayoutAbject.tellChildHold), so a
+   * pane that also sat in a cleared layout is not released while shown here.
+   */
+  private holdChild(previous: AbjectId | undefined, next: AbjectId, other: AbjectId | undefined): void {
+    if (previous === next) return;
+    try {
+      if (previous && previous !== other) this.send(event(this.id, previous, 'layoutDetached', {}));
+      this.send(event(this.id, next, 'layoutAttached', {}));
+    } catch { /* child already gone */ }
+  }
+
+  /**
+   * The panes go with the split pane, as a layout's children go with the
+   * layout: without this every window built on split panes left its pane
+   * subtrees alive after it closed. Events, sent while we stop.
+   */
+  protected override async onStop(): Promise<void> {
+    for (const childId of new Set([this.leftChildId, this.rightChildId])) {
+      if (!childId) continue;
+      try { this.send(event(this.id, childId, 'destroy', {})); } catch { /* already gone */ }
+    }
+    this.leftChildId = undefined;
+    this.rightChildId = undefined;
+    await super.onStop();
   }
 
   // ── Geometry ───────────────────────────────────────────────────────

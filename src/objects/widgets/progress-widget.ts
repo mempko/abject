@@ -5,63 +5,59 @@
  * the progress value (0-1). Non-interactive.
  */
 
-import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { hatch } from './widget-types.js';
-import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
+import { WidgetAbject, WidgetConfig, WidgetSceneDecoration, buildFont } from './widget-abject.js';
+import { hatch, withAlpha } from './widget-types.js';
+import { progressSweepOps } from '../ui-kit.js';
 
 export interface ProgressWidgetConfig extends WidgetConfig {
-  /** Value in [0, 1]. Pass a negative number to enable indeterminate mode. */
+  /**
+   * Fraction in [0, 1], or a percentage above 1 (up to 100, as the guide
+   * documents). Pass a negative number for indeterminate mode.
+   */
   value?: number;
 }
 
 export class ProgressWidget extends WidgetAbject {
   private progressValue = 0;
   private indeterminate = false;
-  private indeterminatePos = 0;
-  private indeterminateTween?: Tween;
 
   constructor(config: ProgressWidgetConfig) {
     super(config);
     this.setProgress(config.value ?? 0);
   }
 
-  protected override async onStop(): Promise<void> {
-    this.indeterminateTween?.cancel();
-    this.indeterminateTween = undefined;
-  }
-
   private setProgress(value: number): void {
+    const wasIndeterminate = this.indeterminate;
     if (value < 0) {
       this.indeterminate = true;
       this.progressValue = 0;
-      this.startIndeterminate();
     } else {
       this.indeterminate = false;
-      this.stopIndeterminate();
-      this.progressValue = Math.max(0, Math.min(1, value));
+      const fraction = value > 1 ? value / 100 : value;
+      this.progressValue = Math.max(0, Math.min(1, fraction));
     }
+    // The sweep starts or stops with the mode (the repaint that follows
+    // every update places it exactly).
+    if (this.indeterminate !== wasIndeterminate) this.syncSceneDecorations();
   }
 
-  private startIndeterminate(): void {
-    if (this.indeterminateTween) return;
-    this.indeterminateTween = motionShimmer(
-      1400,
-      (pos) => {
-        this.indeterminatePos = pos;
-        this.requestRedraw().catch(() => {});
-      },
-    ).start();
-  }
-
-  private stopIndeterminate(): void {
-    this.indeterminateTween?.cancel();
-    this.indeterminateTween = undefined;
+  /**
+   * Indeterminate mode is a sweep of light along the track, animated by the
+   * browser as retained scene nodes: no timer here, no per-frame repaint.
+   */
+  protected override sceneDecorations(): WidgetSceneDecoration[] {
+    const base = super.sceneDecorations();
+    if (!this.indeterminate) return base;
+    const id = `sweep-${this.id}`;
+    const color = this.style.color ?? '$accentSecondary';
+    const trackColor = this.style.background ?? this.theme.progressTrack;
+    return [...base, { id, build: (rect) => progressSweepOps(id, rect, { color, trackColor }) }];
   }
 
   /**
    * A flat track with a solid fill (theme.progressFill) and no gloss.
-   * Indeterminate mode runs diagonal hatching across the whole track, slid
-   * by the shimmer phase so the stripes march left to right.
+   * Indeterminate mode paints faint, still diagonal hatching (what a screen
+   * without 3D shows); the moving sweep rides above it in the scene.
    */
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     const commands: unknown[] = [];
@@ -79,9 +75,7 @@ export class ProgressWidget extends WidgetAbject {
     if (this.indeterminate) {
       const spacing = Math.max(8, Math.min(14, h));
       const lineWidth = Math.max(2, spacing * 0.4);
-      // Four whole periods per cycle, so the loop wraps without a jump.
-      const phase = this.indeterminatePos * spacing * 4;
-      commands.push(...hatch(surfaceId, track, fillColor, spacing, lineWidth, phase));
+      commands.push(...hatch(surfaceId, track, withAlpha(fillColor, 0.22), spacing, lineWidth, 0));
     } else if (this.progressValue > 0) {
       commands.push({
         type: 'rect', surfaceId,

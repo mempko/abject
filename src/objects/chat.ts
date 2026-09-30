@@ -220,6 +220,8 @@ export class Chat extends Abject {
 
   /** Consolidated "Thinking / activity" bubble used during task execution. */
   private activityBubbleLabelId?: AbjectId;
+  /** Goals the user folded in the inline progress tree (open by default). */
+  private collapsedGoals = new Set<string>();
   /** Embedded goal-progress widget shown beneath the activity header. */
   private activityGoalWidgetId?: AbjectId;
   private activityGoalHeight = 0;
@@ -765,6 +767,20 @@ export class Chat extends Abject {
             preferredSize: { height: columnHeight },
           }));
         } catch { /* layout may be gone */ }
+        return;
+      }
+
+      // The inline goal tree's arrow (and status mark) fold a goal's tasks
+      // away and back, as in the Goals window.
+      if (aspect === 'toggle' && fromId === this.activityGoalWidgetId) {
+        try {
+          const { id } = JSON.parse(value as string) as { id?: string };
+          if (id) {
+            if (this.collapsedGoals.has(id)) this.collapsedGoals.delete(id);
+            else this.collapsedGoals.add(id);
+            await this.refreshActivityBubble();
+          }
+        } catch { /* malformed toggle */ }
         return;
       }
 
@@ -1956,7 +1972,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.bubbleSenderLabels.clear();
     this.activityBubbleLabelId = undefined;
     this.activityStep = 0;
-    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
+    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); this.collapsedGoals.clear(); }
     this.welcomeWidgetIds = [];
     this._streamBuffer = '';
     if (this.activityRefreshTimer) {
@@ -2842,7 +2858,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.activityHeader = THINKING_TEXT;
     this.activityGoalHeight = 0;
     this.stepStreamChars = 0;
-    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
+    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); this.collapsedGoals.clear(); }
     this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
 
     // Embed the shared goal-progress widget directly beneath the header so the
@@ -2885,7 +2901,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     }
     return buildGoalRows({
       goals,
-      isExpanded: () => true, // inline view is always fully expanded
+      isExpanded: (id) => !this.collapsedGoals.has(id), // open unless folded
       getTasks: (id) => this.liveTasks.get(id) ?? [],
       rootId: this._currentGoalId,
     });

@@ -25,6 +25,10 @@ import {
 import { shapeOf, chromeCase } from '../../core/theme-data.js';
 import { iconCommands } from '../../ui/icons.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
+import {
+  PopoutSurface, TOOLTIP_NODE_ID, TOOLTIP_DELAY_MS, cachedScreenSize, showTooltip,
+} from './popout.js';
+import { isScreenAnchor, type ScreenAnchor } from '../../ui/gl/scene-types.js';
 
 /** The four title-bar buttons, as WindowManager names them. */
 type TitleButtonKind = 'close' | 'minimize' | 'maximize' | 'help';
@@ -39,7 +43,7 @@ export interface WindowConfig {
   draggable?: boolean;
   zIndex?: number;
   theme?: ThemeData;
-  /** Whether the mobile card overview may close this window (default true). */
+  /** Whether the phone's Exposé view may flick this window closed (default true). */
   closable?: boolean;
   /**
    * Whether the window grabs focus when created (default true). Passive
@@ -52,6 +56,11 @@ export interface WindowConfig {
    * decoration), in px from the window's top-left corner (+y down).
    */
   focusDecoration?: Array<Record<string, unknown>> | null;
+  /**
+   * On a zoomable camera (the phone) the window stays pinned to this spot
+   * of the screen at a readable scale; the desktop at zoom 1 ignores it.
+   */
+  screenAnchor?: ScreenAnchor;
 }
 
 /**
@@ -75,6 +84,7 @@ export class WindowAbject extends Abject {
   private chromeless: boolean;
   private transparent: boolean;
   private closable: boolean;
+  private screenAnchor?: ScreenAnchor;
   private focusOnCreate: boolean;
   private resizable: boolean;
   private draggable: boolean;
@@ -93,12 +103,17 @@ export class WindowAbject extends Abject {
   private hoveredChildId?: AbjectId;
   /** Title-bar button under the pointer (drives the Constructivist hover plate). */
   private hoveredTitleButton?: TitleButtonKind;
+  /** Title-button tooltips: a pop-out under the hovered button after a dwell. */
+  private chromeTip?: PopoutSurface;
+  private chromeTipTimer?: ReturnType<typeof setTimeout>;
 
   private windowFocused = false;
   /** Scene ops worn while focused (px from the top-left corner); null = none. */
   private focusDecoration: Array<Record<string, unknown>> | null = null;
   /** Whether the focus decoration is currently in the scene. */
   private decorationShown = false;
+  /** Whether the top-left origin anchor group (scene origin: 'topLeft') exists. */
+  private originAnchorShown = false;
   private destroying = false;
   private rendering = false;
   private renderScheduled = false;
@@ -189,9 +204,10 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas"|"particles", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere"|"ring" (ring: flat annulus facing the viewer), color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) } (intensity is a LINEAR MULTIPLIER on the light color — 1 = full strength, keys 0.8-1.6, fills 0.3-0.6 — NOT watts/lumens; over 10 is rejected because it renders every lit mesh pure white. Use range for reach, not intensity). Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Particles params (kind:\'particles\', an emitter simulated client-side): { rate? (per second, streams while > 0: the desktop redraws while it streams, so set rate 0 or remove it when idle), burst? (count emitted once on add, again whenever burstKey changes), burstKey?, lifetime? (ms), speed?:[min,max] px/s, direction?:[x,y,z], spread? (cone radians), gravity? (px/s², +y down), size?:[min,max] px, color?, colorEnd?, shape?:"glow"|"square", emitterSize?:[w,h,d], maxParticles? }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse"|"shake"|"flash"|"float" (shake: decaying jolt; flash: emissive to params.color and back; float: slow drift and sway), channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). LAYERS: the window\'s own content is the BACKMOST 2D layer; a kind:"canvas" node is a 2D drawing layer in the scene — params { width, height, commands (standard 2D draw commands; an update replaces the batch and repaints; the layer starts transparent), opacity?, radius? }. Canvas layers slice meshes by z: meshes behind draw under, meshes in front draw over — 2D and 3D stack in any order (put HUD/text on a canvas node in front of the meshes). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment"|"canvas"|"particles"|"camera"|"model"|"text"|"label"|"line"|"sky", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere"|"ring" (ring: flat annulus facing the viewer), color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). MATERIALS (mesh params): material?:"<preset name>" (a named material from the SceneLibrary, e.g. gold, chrome, glass, neon, hologram, toon; the node\'s own params override it, and color may then be omitted), shading?:"standard"|"unlit"|"toon"|"matcap"|"rim", blend?:"normal"|"additive" (adds light over what is behind), normalMap?, roughnessMap?, metalnessMap?, aoMap?, emissiveMap?, matcap? (url|dataURI|"surface:<id>"), normalScale?, uvRepeat?:[u,v], uvOffset?:[u,v], clearcoat?, clearcoatRoughness?, sheen?, sheenColor?, transmission?(0..1, see-through glass with reflections), ior?, envIntensity?(reflection strength), toonSteps?, outline?:true|{ color?, width? px }, rimColor?, rimPower?, castShadow?, receiveShadow?. Colors are sRGB; lighting happens in linear light and is tone mapped. Light params: { lightType: "point"|"directional"|"spot"|"hemisphere", color?, intensity?, direction?(the way the light travels), range?, angle?, penumbra?, groundColor?(hemisphere: the color from below; color is the sky), castShadow?(directional or spot: meshes cast shadows on each other), shadow?:{ size?:512|1024|2048|4096, softness?(px), bias? } } (intensity is a LINEAR MULTIPLIER on the light color — 1 = full strength, keys 0.8-1.6, fills 0.3-0.6 — NOT watts/lumens; over 10 is rejected because it renders every lit mesh pure white. Use range for reach, not intensity). Environment params (scene mood): { ambient? (a COLOR \"#hex\"/$token, NOT a number — brightness rides in the color\'s lightness), look?:"<preset name>" (a named look from the SceneLibrary, e.g. studio, sunset, night; own params override it), sky?:{ top?, horizon?, bottom?, sun?:{ direction (toward the sun, y-down), color?, intensity?, size?(degrees) } } (lights and reflects every mesh), envMap?(equirect image), envIntensity?, toneMapping?:"neutral"(default)|"aces"|"agx"|"none", exposure?, grading?:{ contrast?, saturation?, temperature?, tint? }, fog?: { color?, near, far } or { color?, mode:"exp"|"exp2", density } (plus height?, heightFalloff?), bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes); post effects, each on just by being set: ao?:true|{ radius?, intensity? } (contact shadows), dof?:{ focus?(px behind the content plane), range?, aperture?(px blur) }, outline?:true|{ color?, width? } (ink edges), lightShafts?:true|{ intensity?, decay? }, chromaticAberration?(px), fxaa?:true, grading.vignette?, grading.grain?; bloom also takes radius? and quality?:"low"|"medium"|"high". Example: { op:"add", id:"env", kind:"environment", params:{ look:"studio", ao:true, dof:{ focus:0, range:160, aperture:8 }, bloom:{ threshold:0.6, quality:"high" } } } }. CONTENT KINDS: primitive also takes "capsule"|"roundedBox"|"grid"|"tube"|"lathe"|"extrude", with options in params.shape: capsule { radius?, length? }, roundedBox { radius?(0..0.5) }, grid { segments?:[x,y] }, tube { path:[[x,y,z],...] (unit space), radius? }, lathe { points:[[radius,y],...] }, extrude { outline:[[x,y],...], holes?:[[[x,y],...]], depth?, bevel? } (unit-sized like the other primitives; scale sets px), e.g. params:{ primitive:"extrude", color:"$accent", shape:{ outline:[[-0.5,-0.5],[0.5,-0.5],[0,0.5]], depth:0.3, bevel:0.04 } }. kind:"model" (glTF 2.0 / GLB): { src (a URL, or a data-URI "data:model/gltf-binary;base64,..." up to 16 MB, stored once and sent to each screen once), animation?(clip name or index, plays on add), loop?(true), speed?(1), playing?(true), fit?(px: scaled so its largest side is this size, centred; otherwise 1 model unit = 1 px at scale 1), material?, color?(tint), opacity?, shading? (override the model\'s own materials) }, e.g. { op:"add", id:"ship", kind:"model", params:{ src:"https://example.com/ship.glb", fit:200, animation:0 } }. kind:"text" (extruded 3D text, lit like a mesh): { text, font?(CSS family; default the theme display font), size?(48 px), depth?(8 px), bevel?(0), align?:"left"|"center"|"right", color? or material? }, e.g. params:{ text:"LEVEL 2", size:72, depth:14, material:"gold" }. kind:"label" (crisp 2D text facing the camera): { text, font?, size?(14 px), color?($textPrimary), background?, padding?(6), radius?, maxWidth?(wraps), screenSpace?(true: the same size at any depth), anchor?:[ax,ay] }, e.g. params:{ text:"Score 120", background:"$windowBg", radius:4 }. kind:"line" (thick lines, width in screen px): { points:[[x,y,z],...], width?(2), color?, colors?(one per point), widths?(multipliers), closed?, dashed?:{ dash, gap }, join?:"miter"|"round", cap?:"butt"|"round", blend?, ribbon?(true: a camera-facing strip of world width) }, e.g. params:{ points:[[0,0,0],[80,-40,20],[160,0,0]], width:4, color:"$accent", join:"round" }. trail?:true|{ width?, color?, lifetime?(ms), length? } on any node leaves a fading ribbon behind it as it moves. kind:"sky" (a dome behind everything else in its subtree): { top?, horizon?, bottom?, sun?:{ direction (toward the sun, y-down), color?, size?(degrees) }, stars?:true|density, texture?(equirect image) } (an environment sky only lights; add a sky node to see one). Model, text, label and line nodes take input like meshes (interactive: true).  Canvas params (kind:\'canvas\' — a 2D drawing layer living in the scene; the window\'s own content is the BACKMOST 2D layer of the subtree): { width, height (px size of the layer\'s rectangle; transform.scale multiplies), commands? (standard 2D draw commands painted onto the layer — an update supplying commands REPLACES the whole batch and repaints; the layer starts transparent, so unpainted areas show the scene behind it), opacity?, radius?, interactive? }. Particles params (kind:\'particles\', an emitter simulated on the GPU, up to 20000 live particles in one draw): { rate? (per second, streams while > 0: the desktop redraws while it streams, so set rate 0 or remove it when idle), burst? (count emitted once on add, again whenever burstKey changes), burstKey?, lifetime? (ms), speed?:[min,max] px/s, direction?:[x,y,z], spread? (cone radians), gravity? (px/s², +y down), drag? (0..1 of speed lost per second), turbulence? (px/s swirl), size?:[min,max] px, sizeEnd? (px or [min,max]), spin? (rad/s or [min,max]), color?, colorEnd?, opacity?, opacityEnd?, shape?:"glow"|"square", texture? (a sprite: url|dataURI|"surface:<id>", tinted by color), blend?:"additive"|"normal" (default: light colors glow additively, darker ones cover), emitterSize?:[w,h,d], maxParticles? (300, up to 20000) }, e.g. { op:"add", id:"sparks", kind:"particles", params:{ rate:200, speed:[120,220], spread:0.4, gravity:300, drag:0.4, color:"#ffd166", colorEnd:"$accent", sizeEnd:0 } }. Canvas layers slice meshes by depth: meshes behind the layer\'s z draw under it, meshes in front draw over it — 2D and 3D stack in any order (put HUD/text on a canvas layer in front of the meshes). ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse"|"shake"|"flash"|"float"|"wobble"|"breathe"|"hover" (shake: decaying jolt; flash: emissive to params.color and back; float: slow drift and sway; wobble: jelly twist after a hit; breathe: slow swell; hover: lift toward the viewer; amplitude? and duration? tune them), channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing? (linear|standard|easeInOut|backOut|bounce|elastic|... or [x1,y1,x2,y2]), loop?, yoyo?, delay?, path?:[[x,y,z],...], keyframes?:[{ t (ms from the start), value, easing? }] (a key easing shapes the segment starting at it), spring?:true|{ stiffness?(170), damping?(26), mass?(1) } (with to: spring physics; a new to retargets it keeping its speed), stop?:true } }, e.g. { op:"animate", id:"gem", params:{ channel:"scale", keyframes:[{ t:0, value:1 }, { t:300, value:1.3, easing:"backOut" }, { t:700, value:1 }] } }. CONSTRAINTS (node params): lookAt?:[x,y,z] (parent space) | { node:"<id>" } turns the node so its local +z faces it; follow?:{ node:"<id>", offset?:[x,y,z], stiffness?(0..1, 0.15) } eases it after another node; null clears, e.g. params:{ lookAt:{ node:"ship" } }. CAMERA (kind:"camera", one per window): the window 3D subtree renders through it instead of the default camera, still glued to and clipped by the window (pop-out nodes with clip:"none" keep the window\'s own view); transform.position is the eye (default: where the default camera sits), params { target?:[x,y,z] (origin), fov? (degrees, 30), orbit?:true|{ button?:"left"|"middle"|"right", minDistance?, maxDistance?, minPitch?, maxPitch?, damping? } (drag inside the window to turn around target), zoom?:true (wheel dollies), viewport?:{ x, y, width, height } (window px where drags orbit) }; the owner gets nodeInput cameraChange { nodeId, position, target, phase } (throttled) and the view survives reconnects, e.g. { op:"add", id:"cam", kind:"camera", transform:{ position:[0,-200,700] }, params:{ orbit:true, zoom:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default. params.clip: "content" (default) | "window" (the whole window, title bar included) | "none" (pops out past the window, depth-correct against the windows above: near parts draw over them, far parts hide behind them; params.occlude:false means the same). INTERACTION: interactive:true makes a node an input target (nodeInput: mousedown/mouseup/mousemove/mouseenter/mouseleave/focus/blur/keydown/keyup/wheel with deltaX, deltaY). draggable:true or { plane?:"xy"|"xz"|"yz", axis?:"x"|"y"|"z", bounds?:{ min:[x,y,z], max:[x,y,z] }, snap?:px, inertia?:true } lets the user drag the node in the browser (planes and bounds in the node\'s parent space; on a group, pressing any child drags the group); the owner gets nodeInput dragStart, dragMove (about 10/s) and dragEnd with position (the new transform.position) and hitNodeId, e.g. { op:"add", id:"knob", kind:"mesh", transform:{ position:[0, 40, 30], scale:36 }, params:{ primitive:"sphere", color:"$accent", draggable:{ axis:"x", bounds:{ min:[-150, 40, 30], max:[150, 40, 30] } } } }. focusable:true: pressing the node gives it the keyboard exclusively (keys stop reaching the window until the user clicks elsewhere). cursor:"pointer"|"grab"|"crosshair"|... sets the hover cursor. A window can also RIDE a node: see attachTo. LAYERS: the window\'s own content is the BACKMOST 2D layer; a kind:"canvas" node is a 2D drawing layer in the scene — params { width, height, commands (standard 2D draw commands; an update replaces the batch and repaints; the layer starts transparent), opacity?, radius? }. Canvas layers slice meshes by z: meshes behind draw under, meshes in front draw over — 2D and 3D stack in any order (put HUD/text on a canvas node in front of the meshes). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
                 parameters: [
                   { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
+                  { name: 'origin', type: { kind: 'primitive', primitive: 'string' }, description: '"center" (default: positions are px from the window centre) or "topLeft": root nodes added in this batch hang under a window-owned group kept at the window\'s top-left corner, so positions are the same window px widgets draw at (title bar included) and stay put when the window resizes. Later updates and animations of those nodes keep using top-left px.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -220,6 +236,32 @@ export class WindowAbject extends Abject {
                   { name: 'z', type: { kind: 'primitive', primitive: 'number' }, description: 'Lift toward the viewer in px', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'attachTo',
+                description: 'Make this window ride a 3D scene node: the whole window (slab, widgets and its own 3D subtree) follows the node\'s position and rotation every frame, and its buttons and widgets keep working. { scope: "world", nodeId, ownerId? } rides a world node (ownerId defaults to the caller, the usual case: your own world node); { scope: "window", windowId | surfaceId, nodeId } rides a node in another window\'s scene. offset: [x, y, z] px from the node (in the node\'s frame) to this window\'s centre. { detach: true } lets go. Title-bar drags move the window relative to its anchor; resize-edge cursors are approximate while attached. The window lets go by itself when the node or its owner goes away. Example: add a world group { op:"add", id:"cart", kind:"group", transform:{ position:[500, 400, 0] } }, then attachTo({ scope:"world", nodeId:"cart", offset:[0, -120, 0] }), then animate or drag "cart" and the window travels with it.',
+                parameters: [
+                  { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: '"world" or "window"', optional: true },
+                  { name: 'nodeId', type: { kind: 'primitive', primitive: 'string' }, description: 'The node to ride', optional: true },
+                  { name: 'ownerId', type: { kind: 'primitive', primitive: 'string' }, description: 'World scope: the abject owning the world node (default: the caller)', optional: true },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window scope: the host window whose scene holds the node', optional: true },
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window scope: the host surface (instead of windowId)', optional: true },
+                  { name: 'offset', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } }, description: '[x, y, z] px from the node to the window centre', optional: true },
+                  { name: 'detach', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true to stop riding', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getSurfaceId',
+                description: 'The UIServer surface id of this window (for UIServer-level calls such as attaching another window to a node in this window\'s scene).',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'getWindowId',
+                description: 'This window\'s own id. Widgets and nested layouts ask their owner for it (layouts pass the question up), so a widget deep in a layout can reach its window, e.g. to hang scene decorations on it.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'string' },
               },
             ],
             events: [
@@ -253,6 +295,11 @@ export class WindowAbject extends Abject {
                 description: 'Window was restored from minimized state',
                 payload: { kind: 'object', properties: {} },
               },
+              {
+                name: 'windowFocus',
+                description: 'The window gained or lost focus (to dependents; widgets with an open pop-out close it on blur)',
+                payload: { kind: 'object', properties: { focused: { kind: 'primitive', primitive: 'boolean' } } },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -268,6 +315,9 @@ export class WindowAbject extends Abject {
     this.chromeless = config.chromeless ?? false;
     this.transparent = config.transparent ?? false;
     this.closable = config.closable ?? true;
+    contractRequire(config.screenAnchor === undefined || isScreenAnchor(config.screenAnchor),
+      'screenAnchor must be one of top-left, top, top-right, left, center, right, bottom-left, bottom, bottom-right');
+    this.screenAnchor = config.screenAnchor;
     this.focusOnCreate = config.focusOnCreate ?? true;
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
@@ -354,11 +404,16 @@ export class WindowAbject extends Abject {
     // UIServer routes the nodes' input back to the contributor and tears the
     // nodes down if the contributor dies.
     this.on('scene', async (msg: AbjectMessage) => {
-      const { ops } = msg.payload as { ops: unknown[] };
+      const { ops, origin } = msg.payload as { ops: unknown[]; origin?: 'center' | 'topLeft' };
       contractRequire(this.surfaceId !== undefined, 'scene: window has no surface yet');
+      contractRequire(origin === undefined || origin === 'center' || origin === 'topLeft',
+        `scene: origin must be 'center' (default) or 'topLeft', got ${String(origin)}`);
+      // Everything below runs before the first await, so batches reach the
+      // UIServer in the order they arrived (an add never overtakes its remove).
+      const out = origin === 'topLeft' ? this.hangOnOriginAnchor(ops) : ops;
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'scene', {
-          surfaceId: this.surfaceId, ops, contributorId: msg.routing.from,
+          surfaceId: this.surfaceId, ops: out, contributorId: msg.routing.from,
         })
       );
     });
@@ -422,6 +477,51 @@ export class WindowAbject extends Abject {
       contractRequire(this.surfaceId !== undefined, 'setSlabTransform: window has no surface yet');
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'setSurfaceTransform', { surfaceId: this.surfaceId, rotation, z })
+      );
+    });
+
+    this.on('getSurfaceId', async () => {
+      contractRequire(this.surfaceId !== undefined, 'getSurfaceId: window has no surface yet');
+      return this.surfaceId;
+    });
+
+    // Widgets ask their owner chain for their window (nested layouts pass the
+    // question up); the window answers with itself.
+    this.on('getWindowId', async () => this.id);
+
+    // Ride a scene node (world or another window's): the UIServer keeps the
+    // anchor, the client moves the slab with the node every frame.
+    this.on('attachTo', async (msg: AbjectMessage) => {
+      const p = (msg.payload ?? {}) as {
+        scope?: 'world' | 'window'; nodeId?: string; ownerId?: string;
+        windowId?: AbjectId; surfaceId?: string; offset?: [number, number, number]; detach?: boolean;
+      };
+      contractRequire(this.surfaceId !== undefined, 'attachTo: window has no surface yet');
+      if (p.detach === true) {
+        return this.request<boolean>(
+          request(this.id, this.uiServerId, 'attachSurface', { surfaceId: this.surfaceId, target: null })
+        );
+      }
+      contractRequire(p.scope === 'world' || p.scope === 'window',
+        'attachTo: scope must be "world" (a world node) or "window" (a node in another window\'s scene), or pass { detach: true }');
+      contractRequire(typeof p.nodeId === 'string' && p.nodeId.length > 0, 'attachTo: nodeId must name the scene node to ride');
+      contractRequire(p.offset === undefined || (Array.isArray(p.offset) && p.offset.length === 3
+        && p.offset.every((v) => typeof v === 'number' && Number.isFinite(v))), 'attachTo: offset must be [x, y, z] px');
+      let target: Record<string, unknown>;
+      if (p.scope === 'world') {
+        target = { scope: 'world', nodeId: p.nodeId, ownerId: p.ownerId ?? msg.routing.from, ...(p.offset ? { offset: p.offset } : {}) };
+      } else {
+        let hostSurface = p.surfaceId;
+        if (!hostSurface && p.windowId) {
+          contractRequire(p.windowId !== this.id, 'attachTo: a window cannot ride a node in its own scene');
+          hostSurface = await this.request<string>(request(this.id, p.windowId, 'getSurfaceId', {}));
+        }
+        contractRequire(typeof hostSurface === 'string' && hostSurface.length > 0,
+          'attachTo: a window-scope anchor needs windowId (the host window) or surfaceId');
+        target = { scope: 'window', nodeId: p.nodeId, surfaceId: hostSurface, ...(p.offset ? { offset: p.offset } : {}) };
+      }
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'attachSurface', { surfaceId: this.surfaceId, target })
       );
     });
 
@@ -509,6 +609,8 @@ export class WindowAbject extends Abject {
     // Focus/unfocus events from UIServer
     this.on('focus', async (msg: AbjectMessage) => {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
+      // Dependents hear focus transitions (an open pop-out closes on blur).
+      if (focused !== this.windowFocused) this.changed('windowFocus', { focused });
       this.windowFocused = focused;
       void this.syncFocusDecoration();
 
@@ -532,7 +634,10 @@ export class WindowAbject extends Abject {
         }
         this.hoveredChildId = undefined;
       }
-      if (!focused) this.hoveredTitleButton = undefined;
+      if (!focused) {
+        this.hoveredTitleButton = undefined;
+        this.syncChromeTip();
+      }
 
       this.scheduleFrame();
     });
@@ -580,6 +685,7 @@ export class WindowAbject extends Abject {
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;
       this.rect = { x, y, width, height };
       if (sizeChanged && this.decorationShown) void this.placeFocusDecoration();
+      if (sizeChanged && this.originAnchorShown) this.placeOriginAnchor();
 
       // Update the actual UIServer surface so it matches the new rect
       if (this.surfaceId) {
@@ -691,16 +797,27 @@ deformable surfaces (waves, terrain, generated shapes): params { geometry:
 op each tick to deform it (buffers reuse, so per-frame morphing is cheap).
 Primitives: plane, box, sphere, cylinder, cone, torus, icosphere. Material
 params: metalness/roughness (0..1, PBR), emissive (glow), texture (url|dataURI|
-'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize.
-Lights: lightType 'point'|'directional'|'spot' with color, intensity, range,
-angle, penumbra. INTENSITY IS A LINEAR MULTIPLIER ON THE LIGHT'S COLOR
+'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize,
+material:'<preset name>' (gold, chrome, glass, neon, hologram, toon, ... from
+the SceneLibrary; the node's own params override it), shading 'standard'|
+'unlit'|'toon'|'matcap'|'rim', blend 'additive' (glows), normalMap/roughnessMap/
+metalnessMap/aoMap/emissiveMap + uvRepeat/uvOffset, clearcoat, sheen,
+transmission + ior (glass), outline, castShadow/receiveShadow.
+Lights: lightType 'point'|'directional'|'spot'|'hemisphere' with color,
+intensity, range, angle, penumbra, direction (the way the light travels),
+groundColor (hemisphere), castShadow (directional or spot) + shadow:{ size,
+softness, bias }. INTENSITY IS A LINEAR MULTIPLIER ON THE LIGHT'S COLOR
 (1 = that color at full strength), NOT watts/lumens/candela — key lights run
 0.8-1.6, fills 0.3-0.6, and anything over 10 is REJECTED because it pushes
 every channel past white and renders every lit mesh PURE WHITE, erasing its
 own color. Light a bigger scene with 'range' (reach in world px), never with
 a bigger intensity. A kind:'environment' node sets { ambient (a COLOR '#hex'/$token, NOT a
 number — brightness rides in the color's lightness), fog:{color,near,far} (near/far = depth
-in px behind the content, small e.g. 0..400), bloom }. Scene ops validate ATOMICALLY: one
+in px behind the content, small e.g. 0..400), bloom }, plus look:'<name>'
+(studio, sunset, night, ...), sky:{ top, horizon, bottom, sun:{ direction
+toward the sun } } (lights and reflects the meshes), envMap, toneMapping
+'neutral'|'aces'|'agx'|'none', exposure, grading:{ contrast, saturation,
+temperature, tint }, and fog { mode:'exp'|'exp2', density } or height fog. Scene ops validate ATOMICALLY: one
 invalid node rejects the whole batch and nothing renders.
 ANIMATE without per-frame messages: { op:'animate', id, params:{ preset:'spin'|
 'orbit'|'bob'|'pulse' } } or { channel:'position'|'rotation'|'scale'|'color'|
@@ -754,6 +871,15 @@ keydown|keyup. Clicking an interactive mesh selects it; keyboard routes to it
 until the user clicks elsewhere. Drag capture is built in: after mousedown on a mesh,
 mousemove streams to it until mouseup — drag = position [startX + dx,
 startY + dy, z], both axes same sign.
+Or let the desktop do the dragging: params.draggable:true (or { plane, axis,
+bounds, snap, inertia }) moves the node in the browser at full frame rate and
+sends you dragStart / dragMove / dragEnd with its new position. focusable:true
+makes a pressed node the only keyboard receiver; 'wheel' events carry deltaX /
+deltaY; clip:'window' lets a node cover the title bar and clip:'none' pops it
+out of the window (depth-correct against the windows above).
+RIDING 3D: attachTo({ scope: 'world', nodeId, offset? }) hangs this whole
+window on one of your world nodes (it follows the node's position and
+rotation; widgets keep working); attachTo({ detach: true }) lets go.
 DECORATING: you may attach scene nodes to a window you do NOT own — find it
 via WidgetManager listWindows, then call its 'scene' with your nodes. Your
 nodes' nodeInput events come back to YOU (windowId in the payload), and they
@@ -767,7 +893,7 @@ by re-matching title/owner.
 
 ### Interface ID
 
-'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy, scene, setSlabTransform`;
+'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy, scene, setSlabTransform, attachTo, getSurfaceId`;
   }
 
   protected async onInit(): Promise<void> {
@@ -778,6 +904,8 @@ by re-matching title/owner.
         zIndex: this.zIndex,
         transparent: this.transparent,
         closable: this.closable,
+        chromeless: this.chromeless,
+        ...(this.screenAnchor ? { screenAnchor: this.screenAnchor } : {}),
       })
     );
     // Forward title to frontend for mobile tab bar
@@ -878,6 +1006,99 @@ by re-matching title/owner.
       if (Math.abs(x - centers[kind]) <= half) return kind;
     }
     return undefined;
+  }
+
+  /**
+   * Title-button tooltips follow the hover: any change drops the shown tip
+   * and, over a button, schedules the next after the usual dwell. The tip is
+   * a pop-out (popout.ts) under the button, so it may leave the window.
+   */
+  private syncChromeTip(): void {
+    this.dropChromeTip();
+    const kind = this.hoveredTitleButton;
+    if (kind && this.surfaceId) {
+      this.chromeTipTimer = this.setTimer(() => this.showChromeTip(kind), TOOLTIP_DELAY_MS);
+    }
+  }
+
+  private dropChromeTip(): void {
+    this.cancelTimer(this.chromeTipTimer);
+    this.chromeTipTimer = undefined;
+    if (this.chromeTip?.isOpen) void this.chromeTip.hide();
+  }
+
+  private async showChromeTip(kind: TitleButtonKind): Promise<void> {
+    this.chromeTipTimer = undefined;
+    const sid = this.surfaceId;
+    if (this.hoveredTitleButton !== kind || !sid) return;
+    const tip = this.chromeTip ??= new PopoutSurface({
+      scene: (ops) => this.request(request(this.id, this.uiServerId, 'scene', { surfaceId: sid, ops, contributorId: this.id })),
+      draw: (nodeId, commands) => this.request(request(this.id, this.uiServerId, 'draw', {
+        commands: commands.map((c) => ({ ...(c as Record<string, unknown>), surfaceId: sid, nodeId })),
+      })),
+      geometry: async () => {
+        const screen = await cachedScreenSize(() =>
+          this.request<{ width: number; height: number }>(request(this.id, this.uiServerId, 'getDisplayInfo', {}), 3000));
+        return screen ? { window: { x: this.rect.x, y: this.rect.y }, screen } : null;
+      },
+    }, TOOLTIP_NODE_ID, { interactive: false });
+    const size = this.theme.titleButtonSize;
+    const tbh = this.theme.titleBarHeight;
+    const text = kind === 'close' ? 'Close'
+      : kind === 'minimize' ? 'Minimize'
+      : kind === 'maximize' ? (this.maximized ? 'Restore' : 'Maximize')
+      : 'Inspect methods';
+    await showTooltip(tip, {
+      text,
+      anchor: { x: this.titleButtonCenters()[kind] - size / 2, y: tbh / 2 - size / 2, width: size, height: size },
+      side: 'below',
+      theme: this.theme,
+      measure: (t, font) => this.request<number>(request(this.id, this.uiServerId, 'measureText', { surfaceId: sid, text: t, font })),
+    }).catch(() => { /* no surface to hang it on */ });
+    if (this.hoveredTitleButton !== kind) void tip.hide();
+  }
+
+  // ── Top-left scene origin ──────────────────────────────────────────
+  // `scene` with origin: 'topLeft' hangs the batch's root nodes under one
+  // window-owned group kept at the window's top-left corner, so callers
+  // (widgets, decorators) place nodes in the same px they draw at and never
+  // re-send them when the window resizes. The group is created on first use
+  // and lives as long as the window.
+
+  static readonly ORIGIN_ANCHOR = 'window-origin-tl';
+
+  /** Re-parent a batch's root adds onto the top-left anchor (creating it first if needed). */
+  private hangOnOriginAnchor(ops: unknown[]): unknown[] {
+    contractRequire(Array.isArray(ops), 'scene: ops must be an array');
+    const anchor = WindowAbject.ORIGIN_ANCHOR;
+    if (!this.originAnchorShown) {
+      // Sent synchronously ahead of the caller's batch, as the window's own
+      // node, so it outlives every contributor hanging things on it.
+      this.originAnchorShown = true;
+      this.request(request(this.id, this.uiServerId, 'scene', {
+        surfaceId: this.surfaceId,
+        ops: [{ op: 'add', id: anchor, kind: 'group', transform: { position: this.originAnchorPosition() } }],
+        contributorId: this.id,
+      })).catch(() => { this.originAnchorShown = false; });
+    }
+    return ops.map((raw) => {
+      const op = raw as Record<string, unknown>;
+      if (!op || op.op !== 'add' || op.parentId !== undefined || op.parent !== undefined) return raw;
+      return { ...op, parentId: anchor };
+    });
+  }
+
+  private originAnchorPosition(): [number, number, number] {
+    return [-this.rect.width / 2, -this.rect.height / 2, 0];
+  }
+
+  private placeOriginAnchor(): void {
+    if (!this.surfaceId) return;
+    this.request(request(this.id, this.uiServerId, 'scene', {
+      surfaceId: this.surfaceId,
+      ops: [{ op: 'update', id: WindowAbject.ORIGIN_ANCHOR, transform: { position: this.originAnchorPosition() } }],
+      contributorId: this.id,
+    })).catch(() => {});
   }
 
   // ── Focus decoration ───────────────────────────────────────────────
@@ -1148,6 +1369,7 @@ by re-matching title/owner.
   private async handleMouseLeave(): Promise<void> {
     if (this.hoveredTitleButton) {
       this.hoveredTitleButton = undefined;
+      this.syncChromeTip();
       this.scheduleFrame();
     }
     // Send mouseleave to hovered child
@@ -1179,6 +1401,7 @@ by re-matching title/owner.
   }
 
   private async handleMouseDown(e: { x?: number; y?: number }): Promise<void> {
+    this.dropChromeTip();  // a press acts now; its tooltip has said its piece
     const localX = e.x ?? 0;
     const localY = e.y ?? 0;
 
@@ -1278,6 +1501,7 @@ by re-matching title/owner.
       const hit = this.titleButtonAt(e.x ?? 0, e.y ?? 0);
       if (hit !== this.hoveredTitleButton) {
         this.hoveredTitleButton = hit;
+        this.syncChromeTip();
         this.scheduleFrame();
       }
     }

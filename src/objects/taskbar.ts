@@ -13,7 +13,7 @@ import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { chromeCase } from '../core/theme-data.js';
-import { dockStyles, type DockLauncher } from './dock-style.js';
+import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
 
 const log = new Log('Taskbar');
 
@@ -52,9 +52,19 @@ export class Taskbar extends Abject {
   /** Horizontal dock collapse (pushed via show()): render icon-only rows. */
   private compact = false;
   private headerBtnId?: AbjectId;
-  /** Chat system-row button (for the goal-activity busy pulse). */
+  /** Chat system-row button (wears the busy light while a chat works). */
   private chatBtnId?: AbjectId;
   private chatBusy = false;
+  /** Jobs system-row button (wears the busy light while a job runs). */
+  private jobsBtnId?: AbjectId;
+  private jobManagerId?: AbjectId;
+  /** Jobs running now, from JobManager's jobStarted / jobCompleted / jobFailed. */
+  private runningJobs = new Set<string>();
+  /** Debounced jobs light: quick jobs back to back read as one steady light. */
+  private jobsLight = new ActivityLatch(
+    (busy) => this.setRowBusy(this.jobsBtnId, busy),
+    { set: (fn, ms) => this.setTimer(fn, ms), cancel: (h) => this.cancelTimer(h) },
+  );
 
   // Button -> target maps for click dispatch
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
@@ -161,6 +171,27 @@ can restore windows from the sidebar.
     if (this.registryId) {
       await this.request(request(this.id, this.registryId, 'subscribe', {}));
     }
+    await this.watchJobs();
+  }
+
+  /**
+   * Subscribe to JobManager's job lifecycle (once it exists) and seed the
+   * running set from its current jobs, so the Jobs row lights while any job
+   * runs. Retried from rebuild() when JobManager registered after us.
+   */
+  private async watchJobs(): Promise<void> {
+    if (this.jobManagerId) return;
+    const id = await this.discoverDep('JobManager') ?? undefined;
+    if (!id) return;
+    this.jobManagerId = id;
+    this.send(request(this.id, id, 'addDependent', {}));
+    try {
+      const jobs = await this.request<Array<{ jobId: string; status: string }>>(
+        request(this.id, id, 'listJobs', {}), 5000,
+      );
+      for (const j of jobs ?? []) if (j?.status === 'running') this.runningJobs.add(j.jobId);
+    } catch { /* JobManager busy or gone: the next lifecycle event catches us up */ }
+    this.jobsLight.set(this.runningJobs.size > 0);
   }
 
   private setupHandlers(): void {
@@ -188,8 +219,18 @@ can restore windows from the sidebar.
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (aspect === 'goalActivity') {
-        // A chat is busy (turn running or goal active) → pulse the chat icon.
+        // A chat is busy (turn running or goal active) → light the chat row.
         this.setChatBusy(!!(value as { active?: boolean } | undefined)?.active);
+        return;
+      }
+      if (msg.routing.from === this.jobManagerId
+        && (aspect === 'jobStarted' || aspect === 'jobCompleted' || aspect === 'jobFailed')) {
+        const jobId = (value as { jobId?: string } | undefined)?.jobId;
+        if (jobId) {
+          if (aspect === 'jobStarted') this.runningJobs.add(jobId);
+          else this.runningJobs.delete(jobId);
+        }
+        this.jobsLight.set(this.runningJobs.size > 0);
         return;
       }
       if (aspect === 'visibility') {
@@ -282,6 +323,8 @@ can restore windows from the sidebar.
     this.windowId = undefined;
     this.sectionLayoutId = undefined;
     this.headerBtnId = undefined;
+    this.chatBtnId = undefined;
+    this.jobsBtnId = undefined;
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -310,6 +353,7 @@ can restore windows from the sidebar.
     if (!this.externalProjectBrowserId) {
       this.externalProjectBrowserId = await this.discoverDep('ExternalProjectBrowser') ?? undefined;
     }
+    if (!this.jobManagerId) await this.watchJobs();
     this.buildingUI = true;
     try {
       await this.rebuildSection();
@@ -323,6 +367,8 @@ can restore windows from the sidebar.
   private async rebuildSection(): Promise<void> {
     await this.request(request(this.id, this.sectionLayoutId!, 'clearLayoutChildren', {}));
     this.headerBtnId = undefined;
+    this.chatBtnId = undefined;
+    this.jobsBtnId = undefined;
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -389,9 +435,9 @@ can restore windows from the sidebar.
     }
     const sysRowStartIdx = specs.length;
     if (!collapsed) {
-      // Chat (opens ChatBrowser overview). A rebuild creates fresh widgets, so
-      // the row is born in the busy look when a chat is already working.
-      specs.push({ type: 'button', windowId: this.windowId!, text: this.chatRowText(this.chatBusy), style: { ...rowStyle('Chat'), ...this.chatRowStyle(this.chatBusy) } });
+      // Chat (opens ChatBrowser overview). A rebuild creates fresh widgets;
+      // the busy light is re-applied once the rows are laid out (below).
+      specs.push({ type: 'button', windowId: this.windowId!, text: this.chatRowText(), style: { ...rowStyle('Chat'), ...this.chatRowStyle(this.chatBusy) } });
       // Peers is meaningful only for shared/public (including joined) workspaces.
       if (showPeers) {
         specs.push({ type: 'button', windowId: this.windowId!, text: row('peers', 'Peers'), style: rowStyle('Peers', 'peers') });
@@ -465,7 +511,8 @@ can restore windows from the sidebar.
       this.systemButtons.set(chatBtnId, this.chatBrowserId!);
       if (showPeers) this.systemButtons.set(widgetIds[idx++], this.peersViewerId!);
       if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
-      this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
+      this.jobsBtnId = widgetIds[idx++];
+      this.systemButtons.set(this.jobsBtnId, this.jobBrowserId!);
       if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
       if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
       if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
@@ -520,6 +567,10 @@ can restore windows from the sidebar.
       }));
     }
 
+    // Fresh rows are born idle: light the ones whose activity is live now.
+    if (this.chatBusy) this.setRowBusy(this.chatBtnId, true);
+    if (this.jobsLight.busy) this.setRowBusy(this.jobsBtnId, true);
+
     // Register as dependent of all buttons (for click events)
     for (const [btnId] of this.systemButtons) {
       this.send(request(this.id, btnId, 'addDependent', {}));
@@ -566,44 +617,47 @@ can restore windows from the sidebar.
    * inactive), so click-away and close are reflected and every open app shows.
    */
   /**
-   * Apply/clear the chat row's busy indicator on the `goalActivity` aspect.
+   * Apply/clear the chat row's busy light on the `goalActivity` aspect
+   * (ChatManager aggregates every chat, so one idle chat never clears
+   * another's light).
    *
-   * The indicator is deliberately static (accent ink + a trailing dot), not
-   * the widget `busy` halo: that halo is a 60 fps tween, and every frame
-   * re-renders the whole sidebar dock (~3000 bus messages/s measured), for
-   * the full duration of a goal. A static look costs one redraw per
-   * transition and stays fully clickable.
+   * The light is the widget `busy` state: a static frame in the row's paint
+   * plus a breathing frame and a running light the browser animates as scene
+   * nodes. It costs one row repaint per transition, never a timer, so it can
+   * stay on for the whole length of a goal.
    */
   private setChatBusy(busy: boolean): void {
     if (this.chatBusy === busy) return;
     this.chatBusy = busy;
-    if (this.chatBtnId) {
+    this.setRowBusy(this.chatBtnId, busy);
+    // Compact rows have no label; the tooltip says what the light means.
+    if (this.compact && this.chatBtnId) {
       try {
-        this.send(event(this.id, this.chatBtnId, 'update', {
-          text: this.chatRowText(busy),
-          style: this.chatRowStyle(busy),
-        }));
+        this.send(event(this.id, this.chatBtnId, 'update', { style: this.chatRowStyle(busy) }));
       } catch { /* widget gone */ }
     }
   }
 
-  /** Chat row label; the trailing sigil marks a chat that is working on a goal. */
-  private chatRowText(busy: boolean): string {
-    // The vector icon rides in the style (see chatRowStyle).
-    if (this.compact) return '';
-    return busy ? 'Chat \u25C9' : 'Chat';
+  /** Turn a dock row's busy light on or off (one event; the row repaints once). */
+  private setRowBusy(btnId: AbjectId | undefined, busy: boolean): void {
+    if (!btnId) return;
+    try {
+      this.send(event(this.id, btnId, 'update', { busy }));
+    } catch { /* widget gone */ }
+  }
+
+  /** Chat row label (the vector icon rides in the style; see chatRowStyle). */
+  private chatRowText(): string {
+    return this.compact ? '' : 'Chat';
   }
 
   /**
-   * Chat row ink: the living light while busy, primary when idle. In compact
-   * (icon-only) mode the tooltip carries the state since there is no label.
+   * Chat row style: the chat icon, plus in compact (icon-only) mode a tooltip
+   * that says whether a chat is working, since there is no label.
    */
   private chatRowStyle(busy: boolean): Record<string, unknown> {
-    const style: Record<string, unknown> = {
-      color: busy ? this.theme.accentSecondary : this.theme.textPrimary,
-      icon: 'chat',
-    };
-    if (this.compact) style.tooltip = busy ? 'Chat \u25C9 working' : 'Chat';
+    const style: Record<string, unknown> = { icon: 'chat' };
+    if (this.compact) style.tooltip = busy ? 'Chat (working)' : 'Chat';
     return style;
   }
 

@@ -38,14 +38,27 @@ interface PaletteEntry {
   id: AbjectId;
   name: string;
   description: string;
-  /** Special action entries (e.g. "start a chat") instead of showing an object. */
-  action?: 'chat';
+  /** Special action entries (start a chat, a desktop command) instead of showing an object. */
+  action?: 'chat' | 'expose';
   /** The typed query, carried on the chat action entry. */
   query?: string;
 }
 
 /** Sentinel id for the synthetic "Chat about …" entry shown when nothing matches. */
 const CHAT_ENTRY_ID = 'palette:new-chat' as AbjectId;
+
+/**
+ * Desktop commands listed ahead of the objects (they match by name and
+ * description like any entry). Each names the action activateEntry runs.
+ */
+const PALETTE_COMMANDS: readonly PaletteEntry[] = [
+  {
+    id: 'palette:expose' as AbjectId,
+    name: 'Show All Windows',
+    description: 'Expos\u00E9: spread every open window to pick one (F3 or Ctrl+\u2191)',
+    action: 'expose',
+  },
+];
 
 const PALETTE_WIDTH = 520;
 const PALETTE_HEIGHT = 380;
@@ -305,6 +318,15 @@ export class CommandPaletteAbject extends Abject {
   }
 
   private async activateEntry(entry: PaletteEntry): Promise<void> {
+    if (entry.action === 'expose') {
+      // Step aside first, then spread the windows on the user's screen.
+      await this.closePalette();
+      if (!this.widgetManagerId) return;
+      try {
+        await this.request(request(this.id, this.widgetManagerId, 'showExpose', {}));
+      } catch { /* no client to show it on */ }
+      return;
+    }
     if (entry.action === 'chat') {
       const text = (entry.query ?? this.query).trim();
       const chatId = await this.startChat(text);
@@ -350,7 +372,7 @@ export class CommandPaletteAbject extends Abject {
   // ── Search / filter ─────────────────────────────────────────────────
 
   private async refreshEntries(): Promise<void> {
-    if (!this.registryId) return;
+    if (!this.registryId) { this.entries = [...PALETTE_COMMANDS]; return; }
     let summaries: RegistrySummary[] = [];
     try {
       summaries = await this.request<RegistrySummary[]>(
@@ -360,14 +382,17 @@ export class CommandPaletteAbject extends Abject {
       summaries = [];
     }
 
-    this.entries = summaries
-      .filter((s) => hasShowMethod(s))
-      .map((s) => ({
-        id: s.id,
-        name: s.name ?? '',
-        description: s.description ?? '',
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    this.entries = [
+      ...PALETTE_COMMANDS,
+      ...summaries
+        .filter((s) => hasShowMethod(s))
+        .map((s) => ({
+          id: s.id,
+          name: s.name ?? '',
+          description: s.description ?? '',
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    ];
   }
 
   private applyFilter(): void {

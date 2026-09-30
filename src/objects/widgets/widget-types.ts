@@ -34,11 +34,11 @@ export interface WidgetStyle {
   markdown?: boolean;    // labels only: parse text as markdown and render with rich formatting
   syntaxHighlight?: boolean;  // textArea only: colorize JavaScript tokens
   flat?: boolean;  // buttons only: quiet row (sidebar/toolbar item) — no depth gradient, bevel, or border; hover/press feedback only
-  tooltip?: string;  // hover tooltip text, shown after a dwell via WidgetManager's tooltip service (used by icon-only buttons)
+  tooltip?: string;  // buttons: hover tooltip text, shown after a dwell as a pop-out beside the button (popout.ts) that may cross the window edge
   icon?: string;  // buttons only: a built-in vector icon name (ui/icons.ts IconName) drawn before the text; unknown names are ignored
 }
 
-export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video';
+export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video' | 'nodeGraph';
 
 // ── Size/rect input normalization ───────────────────────────────────────────
 // Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema
