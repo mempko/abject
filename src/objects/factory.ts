@@ -82,12 +82,12 @@ export class Factory extends Abject {
             methods: [
               {
                 name: 'spawn',
-                description: 'Create a new Abject from manifest',
+                description: 'Create a new Abject from manifest. The payload is the SpawnRequest itself ({ manifest, source?, ... }) or wrapped as { request: { manifest, ... } }.',
                 parameters: [
                   {
                     name: 'request',
                     type: { kind: 'reference', reference: 'SpawnRequest' },
-                    description: 'Spawn configuration',
+                    description: 'Spawn configuration: { manifest, source?, parentId?, registryHint?, ... }',
                   },
                 ],
                 returns: { kind: 'reference', reference: 'SpawnResult' },
@@ -223,8 +223,14 @@ export class Factory extends Abject {
 
   private setupHandlers(): void {
     this.on('spawn', async (msg: AbjectMessage) => {
-      const req = msg.payload as SpawnRequest;
-      return this.spawn(req);
+      // The manifest names one parameter, `request`, so a caller that wraps
+      // arguments by parameter name (the Explorer's method form) sends
+      // { request: { manifest, ... } }; everyone else sends the SpawnRequest
+      // itself. Both are accepted.
+      const payload = (msg.payload ?? {}) as SpawnRequest & { request?: SpawnRequest };
+      const wrapped = payload.manifest === undefined
+        && typeof payload.request === 'object' && payload.request !== null;
+      return this.spawn(wrapped ? payload.request! : payload);
     });
 
     this.on('kill', async (msg: AbjectMessage) => {
