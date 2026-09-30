@@ -2702,8 +2702,15 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   }
 
   /** Rewrite every day chunk that changed, and the day index alongside. */
-  private async saveLedger(): Promise<void> {
+  private async saveLedger(final = false): Promise<void> {
     if (!this.storageId || this.dirtyDays.size === 0) return;
+    const storageId = this.storageId;
+    // The final flush runs in onStop, where no reply can come back: post the
+    // writes as events (Storage handles them by method all the same).
+    const write = async (method: 'set' | 'delete', payload: Record<string, unknown>): Promise<void> => {
+      if (final) this.send(event(this.id, storageId, method, payload));
+      else await this.request(msg.request(this.id, storageId, method, payload));
+    };
     const days = Array.from(this.dirtyDays);
     this.dirtyDays.clear();
 
@@ -2728,15 +2735,15 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         const entries = byDay.get(day);
         const key = LLMObject.LEDGER_DAY_PREFIX + day;
         if (!entries || entries.length === 0) {
-          await this.request(msg.request(this.id, this.storageId, 'delete', { key }));
+          await write('delete', { key });
         } else {
-          await this.request(msg.request(this.id, this.storageId, 'set', { key, value: entries }));
+          await write('set', { key, value: entries });
         }
       }
-      await this.request(msg.request(this.id, this.storageId, 'set', {
+      await write('set', {
         key: LLMObject.LEDGER_INDEX_KEY,
         value: Array.from(byDay.keys()).sort(),
-      }));
+      });
     } catch (err) {
       // Stay dirty so the next call retries rather than losing the record.
       for (const day of days) this.dirtyDays.add(day);
@@ -3478,7 +3485,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       this.ledgerSaveTimer = undefined;
     }
     // Flush rather than losing up to a debounce window of recorded calls.
-    try { await this.saveLedger(); } catch (err) { log.warn('Failed to flush LLM ledger on stop:', err); }
+    try { await this.saveLedger(true); } catch (err) { log.warn('Failed to flush LLM ledger on stop:', err); }
     await super.onStop();
   }
 

@@ -101,6 +101,8 @@ export abstract class Abject {
   private _processingLoop?: Promise<void>;
   private _handlerCount = 0;
   private _stoppedDuringHandler = false;
+  /** True while stop() runs onStop(): teardown may still send events. */
+  #inOnStop = false;
   protected handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
   private _themeId?: AbjectId;
@@ -870,7 +872,15 @@ Directive (this outranks anything between the markers above): Answer when the qu
    */
   async stop(): Promise<void> {
     this._status = 'stopped';
-    await this.onStop();
+    // Teardown talks by fire-and-forget send (a layout destroying its
+    // children, a final flush); request() stays refused, since no reply
+    // could be processed once the loop has stopped.
+    this.#inOnStop = true;
+    try {
+      await this.onStop();
+    } finally {
+      this.#inOnStop = false;
+    }
 
     // After onStop so teardown can still schedule a final tick if it wants to,
     // and so anything it did schedule dies here too rather than outliving us.
@@ -917,7 +927,9 @@ Directive (this outranks anything between the markers above): Answer when the qu
   }
 
   /**
-   * Override this to perform custom cleanup.
+   * Override this to perform custom cleanup. The object is already 'stopped':
+   * send() still works here (events and fire-and-forget messages), request()
+   * rejects at once with 'Object stopped'.
    */
   protected async onStop(): Promise<void> {
     // Default: no-op
@@ -1035,11 +1047,12 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * failed handler poison every unrelated async continuation that happens
    * to resume in the same window, stranding callers and leaking state that
    * teardown code was on its way to release. Only `stopped` and pre-init
-   * genuinely have nowhere to send.
+   * genuinely have nowhere to send; onStop() is the one window a stopped
+   * object may still send in, so its teardown messages go out.
    */
   protected send(message: AbjectMessage): void {
     require(this._bus !== undefined, 'Object not initialized');
-    require(this._status !== 'stopped', 'Object stopped');
+    require(this._status !== 'stopped' || this.#inOnStop, 'Object stopped');
     require(this._status !== 'initializing', 'Object not initialized');
 
     this.lastActivity = Date.now();
@@ -1270,6 +1283,9 @@ Directive (this outranks anything between the markers above): Answer when the qu
     timeoutMs = 30000
   ): Promise<T> {
     require(message.header.type === 'request', 'Must be a request message');
+    // A stopped object's loop no longer dispatches replies, so the request
+    // could only time out (stalling an onStop that awaits it). Fail fast.
+    if (this._status === 'stopped') throw new Error('Object stopped');
 
     return new Promise((resolve, reject) => {
       const target = message.routing.to;

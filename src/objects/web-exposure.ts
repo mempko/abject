@@ -21,7 +21,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WebExposure');
@@ -167,9 +167,11 @@ export class WebExposure extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
-    const gateway = await this.gateway();
-    if (gateway) {
-      try { this.send(request(this.id, gateway, 'dropWorkspace', { workspaceId: await this.ensureWorkspaceId() })); } catch { /* gateway gone */ }
+    // Only what is already known: a stopping object cannot request, and a
+    // gateway we never pushed to has nothing of ours to drop. An event, so
+    // no reply comes back to a stopped object.
+    if (this.gatewayId && this.workspaceId) {
+      try { this.send(event(this.id, this.gatewayId, 'dropWorkspace', { workspaceId: this.workspaceId })); } catch { /* gateway gone */ }
     }
   }
 

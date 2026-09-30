@@ -12,7 +12,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Scheduler');
@@ -181,10 +181,12 @@ export class Scheduler extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
+    // Fire-and-forget: a stopping object cannot wait on a reply.
     if (this.tickTimerId && this.timerId) {
       try {
-        await this.request(request(this.id, this.timerId, 'clearTimer', { timerId: this.tickTimerId }));
+        this.send(event(this.id, this.timerId, 'clearTimer', { timerId: this.tickTimerId }));
       } catch { /* best effort */ }
+      this.tickTimerId = undefined;
     }
   }
 
