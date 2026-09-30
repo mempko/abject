@@ -260,12 +260,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 8000 });
     const p = noulOf(outcome, 'in_scope');
     if (!outcome || p === undefined) return undefined;
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] SkillAgent agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS)' : ''}`);
-      return undefined;
-    }
-    if (p >= 0.1) return undefined;
-    log.info(`SkillAgent agent.ask-scope: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    const pass = outcome.mode === 'act' && p < 0.1;
+    log.info(`[decision:${outcome.mode}] SkillAgent agent.ask-scope: in_scope=${p.toFixed(2)}${pass ? ' → PASS without an LLM call' : ''}`);
+    if (!pass) return undefined;
     return `PASS: this asks for work outside installing, managing, and running installed skills (runtime scope check, in_scope p=${p.toFixed(2)}).`;
   }
 
@@ -1102,9 +1099,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   // A decision model answers typed questions at three points, each its own
   // site with its own policy (src/core/decision-sites.ts): which installed
   // skill a task needs, what the last result means, and which catalog entry
-  // matches a request. Shadow logs, advise adds a line the agent reads, act
-  // takes effect. A null answer (site off, no decision model, timeout)
-  // leaves today's path. Skill env values never enter a decision state.
+  // matches a request. Advise adds a line the agent reads, act takes effect,
+  // and each verdict is logged once. A null answer (site off, no decision
+  // model, timeout) leaves today's path. Skill env values never enter a
+  // decision state.
 
   /** Preselect choices that are not skill names. */
   private static readonly PRESELECT_OPTIONS: Record<string, string> = {
@@ -1214,16 +1212,12 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     if (!outcome || !pick) return {};
     const p = pick.probabilities[pick.choice] ?? 0;
     const skill = candidates.find(s => s.name === pick.choice);
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] SkillAgent skill.preselect: ${pick.choice}@${p.toFixed(2)}`);
-      return {};
-    }
+    log.info(`[decision:${outcome.mode}] SkillAgent skill.preselect: ${pick.choice}@${p.toFixed(2)}`);
     if (outcome.mode === 'act') {
       if (pick.choice === 'authoring_out_of_scope' && p >= 0.9) {
         return { failFast: `This task is object authoring (creating or modifying an object, app, agent, bridge, or integration), which belongs with a creation agent; handing it back for routing (runtime scope check, p=${p.toFixed(2)}).` };
       }
       if (skill && p >= 0.85) {
-        log.info(`SkillAgent skill.preselect: preloading "${skill.name}" (p=${p.toFixed(2)})`);
         const instructions = skill.instructions ?? '(no instructions)';
         const shown = instructions.length > SkillAgent.PRELOAD_CHARS
           ? `${instructions.slice(0, SkillAgent.PRELOAD_CHARS)}\n… [${instructions.length - SkillAgent.PRELOAD_CHARS} more chars; load_skill returns the whole text]`
@@ -1264,20 +1258,14 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     const kind = choiceOf(outcome, 'last_result');
     if (!outcome || !kind) return { tier: heuristic };
     const p = kind.probabilities[kind.choice] ?? 0;
-    const judgedTier = SkillAgent.SMART_RESULTS.has(kind.choice) ? 'smart' : 'balanced';
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] SkillAgent skill.result: ${kind.choice}@${p.toFixed(2)}${judgedTier !== heuristic && p >= 0.6 ? ` (would think on ${judgedTier}, not ${heuristic})` : ''}`);
-      return { tier: heuristic };
-    }
+    const retier = outcome.mode === 'act' && p >= 0.6;
+    const tier = retier ? (SkillAgent.SMART_RESULTS.has(kind.choice) ? 'smart' : 'balanced') : heuristic;
     const authP = kind.probabilities.auth_or_credential ?? 0;
     const hint = authP >= 0.7
       ? `Runtime result check: the last result looks like a missing or rejected credential (p=${authP.toFixed(2)}); set_skill_config, or ask the user for the missing credential.`
       : undefined;
-    if (outcome.mode === 'act' && p >= 0.6) {
-      if (judgedTier !== heuristic) log.info(`SkillAgent skill.result: thinking on ${judgedTier} (${kind.choice}@${p.toFixed(2)})`);
-      return { tier: judgedTier, hint };
-    }
-    return { tier: heuristic, hint };
+    log.info(`[decision:${outcome.mode}] SkillAgent skill.result: ${kind.choice}@${p.toFixed(2)} → ${tier}${hint ? ' + credential hint' : ''}`);
+    return { tier, hint };
   }
 
   /**
@@ -1342,10 +1330,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       .slice(0, 3)
       .map(([key, prob], i) => `${i + 1}. ${labels[key]} (p=${prob.toFixed(2)})`);
     if (ranked.length === 0) return undefined;
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] SkillAgent skill.catalog "${query.slice(0, 60)}": ${ranked.join('; ')}`);
-      return undefined;
-    }
+    log.info(`[decision:${outcome.mode}] SkillAgent skill.catalog "${query.slice(0, 60)}": ${ranked.join('; ')}`);
     return `Runtime match check, most likely first: ${ranked.join('; ')}.`;
   }
 

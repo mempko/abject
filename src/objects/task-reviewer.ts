@@ -1316,10 +1316,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   // ═══════════════════════════════════════════════════════════════════
   // Decision-model judgments (sites reviewer.*)
   //
-  // Each site's policy mode rides back on its outcome: shadow logs what it
-  // would do, advise hands the verdict to the reviewer model as a prior,
-  // act lets a confident verdict take effect. A null outcome, a missing
-  // answer or a verdict short of its threshold leaves the review as it was.
+  // Each site's mode rides back on its outcome: advise hands the verdict to
+  // the reviewer model as a prior, act lets a confident verdict take effect.
+  // Every verdict is logged once. A null outcome, a missing answer or a
+  // verdict short of its threshold leaves the review as it was.
   // ═══════════════════════════════════════════════════════════════════
 
   private decisionScope(goalId?: string, taskId?: string): { goalId?: string; taskId?: string; onBehalfOf: string } {
@@ -1493,12 +1493,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (answer) byEpisode[`${r.taskId}:${p.step}`] = judgmentFrom(answer, outcome.emulated);
     });
     if (!Object.keys(byEpisode).length) return undefined;
-    if (outcome.mode === 'shadow') {
-      const counts: Record<string, number> = {};
-      for (const j of Object.values(byEpisode)) counts[j.choice] = (counts[j.choice] ?? 0) + 1;
-      const sure = Object.values(byEpisode).filter(j => j.p >= AUTO_ASSESS_MIN_P).length;
-      log.info(`[decision:shadow] reviewer.predictions goal ${goalId.slice(0, 8)}: ${JSON.stringify(counts)}; ${sure}/${episodes.length} sure enough to record`);
-    }
+    const counts: Record<string, number> = {};
+    for (const j of Object.values(byEpisode)) counts[j.choice] = (counts[j.choice] ?? 0) + 1;
+    const sure = Object.values(byEpisode).filter(j => j.p >= AUTO_ASSESS_MIN_P).length;
+    log.info(`[decision:${outcome.mode}] reviewer.predictions goal ${goalId.slice(0, 8)}: ${JSON.stringify(counts)}; ${sure}/${episodes.length} at p>=${AUTO_ASSESS_MIN_P}`);
     return { mode: outcome.mode, byEpisode };
   }
 
@@ -1576,9 +1574,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
     }
     if (!Object.keys(byApplication).length) return undefined;
-    if (mode === 'shadow') {
-      log.info(`[decision:shadow] reviewer.patterns goal ${goalId.slice(0, 8)}: ${Object.entries(byApplication).map(([k, j]) => `${k}=${j.choice}@${fmtP(j.p)}`).join(' ')}`);
-    }
+    log.info(`[decision:${mode}] reviewer.patterns goal ${goalId.slice(0, 8)}: ${Object.entries(byApplication).map(([k, j]) => `${k}=${j.choice}@${fmtP(j.p)}`).join(' ')}`);
     return { mode, byApplication };
   }
 
@@ -1658,22 +1654,21 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * row is advisory; the reviewer's own reading of the evidence decides.
    */
   private renderPriors(worth?: WorthVerdict, judgments?: ReviewJudgments): string | undefined {
-    const shown = (mode?: DecisionMode) => mode === 'advise' || mode === 'act';
     const lines: string[] = [];
     let emulated = false;
-    if (worth && shown(worth.mode)) {
+    if (worth) {
       emulated ||= worth.emulated;
       lines.push(`- Learning value: level ${worth.level} of ${WORTH_LEVELS.length - 1} (${WORTH_LEVELS[worth.level] ?? '?'}), p=${fmtP(worth.levelP)}; owner evidence contradicting injected knowledge p=${fmtP(worth.conflict)}.`);
     }
     const f = judgments?.fidelity;
-    if (f && shown(f.mode)) {
+    if (f) {
       emulated ||= f.emulated;
       lines.push(f.deterministic
         ? '- Summary fidelity: unverifiable (no verification record or user-facing result to compare).'
         : `- Summary fidelity: ${f.verdict} p=${fmtP(f.p)} (a stale figure p=${fmtP(f.staleFigure)}, a dropped caveat p=${fmtP(f.caveatDropped)}).`);
     }
     const preds = judgments?.predictions;
-    if (preds && shown(preds.mode)) {
+    if (preds) {
       // Contradicted and least certain rows lead: they are where reading pays.
       const focus = (j: Judgment) => (j.choice === 'contradicted' ? 2 : 0) + (1 - j.p);
       const rows = Object.entries(preds.byEpisode).sort(([, a], [, b]) => focus(b) - focus(a)).map(([k, j]) => {
@@ -1683,7 +1678,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       if (rows.length) lines.push(`- Predictions (contradicted and least certain first; a confident supported row needs only a confirming look):\n${rows.join('\n')}`);
     }
     const pats = judgments?.patterns;
-    if (pats && shown(pats.mode)) {
+    if (pats) {
       const rows = Object.entries(pats.byApplication).map(([k, j]) => {
         emulated ||= j.emulated;
         return `  ${k}: ${j.choice}${j.deterministic ? ' (outcome unobserved)' : ` p=${fmtP(j.p)}`}`;
@@ -1737,10 +1732,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!outcome || !relation) return undefined;
     const p = relation.probabilities[relation.choice] ?? 0;
     const kind = choiceOf(outcome, 'entry_kind');
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] reviewer.dedupe "${clipText(title, 60)}": ${relation.choice}@${fmtP(p)} kind=${kind?.choice ?? '?'}`);
-      return undefined;
-    }
+    log.info(`[decision:${outcome.mode}] reviewer.dedupe "${clipText(title, 60)}": ${relation.choice}@${fmtP(p)} kind=${kind?.choice ?? '?'}`);
     const match = /^(duplicate_of|refines)_(\d+)$/.exec(relation.choice);
     const target = match ? candidates[Number(match[2])] : undefined;
     const origin = target?.origin ?? 'agent';
@@ -1777,10 +1769,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!outcome || detail === undefined) return undefined;
     const generic = noulOf(outcome, 'generic_multistep_procedure');
     const kind = choiceOf(outcome, 'detail_kind');
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] reviewer.privacy skill "${skill.name}": workspace_specific_detail=${fmtP(detail)} kind=${kind?.choice ?? '?'} generic=${fmtP(generic)}`);
-      return undefined;
-    }
+    log.info(`[decision:${outcome.mode}] reviewer.privacy skill "${skill.name}": workspace_specific_detail=${fmtP(detail)} kind=${kind?.choice ?? '?'} generic=${fmtP(generic)}`);
     const tag = `decision model${outcome.emulated ? ', emulated' : ''}`;
     const warning = detail >= PRIVACY_WARN_P
       ? `Review before enabling: this skill may carry workspace-specific detail (${DETAIL_KINDS[kind?.choice ?? ''] ?? DETAIL_KINDS.other_detail}; ${tag}, p=${fmtP(detail)}).`

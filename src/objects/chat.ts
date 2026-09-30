@@ -2373,34 +2373,25 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (!outcome || !verdict) return shaped;
     const flagged = verdict.ungrounded || verdict.absence || verdict.promise;
     log.info(`[decision:${outcome.mode}] chat.audit: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} flagged=${flagged} clean=${verdict.clean} shapes=${shaped}`);
-    if (outcome.mode === 'shadow') return shaped;
     if (outcome.mode === 'advise') return shaped || flagged;
     if (flagged) return true;
     return verdict.clean ? false : shaped;
   }
 
   /**
-   * How to handle a user message (site chat.route). Shadow runs the verdict
-   * beside the normal turn and logs whether they agree; advise hands the
-   * verdict to the routing think as a hint; act creates a clear, self-contained
-   * goal directly, skipping the routing think.
+   * How to handle a user message (site chat.route). Acting, a clear and
+   * self-contained request becomes a goal directly, skipping the routing
+   * think; otherwise (or advising) the verdict rides to that think as a hint.
    */
   private async routeAndRunTurn(
     userText: string, initialMessages: { role: string; content: string | ContentPart[] }[], newAttachment: boolean,
   ): Promise<ChatTurn> {
     const mode = userText.trim() ? await this.decisionSiteMode('chat.route') : 'off';
     if (mode === 'off') return this.runTaskTurn(userText, initialMessages);
-    const routing = this.decideRoute(userText, newAttachment);
-    if (mode === 'shadow') {
-      const turn = await this.runTaskTurn(userText, initialMessages);
-      void routing.then(r => {
-        if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}; the turn ${turn.goalCreated ? 'created a goal' : 'answered without a goal'}`);
-      });
-      return turn;
-    }
-    const r = await routing;
+    const r = await this.decideRoute(userText, newAttachment);
+    if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}`);
     if (r && r.outcome.mode === 'act' && r.route === 'goal' && r.routeP >= 0.9 && r.selfContained >= 0.85 && !newAttachment) {
-      log.info(`[decision:act] chat.route: goal@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}; creating the goal directly`);
+      log.info('[decision:act] chat.route: creating the goal directly');
       return this.createRoutedGoal(userText);
     }
     const hinted = r && r.routeP >= 0.8

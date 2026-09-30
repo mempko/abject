@@ -1020,9 +1020,9 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'setDecisionPolicy',
-                description: 'Set the decision gates (off | shadow | on | full) and per-site mode overrides (site id → off | shadow | advise | act)',
+                description: 'Set the decision gates (on | off, for every built-in site at once) and per-site mode overrides (site id → off | advise | act, capped at the site\'s own mode)',
                 parameters: [
-                  { name: 'gates', type: { kind: 'primitive', primitive: 'string' }, description: 'off, shadow (log only), on (each site at its default), full (each site at its highest mode)', optional: true },
+                  { name: 'gates', type: { kind: 'primitive', primitive: 'string' }, description: 'on (every built-in site runs at its own mode) or off (none run; explicit calls still do)', optional: true },
                   { name: 'overrides', type: { kind: 'object', properties: {} }, description: 'Site id → mode; replaces the previous overrides', optional: true },
                 ],
                 returns: { kind: 'object', properties: {} },
@@ -1905,8 +1905,8 @@ export class LLMObject extends Abject {
   }
 
   private setDecisionPolicy(policy: Partial<DecisionPolicy>): void {
-    const gates: DecisionGates[] = ['off', 'shadow', 'on', 'full'];
-    const modes: DecisionMode[] = ['off', 'shadow', 'advise', 'act'];
+    const gates: DecisionGates[] = ['on', 'off'];
+    const modes: DecisionMode[] = ['off', 'advise', 'act'];
     if (policy.gates !== undefined) {
       require(gates.includes(policy.gates), `decision gates must be one of ${gates.join(', ')}`);
       this.decisionPolicy.gates = policy.gates;

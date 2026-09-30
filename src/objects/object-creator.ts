@@ -1343,12 +1343,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * The member-relevance line for an outlined source (site
    * object-creator.members, advise): the members a decision model judged the
    * goal most likely touches, limited to those still in `source`. Undefined
-   * when the source is small enough to be shown in full, when nothing was
-   * judged relevant, or when the site only shadows.
+   * when the source is small enough to be shown in full, or when nothing was
+   * judged relevant.
    */
   private relevanceLine(state: LoopState, source: string): string | undefined {
     const rel = state.memberRelevance;
-    if (!rel || rel.key !== this.relevanceKey(state) || rel.mode === 'shadow' || rel.relevant.length === 0) return undefined;
+    if (!rel || rel.key !== this.relevanceKey(state) || rel.relevant.length === 0) return undefined;
     if (source.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) return undefined;
     const present = new Set((this.parseHandlerMembers(source)?.members ?? []).map(m => m.name));
     const names = rel.relevant.filter(r => present.has(r.name)).map(r => r.name);
@@ -2025,9 +2025,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /**
    * Whether a deployed modify is worth the semantic review (site
-   * object-creator.review). Returns an override only when acting on a
-   * confident verdict that disagrees with the line-count rule; shadow and
-   * advise log beside the deploy without holding it.
+   * object-creator.review). Acting, it returns an override when a confident
+   * verdict disagrees with the line-count rule. Held at advise, it judges
+   * beside the deploy without holding it, and a skipped change it judges
+   * risky gets a note under CHECKS suggesting review_semantics.
    */
   private async judgeReviewWorth(
     state: LoopState, previousLive: string, changed: number, callsClean: boolean, heuristicReview: boolean,
@@ -2046,12 +2047,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }, ObjectCreator.REVIEW_QUESTIONS, { ...this.decisionScopeFor(state), timeoutMs: 8000 });
     const logVerdict = (outcomeMode: string, p: number): void =>
       log.info(`[decision:${outcomeMode}] ObjectCreator ${site}: review_worthwhile=${p.toFixed(2)} (${changed} changed lines, calls ${callsClean ? 'clean' : 'flagged'}; line-count rule says ${heuristicReview ? 'review' : 'skip'})`);
+    // Advise: the line-count rule stands; a skipped change judged risky gets a note the agent reads.
+    const advise = (p: number): void => {
+      if (!heuristicReview && p >= 0.7) {
+        state.pendingAdvice = `Semantic review was skipped for this small change, but a runtime check judged it could misbehave in ways the call check misses (p=${p.toFixed(2)}). review_semantics checks it before you rely on it.`;
+      }
+    };
 
-    if (mode !== 'act') {
-      // Shadow (or advise, which has nothing for the model to read here): judge beside the deploy.
+    if (mode === 'advise') {
       void ask().then(outcome => {
         const p = noulOf(outcome, 'review_worthwhile');
-        if (outcome && p !== undefined) logVerdict(outcome.mode, p);
+        if (!outcome || p === undefined) return;
+        logVerdict(outcome.mode, p);
+        advise(p);
       });
       return undefined;
     }
@@ -2059,7 +2067,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const p = noulOf(outcome, 'review_worthwhile');
     if (!outcome || p === undefined) return undefined;
     logVerdict(outcome.mode, p);
-    if (outcome.mode !== 'act') return undefined;
+    if (outcome.mode === 'advise') {
+      advise(p);
+      return undefined;
+    }
     if (heuristicReview && callsClean && p <= 0.2) return { review: false, p };
     if (!heuristicReview && p >= 0.7) return { review: true, p };
     return undefined;
@@ -3186,10 +3197,7 @@ ${source}
     const verdict = choiceOf(outcome, 'call_evidence');
     if (!outcome || !verdict) return;
     const p = verdict.probabilities[verdict.choice] ?? 0;
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ObjectCreator ${site}: ${target}.${method} → ${verdict.choice}@${p.toFixed(2)}`);
-      return;
-    }
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: ${target}.${method} → ${verdict.choice}@${p.toFixed(2)}`);
     // A later deploy starts a fresh record; a verdict for an older deploy is dropped.
     if (state.deployTurn !== deployTurn) return;
     if (state.callEvidence?.deployTurn !== deployTurn) state.callEvidence = { deployTurn, calls: [] };
@@ -3871,9 +3879,9 @@ ${source}
   // next step will do (and so its tier), which members of a large source the
   // goal touches, whether the agent has read enough or should spend its last
   // steps verifying, what kind of task a dispatch is, and which saved draft it
-  // continues. Each site's mode comes back with its answer (shadow logs,
-  // advise adds text the agent reads, act takes effect), and a null or unsure
-  // answer always leaves the heuristic path exactly as it was.
+  // continues. Each site's mode comes back with its answer (advise adds text
+  // the agent reads, act takes effect), and a null or unsure answer always
+  // leaves the heuristic path exactly as it was.
 
   /** How long an observation waits for this turn's judgments before rendering without them. */
   private static readonly OBSERVE_JUDGMENT_WAIT_MS = 6000;
@@ -4041,12 +4049,10 @@ ${source}
     const pWrite = (pick.probabilities.author_code ?? 0) + (pick.probabilities.fix_failure ?? 0);
     const light = ObjectCreator.tierForStep(pick.choice, state.kind) === 'balanced' && pWrite < 0.2 && pTop >= 0.6;
     memo.lightStreak = light ? (memo.lightStreak ?? 0) + 1 : 0;
-    const downgrade = light && memo.lightStreak >= 2;
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${state.turn}: next_step=${pick.choice}@${pTop.toFixed(2)} write=${pWrite.toFixed(2)}; would think on ${downgrade ? 'balanced' : heuristic} (heuristic ${heuristic})`);
-      return heuristic;
-    }
-    return downgrade ? 'balanced' : heuristic;
+    // A tier is not something the agent reads, so a site held at advise keeps the heuristic.
+    const tier = outcome.mode === 'act' && light && memo.lightStreak >= 2 ? 'balanced' : heuristic;
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${state.turn}: next_step=${pick.choice}@${pTop.toFixed(2)} write=${pWrite.toFixed(2)} → ${tier} (heuristic ${heuristic})`);
+    return tier;
   }
 
   // ── object-creator.members ──
@@ -4248,10 +4254,7 @@ ${source}
       };
       if (text[endgame.choice]) lines.push(`ADVISOR: about ${n} step${n === 1 ? '' : 's'} left; ${text[endgame.choice]}`);
     }
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ObjectCreator ${site} turn ${turn} (${trigger}): ready_to_edit=${ready?.toFixed(2) ?? '-'} rereading=${rereading?.toFixed(2) ?? '-'} endgame=${endgame ? `${endgame.choice}@${endP.toFixed(2)}` : '-'}${lines.length ? `; would show ${lines.length} line(s)` : ''}`);
-      return;
-    }
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${turn} (${trigger}): ready_to_edit=${ready?.toFixed(2) ?? '-'} rereading=${rereading?.toFixed(2) ?? '-'} endgame=${endgame ? `${endgame.choice}@${endP.toFixed(2)}` : '-'} → ${lines.length} line(s)`);
     if (lines.length) memo.advice = { turn, lines };
   }
 
@@ -4311,8 +4314,6 @@ ${source}
     const target = targetPick && targetPick.choice !== 'none' ? candidates[Number(targetPick.choice.slice(4))]?.name : undefined;
     const tp = target ? targetPick!.probabilities[targetPick!.choice] ?? 0 : 0;
     log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: task_kind=${kindPick.choice}@${kp.toFixed(2)}${targetPick ? ` target=${target ?? 'none'}@${(targetPick.probabilities[targetPick.choice] ?? 0).toFixed(2)}` : ''} (dispatch inferred ${heuristic}${givenTarget ? ` with target ${givenTarget}` : ''})`);
-    if (outcome.mode === 'shadow') return out;
-
     const act = outcome.mode === 'act';
     const confidentTarget = act && target && tp >= 0.85 ? target : undefined;
     if (act && kp >= 0.85) {
@@ -4387,7 +4388,7 @@ ${source}
     const p = pick.probabilities[pick.choice] ?? 0;
     const chosen = pick.choice === 'none' ? undefined : shown[Number(pick.choice.slice(2))];
     log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: draft=${chosen?.key ?? 'none'}@${p.toFixed(2)} of ${shown.length}`);
-    if (!chosen || outcome.mode === 'shadow') return;
+    if (!chosen) return;
     if (outcome.mode === 'act' && p >= 0.8) {
       await this.loadPersistedDraft(goalId, state, chosen.key);
       return;

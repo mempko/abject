@@ -807,8 +807,8 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * probabilities, several questions in one call.
    *
    * `site` names the call point (src/core/decision-sites.ts); its policy mode
-   * comes back on the outcome, and the caller honours it (shadow: log only;
-   * advise: hint; act: take effect). Pass undefined for an explicit call.
+   * comes back on the outcome, and the caller honours it (advise: hint;
+   * act: take effect). Pass undefined for an explicit call.
    *
    * Returns null whenever no answer should drive behavior: the policy
    * switched the site off, the LLM is unreachable, the call failed or timed

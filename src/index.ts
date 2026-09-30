@@ -290,7 +290,7 @@ export {
 } from './llm/decision.js';
 export { emulateDecision, parseEmulatedAnswers, buildPlans, buildEmulationMessages } from './llm/decision-emulator.js';
 export type { EmulationTransport } from './llm/decision-emulator.js';
-export { DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode, modeAllows } from './core/decision-sites.js';
+export { DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode } from './core/decision-sites.js';
 export type { DecisionMode, DecisionGates, DecisionPolicy, DecisionSite } from './core/decision-sites.js';
 export type { ModelPricing, PricingEntry } from './llm/pricing.js';
 export { lookupPricing, estimateCostUsd } from './llm/pricing.js';

@@ -294,7 +294,7 @@ decisions belong to ScrumMaster.
     if (!outcome || !health) return undefined;
     const p = health.probabilities[health.choice] ?? 0;
     log.info(`[decision:${outcome.mode}] goal.health ${goal.id.slice(0, 8)}: ${health.choice}@${p.toFixed(2)} after ${Math.round(age / 60000)} quiet min`);
-    if (outcome.mode === 'shadow' || p < 0.8) return undefined;
+    if (p < 0.8) return undefined;
     const hold = outcome.mode === 'act' && ['progressing', 'waiting_external'].includes(health.choice);
     const judged = { health: health.choice, hold };
     this.healthCheckedAt.set(goal.id, { at: Date.now(), judged });

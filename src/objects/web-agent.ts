@@ -66,11 +66,9 @@ interface WebTaskExtra {
 
 /** A judged difficulty for the next browsing decision (site web.tier). */
 interface TierVerdict {
-  mode: 'shadow' | 'advise' | 'act';
+  mode: 'advise' | 'act';
   tier: string;
   sure: boolean;
-  level: number;
-  score: number;
 }
 
 /** A page as the observe-time decisions read it. */
@@ -479,12 +477,9 @@ Set keepPageOpen: false to explicitly close the page when done.
     }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 8000 });
     const p = noulOf(outcome, 'in_scope');
     if (!outcome || p === undefined) return undefined;
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] WebAgent agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS)' : ''}`);
-      return undefined;
-    }
-    if (p >= 0.1) return undefined;
-    log.info(`WebAgent agent.ask-scope: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    const pass = outcome.mode === 'act' && p < 0.1;
+    log.info(`[decision:${outcome.mode}] WebAgent agent.ask-scope: in_scope=${p.toFixed(2)}${pass ? ' → PASS without an LLM call' : ''}`);
+    if (!pass) return undefined;
     return `PASS: this asks for work outside operating a browser on web pages (runtime scope check, in_scope p=${p.toFixed(2)}).`;
   }
 
@@ -1236,7 +1231,7 @@ Set keepPageOpen: false to explicitly close the page when done.
         // think tier can see, use that one; a configured vision-fallback model
         // also counts (the think loop reroutes image steps to it). A step
         // without a screenshot keeps its tier.
-        let tier = this.applyTierVerdict(extra, tierVerdict, heuristicTier, step);
+        let tier = this.applyTierVerdict(extra, tierVerdict, heuristicTier);
         if (shipped && caps && caps[tier] === false) {
           const other = tier === 'balanced' ? 'smart' : 'balanced';
           if (caps[other] !== false) {
@@ -1330,8 +1325,9 @@ Set keepPageOpen: false to explicitly close the page when done.
   // questions, each its own site with its own policy (src/core/decision-sites.ts):
   // does the next step need the screenshot, what state is the page in, and
   // how hard is the next choice. The sites are separate requests run side by
-  // side. Shadow logs, advise adds a line the agent reads, act takes effect.
-  // A null answer (site off, no decision model, timeout) leaves today's path.
+  // side. Advise adds a line the agent reads, act takes effect, and each
+  // verdict is logged once. A null answer (site off, no decision model,
+  // timeout) leaves today's path.
 
   /** How long one observe-time judgment may take before the step proceeds without it. */
   private static readonly STEP_DECISION_TIMEOUT_MS = 5000;
@@ -1437,7 +1433,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     extra.lastSuccess = success;
   }
 
-  /** Whether this step's screenshot can be dropped (site web.screenshot, act: needs_screenshot below 0.25). */
+  /** Whether this step's screenshot can be dropped (site web.screenshot; act drops it when needs_screenshot is below 0.25). */
   private async judgeScreenshot(extra: WebTaskExtra, page: ObservedPage, scope: { goalId?: string; taskId: string; onBehalfOf: string }): Promise<boolean> {
     if (await this.decisionSiteMode('web.screenshot') === 'off') return false;
     const outcome = await this.askDecision('web.screenshot', {
@@ -1451,12 +1447,9 @@ Set keepPageOpen: false to explicitly close the page when done.
     }, WebAgent.SCREENSHOT_QUESTIONS, { ...scope, timeoutMs: WebAgent.STEP_DECISION_TIMEOUT_MS });
     const p = noulOf(outcome, 'needs_screenshot');
     if (!outcome || p === undefined) return false;
-    const skip = p < 0.25;
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] WebAgent web.screenshot step ${page.step + 1}: needs_screenshot=${p.toFixed(2)}${skip ? ' (would skip)' : ''}`);
-      return false;
-    }
-    if (skip) log.info(`Observe: no screenshot this step (needs_screenshot=${p.toFixed(2)})`);
+    // Only act drops the image; there is no advice to give about pixels.
+    const skip = outcome.mode === 'act' && p < 0.25;
+    log.info(`[decision:${outcome.mode}] WebAgent web.screenshot step ${page.step + 1}: needs_screenshot=${p.toFixed(2)}${skip ? ' → no screenshot' : ''}`);
     return skip;
   }
 
@@ -1479,10 +1472,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     if (!outcome || !verdict) return {};
     const p = verdict.probabilities[verdict.choice] ?? 0;
     const detail = `${verdict.choice}@${p.toFixed(2)}`;
-    if (outcome.mode === 'shadow') {
-      if (verdict.choice !== 'content_ready') log.info(`[decision:shadow] WebAgent web.page-state step ${page.step + 1}: ${detail}`);
-      return {};
-    }
+    log.info(`[decision:${outcome.mode}] WebAgent web.page-state step ${page.step + 1}: ${detail}`);
     const hint = p >= 0.8 ? WebAgent.PAGE_STATE_HINTS[verdict.choice] : undefined;
     const judged = { detail, ...(hint ? { hint: `${hint} (p=${p.toFixed(2)})` } : {}) };
     if (outcome.mode === 'act') {
@@ -1514,7 +1504,9 @@ Set keepPageOpen: false to explicitly close the page when done.
     const level = topLevel(difficulty);
     const tier = level <= 1 ? 'balanced' : 'smart';
     const easy = (difficulty.probabilities['0'] ?? 0) + (difficulty.probabilities['1'] ?? 0);
-    return { mode: outcome.mode, tier, sure: (tier === 'balanced' ? easy : 1 - easy) >= 0.6, level, score: difficulty.score };
+    const sure = (tier === 'balanced' ? easy : 1 - easy) >= 0.6;
+    log.info(`[decision:${outcome.mode}] WebAgent web.tier step ${page.step + 1}: level ${level} (score ${difficulty.score}) → ${tier}${sure ? '' : ' (not confident)'}`);
+    return { mode: outcome.mode, tier, sure };
   }
 
   /**
@@ -1524,8 +1516,13 @@ Set keepPageOpen: false to explicitly close the page when done.
    * applied, so one timeout does not bounce the task between models. Called
    * once per step, on the look that is handed over.
    */
-  private applyTierVerdict(extra: WebTaskExtra, verdict: TierVerdict | undefined, heuristic: string, step: number): string {
+  private applyTierVerdict(extra: WebTaskExtra, verdict: TierVerdict | undefined, heuristic: string): string {
     if (!verdict) return extra.tierState?.applied ? extra.tierState.current : heuristic;
+    // A tier has no advice to give: held at advise, the verdict is only logged.
+    if (verdict.mode === 'advise') {
+      if (extra.tierState) extra.tierState.applied = false;
+      return heuristic;
+    }
     const ts = (extra.tierState ??= { current: heuristic, streak: 0 });
     if (verdict.sure && verdict.tier !== ts.current) {
       ts.streak = ts.pending === verdict.tier ? ts.streak + 1 : 1;
@@ -1534,11 +1531,6 @@ Set keepPageOpen: false to explicitly close the page when done.
     } else {
       ts.pending = undefined;
       ts.streak = 0;
-    }
-    if (verdict.mode !== 'act') {
-      ts.applied = false;
-      if (ts.current !== heuristic) log.info(`[decision:${verdict.mode}] WebAgent web.tier step ${step + 1}: would think on ${ts.current} (ref-count tier ${heuristic}; level ${verdict.level}, score ${verdict.score})`);
-      return heuristic;
     }
     ts.applied = true;
     return ts.current;
@@ -1611,17 +1603,11 @@ Set keepPageOpen: false to explicitly close the page when done.
     if (!outcome || !pick) return { apply: false };
     const p = pick.probabilities[pick.choice] ?? 0;
     const isExisting = existing.some(e => e.name === pick.choice);
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] WebAgent web.profile: ${pick.choice}@${p.toFixed(2)} (running with ${current ?? 'no profile'})`);
-      return { apply: false };
-    }
+    log.info(`[decision:${outcome.mode}] WebAgent web.profile: ${pick.choice}@${p.toFixed(2)} (the description alone gave ${current ?? 'no profile'})`);
     if (outcome.mode === 'act' && p >= 0.85 && (isExisting || pick.choice === 'none_ephemeral')) {
-      const chosen = isExisting ? pick.choice : undefined;
-      if (chosen !== current) log.info(`WebAgent web.profile: ${chosen ? `selecting profile "${chosen}"` : 'running without a profile'} (p=${p.toFixed(2)}; the description alone gave ${current ?? 'none'})`);
-      return { apply: true, profile: chosen };
+      return { apply: true, profile: isExisting ? pick.choice : undefined };
     }
     if (isExisting && pick.choice !== current && p >= 0.6) {
-      log.info(`[decision:${outcome.mode}] WebAgent web.profile: hinting "${pick.choice}"@${p.toFixed(2)}`);
       return {
         apply: false,
         hint: `\n\n## Likely browser profile\nThe persistent profile "${pick.choice}" likely fits this task (runtime check, p=${p.toFixed(2)}), and this run uses ${current ? `"${current}"` : 'no profile'}. If the site asks for sign-in, fail with a reason naming "${pick.choice}" so the task can run again in that profile.`,

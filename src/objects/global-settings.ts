@@ -109,13 +109,11 @@ const STORAGE_KEY_CACHE_KEEPALIVE = 'global-settings:cacheKeepalive';
 // Decision route: a decision model (e.g. TypeSafe Jev) or a chat model emulating one; unset = auto
 const STORAGE_KEY_DECISION_PROVIDER = 'global-settings:decisionProvider';
 const STORAGE_KEY_DECISION_MODEL = 'global-settings:decisionModel';
-// Decision gates: off | shadow | on | full (see src/core/decision-sites.ts)
+// Decision gates: on | off for every built-in decision site (see src/core/decision-sites.ts)
 const STORAGE_KEY_DECISION_GATES = 'global-settings:decisionGates';
 const DECISION_GATE_OPTIONS: Array<{ gates: DecisionGates; label: string }> = [
-  { gates: 'on', label: 'On (each site at its default)' },
-  { gates: 'shadow', label: 'Shadow (log only)' },
-  { gates: 'full', label: 'Full (every site at its highest mode)' },
-  { gates: 'off', label: 'Off' },
+  { gates: 'on', label: 'On (decision sites advise and act live)' },
+  { gates: 'off', label: 'Off (built-in decision sites do not run)' },
 ];
 
 /**
@@ -2943,8 +2941,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * tiers; 'None' disables the row.
    */
   /**
-   * How far built-in decision sites may act: off, shadow (log only), on
-   * (each site at its default), full (each site at its highest mode).
+   * Whether built-in decision sites run: on (each at its own mode, advising
+   * or acting) or off (explicit decide calls still run).
    */
   private async renderDecisionGatesRow(tiersCard: AbjectId): Promise<void> {
     const rowId = await this.request<AbjectId>(

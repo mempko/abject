@@ -134,10 +134,10 @@ export function completionQuestions(): Questions {
   return {
     completion_status: {
       type: 'choice',
-      instructions: 'The agent reported `result` as finishing `task`. Judge it against the task and the evidence in `recent`.',
+      instructions: 'The agent reported `result` as finishing `task`. Judge it against the task, using `recent` (its last steps and what they returned) and `evidence` (openings of the larger results it read).',
       criteria: {
-        complete_verified: 'Delivers what the task asked, and `recent` shows evidence the work was checked.',
-        complete_unverified: 'Plausibly delivers it, but nothing in `recent` shows the work was checked.',
+        complete_verified: 'Delivers what the task asked, and `recent` or `evidence` shows the work was done or checked.',
+        complete_unverified: 'Plausibly delivers it, but neither `recent` nor `evidence` shows the work was done or checked.',
         partial: 'Delivers part of what the task asked.',
         not_done: 'Describes intentions or plans rather than outcomes.',
         wrong_task: 'Answers a different request than `task`.',
@@ -145,7 +145,7 @@ export function completionQuestions(): Questions {
     },
     claims_unsupported: {
       type: 'noul',
-      instructions: 'Does `result` assert facts, effects, or verification that `recent` does not show?',
+      instructions: 'Does `result` assert facts, effects, or verification that neither `recent` nor `evidence` supports? Summarizing or restating what those show counts as supported.',
     },
   };
 }
@@ -154,7 +154,7 @@ export function finalDispositionQuestions(): Questions {
   return {
     final_disposition: {
       type: 'choice',
-      instructions: 'The agent used its whole step budget on `task`. From `recent` and `last_result`, how does it stand?',
+      instructions: 'The agent used its whole step budget on `task`. From `recent`, `evidence` and `last_result`, how does it stand?',
       criteria: {
         done_complete: 'The requested work is finished and its checks hold.',
         fail_with_partial: 'Useful work or findings exist, but the task is incomplete.',

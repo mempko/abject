@@ -2142,7 +2142,7 @@ Rules:
   // A decision model judges the planning questions whose answer is a pick:
   // is a new goal one step one agent owns, do a round's results satisfy the
   // goal, does a mid-goal note change anything in flight. Each names its site
-  // (src/core/decision-sites.ts); shadow logs, advise hands the verdict to the
+  // (src/core/decision-sites.ts); advise hands the verdict to the
   // scrum as a note, act takes the reversible shortcut. A null answer leaves
   // the scrum exactly as it was.
 
@@ -2175,12 +2175,12 @@ Rules:
     const questions: Record<string, DecisionQuestion> = {
       shape: {
         type: 'choice',
-        instructions: 'Classify how the work in `goal` is shaped, before deciding who does it.',
+        instructions: 'Classify how the work in `goal` splits into tasks. A task is one agent working until it is done: the steps it takes inside that task (reading, deciding, acting, checking) do not make separate tasks.',
         criteria: {
-          single_step: 'One concrete action or lookup that one agent does end to end in one task.',
-          independent_parts: 'Two or more parts obtainable without each other, then combined.',
-          research_then_build: 'What to build depends on facts nobody has yet.',
-          multi_step_chain: 'Dependent steps, coordination, or a verification round.',
+          one_task: 'One agent can carry the whole request to completion in a single task, however many steps that task takes inside.',
+          independent_parts: 'Two or more parts that separate tasks or agents can do without each other, then combine.',
+          research_then_build: 'A first task must discover facts before the real work can even be planned.',
+          coordinated_chain: 'Several tasks in sequence, handoffs between different agents, or a separate verification task by someone else.',
           already_satisfied: 'The conversation or scratchpad already holds the answer.',
           needs_user: 'Ambiguous in a way only the user can settle.',
         },
@@ -2202,13 +2202,12 @@ Rules:
     const shape = choiceOf(outcome, 'shape');
     const owner = choiceOf(outcome, 'owner');
     if (!outcome || !shape || !owner) return undefined;
-    const shapeP = shape.probabilities.single_step ?? 0;
+    const shapeP = shape.probabilities.one_task ?? 0;
     const ownerP = owner.probabilities[owner.choice] ?? 0;
     const needsHint = noulOf(outcome, 'needs_profile_or_target') ?? 1;
-    const clear = shape.choice === 'single_step' && shapeP >= 0.85 && owner.choice !== 'unclear'
+    const clear = shape.choice === 'one_task' && shapeP >= 0.85 && owner.choice !== 'unclear'
       && ownerP >= 0.75 && owner.confidence >= 0.4 && needsHint < 0.3;
     log.info(`[decision:${outcome.mode}] scrum.quick-dispatch ${goalId.slice(0, 8)}: shape=${shape.choice}@${(shape.probabilities[shape.choice] ?? 0).toFixed(2)} owner=${owner.choice}@${ownerP.toFixed(2)} needs_hint=${needsHint.toFixed(2)} clear=${clear}`);
-    if (outcome.mode === 'shadow') return undefined;
     if (outcome.mode === 'act' && clear) {
       // Claim the round-0 scrum so nothing else plans this goal; a failed
       // commit falls back to a full scrum (fallBackToFullScrum clears it).
@@ -2258,7 +2257,6 @@ Rules:
     if (!outcome || !round) return undefined;
     const p = round.probabilities[round.choice] ?? 0;
     log.info(`[decision:${outcome.mode}] scrum.review ${goalId.slice(0, 8)} round ${scrumNumber}: ${round.choice}@${p.toFixed(2)} grounded=${grounded.toFixed(2)}`);
-    if (outcome.mode === 'shadow') return undefined;
     if (outcome.mode === 'act' && round.choice === 'satisfied' && p >= 0.9 && grounded >= 0.8) {
       this.scrummedRounds.add(`${goalId}#${scrumNumber}`);
       await this.commitCompleteGoal(goalId, {});
@@ -2293,7 +2291,6 @@ Rules:
     const partial = verdict.kind === 'partial_or_failure' && verdict.kindP >= 0.6;
     const flaggedClaim = verdict.ungrounded || partial;
     log.info(`[decision:${outcome.mode}] scrum.one-shot ${goalId.slice(0, 8)}: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} answers_goal=${answers.toFixed(2)} shapes=${JSON.stringify(shaped)}`);
-    if (outcome.mode === 'shadow') return shaped;
     if (outcome.mode === 'advise') return { claim: shaped.claim || flaggedClaim, bareAck: shaped.bareAck || verdict.bareAck };
     const solid = ['answer', 'grounded_action'].includes(verdict.kind) && verdict.kindP >= 0.75 && answers >= 0.7;
     return {
@@ -2333,7 +2330,6 @@ Rules:
     if (!outcome || !intent) return undefined;
     const p = intent.probabilities[intent.choice] ?? 0;
     log.info(`[decision:${outcome.mode}] scrum.interjection ${goalId.slice(0, 8)}: ${intent.choice}@${p.toFixed(2)} conflicts=${conflicts.toFixed(2)}`);
-    if (outcome.mode === 'shadow') return undefined;
     const benign = ['acknowledge', 'status', 'constraint'].includes(intent.choice) && p >= 0.85 && conflicts < 0.2;
     if (outcome.mode === 'act' && benign && inFlight.length > 0) {
       const status = intent.choice === 'status'
@@ -2365,7 +2361,7 @@ Rules:
     const p = noulOf(outcome, 'repeating_failure');
     if (!outcome || p === undefined) return undefined;
     log.info(`[decision:${outcome.mode}] scrum.loop ${goalId.slice(0, 8)}: repeating_failure=${p.toFixed(2)} after ${rounds} rounds`);
-    if (outcome.mode === 'shadow' || p < 0.7) return undefined;
+    if (p < 0.7) return undefined;
     return `This goal has run ${rounds} scrum rounds, and a runtime check reads the failures as the same fix failing the same way (p=${p.toFixed(2)}). ` +
       `Another near-identical retry is unlikely to help: change strategy decisively, or fail_goal with a precise diagnosis (what recurs, what was tried, what would unblock it).`;
   }

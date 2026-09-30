@@ -428,12 +428,9 @@ clean result I did not observe.`;
     }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 15_000 });
     const p = noulOf(outcome, 'in_scope');
     if (!outcome || p === undefined) return {};
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ExternalCreator agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS without an answer)' : ''}`);
-      return {};
-    }
-    if (outcome.mode === 'act' && p < 0.1) {
-      log.info(`[decision:act] ExternalCreator agent.ask-scope: PASS (in_scope=${p.toFixed(2)})`);
+    const pass = outcome.mode === 'act' && p < 0.1;
+    log.info(`[decision:${outcome.mode}] ExternalCreator agent.ask-scope: in_scope=${p.toFixed(2)}${pass ? ' -> PASS' : p < 0.2 ? ' -> hint' : ''}`);
+    if (pass) {
       return { pass: `PASS: this falls outside what I do (runtime scope check, in_scope p=${p.toFixed(2)}). I work on files inside registered external projects.` };
     }
     if (p < 0.2) {
@@ -630,11 +627,9 @@ clean result I did not observe.`;
     if (!outcome || !pick) return undefined;
     const p = pick.probabilities[pick.choice] ?? 0;
     const project = candidates.find(c => c.name === pick.choice);
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ExternalCreator external.project: ${pick.choice}@${p.toFixed(2)}${project && p >= 0.9 ? ' (would auto-select)' : ''}`);
-      return undefined;
-    }
-    if (project && outcome.mode === 'act' && p >= 0.9) {
+    const select = !!project && outcome.mode === 'act' && p >= 0.9;
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.project: ${pick.choice}@${p.toFixed(2)}${select ? ' -> selected' : p >= 0.5 ? ' -> note' : ''}`);
+    if (project && select) {
       if (extra) {
         extra.projectNote = `Project ${project.name} was auto-selected by a runtime judgment of the task (p=${p.toFixed(2)}); use set_project to change it.`;
         this.audit(extra, `project ${project.name} auto-selected (external.project p=${p.toFixed(2)})`);
@@ -1077,10 +1072,7 @@ clean result I did not observe.`;
     const pick = choiceOf(outcome, 'attribution');
     if (!outcome || !pick) return;
     const p = pick.probabilities[pick.choice] ?? 0;
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ExternalCreator external.attribution: ${pick.choice}@${p.toFixed(2)} for \`${verdict.outcome.command.slice(0, 80)}\``);
-      return;
-    }
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.attribution: ${pick.choice}@${p.toFixed(2)} for \`${verdict.outcome.command.slice(0, 80)}\``);
     const advice = ExternalCreator.ATTRIBUTION_ADVICE[pick.choice];
     if (!advice || p < 0.5) return;
     verdict.advisory = `Advisory (runtime judgment, p=${p.toFixed(2)}; not part of the verdict): these failures look ${advice}`;
@@ -1569,7 +1561,8 @@ clean result I did not observe.`;
    * said syntax, one yes/no per diagnostic in that file. Acting, the rollback
    * happens only when at least one diagnostic reads as a parse failure
    * (p >= 0.5); otherwise the edit stays and the agent fixes forward, with the
-   * pre-image still held. No answer keeps today's rollback.
+   * pre-image still held. Advising, the rollback stands and a disagreeing
+   * judgment rides along as a note. No answer keeps today's rollback.
    */
   private async judgeSyntax(extra: TaskExtra, verdict: CheckVerdict, editedPath: string): Promise<{ rollback: boolean; note?: string }> {
     if (await this.decisionSiteMode('external.syntax') === 'off') return { rollback: true };
@@ -1592,8 +1585,9 @@ clean result I did not observe.`;
     if (ps.length === 0) return { rollback: true };
     const max = Math.max(...ps);
     const parses = max < 0.5;
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} max is_syntax_error=${max.toFixed(2)}${parses ? (outcome.mode === 'act' ? ' -> edit kept' : ' -> rollback stands, noted') : ' -> rollback'}`);
+    if (!parses) return { rollback: true };
     if (outcome.mode === 'act') {
-      if (!parses) return { rollback: true };
       this.audit(extra, `syntax-looking failure in ${rel} judged parseable (max is_syntax_error=${max.toFixed(2)}); edit kept`);
       return {
         rollback: false,
@@ -1602,17 +1596,11 @@ clean result I did not observe.`;
           `Fix it forward from the diagnostics above.`,
       };
     }
-    if (parses) {
-      log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} judged parseable (max is_syntax_error=${max.toFixed(2)}); the deterministic rollback stands`);
-    }
-    if (outcome.mode === 'advise' && parses) {
-      return {
-        rollback: true,
-        note: `Runtime judgment: these diagnostics read as findings in parseable code rather than a parse failure ` +
-          `(is_syntax_error at most ${max.toFixed(2)}). If that holds, reapply the edit and fix the findings forward.`,
-      };
-    }
-    return { rollback: true };
+    return {
+      rollback: true,
+      note: `Runtime judgment: these diagnostics read as findings in parseable code rather than a parse failure ` +
+        `(is_syntax_error at most ${max.toFixed(2)}). If that holds, reapply the edit and fix the findings forward.`,
+    };
   }
 
   /** Files this task has written, as project-relative paths (for attribution). */
@@ -2183,14 +2171,11 @@ clean result I did not observe.`;
     }, ExternalCreator.AUTO_VERIFY_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 20_000 });
     const unwanted = noulOf(outcome, 'verification_unwanted');
     if (!outcome || unwanted === undefined) return undefined;
-    if (unwanted >= 0.5) {
-      log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: verification_unwanted=${unwanted.toFixed(2)}; leaving \`${command}\` to the agent`);
-      return undefined;
-    }
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: would auto-verify \`${command}\` (verification_unwanted=${unwanted.toFixed(2)})`);
-      return undefined;
-    }
+    // Held at advise, the site has nothing to add: the refusal already tells
+    // the agent to run the command.
+    const run = outcome.mode === 'act' && unwanted < 0.5;
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: verification_unwanted=${unwanted.toFixed(2)} -> ${run ? `running \`${command}\`` : 'left to the agent'}`);
+    if (!run) return undefined;
 
     extra.autoVerified = true;
     this.audit(extra, `auto-verify: done was claimed with unverified changes, so the runtime is running \`${command}\` itself (verification_unwanted=${unwanted.toFixed(2)})`);
@@ -2843,12 +2828,10 @@ clean result I did not observe.`;
       }, ExternalCreator.ERROR_KIND_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 10_000 });
     const pick = choiceOf(outcome, cmd ? 'command_outcome' : 'error_kind');
     if (!outcome || !pick) return 'smart';
-    const judged = ExternalCreator.OUTCOME_TIERS[pick.choice] ?? 'smart';
-    if (outcome.mode !== 'act') {
-      log.info(`[decision:${outcome.mode}] ExternalCreator external.tier: ${pick.choice}@${pick.confidence.toFixed(2)}${judged === 'code' ? ' (would think on code)' : ''}`);
-      return 'smart';
-    }
-    return pick.confidence >= 0.6 ? judged : 'smart';
+    // Held at advise, a tier choice has no hint to give: the step stays smart.
+    const tier = outcome.mode === 'act' && pick.confidence >= 0.6 ? ExternalCreator.OUTCOME_TIERS[pick.choice] ?? 'smart' : 'smart';
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.tier: ${pick.choice}@${pick.confidence.toFixed(2)} -> ${tier}`);
+    return tier;
   }
 
   private async gitStatusLine(extra: TaskExtra): Promise<string | undefined> {

@@ -102,34 +102,35 @@ I am advisory-only and do not execute creation tasks. ObjectCreator implements t
   }
 
   protected override async handleAsk(question: string): Promise<string> {
-    const outOfScope = await this.askScopeGate(question);
-    if (outOfScope) return outOfScope;
-    return this.askLlm(this.askPrompt(question), question, 'fast');
+    const scope = await this.askScopeGate(question);
+    if (scope.pass) return scope.pass;
+    return this.askLlm(this.askPrompt(question) + (scope.hint ? `\n\n${scope.hint}` : ''), question, 'fast');
   }
 
   /**
    * Whether a question is plainly outside what this object advises on, judged
-   * against its own description (site agent.ask-scope, act): a PASS with its
-   * reason, without the LLM call. Most goals get PASS here anyway, so the
-   * shortcut needs a near-certain judgment (in-scope p < 0.15). Undefined
-   * keeps the full answer path.
+   * against its own description (site agent.ask-scope). Most goals get PASS
+   * here anyway, so only a near-certain judgment counts (in-scope p < 0.15).
+   * Acting, that is a PASS with its reason, without the LLM call; held at
+   * advise, it is a hint the answering model reads. Otherwise the full
+   * answer path runs unchanged.
    */
-  private async askScopeGate(question: string): Promise<string | undefined> {
+  private async askScopeGate(question: string): Promise<{ pass?: string; hint?: string }> {
     const site = 'agent.ask-scope';
-    if (await this.decisionSiteMode(site) === 'off') return undefined;
+    if (await this.decisionSiteMode(site) === 'off') return {};
     const outcome = await this.askDecision(site, {
       agent: { name: this.manifest.name, description: `${this.manifest.description}${AgentCreator.ASK_GUIDE}` },
       question: question.slice(0, 3000),
     }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 5000 });
     const p = noulOf(outcome, 'in_scope');
-    if (!outcome || p === undefined) return undefined;
-    const pass = p < 0.15;
-    if (outcome.mode !== 'act' || !pass) {
-      if (outcome.mode !== 'act') log.info(`[decision:${outcome.mode}] AgentCreator ${site}: in_scope=${p.toFixed(2)}${pass ? ' (would PASS)' : ''}`);
-      return undefined;
+    if (!outcome || p === undefined) return {};
+    const outside = p < 0.15;
+    log.info(`[decision:${outcome.mode}] AgentCreator ${site}: in_scope=${p.toFixed(2)}${outside ? (outcome.mode === 'act' ? ' → PASS without an LLM call' : ' → scope hint') : ''}`);
+    if (!outside) return {};
+    if (outcome.mode === 'advise') {
+      return { hint: `A runtime scope check judged this question outside what you advise on (in-scope p=${p.toFixed(2)}). If that holds, answer PASS with the reason.` };
     }
-    log.info(`[decision:act] AgentCreator ${site}: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
-    return `PASS: judged outside what I advise on (in-scope p=${p.toFixed(2)}); I advise on new autonomous behavior built from several cooperating objects (an agent, a scheduler, a watcher).`;
+    return { pass: `PASS: judged outside what I advise on (in-scope p=${p.toFixed(2)}); I advise on new autonomous behavior built from several cooperating objects (an agent, a scheduler, a watcher).` };
   }
 
   // ═══════════════════════════════════════════════════════════════════

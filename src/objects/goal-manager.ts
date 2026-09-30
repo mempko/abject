@@ -347,7 +347,7 @@ export class GoalManager extends Abject {
       if (!outcome || !kind) return;
       const p = kind.probabilities[kind.choice] ?? 0;
       log.info(`[decision:${outcome.mode}] goal.failure ${taskId.slice(0, 8)}: ${kind.choice}@${p.toFixed(2)}`);
-      if (outcome.mode === 'shadow' || p < 0.5) return;
+      if (p < 0.5) return;
       record = {
         kind: kind.choice, p: Math.round(p * 100) / 100,
         retrySame: noulOf(outcome, 'retry_same'), partialWorkUsable: noulOf(outcome, 'partial_work_usable'),

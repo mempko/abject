@@ -3906,7 +3906,7 @@ The registered object must implement these handlers to participate in the agent 
   // bear out the prediction, is the agent progressing or looping, why did an
   // action fail, does a done result complete the task. Every judgment names
   // its site (src/core/decision-sites.ts), whose mode comes back with the
-  // answer: shadow logs, advise adds a hint the model reads, act takes effect.
+  // answer: advise adds a hint the model reads, act takes effect.
   // A null answer (site off, no model, failure) always leaves today's path.
 
   /** How long the next think waits for the previous step's judgments. */
@@ -3962,12 +3962,21 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   /** The agent's recent acted steps, oldest first, as a judge reads them. */
-  private static recentSteps(entry: TaskEntry, n = 8): Array<Record<string, unknown>> {
+  private static recentSteps(entry: TaskEntry, n = 8, resultChars = 300): Array<Record<string, unknown>> {
     return (entry.predictions ?? []).slice(-n).map(p => ({
       step: p.step, action: p.action, outcome: p.outcome,
       ...(p.expect ? { expect: p.expect.slice(0, 160) } : {}),
-      ...(p.actual ? { result: p.actual.slice(0, 300) } : {}),
+      ...(p.actual ? { result: p.actual.slice(0, resultChars) } : {}),
     }));
+  }
+
+  /**
+   * The openings of the larger results the agent read (held as payloads, so
+   * a step's own result line shows only a handle). Without them a judge sees
+   * "result held as res-3" and cannot tell a grounded report from a claim.
+   */
+  private static heldEvidence(entry: TaskEntry, n = 2, chars = 1500): Array<{ id: string; excerpt: string }> {
+    return (entry.payloads ?? []).slice(-n).map(p => ({ id: p.id, excerpt: p.text.slice(0, chars) }));
   }
 
   /** Start the post-action judgments for the step just recorded; the next think collects them. */
@@ -4030,10 +4039,7 @@ The registered object must implement these handlers to participate in the agent 
     if (!outcome || !verdict) return [];
     record.decisionVerdict = { verdict: verdict.choice, confidence: verdict.confidence, probabilities: verdict.probabilities, emulated: outcome.emulated };
     const p = verdict.probabilities[verdict.choice] ?? 0;
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.prediction step ${record.step}: ${verdict.choice}@${p.toFixed(2)}`);
-      return [];
-    }
+    log.info(`[decision:${outcome.mode}] ${scope.onBehalfOf} agent.prediction step ${record.step}: ${verdict.choice}@${p.toFixed(2)}`);
     if (p < 0.7) return [];
     if (verdict.choice === 'contradicted') {
       return [`Your prediction for step ${record.step} looks CONTRADICTED by its result (p=${p.toFixed(2)}). Say what you learned and adjust the plan before choosing the next action.`];
@@ -4054,9 +4060,8 @@ The registered object must implement these handlers to participate in the agent 
       const level = topLevel(progress);
       entry.progressVerdict = { level, p: progress.probabilities[String(level)] ?? 0, step: task.step };
     }
-    if (outcome?.mode === 'shadow') {
-      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.progress: loop=${loop?.choice ?? '?'} progress=${progress?.score ?? '?'}`);
-    } else if (outcome) {
+    if (outcome) {
+      log.info(`[decision:${outcome.mode}] ${scope.onBehalfOf} agent.progress: loop=${loop?.choice ?? '?'}@${loop ? (loop.probabilities[loop.choice] ?? 0).toFixed(2) : '?'} progress=${progress?.score ?? '?'}`);
       const nudged = (task.nudgedSignatures ??= []);
       const loopP = loop ? loop.probabilities[loop.choice] ?? 0 : 0;
       if (loop && loop.choice !== 'none' && loopP >= 0.7 && AgentAbject.LOOP_NUDGES[loop.choice] && !nudged.includes(`decision:${loop.choice}`)) {
@@ -4096,10 +4101,7 @@ The registered object must implement these handlers to participate in the agent 
     if (kind.choice === 'transient' && p >= 0.85 && (retry ?? 0) >= 0.8 && !nudged.includes(key)) {
       entry.retryCandidate = { action: structuredClone(action), key };
     }
-    if (outcome.mode === 'shadow') {
-      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.failure: ${kind.choice}@${p.toFixed(2)} retry_same=${retry?.toFixed(2) ?? '?'}`);
-      return [];
-    }
+    log.info(`[decision:${outcome.mode}] ${scope.onBehalfOf} agent.failure: ${kind.choice}@${p.toFixed(2)} retry_same=${retry?.toFixed(2) ?? '?'}`);
     if (p < 0.6) return [];
     return [`The last failure looks like ${kind.choice.replace(/_/g, ' ')} (p=${p.toFixed(2)}): ${FAILURE_GUIDANCE[kind.choice as FailureKind]}.`];
   }
@@ -4127,6 +4129,7 @@ The registered object must implement these handlers to participate in the agent 
     const all = [...late.map(l => `(about an earlier step) ${l}`), ...lines];
     if (all.length) {
       entry.state.llmMessages.push({ role: 'user', content: `[Runtime check]\n${all.map(l => `- ${l}`).join('\n')}` });
+      log.info(`[${this.agentNameOf(entry)}] Runtime check before step ${entry.state.step + 1}: ${all.map(l => l.slice(0, 140)).join(' | ')}`);
     }
 
     if (entry.stopJudgment) {
@@ -4227,7 +4230,8 @@ The registered object must implement these handlers to participate in the agent 
     const outcome = await this.askDecision('agent.completion', {
       task: AgentAbject.summarizeTask(task.task).slice(0, 1500),
       result: AgentAbject.clip(task.result, 3000),
-      recent: AgentAbject.recentSteps(entry, 6),
+      recent: AgentAbject.recentSteps(entry, 8, 900),
+      evidence: AgentAbject.heldEvidence(entry),
       steps_used: task.step,
     }, completionQuestions(), this.decisionScope(entry));
     const status = choiceOf(outcome, 'completion_status');
@@ -4266,7 +4270,8 @@ The registered object must implement these handlers to participate in the agent 
     const task = entry.state;
     const outcome = await this.askDecision('agent.final', {
       task: AgentAbject.summarizeTask(task.task).slice(0, 1500),
-      recent: AgentAbject.recentSteps(entry, 8),
+      recent: AgentAbject.recentSteps(entry, 8, 600),
+      evidence: AgentAbject.heldEvidence(entry),
       last_result: task.lastResult ? AgentAbject.clip({ success: task.lastResult.success, data: task.lastResult.data, error: task.lastResult.error }, 2000) : null,
       steps_used: task.step,
     }, finalDispositionQuestions(), this.decisionScope(entry));
@@ -4294,35 +4299,34 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   /**
-   * Drop recalled knowledge a decision model judges irrelevant to this task
-   * (site agent.knowledge, act). User-authored entries are kept unless judged
-   * irrelevant with high confidence and no background value.
+   * Drop keyword-recalled knowledge a decision model judges irrelevant to
+   * this task (site agent.knowledge). Recall ranks by shared words, so it
+   * surfaces entries about other work; woven patterns are left alone, since
+   * the weave already matched their contexts to the task and the reviewer
+   * tracks what each application did. User-authored entries stay unless the
+   * judgment is near-certain.
    */
-  private async filterRecalledKnowledge<K extends { title: string; type: string; content: string; origin?: string; usefulCount?: number }, P extends K>(
+  private async filterRecalledKnowledge<K extends { title: string; type: string; content: string; origin?: string; usefulCount?: number }, P>(
     entry: TaskEntry, relevant: K[], patterns: P[],
   ): Promise<{ relevant: K[]; patterns: P[] }> {
-    const all: K[] = [...relevant, ...patterns];
-    if (all.length === 0) return { relevant, patterns };
+    if (relevant.length === 0) return { relevant, patterns };
     if (await this.decisionSiteMode('agent.knowledge') === 'off') return { relevant, patterns };
     const outcome = await this.askDecision('agent.knowledge', {
+      agent: this.agentNameOf(entry),
       task: AgentAbject.summarizeTask(entry.state.task).slice(0, 1500),
-      entries: all.map((e, i) => ({ i, title: e.title, type: e.type, origin: e.origin ?? 'agent', useful: e.usefulCount ?? 0, snippet: e.content.slice(0, 400) })),
-    }, relevanceQuestions(all.length), this.decisionScope(entry));
+      entries: relevant.map((e, i) => ({ i, title: e.title, type: e.type, origin: e.origin ?? 'agent', useful: e.usefulCount ?? 0, content: e.content.slice(0, 900) })),
+    }, relevanceQuestions(relevant.length), this.decisionScope(entry));
     if (!outcome) return { relevant, patterns };
     const drop = new Set<number>();
-    all.forEach((e, i) => {
+    relevant.forEach((e, i) => {
       const s = scoreOf(outcome, `rel_${i}`);
       if (!s) return;
-      const irrelevant = (s.probabilities['0'] ?? 0) >= 0.6 && s.score < 0.7;
-      if (irrelevant && (e.origin !== 'user' || (s.probabilities['0'] ?? 0) >= 0.9)) drop.add(i);
+      const pIrrelevant = s.probabilities['0'] ?? 0;
+      if (s.score < 0.5 && pIrrelevant >= (e.origin === 'user' ? 0.95 : 0.75)) drop.add(i);
     });
-    if (drop.size === 0) return { relevant, patterns };
-    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.knowledge: ${outcome.mode === 'act' ? 'dropping' : 'would drop'} ${drop.size}/${all.length}: ${[...drop].map(i => all[i].title.slice(0, 40)).join(' | ')}`);
-    if (outcome.mode !== 'act') return { relevant, patterns };
-    return {
-      relevant: relevant.filter((_, i) => !drop.has(i)),
-      patterns: patterns.filter((_, i) => !drop.has(relevant.length + i)),
-    };
+    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.knowledge: ${outcome.mode === 'act' && drop.size ? 'dropping' : 'judged irrelevant'} ${drop.size}/${relevant.length}${drop.size ? `: ${[...drop].map(i => relevant[i].title.slice(0, 40)).join(' | ')}` : ''}`);
+    if (outcome.mode !== 'act' || drop.size === 0) return { relevant, patterns };
+    return { relevant: relevant.filter((_, i) => !drop.has(i)), patterns };
   }
 
   /** A collaborator's reply to a delegation, classified; a reason to stop when it declined (site agent.delegation, act). */
