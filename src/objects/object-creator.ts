@@ -3253,10 +3253,13 @@ ${source}
       const targetIdOrName = (data?.objectId as string | undefined)
         ?? (data?.target as string | undefined)
         ?? (data?.objectName as string | undefined);
+      // Queue dispatch forwards only the opaque `data`, so a dispatcher names
+      // the kind there; direct callers may still pass it at the top level.
+      const requested = type ?? (data?.type as string | undefined);
       const kind: 'create' | 'modify' | 'investigate' =
-        type === 'create' ? 'create'
-          : type === 'modify' ? 'modify'
-            : type === 'investigate' ? 'investigate'
+        requested === 'create' ? 'create'
+          : requested === 'modify' ? 'modify'
+            : requested === 'investigate' ? 'investigate'
               : (targetIdOrName ? 'modify' : 'create');
       // Use the queue-runner-supplied taskId so AgentAbject's TaskEntry,
       // ObjectCreator's TaskExtra, and the queue's inFlight slot all share
