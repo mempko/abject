@@ -1,5 +1,31 @@
 [
   {
+    "version": "0.12.0",
+    "date": "2026-09-30",
+    "title": "A Desktop with Depth",
+    "summary": "The desktop is now drawn as a real 3D scene in a new Agitprop print style, and windows move with weight when they open, close, or change. System browsers can show what they hold as live 3D maps, and your own Abjects can use the same scene, motion, and widget tools.",
+    "highlights": [
+      "A 3D scene layer for the desktop: glTF models, 3D text and labels, lines and trails, sky, GPU particles, orbit cameras, and post effects, with named presets that give windows their own look",
+      "Map views in every system browser (agents, scheduler, knowledge, objects, processes, peers, collaborators): each shows its contents as an interactive 3D graph, and clicking a node inspects it",
+      "A new default look: the desktop, windows, dock, and icons are redesigned in the Agitprop print style (hard block shadows, square corners, a Constructivist backdrop); saved theme presets are migrated automatically, once",
+      "Windows move with weight: opening, closing, minimizing, restoring, and switching workspaces play motion effects with rim light and particle bursts, and any Abject can play effects on its own windows",
+      "Pop-out windows: any widget can detach into its own window and keep working, with input routed back to the original widget",
+      "A new nodeGraph widget draws force-directed graphs in 3D; lists gain search and filtering, and progress bars can show a percentage or an indeterminate state",
+      "The Eye shows live LLM activity: each call lights up its model, connections are weighted by tokens used, and a pulse marks success or failure, all without opening a window",
+      "Desktop polish: the command palette gains built-in commands, Chat folds goal trees into the conversation, and the dock, taskbar, notifications, and switcher share one consistent style",
+      "A new scene-showcase example you can load and read: it builds a live scene with models, 3D text, labels, lines, particles, sky, and camera motion",
+      "abject.world is redesigned with new screenshots and short clips of the desktop in use"
+    ],
+    "fixes": [
+      "Abjects can now send messages while they are shutting down, so cleanup work reaches other objects instead of being dropped; an object stopped twice no longer runs its cleanup twice",
+      "The LLM service writes its ledger to storage when it stops, so recent entries survive a shutdown",
+      "The Scheduler clears its tick timer on stop, so no stray callbacks fire after an object has stopped",
+      "The Factory accepts spawn requests with arguments wrapped by parameter name, so spawning from the Explorer method form works",
+      "Peer Network and web exposure shut down cleanly when the gateway is already stopped or was never reached",
+      "Widgets tell the objects that depend on them when they stop, so buttons, selects, split panes, and windows clean up properly"
+    ]
+  },
+  {
     "version": "0.11.0",
     "date": "2026-09-24",
     "title": "Clearer routing, steadier long thoughts",
