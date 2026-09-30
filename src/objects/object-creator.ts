@@ -3647,13 +3647,16 @@ ${source}
     // draft_manifest + draft_source + compile in one response) — routing it
     // to balanced writes the whole object on the mid-tier model.
     const MECHANICAL = state.kind === 'investigate'
-      ? new Set(['call', 'read_draft', 'getState', 'ask', 'discover'])
+      ? new Set(['call', 'read_draft'])
       : new Set(['compile', 'validate_calls', 'deploy_spawn', 'deploy_update']);
     if (!MECHANICAL.has(last.action)) return reasoningTier;
     // A deploy now carries the semantic reviewer's findings back with it. If it
     // found something, the next think may well WRITE CODE to address it — that
-    // is an authoring step, not a mechanical one.
-    if (last.action.startsWith('deploy_') && (state.lastValidation?.semantics?.issues.length ?? 0) > 0) {
+    // is an authoring step, not a mechanical one. The review runs beside the
+    // loop, so its findings count only once they are for the draft now staged;
+    // an earlier draft's findings are stale.
+    const semanticsFresh = state.semanticReviewedSource === state.draftSource;
+    if (last.action.startsWith('deploy_') && semanticsFresh && (state.lastValidation?.semantics?.issues.length ?? 0) > 0) {
       return reasoningTier;
     }
     // A "successful" mechanical step can still surface a runtime problem —
