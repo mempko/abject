@@ -1338,8 +1338,16 @@ clean result I did not observe.`;
    */
   private looksLikeParseFailure(verdict: CheckVerdict, editedPath: string, extra: TaskExtra): boolean {
     const rel = this.displayPath(extra, editedPath).split(path.sep).join('/');
-    const syntaxish = /syntax|unexpected token|unterminated|parse error|expected|unbalanced/i;
-    return verdict.newFailures.some(s => s.includes(rel) && syntaxish.test(s));
+    // A bare "expected" also opens type and lint findings ("error TS2554:
+    // Expected 2 arguments", ESLint's "Expected '===' and instead saw '=='"),
+    // so it only counts in rustc's code-less parse form ("error: expected …").
+    const syntaxish = /syntax|unexpected token|unterminated|pars(?:e|ing) error|unbalanced|indentation|\berror: expected\b/i;
+    return verdict.newFailures.some(s => {
+      if (!s.includes(rel)) return false;
+      // TypeScript numbers its diagnostics: the 1xxx range is the syntactic one.
+      const tsCode = s.match(/\bTS(\d{4,5})\b/)?.[1];
+      return tsCode ? tsCode.startsWith('1') : syntaxish.test(s);
+    });
   }
 
   /**
@@ -1399,7 +1407,9 @@ clean result I did not observe.`;
       this.taintVerifyBaseline(extra);
       extra.unknownEffects = true;
       extra.mutationsSinceVerify++;
-    } else if (!before.complete || !after.complete) {
+    } else if ((!before.complete || !after.complete) && !ExternalCreator.isReadOnlyCommand(command)) {
+      // An incomplete snapshot cannot vouch that nothing changed, so the effects
+      // are unknown; a command that cannot write leaves nothing to verify.
       extra.unknownEffects = true;
     }
     this.audit(extra, `bash exit=${r.exitCode}: ${command.slice(0, 160)}`);
@@ -1418,6 +1428,35 @@ clean result I did not observe.`;
     return { ...bulkAwareResult(body), success: r.exitCode === 0,
       data: body.length > 8000 ? summary : { ...summary, output: body },
       ...(r.exitCode !== 0 ? { error: `Command exited ${r.exitCode}; inspect output and truncation metadata.` } : {}) };
+  }
+
+  /** Programs that only read, whatever their arguments. */
+  private static readonly READ_ONLY_PROGRAMS = new Set([
+    'cat', 'ls', 'head', 'tail', 'wc', 'grep', 'rg', 'pwd', 'stat', 'file', 'du', 'tree',
+    'which', 'realpath', 'basename', 'dirname', 'diff', 'cmp', 'echo',
+  ]);
+  /** Git subcommands that only read the repository. */
+  private static readonly READ_ONLY_GIT = new Set([
+    'status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'blame', 'grep', 'describe', 'shortlog',
+  ]);
+
+  /**
+   * Whether a shell command provably cannot write: simple invocations of
+   * read-only programs, optionally piped into each other, with no chaining,
+   * redirection or substitution. Deliberately narrow (sed, awk and find's
+   * -delete/-exec forms can all write); anything it does not recognize keeps
+   * the conservative unknown-effects treatment.
+   */
+  private static isReadOnlyCommand(command: string): boolean {
+    const c = command.trim();
+    if (!c || /[;&<>`\n]|\$\(/.test(c)) return false;
+    return c.split('|').every(segment => {
+      const [prog, ...args] = segment.trim().split(/\s+/);
+      if (!prog) return false;
+      if (prog === 'git') return ExternalCreator.READ_ONLY_GIT.has(args.find(a => !a.startsWith('-')) ?? '');
+      if (prog === 'find') return !args.some(a => /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
+      return ExternalCreator.READ_ONLY_PROGRAMS.has(prog);
+    });
   }
 
   private async opGrep(extra: TaskExtra, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
@@ -1664,6 +1703,12 @@ clean result I did not observe.`;
     if (changed === 0 && !extra.unknownEffects) {
       return { ok: true, note: 'Source edits made by this task: 0.' };
     }
+    // What needs verifying: edits this task made, or commands whose effect on
+    // the tree could not be observed. The reason names which, so a task that
+    // edited nothing is not told it changed files.
+    const pending = changed > 0 || extra.mutationsSinceVerify > 0
+      ? `${changed} file(s) were changed and ${extra.mutationsSinceVerify} mutation(s) have not been verified since.`
+      : 'No file edits were recorded, but a command ran while the project snapshot was incomplete, so its effect on the project is unknown.';
 
     const hasCommands = Boolean(project.checkCommand || project.verifyCommand);
     if (!hasCommands) {
@@ -1685,8 +1730,7 @@ clean result I did not observe.`;
       return {
         ok: false,
         reason:
-          `${changed} file(s) were changed and ${extra.mutationsSinceVerify} mutation(s) have not been ` +
-          `verified since. Run \`${project.verifyCommand ?? project.checkCommand}\` (the verify action) ` +
+          `${pending} Run \`${project.verifyCommand ?? project.checkCommand}\` (the verify action) ` +
           `and address anything it newly reports before claiming this is done.`,
         note: `${changed} file(s) changed, unverified.`,
       };
@@ -1701,13 +1745,22 @@ clean result I did not observe.`;
     }
 
     if (!latest.passed) {
+      // New failures that name only files this task did not write still block,
+      // until their cause (concurrent work, or a knock-on effect of this
+      // change) is established; say that rather than "nothing recognized".
+      const ours = latest.newFailures;
+      const foreign = latest.foreignFailures;
+      const detail = ours.length
+        ? `${ours.length} new diagnostic(s):\n${ours.slice(0, 15).map(s => `  ${s}`).join('\n')}`
+        : foreign.length
+          ? `${foreign.length} new failure(s) are in files this task did not write; establish their cause ` +
+            `(concurrent work, or a knock-on effect of this change) before claiming done:\n` +
+            foreign.slice(0, 15).map(s => `  ${s}`).join('\n')
+          : 'No diagnostic line was recognized; inspect the command output.';
       return {
         ok: false,
-        reason:
-          `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and did not pass. ` +
-          (latest.newFailures.length ? `${latest.newFailures.length} new diagnostic(s):\n` : 'No diagnostic line was recognized; inspect the command output.\n') +
-          latest.newFailures.slice(0, 15).map(s => `  ${s}`).join('\n'),
-        note: `${changed} file(s) changed, ${latest.newFailures.length} new failure(s).`,
+        reason: `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and did not pass. ${detail}`,
+        note: `${changed} file(s) changed, ${ours.length} new failure(s)${foreign.length ? `, ${foreign.length} in other files` : ''}.`,
       };
     }
 
