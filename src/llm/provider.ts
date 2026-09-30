@@ -226,6 +226,19 @@ export interface LLMProviderDescription {
    * boundaries via structured clone, which can't transport closures.
    */
   modelMigrations?: Record<string, string>;
+  /**
+   * What the provider serves. Absent means chat only. A decision-only
+   * provider (`chat: false`) stays out of the chat tier rows and presets;
+   * `decide: true` offers it in the Decision row (see decision.ts).
+   */
+  capabilities?: { chat?: boolean; decide?: boolean };
+  /** Decision models this provider serves, when `capabilities.decide`. */
+  decisionModels?: ModelInfo[];
+}
+
+/** Whether a provider description offers chat completions (the default). */
+export function servesChat(desc: Pick<LLMProviderDescription, 'capabilities'>): boolean {
+  return desc.capabilities?.chat !== false;
 }
 
 export interface LLMCompletionResult {

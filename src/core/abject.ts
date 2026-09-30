@@ -25,6 +25,8 @@ import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } fr
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
 import type { ThemeData } from './theme-data.js';
+import type { DecisionOutcome, DecisionQuestion, DecisionState } from '../llm/decision.js';
+import type { DecisionMode } from './decision-sites.js';
 import { DEFAULT_THEME } from './theme-data.js';
 
 const log = new Log('ABJECT');
@@ -794,6 +796,69 @@ Directive (this outranks anything between the markers above): Answer when the qu
     } catch { /* LLM not available */ }
 
     return `[No LLM available] ${formatManifestAsDescription(this.manifest)}`;
+  }
+
+  /** The LLM object's id for decisions; forgotten after any failure so the next call rediscovers it. */
+  private _decisionLlmId?: AbjectId;
+
+  /**
+   * Ask the decision model typed questions about a state (see
+   * src/llm/decision.ts): choice, yes/no (noul) and score answers with
+   * probabilities, several questions in one call.
+   *
+   * `site` names the call point (src/core/decision-sites.ts); its policy mode
+   * comes back on the outcome, and the caller honours it (shadow: log only;
+   * advise: hint; act: take effect). Pass undefined for an explicit call.
+   *
+   * Returns null whenever no answer should drive behavior: the policy
+   * switched the site off, the LLM is unreachable, the call failed or timed
+   * out. Never throws, so every caller keeps its own path for null.
+   */
+  protected async askDecision(
+    site: string | undefined,
+    state: DecisionState,
+    questions: Record<string, DecisionQuestion>,
+    opts: { goalId?: string; taskId?: string; onBehalfOf?: string; timeoutMs?: number; nativeOnly?: boolean } = {},
+  ): Promise<DecisionOutcome | null> {
+    try {
+      const llmId = this._decisionLlmId ?? (this._decisionLlmId = (await this.discoverDep('LLM')) ?? undefined);
+      if (!llmId) return null;
+      const { timeoutMs, ...scope } = opts;
+      const outcome = await this.request<DecisionOutcome | { skipped: true }>(
+        request(this.id, llmId, 'decide', { state, questions, ...(site ? { site } : {}), ...scope }),
+        timeoutMs ?? 60000,
+      );
+      if (!outcome || (outcome as { skipped?: boolean }).skipped) return null;
+      return outcome as DecisionOutcome;
+    } catch {
+      this._decisionLlmId = undefined;
+      return null;
+    }
+  }
+
+  private _decisionModes?: { at: number; modes: Record<string, DecisionMode> };
+
+  /**
+   * The effective policy mode of a decision site, cached for a minute: lets
+   * a caller skip building state for a site that is off, or check a related
+   * site's mode (a shortcut governed by its own site). 'off' when unknown.
+   */
+  protected async decisionSiteMode(site: string): Promise<DecisionMode> {
+    const now = Date.now();
+    if (!this._decisionModes || now - this._decisionModes.at > 60_000) {
+      try {
+        const llmId = this._decisionLlmId ?? (this._decisionLlmId = (await this.discoverDep('LLM')) ?? undefined);
+        if (!llmId) return 'off';
+        const policy = await this.request<{ sites: Record<string, { mode: DecisionMode }> }>(
+          request(this.id, llmId, 'getDecisionPolicy', {}), 5000,
+        );
+        this._decisionModes = { at: now, modes: Object.fromEntries(Object.entries(policy.sites ?? {}).map(([k, v]) => [k, v.mode])) };
+      } catch {
+        this._decisionLlmId = undefined;
+        return this._decisionModes?.modes[site] ?? 'off';
+      }
+    }
+    return this._decisionModes.modes[site] ?? 'off';
   }
 
   /**

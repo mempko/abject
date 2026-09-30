@@ -35,6 +35,17 @@ import {
 } from '../llm/provider.js';
 import { isContextOverflowError } from '../llm/provider.js';
 import {
+  validateDecisionRequest, boundDecisionState, isDecisionProvider, summarizeAnswers, stateChars,
+  type DecisionProvider, type DecisionRequest, type DecisionResult, type DecisionQuestion, type DecisionState,
+  type DecisionOutcome,
+} from '../llm/decision.js';
+import { emulateDecision, type EmulationTransport } from '../llm/decision-emulator.js';
+import { TypeSafeProvider } from '../llm/typesafe.js';
+import {
+  DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode,
+  type DecisionMode, type DecisionPolicy, type DecisionGates,
+} from '../core/decision-sites.js';
+import {
   ModelPricing,
   estimateCostUsd,
   lookupPricing,
@@ -99,6 +110,19 @@ function normalizeTierFallbacks(input: TierFallbacks | null | undefined): TierFa
 }
 
 /** One concrete place a request can run: a registered provider plus the tier's model/effort overrides. */
+/** A decision's usage in the ledger's shape. */
+function settleUsageOf(result: DecisionResult): LLMCompletionResult['usage'] {
+  return result.usage
+    ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, ...(result.usage.costUsd !== undefined ? { costUsd: result.usage.costUsd } : {}) }
+    : undefined;
+}
+
+/** Ledger attribution for a call made on another method's behalf (a decision emulated on a chat model). */
+interface LedgerMeta { method?: string; site?: string }
+
+/** Settles one goal-budget reservation against the call's real usage. */
+type UsageSettle = (() => Promise<void>) & { usage?: LLMCompletionResult['usage']; failure?: string };
+
 interface ResolvedRoute {
   provider: LLMProvider;
   modelOverride?: string;
@@ -142,6 +166,12 @@ export interface TierCapabilities {
    * when the requested tier's model is text-only. Null when not configured.
    */
   visionFallback: TierCapability | null;
+  /**
+   * Where `decide` requests run: a decision model (`native`) or a chat model
+   * emulating one. Callers with per-step gates check `native` before spending
+   * an emulated call where the gate would cost about what it saves.
+   */
+  decision?: { provider: string; model: string; native: boolean } | null;
 }
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
@@ -162,6 +192,22 @@ import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
 const log = new Log('LLM');
 
 const LLM_INTERFACE = 'abjects:llm';
+
+/** A `decide` request: typed questions about a state (see src/llm/decision.ts). */
+export interface DecidePayload {
+  state: DecisionState;
+  questions: Record<string, DecisionQuestion>;
+  /** The call point (src/core/decision-sites.ts); omitted for explicit calls, which always run. */
+  site?: string;
+  onBehalfOf?: string;
+  goalId?: string;
+  taskId?: string;
+  /** Skip rather than emulate when no decision model is configured (the caller's gate is only worth a fast call). */
+  nativeOnly?: boolean;
+}
+
+/** Where decisions go when routed explicitly: a decision model, or a chat model to emulate one. */
+export interface DecisionRoute { provider: string; model: string }
 
 export interface LLMQueryPayload {
   messages: LLMMessage[];
@@ -297,6 +343,10 @@ export interface LLMLedgerEntry {
   outputContent?: string;
   /** Whether this entry's text is retrievable at all, resident or in storage. */
   hasText?: boolean;
+  /** The decision site that asked, for `decide` calls (and emulation calls made for them). */
+  site?: string;
+  /** For `decide` calls: the policy mode, whether a chat model emulated it, and the answers in brief. */
+  decision?: { mode: string; emulated: boolean; answers: string };
 }
 
 /** The name the monitor's detail view speaks: an entry with its text filled in. */
@@ -501,6 +551,19 @@ export class LLMObject extends Abject {
   /** Optional vision substitute for image-bearing steps on text-only tiers. */
   private visionFallback?: TierConfig;
   private httpClientId?: AbjectId;
+
+  // ── Decisions ─────────────────────────────────────────────────────
+  /** Decision-only providers (TypeSafe). Chat providers that also decide are found in `providers`. */
+  private decisionProviders: Map<string, DecisionProvider> = new Map();
+  /** Explicit decision route from Settings; unset means auto (a keyed decision provider, else Fast). */
+  private decisionRoute?: DecisionRoute;
+  private decisionPolicy: DecisionPolicy = { ...DEFAULT_DECISION_POLICY, overrides: {} };
+  /** Recent identical decisions, so a gate asked twice within a step pays once. */
+  private decisionMemo = new Map<string, { at: number; result: DecisionResult }>();
+  private static readonly DECISION_MEMO_MS = 60_000;
+  private static readonly DECISION_MEMO_MAX = 200;
+  /** Output cap for an emulated decision: short answer lines plus a reasoning model's thinking. */
+  private static readonly EMULATION_MAX_TOKENS = 8192;
 
   // ── The ledger ────────────────────────────────────────────────────
   // Every call is one entry, from start to finish. Active requests are the
@@ -936,6 +999,49 @@ export class LLMObject extends Abject {
                   synthesizeProvider: { kind: 'primitive', primitive: 'string' },
                 } },
               },
+              {
+                name: 'decide',
+                description: 'Answer typed questions about a state with probabilities (a decision model, or a chat model emulating one): choice picks one of 2-255 options, noul gives the probability of yes, score places the state on 2-10 ordered levels. Cannot generate text. Built-in callers name a site; its policy mode comes back with the answer, or { skipped: true } when the policy switches the site off.',
+                parameters: [
+                  { name: 'state', type: { kind: 'object', properties: {} }, description: 'The material to judge: text, a JSON object, or an array of text' },
+                  { name: 'questions', type: { kind: 'object', properties: {} }, description: 'Question id → { type: "choice"|"noul"|"score", instructions, criteria }' },
+                  { name: 'site', type: { kind: 'primitive', primitive: 'string' }, description: 'Decision site id (src/core/decision-sites.ts); omit for an explicit call, which always runs', optional: true },
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal to charge the call to', optional: true },
+                  { name: 'onBehalfOf', type: { kind: 'primitive', primitive: 'string' }, description: 'Name to attribute the call to in the ledger', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  answers: { kind: 'object', properties: {} },
+                  model: { kind: 'primitive', primitive: 'string' },
+                  provider: { kind: 'primitive', primitive: 'string' },
+                  emulated: { kind: 'primitive', primitive: 'boolean' },
+                  calibrated: { kind: 'primitive', primitive: 'boolean' },
+                  mode: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'setDecisionPolicy',
+                description: 'Set the decision gates (off | shadow | on | full) and per-site mode overrides (site id → off | shadow | advise | act)',
+                parameters: [
+                  { name: 'gates', type: { kind: 'primitive', primitive: 'string' }, description: 'off, shadow (log only), on (each site at its default), full (each site at its highest mode)', optional: true },
+                  { name: 'overrides', type: { kind: 'object', properties: {} }, description: 'Site id → mode; replaces the previous overrides', optional: true },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'getDecisionPolicy',
+                description: 'The decision gates, overrides, where decisions run, and every site with its effective mode',
+                parameters: [],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'getDecisionStats',
+                description: 'Per-site rollup of decision calls in the ledger (count, emulated share, errors, latency, cost, recent answers), for calibrating site modes',
+                parameters: [
+                  { name: 'site', type: { kind: 'primitive', primitive: 'string' }, description: 'Only this site', optional: true },
+                  { name: 'since', type: { kind: 'primitive', primitive: 'number' }, description: 'Only calls started at or after this epoch-ms time', optional: true },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
             ],
             events: [
               { name: 'requestStarted', description: 'Emitted when a new LLM request begins', payload: { kind: 'reference', reference: 'LLMActiveRequest' } },
@@ -1013,22 +1119,28 @@ export class LLMObject extends Abject {
     // Standalone deployments may keep caller, LLM and goals in one registry.
     return this.discoverDep('GoalManager');
   }
-  private async reserveModelUsage(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): Promise<(() => Promise<void>) & { usage?: LLMCompletionResult['usage']; failure?: string }> {
+  private async reserveModelUsage(provider: LLMProvider, messages: LLMMessage[], options?: LLMCompletionOptions): Promise<UsageSettle> {
+    const inputTokens = Math.ceil(Buffer.byteLength(JSON.stringify(messages)));
+    return this.reserveUsageFor(provider.name, this.modelFor(provider, options), inputTokens, options?.maxTokens ?? 32768);
+  }
+
+  /** Reserve goal budget for one model call and return the settle step (a no-op outside a goal). */
+  private async reserveUsageFor(providerName: string, model: string, inputTokens: number, outputTokens: number): Promise<UsageSettle> {
     const scope = this.usageContext.getStore();
-    const finish: (() => Promise<void>) & { usage?: LLMCompletionResult['usage']; failure?: string } = async () => {};
+    const finish: UsageSettle = async () => {};
     if (!scope?.goalId) return finish;
     const manager = await this.usageManagerFor(scope.callerId);
     if (!manager) throw new Error('GoalManager unavailable in the requesting workspace for resource accounting');
     const operationId = `llm-${crypto.randomUUID()}`;
-    const tokens = Math.ceil(Buffer.byteLength(JSON.stringify(messages))) + (options?.maxTokens ?? 32768);
-    const estimate = estimateCostUsd(provider.name, this.modelFor(provider, options), { inputTokens: tokens, outputTokens: options?.maxTokens ?? 32768 });
+    const tokens = inputTokens + outputTokens;
+    const estimate = estimateCostUsd(providerName, model, { inputTokens: tokens, outputTokens });
     const receipt = await this.request<{ accepted: boolean; reason?: string }>(msg.request(this.id, manager, 'reserveUsage', { ...scope, operationId, tokens, costUsd: estimate }));
     if (!receipt.accepted) throw new Error(receipt.reason ?? 'Goal budget unavailable');
-    const settle: typeof finish = async () => {
+    const settle: UsageSettle = async () => {
       const usage = settle.usage;
       await this.request(msg.request(this.id, manager, 'settleUsage', { ...scope, operationId,
         tokens: usage ? usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) : undefined,
-        costUsd: usage?.costUsd ?? (usage ? estimateCostUsd(provider.name, this.modelFor(provider, options), usage) : undefined), error: settle.failure }));
+        costUsd: usage?.costUsd ?? (usage ? estimateCostUsd(providerName, model, usage) : undefined), error: settle.failure }));
     };
     return settle;
   }
@@ -1060,6 +1172,7 @@ export class LLMObject extends Abject {
   }
 
   private setupHandlers(): void {
+    this.setupDecisionHandlers();
     this.on('getTaskUsage', msg=>{
       const {taskId,sessionId}=msg.payload as {taskId:string;sessionId?:string};
       const rows=this._ledger.filter(r=>r.taskId===taskId || (sessionId && (r.taskId===sessionId || r.taskId?.startsWith(`${sessionId}:attempt-`))));
@@ -1279,6 +1392,8 @@ export class LLMObject extends Abject {
         const provider = new OllamaProvider({ baseUrl: ollamaUrl ?? 'http://localhost:11434' });
         return provider.listModels();
       }
+      const decisionOnly = this.decisionProviders.get(providerName);
+      if (decisionOnly) return decisionOnly.listDecisionModels();
       if (!this.providers.get(providerName)) return [];
       return this.getProviderModels(providerName, { refresh: true });
     });
@@ -1589,9 +1704,20 @@ export class LLMObject extends Abject {
     tierFallbacks?: TierFallbacks | null;
     visionFallback?: TierConfig | null;
     cacheKeepalive?: { enabled: boolean };
+    /** Explicit decision route: undefined leaves it untouched, null returns to auto. */
+    decisionRoute?: DecisionRoute | null;
+    decisionPolicy?: Partial<DecisionPolicy>;
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
     const credentials = config.credentials ?? {};
+
+    // Decision-only providers, registered when a key is present.
+    if (credentials.typesafe) this.decisionProviders.set('typesafe', new TypeSafeProvider({ apiKey: credentials.typesafe, fetchFn }));
+    if (config.decisionRoute !== undefined) {
+      this.decisionRoute = config.decisionRoute ?? undefined;
+      log.info(`Decision route configured: ${JSON.stringify(this.decisionRoute ?? 'auto')}`);
+    }
+    if (config.decisionPolicy) this.setDecisionPolicy(config.decisionPolicy);
 
     // CLI providers — top-level entries in the registry alongside the API
     // ones. Always registered; their own `isAvailable()` reports whether
@@ -1676,6 +1802,7 @@ export class LLMObject extends Abject {
     callerId?: AbjectId,
     requestId?: string,
     onBehalfOf?: string,
+    ledgerMeta?: LedgerMeta,
   ): Promise<LLMCompletionResult> {
     // Primary first, then each configured fallback in order (see the
     // stream handler for the same loop with the streaming caveat).
@@ -1686,7 +1813,7 @@ export class LLMObject extends Abject {
       const ledgerId = i === 0 ? baseId : `${baseId}:fallback${i}`;
       const fallbackOf = i === 0 ? undefined : this.describeRoute(routes[0], options);
       try {
-        return await this.completeAttempt(route, messages, options, callerId, ledgerId, onBehalfOf, fallbackOf);
+        return await this.completeAttempt(route, messages, options, callerId, ledgerId, onBehalfOf, fallbackOf, ledgerMeta);
       } catch (err) {
         const next = routes[i + 1];
         if (!next || !this.canFallBack(err, { emittedChars: 0, killed: false })) throw err;
@@ -1704,6 +1831,7 @@ export class LLMObject extends Abject {
     trackId: string,
     onBehalfOf: string | undefined,
     fallbackOf: string | undefined,
+    ledgerMeta?: LedgerMeta,
   ): Promise<LLMCompletionResult> {
     const { provider } = route;
     const effectiveOptions = this.applyRouting(options, route.modelOverride, route.effortOverride);
@@ -1714,9 +1842,9 @@ export class LLMObject extends Abject {
 
     // Track active request
     if (callerId) {
-      await this.trackRequestStart(trackId, callerId, 'complete', provider.name,
+      await this.trackRequestStart(trackId, callerId, ledgerMeta?.method ?? 'complete', provider.name,
         this.modelFor(provider, effectiveOptions), totalChars, false, messages,
-        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens, fallbackOf },
+        { tier: options?.tier, effort: effectiveOptions?.effort, maxTokens: options?.maxTokens, fallbackOf, site: ledgerMeta?.site },
         onBehalfOf);
     }
 
@@ -1753,6 +1881,248 @@ export class LLMObject extends Abject {
     } finally {
       if (keepaliveTimer) this.cancelTimer(keepaliveTimer);
     }
+  }
+
+  // ── Decisions ─────────────────────────────────────────────────────────
+  // `decide` answers typed questions about a state (src/llm/decision.ts). A
+  // decision model answers natively when one is configured; otherwise a chat
+  // model emulates it (src/llm/decision-emulator.ts). Each call names its
+  // site (src/core/decision-sites.ts), whose policy says what the answer may
+  // do: the mode travels back with the answer and the caller honours it.
+
+  private setupDecisionHandlers(): void {
+    this.onMetered('decide', async (m: AbjectMessage) => {
+      require(!this._paused, 'LLM is paused');
+      return this.decide(m.payload as DecidePayload, m.routing.from, m.header.messageId);
+    });
+    this.on('setDecisionPolicy', async (m: AbjectMessage) => {
+      this.setDecisionPolicy((m.payload ?? {}) as Partial<DecisionPolicy>);
+      return this.getDecisionPolicy();
+    });
+    this.on('getDecisionPolicy', async () => this.getDecisionPolicy());
+    this.on('getDecisionStats', async (m: AbjectMessage) =>
+      this.decisionStats((m.payload ?? {}) as { site?: string; since?: number }));
+  }
+
+  private setDecisionPolicy(policy: Partial<DecisionPolicy>): void {
+    const gates: DecisionGates[] = ['off', 'shadow', 'on', 'full'];
+    const modes: DecisionMode[] = ['off', 'shadow', 'advise', 'act'];
+    if (policy.gates !== undefined) {
+      require(gates.includes(policy.gates), `decision gates must be one of ${gates.join(', ')}`);
+      this.decisionPolicy.gates = policy.gates;
+    }
+    if (policy.overrides !== undefined) {
+      for (const [id, mode] of Object.entries(policy.overrides ?? {})) {
+        require(modes.includes(mode), `decision override for ${id} must be one of ${modes.join(', ')}`);
+      }
+      this.decisionPolicy.overrides = { ...(policy.overrides ?? {}) };
+    }
+    log.info(`Decision policy: gates=${this.decisionPolicy.gates} overrides=${JSON.stringify(this.decisionPolicy.overrides ?? {})}`);
+  }
+
+  private getDecisionPolicy(): DecisionPolicy & { route: ReturnType<LLMObject['describeDecisionRoute']>; sites: Record<string, unknown> } {
+    const nativeAvailable = !!this.nativeDecisionRoute();
+    return {
+      gates: this.decisionPolicy.gates,
+      overrides: { ...(this.decisionPolicy.overrides ?? {}) },
+      route: this.describeDecisionRoute(),
+      sites: Object.fromEntries(Object.entries(DECISION_SITES).map(([id, spec]) =>
+        [id, { ...spec, mode: resolveSiteMode(id, this.decisionPolicy, nativeAvailable) }])),
+    };
+  }
+
+  /**
+   * The decision model decisions run on, when there is one: the explicit
+   * route when it names a decision model, else (auto) the first keyed
+   * decision-only provider. Undefined means decisions are emulated.
+   */
+  private nativeDecisionRoute(): { provider: DecisionProvider; model: string } | undefined {
+    if (this.decisionRoute) {
+      const { provider: name, model } = this.decisionRoute;
+      const dedicated = this.decisionProviders.get(name);
+      if (dedicated) return { provider: dedicated, model: model || dedicated.defaultDecisionModel() };
+      const chat = this.providers.get(name);
+      if (isDecisionProvider(chat) && (chat.describe().decisionModels ?? []).some(mi => mi.id === model)) {
+        return { provider: chat, model };
+      }
+      return undefined;
+    }
+    const auto = [...this.decisionProviders.values()][0];
+    return auto ? { provider: auto, model: auto.defaultDecisionModel() } : undefined;
+  }
+
+  /** Where emulated decisions run: the explicit route when it names a chat model, else the fast tier. */
+  private emulationRoute(): { providerName?: string; model?: string } {
+    const r = this.decisionRoute;
+    if (r && this.providers.has(r.provider) && !this.nativeDecisionRoute()) return { providerName: r.provider, model: r.model };
+    return {};
+  }
+
+  private describeDecisionRoute(): { provider: string; model: string; native: boolean } | null {
+    const native = this.nativeDecisionRoute();
+    if (native) return { provider: native.provider.name, model: native.model, native: true };
+    const emu = this.emulationRoute();
+    try {
+      const route = this.resolveProviderAndModel(emu.providerName, 'fast');
+      const model = emu.model ?? this.modelFor(route.provider, this.applyRouting({ tier: 'fast' }, route.modelOverride, route.effortOverride));
+      return { provider: route.provider.name, model, native: false };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Answer a decision request under its site's policy. A site the policy
+   * switches off (or a native-only site without a decision model) is
+   * skipped without spending a call; the caller keeps its own path.
+   */
+  async decide(payload: DecidePayload, callerId: AbjectId, requestId: string): Promise<DecisionOutcome | { skipped: true; site?: string; mode: 'off'; reason: string }> {
+    const { site, onBehalfOf } = payload;
+    const request: DecisionRequest = { state: boundDecisionState(payload.state), questions: payload.questions };
+    validateDecisionRequest(request);
+    const native = this.nativeDecisionRoute();
+    if (payload.nativeOnly && !native) return { skipped: true, site, mode: 'off', reason: 'caller asked for a decision model and none is configured' };
+    const mode = resolveSiteMode(site, this.decisionPolicy, !!native);
+    if (mode === 'off') return { skipped: true, site, mode: 'off', reason: native || !site ? 'policy' : 'native-only site without a decision model' };
+
+    const memoKey = LLMObject.decisionMemoKey(site, request);
+    const cached = this.decisionMemo.get(memoKey);
+    if (cached && Date.now() - cached.at < LLMObject.DECISION_MEMO_MS) return { ...cached.result, site, mode };
+
+    let result: DecisionResult | undefined;
+    let fallbackOf: string | undefined;
+    if (native) {
+      try {
+        result = await this.decideNative(native, request, site, mode, callerId, requestId, onBehalfOf);
+      } catch (err) {
+        fallbackOf = `${native.provider.name}/${native.model}`;
+        const reason = err instanceof Error ? err.message : String(err);
+        if (site && DECISION_SITES[site]?.emulation === 'native-only') {
+          log.warn(`decide ${site}: ${fallbackOf} failed (${reason.slice(0, 200)}); native-only site skipped`);
+          return { skipped: true, site, mode: 'off', reason: `decision model failed: ${reason.slice(0, 200)}` };
+        }
+        log.warn(`decide ${site ?? '(explicit)'}: ${fallbackOf} failed (${reason.slice(0, 200)}); emulating on a chat model`);
+      }
+    }
+    if (!result) result = await this.decideEmulated(request, site, mode, callerId, requestId, onBehalfOf, fallbackOf);
+
+    this.decisionMemo.set(memoKey, { at: Date.now(), result });
+    if (this.decisionMemo.size > LLMObject.DECISION_MEMO_MAX) {
+      const oldest = this.decisionMemo.keys().next().value;
+      if (oldest !== undefined) this.decisionMemo.delete(oldest);
+    }
+    return { ...result, site, mode };
+  }
+
+  /** A cheap content hash, so the memo holds no copies of large states. */
+  private static decisionMemoKey(site: string | undefined, request: DecisionRequest): string {
+    const text = JSON.stringify([site ?? '', request.state, request.questions]);
+    let h1 = 2166136261, h2 = 5381;
+    for (let i = 0; i < text.length; i++) { h1 = Math.imul(h1 ^ text.charCodeAt(i), 16777619); h2 = Math.imul(h2, 33) ^ text.charCodeAt(i); }
+    return `${text.length}:${h1 >>> 0}:${h2 >>> 0}`;
+  }
+
+  private async decideNative(
+    native: { provider: DecisionProvider; model: string }, request: DecisionRequest, site: string | undefined, mode: DecisionMode,
+    callerId: AbjectId, requestId: string, onBehalfOf: string | undefined,
+  ): Promise<DecisionResult> {
+    const providerName = native.provider.name;
+    const questionText = JSON.stringify(request.questions);
+    const chars = stateChars(request.state) + questionText.length;
+    const questions = Object.keys(request.questions).length;
+    const prompt: LLMMessage[] = [{ role: 'user', content: JSON.stringify({ state: request.state, questions: request.questions }) }];
+    await this.trackRequestStart(requestId, callerId, 'decide', providerName, native.model, chars, false, prompt, { site }, onBehalfOf);
+    log.info(`→ ${providerName} decide | site=${site ?? 'explicit'} | ${questions} q | ${chars} chars | model=${native.model}`);
+    const start = Date.now();
+    try {
+      // Output is a few typed answers; reserve accordingly, not a chat completion's cap.
+      const settle = await this.reserveUsageFor(providerName, native.model, Math.ceil(chars / 3), 256);
+      let result: DecisionResult;
+      try {
+        result = await native.provider.decide(request, { model: native.model, timeoutMs: 15_000 });
+        settle.usage = result.usage ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, ...(result.usage.costUsd !== undefined ? { costUsd: result.usage.costUsd } : {}) } : undefined;
+      } catch (err) {
+        settle.failure = String(err);
+        throw err;
+      } finally {
+        await settle();
+      }
+      const entry = this._byId.get(requestId);
+      if (entry) entry.decision = { mode, emulated: false, answers: summarizeAnswers(result) };
+      log.info(`← ${providerName} decide | site=${site ?? 'explicit'} | ${Date.now() - start}ms | ${summarizeAnswers(result)} | tokens=${result.usage?.inputTokens ?? '?'}in`);
+      this.trackRequestEnd(requestId, JSON.stringify(result.answers), settleUsageOf(result), 'stop');
+      return result;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.error(`${providerName} decide | ${Date.now() - start}ms | ${reason}`);
+      this.trackRequestError(requestId, reason);
+      throw err;
+    }
+  }
+
+  private async decideEmulated(
+    request: DecisionRequest, site: string | undefined, mode: DecisionMode,
+    callerId: AbjectId, requestId: string, onBehalfOf: string | undefined, fallbackOf: string | undefined,
+  ): Promise<DecisionResult> {
+    const emu = this.emulationRoute();
+    let calls = 0;
+    const ledgerIds: string[] = [];
+    const transport: EmulationTransport = {
+      complete: async (messages, attempt) => {
+        // A reply with nothing parseable escalates to balanced, which also
+        // leaves an explicitly routed model behind: that model just failed.
+        const escalate = attempt.kind === 'escalate';
+        const tier: ModelTier = escalate ? 'balanced' : 'fast';
+        const providerName = escalate ? undefined : emu.providerName;
+        // The answer is a few short lines, but a reasoning model spends its
+        // thinking from the same cap: leave it room or the lines never come.
+        const options: LLMCompletionOptions = { tier, maxTokens: LLMObject.EMULATION_MAX_TOKENS, ...(!escalate && emu.model ? { model: emu.model } : {}) };
+        const id = `${requestId}:emu${calls++}`;
+        ledgerIds.push(id);
+        const r = await this.complete(messages, options, providerName, callerId, id, onBehalfOf, { method: 'decide', site });
+        const route = this.resolveProviderAndModel(providerName, tier);
+        const model = this.modelFor(route.provider, this.applyRouting(options, route.modelOverride, route.effortOverride));
+        return {
+          content: r.content,
+          model,
+          provider: route.provider.name,
+          usage: r.usage ? { inputTokens: r.usage.inputTokens, outputTokens: r.usage.outputTokens, ...(r.usage.costUsd !== undefined ? { costUsd: r.usage.costUsd } : {}) } : undefined,
+        };
+      },
+    };
+    const result = await emulateDecision(request, transport);
+    const first = ledgerIds[0] ? this._byId.get(ledgerIds[0]) : undefined;
+    if (first) {
+      first.decision = { mode, emulated: true, answers: summarizeAnswers(result) };
+      if (fallbackOf) first.fallbackOf = fallbackOf;
+    }
+    log.info(`decide ${site ?? '(explicit)'} emulated on ${result.provider}/${result.model} in ${calls} call(s) | ${summarizeAnswers(result)}` +
+      (result.missing?.length ? ` | missing=${result.missing.join(',')}` : ''));
+    return result;
+  }
+
+  /** Per-site rollup of decision calls in the ledger, for calibrating site policies. */
+  private decisionStats(filter: { site?: string; since?: number }): Record<string, {
+    decisions: number; emulated: number; errors: number; avgMs: number; costUsd: number; recent: string[];
+  }> {
+    const out: Record<string, { decisions: number; emulated: number; errors: number; avgMs: number; costUsd: number; recent: string[]; totalMs: number }> = {};
+    for (const e of this._ledger) {
+      if (e.method !== 'decide') continue;
+      if (filter.site && e.site !== filter.site) continue;
+      if (filter.since && e.startTime < filter.since) continue;
+      const key = e.site ?? '(explicit)';
+      const row = out[key] ??= { decisions: 0, emulated: 0, errors: 0, avgMs: 0, costUsd: 0, recent: [], totalMs: 0 };
+      if (e.status === 'error') row.errors++;
+      row.costUsd += e.costUsd ?? 0;
+      if (!e.decision) continue;
+      row.decisions++;
+      if (e.decision.emulated) row.emulated++;
+      row.totalMs += e.elapsedMs;
+      row.recent.push(`${e.decision.mode}: ${e.decision.answers}`);
+      if (row.recent.length > 10) row.recent.shift();
+    }
+    return Object.fromEntries(Object.entries(out).map(([k, { totalMs, ...row }]) =>
+      [k, { ...row, avgMs: row.decisions ? Math.round(totalMs / row.decisions) : 0, costUsd: Math.round(row.costUsd * 1e6) / 1e6 }]));
   }
 
   // ── Tier fallback ─────────────────────────────────────────────────────
@@ -2180,6 +2550,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new KimiProvider({ apiKey: '' }),
     new MiniMaxProvider({ apiKey: '' }),
     new MetaProvider({ apiKey: '' }),
+    new TypeSafeProvider({ apiKey: '' }),
   ].map(p => ({ id: p.describe().id, describe: () => p.describe() }));
 
   /**
@@ -2245,7 +2616,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     inputChars: number,
     streaming: boolean,
     messages?: LLMMessage[],
-    routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number; fallbackOf?: string },
+    routing?: { tier?: ModelTier; effort?: EffortLevel; maxTokens?: number; fallbackOf?: string; site?: string },
     onBehalfOf?: string,
   ): Promise<LLMLedgerEntry> {
     const senderName = await this.resolveCallerName(callerId);
@@ -2272,6 +2643,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       ...(routing?.fallbackOf ? { fallbackOf: routing.fallbackOf } : {}),
       effort: routing?.effort,
       maxTokens: routing?.maxTokens,
+      ...(routing?.site ? { site: routing.site } : {}),
     };
     this._ledger.push(entry);
     this._byId.set(requestId, entry);
@@ -3109,6 +3481,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         supportedEfforts: model && tierProvider?.supportedEfforts ? tierProvider.supportedEfforts(model) : [],
       };
     }
+    out.decision = this.describeDecisionRoute();
     return out;
   }
 
@@ -3564,6 +3937,32 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     this.dep('LLM'), 'analyze',
     { content: 'some text to analyze', task: 'identify the main themes' });
   // Returns the analysis as a plain string
+
+### Decisions (choice / yes-no / score)
+
+When code needs a judgment rather than text (route this, is this urgent,
+how severe), ask \`decide\`: typed questions about one state, answered with
+probabilities. It is fast and cheap, and several questions share one call.
+
+  const d = await this.call(this.dep('LLM'), 'decide', {
+    state: { ticket: 'Payments failing for 3 days, nobody answers' },
+    questions: {
+      team: { type: 'choice', instructions: 'Which team should handle \`ticket\`?',
+        criteria: { billing: 'Payments, invoices, refunds', technical: 'Bugs, outages', sales: 'Pricing, upgrades' } },
+      urgent: { type: 'noul', instructions: 'Does \`ticket\` convey urgency?' },
+      frustration: { type: 'score', instructions: 'How frustrated is the customer?',
+        criteria: ['Calm', 'Frustrated', 'Very angry'] },
+    },
+  });
+  // d.answers.team        → { choice: 'billing', confidence: 0.97, probabilities: { billing: 0.98, ... } }
+  // d.answers.urgent      → { noul: 0.96 }            (probability of yes)
+  // d.answers.frustration → { score: 1.3, confidence, legend, probabilities }  (0-based levels)
+  // d.emulated: true when a chat model stood in for a decision model; d.calibrated says
+  // whether the probabilities are trained to be calibrated. Keep control flow in code:
+  // act on high confidence, fall back to your own logic when confidence is low.
+
+IMPORTANT: \`decide\` cannot write text or fill arguments. It picks among the
+options you give it (choice: 2-255 options; score: 2-10 levels, lowest first).
 
 ### Completion Options
 

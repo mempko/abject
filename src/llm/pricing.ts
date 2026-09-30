@@ -67,6 +67,9 @@ const BUILTIN_PRICES: Record<string, ModelPricing> = {
   'anthropic/claude-sonnet-4': { inputPerMTok: 3, outputPerMTok: 15 },
   'anthropic/claude-haiku-4': { inputPerMTok: 1, outputPerMTok: 5 },
 
+  // ── TypeSafe System One (docs.typesafe.ai/models): output is free ──
+  'typesafe/jev': { inputPerMTok: 0.042, outputPerMTok: 0 },
+
   // ── PeerLLM: unified public balance-token acquisition rate ───────
   'peerllm/': { inputPerMTok: 10, outputPerMTok: 10, cacheReadPerMTok: 10, cacheWritePerMTok: 10 },
 

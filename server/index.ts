@@ -182,6 +182,7 @@ async function main(): Promise<void> {
   // Read API keys from environment
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
+  const typesafeKey = process.env.TYPESAFE_API_KEY;
 
   // Reset any stale singleton state
   resetRuntime();
@@ -758,6 +759,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const bootCreds: Record<string, string> = {};
   if (anthropicKey) bootCreds.anthropic = anthropicKey;
   if (openaiKey)    bootCreds.openai    = openaiKey;
+  if (typesafeKey)  bootCreds.typesafe  = typesafeKey;
   await bootstrapRequest(llmId, 'configure', {
     credentials: bootCreds,
   });

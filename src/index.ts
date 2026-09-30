@@ -279,6 +279,19 @@ export { GeminiProvider } from './llm/google-gemini.js';
 export { KimiProvider } from './llm/kimi.js';
 export { MiniMaxProvider } from './llm/minimax.js';
 export { MetaProvider } from './llm/meta.js';
+export { TypeSafeProvider, callSystemOne, TYPESAFE_BASE_URL } from './llm/typesafe.js';
+export type {
+  DecisionRequest, DecisionQuestion, DecisionAnswer, DecisionResult, DecisionOutcome, DecisionProvider, DecisionState,
+  ChoiceQuestion, NoulQuestion, ScoreQuestion, ChoiceAnswer, NoulAnswer, ScoreAnswer,
+} from './llm/decision.js';
+export {
+  validateDecisionRequest, boundDecisionState, choiceOf, noulOf, scoreOf, topLevel, summarizeAnswers,
+  choiceFromDistribution, scoreFromDistribution, DECISION_LIMITS,
+} from './llm/decision.js';
+export { emulateDecision, parseEmulatedAnswers, buildPlans, buildEmulationMessages } from './llm/decision-emulator.js';
+export type { EmulationTransport } from './llm/decision-emulator.js';
+export { DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode, modeAllows } from './core/decision-sites.js';
+export type { DecisionMode, DecisionGates, DecisionPolicy, DecisionSite } from './core/decision-sites.js';
 export type { ModelPricing, PricingEntry } from './llm/pricing.js';
 export { lookupPricing, estimateCostUsd } from './llm/pricing.js';
 

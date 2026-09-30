@@ -11,6 +11,8 @@
 import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
+import type { DecisionOptions, DecisionProvider, DecisionRequest, DecisionResult } from './decision.js';
+import { callSystemOne } from './typesafe.js';
 
 const log = new Log('OPENROUTER');
 
@@ -52,27 +54,39 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
 };
 
 
+/**
+ * Decision models OpenRouter serves through its System One endpoint, billed
+ * to the same OpenRouter key: TypeSafe's Jev needs no separate account.
+ */
+const DECISION_MODELS: ModelInfo[] = [
+  { id: '~typesafe/jev-latest', name: 'TypeSafe Jev (latest)' },
+  { id: 'typesafe/jev-1.13', name: 'TypeSafe Jev 1.13' },
+];
+
 interface OpenRouterModelsResponse {
   data: Array<{ id: string; name?: string; architecture?: { input_modalities?: string[] } }>;
 }
 
-export class OpenRouterProvider extends OpenAIProvider {
+export class OpenRouterProvider extends OpenAIProvider implements DecisionProvider {
   private readonly providerPreferences?: Record<string, unknown>;
+  private readonly attributionHeaders: Record<string, string>;
   private readonly reasoningOverrides: OpenRouterReasoningOverride[];
 
   constructor(config: OpenRouterConfig) {
+    const attributionHeaders = {
+      'HTTP-Referer': config.siteUrl ?? 'https://abjects.local',
+      'X-Title': config.appTitle ?? 'Abjects',
+    };
     super({
       apiKey: config.apiKey,
       model: config.model,
       baseUrl: config.baseUrl ?? 'https://openrouter.ai/api',
       fetchFn: config.fetchFn,
       tierModels: DEFAULT_TIER_MODELS,
-      extraHeaders: {
-        'HTTP-Referer': config.siteUrl ?? 'https://abjects.local',
-        'X-Title': config.appTitle ?? 'Abjects',
-      },
+      extraHeaders: attributionHeaders,
     });
     this.name = 'openrouter';
+    this.attributionHeaders = attributionHeaders;
     this.providerPreferences = config.providerPreferences;
     this.reasoningOverrides = config.reasoningOverrides ?? [];
   }
@@ -179,6 +193,19 @@ export class OpenRouterProvider extends OpenAIProvider {
     }
   }
 
+  // ── Decisions (System One endpoint) ──
+
+  defaultDecisionModel(): string { return DECISION_MODELS[0].id; }
+
+  async decide(request: DecisionRequest, options: DecisionOptions = {}): Promise<DecisionResult> {
+    return callSystemOne(
+      { url: `${this.baseUrl}/v1/systemone`, apiKey: this.apiKey ?? '', fetchFn: this.fetchFn, headers: this.attributionHeaders, label: `${this.name}-decide` },
+      options.model ?? this.defaultDecisionModel(), request, this.name, options.timeoutMs,
+    );
+  }
+
+  async listDecisionModels(): Promise<ModelInfo[]> { return DECISION_MODELS; }
+
   override describe(): LLMProviderDescription {
     return {
       id: 'openrouter',
@@ -189,6 +216,8 @@ export class OpenRouterProvider extends OpenAIProvider {
       credentialPlaceholder: 'sk-or-...',
       models: Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id })),
       defaultTierModels: DEFAULT_TIER_MODELS,
+      capabilities: { chat: true, decide: true },
+      decisionModels: DECISION_MODELS,
     };
   }
 }
