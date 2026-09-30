@@ -38,6 +38,7 @@ import { ObjectBrowser } from '../src/objects/object-browser.js';
 import { MethodInspector } from '../src/objects/method-inspector.js';
 import { ObjectCatalog } from '../src/objects/object-catalog.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
+import { SceneLibrary } from '../src/objects/scene-library.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { WindowManager } from '../src/objects/window-manager.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
@@ -564,6 +565,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
   runtime.objectFactory.registerConstructor('WindowManager', () => new WindowManager());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
+  runtime.objectFactory.registerConstructor('SceneLibrary', () => new SceneLibrary());
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
   runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
@@ -677,7 +679,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'WebSearch', 'WebFetch', 'Screenshot',
       'Storage', 'StreamClient', 'AudioOutput', 'Speech',
       // Global services
-      'GlobalSettings', 'PermissionBroker', 'PeerNetwork',
+      'GlobalSettings', 'PermissionBroker', 'PeerNetwork', 'SceneLibrary',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor', 'CassetteRecorder',
       'SkillRegistry', 'SkillBrowser',
@@ -779,6 +781,8 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const speechId = await supervisedSpawn('Speech');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
+  // Named 3D presets (materials, looks); pushes its library to UIServer.
+  await supervisedSpawn('SceneLibrary');
   // CommandPalette / NotificationCenter / WindowSwitcher are per-workspace —
   // spawned by WorkspaceManager so each instance sees its workspace's
   // registry. See INFRA_OBJECTS / UI_OBJECTS in workspace-manager.ts.

@@ -149,6 +149,33 @@ export function rayCustomMeshHit(
 }
 
 /**
+ * Intersect a ray with an infinite plane through `point` with `normal`
+ * (any length; the ray direction need not be normalized). Returns the ray
+ * parameter t (hit = origin + dir * t), or null when the ray runs parallel
+ * to the plane or the plane lies behind the origin.
+ */
+export function rayPlaneT(origin: Vec3, dir: Vec3, point: Vec3, normal: Vec3): number | null {
+  const denom = vec3Dot(dir, normal);
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = vec3Dot(vec3Sub(point, origin), normal) / denom;
+  return t >= 0 ? t : null;
+}
+
+/**
+ * Project a world point to CSS px (y-down) through `viewProj`. Returns
+ * undefined when the point is behind the camera.
+ */
+export function projectToScreen(
+  viewProj: Mat4, p: Vec3, viewportWidth: number, viewportHeight: number,
+): { x: number; y: number } | undefined {
+  const x = viewProj[0] * p.x + viewProj[4] * p.y + viewProj[8] * p.z + viewProj[12];
+  const y = viewProj[1] * p.x + viewProj[5] * p.y + viewProj[9] * p.z + viewProj[13];
+  const w = viewProj[3] * p.x + viewProj[7] * p.y + viewProj[11] * p.z + viewProj[15];
+  if (w <= 1e-6) return undefined;
+  return { x: (x / w * 0.5 + 0.5) * viewportWidth, y: (0.5 - y / w * 0.5) * viewportHeight };
+}
+
+/**
  * Intersect a ray with a slab's local z=0 plane. The slab is a unit quad
  * (-0.5..0.5) under `model` (which bakes in its px size). Returns
  * surface-local pixel coordinates, or null when the ray misses the quad.
@@ -169,4 +196,31 @@ export function raySurfaceHit(
   const ly = o.y + d.y * t;
   if (lx < -0.5 || lx > 0.5 || ly < -0.5 || ly > 0.5) return null;
   return { x: (lx + 0.5) * widthPx, y: (ly + 0.5) * heightPx };
+}
+
+/**
+ * Like raySurfaceHit, but the plane is unbounded: the pointer may be
+ * outside the slab (a drag that outruns the window) and still gets
+ * surface-local px, plus the world-space hit point. Null only when the ray
+ * runs parallel to the slab or the slab is behind the camera.
+ */
+export function raySurfacePlane(
+  ray: Ray,
+  model: Mat4,
+  widthPx: number,
+  heightPx: number,
+): { x: number; y: number; world: Vec3 } | null {
+  const inv = mat4Invert(model);
+  const o = mat4TransformPoint(inv, ray.origin);
+  const d = mat4TransformDir(inv, ray.dir);
+  if (Math.abs(d.z) < 1e-8) return null;
+  const t = -o.z / d.z;
+  if (t < 0) return null;
+  const lx = o.x + d.x * t;
+  const ly = o.y + d.y * t;
+  return {
+    x: (lx + 0.5) * widthPx,
+    y: (ly + 0.5) * heightPx,
+    world: mat4TransformPoint(model, { x: lx, y: ly, z: 0 }),
+  };
 }

@@ -6,6 +6,7 @@
  */
 
 import type { AbjectId } from '../src/core/types.js';
+import type { ScreenAnchor } from '../src/ui/gl/scene-types.js';
 
 // =============================================================================
 // Common
@@ -30,9 +31,14 @@ export interface CreateSurfaceMsg extends WsEnvelope {
   title?: string;
   /** Window paints no background; the compositor skips its focus-glow halo. */
   transparent?: boolean;
-  /** Whether the mobile card overview may close this surface (default true).
+  /** Whether the phone's Exposé may flick this surface closed (default true).
    * System rails (taskbar, switchers, toolbars) set this false. */
   closable?: boolean;
+  /** No title bar: the content clip for window 3D insets nothing (default false). */
+  chromeless?: boolean;
+  /** On a zoomable camera (the phone) the surface stays pinned to this spot of
+   * the screen at a readable scale (see SCREEN_ANCHORS in scene-types.ts). */
+  screenAnchor?: ScreenAnchor;
 }
 
 export interface SetSurfaceTitleMsg extends WsEnvelope {
@@ -97,6 +103,12 @@ export interface DisplayInfoRequestMsg extends WsEnvelope {
   requestId: string;
 }
 
+/** Ask a client what its GPU offers and how its scene is running (UIServer getSceneInfo). */
+export interface SceneInfoRequestMsg extends WsEnvelope {
+  type: 'sceneInfoRequest';
+  requestId: string;
+}
+
 export interface SetSelectedTextMsg extends WsEnvelope {
   type: 'setSelectedText';
   text: string;
@@ -150,11 +162,15 @@ export interface SetSurfaceResizableMsg extends WsEnvelope {
 export interface ShowMobileKeyboardMsg extends WsEnvelope {
   type: 'showMobileKeyboard';
   show: boolean;
+  /** The surface holding the focused text field (optional; older widgets omit it). */
+  surfaceId?: string;
+  /** The field's rect in that surface's local px, so the phone can keep it above the keyboard. */
+  rect?: { x: number; y: number; width: number; height: number };
 }
 
 /**
  * Ask the backend to close the window owning a surface. Sent by the mobile
- * card overview when a card is flicked up to close. Routed to WindowManager,
+ * Exposé when a window is flicked up to close. Routed to WindowManager,
  * which replays the same close path as the title-bar close button.
  */
 export interface CloseWindowMsg extends WsEnvelope {
@@ -387,6 +403,7 @@ export type BackendToFrontendMsg =
   | SetFocusedMsg
   | MeasureTextRequestMsg
   | DisplayInfoRequestMsg
+  | SceneInfoRequestMsg
   | SetSelectedTextMsg
   | SetSurfaceTitleMsg
   | SetSurfaceVisibleMsg
@@ -406,9 +423,12 @@ export type BackendToFrontendMsg =
   | SceneOpsMsg
   | SetSceneThemeMsg
   | SetSurfaceTransformMsg
+  | AttachSurfaceMsg
   | SurfaceEffectMsg
   | SetSurfaceModalMsg
   | SetSlabMotionMsg
+  | SetSceneLibraryMsg
+  | ExposeMsg
   | AudioPlayMsg
   | AudioControlMsg
   | AudioGraphMsg
@@ -464,6 +484,62 @@ export interface EndWindowDragMsg extends WsEnvelope {
   y: number;
 }
 
+/**
+ * A client-side drag of a `draggable` scene node. The client moves the node
+ * locally every frame; this carries the start, throttled moves (~10/s) and
+ * the end (after any inertia settles). `position` is the dragged node's new
+ * transform.position in its parent space. The backend updates its retained
+ * copy, tells the node's owner (nodeInput dragStart / dragMove / dragEnd)
+ * and shows the result to the other connected clients.
+ */
+export interface NodeDragMsg extends WsEnvelope {
+  type: 'nodeDrag';
+  phase: 'start' | 'move' | 'end';
+  nodeScope: 'window' | 'world';
+  /** Window scope: the surface whose subtree holds the node. */
+  surfaceId?: string;
+  /** World scope: the abject owning the node. */
+  nodeOwnerId?: string;
+  /** The dragged node (nearest draggable ancestor-or-self of the pressed node). */
+  nodeId: string;
+  /** The node the pointer pressed. */
+  hitNodeId: string;
+  position: [number, number, number];
+  /** Pointer, window-relative for window scope, workspace px for world scope. */
+  x?: number;
+  y?: number;
+  modifiers?: { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean };
+}
+
+/**
+ * The pointer pressed a `layer: 'stack'` world object that raises on press
+ * (raiseOnClick or draggable). The backend moves the root node to the top
+ * of the window stacking order (below the system rails) and broadcasts it.
+ */
+export interface RaiseWorldNodeMsg extends WsEnvelope {
+  type: 'raiseWorldNode';
+  ownerId: string;
+  /** The stacked ROOT node. */
+  nodeId: string;
+}
+
+/**
+ * The user turned or dollied a window's `camera` node (orbit / zoom run in
+ * the browser). 'start' is the press, 'move' arrives about 10 per second,
+ * 'end' when the view comes to rest. `position` (the eye) and `target` are
+ * in the camera node's parent space. The backend updates its retained copy
+ * (so a reconnect restores the view), tells the owner (nodeInput
+ * 'cameraChange') and shows the view to the other connected clients.
+ */
+export interface CameraChangeMsg extends WsEnvelope {
+  type: 'cameraChange';
+  phase: 'start' | 'move' | 'end';
+  surfaceId: string;
+  nodeId: string;
+  position: [number, number, number];
+  target: [number, number, number];
+}
+
 export interface MeasureTextReplyMsg extends WsEnvelope {
   type: 'measureTextReply';
   requestId: string;
@@ -475,6 +551,14 @@ export interface DisplayInfoReplyMsg extends WsEnvelope {
   requestId: string;
   width: number;
   height: number;
+}
+
+/** A client's scene capabilities (GPU limits, available effects) and running stats. */
+export interface SceneInfoReplyMsg extends WsEnvelope {
+  type: 'sceneInfoReply';
+  requestId: string;
+  capabilities: Record<string, unknown>;
+  stats: Record<string, unknown>;
 }
 
 export interface CaptureSurfaceReplyMsg extends WsEnvelope {
@@ -528,6 +612,16 @@ export interface SurfaceEffectMsg extends WsEnvelope {
   color?: string;
 }
 
+/**
+ * Open, close or toggle Exposé on this client (the windows of the active
+ * workspace spread into a grid to pick one). Visual and per client: each
+ * client keeps its own Exposé, and backend rects never change.
+ */
+export interface ExposeMsg extends WsEnvelope {
+  type: 'expose';
+  action: 'show' | 'hide' | 'toggle';
+}
+
 /** Mark a surface modal (others recede while it shows). */
 export interface SetSurfaceModalMsg extends WsEnvelope {
   type: 'setSurfaceModal';
@@ -541,12 +635,44 @@ export interface SetSlabMotionMsg extends WsEnvelope {
   config: Record<string, unknown>;
 }
 
+/** Named material and look presets (SceneLibraryConfig from src/ui/gl/scene-presets.ts). */
+export interface SetSceneLibraryMsg extends WsEnvelope {
+  type: 'setSceneLibrary';
+  config: Record<string, unknown>;
+}
+
 /** Abject-requested slab transform: tilt/float a window in the scene. */
 export interface SetSurfaceTransformMsg extends WsEnvelope {
   type: 'setSurfaceTransform';
   surfaceId: string;
   rotation?: [number, number, number];
   z?: number;
+}
+
+/** A scene node a window slab can ride (see AttachSurfaceMsg). */
+export interface SurfaceAttachTarget {
+  scope: 'world' | 'window';
+  /** World scope: the abject owning the world node. */
+  ownerId?: string;
+  /** Window scope: the host surface whose subtree holds the node. */
+  surfaceId?: string;
+  nodeId: string;
+  /** px in the node's (scale-free) frame, added to the window centre. */
+  offset?: [number, number, number];
+}
+
+/**
+ * Attach a window slab (and its whole subtree) to a scene node, or detach
+ * it (target null). While attached, the slab rides the node's world matrix
+ * and renders through the camera that node renders with; `origin` is the
+ * surface rect position at attach time, so later title-bar drags move the
+ * window relative to its anchor. Retained and replayed on reconnect.
+ */
+export interface AttachSurfaceMsg extends WsEnvelope {
+  type: 'attachSurface';
+  surfaceId: string;
+  target: SurfaceAttachTarget | null;
+  origin?: { x: number; y: number };
 }
 
 export interface ReadyMsg extends WsEnvelope {
@@ -561,6 +687,11 @@ export interface DisplayResizedMsg extends WsEnvelope {
   type: 'displayResized';
   width: number;
   height: number;
+  /**
+   * The client is a phone looking at the desktop through a camera: its
+   * viewport never sizes the desktop (the backend keeps a desktop's size).
+   */
+  mobile?: boolean;
 }
 
 // =============================================================================
@@ -593,10 +724,12 @@ export interface ClientDiagnosticMsg extends WsEnvelope {
 }
 
 /** P7: the mobile client reports the user's explicit surface selection
- * (e.g. a carousel pick) so backend focus stays in agreement with it. */
+ * (e.g. an Exposé pick) so backend focus stays in agreement with it. */
 export interface FrontendFocusMsg extends WsEnvelope {
   type: 'frontendFocus';
   surfaceId: string;
+  /** Also bring the window to the front (the desktop Exposé pick). */
+  raise?: boolean;
 }
 
 /** P6: client handshake — identifies which bundle is running. */
@@ -605,6 +738,8 @@ export interface HelloMsg extends WsEnvelope {
   client: {
     bundle: string;
     userAgent: string;
+    /** A phone (see DisplayResizedMsg.mobile). Absent on older bundles: treated as a desktop. */
+    mobile?: boolean;
   };
 }
 
@@ -746,8 +881,12 @@ export type FrontendToBackendMsg =
   | FileUploadMsg
   | CloseWindowMsg
   | EndWindowDragMsg
+  | NodeDragMsg
+  | RaiseWorldNodeMsg
+  | CameraChangeMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
+  | SceneInfoReplyMsg
   | CaptureSurfaceReplyMsg
   | CaptureDesktopReplyMsg
   | SurfaceCreatedMsg

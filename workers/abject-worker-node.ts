@@ -98,6 +98,7 @@ import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collabo
 import { Organism } from '../src/objects/organism.js';
 import type { OrganismSpec } from '../src/objects/organism.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
+import { SceneLibrary } from '../src/objects/scene-library.js';
 import { WindowManager } from '../src/objects/window-manager.js';
 import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
@@ -237,6 +238,7 @@ constructors.set('Organism', (args?: unknown) => {
 // carries its whole widget tree with it (windows/widgets/layouts init onto
 // their creator's bus), which moves the largest mailbox population off main.
 constructors.set('WidgetManager', () => new WidgetManager());
+constructors.set('SceneLibrary', () => new SceneLibrary());
 constructors.set('WindowManager', () => new WindowManager());
 constructors.set('Sidebar', () => new Sidebar());
 constructors.set('GlobalToolbar', () => new GlobalToolbar());

@@ -37,6 +37,13 @@ export { ObjectBrowser, OBJECT_BROWSER_ID } from './objects/object-browser.js';
 export { MethodInspector, METHOD_INSPECTOR_ID } from './objects/method-inspector.js';
 export { ObjectCatalog, OBJECT_CATALOG_ID } from './objects/object-catalog.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
+export { SceneLibrary, SCENE_LIBRARY_ID } from './objects/scene-library.js';
+export type { ScenePresetInfo } from './objects/scene-library.js';
+export {
+  BUILTIN_SCENE_LIBRARY, BUILTIN_PRESET_DESCRIPTIONS, MATERIAL_PRESET_FIELDS, LOOK_PRESET_FIELDS,
+  mergeSceneLibrary, validateMaterialPreset, validateLookPreset, sanitizeSceneLibrary,
+} from './ui/gl/scene-presets.js';
+export type { MaterialPreset, LookPreset, SceneLibraryConfig } from './ui/gl/scene-presets.js';
 export { ModalDialog } from './objects/modal-dialog.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';

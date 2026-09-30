@@ -15,6 +15,7 @@ import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES, TITLE_BAR_HEIGHT } from '../objects/widgets/widget-types.js';
 import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode, ShadowOpts } from './gl/renderer.js';
+import { srgbToLinear, linearToSrgb } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
 import { CAMERA_FOV_Y, cameraDistance, NEAR_PLANE_FACTOR, FAR_PLANE_FACTOR } from './gl/camera.js';
 
@@ -32,26 +33,211 @@ interface SceneCamera {
 import { Overlay2D } from './gl/overlay-2d.js';
 import { SceneStore, VocabNode } from './gl/scene.js';
 import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneColor, hasCustomGeometry } from './gl/scene-types.js';
-import { getGeometry, customGeometry, Geometry } from './gl/primitives.js';
+import { getGeometry, getShapeGeometry, customGeometry, Geometry, isShapePrimitive, shapeKey } from './gl/primitives.js';
+// Content kinds: models, 3D text, labels, lines, trails, sky.
+import {
+  parseGltf, decodeDataUri, flattenScene, drawItemsBounds, primitiveGeometry, sampleAnimation, animationTime,
+  findAnimation, isTrianglePrimitive, GLTF_MODE, GltfDocument, GltfDrawItem, GltfPrimitive,
+} from './gl/gltf.js';
+import { getTextGeometry, clearTextGeometryCache, ensureTextFont } from './gl/text-geometry.js';
+import { renderLabel, labelKey, cssFont, LabelOptions } from './gl/label-texture.js';
+import { LineRenderer, LineHandle, Trail } from './gl/line-renderer.js';
+import { SkyRenderer } from './gl/sky-renderer.js';
+import { contextGeneration, programError } from './gl/program-cache.js';
 import { cubicBezier, STANDARD, LINEAR, EMPHASIZE } from './motion.js';
 import {
   SlabEffectSpec, SlabMotionConfig, MotionTrack, BUILTIN_SLAB_EFFECTS, DEFAULT_SLAB_MOTION,
   sampleTrack, channelNeutral,
 } from './gl/slab-motion.js';
+import { SceneLibraryConfig, BUILTIN_SCENE_LIBRARY } from './gl/scene-presets.js';
+import {
+  resolveMaterial, materialDrawOpts, resolveLight, resolveEnvironment, defaultKeyLight, surfaceWorldY, resolveSky,
+  withMaterialPreset, withLookPreset, ResolvedEnvironment, ResolvedLight,
+} from './gl/material.js';
+import { fitDirectionalShadow, fitSpotShadow, ShadowFit, ShadowSet, Vec3Tuple } from './gl/shadow-fit.js';
+import { PostEffects, PostPass, hasPostEffects } from './gl/post-effects.js';
+import type { MeshMaterialOpts } from './gl/renderer.js';
 import { EasingCurve } from '../core/theme-data.js';
 import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert, mat4LookAt, mat4Ortho, mat4TransformPoint, vec3 } from './gl/math.js';
 import { rayFromScreen, raySurfaceHit, rayMeshHit, rayCustomMeshHit, Ray } from './gl/picking.js';
+// Interaction: dragging, stacking, clip modes, windows riding nodes.
+import { mat4StripScale, mat4TransformDir, vec3Add, vec3Scale, vec3Sub, vec3Dot, vec3Cross, vec3Normalize, vec3Length, Vec3 } from './gl/math.js';
+import { rayPlaneT, projectToScreen, raySurfacePlane } from './gl/picking.js';
+import { ClipMode, clipModeOf, parseDraggable, DragSpec, RAIL_Z_THRESHOLD, isScreenAnchor, type ScreenAnchor } from './gl/scene-types.js';
+// Motion: GPU particles, keyframe / spring tracks, constraints, node cameras.
+import { GpuParticles, billboardBasis } from './gl/gpu-particles.js';
+import {
+  KeyframeTrack, Spring, buildKeyframeTrack, sampleKeyframes, createSpring, retargetSpring, stepSpring,
+  lookAtEuler, followStep, MOTION_PRESETS, expandMotionPreset,
+} from './gl/anim-tracks.js';
+import { buildNodeCamera, OrbitController } from './gl/orbit-camera.js';
+
+/** A picked interactive scene node (what input routing needs to reach its owner). */
+export interface NodeHit {
+  scope: 'window' | 'world';
+  surfaceId?: string;
+  ownerId?: string;
+  nodeId: string;
+}
 
 /**
- * Mobile interaction states (WebOS-style).
- * - NATIVE_FIT: one window shown fit-to-screen; single finger = content input.
- * - NATIVE_ZOOMED: window shown at 1:1 native pixels; single finger pans.
- * - CARD_OVERVIEW: all windows as cards; gestures flip/close/open/reorder them.
+ * A drag of a `draggable` node, reported through Compositor.onNodeDrag.
+ * `position` is the dragged node's transform.position in its parent space.
+ */
+export interface NodeDragEvent extends NodeHit {
+  phase: 'start' | 'move' | 'end';
+  /** The node the pointer pressed (the dragged node or a descendant). */
+  hitNodeId: string;
+  position: [number, number, number];
+}
+
+/**
+ * A window's camera node moved under the user's hand (orbit drag, wheel
+ * dolly, or the coast after a release). `position` (the eye) and `target`
+ * are in the camera node's parent space, like its transform.position and
+ * params.target. 'start' is the press, 'end' the moment it comes to rest.
+ */
+export interface CameraChangeEvent {
+  phase: 'start' | 'move' | 'end';
+  surfaceId: string;
+  nodeId: string;
+  position: [number, number, number];
+  target: [number, number, number];
+}
+
+/** A scene node a window slab rides (see Compositor.setSurfaceAttachment). */
+export interface SurfaceAttachment {
+  scope: 'world' | 'window';
+  ownerId?: string;
+  surfaceId?: string;
+  nodeId: string;
+  offset?: [number, number, number];
+}
+
+/** Internal pick result: the public hit plus the ray geometry drags need. */
+interface NodePick extends NodeHit {
+  key: string;
+  ray: Ray;
+  t: number;
+  cam: SceneCamera;
+  frame: Mat4;
+}
+
+/** Client-side orbit state for one camera node (see Compositor.cameraFor). */
+interface OrbitCam {
+  surfaceId: string;
+  nodeId: string;
+  ctl: OrbitController;
+  /** The orbit options the controller was built with (rebuilt when they change). */
+  sig: string;
+  /** The pose last written into the node, to tell the owner's own moves apart. */
+  eye: [number, number, number];
+  target: [number, number, number];
+  lastT: number;
+  /** Whether the last step moved (an 'end' follows when it stops). */
+  active: boolean;
+}
+
+/** One entry of the desktop depth order: a window, or a stacked world root. */
+type DesktopItem =
+  | { kind: 'surface'; surface: Surface; z: number }
+  | { kind: 'stack'; key: string; rootId: string; z: number };
+
+/**
+ * How a window is placed for picking: its unscaled frame (what its subtree
+ * hangs from), its slab model, the camera both render through, and whether
+ * it is transformed beyond an upright screen rect (tilted or riding a node),
+ * which switches clip tests from rects to projected quads.
+ */
+interface WindowView {
+  frame: Mat4;
+  slab: Mat4;
+  cam: SceneCamera;
+  free: boolean;
+  /** The camera the window's 3D subtree renders through when a `camera` node replaces `cam` (see cameraFor). */
+  sceneCam?: SceneCamera;
+}
+
+/**
+ * A camera view of the desktop: a workspace point on the z=0 plane lands at
+ * screen = (workspace - scroll) * zoom. The phone's camera is one; a window
+ * pinned to the screen (screenAnchor) is drawn through its own (see pinView).
+ */
+interface ScreenView {
+  zoom: number;
+  scrollX: number;
+  scrollY: number;
+}
+
+/** A drag of a `draggable` node in progress (pointer held, or gliding on inertia). */
+interface NodeDragSession {
+  hit: NodeHit;
+  key: string;
+  nodeId: string;
+  hitNodeId: string;
+  spec: DragSpec;
+  /** Viewport px of the press (the drag starts past a small threshold). */
+  startX: number;
+  startY: number;
+  /** The node's position at the press, in its parent space. */
+  startPos: [number, number, number];
+  /** The pressed point, in the parent space. */
+  anchor: Vec3;
+  /** Drag plane normal and in-plane axes, in the parent space. */
+  normal: Vec3;
+  basis: [Vec3, Vec3];
+  /** Single-axis constraint (parent space). */
+  axis?: Vec3;
+  /**
+   * Screen px per parent unit along basis[0] / basis[1] (or along `axis`
+   * in j1). Set for axis drags and for planes seen nearly edge-on, where a
+   * ray-plane hit would run away; the pointer delta is solved on screen.
+   */
+  screen?: { j1: { x: number; y: number }; j2: { x: number; y: number } };
+  started: boolean;
+  /** Released with speed: gliding on inertia until it settles. */
+  released: boolean;
+  pos: [number, number, number];
+  /** Parent units per second (EMA of the last moves). */
+  vel: [number, number, number];
+  lastT: number;
+}
+
+/**
+ * What the phone shows. The phone is a camera on the real desktop (the same
+ * scene renderDesktop draws), so every state is a camera pose or a pose of
+ * the slabs; nothing reflows and no backend rect changes.
+ * - DESKTOP: the whole desktop through a zoomable, pannable camera.
+ * - FOCUS: the camera has flown in on one window (or 3D object); one finger
+ *   scrolls the content under it.
+ * - EXPOSE: the visible windows spread into a grid to pick or close one.
  */
 export enum MobileViewState {
-  NATIVE_FIT = 'fit',
-  NATIVE_ZOOMED = 'zoomed',
-  CARD_OVERVIEW = 'overview',
+  DESKTOP = 'desktop',
+  FOCUS = 'focus',
+  EXPOSE = 'expose',
+}
+
+/** One window's place in the Exposé grid (workspace centre and scale), and its glide after a re-layout. */
+interface ExposeSlot {
+  cx: number;
+  cy: number;
+  s: number;
+  title: string;
+  /** Reading-order position (the desktop staggers flights by it). */
+  index: number;
+  /** Where it glides from after a re-layout, since moveStart (performance.now ms). */
+  from?: { cx: number; cy: number; s: number };
+  moveStart?: number;
+  /** A window that joined the open grid (it flies in from its own rect). */
+  joining?: boolean;
+}
+
+/** A phone camera pose: the workspace point at the viewport's top-left, and the zoom. */
+interface MobileCam {
+  x: number;
+  y: number;
+  zoom: number;
 }
 
 export interface Rect {
@@ -120,9 +306,12 @@ export interface Surface {
   tainted: boolean;      // canvas tainted by a cross-origin image; texture upload is unsafe, render the last-good texture
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   transparent: boolean;  // window paints no background; skip the focus-glow halo (it would bleed through)
-  closable: boolean;     // mobile card overview may flick this closed (false for system rails)
+  closable: boolean;     // the phone's Exposé may flick this closed (false for system rails)
+  chromeless: boolean;   // no title bar: window 3D clipped to the content uses the whole rect
+  /** Pinned to this spot of the screen on the phone's zoomable camera (see pinPlacement). */
+  screenAnchor?: ScreenAnchor;
   workspaceId?: string;  // undefined = always visible (global objects)
-  title?: string;        // window title for mobile tab bar
+  title?: string;        // window title (the phone's Exposé labels)
 }
 
 export interface DrawCommand {
@@ -399,6 +588,21 @@ interface SurfaceGlState {
   modal?: boolean;
   /** Eased 0..1 recede amount (other windows while a modal shows). */
   recede?: number;
+  /** Frame (unscaled window matrix) and camera the window drew with this frame. */
+  frame?: Mat4;
+  cam?: SceneCamera;
+  // ── Riding a scene node (setSurfaceAttachment) ──
+  /** The node this slab rides; undefined for an ordinary window. */
+  attach?: SurfaceAttachment;
+  /** Surface rect position when attached: later drags move it relative to the anchor. */
+  attachOrigin?: { x: number; y: number };
+  /** Anchor frame and camera from the last draw (ghosts of closed attached windows reuse them). */
+  attachFrame?: Mat4;
+  attachCam?: SceneCamera;
+  /** Pinned to the screen (screenAnchor): the view it drew through last frame (its ghost reuses it). */
+  pinView?: ScreenView;
+  /** Phone camera zoomed out: the slab texture carries a mip chain for its current pixels. */
+  slabMips?: boolean;
 }
 
 /** One playing slab effect: its spec, clock, resolved colours and particles. */
@@ -456,6 +660,12 @@ interface NodeAnim {
   plane?: 'xy' | 'xz' | 'yz';
   /** Position path: piecewise-linear waypoints traversed over duration. */
   path?: number[][];
+  /** Keyframes (op keyframes, or a data preset like wobble): sampled instead of from/to. */
+  track?: KeyframeTrack;
+  /** Spring physics toward `to` (op spring): stepped per frame, retargetable. */
+  spring?: Spring;
+  /** performance.now() of the spring's last step. */
+  lastT?: number;
 }
 
 export class Compositor {
@@ -496,7 +706,7 @@ export class Compositor {
    * field: a single game enabling bloom for its own neon put a halo on every
    * bright pixel of every window on screen, screenshots included.
    */
-  private bloomBySurface = new Map<string, { nodeId: string; threshold: number; intensity: number }>();
+  private bloomBySurface = new Map<string, { nodeId: string; threshold: number; intensity: number; levels: number; radius: number }>();
   /**
    * Surfaces whose model matrix was set THIS frame. `SurfaceGlState.model` is
    * kept between frames for picking, so on a phone — where only the focused
@@ -568,39 +778,105 @@ export class Compositor {
   };
   private panDrag?: { startX: number; startY: number; startScrollX: number; startScrollY: number };
 
+  // ── Interaction: node drags, stacking, pop-out depth ──
+  /**
+   * Receives node drags: 'start' once the pointer moves past a small
+   * threshold, 'move' on every pointer move and inertia frame (callers
+   * throttle what they send), and 'end' when released or when inertia
+   * settles. Mouse and touch paths drive the same begin/update/end calls.
+   */
+  onNodeDrag?: (e: NodeDragEvent) => void;
+  private nodeDrag?: NodeDragSession;
+  /**
+   * Receives camera-node changes made by the user (orbit, dolly, coast):
+   * 'start' on the press, 'move' as the view changes (callers throttle what
+   * they send), 'end' once it rests.
+   */
+  onCameraChange?: (e: CameraChangeEvent) => void;
+  /** The camera node of each window subtree that has one, by surface key. */
+  private cameraNodeIds = new Map<string, string>();
+  /** Orbit controllers for camera nodes the user has touched, keyed `${surfaceId}/${nodeId}`. */
+  private orbitCams = new Map<string, OrbitCam>();
+  /** The camera being orbited by a held pointer. */
+  private orbitGrab?: string;
+  /** Nodes carrying a lookAt / follow constraint, keyed `${surfaceKey}/${nodeId}`. */
+  private constrainedNodes = new Map<string, { surfaceKey: string; id: string; lastT?: number }>();
+  /** Pointer travel (px) before a press on a draggable node becomes a drag. */
+  private static readonly DRAG_THRESHOLD_PX = 3;
+  /** Inertia friction (1/s): velocity decays by e^(-k t). */
+  private static readonly DRAG_FRICTION = 5;
+  /** Depth-only quad program for the deferred pop-out pass (null = unavailable). */
+  private depthQuad?: { program: WebGLProgram; uModel: WebGLUniformLocation | null; uViewProj: WebGLUniformLocation | null; vao: WebGLVertexArrayObject } | null;
+
   // ── Mobile mode state ──
+  // The phone is a camera on the real desktop: it renders through
+  // renderDesktop like the desktop does, with a view scale. A workspace point
+  // lands at screen = (workspace - scroll) * viewZoom, where scrollX/scrollY
+  // is the workspace point at the viewport's top-left. The desktop keeps
+  // viewZoom at 1, where every mapping reduces exactly to the unzoomed one.
   private mobileMode = false;
+  private viewZoom = 1;
+  private mobileView = MobileViewState.DESKTOP;
+  /** The window the camera last flew in on (FOCUS framing, neighbour swipes). */
   private mobileFocusedSurfaceId?: string;
-  private mobileView = MobileViewState.NATIVE_FIT;
-  /** Slim bottom band that hints the swipe-up gesture (replaces the tab bar). */
+  /** Slim bottom band that hints the swipe-up gesture (the "home" affordance). */
   private static readonly MOBILE_GESTURE_HANDLE_HEIGHT = 28;
   /** Optional hook: relay client-side compositor diagnostics to the backend
    *  (clientDiagnostic path — the browser console never reaches the log). */
   onDiagnostic?: (gate: string, detail: string) => void;
+  /** A camera flight in progress (focus, fly out, keyboard pan). */
+  private mobileFlight?: { from: MobileCam; to: MobileCam; start: number; duration: number };
+  /** A one-finger pan released with speed: the camera glides (screen px/s). */
+  private mobileGlide?: { vx: number; vy: number; last: number };
+  /** Until the user moves the camera, the desktop stays fitted as windows arrive. */
+  private mobileAutoFit = true;
+  private static readonly MOBILE_MAX_ZOOM = 4;
+  /** Focus mode never magnifies a window past this. */
+  private static readonly MOBILE_FOCUS_MAX_ZOOM = 2;
+  private static readonly MOBILE_FLIGHT_MS = 350;
+  /** Glide friction (1/s): velocity decays by e^(-k t). */
+  private static readonly MOBILE_GLIDE_FRICTION = 4;
+  /** Screen px kept around a framed window or the fitted desktop. */
+  private static readonly MOBILE_MARGIN = 8;
+  /** What the phone's 2D overlay last drew; it redraws only when this changes. */
+  private mobileOverlaySig = '';
+  /** The framed window closed: fly out unless its object reappears (churn) first. */
+  private mobileFocusLost?: { objectId: AbjectId; at: number };
+  /** Screen px a virtual keyboard covers at the bottom (see setMobileBottomInset). */
+  private mobileBottomInset = 0;
 
-  /** Cached mobile transform for coordinate mapping (native states). */
-  private mobileTransform = { scale: 1, offsetX: 0, offsetY: 0 };
-  // Pinch / double-tap zoom state: userZoom multiplies the fit-to-screen base scale.
-  private mobileUserZoom = 1;
-  private static readonly MOBILE_MAX_ZOOM = 3;  // pinch ceiling beyond fit-to-screen
-  private mobilePanX = 0;  // pan offset when zoomed in
-  private mobilePanY = 0;
-
-  // ── Card overview state ──
-  /** Stable, mutable deck order (surfaceIds), independent of z-index. */
-  private mobileCardOrder: string[] = [];
-  /** Carousel offset measured in card slots (active index = round(scroll)). */
-  private mobileCardScroll = 0;
-  /** Per-card drag in progress (flick-close or long-press reorder). */
-  private cardDragState?: { surfaceId: string; dx: number; dy: number; reorder: boolean };
-  /** Reveal progress 0→1 when entering the overview. */
-  private cardRevealT = 1;
-  /** Active overview/zoom tween (only one runs at a time). */
-  private cardAnim?: Tween;
-  // Overview layout fractions of the available content area.
-  private static readonly CARD_BOX_W_FRAC = 0.72;
-  private static readonly CARD_BOX_H_FRAC = 0.54;
-  private static readonly CARD_SLOT_FRAC = 0.82;  // center-to-center spacing / box width
+  // ── Exposé (MobileViewState.EXPOSE, on the phone and the desktop) ──
+  // Visual only: slabs fly to grid slots and back; backend rects never
+  // change. The phone picks with taps and flicks. The desktop picks with the
+  // mouse (hover selects, click picks) and the keyboard (arrows and Tab move
+  // the selection, Enter picks, Escape leaves); its system rails (dock,
+  // toolbars, toasts) stay put and live over the scrim.
+  /** Grid slot per window (workspace centre and scale, reading-order index), laid out on entry. */
+  private exposeSlots = new Map<string, ExposeSlot>();
+  /** Windows the grid was laid out for (the stagger spreads start times across them). */
+  private exposeCount = 0;
+  /** Their ids: when the open grid's windows change (one opens, closes, hides), it lays out again. */
+  private exposeMembers = new Set<string>();
+  /** 0 = windows at their rects, 1 = spread in the grid (eased; the scrim and titles follow it). */
+  private exposeT = 0;
+  /** Linear progress of the same spread (the desktop staggers each window's flight along it). */
+  private exposeP = 0;
+  private exposeAnim?: { from: number; to: number; pFrom: number; start: number; duration: number; done?: () => void };
+  /** Vertical screen offset of a slot the finger is lifting (negative = up). */
+  private exposeLift = new Map<string, number>();
+  /** Slots flicked away: they fly off the top from their lift offset. */
+  private exposeFlyOff = new Map<string, { from: number; start: number }>();
+  /** Desktop: the window the pointer or the keys selected (it lifts and wears the accent). */
+  private exposeSelected?: string;
+  /** Desktop: eased selection highlight per slot, 0..1. */
+  private exposeHot = new Map<string, number>();
+  /** Desktop: one window's flight (ms); start times spread over this fraction of a flight across the grid. */
+  private static readonly EXPOSE_FLIGHT_MS = 380;
+  private static readonly EXPOSE_STAGGER = 0.3;
+  /** Desktop: px a window arcs toward the viewer mid-flight. */
+  private static readonly EXPOSE_ARC = 56;
+  /** Desktop: scale the selected window gains over its slot. */
+  private static readonly EXPOSE_HOT_SCALE = 0.05;
 
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
@@ -622,7 +898,12 @@ export class Compositor {
       this.instancedMeshes.clear();
       // Mesh textures are gone too; drop the cache so resolveTexture reloads.
       this.meshTextures.clear();
+      // So are the post-effect targets.
+      this.postFxInstance?.reset();
+      // The pop-out depth program rebuilds on first use.
+      this.depthQuad = undefined;
       this.overlay.invalidate();
+      this.contentContextRestored();
       this.needsRender = true;
     };
 
@@ -645,6 +926,8 @@ export class Compositor {
     this.renderer.cssWidth = rect.width;
     this.renderer.cssHeight = rect.height;
     this.overlay.resize(rect.width, rect.height, dpr);
+    // A desktop Exposé grid is laid out in screen space: lay it out again.
+    if (!this.mobileMode && this.mobileView === MobileViewState.EXPOSE) this.relayoutExpose();
 
     this.needsRender = true;
   }
@@ -662,8 +945,10 @@ export class Compositor {
     title?: string,
     transparent = false,
     closable = true,
+    opts: { chromeless?: boolean; screenAnchor?: ScreenAnchor } = {},
   ): string {
     require(objectId !== '', 'objectId is required');
+    require(opts.screenAnchor === undefined || isScreenAnchor(opts.screenAnchor), 'screenAnchor must name a screen anchor');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
 
     const id = surfaceId ?? `surface-${objectId}-${Date.now()}`;
@@ -687,12 +972,19 @@ export class Compositor {
       drawn: false,
       transparent,
       closable,
+      chromeless: opts.chromeless ?? false,
+      screenAnchor: opts.screenAnchor,
       title,
     };
 
     this.surfaces.set(id, surface);
     this.sortSurfaces();
     this.needsRender = true;
+    // A phone framed on a window whose surface was just reminted stays on it.
+    if (this.mobileFocusLost && this.mobileFocusLost.objectId === objectId) {
+      this.mobileFocusLost = undefined;
+      this.mobileFocusedSurfaceId = id;
+    }
 
     ensure(this.surfaces.has(id), 'Surface must be registered');
     return id;
@@ -706,14 +998,22 @@ export class Compositor {
     // A sink still in flight shares this surface's texture, which is about to go.
     this.ghosts = this.ghosts.filter((g) => !(g.kind === 'minimize' && g.surface.id === surfaceId));
     const deleted = this.surfaces.delete(surfaceId);
-    // Never leave the mobile view pointed at a destroyed surface: renderMobile
-    // would otherwise draw an empty frame (black screen) instead of the
-    // fallback. Dropping the id makes the next render pick the top visible
-    // surface. Mobile-only state; desktop ignores it.
+    // A phone framed on this window flies back out to the desktop, unless the
+    // same object reappears under a new surface id right away (window churn):
+    // then it stays framed on the replacement (see stepMobileCamera).
+    // Mobile-only state; desktop ignores it.
     if (this.mobileFocusedSurfaceId === surfaceId) {
       this.mobileFocusedSurfaceId = undefined;
+      if (this.mobileMode && this.mobileView === MobileViewState.FOCUS && this.lastDestroyed) {
+        this.mobileFocusLost = { objectId: this.lastDestroyed.objectId, at: performance.now() };
+      }
       this.needsRender = true;
     }
+    this.exposeSlots.delete(surfaceId);
+    this.exposeLift.delete(surfaceId);
+    this.exposeFlyOff.delete(surfaceId);
+    this.exposeHot.delete(surfaceId);
+    if (this.exposeSelected === surfaceId) this.exposeSelected = this.exposeSlots.keys().next().value;
     if (deleted) {
       this.liveDataImages.delete(surfaceId);
       this.surfaceVideoStamps.delete(surfaceId);
@@ -765,6 +1065,8 @@ export class Compositor {
     // Drop client-side animations too: the backend replays retained ones after
     // reconnect, so stale entries would otherwise double up on the re-added nodes.
     this.nodeAnims.clear();
+    // A drag in flight belonged to the old connection's scene.
+    this.nodeDrag = undefined;
     this.needsRender = true;
   }
 
@@ -946,6 +1248,104 @@ export class Compositor {
     };
   }
 
+  // ── Scene info (what this GPU can do, how the scene is running) ──────
+
+  /** Rendered frames of the last ~2 s: [timestamp, ms spent in render(), ms since the previous frame or 0]. */
+  private frameLog: Array<[number, number, number]> = [];
+  /** Live particles at the end of the last rendered frame. */
+  private lastParticleCount = 0;
+  /** Whether the previous rendered frame asked for another (the loop was running, not resting). */
+  private frameWantedNext = false;
+
+  /** Record one rendered frame for sceneInfo (runs before the particle prune). */
+  private noteFrame(start: number): void {
+    const now = performance.now();
+    const prev = this.frameLog.length > 0 ? this.frameLog[this.frameLog.length - 1][0] : 0;
+    // Only back-to-back frames measure frame time; a gap after a frame that
+    // wanted no successor is the loop resting.
+    const running = this.frameWantedNext && prev > 0 && now - prev < 5000;
+    this.frameLog.push([now, now - start, running ? now - prev : 0]);
+    this.frameWantedNext = this.needsRender;
+    while (this.frameLog.length > 0 && (now - this.frameLog[0][0] > 2000 || this.frameLog.length > 720)) this.frameLog.shift();
+    let particles = 0;
+    for (const id of this.touchedParticles) {
+      particles += this.particleStates.get(id)?.ps.length ?? this.gpuParticles?.aliveCount(id) ?? 0;
+    }
+    this.lastParticleCount = particles;
+  }
+
+  /**
+   * What this client's GPU offers and how the scene is running, for authors
+   * choosing effects (WidgetManager's getSceneParams folds it in). A render
+   * module or post effect reads as available until this GPU rejects its
+   * program (they build lazily on first use). Stats cover the frames of the
+   * last two seconds; draw calls and triangles are the last rendered frame's.
+   */
+  sceneInfo(): { capabilities: Record<string, unknown>; stats: Record<string, unknown> } {
+    const gl = this.renderer.context;
+    const lost = this.renderer.isContextLost;
+    const param = (p: number): number => (lost ? 0 : Number(gl.getParameter(p)) || 0);
+    const ext = (name: string): boolean => !lost && !!gl.getExtension(name);
+    const failed = (...names: string[]): boolean => names.some((n) => programError(gl, n) !== undefined);
+    const aniso = lost ? null : gl.getExtension('EXT_texture_filter_anisotropic');
+    const postBase = !failed('postComposite', 'postCombine');
+    const now = performance.now();
+    const frames = this.frameLog.filter((f) => now - f[0] <= 2000);
+    const stat = (values: number[]): { avg: number; p95: number } => {
+      if (values.length === 0) return { avg: 0, p95: 0 };
+      const sorted = [...values].sort((a, b) => a - b);
+      const avg = values.reduce((s, v) => s + v, 0) / values.length;
+      const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+      return { avg: Math.round(avg * 100) / 100, p95: Math.round(p95 * 100) / 100 };
+    };
+    const intervals = stat(frames.map((f) => f[2]).filter((v) => v > 0));
+    const cpu = stat(frames.map((f) => f[1]));
+    const last = this.frameLog.length > 0 ? this.frameLog[this.frameLog.length - 1][0] : 0;
+    return {
+      capabilities: {
+        webgl2: !lost,
+        gpu: lost ? '' : String(gl.getParameter(gl.RENDERER) ?? ''),
+        maxTextureSize: param(gl.MAX_TEXTURE_SIZE),
+        maxRenderbufferSize: param(gl.MAX_RENDERBUFFER_SIZE),
+        maxSamples: param(gl.MAX_SAMPLES),
+        floatRenderTargets: ext('EXT_color_buffer_float'),
+        anisotropy: aniso ? param(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 0,
+        instancing: !lost,
+        gpuParticles: !lost && !failed('gpuParticles'),
+        maxLightsPerSubtree: MAX_MESH_LIGHTS,
+        shadowMapMax: this.mobileMode ? 1024 : 4096,
+        postEffects: {
+          bloom: !lost,
+          ao: postBase && !failed('postAo12', 'postAo8', 'postAo6'),
+          dof: postBase && !failed('postDof16', 'postDof12', 'postDof8'),
+          lightShafts: postBase && !failed('postShafts32', 'postShafts24', 'postShafts16', 'postShafts12'),
+          outline: postBase,
+          fxaa: postBase && !failed('postFxaa'),
+          chromaticAberration: postBase,
+          vignette: postBase,
+          grain: postBase,
+        },
+        postQuality: this.postQuality,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        mobile: this.mobileMode,
+        viewport: { width: Math.round(this.width), height: Math.round(this.height) },
+      },
+      stats: {
+        windowMs: 2000,
+        framesRendered: frames.length,
+        fps: intervals.avg > 0 ? Math.round(1000 / intervals.avg) : 0,
+        frameMs: intervals,
+        renderCpuMs: cpu,
+        idleMs: last > 0 ? Math.round(now - last) : null,
+        drawCalls: this.renderer.frameStats.drawCalls,
+        triangles: Math.round(this.renderer.frameStats.triangles),
+        particles: this.lastParticleCount,
+        textureMB: Math.round((this.renderer.textureBytes / 1048576) * 10) / 10,
+        surfaces: this.surfaces.size,
+      },
+    };
+  }
+
   /**
    * Check if a surface is filtered out by the active workspace.
    */
@@ -1103,15 +1503,24 @@ export class Compositor {
     // up a node that does not exist yet, drops the animation, and still replies
     // success. Collect them and start them once the batch has been applied.
     const anims: SceneOp[] = [];
-    for (const op of ops) {
+    // The node under the user's hand keeps following the hand: incoming
+    // position updates for it (owner echoes, other clients) wait until the
+    // drag ends, or they would yank it back to a stale spot mid-drag.
+    const held = this.nodeDrag && this.nodeDrag.key === surfaceKey ? this.nodeDrag.nodeId : undefined;
+    for (let op of ops) {
       if (op.op === 'animate') { anims.push(op); continue; }
       if (op.op === 'remove') this.nodeAnims.delete(`${surfaceKey}/${op.id}`);
+      if (held !== undefined && op.op === 'update' && op.id === held && op.transform?.position) {
+        const { position: _drop, ...keep } = op.transform;
+        op = { ...op, transform: keep };
+      }
       rest.push(op);
     }
     if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
     for (const op of anims) this.startOrStopAnim(surfaceKey, op);
     // Pick up bloom config from this surface's 'environment' node.
     for (const op of rest) this.syncBloomFrom(surfaceKey, op);
+    for (const op of rest) this.syncMotionNode(surfaceKey, op);
     // Only wake the render loop for changes that can reach pixels. A 30-60fps
     // animation stream aimed at a hidden window or an inactive workspace
     // still mutates the retained store (so the next reveal is correct) but
@@ -1123,16 +1532,24 @@ export class Compositor {
   private syncBloomFrom(surfaceKey: string, op: SceneOp): void {
     const current = this.bloomBySurface.get(surfaceKey);
     if (op.op === 'remove') {
-      if (current?.nodeId === op.id) this.bloomBySurface.delete(surfaceKey);
+      // Removing an ancestor group takes the environment node with it.
+      if (current && (current.nodeId === op.id || !this.sceneStore.getNode(surfaceKey, current.nodeId))) {
+        this.bloomBySurface.delete(surfaceKey);
+      }
       return;
     }
     const node = this.sceneStore.getNode(surfaceKey, op.id);
     if (node?.kind !== 'environment') return;
-    const b = node.params.bloom as boolean | { threshold?: number; intensity?: number } | undefined;
+    // The node's own bloom, or its look's (a look like 'neon' brings its glow).
+    const b = withLookPreset(node.params, this.sceneLibrary).bloom as boolean
+      | { threshold?: number; intensity?: number; radius?: number; quality?: number | string } | undefined;
     if (b) {
+      // quality: the mip-chain depth (how far the glow reaches); radius: its spread.
+      const q = b === true ? undefined : b.quality;
+      const levels = typeof q === 'number' ? q : q === 'low' ? 2 : q === 'high' ? 5 : 3;
       this.bloomBySurface.set(surfaceKey, b === true
-        ? { nodeId: op.id, threshold: 0.6, intensity: 1 }
-        : { nodeId: op.id, threshold: b.threshold ?? 0.6, intensity: b.intensity ?? 1 });
+        ? { nodeId: op.id, threshold: 0.6, intensity: 1, levels, radius: 1 }
+        : { nodeId: op.id, threshold: b.threshold ?? 0.6, intensity: b.intensity ?? 1, levels, radius: b.radius ?? 1 });
     } else if (current?.nodeId === op.id) {
       this.bloomBySurface.delete(surfaceKey);
     }
@@ -1147,7 +1564,7 @@ export class Compositor {
     if (this.bloomBySurface.size === 0) return;
     for (const [surfaceKey, cfg] of this.bloomBySurface) {
       if (surfaceKey.startsWith('world:')) {
-        this.renderer.applyBloom(cfg.threshold, cfg.intensity);
+        this.renderer.applyBloom(cfg.threshold, cfg.intensity, cfg.levels, undefined, { radius: cfg.radius });
         continue;
       }
       const surface = this.surfaces.get(surfaceKey);
@@ -1156,10 +1573,13 @@ export class Compositor {
       // Drawn this frame, on either the desktop or the phone path — a
       // matrix left over from an earlier frame is not a place on screen.
       if (!this.drawnThisFrame.has(surfaceKey)) continue;
-      const model = this.glState(surfaceKey).model;
+      const st = this.glState(surfaceKey);
+      const model = st.model;
       if (!model) continue;
-      const rect = projectUnitQuadToCss(model, this.viewProj, this.width, this.height, BLOOM_SPILL_PX);
-      if (rect) this.renderer.applyBloom(cfg.threshold, cfg.intensity, 3, rect);
+      // A window pinned to the phone's screen drew through its own view.
+      const viewProj = st.pinView && st.cam ? st.cam.viewProj : this.viewProj;
+      const rect = projectUnitQuadToCss(model, viewProj, this.width, this.height, BLOOM_SPILL_PX);
+      if (rect) this.renderer.applyBloom(cfg.threshold, cfg.intensity, cfg.levels, rect, { radius: cfg.radius });
     }
   }
 
@@ -1197,7 +1617,13 @@ export class Compositor {
   // the input path at once (their ghosts are drawn, never hit).
 
   private slabMotionConfig: SlabMotionConfig = DEFAULT_SLAB_MOTION;
-  /** Particle emitter simulations, keyed `${surfaceKey}/${nodeId}`. */
+  /**
+   * GPU particle emitters (one instanced draw each), keyed
+   * `${surfaceKey}/${nodeId}`. The CPU simulation below remains only as the
+   * fallback for a GPU that rejects the particle program.
+   */
+  private gpuParticles?: GpuParticles;
+  /** Particle emitter simulations (CPU fallback), keyed `${surfaceKey}/${nodeId}`. */
   private particleStates = new Map<string, {
     ps: Array<{ x: number; y: number; z: number; vx: number; vy: number; vz: number; age: number; size: number }>;
     acc: number; last: number; burstKey: unknown; burstDone: boolean;
@@ -1213,9 +1639,34 @@ export class Compositor {
     this.needsRender = true;
   }
 
+  /**
+   * Named material and look presets (SceneLibrary data, relayed by the
+   * UIServer). Nodes name them with `material` / `look`; resolution happens
+   * at draw time, so a re-registered preset restyles every node using it.
+   */
+  private sceneLibrary: SceneLibraryConfig = BUILTIN_SCENE_LIBRARY;
+
+  /** Material presets expand before inheritance, so a group can dress its subtree (SceneStore.expandParams). */
+  private readonly presetExpander = (this.sceneStore.expandParams = (p) => withMaterialPreset(p, this.sceneLibrary));
+
+  /** Replace the preset library (materials and looks). */
+  setSceneLibrary(config: SceneLibraryConfig): void {
+    this.sceneLibrary = {
+      materials: { ...BUILTIN_SCENE_LIBRARY.materials, ...(config.materials ?? {}) },
+      looks: { ...BUILTIN_SCENE_LIBRARY.looks, ...(config.looks ?? {}) },
+    };
+    // A look can carry bloom: re-read every environment node against the new looks.
+    for (const key of [...this.surfaces.keys(), ...this.worldKeys]) {
+      for (const node of this.sceneStore.nodesForSurface(key)) {
+        if (node.kind === 'environment') this.syncBloomFrom(key, { op: 'update', id: node.id });
+      }
+    }
+    this.needsRender = true;
+  }
+
   /** Slabs that take part in lifecycle motion (tooltips and passthrough layers stay instant). */
   private hasMotion(surface: Surface): boolean {
-    return !this.mobileMode && !surface.transparent && !surface.inputPassthrough
+    return !surface.transparent && !surface.inputPassthrough
       && surface.rect.height >= this.slabMotionConfig.minHeight;
   }
 
@@ -1363,11 +1814,14 @@ export class Compositor {
   private drawPoseAuras(
     pose: SlabPose, cx: number, cy: number, z: number, w: number, h: number,
     rot: number[], viewProj: Mat4,
+    /** Frame the pose is expressed in (a window riding a node); omitted = world. */
+    parent?: Mat4,
   ): void {
+    const place = (m: Mat4): Mat4 => (parent ? mat4Multiply(parent, m) : m);
     for (const aura of pose.auras) {
       const pad = aura.spread;
       this.renderer.drawGlow({
-        model: mat4TRS(cx, cy, z - 0.4, rot[0], rot[1], rot[2], w + pad * 2, h + pad * 2, 1),
+        model: place(mat4TRS(cx, cy, z - 0.4, rot[0], rot[1], rot[2], w + pad * 2, h + pad * 2, 1)),
         viewProj,
         quadWidth: w + pad * 2, quadHeight: h + pad * 2,
         halfWidth: w / 2, halfHeight: h / 2,
@@ -1383,13 +1837,16 @@ export class Compositor {
   private drawPoseLights(
     pose: SlabPose, now: number, cx: number, cy: number, z: number, w: number, h: number,
     rot: number[], viewProj: Mat4,
+    /** Frame the pose is expressed in (a window riding a node); omitted = world. */
+    parent?: Mat4,
   ): void {
+    const place = (m: Mat4): Mat4 => (parent ? mat4Multiply(parent, m) : m);
     for (const scan of pose.scans) {
       const y = cy - h / 2 + h * scan.pos;
       const qw = w + 60;
       const qh = 40;
       this.renderer.drawGlow({
-        model: mat4TRS(cx, y, z + 1, rot[0], rot[1], rot[2], qw, qh, 1),
+        model: place(mat4TRS(cx, y, z + 1, rot[0], rot[1], rot[2], qw, qh, 1)),
         viewProj,
         quadWidth: qw, quadHeight: qh,
         halfWidth: w / 2, halfHeight: 1,
@@ -1410,7 +1867,7 @@ export class Compositor {
         const pz = z + p.z + p.vz * secs;
         const q = p.square ? p.size * 2 + 2 : p.size * 6;
         this.renderer.drawGlow({
-          model: mat4TRS(px, py, pz, 0, 0, secs * 3, q, q, 1),
+          model: place(mat4TRS(px, py, pz, 0, 0, secs * 3, q, q, 1)),
           viewProj,
           quadWidth: q, quadHeight: q,
           halfWidth: p.square ? p.size : 0.5, halfHeight: p.square ? p.size : 0.5,
@@ -1434,8 +1891,10 @@ export class Compositor {
       }
       keep.push(g);
       const { rect } = g.surface;
-      const bx = rect.x + rect.width / 2;
-      const by = rect.y + rect.height / 2;
+      // A window that rode a node folds away where it last was on screen.
+      const parent = g.state.attachFrame;
+      const bx = parent ? 0 : rect.x + rect.width / 2;
+      const by = parent ? 0 : rect.y + rect.height / 2;
       const pose = this.evalPose([g.run], now, bx, by);
       const cx = bx + pose.dx;
       const cy = by + pose.dy;
@@ -1443,16 +1902,17 @@ export class Compositor {
       const w = rect.width * pose.sx;
       const h = rect.height * pose.sy;
       const rot = [pose.rx, pose.ry, pose.rz];
-      const cam = this.windowCamera(cx, cy, z);
-      this.drawPoseAuras(pose, cx, cy, z, w, h, rot, cam.viewProj);
+      const cam = (parent && g.state.attachCam) ? g.state.attachCam : this.windowCamera(cx, cy, z, g.state.pinView);
+      this.drawPoseAuras(pose, cx, cy, z, w, h, rot, cam.viewProj, parent);
+      const slab = mat4TRS(cx, cy, z, rot[0], rot[1], rot[2], w, h, 1);
       this.renderer.drawSurface({
-        model: mat4TRS(cx, cy, z, rot[0], rot[1], rot[2], w, h, 1),
+        model: parent ? mat4Multiply(parent, slab) : slab,
         viewProj: cam.viewProj, texture: g.state.texture,
         width: rect.width, height: rect.height, radius: 0,
         dim: pose.dim, opacity: pose.opacity,
         rimColor: pose.rim, rimWidth: 2.5,
       });
-      this.drawPoseLights(pose, now, cx, cy, z, w, h, rot, cam.viewProj);
+      this.drawPoseLights(pose, now, cx, cy, z, w, h, rot, cam.viewProj, parent);
     }
     this.ghosts = keep;
     return keep.length > 0;
@@ -1510,7 +1970,7 @@ export class Compositor {
   }
 
   /**
-   * Set a surface's title (used for mobile tab bar labels).
+   * Set a surface's title (used for the phone's Exposé labels).
    */
   setSurfaceTitle(surfaceId: string, title: string): void {
     const surface = this.surfaces.get(surfaceId);
@@ -1527,6 +1987,8 @@ export class Compositor {
   setActiveWorkspace(workspaceId: string | undefined): void {
     const changed = this.activeWorkspaceId !== workspaceId;
     this.activeWorkspaceId = workspaceId;
+    // Exposé spreads one workspace's windows: another workspace closes it at once.
+    if (changed && (this.exposeT > 0 || this.mobileView === MobileViewState.EXPOSE)) this.closeExposeNow();
     const enter = changed && workspaceId
       ? this.resolveEffect(this.slabMotionConfig.transitions.workspaceIn) : undefined;
     if (enter) {
@@ -2393,8 +2855,20 @@ export class Compositor {
    */
   private render(): void {
     if (this.renderer.isContextLost) return;
+    const frameStart = performance.now();
+    this.postFxInstance?.newFrame(performance.now());
     // Advance declarative animations; keep the loop alive while any run.
     if (this.stepAnimations(performance.now())) this.needsRender = true;
+    // A released node gliding on inertia moves here, off the render loop.
+    if (this.stepNodeDragInertia(performance.now())) this.needsRender = true;
+    // Constraints (follow, lookAt) see this frame's positions; released
+    // camera orbits coast here too.
+    if (this.stepConstraints(performance.now())) this.needsRender = true;
+    if (this.stepCameras(performance.now())) this.needsRender = true;
+    // Exposé's spread, selection highlight and flicks (phone and desktop).
+    if (this.stepExpose(performance.now())) this.needsRender = true;
+    // Resolved node params are cached per frame (all passes share them).
+    this.frameNodes.clear();
     this.touchedCustomMeshes.clear();
     this.touchedInstanced.clear();
     this.drawnThisFrame.clear();
@@ -2408,27 +2882,40 @@ export class Compositor {
     // clipped to each window that asked for it.
     this.applyBloomPasses();
     this.overlay.draw();
+    this.noteFrame(frameStart);
     this.pruneCustomMeshes();
     this.pruneCanvasLayers();
     this.pruneParticles();
+    this.pruneContent();
+    this.postFxInstance?.frameEnd(this.needsRender);
   }
 
   /**
    * Perspective camera whose z=0 plane maps ~1:1 to CSS pixels. The eye sits
    * over the viewport center (plus scroll), so desktop scroll is a camera
    * truck and lifted/tilted slabs gain genuine parallax.
+   *
+   * The phone's view zoom is a focal-length change: the eye stays at the
+   * same distance over the centre of what is shown and the projection's
+   * x/y scale grows by viewZoom, so the scene magnifies without changing its
+   * perspective (screen = (workspace - scroll) * viewZoom on the z=0 plane).
    */
   private updateCamera(scrollX: number, scrollY: number): void {
     const w = Math.max(1, this.width);
     const h = Math.max(1, this.height);
+    const zoom = this.viewZoom;
     const dist = cameraDistance(h);
-    const eyeX = w / 2 + scrollX;
-    const eyeY = h / 2 + scrollY;
+    const eyeX = w / (2 * zoom) + scrollX;
+    const eyeY = h / (2 * zoom) + scrollY;
     this.cameraPos = [eyeX, eyeY, dist];
     const proj = mat4PerspectiveYDown(
       Compositor.CAMERA_FOV, w / h,
       dist * NEAR_PLANE_FACTOR, dist * FAR_PLANE_FACTOR,
     );
+    if (zoom !== 1) {
+      proj[0] *= zoom;
+      proj[5] *= zoom;
+    }
     const view = mat4Translation(-eyeX, -eyeY, -dist);
     this.viewProj = mat4Multiply(proj, view);
     this.invViewProj = mat4Invert(this.viewProj);
@@ -2472,9 +2959,11 @@ export class Compositor {
     const chrome = this.chromeColors();
     let animating = false;
     const now = performance.now();
-    // Any modal up? Everything else recedes behind it.
+    // Any modal up? Everything else recedes behind it (Exposé shows every
+    // window it spreads at full depth).
     let anyModal = false;
     for (const s of this.sortedSurfaces) {
+      if (this.exposeT > 0) break;
       if (s.visible && s.drawn && !this.isWorkspaceFiltered(s) && this.surfaceGl.get(s.id)?.modal) {
         anyModal = true;
         break;
@@ -2484,12 +2973,44 @@ export class Compositor {
     // World-scope nodes behind the windows (desktop décor, roaming pets).
     this.drawWorldNodes('back');
 
-    for (const surface of this.sortedSurfaces) {
-      if (!surface.visible || !surface.drawn) continue;
-      if (this.isWorkspaceFiltered(surface)) continue;
-
+    // Windows and stacked world objects (layer 'stack') share one depth
+    // order, back to front (see desktopOrder).
+    const order = this.desktopOrder();
+    // Exposé: the world stays where it is and recedes under the scrim.
+    if (this.exposeT > 0) this.drawExposeUnderlay(order);
+    const deferred: Array<{ surface: Surface; frame: Mat4; cam: SceneCamera; index: number }> = [];
+    for (let oi = 0; oi < order.length; oi++) {
+      const item = order[oi];
+      // Exposé shows the windows it spread (see exposeView) over the scrim,
+      // and on the desktop the system rails, which stay put.
+      if (this.exposeT > 0 && (item.kind === 'stack'
+          || (!this.exposeSlots.has(item.surface.id) && !this.exposeKeeps(item.surface)))) continue;
+      if (item.kind === 'stack') {
+        // A stacked world object gets its own depth range, like a window.
+        this.renderer.clearDepth();
+        this.drawNodeTree(item.key, mat4Identity(), this.globalCamera(), 'stack', undefined, undefined, undefined, { rootId: item.rootId });
+        continue;
+      }
+      const surface = item.surface;
       const state = this.glState(surface.id);
-      const focused = surface.id === this.focusedSurfaceId;
+      // A zoomed-in phone skips windows the camera cannot see at all (their
+      // resting slab still answers picking).
+      if (this.mobileMode && this.mobileOffCamera(surface, state)) {
+        const r = surface.rect;
+        state.model = mat4TRS(r.x + r.width / 2, r.y + r.height / 2, 0, 0, 0, 0, r.width, r.height, 1);
+        continue;
+      }
+      // A window riding a scene node hangs from the node's (scale-free) frame
+      // and renders through the camera that node renders with. Everything
+      // below is then placed in that frame, centred on the window.
+      // (Exposé carries a window to its grid slot the same way.)
+      const anchor = state.attach ? this.anchorView(surface, state, 0) : this.exposeView(surface, state);
+      const parent = anchor?.frame;
+      const place = (m: Mat4): Mat4 => (parent ? mat4Multiply(parent, m) : m);
+      // In the desktop Exposé the selection wears focus: the lift and the accent print shadow.
+      const focused = !this.mobileMode && this.exposeT > 0 && this.exposeSlots.has(surface.id)
+        ? surface.id === this.exposeSelected
+        : surface.id === this.focusedSurfaceId;
       // First appearance plays the open transition.
       if (!state.seen) {
         state.seen = true;
@@ -2498,9 +3019,9 @@ export class Compositor {
           (state.effects ??= []).push(this.makeRun(open, now, surface.rect.width, surface.rect.height));
         }
       }
-      const baseCx = surface.rect.x + surface.rect.width / 2;
-      const baseCy = surface.rect.y + surface.rect.height / 2;
-      const motion = this.evalPose(state.effects ?? [], now, baseCx, baseCy);
+      const baseCx = parent ? 0 : surface.rect.x + surface.rect.width / 2;
+      const baseCy = parent ? 0 : surface.rect.y + surface.rect.height / 2;
+      const motion = this.evalPose(state.effects ?? [], now, parent ? parent[12] : baseCx, parent ? parent[13] : baseCy);
       if (state.effects?.length) {
         state.effects = state.effects.filter((r) => now - r.start < r.spec.duration);
       }
@@ -2530,11 +3051,11 @@ export class Compositor {
       const userRot = state.userRotation ?? [0, 0, 0];
       const rot: [number, number, number] = [userRot[0] + motion.rx, userRot[1] + motion.ry, userRot[2] + motion.rz];
       const z = state.lift + (state.userZ ?? 0) + motion.dz;
-      const model = mat4TRS(
+      const model = place(mat4TRS(
         cx, cy, z,
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         rect.width, rect.height, 1,
-      );
+      ));
       state.model = model;
       this.drawnThisFrame.add(surface.id);
 
@@ -2546,7 +3067,14 @@ export class Compositor {
       // shows the content nearly head-on, so the frame visibly tilted away
       // from its own content. Drawing both through ONE camera keeps a tilted
       // window rigid.
-      const cam = this.windowCamera(cx, cy, z);
+      // A window pinned to the screen (phone) sits at its rect as usual but
+      // is seen through its own screen view (see pinView).
+      const pin = anchor ? undefined : this.pinView(surface);
+      const cam = anchor?.cam ?? this.windowCamera(cx, cy, z, pin);
+      state.cam = cam;
+      state.attachFrame = parent;
+      state.attachCam = anchor ? cam : undefined;
+      state.pinView = pin;
 
       const radius = surface.transparent ? 0 : Math.min(chrome.radius, rect.width / 2, rect.height / 2);
 
@@ -2557,11 +3085,11 @@ export class Compositor {
         const off = chrome.block.offset;
         const bw = rect.width + 2;
         const bh = rect.height + 2;
-        const blockModel = mat4TRS(
+        const blockModel = place(mat4TRS(
           cx + off, cy + off, z - 1,
           state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
           bw + 4, bh + 4, 1,
-        );
+        ));
         this.renderer.drawGlow({
           model: blockModel, viewProj: cam.viewProj,
           quadWidth: bw + 4, quadHeight: bh + 4,
@@ -2572,7 +3100,7 @@ export class Compositor {
         });
       }
       const tilt = [state.tiltX + rot[0], state.tiltY + rot[1], rot[2]];
-      this.drawPoseAuras(motion, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj);
+      this.drawPoseAuras(motion, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj, parent);
 
       this.drawSurfaceSlab(surface, state, model, {
         radius,
@@ -2583,15 +3111,16 @@ export class Compositor {
         rim: motion.rim,
         viewProj: cam.viewProj,
       });
-      this.drawPoseLights(motion, now, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj);
+      this.drawPoseLights(motion, now, cx, cy, z, rect.width, rect.height, tilt, cam.viewProj, parent);
 
       // Scene-vocabulary nodes ride the window's UNSCALED frame (the slab
       // model bakes in the window's px size, which would distort meshes).
-      const frame = mat4TRS(
+      const frame = place(mat4TRS(
         cx, cy, z,
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         motion.sx, motion.sy, Math.min(motion.sx, motion.sy),
-      );
+      ));
+      state.frame = frame;
       // The window's subtree is drawn through the same window camera as the
       // slab (see above), so its depth converges into the window rather than
       // toward the middle of the screen (see windowCamera). Without this, a
@@ -2616,10 +3145,18 @@ export class Compositor {
       // always composites over a back window's, whatever their world depths.
       this.renderer.clearDepth();
       this.drawVocabNodes(surface, frame, 'occluded', cam);
-      // The overlay (pop-out) pass keeps sharing this window's depth range, so
-      // intra-window stacking between occluded and pop-out content is unchanged.
-      this.drawVocabNodes(surface, frame, 'overlay', cam);
+      // Pop-outs (clip 'none' / occlude:false). With nothing covering the
+      // window they draw now, sharing this window's depth range, so stacking
+      // between clipped and pop-out content is unchanged. When a higher
+      // window covers it they wait until every window is down and are then
+      // depth-tested against the covering slabs (drawDeferredPopouts): near
+      // parts show over the higher window, far parts hide behind it.
+      if (this.passNodes(surface.id, undefined, 'none').length > 0) {
+        if (this.popoutsCovered(order, oi, surface)) deferred.push({ surface, frame, cam, index: oi });
+        else this.drawVocabNodes(surface, frame, 'overlay', cam);
+      }
     }
+    for (const d of deferred) this.drawDeferredPopouts(d, order);
 
     // Closing / minimizing slabs, drawn over the live ones.
     this.renderer.clearDepth();
@@ -2629,9 +3166,14 @@ export class Compositor {
     // so give them a fresh depth range rather than testing against the last
     // window's leftover depth.
     this.renderer.clearDepth();
-    this.drawWorldNodes('front');
+    if (this.exposeT <= 0) this.drawWorldNodes('front');
 
-    this.renderScrollbarsOverlay();
+    // The phone draws its own 2D chrome (renderMobile); the desktop's is the
+    // scrollbars, or Exposé's titles while it shows.
+    if (!this.mobileMode) {
+      if (this.exposeT > 0.02) this.renderExposeOverlay();
+      else this.renderScrollbarsOverlay();
+    }
     if (animating) this.needsRender = true;
   }
 
@@ -2660,7 +3202,12 @@ export class Compositor {
         // through the clientDiagnostic relay so it lands in abject.log.
         this.onDiagnostic?.('surface-tainted', taintDetail);
       }
+      // A fresh upload replaced level 0; any mip chain now describes old pixels.
+      if (state.slabMips) this.syncSlabMips(state, true);
     }
+    // A phone camera zoomed out minifies slabs: sample a mip chain so window
+    // text stays steady instead of shimmering. (The desktop draws at 1:1.)
+    if (this.mobileMode && this.viewZoom < 0.999 && !state.slabMips) this.syncSlabMips(state, false);
     this.renderer.drawSurface({
       model,
       viewProj: opts.viewProj ?? this.viewProj,
@@ -2677,6 +3224,27 @@ export class Compositor {
   }
 
   /**
+   * Match a slab texture's filtering to the phone camera: zoomed out, it
+   * samples a freshly generated mip chain (trilinear); otherwise plain
+   * linear. Called after every upload of a mipmapped slab, since a stale
+   * chain beside a new level 0 would leave the texture incomplete.
+   */
+  private syncSlabMips(state: SurfaceGlState, _reuploaded: boolean): void {
+    const tex = state.texture;
+    if (!tex) return;
+    const gl = this.renderer.context;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    if (this.mobileMode && this.viewZoom < 0.999) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      state.slabMips = true;
+    } else {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      state.slabMips = false;
+    }
+  }
+
+  /**
    * Draw a window's scene-vocabulary nodes in one of two passes. The window's
    * own content (chrome + widgets + default canvas) is the BACKMOST 2D layer
    * of its subtree; scene nodes draw above it. Within a pass, canvas nodes
@@ -2686,9 +3254,14 @@ export class Compositor {
    *   clipped to the window's content rect, so nodes sit above the window's
    *   base 2D content but cannot paint over the title bar or spill across
    *   the desktop.
-   * - 'overlay': nodes whose resolved params set `occlude: false`, drawn last
-   *   with no clip, so they sit on top of everything and may extend past the
-   *   window (pop-out 3D, decorations meant to be visible over the chrome).
+   *   Nodes with `clip: 'window'` draw in the same pass right after, clipped
+   *   to the WHOLE window rect (title bar included) and sharing its depth.
+   * - 'overlay': pop-out nodes (`clip: 'none'`, or the older `occlude:
+   *   false`), unclipped, so they may extend past the window. The desktop
+   *   draws these inline when nothing covers the window, and otherwise in a
+   *   deferred pass depth-tested against the windows above (see
+   *   drawDeferredPopouts).
+   * `depthOnly` replays the pass's opaque meshes into the depth buffer only.
    */
   private drawVocabNodes(
     surface: Surface,
@@ -2696,27 +3269,50 @@ export class Compositor {
     pass: 'occluded' | 'overlay',
     cam: SceneCamera,
     // Force the projected-quad clip even when the window itself is untilted:
-    // the card switcher rotates and recedes its cards through the model it
-    // passes here rather than through the surface's glState, so the tilt test
-    // below cannot see it and would fall back to an upright screen rect.
+    // a caller that poses a slab through the model it passes here, rather
+    // than through the surface's glState, is invisible to the tilt test
+    // below, which would fall back to an upright screen rect.
     forceQuadClip = false,
+    depthOnly = false,
+    /** Pop-outs drawn in the deferred pass (see drawDeferredPopouts). */
+    deferred = false,
   ): void {
+    if (pass === 'overlay') {
+      // Pop-outs (clip 'none') hang off the window's frame in window px:
+      // chrome decorations (the focus sigil), badges, parts reaching past the
+      // window. They render through the window camera, like the slab; a
+      // camera node frames only the clipped scene inside the window, so an
+      // orbiting camera never swings the window's chrome around.
+      this.drawNodeTree(surface.id, surfaceModel, cam, undefined, undefined, 'none', undefined, { depthOnly, deferred });
+      return;
+    }
+    // A camera node replaces the window camera for the clipped subtree;
+    // clipping (the content quad) stays on the window camera the slab draws with.
+    const sceneCam = this.cameraFor(surface, cam, surfaceModel) ?? cam;
     const state = this.glState(surface.id);
     const rot = state.userRotation;
-    const tilted = forceQuadClip || !!(state.tiltX || state.tiltY || (rot && (rot[0] || rot[1] || rot[2])));
-    let clip = this.contentClip(surface);
-    let clipQuad: { model: Mat4; viewProj: Mat4 } | undefined;
-    if (tilted) {
-      // A tilted window's content region is a rotated quad on screen; the
-      // axis-aligned scissor would crop it with an upright rectangle. Build
-      // the content rect's model under the tilted frame for a stencil clip,
-      // and shrink the scissor to the quad's conservative screen bbox (it
-      // still bounds the stencil clear + draws cheaply).
-      const { model } = this.contentQuadModel(surface, surfaceModel);
-      clipQuad = { model, viewProj: cam.viewProj };
-      clip = this.projectedQuadBounds(model, cam.viewProj) ?? clip;
+    // A window riding a node is transformed arbitrarily, like a tilted one
+    // (so is a window the phone's Exposé carries to a grid slot).
+    const tilted = forceQuadClip || !!state.attach || !!state.pinView || (this.exposeT > 0 && this.exposeSlots.has(surface.id))
+      || !!(state.tiltX || state.tiltY || (rot && (rot[0] || rot[1] || rot[2])));
+    for (const mode of ['content', 'window'] as const) {
+      if (this.passNodes(surface.id, undefined, mode).length === 0) continue;
+      let clip = mode === 'content' ? this.contentClip(surface) : this.windowClip(surface);
+      let clipQuad: { model: Mat4; viewProj: Mat4 } | undefined;
+      if (tilted) {
+        // A tilted window's content region is a rotated quad on screen; the
+        // axis-aligned scissor would crop it with an upright rectangle. Build
+        // the clip rect's model under the tilted frame for a stencil clip,
+        // and shrink the scissor to the quad's conservative screen bbox (it
+        // still bounds the stencil clear + draws cheaply).
+        const model = mode === 'content'
+          ? this.contentQuadModel(surface, surfaceModel).model
+          : mat4Multiply(surfaceModel, mat4TRS(0, 0, 0, 0, 0, 0, surface.rect.width, surface.rect.height, 1));
+        clipQuad = { model, viewProj: cam.viewProj };
+        clip = this.projectedQuadBounds(model, cam.viewProj) ?? clip;
+      }
+      this.drawNodeTree(surface.id, surfaceModel, sceneCam, undefined, clip, mode, clipQuad, { depthOnly });
     }
-    this.drawNodeTree(surface.id, surfaceModel, cam, undefined, clip, pass, clipQuad);
   }
 
   /**
@@ -2725,8 +3321,7 @@ export class Compositor {
    * contentClip().
    */
   private contentQuadModel(surface: Surface, surfaceModel: Mat4): { model: Mat4; cw: number; ch: number } {
-    const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
-    const border = surface.transparent ? 0 : 2;
+    const { titleBar, border } = Compositor.contentInsets(surface);
     const cw = Math.max(1, surface.rect.width - border * 2);
     const ch = Math.max(1, surface.rect.height - titleBar - border);
     // Content center offset from the window center, in window-local px.
@@ -2792,16 +3387,23 @@ export class Compositor {
    * Depth, scale, and the 1:1 plane are untouched, so window 2D and window 3D
    * stay in lockstep and depth values remain comparable with every other window.
    */
-  private windowCamera(cx: number, cy: number, z: number): SceneCamera {
+  private windowCamera(cx: number, cy: number, z: number, screen?: ScreenView): SceneCamera {
     const W = Math.max(1, this.width);
     const H = Math.max(1, this.height);
     const D = cameraDistance(H);
 
     // Where the desktop camera puts this window's centre on screen (its slab is
-    // drawn there, so the subtree must converge on the same point).
+    // drawn there, so the subtree must converge on the same point). The
+    // phone's view zoom scales screen offsets from the eye (see updateCamera).
+    // A window pinned to the screen passes its own view (see pinView): the
+    // camera the phone would have if it showed that window at a readable
+    // scale, right where the window is pinned.
+    const zoom = screen ? screen.zoom : this.viewZoom;
+    const scrollX = screen ? screen.scrollX : this.scrollX;
+    const scrollY = screen ? screen.scrollY : this.scrollY;
     const s = D / Math.max(1e-3, D - z);
-    const ax = W / 2 + ((cx - this.scrollX) - W / 2) * s;
-    const ay = H / 2 + ((cy - this.scrollY) - H / 2) * s;
+    const ax = W / 2 + ((cx - scrollX) - W / (2 * zoom)) * s * zoom;
+    const ay = H / 2 + ((cy - scrollY) - H / (2 * zoom)) * s * zoom;
 
     const proj = mat4PerspectiveYDown(
       Compositor.CAMERA_FOV, W / H,
@@ -2811,6 +3413,10 @@ export class Compositor {
     // Solve for the view axis (x_view = y_view = 0) landing on (ax, ay).
     proj[8] = 1 - (2 * ax) / W;
     proj[9] = (2 * ay) / H - 1;
+    if (zoom !== 1) {
+      proj[0] *= zoom;
+      proj[5] *= zoom;
+    }
 
     const view = mat4Translation(-cx, -cy, -D);
     const viewProj = mat4Multiply(proj, view);
@@ -2818,43 +3424,58 @@ export class Compositor {
   }
 
   /**
+   * How far a window's CONTENT rect sits inside its slab: the title bar and
+   * a thin border on chromed windows. Chromeless and transparent windows
+   * have no title bar, so their content is the whole rect.
+   */
+  private static contentInsets(surface: Surface): { titleBar: number; border: number } {
+    return surface.transparent || surface.chromeless
+      ? { titleBar: 0, border: 0 }
+      : { titleBar: TITLE_BAR_HEIGHT, border: 2 };
+  }
+
+  /**
    * The window's CONTENT rect in screen px: inset the title bar + a thin
    * border on chromed windows so occluded 3D and the overlay 2D layer can
-   * never paint over the title bar or escape the frame. Transparent windows
-   * have no chrome, so they clip to the full rect.
+   * never paint over the title bar or escape the frame. Chromeless and
+   * transparent windows have no title bar, so they clip to the full rect.
    */
   private contentClip(surface: Surface): { x: number; y: number; width: number; height: number } {
-    const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
-    const border = surface.transparent ? 0 : 2;
-    if (this.mobileMode && this.mobileView !== MobileViewState.CARD_OVERVIEW) {
-      // The phone draws the focused window fitted and centred (mobileTransform)
-      // instead of at its desktop rect, which it never moves. Clipping to that
-      // rect therefore scissors the subtree to wherever the window happens to
-      // sit on the virtual desktop — off-screen for any window past the ~390px
-      // phone viewport, which is what kept scene-rendered abjects blank even
-      // once they started being drawn. Follow the on-screen slab instead, and
-      // stay inside the content band so nodes cannot paint over the gesture
-      // handle.
-      const { scale, offsetX, offsetY } = this.mobileTransform;
-      const x = offsetX + border * scale;
-      const y = offsetY + titleBar * scale;
-      const right = x + Math.max(0, surface.rect.width - border * 2) * scale;
-      const bottom = y + Math.max(0, surface.rect.height - titleBar - border) * scale;
-      const x0 = Math.max(0, x);
-      const y0 = Math.max(0, y);
-      return {
-        x: x0,
-        y: y0,
-        width: Math.max(0, Math.min(this.width, right) - x0),
-        height: Math.max(0, Math.min(this.mobileAvailHeight, bottom) - y0),
-      };
-    }
-    return {
+    const { titleBar, border } = Compositor.contentInsets(surface);
+    return this.zoomViewRect({
       x: surface.rect.x - this.scrollX + border,
       y: surface.rect.y - this.scrollY + titleBar,
       width: Math.max(0, surface.rect.width - border * 2),
       height: Math.max(0, surface.rect.height - titleBar - border),
-    };
+    });
+  }
+
+  /**
+   * The WHOLE window rect in screen px (title bar included), for nodes with
+   * `clip: 'window'`. Follows the phone's view zoom like contentClip.
+   */
+  private windowClip(surface: Surface): { x: number; y: number; width: number; height: number } {
+    return this.zoomViewRect({
+      x: surface.rect.x - this.scrollX,
+      y: surface.rect.y - this.scrollY,
+      width: surface.rect.width,
+      height: surface.rect.height,
+    });
+  }
+
+  /**
+   * A rect in unzoomed viewport px (workspace minus scroll) as the phone's
+   * view zoom puts it on screen, clamped to the viewport for the scissor.
+   * Identity at zoom 1, so the desktop's clips are exactly what they were.
+   */
+  private zoomViewRect(r: Rect): Rect {
+    const z = this.viewZoom;
+    if (z === 1) return r;
+    const x0 = Math.max(0, r.x * z);
+    const y0 = Math.max(0, r.y * z);
+    const x1 = Math.min(this.width, (r.x + r.width) * z);
+    const y1 = Math.min(this.height, (r.y + r.height) * z);
+    return { x: x0, y: y0, width: Math.max(0, x1 - x0), height: Math.max(0, y1 - y0) };
   }
 
   // ── Canvas-layer nodes (kind:'canvas') ────────────────────────────────
@@ -3066,106 +3687,175 @@ export class Compositor {
     }
   }
 
+  /** Node kinds drawn by drawNodeTree (the rest are lights, groups, environment). */
+  private static readonly DRAWABLE_KINDS = new Set<string>(['mesh', 'canvas', 'particles', 'model', 'text', 'label', 'line', 'sky']);
+
+  /**
+   * Every drawable node of a subtree with its resolved params, clip mode,
+   * layer and root, resolved once per frame (the content, window and
+   * pop-out passes all read the same resolution). Cleared in render().
+   */
+  private frameNodes = new Map<string, Array<{ node: VocabNode; rp: Record<string, unknown>; clip: ClipMode; layer: string; rootId: string }>>();
+
+  private resolvedNodes(key: string): Array<{ node: VocabNode; rp: Record<string, unknown>; clip: ClipMode; layer: string; rootId: string }> {
+    let list = this.frameNodes.get(key);
+    if (list) return list;
+    list = [];
+    for (const node of this.sceneStore.nodesForSurface(key)) {
+      // A group draws nothing itself, but one carrying its own `trail` leaves
+      // a ribbon (the usual way to trail a many-part object as a whole).
+      const trailedGroup = node.kind === 'group' && node.params.trail !== undefined && node.params.trail !== false;
+      if (!Compositor.DRAWABLE_KINDS.has(node.kind) && !trailedGroup) continue;
+      const rp = this.sceneStore.resolveParams(node);
+      list.push({
+        node, rp,
+        clip: clipModeOf(rp),
+        layer: (rp.layer as string) ?? 'back',
+        rootId: this.sceneStore.rootOf(node).id,
+      });
+    }
+    this.frameNodes.set(key, list);
+    return list;
+  }
+
+  /**
+   * The drawable nodes of one pass: world `layer` (back/front/stack), window
+   * clip mode (`content` default, `window`, `none` = pop-out; `occlude:
+   * false` means `none`), and optionally one stacked root's subtree.
+   */
+  private passNodes(key: string, layer: string | undefined, pass: ClipMode | undefined, rootId?: string): Array<{ node: VocabNode; rp: Record<string, unknown> }> {
+    return this.resolvedNodes(key).filter((e) =>
+      (layer === undefined || e.layer === layer)
+      && (pass === undefined || e.clip === pass)
+      && (rootId === undefined || e.rootId === rootId));
+  }
+
   /**
    * Draw a retained node tree (a window subtree or a world-scope namespace).
-   * `layer` filters world meshes (back/front). `clip` + `pass` drive window
-   * occlusion: when given, meshes are partitioned by their resolved `occlude`
-   * param and only the matching pass is drawn (occluded meshes are scissored
-   * to `clip`). World trees pass neither and draw every mesh unclipped.
+   * `layer` filters world nodes (back/front/stack; `opts.rootId` narrows a
+   * stack pass to one stacked root's subtree). `pass` selects a window
+   * clip mode (see passNodes): 'content' and 'window' passes are scissored
+   * to `clip` (stencilled to `clipQuad` when the window is tilted or rides
+   * a node), 'none' draws unclipped. World trees pass no clip mode and draw
+   * every node unclipped. `opts.depthOnly` replays the opaque meshes into
+   * the depth buffer only (the caller masks colour), and `opts.deferred`
+   * draws pop-outs over that depth (see drawDeferredPopouts).
    */
   private drawNodeTree(
     key: string, surfaceModel: Mat4,
     cam: SceneCamera,
-    layer?: 'back' | 'front',
+    layer?: 'back' | 'front' | 'stack',
     clip?: { x: number; y: number; width: number; height: number },
-    pass?: 'occluded' | 'overlay',
+    pass?: ClipMode,
     clipQuad?: { model: Mat4; viewProj: Mat4 },
+    opts?: { rootId?: string; depthOnly?: boolean; deferred?: boolean },
   ): void {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return;
 
-    // Scene-wide environment (ambient + fog) from an 'environment' node, if any.
-    const env = this.environmentFor(nodes);
+    // Scene mood (ambient, sky, fog, tone mapping, grading; with its look)
+    // from an 'environment' node, if any.
+    const env = this.environmentFor(nodes, surfaceModel);
 
-    // Collect lights first (they illuminate every mesh in this subtree).
-    // Note the first shadow-casting directional light's index + direction.
+    // Collect lights first (they illuminate every mesh in this subtree). The
+    // first shadow-casting directional light and the first shadow-casting
+    // spot light each get a shadow map: renderShadowPass reads both from
+    // this.shadowPlan, and runs when either exists.
     const lights: MeshLight[] = [];
-    let shadowLightIndex = -1;
-    let shadowDir: [number, number, number] | undefined;
+    this.shadowPlan = {};
     for (const node of nodes) {
       if (node.kind !== 'light' || lights.length >= MAX_MESH_LIGHTS) continue;
-      if (shadowLightIndex < 0 && node.params.lightType === 'directional' && node.params.castShadow === true) {
-        shadowLightIndex = lights.length;
-        shadowDir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
-      }
-      lights.push(this.buildLight(node, surfaceModel));
+      const light = this.buildLight(node, surfaceModel);
+      const slot = light.kind === 'directional' ? 'dir' : light.kind === 'spot' ? 'spot' : undefined;
+      if (light.castShadow && slot && !this.shadowPlan[slot]) this.shadowPlan[slot] = { index: lights.length, light };
+      lights.push(light.light);
     }
+    const planned = this.shadowPlan.dir ?? this.shadowPlan.spot;
+    const shadowLightIndex = planned ? planned.index : -1;
+    const shadowDir: [number, number, number] | undefined = planned?.light.light.dir;
     if (lights.length === 0) {
-      // Default key light from the camera's upper left (directional → dir).
-      lights.push({ pos: [0, 0, 0, 0], color: [0.9, 0.9, 0.95], dir: [-0.4, -0.5, -1] });
+      // Default key light from the front (directional → dir).
+      lights.push(defaultKeyLight());
     }
 
-    // Resolve each mesh's effective params (inheriting from ancestor groups),
-    // then keep only those in this layer + occlusion pass.
-    let entries = nodes
-      .filter((n) => n.kind === 'mesh')
-      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
-      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
-    if (pass) {
-      entries = entries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
-    }
+    // Each drawable node's effective params (inheriting from ancestor groups),
+    // resolved once per frame, narrowed to this layer + clip pass (+ root).
+    const depthOnly = opts?.depthOnly === true;
+    const picked = this.passNodes(key, layer, pass, opts?.rootId);
+    let entries = picked.filter((e) => e.node.kind === 'mesh' || Compositor.CONTENT_SOLIDS.has(e.node.kind));
+    // Canvas-layer nodes (2D layers living in the scene graph) and particle
+    // emitters follow the same layer/pass filters as meshes. A depth-only
+    // replay needs neither (they write no depth).
+    let canvasEntries = depthOnly ? [] : picked.filter((e) => e.node.kind === 'canvas');
+    const particleEntries = depthOnly ? [] : picked.filter((e) => e.node.kind === 'particles');
+    // Content kinds (see the content section): a sky first, lines and trails
+    // after the solids, labels last. None of them joins a depth-only replay.
+    const skyEntries = depthOnly || opts?.deferred ? [] : picked.filter((e) => e.node.kind === 'sky');
+    const lineEntries = depthOnly ? [] : picked.filter((e) => e.node.kind === 'line');
+    const labelEntries = depthOnly ? [] : picked.filter((e) => e.node.kind === 'label');
+    const trailEntries = depthOnly ? [] : picked.filter((e) => e.rp.trail !== undefined && e.rp.trail !== false);
+    if (depthOnly) entries = entries.filter(({ rp }) => !this.meshIsTranslucent(rp));
 
-    // Canvas-layer nodes (2D layers living in the scene graph) follow the
-    // same layer/pass filters as meshes.
-    let canvasEntries = nodes
-      .filter((n) => n.kind === 'canvas')
-      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
-      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
-    if (pass) {
-      canvasEntries = canvasEntries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
-    }
-
-    // Particle emitters follow the same layer/pass filters.
-    let particleEntries = nodes
-      .filter((n) => n.kind === 'particles')
-      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
-      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
-    if (pass) {
-      particleEntries = particleEntries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
-    }
-
-    if (entries.length === 0 && canvasEntries.length === 0 && particleEntries.length === 0) return;
+    if (entries.length === 0 && canvasEntries.length === 0 && particleEntries.length === 0
+      && skyEntries.length === 0 && lineEntries.length === 0 && labelEntries.length === 0 && trailEntries.length === 0) return;
 
     // Transparent meshes draw last, back-to-front, so they composite correctly.
     // nodeCameraDepth is -(distance^2) — LARGER means NEARER — so back-to-front
     // is ASCENDING. Sorting the other way drew them nearest-first, which both
     // blends in the wrong order and (since meshes write depth) makes the FARTHER
     // transparent surface fail the depth test and vanish instead of showing through.
-    const opaque = entries.filter(({ rp }) => ((rp.opacity as number) ?? 1) >= 1 && !rp.texture);
+    // Translucent: alpha (opacity, textures) or a light-adding material (additive, rim, glass).
+    const opaque = entries.filter(({ rp }) => !this.meshIsTranslucent(rp));
     const transparent = entries.filter((e) => !opaque.includes(e));
     transparent.sort((a, b) => this.nodeCameraDepth(a.node, surfaceModel, cam) - this.nodeCameraDepth(b.node, surfaceModel, cam));
 
     // Opt-in directional shadows: render a depth map from the light's POV,
     // auto-fitting the ortho frustum to the casters' world AABB. Casters are
     // this pass's meshes; skip on the overlay pass (overlay nodes pop out).
-    const shadow = shadowLightIndex >= 0 && shadowDir && pass !== 'overlay' && entries.length > 0
+    const shadow = shadowLightIndex >= 0 && shadowDir && pass !== 'none' && !depthOnly && entries.length > 0
       ? this.renderShadowPass(key, entries.map((e) => e.node), surfaceModel, shadowDir, shadowLightIndex)
       : undefined;
 
-    const scissored = clip !== undefined && pass === 'occluded';
+    // Post effects (environment ao, dof, outline, lightShafts, fxaa,
+    // chromaticAberration, grading vignette/grain) draw this pass offscreen
+    // and composite it back clipped the same way (see PostEffects). Passes
+    // without them take the plain path below untouched.
+    const post = !depthOnly && hasPostEffects(env?.post)
+      ? this.postFx.begin(clip ?? { x: 0, y: 0, width: this.width, height: this.height })
+      : undefined;
+
+    const scissored = clip !== undefined && (pass === 'content' || pass === 'window');
     if (scissored) this.renderer.setScissor(clip);
     // Tilted windows additionally stencil-clip to the PROJECTED content quad
     // (the scissor above is only its conservative bbox, and also bounds the
     // stencil clear).
     const stencilled = scissored && clipQuad !== undefined;
     if (stencilled) this.renderer.beginStencilClip(clipQuad!.model, clipQuad!.viewProj);
+    // beginStencilClip re-enables colour writes; a depth-only replay keeps them off.
+    if (depthOnly) this.renderer.context.colorMask(false, false, false, false);
+
+    // Deferred pop-outs (drawDeferredPopouts): canvas layers write no depth
+    // and cannot be depth-tested, so they stay under the covering windows
+    // (the stencil marks their slabs), as pop-outs always did there.
+    const gl = this.renderer.context;
+    const drawCanvas = (e: { node: VocabNode; rp: Record<string, unknown> }): void => {
+      if (opts?.deferred) {
+        gl.enable(gl.STENCIL_TEST);
+        gl.stencilFunc(gl.EQUAL, 0, 0xff);
+        gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+      }
+      this.drawCanvasLayerNode(key, e.node, e.rp, surfaceModel, cam);
+      if (opts?.deferred) gl.disable(gl.STENCIL_TEST);
+    };
 
     // Backdrop layers (params.backdrop:true — layout-managed widget canvases
     // and window-glued backgrounds) pin behind ALL meshes regardless of z,
     // like the window's own content plane. Everything else z-slices.
+    for (const e of skyEntries) this.drawSkyNode(e.rp, env, cam);
+
     const backdrops = canvasEntries.filter(({ rp }) => rp.backdrop === true);
     canvasEntries = canvasEntries.filter(({ rp }) => rp.backdrop !== true);
-    for (const b of backdrops) this.drawCanvasLayerNode(key, b.node, b.rp, surfaceModel, cam);
+    for (const b of backdrops) drawCanvas(b);
 
     const meshOrder = [...opaque, ...transparent];
     if (canvasEntries.length === 0) {
@@ -3188,20 +3878,45 @@ export class Compositor {
           this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow, cam);
           drawn.add(e.node);
         }
-        this.drawCanvasLayerNode(key, layerEntry.node, layerEntry.rp, surfaceModel, cam);
+        drawCanvas(layerEntry);
       }
       for (const e of meshOrder) {
         if (!drawn.has(e.node)) this.drawMeshEntry(key, e, surfaceModel, lights, env, shadow, cam);
       }
     }
 
-    // Particles draw last in the pass (glowing light over the solids).
+    for (const e of lineEntries) this.drawLineNode(key, e.node, e.rp, surfaceModel, cam);
+    for (const e of trailEntries) this.drawNodeTrail(key, e.node, e.rp, surfaceModel, cam);
+
+    // Particles draw last in the pass (glowing light over the solids). As
+    // deferred pop-outs they are depth-tested (not written) against the
+    // covering slabs, so a stream behind a higher window hides behind it.
+    if (opts?.deferred && particleEntries.length > 0) {
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(false);
+    }
     for (const p of particleEntries) {
-      if (this.drawParticleNode(key, p.node, p.rp, surfaceModel, cam)) this.needsRender = true;
+      if (this.drawParticleNode(key, p.node, p.rp, surfaceModel, cam, opts?.deferred === true)) this.needsRender = true;
+    }
+    if (opts?.deferred && particleEntries.length > 0) {
+      gl.depthMask(true);
+      gl.disable(gl.DEPTH_TEST);
+    }
+
+    // Labels are 2D over the pass; as deferred pop-outs they stay under covering windows, like canvas layers.
+    for (const e of labelEntries) {
+      if (opts?.deferred) {
+        gl.enable(gl.STENCIL_TEST);
+        gl.stencilFunc(gl.EQUAL, 0, 0xff);
+        gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+      }
+      this.drawLabelNode(key, e.node, e.rp, surfaceModel, cam);
+      if (opts?.deferred) gl.disable(gl.STENCIL_TEST);
     }
 
     if (stencilled) this.renderer.endStencilClip();
     if (scissored) this.renderer.clearScissor();
+    if (post) this.endPost(post, env!, lights, cam, scissored ? clip : undefined, opts?.deferred === true);
   }
 
   /**
@@ -3210,9 +3925,39 @@ export class Compositor {
    * once on add and again whenever `burstKey` changes. Each particle flies
    * along `direction` within a `spread` cone at a `speed` in [min, max],
    * falls with `gravity`, and fades from `color` toward `colorEnd` over its
-   * `lifetime`. Returns true while the emitter still has something to draw.
+   * `lifetime` (plus sizeEnd, opacityEnd, spin, drag, turbulence, blend and a
+   * `texture` sprite). The GPU evaluates every particle in one instanced
+   * draw (see gpu-particles.ts); the CPU path below is the fallback for a
+   * GPU that rejects that program. `deferred` pop-outs are depth-tested
+   * (never written) against the covering slabs. Returns true while the
+   * emitter still has something to draw.
    */
   private drawParticleNode(
+    key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera,
+    deferred = false,
+  ): boolean {
+    const gpu = this.gpuParticles ??= new GpuParticles(this.renderer.context);
+    if (!gpu.available) return this.drawParticleNodeCpu(key, node, rp, surfaceModel, cam);
+    const id = `${key}/${node.id}`;
+    this.touchedParticles.add(id);
+    const alive = gpu.update(id, rp, this.sceneStore.worldMatrix(node, surfaceModel), performance.now());
+    const color = parseCssColor(resolveSceneColor((rp.color as string) ?? '$accentSecondary', this.sceneTheme));
+    const colorEnd = rp.colorEnd ? parseCssColor(resolveSceneColor(rp.colorEnd as string, this.sceneTheme)) : undefined;
+    const basis = billboardBasis(cam.invViewProj);
+    gpu.draw(id, {
+      viewProj: cam.viewProj,
+      cameraRight: basis.right,
+      cameraUp: basis.up,
+      color,
+      colorEnd,
+      texture: typeof rp.texture === 'string' ? this.resolveTexture(rp.texture) : undefined,
+      depthTest: deferred,
+    });
+    return alive;
+  }
+
+  /** The CPU particle emitter (fallback when the GPU particle program cannot build). */
+  private drawParticleNodeCpu(
     key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera,
   ): boolean {
     const id = `${key}/${node.id}`;
@@ -3311,6 +4056,7 @@ export class Compositor {
     for (const id of this.particleStates.keys()) {
       if (!this.touchedParticles.has(id)) this.particleStates.delete(id);
     }
+    this.gpuParticles?.prune(this.touchedParticles);
     this.touchedParticles.clear();
   }
 
@@ -3320,33 +4066,41 @@ export class Compositor {
     entry: { node: VocabNode; rp: Record<string, unknown> },
     surfaceModel: Mat4,
     lights: MeshLight[],
-    env: { ambient?: [number, number, number]; fog?: FogOpts },
-    shadow: ShadowOpts | undefined,
+    env: ResolvedEnvironment | undefined,
+    shadow: ShadowSet | undefined,
     cam: SceneCamera,
   ): void {
+    if (Compositor.CONTENT_SOLIDS.has(entry.node.kind)) {
+      this.drawContentSolid(key, entry, surfaceModel, {
+        viewProj: cam.viewProj, lights, ambient: env?.ambient, fog: env?.fog, environment: env?.environment,
+        shadow: shadow?.dir, spotShadow: shadow?.spot, cameraPos: cam.cameraPos,
+      });
+      return;
+    }
     {
       const { node, rp } = entry;
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
-      const color = parseCssColor(resolveSceneColor((rp.color as string) ?? '#ffffff', this.sceneTheme));
-      const emissiveStr = rp.emissive as string | undefined;
-      const billboard = rp.billboard === true;
-      const material = {
-        model: billboard ? this.billboardMatrix(world, cam.cameraPos) : world,
+      // Preset (material: '<name>') under the node's own params, $tokens
+      // against the theme, maps to textures (absent until loaded).
+      const m = resolveMaterial(rp, this.sceneTheme, this.sceneLibrary);
+      const material: MeshMaterialOpts = {
+        ...materialDrawOpts(m, (src) => this.resolveTexture(src)),
+        model: m.billboard ? this.billboardMatrix(world, cam.cameraPos) : world,
         viewProj: cam.viewProj,
-        color,
-        emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
-        opacity: (rp.opacity as number) ?? 1,
-        metalness: rp.metalness as number | undefined,
-        roughness: rp.roughness as number | undefined,
-        texture: this.resolveTexture(rp.texture as string | undefined),
-        drawMode: rp.drawMode as DrawMode | undefined,
-        pointSize: rp.pointSize as number | undefined,
         lights,
-        ambient: env.ambient,
-        fog: env.fog,
-        shadow,
+        ambient: env?.ambient,
+        fog: env?.fog,
+        environment: env?.environment,
+        shadow: shadow?.dir,
+        spotShadow: shadow?.spot,
         cameraPos: cam.cameraPos,
+        closed: !hasCustomGeometry(rp) && Compositor.CLOSED_SHAPES.has((rp.primitive as string) ?? 'box'),
       };
+      if (material.outline) {
+        // Faceted convex primitives expand radially so the hull's corners meet.
+        const radial = !hasCustomGeometry(rp) && Compositor.RADIAL_HULL.has((rp.primitive as string) ?? 'box');
+        material.outline = { ...material.outline, radial };
+      }
       if (Array.isArray(rp.instances) && (rp.instances as unknown[]).length > 0) {
         const handle = this.instancedHandle(key, node);
         if (handle) this.renderer.drawInstanced(handle, material);
@@ -3356,7 +4110,7 @@ export class Compositor {
       } else {
         this.renderer.drawMesh({
           ...material,
-          geometry: getGeometry((rp.primitive as MeshPrimitive) ?? 'box'),
+          geometry: getShapeGeometry((rp.primitive as string) ?? 'box', rp.shape),
         });
       }
     }
@@ -3372,7 +4126,7 @@ export class Compositor {
     const fullKey = `${key}/${node.id}`;
     this.touchedInstanced.add(fullKey);
     const custom = hasCustomGeometry(node.params);
-    const baseSig = custom ? `geom:${node.geomRev}` : `prim:${(node.params.primitive as string) ?? 'box'}`;
+    const baseSig = custom ? `geom:${node.geomRev}` : `prim:${(node.params.primitive as string) ?? 'box'}|${shapeKey(node.params.shape ?? null)}`;
     let entry = this.instancedMeshes.get(fullKey);
     if (!entry || entry.baseSig !== baseSig) {
       if (entry) this.renderer.deleteInstancedMesh(entry.handle);
@@ -3381,14 +4135,16 @@ export class Compositor {
         const g = node.params.geometry as CustomGeometryParam;
         geom = customGeometry(g.positions, g.indices, g.normals, g.colors, g.uvs);
       } else {
-        geom = getGeometry((node.params.primitive as MeshPrimitive) ?? 'box');
+        geom = getShapeGeometry((node.params.primitive as string) ?? 'box', node.params.shape);
       }
       entry = { baseSig, instRef: undefined, handle: this.renderer.createInstancedMesh(geom) };
       this.instancedMeshes.set(fullKey, entry);
     }
     const instances = node.params.instances as MeshInstance[];
     if (entry.instRef !== instances) {
-      const baseColor = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
+      // A material preset may supply the colour instances default to.
+      const baseParams = withMaterialPreset(node.params, this.sceneLibrary);
+      const baseColor = parseCssColor(resolveSceneColor((baseParams.color as string) ?? '#ffffff', this.sceneTheme));
       const data = new Float32Array(instances.length * 19);
       for (let i = 0; i < instances.length; i++) {
         const inst = instances[i];
@@ -3409,116 +4165,174 @@ export class Compositor {
     return entry.handle;
   }
 
-  /** Build a renderer light from a 'light' node's params (point/dir/spot). */
-  private buildLight(node: VocabNode, surfaceModel: Mat4): MeshLight {
-    const world = this.sceneStore.worldMatrix(node, surfaceModel);
-    const col = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
-    const intensity = (node.params.intensity as number) ?? 1;
-    const color: [number, number, number] = [col.r * intensity, col.g * intensity, col.b * intensity];
-    const type = node.params.lightType as string;
-    const dir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
-    if (type === 'directional') {
-      return { pos: [0, 0, 0, 0], color, dir };
-    }
-    const pos: [number, number, number, number] = [world[12], world[13], world[14], type === 'spot' ? 2 : 1];
-    const range = (node.params.range as number) ?? 0;
-    if (type === 'spot') {
-      const angle = (node.params.angle as number) ?? Math.PI / 6;
-      const penumbra = Math.min(1, Math.max(0, (node.params.penumbra as number) ?? 0.3));
-      return { pos, color, dir, range, spotInner: Math.cos(angle * (1 - penumbra)), spotOuter: Math.cos(angle) };
-    }
-    return { pos, color, range };
-  }
-
-  /** Resolve a node's ambient/fog 'environment' settings for a subtree. */
-  private environmentFor(nodes: VocabNode[]): { ambient?: [number, number, number]; fog?: FogOpts } {
-    const node = nodes.find((n) => n.kind === 'environment');
-    if (!node) return {};
-    const out: { ambient?: [number, number, number]; fog?: FogOpts } = {};
-    if (node.params.ambient !== undefined) {
-      const c = parseCssColor(resolveSceneColor(node.params.ambient as string, this.sceneTheme));
-      out.ambient = [c.r, c.g, c.b];
-    }
-    const fog = node.params.fog as { color?: string; near: number; far: number } | undefined;
-    if (fog && typeof fog.near === 'number' && typeof fog.far === 'number') {
-      const c = parseCssColor(resolveSceneColor(fog.color ?? '#0a0a14', this.sceneTheme));
-      // fog.near/far are SCENE-relative depth (px behind the content plane), not
-      // camera-relative — the camera distance scales with the live viewport, so
-      // an author can't know it. Add the camera-to-content baseline here so a
-      // small near/far works at any viewport size.
-      const baseline = this.cameraPos[2];
-      out.fog = { color: [c.r, c.g, c.b], near: baseline + fog.near, far: baseline + fog.far };
-    }
-    return out;
+  /** Build a renderer light (point/directional/spot/hemisphere) plus its shadow request from a 'light' node. */
+  private buildLight(node: VocabNode, surfaceModel: Mat4): ResolvedLight {
+    return resolveLight(node.params, this.sceneTheme, this.sceneStore.worldMatrix(node, surfaceModel));
   }
 
   /**
-   * Render the directional shadow map: gather the casters' world AABB, fit an
-   * orthographic light frustum to it (so the map adapts to any scene with no
-   * magic constants), then draw caster depth from the light's POV. Returns the
-   * sampling state for the mesh pass, or undefined if there is nothing to cast.
-   * Instanced meshes receive shadows but do not cast them (v1).
+   * Resolve a subtree's 'environment' node (merged over its look) into the
+   * renderer's environment. Fog near/far are SCENE-relative depth (px behind
+   * the content plane), not camera-relative: the camera distance scales with
+   * the live viewport, so an author cannot know it. The camera-to-content
+   * baseline makes small values work at any viewport size.
+   */
+  private environmentFor(nodes: VocabNode[], surfaceModel: Mat4): ResolvedEnvironment | undefined {
+    const node = nodes.find((n) => n.kind === 'environment');
+    if (!node) return undefined;
+    const env = resolveEnvironment(node.params, this.sceneTheme, this.sceneLibrary, {
+      baseline: this.cameraPos[2],
+      worldY: surfaceWorldY(surfaceModel),
+    });
+    if (env.envMapSrc) env.environment.envMap = this.resolveTexture(env.envMapSrc);
+    return env;
+  }
+
+  /**
+   * Render the shadow maps this subtree's lights asked for (this.shadowPlan:
+   * the first shadow-casting directional light and the first spot light).
+   * Gathers the casters' world AABB and fits each light's frustum to it (an
+   * orthographic box for the directional light, a perspective cone for the
+   * spot), so the maps adapt to any scene with no magic constants. Casters
+   * are this pass's meshes whose material casts (`castShadow: false` opts a
+   * mesh out). Instanced meshes receive shadows but do not cast them (v1).
+   * Returns the sampling state for the mesh pass, or undefined.
    */
   private renderShadowPass(
     key: string, meshes: VocabNode[], surfaceModel: Mat4,
-    dir: [number, number, number], lightIndex: number,
-  ): ShadowOpts | undefined {
-    const casters = meshes.filter((n) => !Array.isArray(n.params.instances));
-    if (casters.length === 0) return undefined;
+    _dir: [number, number, number], _lightIndex: number,
+  ): ShadowSet | undefined {
+    const plan = this.shadowPlan;
+    const casters = meshes.filter((n) => !Array.isArray(n.params.instances)
+      && withMaterialPreset(this.sceneStore.resolveParams(n), this.sceneLibrary).castShadow !== false);
+    if (casters.length === 0 || (!plan.dir && !plan.spot)) return undefined;
 
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const min: Vec3Tuple = [Infinity, Infinity, Infinity];
+    const max: Vec3Tuple = [-Infinity, -Infinity, -Infinity];
     const built: Array<{ node: VocabNode; world: Mat4; custom: boolean }> = [];
     for (const node of casters) {
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
       const custom = hasCustomGeometry(node.params);
       const [lo, hi] = custom
         ? this.positionsAABB((node.params.geometry as CustomGeometryParam).positions)
+        : Compositor.CONTENT_SOLIDS.has(node.kind) ? this.contentBounds(key, node)
         : [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]] as [number[], number[]];
       for (let i = 0; i < 8; i++) {
         const p = mat4TransformPoint(world, vec3(
           i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]));
-        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
-        minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+        min[0] = Math.min(min[0], p.x); max[0] = Math.max(max[0], p.x);
+        min[1] = Math.min(min[1], p.y); max[1] = Math.max(max[1], p.y);
+        min[2] = Math.min(min[2], p.z); max[2] = Math.max(max[2], p.z);
       }
       built.push({ node, world, custom });
     }
 
-    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
-    const radius = Math.max(1, 0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ));
-    let dl = Math.hypot(dir[0], dir[1], dir[2]) || 1;
-    const d: [number, number, number] = [dir[0] / dl, dir[1] / dl, dir[2] / dl];
-    const up = Math.abs(d[1]) > 0.99 ? vec3(0, 0, 1) : vec3(0, 1, 0);
-    const dist = radius * 2 + 50;
-    const eye = vec3(cx - d[0] * dist, cy - d[1] * dist, cz - d[2] * dist);
-    const view = mat4LookAt(eye, vec3(cx, cy, cz), up);
-
-    // Fit the ortho box to the AABB in light space.
-    let lminX = Infinity, lminY = Infinity, lminZ = Infinity, lmaxX = -Infinity, lmaxY = -Infinity, lmaxZ = -Infinity;
-    for (let i = 0; i < 8; i++) {
-      const p = mat4TransformPoint(view, vec3(
-        i & 1 ? maxX : minX, i & 2 ? maxY : minY, i & 4 ? maxZ : minZ));
-      lminX = Math.min(lminX, p.x); lmaxX = Math.max(lmaxX, p.x);
-      lminY = Math.min(lminY, p.y); lmaxY = Math.max(lmaxY, p.y);
-      lminZ = Math.min(lminZ, p.z); lmaxZ = Math.max(lmaxZ, p.z);
+    const out: ShadowSet = {};
+    if (plan.dir) {
+      const fit = fitDirectionalShadow(min, max, plan.dir.light.light.dir ?? [0, 0.4, -1]);
+      out.dir = this.drawShadowMap(key, built, 'directional', fit, plan.dir);
     }
-    const pad = radius * 0.05 + 1;
-    const ortho = mat4Ortho(lminX - pad, lmaxX + pad, lminY - pad, lmaxY + pad, -(lmaxZ + dist), -(lminZ - pad));
-    const lightVP = mat4Multiply(ortho, view);
+    if (plan.spot) {
+      const l = plan.spot.light.light;
+      const fit = fitSpotShadow(min, max, [l.pos[0], l.pos[1], l.pos[2]], l.dir ?? [0, 0.4, -1], plan.spot.light.angle ?? Math.PI / 6);
+      if (fit) out.spot = this.drawShadowMap(key, built, 'spot', fit, plan.spot);
+    }
+    return out.dir || out.spot ? out : undefined;
+  }
 
-    this.renderer.beginShadowPass(lightVP);
+  /** Shadow-casting lights found by drawNodeTree's light collection, consumed by renderShadowPass. */
+  private shadowPlan: { dir?: { index: number; light: ResolvedLight }; spot?: { index: number; light: ResolvedLight } } = {};
+
+  /** Post-effect chain and its pooled targets, created on first use. */
+  private postFxInstance?: PostEffects;
+  private get postFx(): PostEffects {
+    return (this.postFxInstance ??= new PostEffects(this.renderer));
+  }
+
+  /** The post-effect quality level the frame-time governor settled on (0 = full). */
+  get postQuality(): { level: number; name: string; frameMs: number } {
+    return { level: this.postFx.level, name: this.postFx.levelName, frameMs: +this.postFx.frameTime.toFixed(1) };
+  }
+
+  /**
+   * Run a pass's post effects and composite it back. Light shafts stream
+   * from the environment's sun, else the brightest directional light, else
+   * the brightest point or spot light.
+   */
+  private endPost(
+    post: PostPass, env: ResolvedEnvironment, lights: MeshLight[], cam: SceneCamera,
+    clip: { x: number; y: number; width: number; height: number } | undefined, deferred: boolean,
+  ): void {
+    let lightDir: [number, number, number] | undefined;
+    let lightPos: [number, number, number] | undefined;
+    const sun = env.environment.sky?.sun;
+    if (sun) {
+      lightDir = sun.direction;
+    } else {
+      let best = -1;
+      for (const l of lights) {
+        const e = l.color[0] + l.color[1] + l.color[2];
+        if (l.pos[3] > 2.5 || e <= best) continue;
+        best = e;
+        if (l.pos[3] < 0.5) { lightDir = l.dir ? [-l.dir[0], -l.dir[1], -l.dir[2]] : undefined; lightPos = undefined; } else { lightPos = [l.pos[0], l.pos[1], l.pos[2]]; lightDir = undefined; }
+      }
+    }
+    if (lightDir) {
+      const n = Math.hypot(lightDir[0], lightDir[1], lightDir[2]) || 1;
+      lightDir = [lightDir[0] / n, lightDir[1] / n, lightDir[2] / n];
+    }
+    this.postFx.end(post, env.post!, {
+      viewProj: cam.viewProj, invViewProj: cam.invViewProj, cameraPos: cam.cameraPos,
+      baseline: this.cameraPos[2], lightDir, lightPos,
+    }, { scissorCss: clip, depthTest: deferred });
+  }
+
+  /** Faceted convex primitives whose outline hull expands radially (their split normals would crack). */
+  private static readonly RADIAL_HULL = new Set(['box', 'cylinder', 'cone']);
+
+  /** Closed built-in primitives: glows and glass on them draw their near shell only. */
+  private static readonly CLOSED_SHAPES = new Set(['box', 'sphere', 'cylinder', 'cone', 'torus', 'icosphere', 'capsule', 'roundedBox']);
+
+  /**
+   * True when a mesh belongs in the transparent, back-to-front pass: it may
+   * carry alpha (opacity < 1, a texture) or its material adds light and shows
+   * what is behind it (additive blend, rim holograms, glass). Those materials
+   * write no depth, so drawn among the opaque meshes anything behind them
+   * that draws later covers them.
+   */
+  private meshIsTranslucent(rp: Record<string, unknown>): boolean {
+    return !!rp.texture || resolveMaterial(rp, this.sceneTheme, this.sceneLibrary).translucent;
+  }
+
+  /**
+   * Draw one shadow map (directional or spot) of the casters and describe it
+   * for the mesh pass. Map size follows the light's `shadow.size`, capped at
+   * 1024 on phones; the receiver normal offset is 1.5 texels of world size.
+   */
+  private drawShadowMap(
+    key: string, built: Array<{ node: VocabNode; world: Mat4; custom: boolean }>,
+    kind: 'directional' | 'spot', fit: ShadowFit, planned: { index: number; light: ResolvedLight },
+  ): ShadowOpts | undefined {
+    const size = Math.min(planned.light.shadow.size, this.mobileMode ? 1024 : 4096);
+    this.renderer.beginShadowPass(fit.lightVP, kind, size);
     for (const item of built) {
-      if (item.custom) {
+      if (Compositor.CONTENT_SOLIDS.has(item.node.kind)) {
+        this.drawContentDepth(key, item.node, item.world);
+      } else if (item.custom) {
         const handle = this.customMeshHandle(key, item.node);
         if (handle) this.renderer.drawDepthDynamic(handle, item.world);
       } else {
-        this.renderer.drawDepthGeometry(getGeometry((item.node.params.primitive as MeshPrimitive) ?? 'box'), item.world);
+        this.renderer.drawDepthGeometry(getShapeGeometry((item.node.params.primitive as string) ?? 'box', item.node.params.shape), item.world);
       }
     }
     this.renderer.endShadowPass();
-    const map = this.renderer.shadowMap;
-    return map ? { map, lightVP, lightIndex } : undefined;
+    const map = kind === 'spot' ? this.renderer.spotShadowMap : this.renderer.shadowMap;
+    const res = this.renderer.shadowSize;
+    return map ? {
+      map, lightVP: fit.lightVP, lightIndex: planned.index, size: res,
+      softness: planned.light.shadow.softness, bias: planned.light.shadow.bias,
+      normalOffset: (1.5 * fit.texelWorld) / res,
+    } : undefined;
   }
 
   /** Local-space AABB [min,max] of a flat positions array. */
@@ -3578,19 +4392,1051 @@ export class Compositor {
       return this.surfaceGl.get(src.slice('surface:'.length))?.texture;
     }
     const hit = this.meshTextures.get(src);
-    if (hit) return hit.tex;
+    if (hit) return hit.loaded ? hit.tex : undefined;
     const tex = this.renderer.createTexture();
     this.meshTextures.set(src, { tex, loaded: false });
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
-      this.renderer.uploadTexture(tex, img);
+      // Mipmapped (trilinear + anisotropic via the mesh samplers), so maps
+      // stay clean when a textured surface recedes or tilts away.
+      this.renderer.uploadImageTexture(tex, img);
       const e = this.meshTextures.get(src);
       if (e) e.loaded = true;
       this.needsRender = true;
     };
     img.src = src;
-    return tex;
+    // Until it loads the mesh draws without this map (not black).
+    return undefined;
+  }
+
+  // ── Camera nodes, orbit, and node constraints ───────────────────────
+
+  /** Mouse button index for a camera node's orbit button. */
+  private static readonly ORBIT_BUTTONS: Record<string, number> = { left: 0, middle: 1, right: 2 };
+  /** Window-edge band (px) left to the resize handles when a camera captures the pointer. */
+  private static readonly CAMERA_EDGE_BAND = 10;
+
+  /** Track camera nodes and constrained nodes as ops land (see applyOps). */
+  private syncMotionNode(surfaceKey: string, op: SceneOp): void {
+    const fullKey = `${surfaceKey}/${op.id}`;
+    if (op.op === 'remove') {
+      this.constrainedNodes.delete(fullKey);
+      this.orbitCams.delete(fullKey);
+      if (this.cameraNodeIds.get(surfaceKey) === op.id) this.cameraNodeIds.delete(surfaceKey);
+      return;
+    }
+    const node = this.sceneStore.getNode(surfaceKey, op.id);
+    if (!node) return;
+    // Cameras belong to windows; a world-scope camera node has no effect.
+    if (node.kind === 'camera' && !surfaceKey.startsWith('world:')) this.cameraNodeIds.set(surfaceKey, node.id);
+    if (node.params.lookAt != null || node.params.follow != null) {
+      if (!this.constrainedNodes.has(fullKey)) this.constrainedNodes.set(fullKey, { surfaceKey, id: node.id });
+    } else {
+      this.constrainedNodes.delete(fullKey);
+    }
+  }
+
+  /** A window subtree's camera node, if it has one (stale ids from silent cascades fall back to a rescan). */
+  private cameraNodeOf(surfaceId: string): VocabNode | undefined {
+    const id = this.cameraNodeIds.get(surfaceId);
+    if (id === undefined) return undefined;
+    const node = this.sceneStore.getNode(surfaceId, id);
+    if (node?.kind === 'camera') return node;
+    this.cameraNodeIds.delete(surfaceId);
+    const other = this.sceneStore.nodesForSurface(surfaceId).find((n) => n.kind === 'camera');
+    if (other) this.cameraNodeIds.set(surfaceId, other.id);
+    return other;
+  }
+
+  /**
+   * The camera a window's 3D subtree renders and picks through when the
+   * subtree holds a `camera` node; undefined keeps `defaultCam` (the window
+   * camera), so a window without one is exactly as before. The node camera
+   * keeps the default camera's intrinsics (its field of view unless the node
+   * sets `fov`, and any view zoom the desktop camera carries) and replaces
+   * only the pose: the eye at the node's transform.position (default: the
+   * default camera's own eye) looking at params.target (default the origin of
+   * the node's parent space), with the target projected exactly where the
+   * default camera shows it, so the scene stays glued to its window and
+   * inside its clip. `frame` is the window's frame matrix; when it carries a
+   * scale (an open / close transition, a card), the eye rides the scaled
+   * frame and the focal length follows the scale, so the view shrinks with
+   * the slab exactly as the default camera's does.
+   */
+  private cameraFor(surface: Surface, defaultCam: SceneCamera, frame: Mat4): SceneCamera | undefined {
+    const node = this.cameraNodeOf(surface.id);
+    if (!node) return undefined;
+    const W = Math.max(1, this.width);
+    const H = Math.max(1, this.height);
+    const parent = this.sceneStore.parentMatrix(node, frame);
+    const pose = this.cameraPose(node, this.sceneStore.parentMatrix(node, mat4StripScale(frame)), defaultCam);
+    const frameScale = Math.sqrt(Math.hypot(frame[0], frame[1], frame[2]) * Math.hypot(frame[4], frame[5], frame[6])) || 1;
+    const eye = mat4TransformPoint(parent, vec3(pose.eye[0], pose.eye[1], pose.eye[2]));
+    const target = mat4TransformPoint(parent, vec3(pose.target[0], pose.target[1], pose.target[2]));
+    // Screen-up follows the window, so a tilted window's camera stays upright to it.
+    const up = mat4TransformDir(parent, vec3(0, -1, 0));
+    // The default camera's projection (its view is a pure translation to its
+    // eye), whose focal length carries any view zoom.
+    const e = defaultCam.cameraPos;
+    const proj = mat4Multiply(defaultCam.viewProj, mat4Translation(e[0], e[1], e[2]));
+    const zoom = (Math.abs(proj[5]) * Math.tan(Compositor.CAMERA_FOV / 2) || 1) * frameScale;
+    const anchor = projectToScreen(defaultCam.viewProj, target, W, H);
+    const fov = typeof node.params.fov === 'number' && node.params.fov > 0
+      ? (node.params.fov * Math.PI) / 180 : Compositor.CAMERA_FOV;
+    const cam = buildNodeCamera({
+      eye: [eye.x, eye.y, eye.z],
+      target: [target.x, target.y, target.z],
+      up: [up.x, up.y, up.z],
+      fovY: fov,
+      screenW: W,
+      screenH: H,
+      anchorX: anchor ? anchor.x : W / 2,
+      anchorY: anchor ? anchor.y : H / 2,
+      zoom,
+    });
+    return { viewProj: cam.viewProj, invViewProj: cam.invViewProj, cameraPos: cam.cameraPos };
+  }
+
+  /**
+   * A camera node's eye and target in its parent space. The eye defaults to
+   * the default camera's, placed through `parent` (the node's parent matrix
+   * under the window's scale-free frame).
+   */
+  private cameraPose(node: VocabNode, parent: Mat4, defaultCam: SceneCamera): { eye: [number, number, number]; target: [number, number, number] } {
+    const t = node.params.target;
+    const target: [number, number, number] = Array.isArray(t) && t.length === 3 && t.every((v) => typeof v === 'number')
+      ? [t[0] as number, t[1] as number, t[2] as number] : [0, 0, 0];
+    const pos = node.transform.position;
+    if (pos) return { eye: [pos[0], pos[1], pos[2]], target };
+    const c = defaultCam.cameraPos;
+    const local = mat4TransformPoint(mat4Invert(parent), vec3(c[0], c[1], c[2]));
+    return { eye: [local.x, local.y, local.z], target };
+  }
+
+  /** A camera node's orbit options, or undefined when it does not orbit. */
+  private static orbitSpecOf(orbit: unknown): { button: string; minDistance?: number; maxDistance?: number; minPitch?: number; maxPitch?: number; damping?: number } | undefined {
+    if (orbit === true) return { button: 'left' };
+    if (!orbit || typeof orbit !== 'object' || Array.isArray(orbit)) return undefined;
+    const o = orbit as Record<string, unknown>;
+    const num = (k: string) => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? o[k] as number : undefined);
+    return {
+      button: typeof o.button === 'string' && o.button in Compositor.ORBIT_BUTTONS ? o.button : 'left',
+      minDistance: num('minDistance'), maxDistance: num('maxDistance'),
+      minPitch: num('minPitch'), maxPitch: num('maxPitch'), damping: num('damping'),
+    };
+  }
+
+  /** Where a camera captures the pointer, window-local px: params.viewport or the content area clear of the resize bands. */
+  private cameraViewport(surface: Surface, node: VocabNode): { x: number; y: number; width: number; height: number } {
+    const v = node.params.viewport as { x?: unknown; y?: unknown; width?: unknown; height?: unknown } | undefined;
+    if (v && typeof v.x === 'number' && typeof v.y === 'number' && typeof v.width === 'number' && typeof v.height === 'number') {
+      return { x: v.x, y: v.y, width: v.width, height: v.height };
+    }
+    const band = Compositor.CAMERA_EDGE_BAND;
+    const top = surface.transparent || surface.chromeless ? band : TITLE_BAR_HEIGHT;
+    const { width, height } = surface.rect;
+    return { x: band, y: top, width: Math.max(0, width - band * 2), height: Math.max(0, height - top - band) };
+  }
+
+  /** The camera node whose capture viewport holds a viewport point. */
+  private cameraAt(x: number, y: number): { surface: Surface; node: VocabNode } | undefined {
+    // (The phone picks through the same zoomed desktop camera, so it orbits too.)
+    if (this.cameraNodeIds.size === 0) return undefined;
+    const hit = this.surfaceLocalAt(x, y);
+    if (!hit) return undefined;
+    const node = this.cameraNodeOf(hit.surface.id);
+    if (!node) return undefined;
+    const vp = this.cameraViewport(hit.surface, node);
+    if (hit.x < vp.x || hit.y < vp.y || hit.x > vp.x + vp.width || hit.y > vp.y + vp.height) return undefined;
+    return { surface: hit.surface, node };
+  }
+
+  /** Whether a press with `button` here would orbit a camera (the client then keeps the context menu away). */
+  cameraOrbitsAt(x: number, y: number, button: number): boolean {
+    const at = this.cameraAt(x, y);
+    const spec = at ? Compositor.orbitSpecOf(at.node.params.orbit) : undefined;
+    return !!spec && Compositor.ORBIT_BUTTONS[spec.button] === button;
+  }
+
+  /** True while a held pointer orbits a camera. */
+  get isOrbitingCamera(): boolean {
+    return this.orbitGrab !== undefined;
+  }
+
+  /**
+   * A press at a viewport point: when it lands in the capture viewport of a
+   * window's camera node that orbits with this button, the camera takes the
+   * drag (the window never sees the press). Returns whether it did.
+   */
+  beginCameraOrbit(x: number, y: number, button: number, time?: number): boolean {
+    if (this.orbitGrab) this.endCameraOrbit(time);
+    const at = this.cameraAt(x, y);
+    const spec = at ? Compositor.orbitSpecOf(at.node.params.orbit) : undefined;
+    if (!at || !spec || Compositor.ORBIT_BUTTONS[spec.button] !== button) return false;
+    const oc = this.orbitCamFor(at.surface, at.node);
+    oc.ctl.pointerDown(x, y, time ?? performance.now());
+    oc.active = false;
+    this.orbitGrab = `${at.surface.id}/${at.node.id}`;
+    this.emitCamera(oc, 'start');
+    return true;
+  }
+
+  /** Follow the held pointer: the eye turns around the target. */
+  updateCameraOrbit(x: number, y: number, time?: number): void {
+    const oc = this.orbitGrab ? this.orbitCams.get(this.orbitGrab) : undefined;
+    if (!oc) return;
+    if (oc.ctl.pointerMove(x, y, time ?? performance.now()) && this.writeCameraPose(oc)) this.emitCamera(oc, 'move');
+  }
+
+  /** Release the orbit: the view coasts on a flick (render loop), then reports 'end'. */
+  endCameraOrbit(time?: number): void {
+    const oc = this.orbitGrab ? this.orbitCams.get(this.orbitGrab) : undefined;
+    this.orbitGrab = undefined;
+    if (!oc) return;
+    oc.ctl.pointerUp(time ?? performance.now());
+    oc.lastT = performance.now();
+    if (oc.ctl.moving) {
+      oc.active = true;
+      this.needsRender = true;
+    } else {
+      this.emitCamera(oc, 'end');
+    }
+  }
+
+  /**
+   * A wheel at a viewport point: dolly the camera whose capture viewport
+   * holds it when its node has zoom: true. Returns whether the wheel was used.
+   */
+  cameraWheel(x: number, y: number, deltaY: number): boolean {
+    const at = this.cameraAt(x, y);
+    if (!at || at.node.params.zoom !== true) return false;
+    const oc = this.orbitCamFor(at.surface, at.node);
+    if (!oc.active && !oc.ctl.isDragging) {
+      oc.lastT = performance.now();
+      this.emitCamera(oc, 'start');
+    }
+    oc.ctl.wheel(deltaY);
+    oc.active = true;
+    this.needsRender = true;
+    return true;
+  }
+
+  /** The orbit state for a camera node, created or re-synced with the node's current pose. */
+  private orbitCamFor(surface: Surface, node: VocabNode): OrbitCam {
+    const key = `${surface.id}/${node.id}`;
+    const v = this.windowView(surface);
+    const pose = this.cameraPose(node, this.sceneStore.parentMatrix(node, mat4StripScale(v.frame)), v.cam);
+    const spec = Compositor.orbitSpecOf(node.params.orbit) ?? { button: 'left' };
+    const sig = JSON.stringify(spec);
+    let oc = this.orbitCams.get(key);
+    if (!oc || oc.sig !== sig) {
+      oc = {
+        surfaceId: surface.id, nodeId: node.id, sig,
+        ctl: new OrbitController(pose.eye, pose.target, {
+          minDistance: spec.minDistance, maxDistance: spec.maxDistance,
+          minPitch: spec.minPitch, maxPitch: spec.maxPitch, damping: spec.damping,
+        }),
+        eye: pose.eye, target: pose.target, lastT: performance.now(), active: false,
+      };
+      this.orbitCams.set(key, oc);
+    } else if (!Compositor.sameVec(pose.eye, oc.eye) || !Compositor.sameVec(pose.target, oc.target)) {
+      // The owner moved the camera since we last wrote it: start from there.
+      oc.ctl.setView(pose.eye, pose.target);
+      oc.eye = pose.eye;
+      oc.target = pose.target;
+    }
+    return oc;
+  }
+
+  private static sameVec(a: readonly number[], b: readonly number[]): boolean {
+    return Math.abs(a[0] - b[0]) < 1e-4 && Math.abs(a[1] - b[1]) < 1e-4 && Math.abs(a[2] - b[2]) < 1e-4;
+  }
+
+  /** Write the controller's pose into the camera node (the retained copy renders and picks from it). */
+  private writeCameraPose(oc: OrbitCam): boolean {
+    const node = this.sceneStore.getNode(oc.surfaceId, oc.nodeId);
+    if (!node) return false;
+    const eye = oc.ctl.eye;
+    const target: [number, number, number] = [oc.ctl.target[0], oc.ctl.target[1], oc.ctl.target[2]];
+    node.transform = { ...node.transform, position: eye };
+    node.params = { ...node.params, target };
+    oc.eye = eye;
+    oc.target = target;
+    if (this.isSurfaceKeyRenderable(oc.surfaceId)) this.needsRender = true;
+    return true;
+  }
+
+  private emitCamera(oc: OrbitCam, phase: CameraChangeEvent['phase']): void {
+    try {
+      this.onCameraChange?.({
+        phase, surfaceId: oc.surfaceId, nodeId: oc.nodeId,
+        position: [oc.eye[0], oc.eye[1], oc.eye[2]],
+        target: [oc.target[0], oc.target[1], oc.target[2]],
+      });
+    } catch (err) {
+      console.error('[Compositor] onCameraChange listener failed:', err);
+    }
+  }
+
+  /** Coast released orbits and ease wheel dollies. Returns true while any camera still moves. */
+  private stepCameras(now: number): boolean {
+    if (this.orbitCams.size === 0) return false;
+    let moving = false;
+    for (const [key, oc] of this.orbitCams) {
+      if (!oc.active || oc.ctl.isDragging) continue;
+      const node = this.sceneStore.getNode(oc.surfaceId, oc.nodeId);
+      if (!node || node.kind !== 'camera') { this.orbitCams.delete(key); continue; }
+      const pos = node.transform.position;
+      const tg = node.params.target as number[] | undefined;
+      if ((pos && !Compositor.sameVec(pos, oc.eye)) || (Array.isArray(tg) && !Compositor.sameVec(tg, oc.target))) {
+        // The owner moved it mid-coast: its word wins, the coast stops.
+        oc.active = false;
+        continue;
+      }
+      const still = oc.ctl.update(now - oc.lastT);
+      oc.lastT = now;
+      this.writeCameraPose(oc);
+      if (still) {
+        moving = true;
+        this.emitCamera(oc, 'move');
+      } else {
+        oc.active = false;
+        this.emitCamera(oc, 'end');
+      }
+    }
+    return moving;
+  }
+
+  /**
+   * Evaluate node constraints: `follow` eases a node toward another node's
+   * position (plus offset) and `lookAt` turns it so its local +z faces a
+   * point or node. Runs after animations and drags, so constraints see this
+   * frame's positions. Returns true while a follower is still closing in
+   * (a lookAt only changes when something it watches moves, which renders
+   * anyway).
+   */
+  private stepConstraints(now: number): boolean {
+    if (this.constrainedNodes.size === 0) return false;
+    let moving = false;
+    for (const [key, c] of this.constrainedNodes) {
+      const node = this.sceneStore.getNode(c.surfaceKey, c.id);
+      if (!node || (node.params.lookAt == null && node.params.follow == null)) {
+        this.constrainedNodes.delete(key);
+        continue;
+      }
+      const dt = c.lastT === undefined ? 0 : Math.min(0.25, Math.max(0, (now - c.lastT) / 1000));
+      c.lastT = now;
+      if (!this.isSurfaceKeyRenderable(c.surfaceKey)) continue;
+      const f = node.params.follow as { node?: unknown; offset?: unknown; stiffness?: unknown } | null | undefined;
+      // The hand wins over a follower being dragged.
+      const held = this.nodeDrag !== undefined && this.nodeDrag.key === c.surfaceKey && this.nodeDrag.nodeId === node.id;
+      if (f && typeof f.node === 'string' && !held) {
+        const goal = this.pointInParentOf(node, f.node);
+        if (goal) {
+          const off = Array.isArray(f.offset) ? f.offset as number[] : [0, 0, 0];
+          const g = [goal[0] + (off[0] ?? 0), goal[1] + (off[1] ?? 0), goal[2] + (off[2] ?? 0)];
+          const cur = node.transform.position ?? [0, 0, 0];
+          if (Math.hypot(g[0] - cur[0], g[1] - cur[1], g[2] - cur[2]) > 0.01) {
+            let next = followStep(cur, g, typeof f.stiffness === 'number' ? f.stiffness : 0.15, dt);
+            if (Math.hypot(g[0] - next[0], g[1] - next[1], g[2] - next[2]) <= 0.01) next = g;
+            else moving = true;
+            node.transform = { ...node.transform, position: [next[0], next[1], next[2]] };
+          }
+        }
+      }
+      const la = node.params.lookAt as unknown;
+      const to = Array.isArray(la) && la.length === 3
+        ? la as number[]
+        : la && typeof la === 'object' && typeof (la as { node?: unknown }).node === 'string'
+          ? this.pointInParentOf(node, (la as { node: string }).node) : undefined;
+      if (to) {
+        const r = lookAtEuler(node.transform.position ?? [0, 0, 0], to);
+        const cur = node.transform.rotation;
+        if (!cur || !Compositor.sameVec(cur, r)) node.transform = { ...node.transform, rotation: r };
+      }
+    }
+    return moving;
+  }
+
+  /** Another node's origin in `node`'s parent space (same subtree), or undefined when it is gone. */
+  private pointInParentOf(node: VocabNode, otherId: string): number[] | undefined {
+    const other = this.sceneStore.getNode(node.surfaceId, otherId);
+    if (!other || other === node) return undefined;
+    const identity = mat4Identity();
+    const w = this.sceneStore.worldMatrix(other, identity);
+    const p = mat4TransformPoint(mat4Invert(this.sceneStore.parentMatrix(node, identity)), vec3(w[12], w[13], w[14]));
+    return [p.x, p.y, p.z];
+  }
+
+  // ── Content kinds: models, 3D text, labels, lines, trails, sky ────────
+  //
+  // `model` and `text` are solids: drawMeshEntry hands them to
+  // drawContentSolid, so presets, maps, lights, shadows, canvas-layer
+  // slicing and transparency sorting treat them exactly like meshes. Lines
+  // and trails draw after a pass's meshes (they test depth and, except
+  // opaque mitred lines, write none), labels last (crisp 2D over the 3D),
+  // and a sky first, behind everything else in its subtree. Models are
+  // shared by source between every node naming them and freed when no node
+  // does; per-node GPU state (labels, lines, trails) is freed when its node
+  // stops drawing. Everything rebuilds after a lost context.
+
+  private static readonly CONTENT_SOLIDS = new Set(['model', 'text']);
+  /** Beyond this many triangles a model picks by its bounds instead of its triangles. */
+  private static readonly MODEL_PICK_TRIANGLES = 20000;
+  private static readonly ABX_PREFIX = 'abx:sha256:';
+
+  private lineRendererInst?: LineRenderer;
+  private skyRendererInst?: SkyRenderer;
+  private get lineRenderer(): LineRenderer { return this.lineRendererInst ??= new LineRenderer(this.renderer); }
+  private get skyRenderer(): SkyRenderer { return this.skyRendererInst ??= new SkyRenderer(this.renderer); }
+
+  /** Parsed models and their GPU buffers, keyed by `src` (URL, data-URI or abx ref). */
+  private models = new Map<string, ModelEntry>();
+  /** Per model node: which clip plays and its clock. */
+  private modelClocks = new Map<string, { clip: number; start: number; pausedAt?: number; speed: number }>();
+  /** Per model node: its pose this frame (shared by the shadow pass, the draw and picking). */
+  private modelPoses = new Map<string, { items: GltfDrawItem[]; fit: Mat4; src: string; frame: number; moving: boolean }>();
+  /** Frame counter for per-frame content caches. */
+  private contentFrame = 0;
+  /** Per label node: its rendered texture and the quad it was last drawn as. */
+  private labelTextures = new Map<string, { key: string; tex: WebGLTexture; w: number; h: number; model?: Mat4 }>();
+  /** Per line node: GPU handle plus the param references it was built from. */
+  private lineHandles = new Map<string, { handle: LineHandle; points: unknown; colors: unknown; widths: unknown; closed: unknown; theme?: SceneTheme }>();
+  /** Per trailed node: recent world positions. */
+  private trails = new Map<string, Trail>();
+  /** Node keys whose label, line or trail drew this frame (drives pruning). */
+  private touchedContent = new Set<string>();
+  /** Fonts being fetched for 3D text (retraced once loaded). */
+  private pendingTextFonts = new Set<string>();
+  private lastModelSweep = 0;
+  /** Resolves an `abx:sha256:` hash to a fetchable URL, or undefined when the bytes are not here yet. */
+  private blobResolver?: (hash: string) => string | undefined;
+
+  /**
+   * Where model bytes delivered by the UIServer live (the client's blob
+   * cache). A model whose blob is missing waits; call blobArrived when it lands.
+   */
+  setBlobResolver(resolve: (hash: string) => string | undefined): void {
+    this.blobResolver = resolve;
+  }
+
+  /** A content blob arrived: retry the models that were waiting for it. */
+  blobArrived(hash: string): void {
+    const src = Compositor.ABX_PREFIX + hash;
+    const e = this.models.get(src);
+    if (e && e.state === 'waiting') {
+      e.state = 'loading';
+      void this.loadModel(e);
+    }
+  }
+
+  /** Why a model node is not showing (for diagnostics), or undefined when it is fine. */
+  modelStatus(src: string): { state: string; error?: string } | undefined {
+    const e = this.models.get(src);
+    return e ? { state: e.state, error: e.error } : undefined;
+  }
+
+  private modelEntry(src: string): ModelEntry {
+    let e = this.models.get(src);
+    if (!e) {
+      e = { src, state: 'loading', meshes: new Map(), textures: new Map(), bitmaps: new Map(), generation: 0 };
+      this.models.set(src, e);
+      void this.loadModel(e);
+    }
+    return e;
+  }
+
+  /** Fetch, parse, and decode a model's images. GPU buffers are built on first draw. */
+  private async loadModel(e: ModelEntry): Promise<void> {
+    try {
+      let bytes: Uint8Array;
+      let base: string | undefined;
+      if (e.src.startsWith(Compositor.ABX_PREFIX)) {
+        const url = this.blobResolver?.(e.src.slice(Compositor.ABX_PREFIX.length));
+        if (!url) { e.state = 'waiting'; return; }
+        bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+      } else if (e.src.startsWith('data:')) {
+        const d = decodeDataUri(e.src);
+        if (!d) throw new Error('the data-URI is malformed');
+        bytes = d.bytes;
+      } else {
+        const res = await fetch(e.src);
+        if (!res.ok) throw new Error(`HTTP ${res.status} loading ${e.src}`);
+        bytes = new Uint8Array(await res.arrayBuffer());
+        base = res.url || e.src;
+      }
+      const fetchRelative = base
+        ? async (uri: string) => {
+          const r = await fetch(new URL(uri, base).href);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return new Uint8Array(await r.arrayBuffer());
+        }
+        : undefined;
+      const doc = await parseGltf(bytes, { fetch: fetchRelative });
+      for (let i = 0; i < doc.images.length; i++) {
+        const im = doc.images[i];
+        if (!im.bytes || typeof createImageBitmap !== 'function') continue;
+        try {
+          const bmp = await createImageBitmap(new Blob([im.bytes as BlobPart], { type: im.mime }), {
+            premultiplyAlpha: 'premultiply', colorSpaceConversion: 'none',
+          });
+          e.bitmaps.set(i, bmp);
+        } catch (err) {
+          console.warn(`[scene] model ${e.src.slice(0, 60)}: image ${i} could not be decoded (${err instanceof Error ? err.message : String(err)})`);
+        }
+      }
+      const items = flattenScene(doc);
+      const b = drawItemsBounds(items);
+      e.doc = doc;
+      e.rest = { items, min: b.min, max: b.max };
+      e.state = 'ready';
+      for (const w of doc.warnings) console.info(`[scene] model ${e.src.slice(0, 60)}: ${w}`);
+    } catch (err) {
+      e.state = 'error';
+      e.error = err instanceof Error ? err.message : String(err);
+      console.warn(`[scene] model ${e.src.slice(0, 80)} failed: ${e.error}`);
+    }
+    this.needsRender = true;
+  }
+
+  /** Build (or rebuild after a context loss) a ready model's GPU buffers and textures. */
+  private ensureModelGpu(e: ModelEntry): void {
+    const gen = contextGeneration(this.renderer.context);
+    if (e.generation === gen) return;
+    // Old handles died with the old context; forget them without deleting.
+    e.meshes.clear();
+    e.textures.clear();
+    for (const mesh of e.doc!.meshes) {
+      for (const prim of mesh.primitives) {
+        const handle = this.renderer.createDynamicMesh();
+        this.renderer.updateDynamicMesh(handle, primitiveGeometry(prim));
+        e.meshes.set(prim, handle);
+      }
+    }
+    for (const [i, bmp] of e.bitmaps) {
+      const tex = this.renderer.createTexture();
+      this.renderer.uploadImageTexture(tex, bmp);
+      e.textures.set(i, tex);
+    }
+    e.generation = gen;
+  }
+
+  private freeModel(e: ModelEntry): void {
+    if (e.generation === contextGeneration(this.renderer.context)) {
+      for (const h of e.meshes.values()) this.renderer.deleteDynamicMesh(h);
+      for (const t of e.textures.values()) this.renderer.deleteTexture(t);
+    }
+    for (const bmp of e.bitmaps.values()) bmp.close?.();
+    e.meshes.clear();
+    e.textures.clear();
+    e.bitmaps.clear();
+  }
+
+  /** `fit`: scale a model so its largest side is `fit` px, centred on the node. */
+  private modelFitMatrix(e: ModelEntry, fit: unknown): Mat4 {
+    if (typeof fit !== 'number' || !(fit > 0) || !e.rest) return mat4Identity();
+    const { min, max } = e.rest;
+    const size = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]) || 1;
+    const k = fit / size;
+    return mat4Multiply(
+      mat4TRS(0, 0, 0, 0, 0, 0, k, k, k),
+      mat4Translation(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2, -(min[2] + max[2]) / 2),
+    );
+  }
+
+  /** The pose a model node shows now (and whether its animation still moves). */
+  private modelPose(fullKey: string, e: ModelEntry, rp: Record<string, unknown>): { items: GltfDrawItem[]; moving: boolean } {
+    const doc = e.doc!;
+    const clip = findAnimation(doc, rp.animation as string | number | undefined);
+    if (clip < 0) {
+      this.modelClocks.delete(fullKey);
+      return { items: e.rest!.items, moving: false };
+    }
+    const now = performance.now();
+    const speed = typeof rp.speed === 'number' ? rp.speed : 1;
+    const playing = rp.playing !== false;
+    let clock = this.modelClocks.get(fullKey);
+    if (!clock || clock.clip !== clip) {
+      clock = { clip, start: now, speed };
+      this.modelClocks.set(fullKey, clock);
+    }
+    if (clock.speed !== speed) {
+      // Keep the current time when the rate changes.
+      const t = ((clock.pausedAt ?? now) - clock.start) * clock.speed;
+      clock.start = (clock.pausedAt ?? now) - (speed !== 0 ? t / speed : 0);
+      clock.speed = speed;
+    }
+    if (!playing && clock.pausedAt === undefined) clock.pausedAt = now;
+    if (playing && clock.pausedAt !== undefined) {
+      clock.start += now - clock.pausedAt;
+      clock.pausedAt = undefined;
+    }
+    const anim = doc.animations[clip];
+    const loop = rp.loop !== false;
+    const elapsed = (((clock.pausedAt ?? now) - clock.start) / 1000) * speed;
+    const t = animationTime(anim, elapsed, loop);
+    const moving = playing && speed !== 0 && (loop || (elapsed >= 0 && elapsed < anim.duration));
+    return { items: flattenScene(doc, { pose: sampleAnimation(anim, t) }), moving };
+  }
+
+  /**
+   * One model primitive's material: the glTF material (linear factors
+   * encoded to the sRGB the renderer expects, its maps and texture
+   * transform), with the node's params as overrides: a `material` preset
+   * replaces it (keeping the normal and occlusion maps), `color` tints,
+   * `opacity` multiplies, and `shading`, metalness, roughness and emissive
+   * replace their glTF values.
+   */
+  private modelMaterial(e: ModelEntry, item: GltfDrawItem, rp: Record<string, unknown>): Omit<MeshMaterialOpts, 'model' | 'viewProj' | 'cameraPos'> {
+    const r = resolveMaterial(rp, this.sceneTheme, this.sceneLibrary);
+    const base = materialDrawOpts(r, (src) => this.resolveTexture(src));
+    const gm = item.materialIndex >= 0 ? e.doc!.materials[item.materialIndex] : undefined;
+    const tex = (ref: { image: number } | undefined) => (ref && ref.image >= 0 ? e.textures.get(ref.image) : undefined);
+    const preset = typeof rp.material === 'string' && !!this.sceneLibrary.materials[rp.material as string];
+    if (!gm) return base;
+    const maps = { ...(base.maps ?? {}) };
+    maps.normal ??= tex(gm.normalTexture);
+    maps.ao ??= tex(gm.occlusionTexture);
+    if (preset) return { ...base, maps, normalScale: base.normalScale ?? gm.normalTexture?.scale };
+    const bc = gm.baseColorFactor;
+    const tint = rp.color !== undefined ? r.color : { r: 1, g: 1, b: 1, a: 1 };
+    const enc = (lin: number, t: number) => linearToSrgb(lin * srgbToLinear(t));
+    const emissive = rp.emissive !== undefined
+      ? base.emissive
+      : (gm.emissiveFactor.some((c) => c > 0) || gm.emissiveTexture
+        ? { r: linearToSrgb(gm.emissiveFactor[0]), g: linearToSrgb(gm.emissiveFactor[1]), b: linearToSrgb(gm.emissiveFactor[2]), a: 1 }
+        : undefined);
+    if (rp.emissive === undefined && gm.emissiveTexture && !gm.emissiveFactor.some((c) => c > 0) && emissive) {
+      emissive.r = emissive.g = emissive.b = 1;
+    }
+    const mr = tex(gm.metallicRoughnessTexture);
+    const colorTex = tex(gm.baseColorTexture);
+    const xf = gm.baseColorTexture;
+    return {
+      ...base,
+      color: { r: enc(bc[0], tint.r), g: enc(bc[1], tint.g), b: enc(bc[2], tint.b), a: 1 },
+      opacity: (gm.alphaMode === 'OPAQUE' ? 1 : bc[3]) * (typeof rp.opacity === 'number' ? rp.opacity : 1),
+      metalness: typeof rp.metalness === 'number' ? rp.metalness : gm.metallicFactor,
+      roughness: typeof rp.roughness === 'number' ? rp.roughness : gm.roughnessFactor,
+      emissive,
+      texture: base.texture ?? colorTex,
+      maps: {
+        ...maps,
+        roughness: maps.roughness ?? mr,
+        metalness: maps.metalness ?? mr,
+        emissive: maps.emissive ?? tex(gm.emissiveTexture),
+      },
+      normalScale: base.normalScale ?? gm.normalTexture?.scale,
+      uvRepeat: base.uvRepeat ?? (xf && (xf.scale[0] !== 1 || xf.scale[1] !== 1) ? xf.scale : undefined),
+      uvOffset: base.uvOffset ?? (xf && (xf.offset[0] !== 0 || xf.offset[1] !== 0) ? xf.offset : undefined),
+      shading: typeof rp.shading === 'string' ? base.shading : (gm.unlit ? 'unlit' : base.shading),
+    };
+  }
+
+  /** Draw a model or text node (called from drawMeshEntry with the pass's lighting). */
+  private drawContentSolid(
+    key: string,
+    entry: { node: VocabNode; rp: Record<string, unknown> },
+    surfaceModel: Mat4,
+    common: Pick<MeshMaterialOpts, 'viewProj' | 'lights' | 'ambient' | 'fog' | 'environment' | 'shadow' | 'spotShadow' | 'cameraPos'>,
+  ): void {
+    const { node, rp } = entry;
+    const world = this.sceneStore.worldMatrix(node, surfaceModel);
+    const fullKey = `${key}/${node.id}`;
+    if (node.kind === 'text') {
+      const geometry = this.textGeometryFor(rp);
+      if (!geometry) return;
+      const m = resolveMaterial(this.withDefaultColor(rp, '$textPrimary'), this.sceneTheme, this.sceneLibrary);
+      this.renderer.drawMesh({ ...materialDrawOpts(m, (src) => this.resolveTexture(src)), ...common, model: world, geometry, closed: true });
+      return;
+    }
+    const src = rp.src;
+    if (typeof src !== 'string' || !src) return;
+    const e = this.modelEntry(src);
+    if (e.state !== 'ready') return;
+    this.ensureModelGpu(e);
+    const pose = this.posedModel(fullKey, e, rp);
+    if (pose.moving) this.needsRender = true;
+    const placed = mat4Multiply(world, pose.fit);
+    for (const item of pose.items) {
+      const handle = e.meshes.get(item.primitive);
+      if (!handle) continue;
+      const mode = item.primitive.mode === GLTF_MODE.POINTS ? 'points'
+        : isTrianglePrimitive(item.primitive) ? undefined : 'lines';
+      this.renderer.drawDynamicMesh(handle, {
+        ...this.modelMaterial(e, item, rp),
+        ...common,
+        ...(mode ? { drawMode: mode } : {}),
+        model: mat4Multiply(placed, item.worldMatrix),
+      });
+    }
+  }
+
+  /** A model node's pose for this frame, computed once and shared by every pass. */
+  private posedModel(fullKey: string, e: ModelEntry, rp: Record<string, unknown>): { items: GltfDrawItem[]; fit: Mat4; src: string; moving: boolean } {
+    const hit = this.modelPoses.get(fullKey);
+    if (hit && hit.frame === this.contentFrame && hit.src === e.src) return hit;
+    const pose = this.modelPose(fullKey, e, rp);
+    const entry = { items: pose.items, fit: this.modelFitMatrix(e, rp.fit), src: e.src, frame: this.contentFrame, moving: pose.moving };
+    this.modelPoses.set(fullKey, entry);
+    return entry;
+  }
+
+  /** Params with a default colour when neither they nor their preset give one. */
+  private withDefaultColor(rp: Record<string, unknown>, color: string): Record<string, unknown> {
+    if (rp.color !== undefined) return rp;
+    if (withMaterialPreset(rp, this.sceneLibrary).color !== undefined) return rp;
+    return { ...rp, color };
+  }
+
+  /** Extruded geometry for a text node (cached by its text inputs), retraced once a web font loads. */
+  private textGeometryFor(rp: Record<string, unknown>): Geometry | undefined {
+    const text = rp.text;
+    if (typeof text !== 'string' || !text) return undefined;
+    const font = typeof rp.font === 'string' ? rp.font : (this.sceneTheme?.fonts?.display ?? 'sans-serif');
+    const fonts = typeof document !== 'undefined' ? document.fonts : undefined;
+    if (fonts && !this.pendingTextFonts.has(font)) {
+      let ready = true;
+      try { ready = fonts.check(cssFont(font, 48)); } catch { ready = true; }
+      if (!ready) {
+        this.pendingTextFonts.add(font);
+        void ensureTextFont(font).then(() => {
+          clearTextGeometryCache();
+          this.needsRender = true;
+        });
+      }
+    }
+    return getTextGeometry({
+      text, font,
+      size: typeof rp.size === 'number' ? rp.size : undefined,
+      depth: typeof rp.depth === 'number' ? rp.depth : undefined,
+      bevel: typeof rp.bevel === 'number' ? rp.bevel : undefined,
+      align: rp.align as 'left' | 'center' | 'right' | undefined,
+      lineHeight: typeof rp.lineHeight === 'number' ? rp.lineHeight : undefined,
+    })?.geometry;
+  }
+
+  /** A sky node: the dome behind everything else in its subtree. */
+  private drawSkyNode(rp: Record<string, unknown>, env: ResolvedEnvironment | undefined, cam: SceneCamera): void {
+    const sky = resolveSky(rp, this.sceneTheme, env?.ambient);
+    this.skyRenderer.draw({
+      invViewProj: cam.invViewProj,
+      top: sky.top, horizon: sky.horizon, bottom: sky.bottom,
+      sun: sky.sun ? {
+        direction: sky.sun.direction, color: sky.sun.color, intensity: sky.sun.intensity,
+        size: (sky.sun.size * 180) / Math.PI,
+      } : undefined,
+      stars: rp.stars as boolean | number | undefined,
+      texture: typeof rp.texture === 'string' ? this.resolveTexture(rp.texture) : undefined,
+      rotation: typeof rp.rotation === 'number' ? rp.rotation : undefined,
+      opacity: typeof rp.opacity === 'number' ? rp.opacity : undefined,
+    });
+  }
+
+  /** A line node: thick polyline or ribbon in the node's local px. */
+  private drawLineNode(key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera): void {
+    const pts = rp.points;
+    if (!Array.isArray(pts) || pts.length < 2) return;
+    const fullKey = `${key}/${node.id}`;
+    this.touchedContent.add(fullKey);
+    let entry = this.lineHandles.get(fullKey);
+    if (!entry) {
+      entry = { handle: this.lineRenderer.createLine(), points: undefined, colors: undefined, widths: undefined, closed: undefined };
+      this.lineHandles.set(fullKey, entry);
+    }
+    if (entry.points !== pts || entry.colors !== rp.colors || entry.widths !== rp.widths
+      || entry.closed !== rp.closed || entry.theme !== this.sceneTheme) {
+      const colors = Array.isArray(rp.colors)
+        ? (rp.colors as string[]).map((c) => parseCssColor(resolveSceneColor(c, this.sceneTheme)))
+        : undefined;
+      this.lineRenderer.updateLine(entry.handle, {
+        points: pts as number[][], colors, widths: Array.isArray(rp.widths) ? rp.widths as number[] : undefined, closed: rp.closed === true,
+      });
+      Object.assign(entry, { points: pts, colors: rp.colors, widths: rp.widths, closed: rp.closed, theme: this.sceneTheme });
+    }
+    this.lineRenderer.drawLine(entry.handle, {
+      model: this.sceneStore.worldMatrix(node, surfaceModel),
+      viewProj: cam.viewProj,
+      cameraPos: cam.cameraPos,
+      width: typeof rp.width === 'number' ? rp.width : 2,
+      color: parseCssColor(resolveSceneColor((rp.color as string) ?? '$accent', this.sceneTheme)),
+      opacity: typeof rp.opacity === 'number' ? rp.opacity : 1,
+      dashed: rp.dashed as { dash: number; gap: number } | undefined,
+      blend: rp.blend === 'additive' ? 'additive' : 'normal',
+      join: rp.join === 'round' ? 'round' : 'miter',
+      cap: rp.cap === 'round' ? 'round' : 'butt',
+      ribbon: rp.ribbon === true,
+    });
+  }
+
+  /** A `trail` param: a fading ribbon through the node's recent world positions. */
+  private drawNodeTrail(key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera): void {
+    const spec = (rp.trail === true ? {} : rp.trail) as Record<string, unknown> | undefined;
+    if (!spec || typeof spec !== 'object') return;
+    const fullKey = `${key}/${node.id}`;
+    this.touchedContent.add(`${fullKey}#trail`);
+    const now = performance.now();
+    let trail = this.trails.get(fullKey);
+    if (!trail) {
+      trail = new Trail({
+        capacity: typeof spec.length === 'number' ? spec.length : 48,
+        minDistance: typeof spec.minDistance === 'number' ? spec.minDistance : 3,
+        lifetime: typeof spec.lifetime === 'number' ? spec.lifetime : 600,
+      });
+      this.trails.set(fullKey, trail);
+    }
+    const w = this.sceneStore.worldMatrix(node, surfaceModel);
+    trail.push(w[12], w[13], w[14], now);
+    this.lineRenderer.drawTrail(trail, {
+      viewProj: cam.viewProj,
+      cameraPos: cam.cameraPos,
+      width: typeof spec.width === 'number' ? spec.width : 12,
+      color: parseCssColor(resolveSceneColor((spec.color as string) ?? (rp.color as string) ?? '$accent', this.sceneTheme)),
+      opacity: typeof spec.opacity === 'number' ? spec.opacity : 1,
+      blend: spec.blend === 'normal' ? 'normal' : 'additive',
+      now,
+    });
+    if (trail.isActive(now)) this.needsRender = true;
+  }
+
+  /**
+   * A label node: its text rendered at the device pixel ratio into a
+   * texture, drawn as a quad facing the camera. Screen-space labels keep
+   * their CSS size at any depth; others are world px at the node's scale.
+   */
+  private drawLabelNode(key: string, node: VocabNode, rp: Record<string, unknown>, surfaceModel: Mat4, cam: SceneCamera): void {
+    if (typeof rp.text !== 'string' || !rp.text) return;
+    const fullKey = `${key}/${node.id}`;
+    this.touchedContent.add(fullKey);
+    const dpr = this.renderer.canvas.width / Math.max(1, this.renderer.cssWidth);
+    const opts: LabelOptions = {
+      text: rp.text,
+      font: typeof rp.font === 'string' ? rp.font : (this.sceneTheme?.fonts?.body ?? 'system-ui, sans-serif'),
+      size: typeof rp.size === 'number' ? rp.size : 14,
+      color: resolveSceneColor((rp.color as string) ?? '$textPrimary', this.sceneTheme),
+      background: typeof rp.background === 'string' ? resolveSceneColor(rp.background, this.sceneTheme) : undefined,
+      padding: typeof rp.padding === 'number' ? rp.padding : undefined,
+      radius: typeof rp.radius === 'number' ? rp.radius : undefined,
+      maxWidth: typeof rp.maxWidth === 'number' ? rp.maxWidth : undefined,
+      align: rp.align as 'left' | 'center' | 'right' | undefined,
+      lineHeight: typeof rp.lineHeight === 'number' ? rp.lineHeight : undefined,
+      dpr,
+    };
+    const lkey = labelKey(opts);
+    let entry = this.labelTextures.get(fullKey);
+    if (!entry || entry.key !== lkey) {
+      const rendered = renderLabel(opts);
+      if (!rendered) return;
+      const tex = entry?.tex ?? this.renderer.createTexture();
+      this.renderer.uploadTexture(tex, rendered.canvas as HTMLCanvasElement);
+      entry = { key: lkey, tex, w: rendered.width, h: rendered.height };
+      this.labelTextures.set(fullKey, entry);
+    }
+    const world = this.sceneStore.worldMatrix(node, surfaceModel);
+    const model = this.labelQuad(world, entry.w, entry.h, rp, cam);
+    if (!model) return;
+    entry.model = model;
+    this.renderer.drawSurface({
+      model, viewProj: cam.viewProj, texture: entry.tex, width: entry.w, height: entry.h,
+      radius: 0, dim: 1, opacity: typeof rp.opacity === 'number' ? rp.opacity : 1,
+    });
+  }
+
+  /**
+   * The quad a label draws as: axes along the camera's screen right and down
+   * at the label's point (any camera, off-axis or orbiting), sized in CSS px
+   * (constant on screen when screenSpace, the default) times the node scale.
+   */
+  private labelQuad(world: Mat4, w: number, h: number, rp: Record<string, unknown>, cam: SceneCamera): Mat4 | undefined {
+    const p = vec3(world[12], world[13], world[14]);
+    const vp = cam.viewProj;
+    const cw = vp[3] * p.x + vp[7] * p.y + vp[11] * p.z + vp[15];
+    if (cw <= 1e-6) return undefined;
+    const nx = (vp[0] * p.x + vp[4] * p.y + vp[8] * p.z + vp[12]) / cw;
+    const ny = (vp[1] * p.x + vp[5] * p.y + vp[9] * p.z + vp[13]) / cw;
+    const nz = (vp[2] * p.x + vp[6] * p.y + vp[10] * p.z + vp[14]) / cw;
+    // Unproject one CSS px to the right and one down at the label's depth.
+    const W = Math.max(1, this.width), H = Math.max(1, this.height);
+    const o = mat4TransformPoint(cam.invViewProj, vec3(nx, ny, nz));
+    const r = vec3Sub(mat4TransformPoint(cam.invViewProj, vec3(nx + 2 / W, ny, nz)), o);
+    const d = vec3Sub(mat4TransformPoint(cam.invViewProj, vec3(nx, ny - 2 / H, nz)), o);
+    const pxR = vec3Length(r), pxD = vec3Length(d);
+    if (!(pxR > 0) || !(pxD > 0)) return undefined;
+    const scale = Math.hypot(world[0], world[1], world[2]) || 1;
+    const screen = rp.screenSpace !== false;
+    const kx = (screen ? pxR : 1) * scale, ky = (screen ? pxD : 1) * scale;
+    const right = vec3Scale(r, 1 / pxR), down = vec3Scale(d, 1 / pxD);
+    const fwd = vec3Normalize(vec3Cross(right, down));
+    const anchor = Array.isArray(rp.anchor) ? rp.anchor as [number, number] : [0.5, 0.5];
+    const Wq = w * kx, Hq = h * ky;
+    const ox = (0.5 - anchor[0]) * Wq, oy = (0.5 - anchor[1]) * Hq;
+    const m = new Float32Array(16);
+    m[0] = right.x * Wq; m[1] = right.y * Wq; m[2] = right.z * Wq;
+    m[4] = down.x * Hq; m[5] = down.y * Hq; m[6] = down.z * Hq;
+    m[8] = fwd.x; m[9] = fwd.y; m[10] = fwd.z;
+    m[12] = p.x + right.x * ox + down.x * oy;
+    m[13] = p.y + right.y * ox + down.y * oy;
+    m[14] = p.z + right.z * ox + down.z * oy;
+    m[15] = 1;
+    return m;
+  }
+
+  /** Ray-test a content node (model, text, label, line); world distance or null. */
+  private hitContentNode(ray: Ray, key: string, node: VocabNode, world: Mat4): number | null {
+    const fullKey = `${key}/${node.id}`;
+    const rp = this.sceneStore.resolveParams(node);
+    if (node.kind === 'label') {
+      const model = this.labelTextures.get(fullKey)?.model;
+      return model ? rayMeshHit(ray, model, 'plane') : null;
+    }
+    if (node.kind === 'text') {
+      // The text's box: clicks between letters still count.
+      const g = this.textGeometryFor(rp);
+      if (!g) return null;
+      const [lo, hi] = this.positionsAABB(g.positions as unknown as number[]);
+      const box = mat4Multiply(world, mat4TRS(
+        (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2, 0, 0, 0,
+        Math.max(1e-3, hi[0] - lo[0]), Math.max(1e-3, hi[1] - lo[1]), Math.max(1e-3, hi[2] - lo[2])));
+      return rayMeshHit(ray, box, 'box');
+    }
+    if (node.kind === 'line') {
+      return this.hitLine(ray, world, rp);
+    }
+    if (node.kind === 'model') {
+      const pose = this.modelPoses.get(fullKey);
+      const e = pose ? this.models.get(pose.src) : undefined;
+      if (!pose || !e?.rest) return null;
+      const placed = mat4Multiply(world, pose.fit);
+      let tris = 0;
+      for (const it of pose.items) tris += (it.primitive.indices?.length ?? it.primitive.vertexCount) / 3;
+      if (tris > Compositor.MODEL_PICK_TRIANGLES) {
+        const { min, max } = e.rest;
+        const box = mat4Multiply(placed, mat4TRS(
+          (min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2, 0, 0, 0,
+          Math.max(1e-3, max[0] - min[0]), Math.max(1e-3, max[1] - min[1]), Math.max(1e-3, max[2] - min[2])));
+        return rayMeshHit(ray, box, 'box');
+      }
+      let best: number | null = null;
+      for (const it of pose.items) {
+        if (!isTrianglePrimitive(it.primitive)) continue;
+        const g = primitiveGeometry(it.primitive);
+        const t = rayCustomMeshHit(ray, mat4Multiply(placed, it.worldMatrix), g.positions, g.indices);
+        if (t !== null && (best === null || t < best)) best = t;
+      }
+      return best;
+    }
+    return null;
+  }
+
+  /** Nearest approach of a ray to a line node's segments, within half its width (plus slack). */
+  private hitLine(ray: Ray, world: Mat4, rp: Record<string, unknown>): number | null {
+    const pts = rp.points as number[][] | undefined;
+    if (!Array.isArray(pts) || pts.length < 2) return null;
+    const tol = Math.max(3, ((typeof rp.width === 'number' ? rp.width : 2) / 2) + 3);
+    const P = pts.map((q) => mat4TransformPoint(world, vec3(q[0] ?? 0, q[1] ?? 0, q[2] ?? 0)));
+    if (rp.closed === true && P.length > 2) P.push(P[0]);
+    const dl = vec3Length(ray.dir) || 1;
+    const u = vec3Scale(ray.dir, 1 / dl);
+    let best: number | null = null;
+    for (let i = 0; i + 1 < P.length; i++) {
+      const a = P[i], v = vec3Sub(P[i + 1], a);
+      const w0 = vec3Sub(ray.origin, a);
+      const b = vec3Dot(u, v), c = vec3Dot(v, v), d = vec3Dot(u, w0), e = vec3Dot(v, w0);
+      const den = c - b * b;
+      let s = den > 1e-9 ? (e - b * d) / den : 0; // along the segment (0..1 of v)
+      s = Math.max(0, Math.min(1, c > 0 ? s : 0));
+      const q = vec3Add(a, vec3Scale(v, s));
+      const t = Math.max(0, vec3Dot(vec3Sub(q, ray.origin), u));
+      const dist = vec3Length(vec3Sub(vec3Add(ray.origin, vec3Scale(u, t)), q));
+      if (dist <= tol && (best === null || t < best)) best = t;
+    }
+    return best;
+  }
+
+  /** Local AABB of a content solid (shadow-map fitting). */
+  private contentBounds(key: string, node: VocabNode): [number[], number[]] {
+    const rp = this.sceneStore.resolveParams(node);
+    if (node.kind === 'text') {
+      const g = this.textGeometryFor(rp);
+      return g ? this.positionsAABB(g.positions as unknown as number[]) : [[0, 0, 0], [0, 0, 0]];
+    }
+    const e = typeof rp.src === 'string' ? this.models.get(rp.src) : undefined;
+    if (!e || e.state !== 'ready') return [[0, 0, 0], [0, 0, 0]];
+    const pose = this.posedModel(`${key}/${node.id}`, e, rp);
+    const items = pose.items.map((it) => ({ ...it, worldMatrix: mat4Multiply(pose.fit, it.worldMatrix) }));
+    const b = drawItemsBounds(items);
+    return [b.min, b.max];
+  }
+
+  /** Draw a content solid's depth into the current shadow map. */
+  private drawContentDepth(key: string, node: VocabNode, world: Mat4): void {
+    if (node.kind === 'text') {
+      const g = this.textGeometryFor(this.sceneStore.resolveParams(node));
+      if (g) this.renderer.drawDepthGeometry(g, world);
+      return;
+    }
+    const rp = this.sceneStore.resolveParams(node);
+    const e = typeof rp.src === 'string' ? this.models.get(rp.src) : undefined;
+    if (!e || e.state !== 'ready') return;
+    this.ensureModelGpu(e);
+    const pose = this.posedModel(`${key}/${node.id}`, e, rp);
+    const placed = mat4Multiply(world, pose.fit);
+    for (const it of pose.items) {
+      if (!isTrianglePrimitive(it.primitive)) continue;
+      const h = e.meshes.get(it.primitive);
+      if (h) this.renderer.drawDepthDynamic(h, mat4Multiply(placed, it.worldMatrix));
+    }
+  }
+
+  /**
+   * Free content GPU state that no longer has a node: per-node labels,
+   * lines and trails that did not draw this frame, and (every couple of
+   * seconds) models no node names any more.
+   */
+  private pruneContent(): void {
+    this.contentFrame++;
+    for (const [k, e] of this.labelTextures) {
+      if (this.touchedContent.has(k)) continue;
+      this.renderer.deleteTexture(e.tex);
+      this.labelTextures.delete(k);
+    }
+    for (const [k, e] of this.lineHandles) {
+      if (this.touchedContent.has(k)) continue;
+      this.lineRenderer.deleteLine(e.handle);
+      this.lineHandles.delete(k);
+    }
+    for (const k of this.trails.keys()) {
+      if (!this.touchedContent.has(`${k}#trail`)) this.trails.delete(k);
+    }
+    this.touchedContent.clear();
+    const now = performance.now();
+    if (this.models.size === 0 || now - this.lastModelSweep < 2000) return;
+    this.lastModelSweep = now;
+    const used = new Set<string>();
+    const liveNodes = new Set<string>();
+    for (const key of [...this.surfaces.keys(), ...this.worldKeys]) {
+      for (const node of this.sceneStore.nodesForSurface(key)) {
+        if (node.kind !== 'model') continue;
+        liveNodes.add(`${key}/${node.id}`);
+        const src = this.sceneStore.resolveParams(node).src;
+        if (typeof src === 'string') used.add(src);
+      }
+    }
+    for (const [src, e] of this.models) {
+      if (used.has(src) || e.state === 'loading') continue;
+      this.freeModel(e);
+      this.models.delete(src);
+    }
+    for (const k of this.modelClocks.keys()) if (!liveNodes.has(k)) this.modelClocks.delete(k);
+    for (const k of this.modelPoses.keys()) if (!liveNodes.has(k)) this.modelPoses.delete(k);
+  }
+
+  /** After a context restore: label textures re-render; models and lines rebuild from their CPU copies. */
+  private contentContextRestored(): void {
+    this.labelTextures.clear();
+    this.lineHandles.clear();
+    // Model buffers rebuild in ensureModelGpu (their generation is stale now).
   }
 
   // ── Declarative animation engine ─────────────────────────────────────
@@ -3607,9 +5453,20 @@ export class Compositor {
     if (p.stop === true) { this.nodeAnims.delete(fullKey); return; }
     const node = this.sceneStore.getNode(surfaceKey, op.id);
     if (!node) return;
+    const existing = this.nodeAnims.get(fullKey)?.anims ?? [];
+    // A new target for a running spring bends its motion (keeping its
+    // velocity) instead of restarting it.
+    if (p.spring !== undefined && p.spring !== false && typeof p.channel === 'string' && p.to !== undefined) {
+      const running = existing.find((a) => a.channel === p.channel && a.spring && !a.spring.settled);
+      if (running?.spring) {
+        const cfg = typeof p.spring === 'object' && p.spring ? p.spring as Record<string, number> : {};
+        retargetSpring(running.spring, this.channelValue(running.channel, p.to), cfg);
+        this.needsRender = true;
+        return;
+      }
+    }
     const built = this.buildAnims(node, p);
     if (built.length === 0) return;
-    const existing = this.nodeAnims.get(fullKey)?.anims ?? [];
     // Replace same-channel animations; keep others (so spin + bob can coexist).
     const channels = new Set(built.map((a) => a.channel));
     const merged = existing.filter((a) => !channels.has(a.channel)).concat(built);
@@ -3679,10 +5536,43 @@ export class Compositor {
         const plane = ((p.plane as string) ?? 'xz') as 'xy' | 'xz' | 'yz';
         return [{ ...base, channel: 'orbit', from: cur, to: cur, duration: dur, loop: true, center, radius, plane }];
       }
+      // Data presets (wobble, breathe, hover, ...): keyframe tracks around
+      // the node's current transform.
+      const data = MOTION_PRESETS[preset];
+      if (data) {
+        const tracks = expandMotionPreset(data, {
+          position: this.vecOf(node, 'position'), rotation: this.vecOf(node, 'rotation'), scale: this.vecOf(node, 'scale'),
+        }, {
+          duration: typeof p.duration === 'number' ? p.duration : undefined,
+          amplitude: typeof p.amplitude === 'number' ? p.amplitude : undefined,
+          loop: typeof p.loop === 'boolean' ? p.loop : undefined,
+          yoyo: typeof p.yoyo === 'boolean' ? p.yoyo : undefined,
+        });
+        return tracks.map(({ channel, track }) => ({
+          ...base, channel, from: [], to: [], duration: track.duration, loop: track.loop, yoyo: track.yoyo, track,
+        }));
+      }
       return [];
     }
     const channel = p.channel as NodeAnim['channel'];
     if (!channel) return [];
+    if (Array.isArray(p.keyframes)) {
+      // Keyframes: [{ t (ms), value, easing? }], each key's easing shaping
+      // the segment that starts at it (default: the op's easing, else linear).
+      const track = buildKeyframeTrack(
+        p.keyframes as Array<{ t: number; value: unknown; easing?: unknown }>,
+        (v) => this.keyframeValue(channel, v),
+        { loop: p.loop === true, yoyo: p.yoyo === true, easing: p.easing },
+      );
+      if (!track) return [];
+      return [{ ...base, channel, from: [], to: [], duration: track.duration, track }];
+    }
+    if (p.spring !== undefined && p.spring !== false && p.to !== undefined) {
+      const cfg = typeof p.spring === 'object' && p.spring ? p.spring as Record<string, number> : {};
+      const from = p.from !== undefined ? this.channelValue(channel, p.from) : this.vecOf(node, channel);
+      const spring = createSpring(from, this.channelValue(channel, p.to), cfg);
+      return [{ ...base, channel, from, to: spring.target, duration: 0, loop: false, yoyo: false, spring }];
+    }
     const duration = (p.duration as number) ?? 800;
     if (channel === 'position' && Array.isArray(p.path)) {
       const path = (p.path as number[][]);
@@ -3709,6 +5599,14 @@ export class Compositor {
     // color / emissive
     const c = parseCssColor(resolveSceneColor((node.params[channel === 'color' ? 'color' : 'emissive'] as string) ?? '#ffffff', this.sceneTheme));
     return [c.r, c.g, c.b];
+  }
+
+  /** A keyframe's value as the channel's vector, or undefined when it does not fit the channel. */
+  private keyframeValue(channel: NodeAnim['channel'], v: unknown): number[] | undefined {
+    if (channel === 'color' || channel === 'emissive') return typeof v === 'string' ? this.channelValue(channel, v) : undefined;
+    if (channel === 'opacity') return typeof v === 'number' ? [v] : undefined;
+    if (typeof v === 'number') return channel === 'scale' ? [v, v, v] : undefined;
+    return Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === 'number') ? [...v as number[]] : undefined;
   }
 
   /** Coerce an animate target value into the channel's numeric vector form. */
@@ -3752,6 +5650,19 @@ export class Compositor {
   private applyAnim(node: VocabNode, a: NodeAnim, now: number): boolean {
     const elapsed = now - a.start;
     if (elapsed < 0) return false; // still in delay
+    if (a.track) {
+      const { value, done } = sampleKeyframes(a.track, elapsed);
+      this.writeChannel(node, a.channel, value);
+      return done;
+    }
+    if (a.spring) {
+      // Exact spring step for the real frame time (stable at any frame rate).
+      const dt = (now - Math.max(a.lastT ?? a.start, a.start)) / 1000;
+      a.lastT = now;
+      const moving = stepSpring(a.spring, dt);
+      this.writeChannel(node, a.channel, a.spring.value);
+      return !moving;
+    }
     if (a.channel === 'orbit') {
       const ang = (elapsed / a.duration) * Math.PI * 2;
       const c = a.center ?? [0, 0, 0], r = a.radius ?? 100;
@@ -3880,6 +5791,8 @@ export class Compositor {
   }
 
   private clampScroll(): void {
+    // The phone camera keeps to the used desktop instead (see clampMobileView).
+    if (this.mobileMode) { this.clampMobileView(); return; }
     const ws = this.getWorkspaceSize();
     const maxX = Math.max(0, ws.width - this.width);
     const maxY = Math.max(0, ws.height - this.height);
@@ -4037,325 +5950,649 @@ export class Compositor {
     this.panDrag = undefined;
   }
 
+  /** Screen height above the gesture handle (where framing places content). */
   private get mobileAvailHeight(): number {
     return this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
   }
 
+  /**
+   * The phone renders the real desktop (renderDesktop: slabs, shadows, world
+   * layers, pop-outs, effects, ghosts) through its zoomable camera, after
+   * advancing any camera flight, glide or Exposé animation, then draws its
+   * own 2D chrome: the gesture handle and, in Exposé, the window titles.
+   */
   private renderMobile(): void {
-    this.updateCamera(0, 0);
-
-    if (this.mobileView === MobileViewState.CARD_OVERVIEW) {
-      this.renderCardOverview();
-      return;
-    }
-
-    const availW = this.width;
-    const availH = this.mobileAvailHeight;
-
-    // Find focused surface (or fallback to top visible). A focused id that
-    // is stale (destroyed), not yet drawn, or hidden must NOT render an
-    // empty frame (black screen) — fall back to the top visible surface
-    // until the focused surface becomes displayable.
-    let surface = this.mobileFocusedSurfaceId
-      ? this.surfaces.get(this.mobileFocusedSurfaceId)
-      : undefined;
-    if (!surface || !surface.drawn || !surface.visible) {
-      surface = this.getTopVisibleSurface();
-    }
-
-    if (surface && surface.drawn && surface.visible) {
-      // Base scale: fit window into available area
-      const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
-      // Final scale: base * user zoom (min zoom = fit-to-screen)
-      const scale = baseScale * this.mobileUserZoom;
-
-      // When zoomed in, allow panning. Clamp pan so content stays visible.
-      const scaledW = surface.rect.width * scale;
-      const scaledH = surface.rect.height * scale;
-      const maxPanX = Math.max(0, (scaledW - availW) / 2);
-      const maxPanY = Math.max(0, (scaledH - availH) / 2);
-      this.mobilePanX = Math.max(-maxPanX, Math.min(maxPanX, this.mobilePanX));
-      this.mobilePanY = Math.max(-maxPanY, Math.min(maxPanY, this.mobilePanY));
-
-      const offsetX = (availW - scaledW) / 2 + this.mobilePanX;
-      const offsetY = (availH - scaledH) / 2 + this.mobilePanY;
-
-      // Cache transform for coordinate mapping
-      this.mobileTransform = { scale, offsetX, offsetY };
-
-      const state = this.glState(surface.id);
-      const cx = offsetX + scaledW / 2;
-      const cy = offsetY + scaledH / 2;
-      const model = mat4TRS(
-        cx, cy, 0,
-        0, 0, 0,
-        scaledW, scaledH, 1,
-      );
-      state.model = model;
-      this.drawnThisFrame.add(surface.id);
-      // Off-axis camera fitted to the on-screen slab: the same per-window
-      // projection the desktop uses, so scene-vocabulary nodes keep their
-      // exact desktop geometry while the slab stays a front-facing rectangle.
-      const cam = this.windowCamera(cx, cy, 0);
-      this.drawSurfaceSlab(surface, state, model, {
-        radius: 0,
-        dim: 1,
-        opacity: 1,
-        viewProj: cam.viewProj,
-        // Clip to content area (above the gesture handle)
-        scissor: { x: 0, y: 0, width: availW, height: availH },
-      });
-      // Render the surface's scene-vocabulary nodes (3D meshes and
-      // kind:'canvas' layers) in the same slab space. Without this, any
-      // scene-rendered abject (FluidSimulation's 3D fluid, OpenStreetMap's
-      // tile layer) is blank on the phone client while slab-only content
-      // (MaximKhailoPhoto) works. Card overview stays 2D-slab-only.
-      //
-      // Nodes ride a frame WITHOUT the slab's px size baked in, exactly as the
-      // desktop does (see renderDesktop). Handing them the slab model instead
-      // multiplied every node offset by the slab's width/height — a 256px
-      // canvas tile landed tens of thousands of px wide, far outside the clip —
-      // and, since the slab scales x/y but not z, squashed every mesh flat.
-      // The phone's fit-to-screen factor is the one scale the subtree does
-      // want, applied UNIFORMLY so geometry shrinks with the window undistorted.
-      const frame = mat4TRS(cx, cy, 0, 0, 0, 0, scale, scale, scale);
-      this.renderer.clearDepth();
-      this.drawVocabNodes(surface, frame, 'occluded', cam);
-      this.drawVocabNodes(surface, frame, 'overlay', cam);
-    }
-
-    const ctx = this.overlay.begin();
-    this.drawGestureHandle(ctx);
-    this.overlay.markContent();
+    if (this.stepMobileCamera(performance.now())) this.needsRender = true;
+    this.renderDesktop();
+    this.drawMobileOverlay();
   }
 
-  /** Slim centered pill hinting the swipe-up-from-bottom gesture. */
-  private drawGestureHandle(ctx: OffscreenCanvasRenderingContext2D): void {
+  /** Advance the phone camera one frame (Exposé steps in stepExpose). True while anything moves. */
+  private stepMobileCamera(now: number): boolean {
+    let moving = false;
+    // The framed window closed: fly out unless its object came right back.
+    if (this.mobileFocusLost) {
+      if (now - this.mobileFocusLost.at > 400) {
+        this.mobileFocusLost = undefined;
+        if (this.mobileView === MobileViewState.FOCUS) this.mobileFlyOut();
+      } else {
+        moving = true;
+      }
+    }
+    // Keep the desktop fitted while windows arrive, until the user takes the camera.
+    if (this.mobileAutoFit && !this.mobileFlight && this.mobileView === MobileViewState.DESKTOP) {
+      const fit = this.mobileFitCam();
+      if (Math.abs(fit.x - this.scrollX) > 0.01 || Math.abs(fit.y - this.scrollY) > 0.01
+          || Math.abs(fit.zoom - this.viewZoom) > 1e-5) {
+        this.applyMobileCam(fit);
+      }
+    }
+    const f = this.mobileFlight;
+    if (f) {
+      const t = Math.min(1, (now - f.start) / f.duration);
+      this.applyMobileCam(this.lerpCam(f.from, f.to, cubicBezier(EMPHASIZE, t)));
+      if (t >= 1) this.mobileFlight = undefined;
+      else moving = true;
+    }
+    const g = this.mobileGlide;
+    if (g) {
+      const dt = Math.min(0.05, Math.max(0, (now - g.last) / 1000));
+      g.last = now;
+      const decay = Math.exp(-Compositor.MOBILE_GLIDE_FRICTION * dt);
+      g.vx *= decay;
+      g.vy *= decay;
+      const before = this.currentCam();
+      this.scrollX -= (g.vx * dt) / this.viewZoom;
+      this.scrollY -= (g.vy * dt) / this.viewZoom;
+      this.clampMobileView();
+      // A glide that hits the edge of the desktop stops there.
+      if (Math.abs(this.scrollX - before.x) < 1e-3 && Math.abs(g.vx) > 0) g.vx = 0;
+      if (Math.abs(this.scrollY - before.y) < 1e-3 && Math.abs(g.vy) > 0) g.vy = 0;
+      if (Math.hypot(g.vx, g.vy) < 12) this.mobileGlide = undefined;
+      else moving = true;
+    }
+    return moving;
+  }
+
+  /**
+   * Advance Exposé one frame (render, phone and desktop): the spread, the
+   * desktop's selection highlight, and the phone's flicked windows. True
+   * while anything moves; once settled the desktop rests.
+   */
+  private stepExpose(now: number): boolean {
+    let moving = this.syncExposeMembers(now);
+    for (const slot of this.exposeSlots.values()) {
+      if (!slot.from || slot.moveStart === undefined) continue;
+      if (now - slot.moveStart < Compositor.EXPOSE_FLIGHT_MS) moving = true;
+      else { slot.from = undefined; slot.moveStart = undefined; slot.joining = undefined; moving = true; }
+    }
+    const a = this.exposeAnim;
+    if (a) {
+      const t = Math.min(1, (now - a.start) / a.duration);
+      this.exposeT = a.from + (a.to - a.from) * cubicBezier(EMPHASIZE, t);
+      this.exposeP = a.pFrom + (a.to - a.pFrom) * t;
+      if (t >= 1) {
+        this.exposeAnim = undefined;
+        a.done?.();
+      } else {
+        moving = true;
+      }
+    }
+    for (const [id, fly] of this.exposeFlyOff) {
+      const age = now - fly.start;
+      if (age < 260) moving = true;
+      // A window the backend kept (it refused to close) drops back into its slot.
+      else if (age > 2500) { this.exposeFlyOff.delete(id); this.exposeLift.delete(id); moving = true; }
+    }
+    if (!this.mobileMode) {
+      // The selected window eases up to its highlight; the rest ease down.
+      for (const id of this.exposeSlots.keys()) {
+        const target = id === this.exposeSelected && this.mobileView === MobileViewState.EXPOSE ? 1 : 0;
+        const cur = this.exposeHot.get(id) ?? 0;
+        if (cur === target) continue;
+        const next = cur + (target - cur) * 0.3;
+        this.exposeHot.set(id, Math.abs(next - target) < 0.01 ? target : next);
+        moving = true;
+      }
+    }
+    return moving;
+  }
+
+  /** Draw the phone's 2D chrome. The overlay texture is reused until what it shows changes. */
+  private drawMobileOverlay(): void {
+    const expose = this.exposeT > 0.02;
+    const color = this.mobileView === MobileViewState.EXPOSE
+      ? this.sceneColor('accent', '#d32f22')
+      : this.sceneColor('textSecondary', '#a8a292');
+    const sig = expose ? `expose:${performance.now()}` : `${this.width}x${this.height}:${color}`;
+    if (sig === this.mobileOverlaySig) return;
+    this.mobileOverlaySig = sig;
+    const ctx = this.overlay.begin();
+    this.overlay.markContent();
+    if (expose) this.drawExposeLabels(ctx);
+    this.drawGestureHandle(ctx, color);
+  }
+
+  /** Slim centered pill: the phone's "home" affordance (tap or swipe up to fly out). */
+  private drawGestureHandle(ctx: OffscreenCanvasRenderingContext2D, color: string): void {
     const h = Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
     const y = this.height - h / 2;
     const pillW = 120;
     const pillH = 4;
     const x = (this.width - pillW) / 2;
-    ctx.fillStyle = this.mobileView === MobileViewState.CARD_OVERVIEW
-      ? this.sceneColor('accent', '#d32f22')
-      : this.sceneColor('textSecondary', '#a8a292');
+    ctx.fillStyle = color;
     this.roundRectOn(ctx, x, y - pillH / 2, pillW, pillH, 0);
     ctx.fill();
   }
 
-  // ── Card overview (WebOS-style) ─────────────────────────────────────
+  // ── Phone camera ──────────────────────────────────────────────────────
 
-  /** Sync mobileCardOrder with the currently visible surfaces. */
-  private reconcileCardOrder(): void {
-    const vis = this.getMobileVisibleSurfaces().map(s => s.id);
-    const visSet = new Set(vis);
-    // Drop destroyed/hidden surfaces, preserve existing positions.
-    this.mobileCardOrder = this.mobileCardOrder.filter(id => visSet.has(id));
-    // Append newly-visible surfaces at the end.
-    const known = new Set(this.mobileCardOrder);
-    for (const id of vis) if (!known.has(id)) this.mobileCardOrder.push(id);
-    // Clamp scroll to deck bounds.
-    const n = this.mobileCardOrder.length;
-    this.mobileCardScroll = Math.max(0, Math.min(this.mobileCardScroll, Math.max(0, n - 1)));
+  private currentCam(): MobileCam {
+    return { x: this.scrollX, y: this.scrollY, zoom: this.viewZoom };
   }
 
-  /** Card box dimensions and slot spacing for the current viewport. */
-  private cardMetrics(): { boxW: number; boxH: number; slotW: number; cx: number; cy: number } {
-    const availH = this.mobileAvailHeight;
-    const boxW = this.width * Compositor.CARD_BOX_W_FRAC;
-    const boxH = availH * Compositor.CARD_BOX_H_FRAC;
+  private applyMobileCam(c: MobileCam): void {
+    this.scrollX = c.x;
+    this.scrollY = c.y;
+    this.viewZoom = c.zoom;
+    this.needsRender = true;
+  }
+
+  /** Between two poses: zoom geometrically, the view centre in a straight line. */
+  private lerpCam(a: MobileCam, b: MobileCam, t: number): MobileCam {
+    const W = this.width;
+    const H = this.height;
+    const zoom = Math.exp(Math.log(a.zoom) + (Math.log(b.zoom) - Math.log(a.zoom)) * t);
+    const acx = a.x + W / (2 * a.zoom), acy = a.y + H / (2 * a.zoom);
+    const bcx = b.x + W / (2 * b.zoom), bcy = b.y + H / (2 * b.zoom);
+    const cx = acx + (bcx - acx) * t;
+    const cy = acy + (bcy - acy) * t;
+    return { x: cx - W / (2 * zoom), y: cy - H / (2 * zoom), zoom };
+  }
+
+  /** Fly the camera to a pose with the motion curve. */
+  private flyTo(to: MobileCam, duration = Compositor.MOBILE_FLIGHT_MS): void {
+    this.mobileGlide = undefined;
+    this.mobileFlight = { from: this.currentCam(), to, start: performance.now(), duration };
+    this.needsRender = true;
+  }
+
+  /** Workspace bounds the phone can see: every visible window, the dock included. */
+  private mobileUsedBounds(): { x0: number; y0: number; x1: number; y1: number } {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of this.sortedSurfaces) {
+      // Pinned windows live in screen space, not on the desktop being framed.
+      if (!s.visible || !s.drawn || s.inputPassthrough || this.isWorkspaceFiltered(s) || this.pinnable(s)) continue;
+      const b = this.surfaceBounds(s);
+      if (b.x0 < x0) x0 = b.x0;
+      if (b.y0 < y0) y0 = b.y0;
+      if (b.x1 > x1) x1 = b.x1;
+      if (b.y1 > y1) y1 = b.y1;
+    }
+    if (!Number.isFinite(x0)) return { x0: 0, y0: 0, x1: 1280, y1: 800 };
+    return { x0, y0, x1, y1 };
+  }
+
+  /**
+   * A window's workspace box: its rect, or for a window riding a scene node
+   * the box its slab covered on screen last frame (mapped back to workspace
+   * px), so framing follows where the window really is.
+   */
+  private surfaceBounds(s: Surface): { x0: number; y0: number; x1: number; y1: number; z?: number } {
+    const st = this.surfaceGl.get(s.id);
+    if (st?.attach && st.model) {
+      // The slab's corners in world space (x, y) and its mean depth, which
+      // framing uses for the perspective scale once the eye is over it.
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, z = 0;
+      for (const [qx, qy] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]) {
+        const p = mat4TransformPoint(st.model, vec3(qx, qy, 0));
+        x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
+        y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+        z += p.z / 4;
+      }
+      if (Number.isFinite(x0) && Number.isFinite(y0) && Number.isFinite(z)) return { x0, y0, x1, y1, z };
+    }
+    return { x0: s.rect.x, y0: s.rect.y, x1: s.rect.x + s.rect.width, y1: s.rect.y + s.rect.height };
+  }
+
+  /** The pose that shows the whole used desktop above the gesture handle. */
+  private mobileFitCam(): MobileCam {
+    const b = this.mobileUsedBounds();
+    const m = Compositor.MOBILE_MARGIN;
+    const W = Math.max(1, this.width);
+    const H = Math.max(1, this.mobileAvailHeight);
+    const bw = Math.max(1, b.x1 - b.x0);
+    const bh = Math.max(1, b.y1 - b.y0);
+    const zoom = Math.max(0.05, Math.min(1, (W - 2 * m) / bw, (H - 2 * m) / bh));
+    return { x: (b.x0 + b.x1) / 2 - W / (2 * zoom), y: (b.y0 + b.y1) / 2 - H / (2 * zoom), zoom };
+  }
+
+  /**
+   * The pose that frames a workspace box: its width fits the screen with a
+   * small margin (zoom capped at `maxZoom`), top-aligned when it is taller
+   * than the space above the handle (so a window's title bar stays in view),
+   * centred otherwise.
+   */
+  private mobileFrameCam(b: { x0: number; y0: number; x1: number; y1: number; z?: number }, maxZoom: number): MobileCam {
+    const m = Compositor.MOBILE_MARGIN;
+    const W = Math.max(1, this.width);
+    const Hc = Math.max(1, this.height);
+    const H = Math.max(1, this.mobileAvailHeight);
+    const bw = Math.max(1, b.x1 - b.x0);
+    const bh = Math.max(1, b.y1 - b.y0);
+    // A box off the z=0 plane (a window riding a node) shows larger or
+    // smaller by the perspective at its depth once the eye is over it.
+    const D = cameraDistance(Hc);
+    const s = b.z ? D / Math.max(1, D - b.z) : 1;
+    const zoom = Math.max(0.05, Math.min(maxZoom, (W - 2 * m) / (bw * s)));
+    // The eye goes over the box centre horizontally; vertically the box is
+    // top-aligned under the margin, or centred in the space above the handle.
+    const x = (b.x0 + b.x1) / 2 - W / (2 * zoom);
+    const eyeY = bh * s * zoom > H - 2 * m
+      ? b.y0 - (m - Hc / 2) / (zoom * s)
+      : (b.y0 + b.y1) / 2 - (H - Hc) / (2 * zoom * s);
+    return { x, y: eyeY - Hc / (2 * zoom), zoom };
+  }
+
+  /**
+   * Keep the phone camera on the desktop: zoom between half the fit-all zoom
+   * and the maximum, and the view centre inside the used area (lowered by
+   * any bottom inset, so a field just above a covering keyboard can scroll
+   * into view). Flights and Exposé own the camera while they run.
+   */
+  private clampMobileView(): void {
+    if (this.mobileFlight || this.exposeT > 0) return;
+    const W = Math.max(1, this.width);
+    const H = Math.max(1, this.height);
+    const fit = this.mobileFitCam().zoom;
+    const zoom = Math.max(fit * 0.5, Math.min(Compositor.MOBILE_MAX_ZOOM, this.viewZoom));
+    const b = this.mobileUsedBounds();
+    const cx = this.scrollX + W / (2 * this.viewZoom);
+    const cy = this.scrollY + H / (2 * this.viewZoom);
+    const ncx = Math.max(b.x0, Math.min(b.x1, cx));
+    const ncy = Math.max(b.y0, Math.min(b.y1 + this.mobileBottomInset / zoom, cy));
+    this.viewZoom = zoom;
+    this.scrollX = ncx - W / (2 * zoom);
+    this.scrollY = ncy - H / (2 * zoom);
+  }
+
+  // ── Exposé ────────────────────────────────────────────────────────────
+
+  /**
+   * Windows Exposé spreads (and focus swipes move between): visible and
+   * ordinary, so no system rails, overlays, passthrough surfaces, windows
+   * riding a scene node (they stay with their node), or windows pinned to
+   * the phone's screen (HUDs, not places to go).
+   */
+  private exposeCandidates(): Surface[] {
+    return this.sortedSurfaces.filter((s) => s.visible && s.drawn && !s.inputPassthrough && !s.transparent
+      && s.zIndex < RAIL_Z_THRESHOLD && !this.isWorkspaceFiltered(s) && !this.surfaceGl.get(s.id)?.attach
+      && !this.pinnable(s));
+  }
+
+  /**
+   * A surface the desktop Exposé leaves in place, live over the scrim: the
+   * system rails (the dock, toolbars, toasts: anything stacked at or above
+   * the rail threshold). The phone's Exposé shows only the spread windows.
+   */
+  private exposeKeeps(s: Surface): boolean {
+    return !this.mobileMode && s.zIndex >= RAIL_Z_THRESHOLD && s.visible && s.drawn && !this.isWorkspaceFiltered(s);
+  }
+
+  /**
+   * The screen area the desktop Exposé grid fills: the viewport, less the
+   * rails docked along its edges (they stay put, see exposeKeeps), inset by
+   * a margin with room at the top for the key hint.
+   */
+  private exposeDesktopArea(): Rect {
+    const W = this.width;
+    const H = this.height;
+    let x0 = 0, y0 = 0, x1 = W, y1 = H;
+    for (const s of this.sortedSurfaces) {
+      if (!this.exposeKeeps(s)) continue;
+      const p = this.workspaceToViewport(s.rect.x, s.rect.y);
+      const { width: w, height: h } = s.rect;
+      const edge = 8;
+      if (h >= H * 0.5 && p.x <= edge) x0 = Math.max(x0, p.x + w);
+      else if (h >= H * 0.5 && p.x + w >= W - edge) x1 = Math.min(x1, p.x);
+      else if (w >= W * 0.5 && p.y <= edge) y0 = Math.max(y0, p.y + h);
+      else if (w >= W * 0.5 && p.y + h >= H - edge) y1 = Math.min(y1, p.y);
+    }
+    const side = 36, top = 52, bottom = 24;
+    return { x: x0 + side, y: y0 + top, width: Math.max(40, x1 - x0 - side * 2), height: Math.max(40, y1 - y0 - top - bottom) };
+  }
+
+  /**
+   * Lay the windows out in a grid on the current screen (reading order,
+   * columns chosen for the largest shown area, never above 1:1), stored as
+   * workspace centres and scales so renderDesktop can carry each slab there.
+   */
+  private layoutExpose(wins: Surface[]): void {
+    this.exposeSlots.clear();
+    const desk = this.mobileMode ? undefined : this.exposeDesktopArea();
+    const side = desk ? desk.x : 12;
+    const top = desk ? desk.y : 28;
+    const labelH = desk ? 36 : 22;
+    const gap = desk ? 36 : 16;
+    const areaW = desk ? desk.width : Math.max(40, this.width - side * 2);
+    const areaH = desk ? desk.height : Math.max(40, this.mobileAvailHeight - top - 8);
+    const n = wins.length;
+    this.exposeCount = n;
+    this.exposeMembers = new Set(wins.map((s) => s.id));
+    const sorted = [...wins].sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));
+    const fitIn = (s: Surface, cw: number, ch: number) =>
+      Math.max(0.02, Math.min(1, (cw - gap) / s.rect.width, (ch - gap - labelH) / s.rect.height));
+    let cols = 1;
+    let bestScore = -1;
+    for (let c = 1; c <= n; c++) {
+      const rows = Math.ceil(n / c);
+      const cw = areaW / c, ch = areaH / rows;
+      let score = 0;
+      for (const s of sorted) {
+        const k = fitIn(s, cw, ch);
+        score += k * k * s.rect.width * s.rect.height;
+      }
+      if (score > bestScore) { bestScore = score; cols = c; }
+    }
+    const rows = Math.ceil(n / cols);
+    const cw = areaW / cols, ch = areaH / rows;
+    sorted.forEach((s, i) => {
+      const r = Math.floor(i / cols);
+      const c = i % cols;
+      const inRow = r === rows - 1 ? n - r * cols : cols;
+      const sx = side + ((cols - inRow) * cw) / 2 + c * cw + cw / 2;
+      const sy = top + r * ch + (ch - labelH) / 2;
+      const k = fitIn(s, cw, ch);
+      const w = this.viewportToWorkspace(sx, sy);
+      this.exposeSlots.set(s.id, { cx: w.x, cy: w.y, s: k / this.viewZoom, title: s.title ?? '', index: i });
+    });
+  }
+
+  /** Lay the open desktop grid out again for the current screen. */
+  private relayoutExpose(): void {
+    const wins = this.exposeCandidates();
+    if (wins.length > 0) this.layoutExpose(wins);
+  }
+
+  /**
+   * While Exposé is open, keep the grid in step with the windows (render,
+   * phone and desktop): a window that opens, closes, hides or shows lays the
+   * grid out again. Every window glides from where it is to its new slot; a
+   * newcomer flies in from its own rect (arcing toward the viewer on the
+   * desktop); a closed one folds away in its old slot (its close ghost rides
+   * the slot frame it was last drawn in). No window left: Exposé closes.
+   */
+  private syncExposeMembers(now: number): boolean {
+    if (this.mobileView !== MobileViewState.EXPOSE) return false;
+    const wins = this.exposeCandidates();
+    if (wins.length === this.exposeMembers.size && wins.every((w) => this.exposeMembers.has(w.id))) return false;
+    if (wins.length === 0) {
+      this.exitExpose();
+      return true;
+    }
+    const from = new Map<string, { cx: number; cy: number; s: number }>();
+    for (const [id, slot] of this.exposeSlots) from.set(id, this.exposeSlotNow(slot, now));
+    this.layoutExpose(wins);
+    for (const [id, slot] of this.exposeSlots) {
+      const r = this.surfaces.get(id)!.rect;
+      slot.from = from.get(id) ?? { cx: r.x + r.width / 2, cy: r.y + r.height / 2, s: 1 };
+      slot.joining = !from.has(id);
+      slot.moveStart = now;
+    }
+    if (this.exposeSelected && !this.exposeSlots.has(this.exposeSelected)) this.exposeSelected = this.exposeOrder()[0];
+    return true;
+  }
+
+  /**
+   * A slot where it is right now: gliding from its previous place after a
+   * re-layout (EMPHASIZE over one flight), else at rest. z is the newcomer's
+   * arc toward the viewer on the desktop.
+   */
+  private exposeSlotNow(slot: ExposeSlot, now: number): { cx: number; cy: number; s: number; z: number } {
+    const f = slot.from;
+    if (!f || slot.moveStart === undefined) return { cx: slot.cx, cy: slot.cy, s: slot.s, z: 0 };
+    const k = Math.min(1, Math.max(0, (now - slot.moveStart) / Compositor.EXPOSE_FLIGHT_MS));
+    if (k >= 1) return { cx: slot.cx, cy: slot.cy, s: slot.s, z: 0 };
+    const e = cubicBezier(EMPHASIZE, k);
     return {
-      boxW,
-      boxH,
-      slotW: boxW * Compositor.CARD_SLOT_FRAC,
-      cx: this.width / 2,
-      cy: availH / 2,
+      cx: f.cx + (slot.cx - f.cx) * e,
+      cy: f.cy + (slot.cy - f.cy) * e,
+      s: f.s + (slot.s - f.s) * e,
+      z: slot.joining && !this.mobileMode ? Math.sin(Math.PI * e) * Compositor.EXPOSE_ARC : 0,
     };
   }
 
-  /** Eased size factor for a card by its signed slot distance from center. */
-  private cardSizeFactor(slot: number): number {
-    const d = Math.min(Math.abs(slot), 1);
-    return 1 - 0.18 * d;
+  /**
+   * Run the spread toward `to` (1 = into the grid, 0 = home). The phone flies
+   * every window together; the desktop staggers them in reading order along
+   * the linear progress (see exposeLocalT), so the whole run is longer.
+   */
+  private animateExpose(to: number, done?: () => void): void {
+    const duration = this.mobileMode
+      ? Compositor.MOBILE_FLIGHT_MS
+      : Compositor.EXPOSE_FLIGHT_MS * (1 + Compositor.EXPOSE_STAGGER);
+    this.exposeAnim = { from: this.exposeT, to, pFrom: this.exposeP, start: performance.now(), duration, done };
+    this.needsRender = true;
   }
 
-  /** Drawn rect (and surface) for a deck index, applying any active drag. */
-  private cardDrawRect(index: number): { x: number; y: number; w: number; h: number; surface: Surface; slot: number } | undefined {
-    const id = this.mobileCardOrder[index];
-    if (id === undefined) return undefined;
-    const surface = this.surfaces.get(id);
-    if (!surface || !surface.drawn) return undefined;
+  /**
+   * How far one window is along its flight (0 at its rect, 1 in its slot).
+   * The phone moves every window with the scrim; the desktop starts each a
+   * little after the one before it in reading order (and on the way home
+   * the last one leaves first), each flight eased on its own.
+   */
+  private exposeLocalT(index: number): number {
+    const n = this.exposeCount;
+    if (this.mobileMode || n <= 1) return this.exposeT;
+    const S = Compositor.EXPOSE_STAGGER;
+    const q = Math.max(0, Math.min(1, this.exposeP * (1 + S) - (S * Math.min(index, n - 1)) / (n - 1)));
+    return cubicBezier(EMPHASIZE, q);
+  }
 
-    const { boxW, boxH, slotW, cx, cy } = this.cardMetrics();
-    let slot = index - this.mobileCardScroll;
-
-    // A reordering card follows the finger horizontally.
-    const drag = this.cardDragState;
-    let dragDx = 0, dragDy = 0;
-    if (drag && drag.surfaceId === id) {
-      if (drag.reorder) dragDx = drag.dx;
-      else dragDy = drag.dy;
+  /** A slot's vertical screen offset: the finger's lift, or a flick flying it off the top. */
+  private exposeOffset(id: string): number {
+    const fly = this.exposeFlyOff.get(id);
+    if (fly) {
+      const t = Math.min(1, (performance.now() - fly.start) / 240);
+      return fly.from + (-(this.height + 200) - fly.from) * cubicBezier(ACCELERATE, t);
     }
-
-    const reveal = 0.92 + 0.08 * this.cardRevealT;
-    const fit = Math.min(boxW / surface.rect.width, boxH / surface.rect.height);
-    const cardScale = fit * this.cardSizeFactor(slot) * reveal;
-    const w = surface.rect.width * cardScale;
-    const h = surface.rect.height * cardScale;
-    const centerX = cx + slot * slotW + dragDx;
-    const centerY = cy + dragDy;
-    return { x: centerX - w / 2, y: centerY - h / 2, w, h, surface, slot };
+    return this.exposeLift.get(id) ?? 0;
   }
 
-  private renderCardOverview(): void {
-    this.reconcileCardOrder();
-    const availH = this.mobileAvailHeight;
-    const chrome = this.chromeColors();
+  /**
+   * Exposé pose of a window (renderDesktop): a frame carrying it from its
+   * rect toward its grid slot, scaled, plus the window camera over that
+   * spot. Undefined when Exposé is closed or the window has no slot.
+   */
+  private exposeView(surface: Surface, state: SurfaceGlState): { frame: Mat4; cam: SceneCamera } | undefined {
+    if (this.exposeT <= 0) return undefined;
+    const p = this.exposePose(surface);
+    if (!p) return undefined;
+    const z = p.z + p.s * (state.lift + (state.userZ ?? 0));
+    return { frame: mat4TRS(p.cx, p.cy, p.z, 0, 0, 0, p.s, p.s, p.s), cam: this.windowCamera(p.cx, p.cy, z) };
+  }
 
-    // Dim backdrop quad.
-    const backdropModel = mat4TRS(this.width / 2, availH / 2, -2, 0, 0, 0, this.width, availH, 1);
-    this.renderer.drawFlat(backdropModel, this.viewProj, { r: 8 / 255, g: 8 / 255, b: 16 / 255, a: 0.92 });
+  /**
+   * Where Exposé has a window right now: workspace centre and scale, and on
+   * the desktop a hop toward the viewer mid-flight (z, 0 at rest) and the
+   * selection's scale-up.
+   */
+  private exposePose(surface: Surface): { cx: number; cy: number; s: number; z: number } | undefined {
+    const slot = this.exposeSlots.get(surface.id);
+    if (!slot) return undefined;
+    const t = this.exposeLocalT(slot.index);
+    const at = this.exposeSlotNow(slot, performance.now());
+    const rx = surface.rect.x + surface.rect.width / 2;
+    const ry = surface.rect.y + surface.rect.height / 2;
+    const hot = this.mobileMode ? 0 : (this.exposeHot.get(surface.id) ?? 0) * t;
+    return {
+      cx: rx + (at.cx - rx) * t,
+      cy: ry + (at.cy - ry) * t + this.exposeOffset(surface.id) / this.viewZoom,
+      s: (1 + (at.s - 1) * t) * (1 + Compositor.EXPOSE_HOT_SCALE * hot),
+      z: (this.mobileMode ? 0 : Math.sin(Math.PI * t) * Compositor.EXPOSE_ARC) + at.z * t,
+    };
+  }
 
-    const overlayCtx = this.overlay.begin();
+  /** A window's Exposé rect on screen (px), from its current pose. */
+  private exposeScreenRect(surface: Surface): Rect | undefined {
+    const p = this.exposePose(surface);
+    if (!p) return undefined;
+    const c = this.workspaceToViewport(p.cx, p.cy);
+    const w = surface.rect.width * p.s * this.viewZoom;
+    const h = surface.rect.height * p.s * this.viewZoom;
+    return { x: c.x - w / 2, y: c.y - h / 2, width: w, height: h };
+  }
+
+  /**
+   * Whether a window lies wholly outside the phone camera's view, with room
+   * for pop-outs (half its larger side, as popoutsCovered reaches). Windows
+   * riding a node, pinned to the screen, Exposé, and running slab effects
+   * always draw.
+   */
+  private mobileOffCamera(surface: Surface, state: SurfaceGlState): boolean {
+    if (this.exposeT > 0 || state.attach || state.effects?.length || this.pinnable(surface)) return false;
+    const { x, y, width, height } = surface.rect;
+    const reach = Math.max(width, height) / 2;
+    const z = this.viewZoom;
+    const vx0 = this.scrollX, vy0 = this.scrollY;
+    const vx1 = vx0 + this.width / z, vy1 = vy0 + this.height / z;
+    return x + width + reach < vx0 || x - reach > vx1 || y + height + reach < vy0 || y - reach > vy1;
+  }
+
+  // ── Windows pinned to the screen (screenAnchor) ──────────────────────
+  // On the phone's zoomable camera a window with a screenAnchor stays at
+  // that spot of the screen, at a readable scale (its own px size, shrunk
+  // only to fit), while the camera pans and zooms. It keeps its rect: it is
+  // drawn and picked at that rect through its own ScreenView (windowCamera),
+  // so slab effects, its 3D subtree and input all agree. Windows pinned to
+  // the same anchor move as one block (their bounding box is what is
+  // anchored), so a stack of toasts stays a stack. The desktop ignores
+  // anchors: pinView is undefined there and nothing changes.
+
+  /** Screen px kept between a pinned block and the screen edges. */
+  private static readonly PIN_MARGIN = 12;
+
+  /** Whether a window is pinned to the screen right now (the phone camera, not riding a node). */
+  isScreenPinned(surfaceId: string): boolean {
+    const s = this.surfaces.get(surfaceId);
+    return !!s && this.pinnable(s);
+  }
+
+  private pinnable(s: Surface): boolean {
+    return this.mobileMode && s.screenAnchor !== undefined && !this.surfaceGl.get(s.id)?.attach;
+  }
+
+  /**
+   * The screen view a pinned window is drawn and picked through: the camera
+   * the phone would have if it showed the window's anchored block at scale
+   * k, placed at its anchor (clear of the gesture handle and any keyboard
+   * at the bottom). Undefined for a window that is not pinned.
+   */
+  private pinView(surface: Surface): ScreenView | undefined {
+    const anchor = surface.screenAnchor;
+    if (!anchor || !this.pinnable(surface)) return undefined;
+    // The block: this window and every shown window pinned to the same anchor.
+    let x0 = surface.rect.x, y0 = surface.rect.y;
+    let x1 = x0 + surface.rect.width, y1 = y0 + surface.rect.height;
+    for (const s of this.sortedSurfaces) {
+      if (s === surface || s.screenAnchor !== anchor || !s.visible || !s.drawn
+          || this.isWorkspaceFiltered(s) || !this.pinnable(s)) continue;
+      x0 = Math.min(x0, s.rect.x);
+      y0 = Math.min(y0, s.rect.y);
+      x1 = Math.max(x1, s.rect.x + s.rect.width);
+      y1 = Math.max(y1, s.rect.y + s.rect.height);
+    }
+    const m = Compositor.PIN_MARGIN;
+    const W = Math.max(1, this.width);
+    const bottom = Math.max(1, this.height - Math.max(Compositor.MOBILE_GESTURE_HANDLE_HEIGHT, this.mobileBottomInset));
+    const bw = Math.max(1, x1 - x0);
+    const bh = Math.max(1, y1 - y0);
+    const k = Math.max(0.05, Math.min(1, (W - 2 * m) / bw, (bottom - 2 * m) / bh));
+    const sx0 = anchor.includes('left') ? m
+      : anchor.includes('right') ? W - m - bw * k
+      : (W - bw * k) / 2;
+    const sy0 = anchor.startsWith('top') ? m
+      : anchor.startsWith('bottom') ? bottom - m - bh * k
+      : (bottom - bh * k) / 2;
+    // screen = (workspace - scroll) * k puts the block's corner (x0, y0) at (sx0, sy0).
+    return { zoom: k, scrollX: x0 - sx0 / k, scrollY: y0 - sy0 / k };
+  }
+
+  /**
+   * What Exposé leaves in place, then the scrim over it: stacked and front
+   * world objects stay where they are (behind the scrim with the back layer,
+   * receding with the rest of the desktop), so only the spread windows and
+   * the desktop's rails draw above it.
+   */
+  private drawExposeUnderlay(order: DesktopItem[]): void {
+    for (const item of order) {
+      if (item.kind !== 'stack') continue;
+      this.renderer.clearDepth();
+      this.drawNodeTree(item.key, mat4Identity(), this.globalCamera(), 'stack', undefined, undefined, undefined, { rootId: item.rootId });
+    }
+    this.renderer.clearDepth();
+    this.drawWorldNodes('front');
+    this.drawExposeBackdrop();
+  }
+
+  /** A full-screen scrim behind the spread windows. */
+  private drawExposeBackdrop(): void {
+    const W = this.width;
+    const H = this.height;
+    const c = this.viewportToWorkspace(W / 2, H / 2);
+    const model = mat4TRS(c.x, c.y, -4, 0, 0, 0, (W / this.viewZoom) * 1.2, (H / this.viewZoom) * 1.2, 1);
+    const ink = parseCssColor(this.sceneColor('windowBg', '#0d0d14'));
+    this.renderer.context.disable(this.renderer.context.DEPTH_TEST);
+    this.renderer.drawFlat(model, this.viewProj, { ...ink, a: 0.78 * this.exposeT });
+  }
+
+  /**
+   * Window titles under the Exposé slots. On the desktop the titles rest in
+   * the secondary ink and the selected window's sits on an accent chip (the
+   * hand's colour), under a one-line key hint.
+   */
+  private drawExposeLabels(ctx: OffscreenCanvasRenderingContext2D): void {
+    const desk = !this.mobileMode;
+    const display = this.sceneTheme?.fonts?.display ?? '"Oswald", sans-serif';
+    ctx.globalAlpha = Math.max(0, Math.min(1, this.exposeT));
+    ctx.font = `600 ${desk ? 13 : 12}px ${display}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    const rest = this.sceneColor(desk ? 'textSecondary' : 'textPrimary', desk ? '#a8a292' : '#e8e2d0');
+    for (const [id, slot] of this.exposeSlots) {
+      const s = this.surfaces.get(id);
+      const r = s && s.visible ? this.exposeScreenRect(s) : undefined;
+      if (!r || r.y + r.height < 0) continue;
+      const label = ((s?.title || slot.title) || id.slice(0, 12)).slice(0, 26).toLocaleUpperCase();
+      const x = r.x + r.width / 2;
+      const y = r.y + r.height + (desk ? 15 : 6);
+      const maxW = Math.max(40, r.width + 8);
+      if (desk && id === this.exposeSelected) {
+        const w = Math.min(maxW, ctx.measureText(label).width) + 18;
+        ctx.fillStyle = this.sceneColor('accent', '#d32f22');
+        ctx.fillRect(x - w / 2, y - 4, w, 22);
+        ctx.fillStyle = this.sceneColor('windowBg', '#0d0d14');
+      } else {
+        ctx.fillStyle = rest;
+      }
+      ctx.fillText(label, x, y, maxW);
+    }
+    if (desk) {
+      const area = this.exposeDesktopArea();
+      const n = this.exposeSlots.size;
+      ctx.font = `500 11px ${display}`;
+      ctx.fillStyle = rest;
+      const hint = `${n} ${n === 1 ? 'WINDOW' : 'WINDOWS'}  ·  ARROWS OR TAB SELECT  ·  ENTER OPENS  ·  ESC RETURNS`;
+      ctx.fillText(hint, area.x + area.width / 2, Math.max(8, area.y - 34), area.width);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** The desktop's 2D chrome while Exposé shows: the titles and the key hint. */
+  private renderExposeOverlay(): void {
+    const ctx = this.overlay.begin();
     this.overlay.markContent();
-
-    const n = this.mobileCardOrder.length;
-    if (n === 0) {
-      overlayCtx.fillStyle = this.sceneColor('textSecondary', '#666680');
-      overlayCtx.font = `16px ${this.sceneTheme?.fonts?.body ?? '"PT Sans", sans-serif'}`;
-      overlayCtx.textAlign = 'center';
-      overlayCtx.textBaseline = 'middle';
-      overlayCtx.fillText('No windows', this.width / 2, availH / 2);
-      this.drawGestureHandle(overlayCtx);
-      return;
-    }
-
-    // Draw far-to-near so the centered card sits on top.
-    const order: number[] = [];
-    for (let i = 0; i < n; i++) order.push(i);
-    order.sort((a, b) => Math.abs(b - this.mobileCardScroll) - Math.abs(a - this.mobileCardScroll));
-
-    for (const i of order) {
-      const r = this.cardDrawRect(i);
-      if (!r) continue;
-      const { x, y, w, h, surface, slot } = r;
-      if (x + w < -40 || x > this.width + 40) continue; // offscreen
-
-      const dist = Math.min(Math.abs(slot), 1.4);
-      let alpha = (1 - 0.4 * dist) * this.cardRevealT;
-      // Fade a card as it is dragged up to close.
-      const drag = this.cardDragState;
-      if (drag && drag.surfaceId === surface.id && !drag.reorder && drag.dy < 0) {
-        alpha *= Math.max(0, 1 - (-drag.dy) / (h * 0.6));
-      }
-      alpha = Math.max(0, alpha);
-      const isActive = Math.round(this.mobileCardScroll) === i;
-
-      // Real depth: off-center cards recede and turn toward the center.
-      const cx = x + w / 2;
-      const cy = y + h / 2;
-      const zRecede = -Math.min(Math.abs(slot), 2) * 90;
-      const yTurn = -Math.max(-1.2, Math.min(1.2, slot)) * 0.32;
-      const state = this.glState(surface.id);
-      const model = mat4TRS(cx, cy, zRecede, 0, yTurn, 0, w, h, 1);
-      state.model = model;
-      this.drawnThisFrame.add(surface.id);
-
-      // Card shadow.
-      const pad = 40;
-      this.renderer.drawGlow({
-        model: mat4TRS(cx, cy + 6, zRecede - 1, 0, yTurn, 0, w + pad * 2, h + pad * 2, 1),
-        viewProj: this.viewProj,
-        quadWidth: w + pad * 2, quadHeight: h + pad * 2,
-        halfWidth: w / 2, halfHeight: h / 2,
-        radius: Math.min(8, chrome.radius),
-        color: { r: 0, g: 0, b: 0, a: 0.5 * alpha },
-        a1: 1, sigma1: 0.4,
-        offsetX: chrome.block.offset, offsetY: chrome.block.offset - 6,
-      });
-
-      // Card frame fill behind transparent content (sharp rounded rect via
-      // the glow shader with a sub-pixel sigma).
-      this.renderer.drawGlow({
-        model,
-        viewProj: this.viewProj,
-        quadWidth: w, quadHeight: h,
-        halfWidth: w / 2, halfHeight: h / 2,
-        radius: Math.min(8, chrome.radius),
-        color: { ...parseCssColor(this.sceneColor('windowBg', '#0d0d14')), a: alpha },
-        a1: 1, sigma1: 0.4,
-      });
-
-      this.drawSurfaceSlab(surface, state, model, {
-        radius: Math.min(8, chrome.radius),
-        dim: 1,
-        opacity: alpha,
-        rim: isActive ? { ...chrome.block.focus, a: 0.8 * alpha } : undefined,
-      });
-
-      // Scene-vocabulary nodes on the CENTRED card. The deck used to draw
-      // slabs only, so every canvas widget (CanvasWidget owns a kind:'canvas'
-      // node, not slab pixels) and every 3D scene was blank in the switcher
-      // even though the same window rendered fine once opened.
-      //
-      // Only the active card: node opacity comes from the node's own params,
-      // with no global multiplier to fade it alongside a receding card's slab,
-      // and a phone should not run every card's scene at once (a live
-      // simulation re-uploads its geometry per frame). Off-centre cards keep
-      // their slab preview. Deferred until the deck has finished revealing so
-      // 3D content does not pop in at full opacity over a still-fading slab.
-      if (isActive && this.cardRevealT >= 0.99) {
-        // Frame WITHOUT the card's px size baked in (see renderMobile), scaled
-        // by the card's own factor so content shrinks with the card, and
-        // carrying the card's recede + turn so nodes sit in the same space as
-        // the slab. Cards rotate mid-swipe, so clip to the projected content
-        // quad rather than an upright rectangle.
-        const cardScale = w / Math.max(1, surface.rect.width);
-        const cardFrame = mat4TRS(
-          cx, cy, zRecede,
-          0, yTurn, 0,
-          cardScale, cardScale, cardScale,
-        );
-        const cardCam = this.globalCamera();
-        this.renderer.clearDepth();
-        this.drawVocabNodes(surface, cardFrame, 'occluded', cardCam, true);
-        this.drawVocabNodes(surface, cardFrame, 'overlay', cardCam, true);
-      }
-
-      // Title below the card (active card sits unrotated, so 2D chrome aligns).
-      overlayCtx.globalAlpha = alpha;
-      overlayCtx.fillStyle = isActive ? this.sceneColor('textPrimary', '#c8c8ff') : this.sceneColor('textSecondary', '#666680');
-      overlayCtx.font = `600 13px ${this.sceneTheme?.fonts?.display ?? '"Oswald", sans-serif'}`;
-      overlayCtx.textAlign = 'center';
-      overlayCtx.textBaseline = 'top';
-      const rawLabel = (surface.title || surface.id.slice(0, 12)).slice(0, 22);
-      const label = rawLabel.toLocaleUpperCase();
-      overlayCtx.fillText(label, x + w / 2, y + h + 8);
-
-      // Close chip on the active card (only if the window may be closed).
-      if (isActive && surface.closable) {
-        const chip = this.cardCloseChipRect(x, y, w);
-        overlayCtx.fillStyle = this.sceneColor('windowBg', 'rgba(20,20,34,0.9)');
-        overlayCtx.beginPath();
-        overlayCtx.arc(chip.cx, chip.cy, chip.r, 0, Math.PI * 2);
-        overlayCtx.fill();
-        overlayCtx.strokeStyle = this.sceneColor('accent', '#8b8bff');
-        overlayCtx.lineWidth = 1.5;
-        overlayCtx.beginPath();
-        overlayCtx.moveTo(chip.cx - 4, chip.cy - 4);
-        overlayCtx.lineTo(chip.cx + 4, chip.cy + 4);
-        overlayCtx.moveTo(chip.cx + 4, chip.cy - 4);
-        overlayCtx.lineTo(chip.cx - 4, chip.cy + 4);
-        overlayCtx.stroke();
-      }
-      overlayCtx.globalAlpha = 1;
-    }
-
-    this.drawGestureHandle(overlayCtx);
-  }
-
-  private cardCloseChipRect(x: number, y: number, w: number): { cx: number; cy: number; r: number } {
-    return { cx: x + w - 14, cy: y + 14, r: 12 };
+    this.drawExposeLabels(ctx);
   }
 
   /**
@@ -4365,18 +6602,643 @@ export class Compositor {
    * transparent pixels pass clicks through.
    */
   surfaceAt(x: number, y: number): Surface | undefined {
-    if (this.mobileMode) {
-      return this.mobileHitTest(x, y);
-    }
+    // Exposé windows are picked as grid slots (exposeAt), not as windows; the
+    // desktop's rails stay live over the scrim (desktopHitTest keeps only them).
+    if (this.exposeT > 0 && this.mobileMode) return undefined;
     return this.desktopHitTest(x, y);
   }
 
   /**
-   * Convert a viewport (x,y) point to workspace coords. Needed by callers
-   * that do their own rect math (e.g., drag-resize hit tests).
+   * Convert a viewport (x,y) point to workspace coords (on the z=0 plane,
+   * through the phone's view zoom). Needed by callers that do their own rect
+   * math (e.g., drag-resize hit tests).
    */
   viewportToWorkspace(x: number, y: number): { x: number; y: number } {
-    return { x: x + this.scrollX, y: y + this.scrollY };
+    if (this.viewZoom === 1) return { x: x + this.scrollX, y: y + this.scrollY };
+    return { x: x / this.viewZoom + this.scrollX, y: y / this.viewZoom + this.scrollY };
+  }
+
+  /** Workspace coords (z=0 plane) to viewport px: the inverse of viewportToWorkspace. */
+  workspaceToViewport(x: number, y: number): { x: number; y: number } {
+    return { x: (x - this.scrollX) * this.viewZoom, y: (y - this.scrollY) * this.viewZoom };
+  }
+
+  /** The view scale (1 on the desktop; the phone camera's zoom). */
+  getViewZoom(): number {
+    return this.viewZoom;
+  }
+
+  // ── One desktop scene: depth order, windows riding nodes, pop-outs ────
+
+  /**
+   * The desktop's back-to-front order: visible windows of the active
+   * workspace and stacked world roots (layer 'stack'), by zIndex. At equal
+   * zIndex a window draws above a stacked object. A stacked root without a
+   * zIndex (the backend stamps one on add) sits just above the windows. A
+   * window riding a node in another window's scene draws after its host.
+   */
+  private desktopOrder(): DesktopItem[] {
+    const items: DesktopItem[] = [];
+    let topWindow = 0;
+    for (const s of this.sortedSurfaces) {
+      if (!s.visible || !s.drawn || this.isWorkspaceFiltered(s)) continue;
+      let z = s.zIndex;
+      const a = this.surfaceGl.get(s.id)?.attach;
+      if (a?.scope === 'window' && a.surfaceId) {
+        const host = this.surfaces.get(a.surfaceId);
+        if (host && host.zIndex >= z) z = host.zIndex + 0.25;
+      }
+      items.push({ kind: 'surface', surface: s, z });
+      if (s.zIndex < RAIL_Z_THRESHOLD && s.zIndex > topWindow) topWindow = s.zIndex;
+    }
+    for (const key of this.worldKeys) {
+      for (const node of this.sceneStore.nodesForSurface(key)) {
+        if (node.params.layer !== 'stack' || this.sceneStore.parentOf(node)) continue;
+        const zi = node.params.zIndex;
+        const z = typeof zi === 'number' ? Math.min(zi, RAIL_Z_THRESHOLD - 0.01) : topWindow + 0.5;
+        items.push({ kind: 'stack', key, rootId: node.id, z });
+      }
+    }
+    // Stable sort: ties keep a stacked object below the window, and windows
+    // keep their existing relative order.
+    items.sort((a, b) => (a.z - b.z) || ((a.kind === 'stack' ? 0 : 1) - (b.kind === 'stack' ? 0 : 1)));
+    return items;
+  }
+
+  /**
+   * How a window is placed for picking (see WindowView). Mirrors
+   * renderDesktop without the transient motion pose, as picking always
+   * has. A window riding a node hangs from the node's frame and camera.
+   */
+  private windowView(surface: Surface, depth = 0): WindowView {
+    const state = this.surfaceGl.get(surface.id);
+    const { rect } = surface;
+    const z = (state?.lift ?? 0) + (state?.userZ ?? 0);
+    const rx = (state?.tiltX ?? 0) + (state?.userRotation?.[0] ?? 0);
+    const ry = (state?.tiltY ?? 0) + (state?.userRotation?.[1] ?? 0);
+    const rz = state?.userRotation?.[2] ?? 0;
+    const anchor = state?.attach ? this.anchorView(surface, state, depth) : undefined;
+    if (anchor) {
+      const frame = mat4Multiply(anchor.frame, mat4TRS(0, 0, z, rx, ry, rz, 1, 1, 1));
+      // The slab as last drawn (it moves with its node every frame).
+      const slab = state?.attachFrame && state.model
+        ? state.model
+        : mat4Multiply(frame, mat4TRS(0, 0, 0, 0, 0, 0, rect.width, rect.height, 1));
+      return { frame, slab, cam: anchor.cam, free: true, sceneCam: this.cameraFor(surface, anchor.cam, frame) };
+    }
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const frame = mat4TRS(cx, cy, z, rx, ry, rz, 1, 1, 1);
+    // A window pinned to the screen is seen through its own view (see pinView).
+    const pin = this.pinView(surface);
+    const cam = this.windowCamera(cx, cy, z, pin);
+    return {
+      frame,
+      slab: state?.model && !state.attachFrame ? state.model : mat4TRS(cx, cy, 0, 0, 0, 0, rect.width, rect.height, 1),
+      cam,
+      // Its content rect is no longer where the phone camera puts its rect: clip by the projected quad.
+      free: !!(rx || ry || rz) || !!pin,
+      sceneCam: this.cameraFor(surface, cam, frame),
+    };
+  }
+
+  /**
+   * The frame and camera a window riding a node hangs from: the node's
+   * world matrix with its scale taken out (the window keeps its pixel size),
+   * moved by the attach offset plus any title-bar drag since attaching.
+   * World nodes render through the desktop camera; a node in another
+   * window's scene through that window's camera. Undefined when the node
+   * is gone (the window then sits at its own rect until detached).
+   */
+  private anchorView(surface: Surface, state: SurfaceGlState, depth: number): { frame: Mat4; cam: SceneCamera } | undefined {
+    const a = state.attach;
+    if (!a || depth > 8) return undefined;
+    let world: Mat4;
+    let cam: SceneCamera;
+    if (a.scope === 'world') {
+      const node = this.sceneStore.getNode(`world:${a.ownerId}`, a.nodeId);
+      if (!node) return undefined;
+      world = this.sceneStore.worldMatrix(node, mat4Identity());
+      cam = this.globalCamera();
+    } else {
+      const host = a.surfaceId ? this.surfaces.get(a.surfaceId) : undefined;
+      const node = host ? this.sceneStore.getNode(host.id, a.nodeId) : undefined;
+      if (!host || !node) return undefined;
+      // The host as drawn (it draws first, see desktopOrder), else its resting view.
+      const hs = this.surfaceGl.get(host.id);
+      const hv = hs?.frame && hs.cam && this.drawnThisFrame.has(host.id)
+        ? { frame: hs.frame, cam: hs.cam }
+        : this.windowView(host, depth + 1);
+      world = this.sceneStore.worldMatrix(node, hv.frame);
+      cam = this.cameraFor(host, hv.cam, hv.frame) ?? hv.cam;
+    }
+    const o = a.offset ?? [0, 0, 0];
+    const origin = state.attachOrigin ?? { x: surface.rect.x, y: surface.rect.y };
+    const dx = surface.rect.x - origin.x;
+    const dy = surface.rect.y - origin.y;
+    return { frame: mat4Multiply(mat4StripScale(world), mat4Translation(o[0] + dx, o[1] + dy, o[2])), cam };
+  }
+
+  /**
+   * Make a window's slab ride a scene node (or stop, with null). `origin`
+   * is the surface rect position when the backend attached it, so title-bar
+   * drags since then move the window relative to its anchor.
+   */
+  setSurfaceAttachment(surfaceId: string, target: SurfaceAttachment | null, origin?: { x: number; y: number }): void {
+    const state = this.glState(surfaceId);
+    if (!target) {
+      state.attach = undefined;
+      state.attachOrigin = undefined;
+      state.attachFrame = undefined;
+      state.attachCam = undefined;
+    } else {
+      const surface = this.surfaces.get(surfaceId);
+      state.attach = { ...target };
+      state.attachOrigin = origin ?? (surface ? { x: surface.rect.x, y: surface.rect.y } : { x: 0, y: 0 });
+    }
+    this.needsRender = true;
+  }
+
+  /** Whether a window currently rides a scene node. */
+  isSurfaceAttached(surfaceId: string): boolean {
+    return !!this.surfaceGl.get(surfaceId)?.attach;
+  }
+
+  /**
+   * Surface-local px of a viewport point on a window riding a node or
+   * pinned to the phone's screen (the pointer may be outside it, e.g.
+   * mid-drag). Undefined for ordinary windows: callers keep their rect math
+   * there.
+   */
+  attachedSurfaceLocal(surfaceId: string, x: number, y: number): { x: number; y: number } | undefined {
+    const surface = this.surfaces.get(surfaceId);
+    // Windows pinned to the screen are not where rect math puts them either.
+    if (!surface || !(this.surfaceGl.get(surfaceId)?.attach || this.pinnable(surface))) return undefined;
+    const v = this.windowView(surface);
+    const hit = raySurfacePlane(rayFromScreen(x, y, this.width, this.height, v.cam.invViewProj), v.slab, surface.rect.width, surface.rect.height);
+    return hit ? { x: hit.x, y: hit.y } : undefined;
+  }
+
+  /** A window's screen rect (projected when it rides a node). */
+  private screenRectOf(surface: Surface): { x: number; y: number; width: number; height: number } | undefined {
+    const st = this.surfaceGl.get(surface.id);
+    if ((st?.attach || this.pinnable(surface)) && st?.model && st.cam) return this.projectedQuadBounds(st.model, st.cam.viewProj);
+    return this.zoomViewRect({ x: surface.rect.x - this.scrollX, y: surface.rect.y - this.scrollY, width: surface.rect.width, height: surface.rect.height });
+  }
+
+  /**
+   * Whether a window's pop-outs may reach under an opaque window above it
+   * (its rect grown by half its larger side, a generous reach for pop-out
+   * content). Only then do they pay for the deferred, depth-tested pass.
+   */
+  private popoutsCovered(order: DesktopItem[], index: number, surface: Surface): boolean {
+    if (this.depthQuad === null) return false; // no depth program: draw inline as before
+    const mine = this.screenRectOf(surface);
+    if (!mine) return false;
+    const reach = Math.max(mine.width, mine.height) / 2;
+    const x0 = mine.x - reach, y0 = mine.y - reach;
+    const x1 = mine.x + mine.width + reach, y1 = mine.y + mine.height + reach;
+    for (let j = index + 1; j < order.length; j++) {
+      const it = order[j];
+      if (it.kind !== 'surface' || it.surface.transparent) continue;
+      const r = this.screenRectOf(it.surface);
+      if (r && r.x < x1 && r.x + r.width > x0 && r.y < y1 && r.y + r.height > y0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Pop-outs of a window that higher windows cover, drawn after every
+   * window: first this window's own clipped 3D goes into a fresh depth
+   * buffer (so pop-outs keep their usual stacking against it), then the
+   * slabs of every opaque window above, then the pop-outs, depth-tested
+   * against both. Near parts show over the higher windows; parts behind a
+   * higher window's plane hide behind it.
+   */
+  private drawDeferredPopouts(
+    d: { surface: Surface; frame: Mat4; cam: SceneCamera; index: number },
+    order: DesktopItem[],
+  ): void {
+    const gl = this.renderer.context;
+    this.renderer.clearDepth();
+    gl.colorMask(false, false, false, false);
+    this.drawVocabNodes(d.surface, d.frame, 'occluded', d.cam, false, true);
+    // (a tilted window's stencil clip used the stencil buffer: start it clean)
+    gl.clearStencil(0);
+    gl.clear(gl.STENCIL_BUFFER_BIT);
+    for (let j = d.index + 1; j < order.length; j++) {
+      const it = order[j];
+      if (it.kind !== 'surface' || it.surface.transparent) continue;
+      const st = this.surfaceGl.get(it.surface.id);
+      if (!st?.cam || !this.drawnThisFrame.has(it.surface.id)) continue;
+      this.writeSlabDepth(st.model, st.cam.viewProj);
+    }
+    gl.colorMask(true, true, true, true);
+    this.drawVocabNodes(d.surface, d.frame, 'overlay', d.cam, false, false, true);
+  }
+
+  /**
+   * Write a slab's unit quad into the depth buffer (colour writes are masked
+   * by the caller) and mark it 1 in the stencil buffer whatever the depth,
+   * so depthless pop-outs (canvas layers) can stay under covering windows.
+   */
+  private writeSlabDepth(model: Mat4, viewProj: Mat4): void {
+    const gl = this.renderer.context;
+    if (this.depthQuad === undefined) this.depthQuad = this.buildDepthQuad(gl);
+    const dq = this.depthQuad;
+    if (!dq) return;
+    gl.useProgram(dq.program);
+    gl.uniformMatrix4fv(dq.uModel, false, model);
+    gl.uniformMatrix4fv(dq.uViewProj, false, viewProj);
+    gl.bindVertexArray(dq.vao);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.enable(gl.STENCIL_TEST);
+    gl.stencilFunc(gl.ALWAYS, 1, 0xff);
+    gl.stencilOp(gl.KEEP, gl.REPLACE, gl.REPLACE);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disable(gl.STENCIL_TEST);
+    gl.bindVertexArray(null);
+    gl.disable(gl.DEPTH_TEST);
+  }
+
+  /**
+   * A tiny depth-only quad program (own VAO, attribute 0). A compile or link
+   * failure is recorded as null once: pop-outs then draw inline as before.
+   */
+  private buildDepthQuad(gl: WebGL2RenderingContext): NonNullable<Compositor['depthQuad']> | null {
+    try {
+      const compile = (type: number, src: string): WebGLShader => {
+        const sh = gl.createShader(type);
+        if (!sh) throw new Error('createShader failed');
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) ?? 'compile failed');
+        return sh;
+      };
+      const program = gl.createProgram();
+      if (!program) throw new Error('createProgram failed');
+      gl.attachShader(program, compile(gl.VERTEX_SHADER, `#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) in vec2 aPos;
+uniform mat4 uModel;
+uniform mat4 uViewProj;
+void main() { gl_Position = uViewProj * uModel * vec4(aPos, 0.0, 1.0); }`));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, `#version 300 es
+precision highp float;
+precision highp int;
+out vec4 fragColor;
+void main() { fragColor = vec4(0.0); }`));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? 'link failed');
+      const vao = gl.createVertexArray();
+      const buf = gl.createBuffer();
+      if (!vao || !buf) throw new Error('buffer allocation failed');
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -0.5, -0.5, 0.5, -0.5, 0.5, 0.5,
+        -0.5, -0.5, 0.5, 0.5, -0.5, 0.5,
+      ]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+      return { program, uModel: gl.getUniformLocation(program, 'uModel'), uViewProj: gl.getUniformLocation(program, 'uViewProj'), vao };
+    } catch (err) {
+      console.error('[Compositor] pop-out depth program unavailable; pop-outs draw inline', err);
+      this.onDiagnostic?.('popout-depth', String(err));
+      return null;
+    }
+  }
+
+  // ── Node dragging (client-side; mouse and touch drive the same calls) ──
+
+  /** The scene node behind a hit, when it still exists. */
+  private nodeOfHit(hit: NodeHit): VocabNode | undefined {
+    const key = hit.scope === 'world' ? `world:${hit.ownerId}` : hit.surfaceId;
+    return key ? this.sceneStore.getNode(key, hit.nodeId) : undefined;
+  }
+
+  /**
+   * CSS cursor for hovering a node: its (or its nearest ancestor's) `cursor`
+   * param, else 'grab' inside a draggable node, else 'pointer'.
+   */
+  nodeCursor(hit: NodeHit): string {
+    const node = this.nodeOfHit(hit);
+    if (!node) return 'pointer';
+    const own = this.sceneStore.findUp(node, (p) => typeof p.cursor === 'string');
+    if (own) return own.params.cursor as string;
+    return this.sceneStore.findUp(node, (p) => parseDraggable(p.draggable) !== undefined) ? 'grab' : 'pointer';
+  }
+
+  /** Whether pressing this node takes keyboard focus exclusively (`focusable` on it or an ancestor). */
+  nodeFocusable(hit: NodeHit): boolean {
+    const node = this.nodeOfHit(hit);
+    return !!node && this.sceneStore.findUp(node, (p) => p.focusable === true) !== undefined;
+  }
+
+  /**
+   * A press on a stacked world object that raises (raiseOnClick or
+   * draggable on the pressed node or an ancestor) brings its root to the top
+   * of the window order, below the system rails. Applied locally at once;
+   * returns the root to report to the backend (which decides for everyone),
+   * or undefined when nothing needs raising.
+   */
+  raiseStackedNode(hit: NodeHit): { ownerId: string; nodeId: string } | undefined {
+    if (hit.scope !== 'world' || !hit.ownerId) return undefined;
+    const pressed = this.nodeOfHit(hit);
+    if (!pressed) return undefined;
+    const root = this.sceneStore.rootOf(pressed);
+    if (root.params.layer !== 'stack') return undefined;
+    if (!this.sceneStore.findUp(pressed, (p) => p.raiseOnClick === true || parseDraggable(p.draggable) !== undefined)) return undefined;
+    let top = 0;
+    for (const item of this.desktopOrder()) {
+      if (item.kind === 'stack' && item.rootId === root.id && item.key === `world:${hit.ownerId}`) continue;
+      const z = item.kind === 'surface' ? item.surface.zIndex : item.z;
+      if (z < RAIL_Z_THRESHOLD && z > top) top = z;
+    }
+    const cur = root.params.zIndex;
+    if (typeof cur === 'number' && cur > top) return undefined; // already frontmost
+    root.params = { ...root.params, zIndex: Math.min(top + 0.5, RAIL_Z_THRESHOLD - 0.01) };
+    this.needsRender = true;
+    return { ownerId: hit.ownerId, nodeId: root.id };
+  }
+
+  /** Whether a pointer-held node drag is in progress (not an inertia glide). */
+  get nodeDragActive(): boolean {
+    return !!this.nodeDrag && !this.nodeDrag.released;
+  }
+
+  /**
+   * Press on a draggable node at a viewport point. Finds the nearest
+   * ancestor-or-self of the pressed node that declares `draggable`, and sets
+   * up the drag in that node's PARENT space through the camera the node
+   * renders with (window camera or desktop camera). Returns the drag target
+   * (as a 'start' event, not yet emitted: onNodeDrag reports 'start' once the
+   * pointer actually moves), or undefined when nothing draggable is there.
+   */
+  beginNodeDrag(x: number, y: number, time?: number): NodeDragEvent | undefined {
+    // A glide in flight (or a release that never arrived) ends first.
+    if (this.nodeDrag) this.finishNodeDrag();
+    const pick = this.pickNode(x, y);
+    if (!pick) return undefined;
+    const pressed = this.sceneStore.getNode(pick.key, pick.nodeId);
+    if (!pressed) return undefined;
+    const target = this.sceneStore.findUp(pressed, (p) => parseDraggable(p.draggable) !== undefined);
+    if (!target) return undefined;
+    const spec = parseDraggable(target.params.draggable)!;
+    const P = this.sceneStore.parentMatrix(target, pick.frame);
+    const Pinv = mat4Invert(P);
+    const hitWorld = vec3Add(pick.ray.origin, vec3Scale(pick.ray.dir, pick.t));
+    const anchor = mat4TransformPoint(Pinv, hitWorld);
+    const X = vec3(1, 0, 0), Y = vec3(0, 1, 0), Z = vec3(0, 0, 1);
+    const basis: [Vec3, Vec3] = spec.plane === 'xz' ? [X, Z] : spec.plane === 'yz' ? [Y, Z] : [X, Y];
+    const normal = spec.plane === 'xz' ? Y : spec.plane === 'yz' ? X : Z;
+    const p0 = target.transform.position ?? [0, 0, 0];
+    const startPos: [number, number, number] = [p0[0], p0[1], p0[2]];
+    const session: NodeDragSession = {
+      hit: { scope: pick.scope, surfaceId: pick.surfaceId, ownerId: pick.ownerId, nodeId: pick.nodeId },
+      key: pick.key, nodeId: target.id, hitNodeId: pressed.id, spec,
+      startX: x, startY: y, startPos, anchor, normal, basis,
+      started: false, released: false,
+      pos: [...startPos] as [number, number, number], vel: [0, 0, 0], lastT: time ?? performance.now(),
+    };
+    if (spec.axis) {
+      // One axis: solve the pointer delta along the axis's screen direction.
+      const axis = spec.axis === 'x' ? X : spec.axis === 'y' ? Y : Z;
+      session.axis = axis;
+      let j = this.screenStep(P, anchor, axis, pick.cam);
+      if (Math.hypot(j.x, j.y) < 0.2) j = { x: 0, y: this.towardCamera(P, anchor, axis, pick.cam) ? 1 : -1 };
+      session.screen = { j1: j, j2: { x: 0, y: 0 } };
+    } else {
+      // A plane seen nearly edge-on turns a ray-plane hit into a runaway;
+      // solve such drags on screen instead (pointer down = toward the viewer).
+      const wn = vec3Normalize(vec3Cross(mat4TransformDir(P, basis[0]), mat4TransformDir(P, basis[1])));
+      if (Math.abs(vec3Dot(vec3Normalize(pick.ray.dir), wn)) < 0.35) {
+        session.screen = this.planeScreenBasis(P, anchor, basis, pick.cam);
+      }
+    }
+    this.stopPositionAnims(pick.key, target.id);
+    this.nodeDrag = session;
+    return this.dragEvent(session, 'start');
+  }
+
+  /**
+   * Follow the pointer (viewport px). Moves the node in the local scene at
+   * once. `time` is the input event's timestamp (performance.now() clock;
+   * default now): flick speed is measured between events, not handlers.
+   */
+  updateNodeDrag(x: number, y: number, time?: number): void {
+    const s = this.nodeDrag;
+    if (!s || s.released) return;
+    if (!s.started) {
+      if (Math.hypot(x - s.startX, y - s.startY) < Compositor.DRAG_THRESHOLD_PX) return;
+      s.started = true;
+      this.emitDrag(s, 'start');
+    }
+    const node = this.sceneStore.getNode(s.key, s.nodeId);
+    if (!node) { this.finishNodeDrag(); return; }
+    let delta: Vec3 | undefined;
+    if (s.screen) {
+      const mx = x - s.startX, my = y - s.startY;
+      const { j1, j2 } = s.screen;
+      if (s.axis) {
+        const a = (mx * j1.x + my * j1.y) / Math.max(1e-6, j1.x * j1.x + j1.y * j1.y);
+        delta = vec3Scale(s.axis, a);
+      } else {
+        const det = j1.x * j2.y - j2.x * j1.y;
+        if (Math.abs(det) < 1e-9) return;
+        const a = (mx * j2.y - my * j2.x) / det;
+        const b = (j1.x * my - j1.y * mx) / det;
+        delta = vec3Add(vec3Scale(s.basis[0], a), vec3Scale(s.basis[1], b));
+      }
+    } else {
+      const view = this.dragView(s);
+      if (!view) return;
+      const Pinv = mat4Invert(this.sceneStore.parentMatrix(node, view.frame));
+      const ray = rayFromScreen(x, y, this.width, this.height, view.cam.invViewProj);
+      const o = mat4TransformPoint(Pinv, ray.origin);
+      const d = mat4TransformDir(Pinv, ray.dir);
+      const t = rayPlaneT(o, d, s.anchor, s.normal);
+      if (t === null) return;
+      delta = vec3Sub(vec3Add(o, vec3Scale(d, t)), s.anchor);
+      if (vec3Length(delta) > 1e5) return; // near the horizon: ignore the runaway
+    }
+    const next = this.constrainDrag(s, [s.startPos[0] + delta.x, s.startPos[1] + delta.y, s.startPos[2] + delta.z], true);
+    const now = time ?? performance.now();
+    const dt = (now - s.lastT) / 1000;
+    if (dt > 0.001) {
+      for (let i = 0; i < 3; i++) s.vel[i] = s.vel[i] * 0.4 + ((next[i] - s.pos[i]) / dt) * 0.6;
+      s.lastT = now;
+    }
+    s.pos = next;
+    this.writeDragPos(node, next, s.key);
+    this.emitDrag(s, 'move');
+  }
+
+  /**
+   * Release. A drag that never moved ends silently (it was a click). With
+   * `inertia` and a flick, the node glides (render loop) and 'end' follows
+   * when it settles; otherwise 'end' fires now.
+   */
+  endNodeDrag(time?: number): void {
+    const s = this.nodeDrag;
+    if (!s || s.released) return;
+    if (!s.started) { this.nodeDrag = undefined; return; }
+    const now = time ?? performance.now();
+    // A flick: the pointer was still moving when released (event times, so a
+    // busy frame between the last move and the release does not count).
+    if (s.spec.inertia && now - s.lastT < 100 && Math.hypot(s.vel[0], s.vel[1], s.vel[2]) > 60) {
+      s.released = true;
+      s.lastT = performance.now();
+      this.needsRender = true;
+      return;
+    }
+    this.finishNodeDrag();
+  }
+
+  /** End the session: final snap and clamp, then report 'end'. */
+  private finishNodeDrag(): void {
+    const s = this.nodeDrag;
+    if (!s) return;
+    this.nodeDrag = undefined;
+    if (!s.started) return;
+    const node = this.sceneStore.getNode(s.key, s.nodeId);
+    if (node) {
+      s.pos = this.constrainDrag(s, s.pos, true);
+      this.writeDragPos(node, s.pos, s.key);
+    }
+    this.emitDrag(s, 'end');
+  }
+
+  /** One inertia frame (friction decay, bounds stop the glide). Returns true while gliding. */
+  private stepNodeDragInertia(now: number): boolean {
+    const s = this.nodeDrag;
+    if (!s || !s.released) return false;
+    const node = this.sceneStore.getNode(s.key, s.nodeId);
+    if (!node) { this.finishNodeDrag(); return false; }
+    const dt = Math.min(0.05, Math.max(0, (now - s.lastT) / 1000));
+    s.lastT = now;
+    const decay = Math.exp(-Compositor.DRAG_FRICTION * dt);
+    for (let i = 0; i < 3; i++) s.vel[i] *= decay;
+    const raw: [number, number, number] = [s.pos[0] + s.vel[0] * dt, s.pos[1] + s.vel[1] * dt, s.pos[2] + s.vel[2] * dt];
+    const next = this.constrainDrag(s, raw, false);
+    for (let i = 0; i < 3; i++) if (next[i] !== raw[i]) s.vel[i] = 0;
+    s.pos = next;
+    this.writeDragPos(node, next, s.key);
+    if (Math.hypot(s.vel[0], s.vel[1], s.vel[2]) < 12) {
+      this.finishNodeDrag();
+      return false;
+    }
+    this.emitDrag(s, 'move');
+    return true;
+  }
+
+  /** Apply snap (on the plane or axis being dragged) and bounds to a position. */
+  private constrainDrag(s: NodeDragSession, p: [number, number, number], snap: boolean): [number, number, number] {
+    const out: [number, number, number] = [p[0], p[1], p[2]];
+    const g = s.spec.snap;
+    if (snap && g) {
+      const moving = s.axis ? [s.axis] : s.basis;
+      for (const ax of moving) {
+        // Snap to the grid itself (multiples of `snap` in the parent space).
+        const i = ax.x ? 0 : ax.y ? 1 : 2;
+        out[i] = Math.round(out[i] / g) * g;
+      }
+    }
+    const b = s.spec.bounds;
+    if (b) for (let i = 0; i < 3; i++) out[i] = Math.max(b.min[i], Math.min(b.max[i], out[i]));
+    return out;
+  }
+
+  /** Move the dragged node locally (no round trip) and wake the renderer if it shows. */
+  private writeDragPos(node: VocabNode, pos: [number, number, number], key: string): void {
+    node.transform = { ...node.transform, position: [pos[0], pos[1], pos[2]] };
+    if (this.isSurfaceKeyRenderable(key)) this.needsRender = true;
+  }
+
+  /** The frame and camera the dragged node's tree is seen through right now. */
+  private dragView(s: NodeDragSession): { frame: Mat4; cam: SceneCamera } | undefined {
+    if (s.hit.scope === 'world') {
+      this.clampScroll();
+      this.updateCamera(this.scrollX, this.scrollY);
+      return { frame: mat4Identity(), cam: this.globalCamera() };
+    }
+    const surface = s.hit.surfaceId ? this.surfaces.get(s.hit.surfaceId) : undefined;
+    if (!surface) return undefined;
+    const v = this.windowView(surface);
+    // A pop-out moves under the window camera it draws with (see drawVocabNodes).
+    const pressed = this.sceneStore.getNode(s.key, s.hitNodeId);
+    const popout = !!pressed && clipModeOf(this.sceneStore.resolveParams(pressed)) === 'none';
+    return { frame: v.frame, cam: popout ? v.cam : (v.sceneCam ?? v.cam) };
+  }
+
+  /** Screen px moved per parent unit along `dir` at `anchor` (parent space). */
+  private screenStep(P: Mat4, anchor: Vec3, dir: Vec3, cam: SceneCamera): { x: number; y: number } {
+    const a = projectToScreen(cam.viewProj, mat4TransformPoint(P, anchor), this.width, this.height);
+    const b = projectToScreen(cam.viewProj, mat4TransformPoint(P, vec3Add(anchor, dir)), this.width, this.height);
+    return a && b ? { x: b.x - a.x, y: b.y - a.y } : { x: 0, y: 0 };
+  }
+
+  /** Whether a parent-space direction at `anchor` points toward the camera. */
+  private towardCamera(P: Mat4, anchor: Vec3, dir: Vec3, cam: SceneCamera): boolean {
+    const w = mat4TransformPoint(P, anchor);
+    const toCam = vec3Sub(vec3(cam.cameraPos[0], cam.cameraPos[1], cam.cameraPos[2]), w);
+    return vec3Dot(mat4TransformDir(P, dir), toCam) > 0;
+  }
+
+  /**
+   * Screen steps for a plane drag seen nearly edge-on. An in-plane axis that
+   * points into the screen (no visible screen motion) gets the direction at
+   * right angles to the other one, at its scale: pointer down moves it
+   * toward the viewer, like a floor seen from above.
+   */
+  private planeScreenBasis(P: Mat4, anchor: Vec3, basis: [Vec3, Vec3], cam: SceneCamera): { j1: { x: number; y: number }; j2: { x: number; y: number } } {
+    const j = [this.screenStep(P, anchor, basis[0], cam), this.screenStep(P, anchor, basis[1], cam)];
+    const len = j.map((v) => Math.hypot(v.x, v.y));
+    const big = Math.max(len[0], len[1], 1e-6);
+    for (let i = 0; i < 2; i++) {
+      if (len[i] >= 0.25 * big) continue;
+      const other = j[1 - i];
+      const toward = this.towardCamera(P, anchor, basis[i], cam);
+      let c = len[1 - i] > 1e-6 ? { x: -other.y, y: other.x } : { x: 0, y: 1 };
+      const mostlyVertical = Math.abs(c.y) >= Math.abs(c.x);
+      const positive = mostlyVertical ? c.y > 0 : c.x > 0;
+      if (positive !== toward) c = { x: -c.x, y: -c.y };
+      const cl = Math.hypot(c.x, c.y) || 1;
+      j[i] = { x: (c.x / cl) * big, y: (c.y / cl) * big };
+    }
+    return { j1: j[0], j2: j[1] };
+  }
+
+  /** Drop position-writing animations on a node the hand now moves. */
+  private stopPositionAnims(key: string, nodeId: string): void {
+    const fullKey = `${key}/${nodeId}`;
+    const entry = this.nodeAnims.get(fullKey);
+    if (!entry) return;
+    entry.anims = entry.anims.filter((a) => a.channel !== 'position' && a.channel !== 'orbit');
+    if (entry.anims.length === 0) this.nodeAnims.delete(fullKey);
+  }
+
+  private dragEvent(s: NodeDragSession, phase: NodeDragEvent['phase']): NodeDragEvent {
+    return {
+      phase,
+      scope: s.hit.scope,
+      surfaceId: s.hit.surfaceId,
+      ownerId: s.hit.ownerId,
+      nodeId: s.nodeId,
+      hitNodeId: s.hitNodeId,
+      position: [s.pos[0], s.pos[1], s.pos[2]],
+    };
+  }
+
+  private emitDrag(s: NodeDragSession, phase: NodeDragEvent['phase']): void {
+    try {
+      this.onNodeDrag?.(this.dragEvent(s, phase));
+    } catch (err) {
+      console.error('[Compositor] onNodeDrag listener failed:', err);
+    }
   }
 
   /**
@@ -4387,84 +7249,142 @@ export class Compositor {
    */
   private slabRay(surface: Surface, x: number, y: number): Ray {
     const state = this.surfaceGl.get(surface.id);
+    // A window riding a node renders through the node's camera.
+    if (state?.attach) return rayFromScreen(x, y, this.width, this.height, this.windowView(surface).cam.invViewProj);
     const { rect } = surface;
     const cx = rect.x + rect.width / 2;
     const cy = rect.y + rect.height / 2;
     const z = (state?.lift ?? 0) + (state?.userZ ?? 0);
-    return rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, z).invViewProj);
+    return rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, z, this.pinView(surface)).invViewProj);
   }
 
   /**
-   * Find the topmost scene-vocabulary MESH node at a viewport point — the
-   * 3D analogue of widget hit-testing. Follows visual order: front-layer
-   * world nodes, then each window's subtree meshes and slab top-down
-   * (an opaque slab occludes everything beneath it), then back-layer world
-   * nodes. Returns the node plus its scope so input can route to the owner.
+   * Find the topmost interactive scene node at a viewport point, the 3D
+   * analogue of widget hit-testing. Returns the node plus its scope so input
+   * can route to the owner. See pickNode for the order.
    */
-  nodeAt(x: number, y: number): { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string } | undefined {
-    if (this.mobileMode) return undefined;
+  nodeAt(x: number, y: number): NodeHit | undefined {
+    const p = this.pickNode(x, y);
+    return p ? { scope: p.scope, surfaceId: p.surfaceId, ownerId: p.ownerId, nodeId: p.nodeId } : undefined;
+  }
+
+  /**
+   * Picking follows what is drawn:
+   * 1. front-layer world nodes;
+   * 2. pop-outs (clip 'none'), top window first, except where a covering
+   *    slab of a higher window sits in front of them (the deferred pass
+   *    depth-tests them the same way);
+   * 3. the desktop order top-down: stacked world objects, and for each
+   *    window its clipped nodes before its slab (an opaque slab occludes
+   *    everything beneath it);
+   * 4. back-layer world nodes.
+   */
+  private pickNode(x: number, y: number): NodePick | undefined {
+    if (this.exposeT > 0) return undefined;
     this.clampScroll();
     this.updateCamera(this.scrollX, this.scrollY);
+    const worldCam = this.globalCamera();
     const ray = rayFromScreen(x, y, this.width, this.height, this.invViewProj);
+    const identity = mat4Identity();
+    const worldPick = (h: { ownerId: string; nodeId: string; t: number }): NodePick => ({
+      scope: 'world', ownerId: h.ownerId, nodeId: h.nodeId,
+      key: `world:${h.ownerId}`, ray, t: h.t, cam: worldCam, frame: identity,
+    });
 
     // 1. World nodes above all windows
     const front = this.hitWorldNodes(ray, 'front');
-    if (front) return front;
+    if (front) return worldPick(front);
 
-    // 2. Windows top-down: subtree meshes render above their slab
-    for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
-      const surface = this.sortedSurfaces[i];
-      if (!surface.visible || !surface.drawn) continue;
-      if (this.isWorkspaceFiltered(surface)) continue;
+    const order = this.desktopOrder();
+    const views = new Map<string, WindowView>();
+    const viewOf = (s: Surface): WindowView => {
+      let v = views.get(s.id);
+      if (!v) { v = this.windowView(s); views.set(s.id, v); }
+      return v;
+    };
 
-      const state = this.surfaceGl.get(surface.id);
+    // 2. Pop-outs draw over the windows above their own, unless covered.
+    for (let i = order.length - 1; i >= 0; i--) {
+      const item = order[i];
+      if (item.kind !== 'surface') continue;
+      const v = viewOf(item.surface);
+      // Pop-outs draw through the window camera, never a camera node (see drawVocabNodes).
+      const sceneCam = v.cam;
+      const nodeRay = rayFromScreen(x, y, this.width, this.height, sceneCam.invViewProj);
+      const hit = this.hitNodeTree(nodeRay, item.surface.id, v.frame, { allow: (m) => m === 'none' });
+      if (!hit) continue;
+      const hitZ = nodeRay.origin.z + nodeRay.dir.z * hit.t;
+      // A canvas pop-out has no depth: any covering window hides it (as drawn).
+      const flat = this.sceneStore.getNode(item.surface.id, hit.nodeId)?.kind === 'canvas';
+      if (this.popoutHidden(order, i, x, y, flat ? -Infinity : hitZ, viewOf)) continue;
+      return {
+        scope: 'window', surfaceId: item.surface.id, nodeId: hit.nodeId,
+        key: item.surface.id, ray: nodeRay, t: hit.t, cam: sceneCam, frame: v.frame,
+      };
+    }
+
+    // 3. The desktop order top-down.
+    for (let i = order.length - 1; i >= 0; i--) {
+      const item = order[i];
+      if (item.kind === 'stack') {
+        const hit = this.hitNodeTree(ray, item.key, identity, { layer: 'stack', rootId: item.rootId });
+        if (hit) return worldPick({ ownerId: item.key.slice('world:'.length), nodeId: hit.nodeId, t: hit.t });
+        continue;
+      }
+      const surface = item.surface;
       const { rect } = surface;
-      const cx = rect.x + rect.width / 2;
-      const cy = rect.y + rect.height / 2;
-      const slabModel = state?.model ?? mat4TRS(cx, cy, 0, 0, 0, 0, rect.width, rect.height, 1);
-
-      const nodeZ = (state?.lift ?? 0) + (state?.userZ ?? 0);
-      const frame = mat4TRS(
-        cx, cy, nodeZ,
-        (state?.tiltX ?? 0) + (state?.userRotation?.[0] ?? 0),
-        (state?.tiltY ?? 0) + (state?.userRotation?.[1] ?? 0),
-        state?.userRotation?.[2] ?? 0,
-        1, 1, 1,
-      );
+      const v = viewOf(surface);
       // Pick through the SAME camera the subtree was drawn with, or the ray
       // misses everything the off-axis projection moved.
-      const nodeRay = rayFromScreen(x, y, this.width, this.height, this.windowCamera(cx, cy, nodeZ).invViewProj);
-      // Interaction must be CLIPPED to the window like rendering is. Occluded
+      const nodeRay = rayFromScreen(x, y, this.width, this.height, v.cam.invViewProj);
+      // Interaction must be CLIPPED to the window like rendering is. Clipped
       // nodes (the default) are scissored to the content rect when drawn, so a
       // click outside that rect must not hit them either — otherwise a mesh
       // grown large enough to project past its window ray-intercepts clicks
       // ANYWHERE on screen, and since this loop runs top-down it steals every
       // click from every window beneath it (invisible, since the mesh is
       // scissored out of view — the exact "one window eats the whole workspace"
-      // bug). Only explicit pop-out nodes (occlude:false) draw outside the rect,
-      // so only they may be picked outside it.
-      const clip = this.contentClip(surface);
-      const rotated = !!((state?.tiltX ?? 0) || (state?.tiltY ?? 0) || state?.userRotation?.some(v => v !== 0));
-      // Tilted windows clip content to the PROJECTED quad (see drawVocabNodes),
-      // so picking must use the same region or clicks near the skewed edges
-      // hit invisible geometry / miss visible geometry.
-      const insideClip = rotated
+      // bug). clip:'window' nodes reach the title bar; pop-outs were step 2.
+      // Tilted (or node-riding) windows clip to the PROJECTED quad (see
+      // drawVocabNodes), so picking uses the same region there.
+      let inContent: boolean | undefined;
+      let inWindow: boolean | undefined;
+      const insideContent = (): boolean => inContent ??= v.free
         ? (() => {
-            const { model, cw, ch } = this.contentQuadModel(surface, frame);
+            const { model, cw, ch } = this.contentQuadModel(surface, v.frame);
             return !!raySurfaceHit(nodeRay, model, cw, ch);
           })()
-        : x >= clip.x && x <= clip.x + clip.width && y >= clip.y && y <= clip.y + clip.height;
-      const nodeId = this.hitNodeTree(nodeRay, surface.id, frame, undefined, undefined, insideClip);
-      if (nodeId) return { scope: 'window', surfaceId: surface.id, nodeId };
+        : (() => {
+            const c = this.contentClip(surface);
+            return x >= c.x && x <= c.x + c.width && y >= c.y && y <= c.y + c.height;
+          })();
+      const insideWindow = (): boolean => inWindow ??= v.free
+        ? !!raySurfaceHit(nodeRay, mat4Multiply(v.frame, mat4TRS(0, 0, 0, 0, 0, 0, rect.width, rect.height, 1)), rect.width, rect.height)
+        : (() => {
+            const c = this.windowClip(surface);
+            return x >= c.x && x <= c.x + c.width && y >= c.y && y <= c.y + c.height;
+          })();
+      // The subtree itself may render through a camera node (cameraFor);
+      // the clip region and the slab stay on the window camera.
+      const sceneRay = v.sceneCam ? rayFromScreen(x, y, this.width, this.height, v.sceneCam.invViewProj) : nodeRay;
+      const hit = this.hitNodeTree(sceneRay, surface.id, v.frame, {
+        allow: (m) => (m === 'content' && insideContent()) || (m === 'window' && insideWindow()),
+      });
+      if (hit) {
+        return {
+          scope: 'window', surfaceId: surface.id, nodeId: hit.nodeId,
+          key: surface.id, ray: sceneRay, t: hit.t, cam: v.sceneCam ?? v.cam, frame: v.frame,
+        };
+      }
 
       if (surface.inputPassthrough) continue;
       // The slab renders through the window camera — pick it the same way.
-      const hit = raySurfaceHit(this.slabRay(surface, x, y), slabModel, rect.width, rect.height);
-      if (!hit) continue;
+      const slabHit = raySurfaceHit(nodeRay, v.slab, rect.width, rect.height);
+      if (!slabHit) continue;
       try {
         const pixel = surface.ctx.getImageData(
-          Math.max(0, Math.min(rect.width - 1, Math.floor(hit.x))),
-          Math.max(0, Math.min(rect.height - 1, Math.floor(hit.y))),
+          Math.max(0, Math.min(rect.width - 1, Math.floor(slabHit.x))),
+          Math.max(0, Math.min(rect.height - 1, Math.floor(slabHit.y))),
           1, 1
         ).data;
         if (pixel[3] === 0) continue;
@@ -4473,53 +7393,89 @@ export class Compositor {
       return undefined;
     }
 
-    // 3. World nodes behind the windows
-    return this.hitWorldNodes(ray, 'back');
-  }
-
-  private hitWorldNodes(ray: Ray, layer: 'back' | 'front'): { scope: 'world'; ownerId: string; nodeId: string } | undefined {
-    const identity = mat4Identity();
-    let best: { ownerId: string; nodeId: string; t: number } | undefined;
-    for (const key of this.worldKeys) {
-      const nodeId = this.hitNodeTree(ray, key, identity, layer, (t, id) => {
-        if (!best || t < best.t) best = { ownerId: key.slice('world:'.length), nodeId: id, t };
-      });
-      void nodeId;
-    }
-    return best ? { scope: 'world', ownerId: best.ownerId, nodeId: best.nodeId } : undefined;
+    // 4. World nodes behind the windows
+    const back = this.hitWorldNodes(ray, 'back');
+    return back ? worldPick(back) : undefined;
   }
 
   /**
-   * Ray-test the meshes of one retained node tree. Returns the closest hit
-   * node id (or reports hits via `collect` for cross-tree comparison).
+   * Whether a pop-out hit of order[index]'s window at world depth `hitZ` is
+   * hidden behind the slab of an opaque window above it (the same test the
+   * deferred pop-out pass makes in the depth buffer). Depth compares world
+   * z: every window camera and the desktop camera share the eye plane, so
+   * nearer means larger z for all of them.
+   */
+  private popoutHidden(
+    order: DesktopItem[], index: number, x: number, y: number, hitZ: number,
+    viewOf: (s: Surface) => WindowView,
+  ): boolean {
+    for (let j = index + 1; j < order.length; j++) {
+      const it = order[j];
+      if (it.kind !== 'surface' || it.surface.transparent) continue;
+      const v = viewOf(it.surface);
+      const { width, height } = it.surface.rect;
+      const hit = raySurfacePlane(rayFromScreen(x, y, this.width, this.height, v.cam.invViewProj), v.slab, width, height);
+      if (!hit || hit.x < 0 || hit.y < 0 || hit.x > width || hit.y > height) continue;
+      if (hit.world.z >= hitZ) return true;
+    }
+    return false;
+  }
+
+  /** The nearest interactive node of one world layer across every owner. */
+  private hitWorldNodes(ray: Ray, layer: 'back' | 'front'): { ownerId: string; nodeId: string; t: number } | undefined {
+    const identity = mat4Identity();
+    let best: { ownerId: string; nodeId: string; t: number } | undefined;
+    for (const key of this.worldKeys) {
+      const hit = this.hitNodeTree(ray, key, identity, { layer });
+      if (hit && (!best || hit.t < best.t)) best = { ownerId: key.slice('world:'.length), nodeId: hit.nodeId, t: hit.t };
+    }
+    return best;
+  }
+
+  /** Node kinds a ray can pick (they have a shape the ray tests). */
+  private static readonly PICKABLE_KINDS = new Set<string>(['mesh', 'canvas', 'model', 'text', 'label', 'line']);
+
+  /**
+   * Whether a node takes input. Nodes are decorative by default: only those
+   * that opt in with `interactive: true`, or sit inside (or are) a node that
+   * declares `draggable` or `raiseOnClick`, are click/drag/keyboard targets
+   * (`interactive: false` opts a node back out). Without this, a
+   * full-window decorative mesh (e.g. a water surface) would ray-intercept
+   * every click and starve the window's widgets / input canvas.
+   */
+  private isInteractive(node: VocabNode): boolean {
+    if (node.params.interactive === true) return true;
+    if (node.params.interactive === false) return false;
+    // Dragging and raising both need a press, so they imply input.
+    return this.sceneStore.findUp(node, (p) => p.raiseOnClick === true || parseDraggable(p.draggable) !== undefined) !== undefined;
+  }
+
+  /**
+   * Ray-test the interactive nodes of one retained node tree and return the
+   * closest hit with its world distance along the ray. `layer` / `rootId`
+   * narrow world trees the way the render passes do; `allow` admits window
+   * nodes by clip mode (a node scissored away where the pointer is must not
+   * be hit there).
    */
   private hitNodeTree(
     ray: Ray,
     key: string,
     frame: Mat4,
-    layer?: 'back' | 'front',
-    collect?: (t: number, nodeId: string) => void,
-    /** When false, the click is OUTSIDE the window's content rect, so occluded
-     *  nodes (which are scissored to that rect on render) are not eligible —
-     *  only pop-out (occlude:false) nodes may be hit. World-scope picks and
-     *  clicks inside the rect pass true. */
-    insideClip = true,
-  ): string | undefined {
+    opts: { layer?: string; rootId?: string; allow?: (clip: ClipMode) => boolean } = {},
+  ): { nodeId: string; t: number } | undefined {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return undefined;
     let bestId: string | undefined;
     let bestT = Infinity;
     for (const node of nodes) {
-      if (node.kind !== 'mesh' && node.kind !== 'canvas') continue;
-      // Nodes are decorative by default: only those that explicitly opt in with
-      // `params.interactive === true` are click/drag/keyboard targets. Without
-      // this, a full-window decorative mesh (e.g. a water surface) would ray-
-      // intercept every click and starve the window's widgets / input canvas.
-      if (node.params.interactive !== true) continue;
-      if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
-      // Outside the window rect, only pop-out nodes are reachable (see the
-      // caller): match the render scissor, which clips everything but occlude:false.
-      if (!insideClip && this.sceneStore.resolveParams(node).occlude !== false) continue;
+      if (!Compositor.PICKABLE_KINDS.has(node.kind)) continue;
+      if (!this.isInteractive(node)) continue;
+      if (opts.layer !== undefined || opts.allow) {
+        const rp = this.sceneStore.resolveParams(node);
+        if (opts.layer !== undefined && ((rp.layer as string) ?? 'back') !== opts.layer) continue;
+        if (opts.allow && !opts.allow(clipModeOf(rp))) continue;
+      }
+      if (opts.rootId !== undefined && this.sceneStore.rootOf(node).id !== opts.rootId) continue;
       let model = this.sceneStore.worldMatrix(node, frame);
       let t: number | null;
       if (node.kind === 'canvas') {
@@ -4528,20 +7484,28 @@ export class Compositor {
         if (!quadModel) continue;
         model = quadModel;
         t = rayMeshHit(ray, model, 'plane');
+      } else if (node.kind !== 'mesh') {
+        t = this.hitContentNode(ray, key, node, model);
       } else if (hasCustomGeometry(node.params)) {
         const g = node.params.geometry as CustomGeometryParam;
         t = rayCustomMeshHit(ray, model, g.positions, g.indices);
       } else {
-        t = rayMeshHit(ray, model, ((node.params.primitive as string) ?? 'box') as 'plane' | 'box' | 'sphere' | 'cylinder');
+        const prim = (node.params.primitive as string) ?? 'box';
+        if (isShapePrimitive(prim)) {
+          // Parametric shapes pick against their triangles.
+          const g = getShapeGeometry(prim, node.params.shape);
+          t = rayCustomMeshHit(ray, model, g.positions, g.indices);
+        } else {
+          t = rayMeshHit(ray, model, prim as 'plane' | 'box' | 'sphere' | 'cylinder');
+        }
       }
       if (t === null) continue;
-      if (collect) collect(t, node.id);
       if (t < bestT) {
         bestT = t;
         bestId = node.id;
       }
     }
-    return bestId;
+    return bestId !== undefined ? { nodeId: bestId, t: bestT } : undefined;
   }
 
   /**
@@ -4550,24 +7514,30 @@ export class Compositor {
    * slabs). Prefer this over subtracting rect origins.
    */
   surfaceLocalAt(x: number, y: number): { surface: Surface; x: number; y: number } | undefined {
-    if (this.mobileMode) {
-      const surface = this.mobileHitTest(x, y);
-      if (!surface) return undefined;
-      const local = this.mobileToSurfaceCoords(x, y);
-      return { surface, x: local.x, y: local.y };
-    }
+    if (this.exposeT > 0 && this.mobileMode) return undefined;
     const surface = this.desktopHitTest(x, y);
     if (!surface) return undefined;
-    const state = this.surfaceGl.get(surface.id);
     const { rect } = surface;
-    const model = state?.model ?? mat4TRS(
-      rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
-      0, 0, 0, rect.width, rect.height, 1,
-    );
+    const model = this.slabModelOf(surface);
     // Pick through the slab's own camera (matches how it renders when tilted).
     const hit = raySurfaceHit(this.slabRay(surface, x, y), model, rect.width, rect.height);
     if (!hit) return undefined;
     return { surface, x: hit.x, y: hit.y };
+  }
+
+  /**
+   * The slab's last model matrix (falls back to an untransformed slab for
+   * surfaces that haven't rendered yet; a window riding a node uses its
+   * anchored slab).
+   */
+  private slabModelOf(surface: Surface): Mat4 {
+    const state = this.surfaceGl.get(surface.id);
+    if (state?.attach) return this.windowView(surface).slab;
+    const { rect } = surface;
+    return state?.model ?? mat4TRS(
+      rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
+      0, 0, 0, rect.width, rect.height, 1,
+    );
   }
 
   private desktopHitTest(viewportX: number, viewportY: number): Surface | undefined {
@@ -4576,21 +7546,19 @@ export class Compositor {
     this.clampScroll();
     this.updateCamera(this.scrollX, this.scrollY);
 
-    // Iterate in reverse z-order (top to bottom)
-    for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
-      const surface = this.sortedSurfaces[i];
-      if (!surface.visible || !surface.drawn) continue;
-      if (this.isWorkspaceFiltered(surface)) continue;
+    // Iterate the desktop order top to bottom (stacked world objects take
+    // input only through their interactive nodes, see pickNode).
+    const order = this.desktopOrder();
+    for (let i = order.length - 1; i >= 0; i--) {
+      const item = order[i];
+      if (item.kind !== 'surface') continue;
+      const surface = item.surface;
       if (surface.inputPassthrough) continue;
+      // In the desktop Exposé only the rails left in place take the pointer.
+      if (this.exposeT > 0 && !this.exposeKeeps(surface)) continue;
 
-      const state = this.surfaceGl.get(surface.id);
       const { rect } = surface;
-      // The slab's last model matrix (falls back to an untransformed slab
-      // for surfaces that haven't rendered yet).
-      const model = state?.model ?? mat4TRS(
-        rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
-        0, 0, 0, rect.width, rect.height, 1,
-      );
+      const model = this.slabModelOf(surface);
       // Pick through the slab's own camera (matches how it renders when tilted).
       const hit = raySurfaceHit(this.slabRay(surface, viewportX, viewportY), model, rect.width, rect.height);
       if (!hit) continue;
@@ -4614,43 +7582,9 @@ export class Compositor {
     return undefined;
   }
 
-  private mobileHitTest(x: number, y: number): Surface | undefined {
-    // The card overview handles its own hit-testing.
-    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return undefined;
+  // ── Phone camera API (the frontend's gestures drive these) ───────────
 
-    // Gesture handle band -- reserved for the swipe-up gesture.
-    if (y >= this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT) return undefined;
-
-    // Reverse-transform through mobile scale/offset to get surface-local coords
-    const surface = this.mobileFocusedSurfaceId
-      ? this.surfaces.get(this.mobileFocusedSurfaceId)
-      : this.getTopVisibleSurface();
-
-    if (!surface || !surface.drawn || !surface.visible) return undefined;
-
-    const { scale, offsetX, offsetY } = this.mobileTransform;
-    const sx = (x - offsetX) / scale;
-    const sy = (y - offsetY) / scale;
-
-    if (sx >= 0 && sx < surface.rect.width && sy >= 0 && sy < surface.rect.height) {
-      return surface;
-    }
-    return undefined;
-  }
-
-  /**
-   * Transform canvas-space coordinates to surface-local coordinates in mobile mode.
-   * Returns [localX, localY] relative to the surface's rect origin.
-   */
-  mobileToSurfaceCoords(canvasX: number, canvasY: number): { x: number; y: number } {
-    const { scale, offsetX, offsetY } = this.mobileTransform;
-    return {
-      x: (canvasX - offsetX) / scale,
-      y: (canvasY - offsetY) / scale,
-    };
-  }
-
-  /** Current mobile view state, for gesture routing in the frontend. */
+  /** Current phone view state, for gesture routing in the frontend. */
   getMobileView(): MobileViewState {
     return this.mobileView;
   }
@@ -4660,300 +7594,23 @@ export class Compositor {
     return this.mobileMode && y >= this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
   }
 
-  // ── Card overview gesture API ───────────────────────────────────────
-
-  /** Open the card overview, centering the current window. */
-  enterCardOverview(): void {
-    this.cardAnim?.cancel();
-    this.reconcileCardOrder();
-    const focusId = this.mobileFocusedSurfaceId ?? this.getTopVisibleSurface()?.id;
-    const idx = focusId ? this.mobileCardOrder.indexOf(focusId) : -1;
-    this.mobileCardScroll = idx >= 0 ? idx : 0;
-    this.mobileView = MobileViewState.CARD_OVERVIEW;
-    this.cardDragState = undefined;
-    // Subtle scale-in reveal.
-    this.cardRevealT = 0;
-    this.cardAnim = new Tween({
-      from: 0, to: 1, duration: 200, easing: DECELERATE,
-      onUpdate: (v) => { this.cardRevealT = v; this.needsRender = true; },
-    }).start();
-    this.needsRender = true;
-  }
-
-  /** Exit the overview, optionally focusing a chosen card. */
-  exitCardOverview(focusSurfaceId?: string): void {
-    this.cardAnim?.cancel();
-    this.cardAnim = undefined;
-    this.cardDragState = undefined;
-    this.cardRevealT = 1;
-    if (focusSurfaceId) {
-      this.setMobileFocusSurface(focusSurfaceId);
-    }
-    this.mobileView = MobileViewState.NATIVE_FIT;
-    this.resetMobileZoom();
-    this.needsRender = true;
-  }
-
-  /** Surface whose card contains (x,y) in the overview, preferring the active card. */
-  cardAt(x: number, y: number): string | undefined {
-    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) return undefined;
-    let best: { id: string; slot: number } | undefined;
-    for (let i = 0; i < this.mobileCardOrder.length; i++) {
-      const r = this.cardDrawRect(i);
-      if (!r) continue;
-      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
-        if (!best || Math.abs(r.slot) < Math.abs(best.slot)) {
-          best = { id: r.surface.id, slot: r.slot };
-        }
-      }
-    }
-    return best?.id;
-  }
-
-  /** Whether the card overview is allowed to close this surface. */
-  isSurfaceClosable(surfaceId: string): boolean {
-    return this.surfaces.get(surfaceId)?.closable ?? true;
-  }
-
-  /** Surface whose active-card close chip contains (x,y), if any. */
-  closeChipAt(x: number, y: number): string | undefined {
-    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) return undefined;
-    const i = Math.round(this.mobileCardScroll);
-    const r = this.cardDrawRect(i);
-    if (!r || !r.surface.closable) return undefined;
-    const chip = this.cardCloseChipRect(r.x, r.y, r.w);
-    if (Math.hypot(x - chip.cx, y - chip.cy) <= chip.r + 4) return r.surface.id;
-    return undefined;
-  }
-
-  /** Pan the carousel by a canvas-pixel delta (positive dx = drag right). */
-  cardDeckPan(dx: number): void {
-    const { slotW } = this.cardMetrics();
-    const n = this.mobileCardOrder.length;
-    this.mobileCardScroll = Math.max(0, Math.min(n - 1, this.mobileCardScroll - dx / slotW));
-    this.needsRender = true;
-  }
-
-  /** Snap the carousel to the nearest card. */
-  cardDeckSnap(): void {
-    const target = Math.max(0, Math.min(this.mobileCardOrder.length - 1, Math.round(this.mobileCardScroll)));
-    this.animateScroll(target);
-  }
-
-  private animateScroll(target: number): void {
-    this.cardAnim?.cancel();
-    const from = this.mobileCardScroll;
-    if (from === target) { this.needsRender = true; return; }
-    this.cardAnim = new Tween({
-      from, to: target, duration: 220, easing: DECELERATE,
-      onUpdate: (v) => { this.mobileCardScroll = v; this.needsRender = true; },
-    }).start();
-  }
-
-  cardReorderBegin(surfaceId: string): void {
-    this.cardDragState = { surfaceId, dx: 0, dy: 0, reorder: true };
-    this.needsRender = true;
-  }
-
-  /** Drag a reordering card horizontally by accumulated dx; swaps on midpoint crossing. */
-  cardReorder(dx: number): void {
-    const drag = this.cardDragState;
-    if (!drag || !drag.reorder) return;
-    drag.dx += dx;
-    const { slotW } = this.cardMetrics();
-    const idx = this.mobileCardOrder.indexOf(drag.surfaceId);
-    if (idx < 0) return;
-    if (drag.dx > slotW / 2 && idx < this.mobileCardOrder.length - 1) {
-      this.swapCards(idx, idx + 1);
-      drag.dx -= slotW;
-      this.mobileCardScroll = idx + 1;
-    } else if (drag.dx < -slotW / 2 && idx > 0) {
-      this.swapCards(idx, idx - 1);
-      drag.dx += slotW;
-      this.mobileCardScroll = idx - 1;
-    }
-    this.needsRender = true;
-  }
-
-  cardReorderEnd(): void {
-    this.cardDragState = undefined;
-    this.cardDeckSnap();
-  }
-
-  private swapCards(a: number, b: number): void {
-    const tmp = this.mobileCardOrder[a];
-    this.mobileCardOrder[a] = this.mobileCardOrder[b];
-    this.mobileCardOrder[b] = tmp;
-  }
-
-  /** Begin a vertical drag on a card (towards flick-to-close). */
-  cardCloseDragBegin(surfaceId: string): void {
-    this.cardDragState = { surfaceId, dx: 0, dy: 0, reorder: false };
-    this.needsRender = true;
-  }
-
-  cardCloseDrag(dy: number): void {
-    const drag = this.cardDragState;
-    if (!drag || drag.reorder) return;
-    drag.dy += dy;
-    this.needsRender = true;
-  }
-
-  /** Whether a vertical close-drag is in progress (so move/end route to close). */
-  get cardCloseDragOffset(): number | undefined {
-    const drag = this.cardDragState;
-    return drag && !drag.reorder ? drag.dy : undefined;
-  }
-
-  get cardReorderActive(): boolean {
-    return !!this.cardDragState?.reorder;
-  }
-
-  /** Animate a card flying off the top, then drop it from the deck. */
-  cardFlickClose(surfaceId: string): void {
-    const idx = this.mobileCardOrder.indexOf(surfaceId);
-    if (idx < 0) return;
-    const r = this.cardDrawRect(idx);
-    const startDy = (this.cardDragState && this.cardDragState.surfaceId === surfaceId && !this.cardDragState.reorder)
-      ? this.cardDragState.dy : 0;
-    const flyTo = -(this.mobileAvailHeight + (r ? r.h : 400));
-    this.cardDragState = { surfaceId, dx: 0, dy: startDy, reorder: false };
-    this.cardAnim?.cancel();
-    this.cardAnim = new Tween({
-      from: startDy, to: flyTo, duration: 220, easing: ACCELERATE,
-      onUpdate: (v) => {
-        if (this.cardDragState && this.cardDragState.surfaceId === surfaceId) this.cardDragState.dy = v;
-        this.needsRender = true;
-      },
-      onDone: () => {
-        this.mobileCardOrder = this.mobileCardOrder.filter(id => id !== surfaceId);
-        this.cardDragState = undefined;
-        this.cardDeckSnap();
-        this.needsRender = true;
-      },
-    }).start();
-  }
-
-  /** Animate a partially-dragged card back into place. */
-  cardSnapBack(surfaceId: string): void {
-    const drag = this.cardDragState;
-    if (!drag || drag.surfaceId !== surfaceId) { this.cardDragState = undefined; this.needsRender = true; return; }
-    const from = drag.dy;
-    this.cardAnim?.cancel();
-    this.cardAnim = new Tween({
-      from, to: 0, duration: 180, easing: DECELERATE,
-      onUpdate: (v) => {
-        if (this.cardDragState && this.cardDragState.surfaceId === surfaceId) this.cardDragState.dy = v;
-        this.needsRender = true;
-      },
-      onDone: () => { this.cardDragState = undefined; this.needsRender = true; },
-    }).start();
-  }
-
-  // ── Mobile mode API ─────────────────────────────────────────────────
-
-  /**
-   * Apply a pinch-zoom delta. zoomDelta > 1 zooms in, < 1 zooms out.
-   * Zoom is clamped: min = 1 (fit-to-screen), max = MOBILE_MAX_ZOOM.
-   * Zoom is centered on the pinch midpoint.
-   */
-  mobilePinchZoom(zoomDelta: number, centerX: number, centerY: number): void {
-    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return;
-    const surface = this.mobileFocusedSurfaceId
-      ? this.surfaces.get(this.mobileFocusedSurfaceId)
-      : this.getTopVisibleSurface();
-    // Allow pinch up to native 1:1 (which may exceed the default ceiling on small screens).
-    const maxZoom = surface
-      ? Math.max(Compositor.MOBILE_MAX_ZOOM, this.nativeZoomTarget(surface))
-      : Compositor.MOBILE_MAX_ZOOM;
-
-    const oldZoom = this.mobileUserZoom;
-    const newZoom = Math.max(1, Math.min(maxZoom, oldZoom * zoomDelta));
-    if (newZoom === oldZoom) return;
-
-    this.zoomAbout(newZoom, centerX, centerY, surface);
-    this.mobileView = newZoom > 1 ? MobileViewState.NATIVE_ZOOMED : MobileViewState.NATIVE_FIT;
-    this.needsRender = true;
-  }
-
-  /** Fit-to-screen base scale → the user-zoom factor that yields 1:1 native pixels. */
-  private nativeZoomTarget(surface: Surface): number {
-    const baseScale = Math.min(this.width / surface.rect.width, this.mobileAvailHeight / surface.rect.height);
-    return baseScale > 0 ? 1 / baseScale : 1;
-  }
-
-  /** Set zoom while keeping the surface point under (centerX,centerY) fixed. */
-  private zoomAbout(newZoom: number, centerX: number, centerY: number, surface: Surface | undefined): void {
-    const { scale: oldScale, offsetX: oldOX, offsetY: oldOY } = this.mobileTransform;
-    const sx = (centerX - oldOX) / oldScale;
-    const sy = (centerY - oldOY) / oldScale;
-    this.mobileUserZoom = newZoom;
-    if (!surface) return;
-    const availW = this.width;
-    const availH = this.mobileAvailHeight;
-    const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
-    const newScale = baseScale * newZoom;
-    const scaledW = surface.rect.width * newScale;
-    const scaledH = surface.rect.height * newScale;
-    const newCenterX = sx * newScale;
-    const newCenterY = sy * newScale;
-    this.mobilePanX = centerX - (availW / 2) - (newCenterX - scaledW / 2);
-    this.mobilePanY = centerY - (availH / 2) - (newCenterY - scaledH / 2);
-  }
-
-  /**
-   * Toggle between fit-to-screen and 1:1 native resolution, centered at (x,y).
-   * Double-tap entry point.
-   */
-  mobileToggleNativeZoom(centerX: number, centerY: number): void {
-    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return;
-    const surface = this.mobileFocusedSurfaceId
-      ? this.surfaces.get(this.mobileFocusedSurfaceId)
-      : this.getTopVisibleSurface();
-    if (!surface) return;
-
-    if (this.mobileView === MobileViewState.NATIVE_ZOOMED) {
-      this.resetMobileZoom();
-      this.mobileView = MobileViewState.NATIVE_FIT;
-    } else {
-      this.zoomAbout(this.nativeZoomTarget(surface), centerX, centerY, surface);
-      this.mobileView = MobileViewState.NATIVE_ZOOMED;
-    }
-    this.needsRender = true;
-  }
-
-  /**
-   * Pan the zoomed view by a delta in canvas pixels (single-finger when zoomed).
-   */
-  mobilePan(dx: number, dy: number): void {
-    if (this.mobileView !== MobileViewState.NATIVE_ZOOMED && this.mobileUserZoom <= 1) return;
-    this.mobilePanX += dx;
-    this.mobilePanY += dy;
-    this.needsRender = true;
-  }
-
-  /**
-   * Reset zoom and pan (called when switching windows).
-   */
-  private resetMobileZoom(): void {
-    this.mobileUserZoom = 1;
-    this.mobilePanX = 0;
-    this.mobilePanY = 0;
-  }
-
   setMobileMode(enabled: boolean): void {
+    if (this.mobileMode === enabled) return;
     this.mobileMode = enabled;
-    if (enabled) {
-      // The phone positions everything in SCREEN space (mobileTransform) and
-      // pans with mobilePanX/Y, never by scrolling the virtual desktop. But
-      // windowCamera() still maps through the desktop scroll offset, so a
-      // scroll restored from a previous desktop session would slide the slab
-      // and its 3D subtree off the screen together. Drop it up front.
-      this.scrollX = 0;
-      this.scrollY = 0;
-    }
-    this.resetMobileZoom();
-    this.mobileView = MobileViewState.NATIVE_FIT;
+    this.mobileFlight = undefined;
+    this.mobileGlide = undefined;
+    this.mobileFocusLost = undefined;
+    this.mobileFocusedSurfaceId = undefined;
+    this.mobileView = MobileViewState.DESKTOP;
+    this.exposeT = 0;
+    this.exposeAnim = undefined;
+    this.exposeSlots.clear();
+    this.exposeLift.clear();
+    this.exposeFlyOff.clear();
+    this.mobileOverlaySig = '';
+    // The phone starts fitted to the used desktop; the desktop is 1:1.
+    this.mobileAutoFit = enabled;
+    if (!enabled) this.viewZoom = 1;
     this.needsRender = true;
   }
 
@@ -4961,30 +7618,460 @@ export class Compositor {
     return this.mobileMode;
   }
 
-  setMobileFocusSurface(surfaceId: string): void {
-    if (this.mobileFocusedSurfaceId === surfaceId) {
-      // Unchanged focus: keep the user's current view (zoom, pan, scroll)
-      // exactly as it is. Repeated setFocused for the surface already shown
-      // made the mobile client visibly reset ("refresh") on every arrival.
-      return;
-    }
-    this.mobileFocusedSurfaceId = surfaceId;
-    this.resetMobileZoom();
-    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) {
-      this.mobileView = MobileViewState.NATIVE_FIT;
-    }
+  /** The window the phone camera is framed on (focus mode), if any. */
+  get mobileFocusSurface(): string | undefined {
+    return this.mobileView === MobileViewState.FOCUS ? this.mobileFocusedSurfaceId : undefined;
+  }
+
+  /**
+   * Screen px at the bottom that something covers (a virtual keyboard over a
+   * canvas that did not shrink). The camera may then pan content up past the
+   * desktop's lower edge, and windows pinned to the screen keep above it.
+   */
+  setMobileBottomInset(px: number): void {
+    const next = Math.max(0, px);
+    if (next !== this.mobileBottomInset) this.needsRender = true;
+    this.mobileBottomInset = next;
+  }
+
+  /** Show the whole used desktop right away (the view after connecting). */
+  mobileFitNow(): void {
+    if (!this.mobileMode) return;
+    this.mobileFlight = undefined;
+    this.mobileGlide = undefined;
+    this.mobileView = MobileViewState.DESKTOP;
+    this.mobileAutoFit = true;
+    this.applyMobileCam(this.mobileFitCam());
+  }
+
+  /** The user has the camera: stop fitting it automatically as windows arrive. */
+  private takeMobileCamera(): void {
+    this.mobileAutoFit = false;
+    this.mobileFlight = undefined;
+  }
+
+  /** Pinch: zoom by `factor` about a screen point (the workspace point under it stays put). */
+  mobileZoomAt(factor: number, sx: number, sy: number): void {
+    if (!this.mobileMode || !Number.isFinite(factor) || factor <= 0) return;
+    this.takeMobileCamera();
+    this.mobileGlide = undefined;
+    const fit = this.mobileFitCam().zoom;
+    const zoom = Math.max(fit * 0.5, Math.min(Compositor.MOBILE_MAX_ZOOM, this.viewZoom * factor));
+    const w = this.viewportToWorkspace(sx, sy);
+    this.applyMobileCam({ x: w.x - sx / zoom, y: w.y - sy / zoom, zoom });
+  }
+
+  /** Pan the camera by a screen-px finger delta (content follows the finger). */
+  mobilePanBy(dx: number, dy: number): void {
+    if (!this.mobileMode) return;
+    this.takeMobileCamera();
+    this.scrollX -= dx / this.viewZoom;
+    this.scrollY -= dy / this.viewZoom;
     this.needsRender = true;
   }
 
-  private getMobileVisibleSurfaces(): Surface[] {
-    return this.sortedSurfaces.filter(s =>
-      s.visible && s.drawn && !s.inputPassthrough && !this.isWorkspaceFiltered(s)
-    );
+  /** A pan released with speed (screen px/s): the camera glides to a stop. */
+  mobileGlideFrom(vx: number, vy: number): void {
+    if (!this.mobileMode || Math.hypot(vx, vy) < 80) return;
+    this.mobileGlide = { vx, vy, last: performance.now() };
+    this.needsRender = true;
   }
 
-  private getTopVisibleSurface(): Surface | undefined {
-    const visible = this.getMobileVisibleSurfaces();
-    return visible.length > 0 ? visible[visible.length - 1] : undefined;
+  /** A finger landed: stop any glide or flight. True when something was moving (the touch only catches it). */
+  mobileStopMotion(): boolean {
+    const moving = !!this.mobileGlide || !!this.mobileFlight;
+    this.mobileGlide = undefined;
+    if (this.mobileFlight) {
+      this.mobileFlight = undefined;
+      this.mobileAutoFit = false;
+    }
+    return moving;
+  }
+
+  /**
+   * A pinch ended. Zoomed out well past fit-all: Exposé (returns 'expose').
+   * Past fit-all a little: settle back to the fitted desktop ('fit').
+   */
+  mobilePinchEnd(): 'expose' | 'fit' | undefined {
+    if (!this.mobileMode || this.mobileView === MobileViewState.EXPOSE) return undefined;
+    const fit = this.mobileFitCam();
+    if (this.viewZoom < fit.zoom * 0.85 && this.enterExpose()) return 'expose';
+    if (this.viewZoom < fit.zoom * 0.999) {
+      this.mobileView = MobileViewState.DESKTOP;
+      this.mobileFocusedSurfaceId = undefined;
+      this.flyTo(fit);
+      return 'fit';
+    }
+    return undefined;
+  }
+
+  /** Focus mode: fly in so the window's width fills the screen (scale only, no reflow). */
+  mobileFlyToSurface(surfaceId: string): boolean {
+    const s = this.surfaces.get(surfaceId);
+    // A window pinned to the screen already shows at a readable scale.
+    if (!this.mobileMode || !s || !s.visible || this.isWorkspaceFiltered(s) || this.pinnable(s)) return false;
+    if (this.mobileView === MobileViewState.EXPOSE) this.leaveExpose();
+    this.takeMobileCamera();
+    this.mobileFocusLost = undefined;
+    this.mobileFocusedSurfaceId = surfaceId;
+    this.mobileView = MobileViewState.FOCUS;
+    this.flyTo(this.mobileFrameCam(this.surfaceBounds(s), Compositor.MOBILE_FOCUS_MAX_ZOOM));
+    return true;
+  }
+
+  /**
+   * Focus mode on a 3D node: a world node (or the stacked object it belongs
+   * to) is framed by its projected bounds; a node inside a window focuses
+   * that window.
+   */
+  mobileFlyToNode(hit: NodeHit): boolean {
+    if (!this.mobileMode) return false;
+    if (hit.scope === 'window') return hit.surfaceId ? this.mobileFlyToSurface(hit.surfaceId) : false;
+    const b = this.worldNodeBounds(hit);
+    if (!b) return false;
+    this.takeMobileCamera();
+    this.mobileFocusedSurfaceId = undefined;
+    this.mobileView = MobileViewState.FOCUS;
+    const cam = this.mobileFrameCam(b, 3);
+    // Centre an object vertically whatever its height.
+    const H = this.mobileAvailHeight;
+    cam.y = (b.y0 + b.y1) / 2 - H / (2 * cam.zoom);
+    if ((b.y1 - b.y0) * cam.zoom > H) {
+      const z = Math.max(0.05, (H - 2 * Compositor.MOBILE_MARGIN) / Math.max(1, b.y1 - b.y0));
+      cam.x += this.width / (2 * cam.zoom) - this.width / (2 * z);
+      cam.y = (b.y0 + b.y1) / 2 - H / (2 * z);
+      cam.zoom = z;
+    }
+    this.flyTo(cam);
+    return true;
+  }
+
+  /**
+   * A world node's workspace box: the corners of every shaped node of its
+   * stacked object (or of the node alone) projected through the desktop
+   * camera and mapped back to the z=0 plane.
+   */
+  private worldNodeBounds(hit: NodeHit): { x0: number; y0: number; x1: number; y1: number } | undefined {
+    const key = `world:${hit.ownerId}`;
+    const node = this.sceneStore.getNode(key, hit.nodeId);
+    if (!node) return undefined;
+    const root = this.sceneStore.rootOf(node);
+    const members = root.params.layer === 'stack'
+      ? this.sceneStore.nodesForSurface(key).filter((n) => this.sceneStore.rootOf(n).id === root.id)
+      : [node];
+    this.clampScroll();
+    this.updateCamera(this.scrollX, this.scrollY);
+    const identity = mat4Identity();
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const add = (m: Mat4, pts: ReadonlyArray<readonly [number, number, number]>) => {
+      for (const [px, py, pz] of pts) {
+        const p = mat4TransformPoint(this.viewProj, mat4TransformPoint(m, vec3(px, py, pz)));
+        const w = this.viewportToWorkspace((p.x + 1) / 2 * this.width, (1 - p.y) / 2 * this.height);
+        if (!Number.isFinite(w.x) || !Number.isFinite(w.y)) continue;
+        x0 = Math.min(x0, w.x); x1 = Math.max(x1, w.x);
+        y0 = Math.min(y0, w.y); y1 = Math.max(y1, w.y);
+      }
+    };
+    const cube: Array<[number, number, number]> = [];
+    for (const cx of [-0.5, 0.5]) for (const cy of [-0.5, 0.5]) for (const cz of [-0.5, 0.5]) cube.push([cx, cy, cz]);
+    for (const n of members) {
+      if (n.kind === 'canvas') {
+        const q = this.canvasNodeModel(key, n, identity);
+        if (q) add(q, [[-0.5, -0.5, 0], [0.5, -0.5, 0], [-0.5, 0.5, 0], [0.5, 0.5, 0]]);
+      } else if (n.kind !== 'light' && n.kind !== 'group' && n.kind !== 'environment' && n.kind !== 'camera') {
+        add(this.sceneStore.worldMatrix(n, identity), cube);
+      }
+    }
+    if (!Number.isFinite(x0)) {
+      // Nothing with a shape: frame a modest box around the node's origin.
+      const o = this.sceneStore.worldMatrix(node, identity);
+      return { x0: o[12] - 120, y0: o[13] - 120, x1: o[12] + 120, y1: o[13] + 120 };
+    }
+    return { x0, y0, x1, y1 };
+  }
+
+  /** Back out to the desktop view, fitted to the used area. */
+  mobileFlyOut(): void {
+    if (!this.mobileMode) return;
+    if (this.mobileView === MobileViewState.EXPOSE) this.leaveExpose();
+    this.mobileView = MobileViewState.DESKTOP;
+    this.mobileFocusedSurfaceId = undefined;
+    this.mobileFocusLost = undefined;
+    this.flyTo(this.mobileFitCam());
+  }
+
+  /**
+   * Focus mode: fly to the spatially nearest window on one side (-1 left,
+   * +1 right) of the framed one. Returns the window flown to.
+   */
+  mobileFlyToNeighbor(dir: -1 | 1): string | undefined {
+    if (!this.mobileMode) return undefined;
+    const cur = this.mobileFocusedSurfaceId ? this.surfaces.get(this.mobileFocusedSurfaceId) : undefined;
+    const from = cur
+      ? { x: cur.rect.x + cur.rect.width / 2, y: cur.rect.y + cur.rect.height / 2 }
+      : this.viewportToWorkspace(this.width / 2, this.height / 2);
+    let best: { id: string; d: number } | undefined;
+    for (const s of this.exposeCandidates()) {
+      if (s.id === cur?.id) continue;
+      const dx = s.rect.x + s.rect.width / 2 - from.x;
+      const dy = s.rect.y + s.rect.height / 2 - from.y;
+      if (dx * dir <= 1) continue;
+      const d = Math.hypot(dx, dy);
+      if (!best || d < best.d) best = { id: s.id, d };
+    }
+    if (!best) return undefined;
+    this.mobileFlyToSurface(best.id);
+    return best.id;
+  }
+
+  /**
+   * Pan (flying) so a screen rect sits inside [top, bottom] of the screen,
+   * e.g. a text field above the virtual keyboard. Returns the pose before
+   * the pan (to restore when the keyboard goes), or undefined when the rect
+   * already shows.
+   */
+  mobileReveal(rect: Rect, top: number, bottom: number): MobileCam | undefined {
+    if (!this.mobileMode) return undefined;
+    const margin = 12;
+    // Keep clear of the gesture handle when the band ends at the canvas bottom.
+    const low = bottom >= this.height - 1 ? Compositor.MOBILE_GESTURE_HANDLE_HEIGHT + 8 : margin;
+    let dy = 0;
+    if (rect.y + rect.height > bottom - low) dy = rect.y + rect.height - (bottom - low);
+    if (rect.y - dy < top + margin) dy = rect.y - (top + margin);
+    if (Math.abs(dy) < 1) return undefined;
+    const before = this.currentCam();
+    this.takeMobileCamera();
+    this.flyTo({ x: before.x, y: before.y + dy / before.zoom, zoom: before.zoom }, 250);
+    return before;
+  }
+
+  /** Fly back to a pose saved by mobileReveal. */
+  mobileRestore(cam: MobileCam): void {
+    if (!this.mobileMode) return;
+    this.flyTo({ ...cam }, 250);
+  }
+
+  /**
+   * Where a window-local point (surface px) is on screen, through the
+   * window's actual slab placement (tilt, lift, riding a node, zoom).
+   */
+  surfaceLocalToViewport(surfaceId: string, lx: number, ly: number): { x: number; y: number } | undefined {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface) return undefined;
+    this.clampScroll();
+    this.updateCamera(this.scrollX, this.scrollY);
+    const v = this.windowView(surface);
+    const p = mat4TransformPoint(v.frame, vec3(lx - surface.rect.width / 2, ly - surface.rect.height / 2, 0));
+    const n = mat4TransformPoint(v.cam.viewProj, p);
+    if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return undefined;
+    return { x: (n.x + 1) / 2 * this.width, y: (1 - n.y) / 2 * this.height };
+  }
+
+  /** Whether pressing this node starts a drag (it, or an ancestor, declares `draggable`). */
+  nodeDraggable(hit: NodeHit): boolean {
+    const node = this.nodeOfHit(hit);
+    return !!node && this.sceneStore.findUp(node, (p) => parseDraggable(p.draggable) !== undefined) !== undefined;
+  }
+
+  /** A system rail (dock, sidebar, toolbars): stacked at or above the rail threshold. */
+  isRailSurface(surfaceId: string): boolean {
+    const s = this.surfaces.get(surfaceId);
+    return !!s && s.zIndex >= RAIL_Z_THRESHOLD;
+  }
+
+  /** Whether a window may be closed by a phone gesture (Exposé flick). */
+  isSurfaceClosable(surfaceId: string): boolean {
+    return this.surfaces.get(surfaceId)?.closable ?? true;
+  }
+
+  /**
+   * Spread the visible windows of the active workspace into a grid (visual
+   * only; backend rects never change). Works on the phone (camera view) and
+   * the desktop (mouse and keys; the focused window starts selected). False
+   * when there is no window to spread.
+   */
+  enterExpose(): boolean {
+    if (this.mobileView === MobileViewState.EXPOSE) return true;
+    const wins = this.exposeCandidates();
+    if (wins.length === 0) return false;
+    this.clampScroll();
+    if (this.mobileMode) {
+      this.takeMobileCamera();
+      this.mobileGlide = undefined;
+    }
+    this.exposeLift.clear();
+    this.exposeFlyOff.clear();
+    this.exposeHot.clear();
+    this.layoutExpose(wins);
+    const focused = this.focusedSurfaceId;
+    this.exposeSelected = focused && this.exposeSlots.has(focused) ? focused : this.exposeOrder()[0];
+    this.mobileView = MobileViewState.EXPOSE;
+    this.animateExpose(1);
+    return true;
+  }
+
+  /**
+   * Leave Exposé: windows glide home. With a window chosen, the phone's
+   * camera flies into it; the desktop raises it at once so it lands on top
+   * (the backend's raise and focus, sent by the caller, confirm it).
+   */
+  exitExpose(focusSurfaceId?: string): void {
+    if (this.mobileView !== MobileViewState.EXPOSE) return;
+    this.leaveExpose();
+    this.mobileView = MobileViewState.DESKTOP;
+    if (!this.mobileMode) {
+      if (focusSurfaceId && this.surfaces.has(focusSurfaceId)) {
+        this.exposeSelected = focusSurfaceId;
+        this.raiseLocally(focusSurfaceId);
+        this.setFocusedSurface(focusSurfaceId);
+      }
+      return;
+    }
+    if (focusSurfaceId && this.mobileFlyToSurface(focusSurfaceId)) return;
+    // Opened by pinching out past the fit: settle back on the fitted desktop.
+    const fit = this.mobileFitCam();
+    if (this.viewZoom < fit.zoom * 0.999) this.flyTo(fit);
+  }
+
+  private leaveExpose(): void {
+    this.mobileView = MobileViewState.DESKTOP;
+    this.animateExpose(0, () => {
+      this.exposeSlots.clear();
+      this.exposeLift.clear();
+      this.exposeFlyOff.clear();
+      this.exposeHot.clear();
+      this.exposeMembers.clear();
+      this.exposeSelected = undefined;
+    });
+  }
+
+  /** Close Exposé without the flight home (another workspace took the screen). */
+  private closeExposeNow(): void {
+    if (this.mobileView === MobileViewState.EXPOSE) this.mobileView = MobileViewState.DESKTOP;
+    this.exposeAnim = undefined;
+    this.exposeT = 0;
+    this.exposeP = 0;
+    this.exposeSlots.clear();
+    this.exposeLift.clear();
+    this.exposeFlyOff.clear();
+    this.exposeHot.clear();
+    this.exposeMembers.clear();
+    this.exposeSelected = undefined;
+    this.needsRender = true;
+  }
+
+  /** Bring a window above every other ordinary window here (its backend raise follows). */
+  private raiseLocally(surfaceId: string): void {
+    const s = this.surfaces.get(surfaceId);
+    if (!s || s.zIndex >= RAIL_Z_THRESHOLD) return;
+    let top = 0;
+    for (const o of this.surfaces.values()) {
+      if (o !== s && o.zIndex < RAIL_Z_THRESHOLD && o.zIndex > top) top = o.zIndex;
+    }
+    if (s.zIndex <= top) this.setZIndex(surfaceId, top + 1);
+  }
+
+  /** Whether Exposé is open (on the phone or the desktop). */
+  isExposeOpen(): boolean {
+    return this.mobileView === MobileViewState.EXPOSE;
+  }
+
+  /** The spread windows that can be picked, in reading order. */
+  private exposeOrder(): string[] {
+    return [...this.exposeSlots.entries()]
+      .filter(([id]) => {
+        const s = this.surfaces.get(id);
+        return !!s && s.visible && s.drawn && !this.exposeFlyOff.has(id);
+      })
+      .sort((a, b) => a[1].index - b[1].index)
+      .map(([id]) => id);
+  }
+
+  /** Desktop Exposé: the selected window (hover or keys), if any. */
+  getExposeSelection(): string | undefined {
+    return this.isExposeOpen() ? this.exposeSelected : undefined;
+  }
+
+  /** Desktop Exposé: select a spread window (the pointer rests on it). */
+  exposeSelect(surfaceId: string): void {
+    require(typeof surfaceId === 'string' && surfaceId.length > 0, 'exposeSelect: surfaceId is required');
+    if (!this.isExposeOpen() || !this.exposeSlots.has(surfaceId) || this.exposeSelected === surfaceId) return;
+    this.exposeSelected = surfaceId;
+    this.needsRender = true;
+  }
+
+  /**
+   * Desktop Exposé: move the selection. 'next' / 'prev' step through the
+   * grid in reading order (wrapping); the arrows move to the nearest window
+   * that way on screen (staying put at the edge). Returns the selection.
+   */
+  exposeMoveSelection(dir: 'left' | 'right' | 'up' | 'down' | 'next' | 'prev'): string | undefined {
+    require(['left', 'right', 'up', 'down', 'next', 'prev'].includes(dir), `exposeMoveSelection: unknown direction ${dir}`);
+    if (!this.isExposeOpen()) return undefined;
+    const ids = this.exposeOrder();
+    if (ids.length === 0) return undefined;
+    const cur = this.exposeSelected && ids.includes(this.exposeSelected) ? this.exposeSelected : undefined;
+    let next: string | undefined;
+    if (!cur) {
+      next = ids[0];
+    } else if (dir === 'next' || dir === 'prev') {
+      const i = ids.indexOf(cur);
+      next = ids[(i + (dir === 'next' ? 1 : ids.length - 1)) % ids.length];
+    } else {
+      const from = this.exposeSlots.get(cur)!;
+      const [ux, uy] = dir === 'left' ? [-1, 0] : dir === 'right' ? [1, 0] : dir === 'up' ? [0, -1] : [0, 1];
+      let best = Infinity;
+      for (const id of ids) {
+        if (id === cur) continue;
+        const to = this.exposeSlots.get(id)!;
+        const dx = to.cx - from.cx;
+        const dy = to.cy - from.cy;
+        const along = dx * ux + dy * uy;
+        if (along <= 1) continue;
+        // Straight ahead wins over a closer window off to the side.
+        const score = along + 2 * Math.abs(dx * uy - dy * ux);
+        if (score < best) { best = score; next = id; }
+      }
+      next ??= cur;
+    }
+    if (next) this.exposeSelect(next);
+    return this.exposeSelected;
+  }
+
+  /** The Exposé window under a screen point. */
+  exposeAt(x: number, y: number): string | undefined {
+    if (this.mobileView !== MobileViewState.EXPOSE) return undefined;
+    for (const id of this.exposeSlots.keys()) {
+      if (this.exposeFlyOff.has(id)) continue;
+      const s = this.surfaces.get(id);
+      const r = s && s.visible && s.drawn ? this.exposeScreenRect(s) : undefined;
+      if (r && x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height) return id;
+    }
+    return undefined;
+  }
+
+  /** Lift an Exposé window with the finger (screen px, negative = up). */
+  exposeSetLift(surfaceId: string, dy: number): void {
+    if (!this.exposeSlots.has(surfaceId)) return;
+    this.exposeLift.set(surfaceId, Math.min(24, dy));
+    this.needsRender = true;
+  }
+
+  /**
+   * Release a lifted Exposé window: a flick sends it off the top (true; the
+   * caller asks the backend to close it), otherwise it drops back.
+   */
+  exposeRelease(surfaceId: string, close: boolean): boolean {
+    if (!this.exposeSlots.has(surfaceId)) return false;
+    const lift = this.exposeLift.get(surfaceId) ?? 0;
+    if (close && this.isSurfaceClosable(surfaceId)) {
+      this.exposeFlyOff.set(surfaceId, { from: lift, start: performance.now() });
+      this.needsRender = true;
+      return true;
+    }
+    this.exposeLift.delete(surfaceId);
+    this.needsRender = true;
+    return false;
   }
 
   /**
@@ -5004,4 +8091,21 @@ export class Compositor {
   get surfaceCount(): number {
     return this.surfaces.size;
   }
+}
+
+/** A model loaded for `model` nodes, shared by every node naming the same source. */
+interface ModelEntry {
+  src: string;
+  /** waiting = its content blob has not arrived yet (see Compositor.blobArrived). */
+  state: 'loading' | 'waiting' | 'ready' | 'error';
+  doc?: GltfDocument;
+  error?: string;
+  /** The rest pose (no animation) and its bounds, model units after the y flip. */
+  rest?: { items: GltfDrawItem[]; min: [number, number, number]; max: [number, number, number] };
+  /** GPU buffers per primitive and textures per image, for context `generation`. */
+  meshes: Map<GltfPrimitive, DynamicMesh>;
+  textures: Map<number, WebGLTexture>;
+  /** Decoded images, kept to re-upload after a lost context. */
+  bitmaps: Map<number, ImageBitmap>;
+  generation: number;
 }

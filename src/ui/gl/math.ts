@@ -230,3 +230,32 @@ export function vec3Normalize(v: Vec3): Vec3 {
   const len = Math.hypot(v.x, v.y, v.z) || 1;
   return { x: v.x / len, y: v.y / len, z: v.z / len };
 }
+
+export function vec3Add(a: Vec3, b: Vec3): Vec3 {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+export function vec3Scale(v: Vec3, s: number): Vec3 {
+  return { x: v.x * s, y: v.y * s, z: v.z * s };
+}
+
+export function vec3Length(v: Vec3): number {
+  return Math.hypot(v.x, v.y, v.z);
+}
+
+/**
+ * A copy of `m` with the scale taken out of its 3x3 basis (each basis
+ * column normalized), keeping rotation and translation. Used to hang
+ * something with its own pixel size (a window slab) on a node whose scale
+ * belongs to the node's geometry.
+ */
+export function mat4StripScale(m: Mat4, out?: Mat4): Mat4 {
+  const r = out ?? new Float32Array(16);
+  for (let c = 0; c < 3; c++) {
+    const x = m[c * 4], y = m[c * 4 + 1], z = m[c * 4 + 2];
+    const len = Math.hypot(x, y, z) || 1;
+    r[c * 4] = x / len; r[c * 4 + 1] = y / len; r[c * 4 + 2] = z / len; r[c * 4 + 3] = 0;
+  }
+  r[12] = m[12]; r[13] = m[13]; r[14] = m[14]; r[15] = 1;
+  return r;
+}

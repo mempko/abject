@@ -126,7 +126,52 @@ export class SceneStore {
   private static readonly INHERITABLE = [
     'color', 'emissive', 'opacity', 'metalness', 'roughness',
     'texture', 'drawMode', 'pointSize', 'layer', 'occlude', 'castShadow',
+    'clip',
+    // Material params (a group can dress its whole subtree: material: 'gold').
+    'material', 'shading', 'blend', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap',
+    'emissiveMap', 'matcap', 'normalScale', 'uvRepeat', 'uvOffset', 'clearcoat',
+    'clearcoatRoughness', 'sheen', 'sheenColor', 'transmission', 'ior', 'envIntensity',
+    'toonSteps', 'outline', 'rimColor', 'rimPower', 'receiveShadow',
   ];
+
+  /**
+   * Expands a node's own params with its named preset (material: '<name>')
+   * before inheritance, so precedence runs: the node's own params, then its
+   * own preset, then the nearest ancestor's params and preset, and so on up.
+   * Set by the owner of the preset library; identity when unset.
+   */
+  expandParams?: (params: Record<string, unknown>) => Record<string, unknown>;
+
+  /** The node's parent in the same subtree, when it exists. */
+  parentOf(node: VocabNode): VocabNode | undefined {
+    return node.parentId ? this.nodes.get(`${node.surfaceId}/${node.parentId}`) : undefined;
+  }
+
+  /** The top of the node's parent chain (the node itself for a root). */
+  rootOf(node: VocabNode): VocabNode {
+    let cur = node;
+    for (let guard = 0; guard < 256; guard++) {
+      const p = this.parentOf(cur);
+      if (!p) break;
+      cur = p;
+    }
+    return cur;
+  }
+
+  /**
+   * The nearest ancestor-or-self whose OWN params satisfy `pred` (not the
+   * inherited view). Interaction params like `draggable` and `focusable`
+   * belong to the node that declares them, and a press anywhere inside it
+   * finds it this way.
+   */
+  findUp(node: VocabNode, pred: (params: Record<string, unknown>) => boolean): VocabNode | undefined {
+    let cur: VocabNode | undefined = node;
+    for (let guard = 0; cur && guard < 256; guard++) {
+      if (pred(cur.params)) return cur;
+      cur = this.parentOf(cur);
+    }
+    return undefined;
+  }
 
   /**
    * Resolve a node's effective params by overlaying inheritable params from
@@ -143,14 +188,17 @@ export class SceneStore {
       ancestors.unshift(p);
       cur = p;
     }
-    if (ancestors.length === 0) return node.params;
+    const expand = this.expandParams;
+    const own = expand ? expand(node.params) : node.params;
+    if (ancestors.length === 0) return own;
     const inherited: Record<string, unknown> = {};
     for (const a of ancestors) {
+      const ap = expand ? expand(a.params) : a.params;
       for (const k of SceneStore.INHERITABLE) {
-        if (a.params[k] !== undefined) inherited[k] = a.params[k];
+        if (ap[k] !== undefined) inherited[k] = ap[k];
       }
     }
-    return { ...inherited, ...node.params };
+    return { ...inherited, ...own };
   }
 
   nodesForSurface(surfaceId: string): VocabNode[] {
@@ -171,6 +219,16 @@ export class SceneStore {
     const s = t.scale ?? 1;
     const sc: [number, number, number] = typeof s === 'number' ? [s, s, s] : s;
     return mat4TRS(pos[0], pos[1], pos[2], rot[0], rot[1], rot[2], sc[0], sc[1], sc[2]);
+  }
+
+  /**
+   * The matrix a node's transform is expressed in: surfaceModel · parent
+   * chain (without the node's own local transform). Dragging converts
+   * pointer rays into this space.
+   */
+  parentMatrix(node: VocabNode, surfaceModel: Mat4): Mat4 {
+    const parent = this.parentOf(node);
+    return parent ? this.worldMatrix(parent, surfaceModel) : surfaceModel;
   }
 
   /** World matrix: surfaceModel · parent chain · local. */
