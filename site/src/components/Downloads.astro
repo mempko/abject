@@ -1,5 +1,14 @@
 ---
 import { latestRelease, platformAssets, fmtSize, fmtDate, LATEST_URL } from '../lib/releases';
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  /** Section number in the header. */
+  num?: string;
+  /** Render this block's own header (a host section may supply its own). */
+  head?: boolean;
+}
+const { num = '05', head = true } = Astro.props;
 
 const rel = await latestRelease();
 const pa = platformAssets(rel);
@@ -10,103 +19,100 @@ const size = (a?: { size: number }) => fmtSize(a?.size);
 const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
 ---
 
-<section id="downloads">
+<section id="downloads" class="dl-section">
   <div class="container">
-    <h2 class="section-title">Get Abject</h2>
-    <p class="dl-subtitle">
-      A standalone desktop app. Download, open, pick a mind, start talking.
-    </p>
+    {head && (
+      <SectionHead num={num} kicker="Download" title="Get Abject">
+        <p class="dl-subtitle">
+          It's a desktop app. Download it, open it, pick a model and start talking to it.
+        </p>
+      </SectionHead>
+    )}
     <p class="dl-meta">
       {version && <span class="dl-version">v{version}</span>}
       {rel.date && <span>released {fmtDate(rel.date)}</span>}
-      <span class="dl-meta-sep">&middot;</span>
+      <span class="dl-meta-sep" aria-hidden="true">&#9632;</span>
       <span>GPL-3.0</span>
-      <span class="dl-meta-sep">&middot;</span>
+      <span class="dl-meta-sep" aria-hidden="true">&#9632;</span>
       <a href="/install">install guide</a>
     </p>
+
     <div class="dl-grid">
 
       <!-- Linux -->
-      <div class="dl-card">
-        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
-          <path d="M12 8v4l2.5 2.5"/>
-          <path d="M8 3.5C5.5 5 3.5 8 3.5 12c0 4.5 3.5 8.5 8.5 8.5s8.5-4 8.5-8.5c0-4-2-7-4.5-8.5"/>
-          <circle cx="12" cy="12" r="2"/>
-        </svg>
-        <span class="dl-platform">Linux</span>
-        <span class="dl-arch">x64</span>
-        <div class="dl-buttons">
-          <a href={href(pa.linuxAppImage)} class="dl-btn" rel="noopener">
-            AppImage {size(pa.linuxAppImage) && <span class="dl-size">{size(pa.linuxAppImage)}</span>}
-          </a>
-          <a href={href(pa.linuxDeb)} class="dl-alt" rel="noopener">
-            .deb {size(pa.linuxDeb) && <span class="dl-size">{size(pa.linuxDeb)}</span>}
-          </a>
+      <article class="dl-card" data-os="linux" aria-label="Linux downloads">
+        <span class="dl-yours" hidden>your system</span>
+        <h3 class="dl-platform">Linux</h3>
+        <div class="dl-card-body">
+          <span class="dl-arch">x64</span>
+          <div class="dl-buttons">
+            <a href={href(pa.linuxAppImage)} class="dl-btn" rel="noopener">
+              AppImage {size(pa.linuxAppImage) && <span class="dl-size">{size(pa.linuxAppImage)}</span>}
+            </a>
+            <a href={href(pa.linuxDeb)} class="dl-alt" rel="noopener">
+              .deb {size(pa.linuxDeb) && <span class="dl-size">{size(pa.linuxDeb)}</span>}
+            </a>
+          </div>
         </div>
-      </div>
+      </article>
 
       <!-- Windows -->
-      <div class="dl-card">
-        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="3" y="3" width="18" height="18" rx="2"/>
-          <path d="M3 9h18"/>
-          <path d="M9 3v6"/>
-          <path d="M3 9l4 4-4 4"/>
-          <path d="M21 9l-4 4 4 4"/>
-        </svg>
-        <span class="dl-platform">Windows</span>
-        <span class="dl-arch">10 or later, x64</span>
-        <div class="dl-buttons">
-          <a href={href(pa.winExe)} class="dl-btn" rel="noopener">
-            Installer (.exe) {size(pa.winExe) && <span class="dl-size">{size(pa.winExe)}</span>}
-          </a>
+      <article class="dl-card" data-os="win" aria-label="Windows downloads">
+        <span class="dl-yours" hidden>your system</span>
+        <h3 class="dl-platform">Windows</h3>
+        <div class="dl-card-body">
+          <span class="dl-arch">10 or later, x64</span>
+          <div class="dl-buttons">
+            <a href={href(pa.winExe)} class="dl-btn" rel="noopener">
+              Installer (.exe) {size(pa.winExe) && <span class="dl-size">{size(pa.winExe)}</span>}
+            </a>
+          </div>
         </div>
-      </div>
+      </article>
 
       <!-- macOS -->
-      <div class="dl-card">
-        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M12 2a10 10 0 100 20 10 10 0 000-20z"/>
-          <path d="M12 2c3 3 4.5 7 4.5 10S15 19 12 22"/>
-          <path d="M12 2c-3 3-4.5 7-4.5 10S9 19 12 22"/>
-          <path d="M2 12h20"/>
-        </svg>
-        <span class="dl-platform">macOS</span>
-        <span class="dl-arch">{pa.macX64Dmg ? 'Apple Silicon and Intel' : 'Apple Silicon'}</span>
-        <div class="dl-buttons">
-          <a href={href(pa.macArmDmg)} class="dl-btn" rel="noopener">
-            {pa.macX64Dmg ? 'Apple Silicon .dmg' : '.dmg'} {size(pa.macArmDmg) && <span class="dl-size">{size(pa.macArmDmg)}</span>}
-          </a>
-          {pa.macX64Dmg && (
-            <a href={pa.macX64Dmg.url} class="dl-btn dl-btn-second" rel="noopener">
-              Intel .dmg <span class="dl-size">{size(pa.macX64Dmg)}</span>
+      <article class="dl-card" data-os="mac" aria-label="macOS downloads">
+        <span class="dl-yours" hidden>your system</span>
+        <h3 class="dl-platform">macOS</h3>
+        <div class="dl-card-body">
+          <span class="dl-arch">{pa.macX64Dmg ? 'Apple Silicon and Intel' : 'Apple Silicon'}</span>
+          <div class="dl-buttons">
+            <a href={href(pa.macArmDmg)} class="dl-btn" rel="noopener">
+              {pa.macX64Dmg ? 'Apple Silicon .dmg' : '.dmg'} {size(pa.macArmDmg) && <span class="dl-size">{size(pa.macArmDmg)}</span>}
             </a>
-          )}
-          <a href={href(pa.macArmZip)} class="dl-alt" rel="noopener">
-            .zip {size(pa.macArmZip) && <span class="dl-size">{size(pa.macArmZip)}</span>}
-          </a>
+            {pa.macX64Dmg && (
+              <a href={pa.macX64Dmg.url} class="dl-btn dl-btn-second" rel="noopener">
+                Intel .dmg <span class="dl-size">{size(pa.macX64Dmg)}</span>
+              </a>
+            )}
+            <a href={href(pa.macArmZip)} class="dl-alt" rel="noopener">
+              .zip {size(pa.macArmZip) && <span class="dl-size">{size(pa.macArmZip)}</span>}
+            </a>
+          </div>
         </div>
-      </div>
+      </article>
 
     </div>
 
     <p class="dl-unsigned">
-      The builds are not code-signed yet, so your OS will pause once before the first launch.
-      <a href="/install#first-launch">What to click</a>, per platform, takes ten seconds.
+      <span class="dl-unsigned-mark" aria-hidden="true">!</span>
+      <span>
+        The builds aren't code-signed yet, so your OS will warn you once before the first launch.
+        <a href="/install#first-launch">Here's what to click</a> on each platform. It takes ten seconds.
+      </span>
     </p>
 
-    <div class="dl-companions">
+    <div class:list={['dl-companions', { split: hasCommune }]}>
       {hasCommune && (
-        <div class="dl-companion">
-          <div class="dl-companion-head">
+        <div class="dl-companion" data-companion="commune">
+          <p class="side-label dl-companion-head">
             <span class="dl-companion-title">commune, the terminal client</span>
-            <span class="dl-companion-tag">companion</span>
-          </div>
+            <span class="tag brass dl-companion-tag">companion</span>
+          </p>
           <p class="dl-companion-desc">
-            Your chats, goals, and permission prompts in a tabbed TUI. A single
-            executable, no install. It talks to the desktop app above, which
-            must be running.<sup>†</sup>
+            Your chats, goals and permission prompts in the terminal, in tabs. It's a
+            single file with nothing to install. It connects to the desktop app, so the
+            app has to be running.<sup>†</sup>
           </p>
           <div class="dl-companion-links">
             {pa.communeLinux && <a href={pa.communeLinux.url} rel="noopener">Linux (x64)</a>}
@@ -114,20 +120,22 @@ const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
             {pa.communeMac && <a href={pa.communeMac.url} rel="noopener">macOS (Apple&nbsp;Silicon)</a>}
           </div>
           <p class="dl-companion-foot">
-            † The terminal is a view, not a second brain. All the abjects live in the app.
+            † It's only a view. All the abjects live in the desktop app.
           </p>
         </div>
       )}
 
-      <div class="dl-companion">
-        <div class="dl-companion-head">
+      {hasCommune && <div class="rule" aria-hidden="true"></div>}
+
+      <div class="dl-companion" data-companion="phone">
+        <p class="side-label dl-companion-head">
           <span class="dl-companion-title">your phone</span>
-          <span class="dl-companion-tag">nothing to install</span>
-        </div>
+          <span class="tag dl-companion-tag">nothing to install</span>
+        </p>
         <p class="dl-companion-desc">
-          Open Network, generate a pairing QR, scan it. Your desktop opens in the phone's
-          browser over an encrypted WebRTC channel, straight to your machine. Works from
-          the couch and from a cell network across town.
+          Open Network in the app, make a pairing QR code and scan it with your phone. Your
+          desktop opens in the phone's browser over an encrypted WebRTC connection, straight to
+          your machine. It works from the couch and from a cell network across town.
         </p>
         <div class="dl-companion-links">
           <a href="/install#phone">How pairing works</a>
@@ -135,272 +143,303 @@ const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
       </div>
     </div>
 
-    <p class="dl-invite">
-      Try it. Break it. Build something slightly cursed.
+    <p class="dl-invite band">
+      Try it, break it, build something horrible with it.
     </p>
     <p class="dl-note">
-      All downloads from the
+      All downloads come from the
       <a href={rel.pageUrl} target="_blank" rel="noopener">{version ? `v${version} release` : 'latest release'}</a>
-      on GitHub. No auto-updater yet: new versions install over the old one and keep your data.
+      on GitHub. There's no auto-updater yet. A new version installs over the old one and keeps your data.
     </p>
   </div>
 </section>
 
+<script>
+  // The visitor's own platform wears the red: its window takes focus and
+  // its download becomes the red block. Phones get the phone card instead.
+  const ua = navigator.userAgent;
+  const plat = navigator.platform || '';
+  const mobile = /Android|iPhone|iPad|iPod/i.test(ua) || (plat === 'MacIntel' && navigator.maxTouchPoints > 1);
+  let key: 'linux' | 'win' | 'mac' | 'phone' | null = null;
+  if (mobile) key = 'phone';
+  else if (/Win/.test(plat)) key = 'win';
+  else if (/Mac/.test(plat)) key = 'mac';
+  else if (/Linux|X11/.test(plat)) key = 'linux';
+  const card = key === 'phone'
+    ? document.querySelector('#downloads [data-companion="phone"]')
+    : key ? document.querySelector(`#downloads [data-os="${key}"]`) : null;
+  if (card) {
+    card.classList.add('focus');
+    const yours = card.querySelector('.dl-yours') as HTMLElement | null;
+    if (yours) yours.hidden = false;
+  }
+</script>
+
 <style>
-  #downloads {
-    padding: var(--section-gap) 0;
-  }
-
-  .dl-subtitle {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 1.05rem;
-    margin-bottom: 0.5rem;
-  }
-
   .dl-meta {
-    text-align: center;
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--text-dim);
-    margin-bottom: 2.5rem;
     display: flex;
     flex-wrap: wrap;
-    justify-content: center;
-    gap: 0 0.5rem;
-  }
-
-  .dl-meta a {
-    color: var(--eldritch-dim);
-  }
-
-  .dl-meta a:hover {
-    color: var(--eldritch);
-    text-decoration: underline;
+    align-items: center;
+    gap: 0.35rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--bone-meta);
+    margin: -1.5rem 0 2.5rem;
   }
 
   .dl-version {
-    color: var(--eldritch-dim);
-    font-weight: 600;
+    color: var(--bone-heading);
+    font-weight: 700;
+    background: var(--band);
+    border: 1px solid var(--rule-mid);
+    padding: 0.05rem 0.45rem;
   }
+
+  .dl-meta-sep { color: var(--red); font-size: 0.55rem; }
 
   .dl-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 1.5rem;
-    max-width: 760px;
-    margin: 0 auto;
+    align-items: stretch;
   }
 
+  /* Platform blocks: outlined slabs; the visitor's own turns solid red. */
   .dl-card {
+    position: relative;
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 2rem 1.5rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    text-decoration: none;
-    transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+    gap: 0.4rem;
+    padding: 1.6rem 1.5rem 1.7rem;
+    border: 2px solid var(--rule-strong);
+    transition: transform 0.15s, box-shadow 0.15s, background-color 0.15s;
   }
 
-  .dl-card:hover {
-    border-color: var(--border-accent);
-    box-shadow: 0 0 24px var(--eldritch-glow);
-    transform: translateY(-2px);
-  }
-
-  .dl-icon {
-    width: 36px;
-    height: 36px;
-    color: var(--eldritch);
-  }
+  .dl-card:hover { transform: translate(-2px, -2px); box-shadow: var(--print); }
 
   .dl-platform {
-    font-family: var(--font-mono);
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-primary);
+    font-size: clamp(2.2rem, 3.6vw, 3.2rem);
+    line-height: 0.95;
+    letter-spacing: 0.02em;
+    color: var(--bone-heading);
+  }
+
+  .dl-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
   }
 
   .dl-arch {
     font-family: var(--font-mono);
-    font-size: 0.72rem;
-    color: var(--text-dim);
-    margin-top: -0.35rem;
+    font-size: 0.78rem;
+    color: var(--bone-meta);
+    letter-spacing: 0.02em;
   }
+
+  .dl-yours {
+    align-self: flex-start;
+    margin-bottom: 0.35rem;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--on-red);
+    border: 1px solid rgba(246, 239, 219, 0.75);
+    padding: 0.05rem 0.45rem;
+  }
+
+  .dl-card.focus {
+    background: var(--red);
+    border-color: var(--red);
+    box-shadow: var(--print);
+  }
+
+  .dl-card.focus:hover { box-shadow: 8px 8px 0 var(--shadow-ink); }
+  .dl-card.focus .dl-platform { color: var(--on-red); font-size: clamp(2.6rem, 4.4vw, 4rem); }
+  .dl-card.focus .dl-arch { color: rgba(246, 239, 219, 0.85); }
 
   .dl-buttons {
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    margin-top: 0.4rem;
+    align-items: stretch;
+    gap: 0.7rem;
   }
 
   .dl-btn {
-    display: inline-block;
-    width: 100%;
-    text-align: center;
-    padding: 0.5rem 1rem;
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    font-family: var(--font-display);
     font-weight: 600;
-    color: var(--bg-primary);
-    background: var(--eldritch);
-    border-radius: 6px;
+    font-size: 0.98rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     text-decoration: none;
-    transition: background 0.2s, box-shadow 0.2s;
+    color: var(--bone-heading);
+    background: transparent;
+    border: var(--rule-w) solid var(--rule-strong);
+    transition: transform 0.12s, box-shadow 0.12s, background-color 0.15s, border-color 0.15s, color 0.15s;
   }
 
   .dl-btn:hover {
-    background: #fff;
-    box-shadow: 0 0 16px var(--eldritch-glow);
+    color: var(--bone-heading);
+    border-color: var(--bone);
+    background: var(--panel);
+    transform: translate(-1px, -1px);
+    box-shadow: var(--print-sm);
   }
 
-  .dl-btn-second {
-    background: transparent;
-    color: var(--eldritch);
-    border: 1px solid var(--eldritch);
+  .dl-btn:active { transform: translate(2px, 2px); box-shadow: none; }
+
+  /* On the red block the download is an ink slab that presses in. */
+  .dl-card.focus .dl-btn:not(.dl-btn-second) {
+    background: var(--void);
+    border-color: var(--void);
+    color: var(--on-red);
+    box-shadow: 5px 5px 0 var(--red-deep);
   }
 
-  .dl-btn-second:hover {
-    background: var(--eldritch-glow);
-    color: var(--eldritch);
-  }
+  .dl-card.focus .dl-btn:not(.dl-btn-second):hover { background: #16130f; }
+
+  .dl-card.focus .dl-btn-second { border-color: rgba(246, 239, 219, 0.7); color: var(--on-red); }
+  .dl-card.focus .dl-btn-second:hover { background: var(--red-hot); }
 
   .dl-size {
+    font-family: var(--font-mono);
     font-weight: 400;
-    opacity: 0.7;
-    margin-left: 0.35rem;
-    font-size: 0.78em;
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    opacity: 0.8;
   }
 
   .dl-alt {
+    align-self: center;
     font-family: var(--font-mono);
-    font-size: 0.78rem;
-    color: var(--text-dim);
-    text-decoration: none;
-    transition: color 0.2s;
+    font-size: 0.8rem;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: rgba(91, 229, 160, 0.45);
   }
 
-  .dl-alt:hover {
-    color: var(--eldritch);
-    text-decoration: underline;
-  }
+  .dl-alt:hover { text-decoration-color: var(--red); }
+
+  .dl-card.focus .dl-alt { color: var(--on-red); text-decoration-color: rgba(246, 239, 219, 0.6); }
 
   .dl-unsigned {
-    max-width: 640px;
-    margin: 1.5rem auto 0;
-    text-align: center;
-    font-size: 0.88rem;
-    color: var(--text-dim);
+    display: flex;
+    align-items: flex-start;
+    gap: 0.9rem;
+    max-width: 760px;
+    margin: 2.25rem 0 0;
+    padding: 0.2rem 0 0.2rem 1rem;
+    border-left: 4px solid var(--brass);
+    font-size: 0.92rem;
+    color: var(--bone-2);
     line-height: 1.6;
   }
 
-  .dl-companions {
+  .dl-unsigned-mark {
+    flex: 0 0 auto;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 1.25rem;
-    max-width: 860px;
-    margin: 2rem auto 0;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    margin-top: 0.1rem;
+    border: 1.5px solid var(--brass);
+    color: var(--brass);
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.85rem;
   }
 
-  .dl-companion {
-    padding: 1.25rem 1.5rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-  }
+  /* Companions: a split, content straight on the void. */
+  .dl-companions { margin-top: 4rem; }
 
   .dl-companion-head {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     flex-wrap: wrap;
     gap: 0.6rem;
+    margin-bottom: 1rem;
   }
 
   .dl-companion-title {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: var(--text-primary);
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    letter-spacing: 0.08em;
+    color: var(--bone-heading);
   }
 
-  .dl-companion-tag {
-    font-family: var(--font-mono);
-    font-size: 0.7rem;
-    color: var(--eldritch-dim);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 0.1rem 0.5rem;
-  }
+  .dl-companion-tag { font-size: 0.64rem; letter-spacing: 0.1em; }
+
+  .dl-companion.focus .dl-companion-title { color: var(--red); }
+  .dl-companion.focus .dl-companion-tag { background: var(--red); border-color: var(--red); color: var(--on-red); }
 
   .dl-companion-desc {
-    margin: 0.5rem 0 0.75rem;
-    font-size: 0.9rem;
-    color: var(--text-secondary);
+    font-size: 1rem;
+    color: var(--bone-2);
     line-height: 1.65;
+    margin-bottom: 0.9rem;
+    max-width: 52ch;
   }
+
+  .dl-companion-desc sup { color: var(--brass); }
 
   .dl-companion-links {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.75rem 1.25rem;
+    gap: 0.5rem 1.25rem;
   }
 
   .dl-companion-links a {
     font-family: var(--font-mono);
     font-size: 0.82rem;
-    color: var(--eldritch);
-    text-decoration: none;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: rgba(91, 229, 160, 0.45);
   }
 
-  .dl-companion-links a:hover {
-    text-decoration: underline;
-  }
+  .dl-companion-links a:hover { text-decoration-color: var(--red); }
 
   .dl-companion-foot {
-    margin: 0.75rem 0 0;
-    font-size: 0.75rem;
-    color: var(--text-dim);
-    font-style: italic;
+    margin-top: 1rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--rule);
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    color: var(--bone-meta);
   }
 
   .dl-invite {
-    text-align: center;
-    margin-top: 2rem;
-    font-family: var(--font-mono);
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    font-style: italic;
+    margin-top: 4.5rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(1.6rem, 3.6vw, 2.8rem);
+    line-height: 1.1;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+    max-width: 24ch;
   }
 
   .dl-note {
-    text-align: center;
-    max-width: 560px;
-    margin: 1.5rem auto 0;
-    font-size: 0.85rem;
-    color: var(--text-dim);
-    line-height: 1.6;
+    margin-top: 1.25rem;
+    max-width: 620px;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--bone-meta);
+    line-height: 1.65;
   }
 
-  .dl-note a {
-    color: var(--eldritch-dim);
-    text-decoration: none;
-  }
+  .dl-note a { font-family: var(--font-mono); }
 
-  .dl-note a:hover {
-    color: var(--eldritch);
-    text-decoration: underline;
-  }
-
-  @media (max-width: 680px) {
-    .dl-grid {
-      grid-template-columns: 1fr;
-      max-width: 320px;
-    }
+  @media (max-width: 900px) {
+    .dl-grid { grid-template-columns: 1fr; max-width: 520px; }
   }
 </style>

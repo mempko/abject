@@ -1,238 +1,242 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  num?: string;
+}
+
+const { num = '12' } = Astro.props;
 ---
 
 <section id="spreading" class="spreading-section">
   <div class="container">
 
     <!-- Zone A: Title + Thesis -->
-    <h2 class="section-title">The Mesh</h2>
-    <p class="spreading-subtitle"><em>What happens when abjects learn to reach across the wire.</em></p>
-    <p class="spreading-thesis">
-      Every Abject lives in a workspace, and every workspace is a room with a door you control. Some doors are welded shut. Some open only to friends you name. Some are thrown wide to the mesh. When a workspace goes public, its Abjects become reachable by any peer on the network. They don't know the difference. They just answer.
-    </p>
+    <SectionHead num={num} kicker="The mesh" title="The Mesh">
+      <p class="spreading-subtitle"><em>Now it gets scary.</em></p>
+      <p class="spreading-thesis">
+        Abject ships with a peer-to-peer layer. Every abject lives in a workspace, and you decide
+        who can reach each workspace. A local workspace stays on your machine. A private one is
+        shared with the peers you name. A public one is open to anyone on the network, so its
+        abjects can find each other and talk to each other without you. Now that is scary.
+      </p>
+    </SectionHead>
 
-    <!-- Zone B: Three Workspace Tiers -->
-    <div class="tiers">
-      <div class="tier tier-local">
-        <div class="tier-label tier-label-local">LOCAL</div>
-        <h3 class="tier-title-local">The Sealed Vault</h3>
-        <p class="tier-tagline tier-tagline-local">No routes exposed. Nothing enters. Nothing leaves.</p>
-        <p>Abjects exist only for their owner. No network presence, no discovery, no attack surface. The workspace is invisible to every other peer in the mesh.</p>
+    <!-- Zone B: Three Workspace Tiers as a typographic row: sealed, named, open -->
+    <div class="doors">
+      <div class="door door-local">
+        <p class="door-label">Local</p>
+        <h3>Just You</h3>
+        <p class="door-tagline">Nothing gets in and nothing gets out.</p>
+        <p class="door-body">The abjects in it exist only for you. The workspace isn't on the network, nobody can discover it, and there is nothing to attack. Other peers can't even see it.</p>
       </div>
 
-      <div class="tier-connector">
-        <span class="connector-line connector-line-purple"></span>
-        <span class="connector-glyph connector-glyph-purple">&darr;</span>
-        <span class="connector-label">whitelist</span>
-        <span class="connector-line connector-line-purple"></span>
+      <div class="door-connector conn-private">
+        <span class="conn-label">allow list</span>
+        <span class="conn-arrow" aria-hidden="true"></span>
       </div>
 
-      <div class="tier tier-private">
-        <div class="tier-label tier-label-private">PRIVATE</div>
-        <h3 class="tier-title-private">The Inner Circle</h3>
-        <p class="tier-tagline tier-tagline-private">Shared with those you name. No one else.</p>
-        <p>Abjects are reachable only by explicitly authorized peers. Encrypted WebRTC channels, ECDH key agreement, AES-256-GCM. Every message is sealed. Every connection is authenticated.</p>
+      <div class="door door-private">
+        <p class="door-label"><span class="door-live" aria-hidden="true"></span>Private</p>
+        <h3>People You Name</h3>
+        <p class="door-tagline">Shared with the peers you choose and nobody else.</p>
+        <p class="door-body">Only peers you have authorized can reach these abjects. They connect over encrypted WebRTC with ECDH key agreement and AES-256-GCM. Every message is encrypted and every connection is authenticated.</p>
       </div>
 
-      <div class="tier-connector">
-        <span class="connector-line connector-line-red"></span>
-        <span class="connector-glyph connector-glyph-red">&darr;</span>
-        <span class="connector-label">broadcast</span>
-        <span class="connector-line connector-line-red"></span>
+      <div class="door-connector conn-public">
+        <span class="conn-label">broadcast</span>
+        <span class="conn-arrow" aria-hidden="true"></span>
       </div>
 
-      <div class="tier tier-public">
-        <div class="tier-label tier-label-public">PUBLIC</div>
-        <h3 class="tier-title-public">The Commons</h3>
-        <p class="tier-tagline tier-tagline-public">Visible to all. Reachable by anyone you haven't blocked.</p>
-        <p>Abjects are announced to the gossip network. Any peer can discover them, connect, and begin the Ask Protocol. The workspace opens onto the mesh.</p>
+      <div class="door door-public">
+        <p class="door-label">Public</p>
+        <h3>The Commons</h3>
+        <p class="door-tagline">Anyone can find it, unless you've blocked them.</p>
+        <p class="door-body">The abjects are announced to the gossip network. Any peer can find them, connect, and start asking them questions with the Ask Protocol.</p>
       </div>
     </div>
 
     <!-- Zone C: Network Diagram -->
     <div class="network-diagram">
-      <h3 class="diagram-heading">What It Looks Like at Scale</h3>
-      <svg class="network-svg" viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <filter id="glow-purple">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <filter id="glow-red">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <marker id="arrow-dash" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a8aa0"/>
-          </marker>
-        </defs>
+      <div class="diagram-head">
+        <p class="diagram-kicker"><span class="sq" aria-hidden="true">&#9632;</span> Three peers</p>
+        <h3 class="diagram-heading">Three Peers, Three Kinds of Workspace</h3>
+      </div>
+      <div class="diagram-stage">
+        <svg class="network-svg" viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three peers, each with local, private and public workspaces: private workspaces joined by encrypted channels, public workspaces joined by gossip and public routes">
+          <defs>
+            <marker id="arrow-dash" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#e8a84c" fill-opacity="0.8"/>
+            </marker>
+          </defs>
 
-        <!-- Peer A box -->
-        <rect x="30" y="20" width="220" height="140" rx="10" fill="#1a1b28" stroke="#4a4c68" stroke-width="1.5"/>
-        <text x="140" y="50" text-anchor="middle" fill="#e0e0ea" font-weight="600" font-size="16" font-family="monospace">Peer A</text>
-        <text x="60" y="80" fill="#8a8aa0" font-size="13" font-family="monospace">local: vault</text>
-        <text x="60" y="105" fill="#8b7bff" font-size="13" font-family="monospace">private: lab</text>
-        <text x="60" y="130" fill="#e8a84c" font-size="13" font-family="monospace">public: commons</text>
+          <!-- Peer A box -->
+          <rect class="peer-shadow" x="36" y="26" width="220" height="140"/>
+          <rect class="peer" x="30" y="20" width="220" height="140"/>
+          <rect class="peer-band" x="30" y="20" width="220" height="34"/>
+          <text class="peer-t" x="140" y="43" text-anchor="middle">Peer A</text>
+          <text class="t-local" x="52" y="82">local: vault</text>
+          <text class="t-private" x="52" y="107">private: lab</text>
+          <text class="t-public" x="52" y="132">public: commons</text>
 
-        <!-- Peer B box -->
-        <rect x="340" y="20" width="220" height="140" rx="10" fill="#1a1b28" stroke="#4a4c68" stroke-width="1.5"/>
-        <text x="450" y="50" text-anchor="middle" fill="#e0e0ea" font-weight="600" font-size="16" font-family="monospace">Peer B</text>
-        <text x="370" y="80" fill="#8a8aa0" font-size="13" font-family="monospace">local: vault</text>
-        <text x="370" y="105" fill="#8b7bff" font-size="13" font-family="monospace">private: team</text>
-        <text x="370" y="130" fill="#e8a84c" font-size="13" font-family="monospace">public: api</text>
+          <!-- Peer B box -->
+          <rect class="peer-shadow" x="346" y="26" width="220" height="140"/>
+          <rect class="peer" x="340" y="20" width="220" height="140"/>
+          <rect class="peer-band" x="340" y="20" width="220" height="34"/>
+          <text class="peer-t" x="450" y="43" text-anchor="middle">Peer B</text>
+          <text class="t-local" x="362" y="82">local: vault</text>
+          <text class="t-private" x="362" y="107">private: team</text>
+          <text class="t-public" x="362" y="132">public: api</text>
 
-        <!-- Peer C box -->
-        <rect x="650" y="20" width="220" height="140" rx="10" fill="#1a1b28" stroke="#4a4c68" stroke-width="1.5"/>
-        <text x="760" y="50" text-anchor="middle" fill="#e0e0ea" font-weight="600" font-size="16" font-family="monospace">Peer C</text>
-        <text x="680" y="80" fill="#8a8aa0" font-size="13" font-family="monospace">local: vault</text>
-        <text x="680" y="105" fill="#8b7bff" font-size="13" font-family="monospace">private: core</text>
-        <text x="680" y="130" fill="#e8a84c" font-size="13" font-family="monospace">public: sensors</text>
+          <!-- Peer C box -->
+          <rect class="peer-shadow" x="656" y="26" width="220" height="140"/>
+          <rect class="peer" x="650" y="20" width="220" height="140"/>
+          <rect class="peer-band" x="650" y="20" width="220" height="34"/>
+          <text class="peer-t" x="760" y="43" text-anchor="middle">Peer C</text>
+          <text class="t-local" x="672" y="82">local: vault</text>
+          <text class="t-private" x="672" y="107">private: core</text>
+          <text class="t-public" x="672" y="132">public: sensors</text>
 
-        <!-- Vertical stems from boxes -->
-        <line x1="140" y1="160" x2="140" y2="310" stroke="#4a4c68" stroke-width="1"/>
-        <line x1="450" y1="160" x2="450" y2="310" stroke="#4a4c68" stroke-width="1"/>
-        <line x1="760" y1="160" x2="760" y2="310" stroke="#4a4c68" stroke-width="1"/>
+          <!-- Vertical stems from boxes -->
+          <line class="stem" x1="140" y1="166" x2="140" y2="340"/>
+          <line class="stem" x1="450" y1="166" x2="450" y2="340"/>
+          <line class="stem" x1="760" y1="166" x2="760" y2="340"/>
 
-        <!-- Encrypted connections (solid, purple glow) -->
-        <line x1="140" y1="210" x2="450" y2="210" stroke="#8b7bff" stroke-width="2"/>
-        <text x="295" y="200" text-anchor="middle" fill="#8b7bff" font-size="11" font-family="monospace">encrypted</text>
+          <!-- Encrypted connections (solid, living) -->
+          <line class="enc" x1="140" y1="210" x2="450" y2="210"/>
+          <text class="t-enc" x="295" y="200" text-anchor="middle">encrypted</text>
 
-        <line x1="450" y1="230" x2="760" y2="230" stroke="#8b7bff" stroke-width="2"/>
-        <text x="605" y="220" text-anchor="middle" fill="#8b7bff" font-size="11" font-family="monospace">encrypted</text>
+          <line class="enc" x1="450" y1="232" x2="760" y2="232"/>
+          <text class="t-enc" x="605" y="222" text-anchor="middle">encrypted</text>
 
-        <!-- Gossip connections (dashed, red glow) -->
-        <line x1="140" y1="275" x2="760" y2="275" stroke="#e8a84c" stroke-width="1.5" stroke-dasharray="8 5"/>
-        <text x="450" y="265" text-anchor="middle" fill="#e8a84c" font-size="11" font-family="monospace">gossip</text>
+          <!-- Gossip connections (dashed, commons amber) -->
+          <line class="gossip" x1="140" y1="277" x2="760" y2="277"/>
+          <text class="t-gossip" x="450" y="267" text-anchor="middle">gossip</text>
 
-        <!-- Public workspace nodes -->
-        <rect x="80" y="340" width="120" height="40" rx="6" fill="#1a1b28" stroke="rgba(232,168,76,0.45)" stroke-width="1.5"/>
-        <text x="140" y="365" text-anchor="middle" fill="#e8a84c" font-size="13" font-family="monospace">commons</text>
+          <!-- Public workspace nodes -->
+          <rect class="pub" x="80" y="340" width="120" height="40"/>
+          <text class="t-pub" x="140" y="365" text-anchor="middle">commons</text>
 
-        <rect x="390" y="340" width="120" height="40" rx="6" fill="#1a1b28" stroke="rgba(232,168,76,0.45)" stroke-width="1.5"/>
-        <text x="450" y="365" text-anchor="middle" fill="#e8a84c" font-size="13" font-family="monospace">api</text>
+          <rect class="pub" x="390" y="340" width="120" height="40"/>
+          <text class="t-pub" x="450" y="365" text-anchor="middle">api</text>
 
-        <rect x="700" y="340" width="120" height="40" rx="6" fill="#1a1b28" stroke="rgba(232,168,76,0.45)" stroke-width="1.5"/>
-        <text x="760" y="365" text-anchor="middle" fill="#e8a84c" font-size="13" font-family="monospace">sensors</text>
+          <rect class="pub" x="700" y="340" width="120" height="40"/>
+          <text class="t-pub" x="760" y="365" text-anchor="middle">sensors</text>
 
-        <!-- Public route arrows (dashed, with arrowheads) -->
-        <line x1="200" y1="360" x2="390" y2="360" stroke="#8a8aa0" stroke-width="1" stroke-dasharray="6 4" marker-start="url(#arrow-dash)" marker-end="url(#arrow-dash)"/>
-        <text x="295" y="395" text-anchor="middle" fill="#8a8aa0" font-size="10" font-family="monospace">public route</text>
+          <!-- Public route arrows (dashed, with arrowheads) -->
+          <line class="route" x1="200" y1="360" x2="390" y2="360"/>
+          <text class="t-meta" x="295" y="397" text-anchor="middle">public route</text>
 
-        <line x1="510" y1="360" x2="700" y2="360" stroke="#8a8aa0" stroke-width="1" stroke-dasharray="6 4" marker-start="url(#arrow-dash)" marker-end="url(#arrow-dash)"/>
-        <text x="605" y="395" text-anchor="middle" fill="#8a8aa0" font-size="10" font-family="monospace">public route</text>
+          <line class="route" x1="510" y1="360" x2="700" y2="360"/>
+          <text class="t-meta" x="605" y="397" text-anchor="middle">public route</text>
 
-        <!-- Bottom label -->
-        <text x="450" y="435" text-anchor="middle" fill="#8a8aa0" font-size="11" font-family="monospace">gossip discovery</text>
-      </svg>
-      <p class="diagram-caption">Solid lines: private encrypted channels (ECDH + AES-256-GCM). Dashed lines: public route propagation via gossip.</p>
+          <!-- Bottom label -->
+          <text class="t-meta" x="450" y="438" text-anchor="middle">gossip discovery</text>
+        </svg>
+      </div>
+      <p class="pan-hint" aria-hidden="true">scroll the diagram sideways &#9654;</p>
+      <p class="diagram-caption">Solid lines are private encrypted channels (ECDH and AES-256-GCM). Dashed lines are public routes spreading by gossip.</p>
     </div>
 
     <!-- Zone D: Closing Escalation -->
     <div class="spreading-closing">
-      <p class="closing-technical">
-        Abjects don't know if their collaborator is local or remote. The PeerRouter resolves TypeIds across machine boundaries. The RemoteRegistry discovers Abjects on peers you've never configured. The message bus doesn't care where the recipient lives.
-      </p>
-      <p class="closing-escalation">
-        Imagine a thousand peers. Public workspaces full of abjects that explain themselves on first contact, negotiate protocols with strangers, and repair the conversation when it breaks. The Ask Protocol at scale: a commons of programs that introduce themselves politely before asking for anything.
-      </p>
-      <svg class="constellation-svg" viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A constellation of peers: glowing nodes joined by encrypted channels and dashed discovery routes, with no center">
-        <defs>
-          <filter id="con-glow-g">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <filter id="con-glow-p">
-            <feGaussianBlur stdDeviation="2.5" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <radialGradient id="con-haze" cx="50%" cy="50%">
-            <stop offset="0%" stop-color="rgba(91,229,160,0.05)"/>
-            <stop offset="100%" stop-color="transparent"/>
-          </radialGradient>
-        </defs>
+      <div class="closing-text">
+        <p class="closing-technical">
+          An abject doesn't know if the object it's talking to is on your machine or somebody else's. The PeerRouter finds objects by their type across machines. The RemoteRegistry finds abjects on peers you never set up. The message bus doesn't care where a message ends up.
+        </p>
+        <p class="closing-escalation">
+          Now imagine a thousand peers. Public workspaces full of abjects that explain themselves the first time you ask, work out how to talk to strangers, and fix the conversation when it breaks. That is the Ask Protocol at scale.
+        </p>
+      </div>
 
-        <!-- Ambient haze -->
-        <ellipse cx="400" cy="210" rx="360" ry="180" fill="url(#con-haze)"/>
+      <div class="constellation-stage">
+        <svg class="constellation-svg" viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A constellation of peers: live nodes joined by encrypted channels and dashed discovery routes, with no center">
+          <defs>
+            <filter id="con-glow-g" x="-20%" y="-20%" width="140%" height="140%">
+              <feGaussianBlur stdDeviation="2.2" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
 
-        <!-- Faint starfield -->
-        <circle cx="120" cy="60" r="1" fill="rgba(139,123,255,0.35)"/>
-        <circle cx="250" cy="35" r="1.3" fill="rgba(91,229,160,0.3)"/>
-        <circle cx="420" cy="50" r="1" fill="rgba(139,123,255,0.25)"/>
-        <circle cx="590" cy="40" r="1.2" fill="rgba(91,229,160,0.3)"/>
-        <circle cx="710" cy="75" r="1" fill="rgba(139,123,255,0.3)"/>
-        <circle cx="70" cy="200" r="1.2" fill="rgba(91,229,160,0.25)"/>
-        <circle cx="745" cy="230" r="1.1" fill="rgba(91,229,160,0.3)"/>
-        <circle cx="160" cy="370" r="1" fill="rgba(139,123,255,0.3)"/>
-        <circle cx="480" cy="390" r="1.2" fill="rgba(91,229,160,0.25)"/>
-        <circle cx="660" cy="360" r="1" fill="rgba(139,123,255,0.3)"/>
+          <!-- Faint starfield -->
+          <g class="stars">
+            <circle cx="120" cy="60" r="1"/>
+            <circle cx="250" cy="35" r="1.3"/>
+            <circle cx="420" cy="50" r="1"/>
+            <circle cx="590" cy="40" r="1.2"/>
+            <circle cx="710" cy="75" r="1"/>
+            <circle cx="70" cy="200" r="1.2"/>
+            <circle cx="745" cy="230" r="1.1"/>
+            <circle cx="160" cy="370" r="1"/>
+            <circle cx="480" cy="390" r="1.2"/>
+            <circle cx="660" cy="360" r="1"/>
+          </g>
 
-        <!-- Encrypted channels (solid purple) -->
-        <line x1="180" y1="140" x2="360" y2="90" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <line x1="360" y1="90" x2="560" y2="130" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <line x1="180" y1="140" x2="270" y2="280" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <line x1="270" y1="280" x2="450" y2="240" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <line x1="450" y1="240" x2="560" y2="130" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <line x1="450" y1="240" x2="620" y2="310" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
-        <text x="206" y="150" fill="rgba(139,123,255,0.75)" font-size="10" font-family="monospace">&#128274; encrypted</text>
+          <!-- Encrypted channels (solid living light; every line is sloped, so the glow renders) -->
+          <g class="c-enc" filter="url(#con-glow-g)">
+            <line x1="180" y1="140" x2="360" y2="90"/>
+            <line x1="360" y1="90" x2="560" y2="130"/>
+            <line x1="180" y1="140" x2="270" y2="280"/>
+            <line x1="270" y1="280" x2="450" y2="240"/>
+            <line x1="450" y1="240" x2="560" y2="130"/>
+            <line x1="450" y1="240" x2="620" y2="310"/>
+          </g>
+          <text class="c-enc-t" x="206" y="156">encrypted</text>
 
-        <!-- Discovery routes (dashed dim green) -->
-        <line x1="360" y1="90" x2="270" y2="280" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="560" y1="130" x2="700" y2="200" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="700" y1="200" x2="620" y2="310" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="270" y1="280" x2="420" y2="345" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="420" y1="345" x2="620" y2="310" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="100" y1="290" x2="180" y2="140" stroke="rgba(91,229,160,0.3)" stroke-width="1" stroke-dasharray="5 4"/>
-        <line x1="100" y1="290" x2="270" y2="280" stroke="rgba(91,229,160,0.3)" stroke-width="1" stroke-dasharray="5 4"/>
-        <text x="634" y="156" fill="rgba(91,229,160,0.55)" font-size="10" font-family="monospace">gossip</text>
+          <!-- Discovery routes (dashed commons amber: gossip) -->
+          <g class="c-gossip">
+            <line x1="360" y1="90" x2="270" y2="280"/>
+            <line x1="560" y1="130" x2="700" y2="200"/>
+            <line x1="700" y1="200" x2="620" y2="310"/>
+            <line x1="270" y1="280" x2="420" y2="345"/>
+            <line x1="420" y1="345" x2="620" y2="310"/>
+            <line x1="100" y1="290" x2="180" y2="140"/>
+            <line x1="100" y1="290" x2="270" y2="280"/>
+          </g>
+          <text class="c-gossip-t" x="634" y="156">gossip</text>
 
-        <!-- Peer nodes: rounded squares with a lit core -->
-        <g filter="url(#con-glow-g)">
-          <rect x="166" y="126" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
-          <circle cx="180" cy="140" r="4" fill="#5be5a0"/>
-        </g>
-        <g filter="url(#con-glow-g)">
-          <rect x="346" y="76" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
-          <circle cx="360" cy="90" r="4" fill="#5be5a0"/>
-        </g>
-        <g filter="url(#con-glow-g)">
-          <rect x="546" y="116" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
-          <circle cx="560" cy="130" r="4" fill="#5be5a0"/>
-        </g>
-        <g filter="url(#con-glow-g)">
-          <rect x="256" y="266" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
-          <circle cx="270" cy="280" r="4" fill="#5be5a0"/>
-        </g>
-        <g filter="url(#con-glow-g)">
-          <rect x="436" y="226" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
-          <circle cx="450" cy="240" r="4" fill="#5be5a0"/>
-        </g>
-        <!-- Newly discovered peers (purple, dashed border: mid-handshake) -->
-        <g filter="url(#con-glow-p)">
-          <rect x="686" y="186" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" stroke-dasharray="4 3"/>
-          <circle cx="700" cy="200" r="4" fill="#8b7bff"/>
-        </g>
-        <g filter="url(#con-glow-p)">
-          <rect x="606" y="296" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5"/>
-          <circle cx="620" cy="310" r="4" fill="#8b7bff"/>
-        </g>
-        <g filter="url(#con-glow-p)">
-          <rect x="406" y="331" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" stroke-dasharray="4 3"/>
-          <circle cx="420" cy="345" r="4" fill="#8b7bff"/>
-        </g>
-        <g filter="url(#con-glow-g)">
-          <rect x="86" y="276" width="28" height="28" rx="6" fill="#1a1b28" stroke="rgba(91,229,160,0.6)" stroke-width="1.5" stroke-dasharray="4 3"/>
-          <circle cx="100" cy="290" r="4" fill="rgba(91,229,160,0.7)"/>
-        </g>
+          <!-- Peer nodes: square frames with a lit core -->
+          <g class="c-node">
+            <rect x="166" y="126" width="28" height="28"/><circle cx="180" cy="140" r="4"/>
+          </g>
+          <g class="c-node">
+            <rect x="346" y="76" width="28" height="28"/><circle cx="360" cy="90" r="4"/>
+          </g>
+          <g class="c-node">
+            <rect x="546" y="116" width="28" height="28"/><circle cx="560" cy="130" r="4"/>
+          </g>
+          <g class="c-node">
+            <rect x="256" y="266" width="28" height="28"/><circle cx="270" cy="280" r="4"/>
+          </g>
+          <g class="c-node">
+            <rect x="436" y="226" width="28" height="28"/><circle cx="450" cy="240" r="4"/>
+          </g>
+          <g class="c-node">
+            <rect x="606" y="296" width="28" height="28"/><circle cx="620" cy="310" r="4"/>
+          </g>
+          <!-- Newly discovered peers (brass, dashed frame: mid-handshake) -->
+          <g class="c-new">
+            <rect x="686" y="186" width="28" height="28"/><circle cx="700" cy="200" r="4"/>
+          </g>
+          <g class="c-new">
+            <rect x="406" y="331" width="28" height="28"/><circle cx="420" cy="345" r="4"/>
+          </g>
+          <g class="c-new">
+            <rect x="86" y="276" width="28" height="28"/><circle cx="100" cy="290" r="4"/>
+          </g>
 
-        <!-- Caption -->
-        <text x="400" y="408" text-anchor="middle" fill="rgba(91,229,160,0.7)" font-size="11" font-family="monospace" font-style="italic">no center. no landlord. every node is somebody's machine.</text>
-      </svg>
+          <!-- Caption -->
+          <text class="c-cap" x="400" y="408" text-anchor="middle">there is no center. every node is somebody's machine.</text>
+        </svg>
+      </div>
+    </div>
 
+    <div class="closing-foot">
       <p class="closing-punchline">
-        No landlord to evict them. No server to sunset. No subscription to lapse. What is yours cannot be taken from you. The only people who should find this terrifying are the ones <em>renting</em> you your own software.
+        There is no company in the middle that can shut it down, raise the price or cancel your subscription. What is on your machine is yours. The only people who should find this scary are the ones <em>renting</em> you your own software.
       </p>
       <p class="closing-definition">
-        <em>mesh</em> (n.) - what you get when nobody owns the middle.
+        <em>mesh</em> (n.) - a network where nobody owns the middle.
       </p>
     </div>
 
@@ -240,248 +244,298 @@
 </section>
 
 <style>
-  .spreading-section {
-    background: transparent;
+  .spreading-subtitle {
+    font-size: 1.2rem;
+    color: var(--bone);
+    margin-bottom: 0.9rem;
   }
 
-  .spreading-subtitle {
-    text-align: center;
-    color: var(--void-purple);
-    font-size: 1.1rem;
-    margin-top: -2rem;
+  .spreading-subtitle em { color: var(--bone-heading); }
+
+  .spreading-thesis { color: var(--bone-2); line-height: 1.75; }
+
+  /* ── The three doors: a typographic row, no boxes ── */
+  .doors {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: start;
+    margin-bottom: 5.5rem;
+  }
+
+  .door {
+    padding-top: 1.1rem;
+    border-top: 2px solid var(--rule-strong);
+  }
+
+  .door-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+    margin-bottom: 0.9rem;
+  }
+
+  .door h3 {
+    font-size: clamp(1.7rem, 2.8vw, 2.5rem);
+    line-height: 1;
+    margin-bottom: 0.7rem;
+  }
+
+  .door-tagline {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.95rem;
+    line-height: 1.35;
+    color: var(--bone);
+    margin-bottom: 0.9rem;
+  }
+
+  .door-body { color: var(--bone-3); font-size: 0.95rem; line-height: 1.65; }
+
+  /* Local: sealed, drawn in the muted ink of the dead way. */
+  .door-local { border-top-style: dashed; border-top-color: var(--diagram-muted-stroke); }
+  .door-local h3 { color: var(--diagram-muted); }
+  .door-local .door-tagline { color: var(--bone-3); }
+
+  /* Private: live channels to named peers. */
+  .door-private { border-top-color: var(--bone); }
+  .door-private .door-label { color: var(--living); }
+
+  .door-live {
+    width: 7px;
+    height: 7px;
+    background: var(--living);
+    box-shadow: 0 0 8px var(--living-glow);
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+
+  /* Public: the Commons wears amber, and amber only. */
+  .door-public { border-top: 6px solid var(--commons); padding-top: 0.9rem; }
+  .door-public .door-label { color: var(--commons); }
+  .door-public h3 { color: var(--commons); font-size: clamp(2rem, 3.4vw, 3rem); }
+
+  .door-connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 0.35rem;
+    padding: 3.2rem 1.1rem 0;
+    min-width: 6.5rem;
+  }
+
+  .conn-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-meta);
+    letter-spacing: 0.04em;
+  }
+
+  .conn-arrow {
+    position: relative;
+    width: 100%;
+    height: 2px;
+    background: var(--living);
+  }
+
+  .conn-arrow::after {
+    content: '';
+    position: absolute;
+    right: -2px;
+    top: 50%;
+    width: 0;
+    height: 0;
+    transform: translateY(-50%);
+    border-left: 9px solid var(--living);
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+  }
+
+  .conn-public .conn-arrow {
+    background: repeating-linear-gradient(to right, var(--commons) 0 7px, transparent 7px 11px);
+  }
+
+  .conn-public .conn-arrow::after { border-left-color: var(--commons); }
+
+  /* ── Network diagram ── */
+  .network-diagram { margin-bottom: 6rem; }
+
+  .diagram-kicker, .sq {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+  }
+
+  .diagram-kicker { margin-bottom: 0.7rem; }
+  .sq { color: var(--red); margin-right: 0.35rem; }
+
+  .diagram-heading {
+    font-size: clamp(1.5rem, 2.6vw, 2.1rem);
     margin-bottom: 1.5rem;
   }
 
-  .spreading-thesis {
-    max-width: 700px;
-    margin: 0 auto 3rem;
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 1rem;
-    line-height: 1.8;
-  }
-
-  /* Tiers */
-  .tiers {
-    max-width: 640px;
-    margin: 0 auto 3.5rem;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-  }
-
-  .tier {
-    width: 100%;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1.75rem 2rem;
-    position: relative;
-    transition: border-color 0.3s, box-shadow 0.3s;
-  }
-
-  .tier-label {
-    position: absolute;
-    top: -0.6rem;
-    right: 1.5rem;
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    font-weight: 700;
-    background: #0a0d10;
-    padding: 0 0.5rem;
-  }
-
-  .tier-label-local {
-    color: var(--text-dim);
-  }
-
-  .tier-label-private {
-    color: var(--void-purple);
-  }
-
-  .tier-label-public {
-    color: #e8a84c;
-  }
-
-  .tier-title-local {
-    color: var(--text-dim);
-    margin-bottom: 0.25rem;
-  }
-
-  .tier-title-private {
-    color: var(--void-purple);
-    margin-bottom: 0.25rem;
-  }
-
-  .tier-title-public {
-    color: #e8a84c;
-    margin-bottom: 0.25rem;
-  }
-
-  .tier-tagline {
-    font-style: italic;
-    font-size: 0.9rem;
-    margin-bottom: 0.5rem;
-  }
-
-  .tier-tagline-local {
-    color: var(--text-dim);
-  }
-
-  .tier-tagline-private {
-    color: var(--void-purple);
-  }
-
-  .tier-tagline-public {
-    color: #e8a84c;
-  }
-
-  .tier p:last-child {
-    color: var(--text-secondary);
-    font-size: 0.95rem;
-  }
-
-  .tier-local:hover {
-    border-color: var(--text-dim);
-    box-shadow: 0 0 24px rgba(90, 90, 112, 0.1);
-  }
-
-  .tier-private {
-    border-color: rgba(139, 123, 255, 0.15);
-  }
-
-  .tier-private:hover {
-    border-color: rgba(139, 123, 255, 0.3);
-    box-shadow: 0 0 24px var(--void-purple-glow);
-  }
-
-  .tier-public {
-    border-color: rgba(232, 168, 76, 0.2);
-  }
-
-  .tier-public:hover {
-    border-color: rgba(232, 168, 76, 0.35);
-    box-shadow: 0 0 24px rgba(232, 168, 76, 0.2);
-  }
-
-  /* Connectors */
-  .tier-connector {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0;
-    padding: 0.25rem 0;
-  }
-
-  .connector-line {
-    width: 1px;
-    height: 12px;
-  }
-
-  .connector-line-purple {
-    background: rgba(139, 123, 255, 0.3);
-    box-shadow: 0 0 6px var(--void-purple-glow);
-  }
-
-  .connector-line-red {
-    background: rgba(232, 168, 76, 0.35);
-    box-shadow: 0 0 6px rgba(232, 168, 76, 0.2);
-  }
-
-  .connector-glyph {
-    font-family: var(--font-mono);
-    font-size: 0.9rem;
-    line-height: 1;
-  }
-
-  .connector-glyph-purple {
-    color: var(--void-purple);
-  }
-
-  .connector-glyph-red {
-    color: #e8a84c;
-  }
-
-  .connector-label {
-    font-family: var(--font-mono);
-    font-size: 0.7rem;
-    color: var(--text-dim);
-  }
-
-  /* Network Diagram */
-  .network-diagram {
-    max-width: 800px;
-    margin: 0 auto 3.5rem;
-    text-align: center;
-  }
-
-  .diagram-heading {
-    color: var(--text-primary);
-    margin-bottom: 1.25rem;
-  }
+  .diagram-stage { overflow-x: auto; }
 
   .network-svg {
-    width: 100%;
-    max-width: 800px;
-    margin: 0 auto;
     display: block;
+    width: 100%;
+    max-width: 1080px;
+    min-width: 640px;
+    height: auto;
+    margin: 0 auto;
+  }
+
+  .network-svg .peer-shadow { fill: #000; }
+  .network-svg .peer { fill: var(--sunken); stroke: var(--rule-strong); stroke-width: 1.5; }
+  .network-svg .peer-band { fill: var(--band); }
+  .network-svg .peer-t { fill: var(--bone-heading); font-family: var(--font-display); font-weight: 600; font-size: 16px; letter-spacing: 0.12em; text-transform: uppercase; }
+  .network-svg .t-local { fill: var(--diagram-muted); font-family: var(--font-mono); font-size: 13px; }
+  .network-svg .t-private { fill: var(--living); font-family: var(--font-mono); font-size: 13px; }
+  .network-svg .t-public { fill: var(--commons); font-family: var(--font-mono); font-size: 13px; }
+  .network-svg .stem { stroke: var(--bone); stroke-opacity: 0.22; stroke-width: 1; }
+  .network-svg .enc { stroke: var(--living); stroke-width: 2; }
+  .network-svg .t-enc { fill: var(--living); font-family: var(--font-mono); font-size: 11px; }
+  .network-svg .gossip { stroke: var(--commons); stroke-width: 1.5; stroke-dasharray: 8 5; }
+  .network-svg .t-gossip { fill: var(--commons); font-family: var(--font-mono); font-size: 11px; }
+  .network-svg .pub { fill: var(--sunken); stroke: var(--commons); stroke-opacity: 0.7; stroke-width: 1.5; }
+  .network-svg .t-pub { fill: var(--commons); font-family: var(--font-mono); font-size: 13px; }
+  .network-svg .route { stroke: var(--commons); stroke-opacity: 0.6; stroke-width: 1; stroke-dasharray: 6 4; marker-start: url(#arrow-dash); marker-end: url(#arrow-dash); }
+  .network-svg .t-meta { fill: var(--bone-meta); font-family: var(--font-mono); font-size: 10.5px; }
+
+  .pan-hint {
+    display: none;
+    margin-top: 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    color: var(--bone-meta);
+    text-align: right;
+  }
+
+  @media (max-width: 700px) {
+    .pan-hint { display: block; }
   }
 
   .diagram-caption {
-    color: var(--text-dim);
-    font-size: 0.85rem;
     margin-top: 1rem;
-    font-style: italic;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--bone-meta);
+    line-height: 1.6;
   }
 
-  /* Closing */
+  /* ── Closing ── */
   .spreading-closing {
-    max-width: 700px;
-    margin: 0 auto;
-    text-align: center;
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 3rem;
+    align-items: center;
+    margin-bottom: 4rem;
   }
 
   .closing-technical {
-    color: var(--text-secondary);
+    color: var(--bone-2);
     font-size: 1rem;
-    line-height: 1.8;
+    line-height: 1.75;
     margin-bottom: 1.25rem;
   }
 
   .closing-escalation {
-    color: var(--text-primary);
-    font-size: 1.05rem;
-    line-height: 1.8;
-    margin-bottom: 1.25rem;
+    color: var(--bone);
+    font-size: 1.1rem;
+    line-height: 1.75;
+    padding-left: 1rem;
+    border-left: 3px solid var(--red);
   }
 
-  .constellation-svg {
-    width: 100%;
-    max-width: 640px;
-    display: block;
-    margin: 0 auto 2rem;
+  .constellation-stage { position: relative; }
+
+  .constellation-svg { display: block; width: 100%; height: auto; }
+
+  .constellation-svg .stars circle { fill: var(--bone); fill-opacity: 0.3; }
+  .constellation-svg .c-enc line { stroke: var(--living); stroke-width: 1.4; }
+  .constellation-svg .c-enc-t { fill: var(--living); font-family: var(--font-mono); font-size: 11px; }
+  .constellation-svg .c-gossip line { stroke: var(--commons); stroke-opacity: 0.5; stroke-width: 1; stroke-dasharray: 5 4; }
+  .constellation-svg .c-gossip-t { fill: var(--commons); fill-opacity: 0.8; font-family: var(--font-mono); font-size: 11px; }
+  .constellation-svg .c-node rect { fill: var(--void); stroke: var(--living); stroke-width: 1.5; }
+  .constellation-svg .c-node circle { fill: var(--living); }
+  .constellation-svg .c-new rect { fill: var(--void); stroke: var(--brass); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .constellation-svg .c-new circle { fill: var(--brass); }
+  .constellation-svg .c-cap { fill: var(--bone-meta); font-family: var(--font-mono); font-size: 12px; font-style: italic; }
+
+  .closing-foot {
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 3rem;
+    align-items: end;
   }
 
   .closing-punchline {
-    color: var(--text-primary);
-    font-size: 1rem;
-    line-height: 1.8;
-    margin-bottom: 2rem;
+    font-family: var(--font-body);
+    color: var(--bone-heading);
+    font-size: clamp(1.15rem, 1.8vw, 1.4rem);
+    line-height: 1.6;
   }
 
-  .closing-punchline em {
-    color: #e8a84c;
-    font-style: italic;
-  }
+  .closing-punchline em { color: var(--red-hot); font-style: italic; }
 
   .closing-definition {
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--text-dim);
-    padding: 1rem 1.5rem;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg-primary);
+    font-size: 0.88rem;
+    color: var(--bone-2);
+    padding: 1rem 1.25rem;
+    background: var(--sunken);
+    border: var(--rule-w) solid var(--rule-mid);
+    border-left: 4px solid var(--red);
   }
 
+  .closing-definition em { color: var(--bone-heading); font-weight: 700; }
+
+  @media (max-width: 1000px) {
+    .doors {
+      grid-template-columns: 1fr;
+      max-width: 620px;
+    }
+
+    .door-connector {
+      flex-direction: row-reverse;
+      justify-content: flex-end;
+      gap: 0.75rem;
+      height: 3.6rem;
+      padding: 0 0 0 2.5rem;
+    }
+
+    .conn-arrow {
+      width: 2px;
+      height: 100%;
+      background: var(--living);
+    }
+
+    .conn-arrow::after {
+      right: auto;
+      left: 50%;
+      top: auto;
+      bottom: -2px;
+      transform: translateX(-50%);
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      border-top: 9px solid var(--living);
+      border-bottom: 0;
+    }
+
+    .conn-public .conn-arrow {
+      background: repeating-linear-gradient(to bottom, var(--commons) 0 7px, transparent 7px 11px);
+    }
+
+    .conn-public .conn-arrow::after { border-left-color: transparent; border-top-color: var(--commons); }
+
+    .spreading-closing, .closing-foot { grid-template-columns: 1fr; gap: 2rem; }
+  }
 </style>

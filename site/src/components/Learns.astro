@@ -1,0 +1,309 @@
+---
+/**
+ * 03 It gets smarter every time (the climax, on the red ground). The loop
+ * as five stages (predict, act, compare, learn, weave) with the way back
+ * to the next plan; then the proof: the Knowledge window with a real
+ * pattern the reviewer wrote, transcribed on a paper slip, and the names of
+ * others it has learned with how often each proved useful.
+ */
+import SectionHead from './ui/SectionHead.astro';
+import Shot from './ui/Shot.astro';
+
+const stages = [
+  { n: '1', verb: 'Predict', note: 'Before it acts, the agent writes down what it expects to happen.' },
+  { n: '2', verb: 'Act', note: 'The runtime keeps the prediction and pairs it with what actually came back.' },
+  { n: '3', verb: 'Compare', note: 'After the goal, the reviewer checks each prediction: supported, contradicted or unresolved. The misses matter most.' },
+  { n: '4', verb: 'Learn', note: 'Lessons become facts. A lesson that keeps coming back becomes a named pattern.' },
+  { n: '5', verb: 'Weave', note: 'For the next task, the patterns that fit, and the ones they link to, go into the agent\u2019s prompt and the ScrumMaster\u2019s plan.' },
+];
+
+// Real patterns from the capture, with their usefulness counts.
+const learned = [
+  { name: 'Modify in Place, Verify from Outside', useful: 28 },
+  { name: 'External Store of Truth', useful: 24 },
+  { name: 'Diagnose Before Repair', useful: 15 },
+  { name: 'Batch the Boring Part', useful: 11 },
+  { name: 'Trust the Registry, Not the Text', useful: 11 },
+  { name: 'Narrow Research Lanes', useful: 5 },
+];
+---
+
+<section id="learns" class="learns-section field-red cut-top">
+  <div class="container">
+    <SectionHead num="03" kicker="Learns" title="It gets smarter every time">
+      Learning happens when things go wrong. For each task, the agent predicts what the result
+      should be. After the goal, a reviewer compares every prediction with what actually
+      happened and saves the lessons as facts and named patterns in a knowledge base. The next
+      plan starts from those patterns. The lessons don&rsquo;t evaporate when the goal ends.
+    </SectionHead>
+
+    <ol class="stages" aria-label="How it learns">
+      {stages.map((s, i) => (
+        <li class:list={['stage', `stage-${i + 1}`]}>
+          <div class="glyph" aria-hidden="true">
+            {i === 0 && (
+              <svg viewBox="0 0 120 64"><line class="g-exp" x1="6" y1="30" x2="114" y2="30" /><text class="g-t" x="6" y="18">expect</text></svg>
+            )}
+            {i === 1 && (
+              <svg viewBox="0 0 120 64"><line class="g-exp" x1="6" y1="30" x2="114" y2="30" /><line class="g-got" x1="6" y1="36" x2="114" y2="38" /><text class="g-t" x="6" y="58">what came back</text></svg>
+            )}
+            {i === 2 && (
+              <svg viewBox="0 0 120 64"><line class="g-exp" x1="6" y1="24" x2="114" y2="24" /><line class="g-got" x1="6" y1="30" x2="114" y2="54" /><circle class="g-eye" cx="96" cy="37" r="11" /><ellipse class="g-pupil" cx="96" cy="37" rx="2.6" ry="6.5" /><text class="g-t" x="6" y="14">miss</text></svg>
+            )}
+            {i === 3 && (
+              <svg viewBox="0 0 120 64"><rect class="g-card" x="30" y="6" width="60" height="52" /><line class="g-ln" x1="38" y1="18" x2="80" y2="17" /><line class="g-ln" x1="38" y1="28" x2="82" y2="27" /><line class="g-ln" x1="38" y1="38" x2="70" y2="37" /><rect class="g-tab" x="38" y="46" width="22" height="6" /></svg>
+            )}
+            {i === 4 && (
+              <svg viewBox="0 0 120 64"><path class="g-link" d="M18 44 L46 20 L74 40 L102 16 M46 20 L60 54 L74 40" /><circle class="g-node" cx="18" cy="44" r="6" /><circle class="g-node" cx="46" cy="20" r="6" /><circle class="g-node new" cx="74" cy="40" r="8" /><circle class="g-node" cx="102" cy="16" r="6" /><circle class="g-node" cx="60" cy="54" r="5" /></svg>
+            )}
+          </div>
+          <p class="stage-n"><span>{s.n}</span> {s.verb}</p>
+          <p class="stage-note">{s.note}</p>
+        </li>
+      ))}
+    </ol>
+    <p class="back">
+      <span class="back-wedge" aria-hidden="true"></span>
+      The next goal starts from what the last ones taught it.
+    </p>
+
+    <div class="proof">
+      <div class="proof-shot">
+        <Shot id="patterns" bare />
+      </div>
+
+      <article class="slip" aria-label="A pattern the reviewer wrote">
+        <p class="slip-kicker">A real pattern, written by the reviewer</p>
+        <h3 class="slip-name">The Team, the Setup, the Verification</h3>
+        <dl>
+          <dt>Context</dt>
+          <dd>&ldquo;A goal spans more than one competency &hellip; and no single agent holds all the tools.&rdquo;</dd>
+          <dt>Therefore</dt>
+          <dd>&ldquo;Assign tasks so each agent owns the data it can reach: default to ONE agent when a single competency covers the whole ask; split at exactly the handoff where the next competency begins&hellip;&rdquo;</dd>
+          <dt>Recorded evidence</dt>
+          <dd class="slip-ev">&ldquo;Revision 1; helpful in 33 distinct goals; counterexamples in 0 goals.&rdquo;</dd>
+        </dl>
+      </article>
+    </div>
+
+    <div class="learned">
+      <p class="learned-label">A few more it has learned, and how often each one helped</p>
+      <ul class="learned-list">
+        {learned.map((p) => (
+          <li><span class="l-name">{p.name}</span> <span class="l-n">useful &times;{p.useful}</span></li>
+        ))}
+      </ul>
+      <p class="learned-note">
+        Once an LLM is deployed, its weights don&rsquo;t change, so on its own it can&rsquo;t
+        learn. An LLM with a harness and an external memory can. Here that memory is something
+        you can read: open the Knowledge window to browse the patterns, and merge or prune them.
+        It stays in its workspace, and a shared workspace syncs it to its peers.
+      </p>
+    </div>
+
+    <p class="poster-quote closing"><span>A loop without memory is a treadmill.</span> <span>A loop with memory is a ratchet.</span></p>
+  </div>
+</section>
+
+<style>
+  .learns-section :global(.lede) { color: var(--field-ink-2); }
+
+  /* ── The five stages: a row of glyphs on the red ground, joined by ink
+     wedges; they stack on narrow screens. ── */
+  .stages {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    border-top: 4px solid var(--field-accent);
+  }
+
+  .stage {
+    position: relative;
+    padding: 1.3rem 1.3rem 0.6rem 0;
+  }
+
+  .stage + .stage { padding-left: 1.3rem; border-left: 1.5px solid var(--field-rule); }
+
+  .stage + .stage::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    top: 3.2rem;
+    width: 14px;
+    height: 16px;
+    background: var(--field-accent);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+  }
+
+  .glyph svg { display: block; width: 100%; max-width: 150px; height: auto; margin-bottom: 0.9rem; }
+
+  .g-exp { stroke: var(--field-accent); stroke-width: 2.5; stroke-dasharray: 7 5; }
+  .g-got { stroke: var(--on-red); stroke-width: 2.5; }
+  .g-t { font-family: var(--font-mono); font-size: 11px; fill: var(--field-accent); }
+  .g-eye { fill: var(--field-accent); stroke: var(--on-red); stroke-width: 2.5; }
+  .g-pupil { fill: var(--living); }
+  .g-card { fill: #efe6d1; stroke: var(--field-accent); stroke-width: 2; }
+  .g-ln { stroke: var(--field-accent); stroke-width: 2; }
+  .g-tab { fill: var(--red-deep); }
+  .g-link { stroke: var(--field-accent); stroke-width: 2; fill: none; }
+  .g-node { fill: var(--on-red); stroke: var(--field-accent); stroke-width: 2; }
+  .g-node.new { fill: var(--field-accent); stroke: var(--on-red); }
+
+  .stage-n {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(1.5rem, 2.3vw, 2rem);
+    line-height: 1;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--on-red);
+    margin-bottom: 0.6rem;
+  }
+
+  .stage-n span { color: var(--field-accent); margin-right: 0.15rem; }
+
+  .stage-note { font-size: 0.93rem; line-height: 1.55; }
+
+  /* The way back: an ink band with a wedge pointing home. */
+  .back {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    margin-top: 1.4rem;
+    padding: 0.7rem 1rem 0.7rem 2.6rem;
+    background: var(--field-accent);
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.05rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--on-red);
+  }
+
+  .back-wedge {
+    position: absolute;
+    left: 0.9rem;
+    width: 14px;
+    height: 16px;
+    background: var(--red);
+    clip-path: polygon(100% 0, 0 50%, 100% 100%);
+  }
+
+  /* ── The proof: the Knowledge window, with the pattern transcribed on a
+     paper slip pinned over its edge. ── */
+  .proof {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    margin-top: 4.5rem;
+    align-items: start;
+  }
+
+  .proof-shot { grid-column: 1 / 10; grid-row: 1; }
+  .proof-shot :global(.shot) { box-shadow: 10px 10px 0 var(--field-accent); }
+
+  .slip {
+    grid-column: 8 / 13;
+    grid-row: 1;
+    margin-top: 5rem;
+    z-index: 2;
+    padding: 1.4rem 1.5rem 1.5rem;
+    background: #efe6d1;
+    color: #16130f;
+    box-shadow: 8px 8px 0 var(--field-accent);
+    transform: rotate(1.4deg);
+  }
+
+  .slip-kicker {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--red-deep);
+    margin-bottom: 0.4rem;
+  }
+
+  .slip-name {
+    color: #16130f;
+    font-size: 1.45rem;
+    line-height: 1.05;
+    margin-bottom: 0.9rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 3px solid var(--red);
+  }
+
+  .slip dt {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.82rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--red-deep);
+    margin-top: 0.7rem;
+  }
+
+  .slip dd { font-size: 0.9rem; line-height: 1.5; color: #2b2620; }
+  .slip-ev { font-family: var(--font-mono); font-size: 0.8rem !important; font-weight: 600; color: #16130f !important; }
+
+  /* ── The names of the others: a strip between ink rules ── */
+  .learned { margin-top: 3.5rem; }
+
+  .learned-label {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin-bottom: 0.6rem;
+  }
+
+  .learned-list {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 2rem;
+    padding: 0.9rem 0;
+    border-top: 2px solid var(--field-accent);
+    border-bottom: 2px solid var(--field-accent);
+  }
+
+  .learned-list li { display: inline-flex; align-items: baseline; gap: 0.5rem; }
+
+  .l-name {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.05rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--on-red);
+  }
+
+  .l-n { font-family: var(--font-mono); font-size: 0.74rem; color: var(--field-accent); }
+
+  .learned-note { margin-top: 1rem; max-width: 760px; font-size: 0.97rem; line-height: 1.6; }
+
+  .closing { margin-top: 3.5rem; color: var(--on-red); }
+  .closing span { display: block; }
+
+  @media (max-width: 980px) {
+    .stages { grid-template-columns: 1fr; }
+    .stage, .stage + .stage {
+      display: grid;
+      grid-template-columns: 7.5rem minmax(0, 1fr);
+      column-gap: 1.2rem;
+      padding: 1rem 0;
+      border-left: none;
+    }
+    .stage + .stage { border-top: 1.5px solid var(--field-rule); }
+    .stage + .stage::before { left: 3rem; top: -9px; transform: rotate(90deg); }
+    .glyph { grid-row: 1 / 3; }
+    .glyph svg { margin-bottom: 0; }
+    .proof-shot { grid-column: 1 / 13; }
+    .slip { grid-column: 3 / 13; grid-row: 2; margin-top: -2.5rem; }
+  }
+
+  @media (max-width: 560px) {
+    .stage, .stage + .stage { grid-template-columns: 5.5rem minmax(0, 1fr); }
+    .slip { grid-column: 1 / 13; margin-top: -1.5rem; transform: rotate(0.8deg); }
+    .back { font-size: 0.92rem; }
+  }
+</style>

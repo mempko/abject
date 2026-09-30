@@ -2,6 +2,10 @@
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import SectionHead from '../components/ui/SectionHead.astro';
+import Faq from '../components/Faq.astro';
+import Providers from '../components/Providers.astro';
+import QuickStart from '../components/QuickStart.astro';
 import { latestRelease, platformAssets, fmtSize } from '../lib/releases';
 
 const rel = await latestRelease();
@@ -11,412 +15,849 @@ const v = rel.version || 'x.y.z';
 
 <Layout
   title="Install - Abject"
-  description="Installing Abject on Linux, Windows, and macOS: the unsigned-build dialogs, first launch, choosing a model, pairing your phone, where your data lives, and what to do when something sticks."
+  description="How to install Abject on Linux, Windows, and macOS. The questions people ask first, the warnings an unsigned app triggers, picking a model from fourteen providers, pairing your phone, where your data lives, building from source, and what to do when something goes wrong."
 >
   <Header />
   <main class="install">
-    <div class="install-container">
+    <div class="container">
 
-      <header class="install-hero">
-        <p class="install-eyebrow">// INSTALL</p>
-        <h1>From Download to Running</h1>
-        <p class="install-thesis">
-          Everything between the download button and a desktop full of objects that answer
-          for themselves. Most of this page is the two dialogs an unsigned app triggers and
-          the one settings tab you fill in once.
-        </p>
-        <p class="install-quick">
-          <a href="/#downloads" class="btn btn-primary">Get the download</a>
-          {rel.version && <span class="install-version">current: v{rel.version}</span>}
-        </p>
+      <header class="hero">
+        <div class="hero-text band">
+          <p class="kicker"><span class="sigil" aria-hidden="true"></span><span>Install</span></p>
+          <h1 class="hero-title">From Download to Running</h1>
+          <span class="hero-bar" aria-hidden="true"></span>
+          <p class="lede">
+            This page takes you from the download button to a desktop full of abjects you can
+            talk to. Most of it covers the two warnings an unsigned app triggers and the one
+            settings tab you fill in once.
+          </p>
+          <p class="hero-actions">
+            <a href="/#downloads" class="btn btn-primary">Get the download</a>
+            {rel.version && <span class="hero-version">current: <span class="ver">v{rel.version}</span></span>}
+          </p>
+        </div>
+
+        <!-- Contents: a plain ruled index; the one step you cannot skip wears red. -->
+        <nav class="toc" aria-label="On this page">
+          <p class="toc-label">Contents</p>
+          <ol class="toc-list">
+            <li><a href="#requirements">What you need</a></li>
+            <li><a href="#faq">Questions</a></li>
+            <li><a href="#first-launch">First launch, per platform</a></li>
+            <li class="key"><a href="#mind">Pick a model</a></li>
+            <li><a href="#first-abject">Your first abject</a></li>
+            <li><a href="#phone">Your phone</a></li>
+            <li><a href="#commune">The terminal client</a></li>
+            <li><a href="#data">Where things live</a></li>
+            <li><a href="#network">What it talks to</a></li>
+            <li><a href="#updating">Updating and uninstalling</a></li>
+            <li><a href="#summon">Build from source</a></li>
+            <li><a href="#trouble">When something goes wrong</a></li>
+          </ol>
+        </nav>
       </header>
 
-      <nav class="install-toc">
-        <ol>
-          <li><a href="#requirements">What you need</a></li>
-          <li><a href="#first-launch">First launch, per platform</a></li>
-          <li><a href="#mind">Pick a mind</a></li>
-          <li><a href="#first-abject">Your first abject</a></li>
-          <li><a href="#phone">Your phone</a></li>
-          <li><a href="#commune">The terminal client</a></li>
-          <li><a href="#data">Where things live</a></li>
-          <li><a href="#network">What it talks to</a></li>
-          <li><a href="#updating">Updating and uninstalling</a></li>
-          <li><a href="#trouble">When something sticks</a></li>
-        </ol>
-      </nav>
-
-      <section id="requirements" class="install-section">
-        <h2>What you need</h2>
-        <ul class="install-list">
-          <li><strong>A desktop.</strong> A 64-bit Linux from the last few years, Windows 10 or later, or macOS 11 or later. Phones join later as remote views; the objects themselves live on the desktop.</li>
-          <li><strong>Disk.</strong> The installers are large because a headless browser ships inside so abjects can browse the web for you.
+      <!-- 01: a mosaic of the four requirements -->
+      <section id="requirements" class="sec">
+        <SectionHead num="01" title="What you need" />
+        <ul class="mosaic needs">
+          <li class="need-desk outline"><strong>A desktop.</strong> A 64-bit Linux from the last few years, Windows 10 or later, or macOS 11 or later. Phones join later as remote views; the objects themselves live on the desktop.</li>
+          <li class="need-disk paper"><strong>Disk.</strong> The installers are large because a headless browser ships inside so abjects can browse the web for you.
             {pa.linuxAppImage && <> Linux {fmtSize(pa.linuxAppImage.size)},</>}
             {pa.winExe && <> Windows {fmtSize(pa.winExe.size)},</>}
             {pa.macArmDmg && <> macOS {fmtSize(pa.macArmDmg.size)}.</>}
           </li>
-          <li><strong>A mind to borrow.</strong> One of: an API key from any of the supported providers, a local model through <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a> (free), or the Claude Code, Codex, or Antigravity CLI already installed and logged in on this machine. Details in <a href="#mind">Pick a mind</a>.</li>
-          <li><strong>No account.</strong> Abject has no signup. Your machine mints its own identity on first run.</li>
+          <li class="need-mind"><strong>A model to think with.</strong> An API key from any of the supported providers, a free local model through <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a>, or the Claude Code, Codex, or Antigravity CLI already installed and logged in on this machine. Details in <a href="#mind">Pick a model</a>.</li>
+          <li class="need-acct solid-red"><strong>No account.</strong> Abject has no signup. Your machine creates its own identity the first time it runs.</li>
         </ul>
       </section>
 
-      <section id="first-launch" class="install-section">
-        <h2>First launch, per platform</h2>
-        <p>
-          The builds are not code-signed yet, so each operating system pauses once with a
-          warning it shows for any software that has not paid for a certificate. This is the
-          only time you will see it. Here is what to click.
-        </p>
+    </div>
 
-        <h3>Linux</h3>
-        <p><strong>AppImage.</strong> Mark it executable and run it:</p>
-        <pre><code>chmod +x Abject-{v}.AppImage
+    <!-- 02: the practical questions, as a ruled accordion on the void -->
+    <Faq num="02" ground="void" only={['code', 'key', 'safe', 'terminal', 'cost']} />
+
+    <div class="container">
+
+      <!-- 03: platform columns; the shells are real terminals, so they keep their window -->
+      <section id="first-launch" class="sec">
+        <SectionHead num="03" title="First launch, per platform" />
+        <div class="prose">
+          <p>
+            The builds aren't code-signed yet, so each operating system warns you once, the same
+            way it warns you about any software that hasn't paid for a certificate. You only see
+            it the first time. Here is what to click.
+          </p>
+        </div>
+
+        <div class="platforms">
+          <div class="platform">
+            <h3 class="sub">Linux</h3>
+            <p><strong>AppImage.</strong> Mark it executable and run it:</p>
+            <div class="code-win">
+              <div class="code-bar" aria-hidden="true">shell</div>
+              <pre><code>chmod +x Abject-{v}.AppImage
 ./Abject-{v}.AppImage</code></pre>
-        <p>
-          AppImages need FUSE 2. On Ubuntu 22.04 and later and on Debian, install it once with
-          <code>sudo apt install libfuse2</code> (Fedora: <code>sudo dnf install fuse</code>).
-          The AppImage starts Electron without the Chromium sandbox helper, because AppImages
-          cannot carry a setuid binary and recent Ubuntu blocks user namespaces by default;
-          the abject sandboxes are separate from that and unaffected.
-        </p>
-        <p><strong>.deb.</strong> Installs a launcher entry and a <code>abjects</code> command:</p>
-        <pre><code>sudo apt install ./abjects_{v}_amd64.deb</code></pre>
+            </div>
+            <p>
+              AppImages need FUSE 2. On Ubuntu 22.04 and later and on Debian, install it once with
+              <code>sudo apt install libfuse2</code> (Fedora: <code>sudo dnf install fuse</code>).
+              The AppImage starts Electron without the Chromium sandbox helper, because AppImages
+              cannot carry a setuid binary and recent Ubuntu blocks user namespaces by default;
+              the abject sandboxes are separate from that and unaffected.
+            </p>
+            <p><strong>.deb.</strong> Installs a launcher entry and a <code>abjects</code> command:</p>
+            <div class="code-win">
+              <div class="code-bar" aria-hidden="true">shell</div>
+              <pre><code>sudo apt install ./abjects_{v}_amd64.deb</code></pre>
+            </div>
+          </div>
 
-        <h3>Windows</h3>
-        <ol class="install-steps">
-          <li>Run the installer. SmartScreen shows "Windows protected your PC".</li>
-          <li>Click <strong>More info</strong>, then <strong>Run anyway</strong>.</li>
-          <li>Choose an install folder if you want one other than the default. Abject appears in the Start menu.</li>
+          <div class="platform">
+            <h3 class="sub">Windows</h3>
+            <ol class="steps">
+              <li>Run the installer. SmartScreen shows "Windows protected your PC".</li>
+              <li class="key">Click <strong>More info</strong>, then <strong>Run anyway</strong>.</li>
+              <li>Choose an install folder if you want one other than the default. Abject appears in the Start menu.</li>
+            </ol>
+
+            <h3 class="sub">macOS</h3>
+            <ol class="steps">
+              <li>Open the .dmg and drag Abject into Applications.</li>
+              <li>Open it once. macOS says it cannot verify the developer and offers only to move it to the Trash. Click <strong>Done</strong>, not Trash.</li>
+              <li class="key">Open <strong>System Settings, Privacy &amp; Security</strong>, scroll to the bottom, and click <strong>Open Anyway</strong> next to Abject. Confirm once.</li>
+            </ol>
+            <p>
+              Prefer the terminal? Clearing the quarantine flag does the same thing in one line:
+            </p>
+            <div class="code-win">
+              <div class="code-bar" aria-hidden="true">shell</div>
+              <pre><code>xattr -d com.apple.quarantine /Applications/Abject.app</code></pre>
+            </div>
+            <p>
+              Pick the build that matches your Mac: Apple Silicon for anything from 2020 on with an
+              M-series chip, Intel otherwise (Apple menu, About This Mac). The download section
+              lists whichever builds the current release ships.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 04: the settings panel is software on screen, so it stays a window -->
+      <section id="mind" class="sec">
+        <SectionHead num="04" title="Pick a model" />
+        <div class="mind-grid">
+        <div class="win focus mind-win">
+          <div class="win-bar">
+            <span class="sigil" aria-hidden="true"></span>
+            <span class="title">Settings &middot; AI</span>
+            <span class="btns" aria-hidden="true">? &minus; &#9633; &times;</span>
+          </div>
+          <div class="win-body prose">
+            <p>
+              On first launch the settings window opens by itself on the <strong>AI</strong> tab.
+              Abjects need a model to think with, so this is the one step you can't skip.
+              Pick any of these, then click <strong>Save</strong>:
+            </p>
+            <ul class="minds">
+              <li><strong>An API key.</strong> Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, xAI Grok, Moonshot Kimi, MiniMax, or Meta. Paste the key next to the provider. Keys are stored in the app's data directory on your machine and sent only to that provider.</li>
+              <li><strong>Ollama, free and local.</strong> Install Ollama, pull a model (<code>ollama pull</code> and a model name), and leave it running. Abject finds it at <code>http://localhost:11434</code> without configuration; a different host goes in the Ollama URL field.</li>
+              <li><strong>A coding CLI you already use.</strong> If the <code>claude</code>, <code>codex</code>, or <code>agy</code> command is on your PATH and logged in, it shows up as a provider and uses the subscription you already pay for.</li>
+              <li><strong>A peer.</strong> Another Abject on the mesh can serve you its models through the PeerLLM provider. Useful when one machine in the house has the GPU.</li>
+            </ul>
+            <p>
+              Below the keys are four <strong>tiers</strong>: smart, balanced, fast, and code.
+              Each one points at a provider and a model. Leave the defaults, or send the simple
+              bookkeeping to a cheap model and keep the smart one for planning. Abjects ask for a
+              tier, never a specific model, so you can change your mind later.
+            </p>
+          </div>
+        </div>
+        <Providers bare />
+        </div>
+      </section>
+
+      <!-- 05: a stepper along one rule; typing the request is the key step -->
+      <section id="first-abject" class="sec">
+        <SectionHead num="05" title="Your first abject" />
+        <ol class="stepper first-steps">
+          <li><span class="step-n" aria-hidden="true">01</span><p>Click <strong>Chat</strong> in the sidebar. A chat window opens.</p></li>
+          <li class="key"><span class="step-n" aria-hidden="true">02</span><p>Type what you want, in your words. Try: <em>"a countdown to tonight's sunset for my city, with the sun sliding toward the horizon."</em></p></li>
+          <li><span class="step-n" aria-hidden="true">03</span><p>Watch the goal run. A window appears when the object is ready. Close the chat if you like; the window keeps running.</p></li>
+          <li><span class="step-n" aria-hidden="true">04</span><p>Click the <strong>?</strong> in any window's title bar to see what that object can do and ask it questions in plain English.</p></li>
         </ol>
-
-        <h3>macOS</h3>
-        <ol class="install-steps">
-          <li>Open the .dmg and drag Abject into Applications.</li>
-          <li>Open it once. macOS says it cannot verify the developer and offers only to move it to the Trash. Click <strong>Done</strong>, not Trash.</li>
-          <li>Open <strong>System Settings, Privacy &amp; Security</strong>, scroll to the bottom, and click <strong>Open Anyway</strong> next to Abject. Confirm once.</li>
-        </ol>
-        <p>
-          Prefer the terminal? Clearing the quarantine flag does the same thing in one line:
-        </p>
-        <pre><code>xattr -d com.apple.quarantine /Applications/Abject.app</code></pre>
-        <p>
-          Pick the build that matches your Mac: Apple Silicon for anything from 2020 on with an
-          M-series chip, Intel otherwise (Apple menu, About This Mac). The download section
-          lists whichever builds the current release ships.
-        </p>
+        <div class="prose after-steps">
+          <p>
+            The first time an abject wants to run a shell command, read a file outside its own
+            sandbox, or reach a new website, a permission prompt appears and waits. Say yes once,
+            or set standing rules under <strong>Settings, Permissions</strong>. The Web sub-tab
+            has domain allow and deny lists; Filesystem has allowed paths and a read-only mode;
+            Shell has a command allow list.
+          </p>
+        </div>
       </section>
 
-      <section id="mind" class="install-section">
-        <h2>Pick a mind</h2>
-        <p>
-          On first launch the settings window opens by itself on the <strong>AI</strong> tab.
-          Nothing works until an abject can think, so this is the one step you cannot skip.
-          Pick any of these, then click <strong>Save</strong>:
-        </p>
-        <ul class="install-list">
-          <li><strong>An API key.</strong> Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, xAI Grok, Moonshot Kimi, MiniMax, or Meta. Paste the key next to the provider. Keys are stored in the app's data directory on your machine and sent only to that provider.</li>
-          <li><strong>Ollama, free and local.</strong> Install Ollama, pull a model (<code>ollama pull</code> and a model name), and leave it running. Abject finds it at <code>http://localhost:11434</code> without configuration; a different host goes in the Ollama URL field.</li>
-          <li><strong>A coding CLI you already use.</strong> If the <code>claude</code>, <code>codex</code>, or <code>agy</code> command is on your PATH and logged in, it appears as a provider and rides the subscription you already pay for.</li>
-          <li><strong>A peer.</strong> Another Abject on the mesh can serve you its models through the PeerLLM provider. Useful when one machine in the house has the GPU.</li>
-        </ul>
-        <p>
-          Below the keys are four <strong>tiers</strong>: smart, balanced, fast, and code.
-          Each points at a provider and model. Leave the defaults, or send the cheap
-          bookkeeping to a cheap model and keep the smart one for planning. The abjects
-          ask for a tier, never a specific model, so you can change your mind later.
-        </p>
+      <!-- 06: a split, the desktop's half and the phone's half -->
+      <section id="phone" class="sec">
+        <SectionHead num="06" title="Your phone" />
+        <div class="prose">
+          <p>
+            There is nothing to install on the phone. The desktop app shows itself in the
+            phone's browser over a direct, encrypted connection:
+          </p>
+        </div>
+        <div class="split phone-split">
+          <div>
+            <p class="side-label">Desktop</p>
+            <ol class="steps">
+              <li>On the desktop, click <strong>Network</strong> in the toolbar and open the <strong>Frontends</strong> tab.</li>
+              <li class="key">Click <strong>Generate Pairing QR</strong>. The code is single-use and expires in about five minutes.</li>
+            </ol>
+          </div>
+          <span class="rule" aria-hidden="true"></span>
+          <div>
+            <p class="side-label hand">Phone</p>
+            <ol class="steps from-3" start="3">
+              <li>Scan it with the phone's camera. It opens <code>client.abject.world</code> with a pairing token, generates its own key pair, finds your desktop through the signaling server, and connects over WebRTC.</li>
+              <li>After the handshake the phone is remembered. Next time it reconnects on its own; revoke it from the same Frontends tab whenever you like.</li>
+            </ol>
+          </div>
+        </div>
+        <div class="prose after-split">
+          <p>
+            The signaling server only introduces the two ends; it never sees the session. When
+            the phone is on a cell network that blocks direct connections, traffic relays through
+            a TURN server if the signaling server offers one, still encrypted end to end.
+          </p>
+        </div>
       </section>
 
-      <section id="first-abject" class="install-section">
-        <h2>Your first abject</h2>
-        <ol class="install-steps">
-          <li>Click <strong>Chat</strong> in the sidebar. A chat window opens.</li>
-          <li>Type what you want, in your words. Try: <em>"a countdown to tonight's sunset for my city, with the sun sliding toward the horizon."</em></li>
-          <li>Watch the goal run. A window appears when the object is ready. Close the chat if you like; the window keeps running.</li>
-          <li>Click the <strong>?</strong> in any window's title bar to see what that object can do and ask it questions in plain English.</li>
-        </ol>
-        <p>
-          The first time an abject wants to run a shell command, read a file outside its own
-          sandbox, or reach a new website, a permission prompt appears and waits. Say yes once,
-          or set standing rules under <strong>Settings, Permissions</strong>. The Web sub-tab
-          has domain allow and deny lists; Filesystem has allowed paths and a read-only mode;
-          Shell has a command allow list.
-        </p>
+      <!-- 07: big type, the command's name carries the section -->
+      <section id="commune" class="sec">
+        <SectionHead num="07" title="The terminal client" />
+        <div class="commune">
+          <p class="stat" aria-hidden="true">
+            <span class="big">commune</span>
+            <span class="cap">ws://127.0.0.1:7723</span>
+          </p>
+          <div class="prose">
+            <p>
+              <strong>commune</strong> is a terminal view of your chats, goals, and permission
+              prompts, one tab each. It is a single executable with nothing to install. It needs
+              the desktop app running, because that is what it talks to. Download
+              it from the <a href="/#downloads">download section</a>, mark it executable on Linux
+              and macOS, and run it. It looks for the app at <code>ws://127.0.0.1:7723</code>.
+            </p>
+          </div>
+        </div>
       </section>
 
-      <section id="phone" class="install-section">
-        <h2>Your phone</h2>
-        <p>
-          There is nothing to install on the phone. The desktop app can show itself in a
-          phone browser over an encrypted, direct connection:
-        </p>
-        <ol class="install-steps">
-          <li>On the desktop, click <strong>Network</strong> in the toolbar and open the <strong>Frontends</strong> tab.</li>
-          <li>Click <strong>Generate Pairing QR</strong>. The code is single-use and expires in about five minutes.</li>
-          <li>Scan it with the phone's camera. It opens <code>client.abject.world</code> with a pairing token, generates its own key pair, finds your desktop through the signaling server, and connects over WebRTC.</li>
-          <li>After the handshake the phone is remembered. Next time it reconnects on its own; revoke it from the same Frontends tab whenever you like.</li>
-        </ol>
-        <p>
-          The signaling server only introduces the two ends; it never sees the session. When
-          the phone is on a cell network that blocks direct connections, traffic relays through
-          a TURN server if the signaling server offers one, still encrypted end to end.
-        </p>
-      </section>
-
-      <section id="commune" class="install-section">
-        <h2>The terminal client</h2>
-        <p>
-          <strong>commune</strong> is a tabbed terminal view of your chats, goals, and
-          permission prompts. It is a single executable with nothing to install, and it does
-          nothing on its own: it connects to the desktop app, which must be running. Download
-          it from the <a href="/#downloads">download section</a>, mark it executable on Linux
-          and macOS, and run it. It looks for the app at <code>ws://127.0.0.1:7723</code>.
-        </p>
-      </section>
-
-      <section id="data" class="install-section">
-        <h2>Where things live</h2>
-        <p>Everything Abject knows about you is in one directory:</p>
-        <table class="install-table">
-          <tbody>
-            <tr><th>Linux</th><td><code>~/.config/abject</code></td></tr>
-            <tr><th>macOS</th><td><code>~/Library/Application Support/abject</code></td></tr>
-            <tr><th>Windows</th><td><code>%APPDATA%\abject</code></td></tr>
-          </tbody>
-        </table>
-        <p>
-          Inside: your identity keys, provider keys, every workspace and the objects in it,
-          the knowledge base, and a <code>skills</code> folder. Drop a SKILL.md into
-          <code>skills</code> (Claude Code or OpenClaw format, unchanged) and rescan from
-          Settings; the agents can use it on their next task. Set <code>ABJECTS_DATA_DIR</code>
-          before launching to put all of it somewhere else. Delete the directory to start
-          over as a stranger.
-        </p>
-      </section>
-
-      <section id="network" class="install-section">
-        <h2>What it talks to</h2>
-        <p>There is no telemetry and nothing phones home. The connections it does make:</p>
-        <ul class="install-list">
-          <li><strong>Your model provider,</strong> whichever you chose. With Ollama that is your own machine.</li>
-          <li><strong><code>signal.abject.world</code>,</strong> so peers and paired phones can find your machine. It relays introductions only; every session is encrypted end to end with keys the server never has. Run your own with <code>pnpm whisper</code> from the source tree and point the app at it.</li>
-          <li><strong>The web, when an abject is asked to.</strong> Web search goes through DuckDuckGo with no API key; page fetches and browsing go wherever the task leads, within the domain rules you set under Permissions.</li>
-        </ul>
-      </section>
-
-      <section id="updating" class="install-section">
-        <h2>Updating and uninstalling</h2>
-        <p>
-          There is no auto-updater yet. Download the new version and install it over the old
-          one; the data directory is untouched and your workspaces come back as they were.
-          The <a href="/changelog">changelog</a> says what changed.
-        </p>
-        <p>
-          To uninstall, remove the app the usual way for your platform (delete the AppImage,
-          <code>apt remove abjects</code>, the Windows uninstaller, or drag it out of
-          Applications) and, if you want no trace, delete the data directory above.
-        </p>
-      </section>
-
-      <section id="trouble" class="install-section">
-        <h2>When something sticks</h2>
-        <dl class="install-faq">
-          <dt>The AppImage does nothing when launched.</dt>
-          <dd>Almost always missing FUSE 2. Install <code>libfuse2</code> (or <code>fuse</code> on Fedora) and try again. Running it from a terminal shows the actual message.</dd>
-
-          <dt>"Port 7719 already in use."</dt>
-          <dd>Another copy is running, or something else took the port. Set <code>WS_PORT</code> to a free port before launching; the terminal client's port moves with it (it is always <code>WS_PORT</code> plus four).</dd>
-
-          <dt>Ollama is running but not offered.</dt>
-          <dd>Abject probes <code>http://localhost:11434</code> at startup. If Ollama is on another host or port, enter its URL in the AI tab and save; if it started after Abject, restart Abject.</dd>
-
-          <dt>The CLI provider is missing.</dt>
-          <dd>The <code>claude</code>, <code>codex</code>, or <code>agy</code> command has to be on the PATH of the launched app, not just your shell. Launch Abject from a terminal where the command works, or install the CLI system-wide.</dd>
-
-          <dt>The window is blank or the desktop looks flat.</dt>
-          <dd>The renderer needs WebGL. On machines without it the desktop falls back to a flat 2D mode rather than staying blank; if you see nothing at all, launch from a terminal and read the log.</dd>
-
-          <dt>I want to start over.</dt>
-          <dd>Quit Abject and delete the data directory listed above. The next launch is a fresh first boot, settings window and all.</dd>
+      <!-- 08: three path columns between heavy rules -->
+      <section id="data" class="sec">
+        <SectionHead num="08" title="Where things live" />
+        <div class="prose">
+          <p>Everything Abject knows about you is in one directory:</p>
+        </div>
+        <dl class="paths">
+          <div><dt>Linux</dt><dd><code>~/.config/abject</code></dd></div>
+          <div><dt>macOS</dt><dd><code>~/Library/Application Support/abject</code></dd></div>
+          <div><dt>Windows</dt><dd><code>%APPDATA%\abject</code></dd></div>
         </dl>
-        <p class="install-help">
+        <div class="prose">
+          <p>
+            Inside: your identity keys, provider keys, every workspace and the objects in it,
+            the knowledge base, and a <code>skills</code> folder. Drop a SKILL.md into
+            <code>skills</code> (Claude Code or OpenClaw format, unchanged) and rescan from
+            Settings; the agents can use it on their next task. Set <code>ABJECTS_DATA_DIR</code>
+            before launching to put all of it somewhere else. Delete the directory to start
+            from scratch.
+          </p>
+        </div>
+      </section>
+
+      <!-- 09: a ledger of the connections -->
+      <section id="network" class="sec">
+        <SectionHead num="09" title="What it talks to" />
+        <div class="prose">
+          <p>There is no telemetry and nothing phones home. The connections it does make:</p>
+        </div>
+        <ol class="ledger talks">
+          <li><span class="ix" aria-hidden="true">01</span><strong class="t">Your model provider,</strong> <span class="n">whichever you chose. With Ollama that is your own machine.</span></li>
+          <li><span class="ix" aria-hidden="true">02</span><strong class="t"><code>signal.abject.world</code>,</strong> <span class="n">so peers and paired phones can find your machine. It relays introductions only; every session is encrypted end to end with keys the server never has. Run your own with <code>pnpm whisper</code> from the source tree and point the app at it.</span></li>
+          <li><span class="ix" aria-hidden="true">03</span><strong class="t">The web, when an abject is asked to.</strong> <span class="n">Web search goes through DuckDuckGo with no API key; page fetches and browsing go wherever the task leads, within the domain rules you set under Permissions.</span></li>
+        </ol>
+      </section>
+
+      <!-- 10: a split, updating on one side, uninstalling on the other -->
+      <section id="updating" class="sec">
+        <SectionHead num="10" title="Updating and uninstalling" />
+        <div class="split update-split">
+          <div>
+            <p class="side-label">Updating</p>
+            <p>
+              There is no auto-updater yet. Download the new version and install it over the old
+              one; the data directory is untouched and your workspaces come back as they were.
+              The <a href="/changelog">changelog</a> says what changed.
+            </p>
+          </div>
+          <span class="rule" aria-hidden="true"></span>
+          <div>
+            <p class="side-label hand">Uninstalling</p>
+            <p>
+              To uninstall, remove the app the usual way for your platform (delete the AppImage,
+              <code>apt remove abjects</code>, the Windows uninstaller, or drag it out of
+              Applications) and, if you want no trace, delete the data directory above.
+            </p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- 11: build from source (the terminal is a shell, so it keeps its window) -->
+    <QuickStart num="11" />
+
+    <!-- 12: the troubleshooting sheet, inked on paper -->
+    <section id="trouble" class="field-paper cut-top trouble">
+      <div class="container">
+        <SectionHead num="12" title="When something goes wrong" />
+        <dl class="faq">
+          <div class="faq-item">
+            <dt>The AppImage does nothing when launched.</dt>
+            <dd>Almost always missing FUSE 2. Install <code>libfuse2</code> (or <code>fuse</code> on Fedora) and try again. Running it from a terminal shows the actual message.</dd>
+          </div>
+          <div class="faq-item">
+            <dt>"Port 7719 already in use."</dt>
+            <dd>Another copy is running, or something else took the port. Set <code>WS_PORT</code> to a free port before launching; the terminal client's port moves with it (it is always <code>WS_PORT</code> plus four).</dd>
+          </div>
+          <div class="faq-item">
+            <dt>Ollama is running but not offered.</dt>
+            <dd>Abject probes <code>http://localhost:11434</code> at startup. If Ollama is on another host or port, enter its URL in the AI tab and save; if it started after Abject, restart Abject.</dd>
+          </div>
+          <div class="faq-item">
+            <dt>The CLI provider is missing.</dt>
+            <dd>The <code>claude</code>, <code>codex</code>, or <code>agy</code> command has to be on the PATH of the launched app, not just your shell. Launch Abject from a terminal where the command works, or install the CLI system-wide.</dd>
+          </div>
+          <div class="faq-item">
+            <dt>The window is blank or the desktop looks flat.</dt>
+            <dd>The renderer needs WebGL. On machines without it the desktop falls back to a flat 2D mode rather than staying blank; if you see nothing at all, launch from a terminal and read the log.</dd>
+          </div>
+          <div class="faq-item">
+            <dt>I want to start over.</dt>
+            <dd>Quit Abject and delete the data directory listed above. The next launch is a fresh first boot, settings window and all.</dd>
+          </div>
+        </dl>
+        <p class="help">
           Still stuck? Ask on <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">Discord</a>
           or open an issue on <a href="https://github.com/mempko/abject/issues" target="_blank" rel="noopener">GitHub</a>
           with the log from a terminal launch.
         </p>
-      </section>
-
-    </div>
+      </div>
+    </section>
   </main>
   <Footer />
 </Layout>
 
 <style>
+  /* ── Page frame ── */
   .install {
-    padding-top: 64px;
+    padding-top: calc(69px + clamp(3rem, 7vw, 5.5rem));
   }
 
-  .install-container {
-    max-width: 780px;
-    margin: 0 auto;
-    padding: 5rem 1.5rem 4rem;
+  /* ── Hero: the poster column plus a ruled contents index ── */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+    gap: clamp(2rem, 5vw, 4.5rem);
+    align-items: start;
+    margin-bottom: clamp(1rem, 3vw, 2rem);
   }
 
-  .install-hero {
-    margin-bottom: 2.5rem;
+  .hero-text.band::before { right: 20%; top: 27%; height: 17%; }
+
+  .hero-title {
+    font-size: clamp(2.6rem, 6.2vw, 5.2rem);
+    line-height: 0.98;
+    margin-bottom: 1.4rem;
   }
 
-  .install-eyebrow {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    letter-spacing: 0.15em;
-    color: var(--eldritch);
-    margin-bottom: 1rem;
+  .hero-bar {
+    display: block;
+    width: 180px;
+    height: 8px;
+    margin-bottom: 1.6rem;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
   }
 
-  .install-hero h1 {
-    margin-bottom: 1.25rem;
+  .hero .lede {
+    font-size: clamp(1.08rem, 1.5vw, 1.22rem);
+    line-height: 1.7;
   }
 
-  .install-thesis {
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-    line-height: 1.75;
-    margin-bottom: 1.5rem;
-  }
-
-  .install-quick {
+  .hero-actions {
     display: flex;
     align-items: center;
-    gap: 1rem;
     flex-wrap: wrap;
+    gap: 1rem 1.4rem;
+    margin-top: 2rem;
   }
 
-  .install-version {
+  .hero-version {
     font-family: var(--font-mono);
     font-size: 0.85rem;
-    color: var(--text-dim);
+    color: var(--bone-meta);
   }
 
-  .install-toc {
-    margin-bottom: 3rem;
-    padding: 1.25rem 1.5rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-  }
+  .hero-version .ver { color: var(--living); }
 
-  .install-toc ol {
-    padding-left: 1.25rem;
-    columns: 2;
-    column-gap: 2rem;
-    font-size: 0.92rem;
-    line-height: 1.9;
-  }
+  .toc { padding-top: 0.6rem; }
 
-  .install-toc a {
-    color: var(--text-secondary);
-  }
-
-  .install-toc a:hover {
-    color: var(--eldritch);
-  }
-
-  .install-section {
-    padding: 0;
-    margin-bottom: 3rem;
-  }
-
-  .install-section h2 {
-    margin-bottom: 1rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .install-section h3 {
-    margin: 1.75rem 0 0.6rem;
-    color: var(--eldritch);
-    font-family: var(--font-mono);
-    font-size: 1rem;
-    letter-spacing: 0.04em;
-  }
-
-  .install-section p {
-    color: var(--text-secondary);
-    line-height: 1.75;
-    margin-bottom: 1rem;
-  }
-
-  .install-section pre {
-    margin-bottom: 1rem;
-  }
-
-  .install-list,
-  .install-steps {
-    padding-left: 1.4rem;
-    color: var(--text-secondary);
-    line-height: 1.7;
-    margin-bottom: 1rem;
-  }
-
-  .install-list li,
-  .install-steps li {
+  .toc-label {
     margin-bottom: 0.6rem;
-  }
-
-  .install-list li::marker {
-    color: var(--eldritch);
-  }
-
-  .install-steps li::marker {
-    color: var(--void-purple);
     font-family: var(--font-mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
   }
 
-  .install-list strong,
-  .install-steps strong {
-    color: var(--text-primary);
+  .toc-list {
+    list-style: none;
+    counter-reset: toc;
+    padding: 0;
+    margin: 0;
+    border-top: var(--rule-w) solid var(--rule-strong);
   }
 
-  .install-table {
-    border-collapse: collapse;
-    margin-bottom: 1rem;
+  .toc-list li { counter-increment: toc; border-bottom: 1px solid var(--rule); }
+
+  .toc-list a {
+    display: grid;
+    grid-template-columns: 2.2rem 1fr auto;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.2rem;
+    font-family: var(--font-display);
     font-size: 0.95rem;
+    font-weight: 500;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    text-decoration: none;
+    color: var(--bone-2);
   }
 
-  .install-table th {
-    text-align: left;
-    padding: 0.4rem 1.25rem 0.4rem 0;
-    color: var(--text-primary);
+  .toc-list a::before {
+    content: counter(toc, decimal-leading-zero);
     font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.02em;
+    color: var(--red);
+  }
+
+  .toc-list a::after {
+    content: '\25B6' / '';
+    font-size: 0.55rem;
+    color: var(--bone-faint);
+    transition: transform 0.15s, color 0.15s;
+  }
+
+  .toc-list a:hover { color: var(--bone-heading); }
+  .toc-list a:hover::after { color: var(--red); transform: translateX(3px); }
+
+  .toc-list li.key { border-bottom-color: var(--red); }
+  .toc-list li.key a { color: var(--red-hot); font-weight: 600; }
+  .toc-list li.key a::after { color: var(--red); }
+
+  /* ── Sections ── */
+  .sec {
+    position: relative;
+    padding: clamp(3.5rem, 7vw, 5.5rem) 0 0;
+    scroll-margin-top: 80px;
+  }
+
+  section :global(.section-head) { margin-bottom: 2rem; }
+
+  .prose {
+    max-width: 780px;
+  }
+
+  .prose p,
+  .platform p,
+  .split p:not(.side-label) {
+    color: var(--bone-2);
+    font-size: 1.04rem;
+    line-height: 1.75;
+    margin-bottom: 1.1rem;
+  }
+
+  .prose > p:last-child,
+  .split p:last-child { margin-bottom: 0; }
+
+  .sub {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0 0 1rem;
+    font-size: 1.2rem;
+    letter-spacing: 0.08em;
+  }
+
+  .sub::before {
+    content: '';
+    width: 10px;
+    height: 10px;
+    background: var(--red);
+    flex: 0 0 auto;
+  }
+
+  .platform .sub:not(:first-child) { margin-top: 2.2rem; }
+
+  /* ── 01: requirements mosaic ── */
+  .needs {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-rows: auto;
+    grid-template-areas:
+      'desk desk mind'
+      'disk acct mind';
+    line-height: 1.65;
+  }
+
+  .needs li { color: var(--bone-2); }
+  .need-desk { grid-area: desk; }
+  .need-disk { grid-area: disk; }
+  .need-mind { grid-area: mind; border-top: 6px solid var(--red) !important; }
+  .need-acct { grid-area: acct; }
+  .needs .paper { color: #3f392f; }
+  .needs .solid-red { color: rgba(246, 239, 219, 0.88); }
+
+  .needs strong {
+    display: block;
+    margin-bottom: 0.6rem;
+    font-family: var(--font-display);
     font-weight: 600;
+    font-size: 1.45rem;
+    letter-spacing: 0.04em;
+    line-height: 1.1;
+    text-transform: uppercase;
+    color: var(--bone-heading);
   }
 
-  .install-table td {
-    padding: 0.4rem 0;
-    color: var(--text-secondary);
+  .needs .paper strong { color: #16130f; }
+  .needs .solid-red strong { color: var(--on-red); font-size: 2rem; }
+
+  /* ── 02: platform columns ── */
+  .platforms {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 3rem;
+    margin-top: 2.2rem;
+    padding-top: 2rem;
+    border-top: var(--rule-w) solid var(--rule-strong);
   }
 
-  .install-faq dt {
-    color: var(--text-primary);
+  .platform + .platform {
+    padding-left: 3rem;
+    margin-left: -1.5rem;
+    border-left: 1px solid var(--rule-mid);
+  }
+
+  /* Shells are real terminals, so they keep a small window. */
+  .code-win {
+    border: var(--rule-w) solid var(--rule-strong);
+    background: var(--sunken);
+    box-shadow: var(--print-sm);
+    margin: 0 0 1.3rem;
+  }
+
+  .code-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    height: 28px;
+    padding: 0 0.8rem;
+    background: var(--band);
+    border-bottom: var(--rule-w) solid var(--rule);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+  }
+
+  .code-bar::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    background: var(--red);
+  }
+
+  .code-win pre {
+    border: none;
+    background: transparent;
+    padding: 1rem 1.2rem;
+    font-size: 0.9rem;
+    color: var(--bone);
+  }
+
+  .code-win pre code { font-size: 1em; }
+
+  /* ── Numbered step rows (platforms and the phone split) ── */
+  .steps {
+    list-style: none;
+    counter-reset: step;
+    padding: 0;
+    margin: 0 0 1.4rem;
+  }
+
+  .steps.from-3 { counter-reset: step 2; }
+
+  .steps li {
+    counter-increment: step;
+    position: relative;
+    min-height: 3.9rem;
+    padding: 0.95rem 1rem 0.95rem 4.6rem;
+    border: var(--rule-w) solid transparent;
+    border-bottom-color: var(--rule);
+    color: var(--bone-2);
+    line-height: 1.65;
+  }
+
+  .steps li::before {
+    content: counter(step, decimal-leading-zero);
+    position: absolute;
+    left: 0.85rem;
+    top: 0.8rem;
+    width: 2.9rem;
+    height: 2.2rem;
+    display: grid;
+    place-items: center;
+    font-family: var(--font-display);
     font-weight: 600;
-    margin-top: 1.25rem;
+    font-size: 1rem;
+    letter-spacing: 0.06em;
+    color: var(--red);
+    border: var(--rule-w) solid var(--rule-strong);
   }
 
-  .install-faq dd {
-    color: var(--text-secondary);
+  .steps li.key {
+    background: var(--panel);
+    border-color: var(--red);
+    box-shadow: var(--print-red);
+    margin: 0.5rem 0 0.9rem;
+    color: var(--bone);
+  }
+
+  .steps li.key::before {
+    background: var(--red);
+    border-color: var(--red);
+    color: var(--on-red);
+  }
+
+  .steps strong { color: var(--bone-heading); }
+
+  /* ── Components that bring their own section: match the page rhythm ── */
+  .install :global(#faq),
+  .install :global(#summon) {
+    padding: clamp(3.5rem, 7vw, 5.5rem) 0 0;
+    scroll-margin-top: 80px;
+  }
+
+  .install :global(#faq .section-head),
+  .install :global(#summon .section-head) { margin-bottom: 2rem; }
+
+  /* ── 04: the settings panel (a real window) beside the full provider list ── */
+  .mind-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 3rem;
+    align-items: start;
+  }
+
+  .mind-win { max-width: 880px; }
+  .mind-win .win-body { padding: 1.6rem 1.7rem 1.4rem; max-width: none; }
+
+  .minds {
+    list-style: none;
+    padding: 0;
+    margin: 0.4rem 0 1.4rem;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-top: 1px solid var(--rule);
+    border-left: 1px solid var(--rule);
+  }
+
+  .minds li {
+    padding: 1.1rem 1.2rem;
+    border-right: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    background: var(--sunken);
+    color: var(--bone-3);
+    font-size: 0.95rem;
+    line-height: 1.65;
+  }
+
+  .minds strong {
+    display: block;
+    margin-bottom: 0.45rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+  }
+
+  /* ── 04: stepper ── */
+  .first-steps {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .first-steps p {
+    margin-top: 0.7rem;
+    color: var(--bone-2);
+    line-height: 1.65;
+  }
+
+  .first-steps .key p { color: var(--bone); }
+  .first-steps strong { color: var(--bone-heading); }
+  .after-steps { margin-top: 2.4rem; }
+
+  /* ── 05 and 09: splits ── */
+  .phone-split { margin-top: 1.8rem; }
+  .phone-split .steps { margin-bottom: 0; }
+  .after-split { margin-top: 2rem; }
+
+  /* ── 06: the command's name, set huge ── */
+  .commune {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    gap: 2.5rem;
+    align-items: center;
+  }
+
+  .commune .stat { margin: 0; }
+  .commune .big { font-size: clamp(3.5rem, 7.5vw, 7rem); letter-spacing: 0; }
+
+  /* ── 07: path columns between heavy rules ── */
+  .paths {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 1.6rem 0 2rem;
+    border-top: 3px solid var(--bone-heading);
+    border-bottom: var(--rule-w) solid var(--rule-strong);
+  }
+
+  .paths > div { padding: 1.3rem 1.4rem 1.4rem 0; }
+  .paths > div + div { padding-left: 1.4rem; border-left: 1px solid var(--rule-mid); }
+
+  .paths dt {
+    margin-bottom: 0.5rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(1.6rem, 2.6vw, 2.2rem);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+  }
+
+  .paths dd { margin: 0; }
+  .paths dd code { padding: 0; border: none; background: none; font-size: 0.98rem; color: var(--bone); word-break: break-word; }
+
+  /* ── 08: ledger ── */
+  .talks {
+    list-style: none;
+    padding: 0;
+    margin: 1.4rem 0 0;
+    max-width: 1000px;
+  }
+
+  .talks .t { font-weight: 600; line-height: 1.35; }
+  .talks .t code { font-size: 0.85em; text-transform: none; }
+  .talks .n { line-height: 1.65; }
+
+  /* ── 10: the troubleshooting sheet on paper ── */
+  .trouble {
+    margin-top: clamp(4rem, 8vw, 6rem);
+    scroll-margin-top: 40px;
+  }
+
+  .faq {
+    margin: 0 0 2rem;
+    max-width: 1000px;
+    border-top: 3px solid #16130f;
+  }
+
+  .faq-item {
+    display: grid;
+    grid-template-columns: minmax(0, 17rem) minmax(0, 1fr);
+    gap: 1.5rem;
+    padding: 1.15rem 0;
+    border-bottom: 1px solid var(--field-rule);
+  }
+
+  .faq dt {
+    position: relative;
+    padding-left: 1.2rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.08rem;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--field-ink);
+    line-height: 1.35;
+  }
+
+  .faq dt::before {
+    content: '\25B6' / '';
+    position: absolute;
+    left: 0;
+    top: 0.35em;
+    font-size: 0.6rem;
+    color: var(--red);
+  }
+
+  .faq dd {
+    margin: 0;
+    color: var(--field-ink-2);
     line-height: 1.7;
-    margin: 0.35rem 0 0;
   }
 
-  .install-help {
-    margin-top: 2rem;
-    font-size: 0.95rem;
+  .help {
+    max-width: 1000px;
+    padding: 1rem 1.2rem;
+    border: 2px solid #16130f;
+    box-shadow: 5px 5px 0 #16130f;
+    background: #f6efdb;
   }
 
-  @media (max-width: 600px) {
-    .install-toc ol {
-      columns: 1;
-    }
+  /* ── Responsive ── */
+  @media (max-width: 1000px) {
+    .mind-grid { grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
+  }
+
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; }
+    .needs { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-areas: 'desk desk' 'mind mind' 'disk acct'; }
+    .platforms { grid-template-columns: minmax(0, 1fr); }
+    .platform + .platform { padding-left: 0; margin-left: 0; border-left: none; margin-top: 1.4rem; padding-top: 2rem; border-top: 1px solid var(--rule-mid); }
+    .commune { grid-template-columns: minmax(0, 1fr); gap: 1.2rem; }
+  }
+
+  @media (max-width: 640px) {
+    .needs { grid-template-columns: 1fr; grid-template-areas: 'desk' 'disk' 'mind' 'acct'; }
+    .faq-item { grid-template-columns: 1fr; gap: 0.4rem; }
+    .minds { grid-template-columns: 1fr; }
+    .mind-win .win-body { padding: 1.2rem 1.1rem; }
+    .steps li { padding: 0.85rem 0.7rem 0.85rem 3.7rem; }
+    .steps li::before { left: 0.6rem; width: 2.4rem; }
+    .paths { grid-template-columns: 1fr; }
+    .paths > div { padding: 1rem 0; }
+    .paths > div + div { padding-left: 0; border-left: none; border-top: 1px solid var(--rule-mid); }
   }
 </style>

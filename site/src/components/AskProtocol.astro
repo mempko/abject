@@ -1,38 +1,147 @@
 ---
+/**
+ * /why section 02: the Ask Protocol in brief. A poster quote, the prose in
+ * two columns, the dinner-invitation exchange from the copy drawn large on the
+ * void (a wide sequence; a tall one on narrow screens), and the three uses as
+ * a ledger. Shared styles live in pages/why.astro (.why-page).
+ */
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  num?: string;
+}
+
+const { num = '02' } = Astro.props;
+
 const useCases = [
   {
     glyph: '{→}',
-    actor: 'Software writes software',
-    action: 'It asks dependencies how to use them, then writes the code. No documentation needed.',
+    actor: 'Software that writes software',
+    action: 'It asks the objects it depends on how to use them, then writes the code. Nobody had to write documentation.',
   },
   {
     glyph: '{⇄}',
-    actor: 'Incompatible minds bridge themselves',
-    action: 'It asks both sides what they expect, then writes a living translator between them.',
+    actor: 'Mismatched objects bridge themselves',
+    action: 'It asks both sides what they expect, then writes a new abject that translates between them.',
   },
   {
     glyph: '{⌘}',
-    actor: 'You can talk to them',
-    action: 'Ask any abject about itself in plain English. It answers from its own source.',
+    actor: 'You can ask them too',
+    action: 'Ask any abject about itself in plain English. It answers from its own code.',
   },
 ];
 ---
 
-<section id="ask-protocol" class="ask-section">
+<section id="ask-protocol" class="why-sec ask-section">
   <div class="container">
-    <h2 class="section-title">The Ask Protocol</h2>
-    <p class="ask-subtitle">Abjects that explain themselves, in their own words.</p>
+    <SectionHead num={num} kicker="Ask" title="The Ask Protocol">
+      Every object explains itself. All you have to do is ask.
+    </SectionHead>
 
-    <p class="ask-explanation">Ordinary software ships a manual and hopes you read it. An abject <em>is</em> its manual. Ask it a question the way you would ask a shopkeeper instead of reading a catalog: "what do you do? how do I talk to you?" It answers in plain English, from its own source code. And it is not just for you; abjects interview <em>each other</em> the same way, teaching one another how to collaborate before a single line is written.</p>
+    <p class="poster-quote ask-quote">What if objects could <em>explain themselves?</em></p>
 
-    <p class="ask-explanation">This is how cells already work. A white blood cell meeting a pathogen doesn't look up an API; it reads the signals on the surface and responds. Same move here: an email abject holding a dinner invitation asks a calendar abject it has never met, <em>"Friday at 7pm, can you help me with this?"</em> The calendar describes how it schedules, an LLM writes the glue on the fly, and the event lands. No SDK. No integration sprint.</p>
+    <div class="ask-prose">
+      <p>In Abject they do. Every object in the system has a mandatory message handler called <em>ask</em>. The caller, often another abject, sends a question in plain English and the abject answers in plain English. To answer, it hands an LLM the question, the relevant context, and even its own code. So objects can describe themselves without anyone writing documentation, schemas, or anything else. And it isn't just for you. Abjects ask <em>each other</em> the same way, which is how they learn to work together before any code is written.</p>
 
-    <div class="ask-uses grid-3">
+      <p>It's how cells already work. A white blood cell meeting a pathogen doesn't look up an API. It reads the chemical signals on the surface and responds. Here is the same idea in software. An email abject gets a dinner invitation. It has no hardcoded integration with the calendar, so it asks the calendar abject, <em>"I have a dinner invitation for Friday at 7pm, can you help me with this?"</em> The calendar describes how it handles scheduling, an LLM writes the glue code on the fly, and the event gets created. No API documentation, no SDK, no integration sprint.</p>
+    </div>
+
+    <!-- The exchange, drawn large on the void -->
+    <figure class="ask-hero">
+      <svg class="dg ask-wide" viewBox="0 0 1000 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An email abject asks a calendar abject: I have a dinner invitation for Friday at 7pm, can you help me with this? The calendar describes how it handles scheduling, an LLM writes the glue code, and the event gets created">
+        <defs>
+          <marker id="ask-mk-w" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path class="mk-live" d="M 0 0 L 10 5 L 0 10 z"/>
+          </marker>
+        </defs>
+
+        <!-- Two abjects that have never met, and their lanes -->
+        <line class="ln-bone-dash" x1="177" y1="62" x2="998" y2="62"/>
+        <line class="ln-bone-dash" x1="177" y1="218" x2="998" y2="218"/>
+        <rect class="n shadow" x="0" y="40" width="175" height="44"/>
+        <text class="lbl" x="87" y="67" text-anchor="middle">Email abject</text>
+        <rect class="n shadow" x="0" y="196" width="175" height="44"/>
+        <text class="lbl" x="87" y="223" text-anchor="middle">Calendar abject</text>
+
+        <!-- step marks -->
+        <rect class="fill-red" x="261" y="0" width="18" height="18"/>
+        <text class="step" x="270" y="13.5" text-anchor="middle">1</text>
+        <rect class="fill-red" x="491" y="0" width="18" height="18"/>
+        <text class="step" x="500" y="13.5" text-anchor="middle">2</text>
+        <rect class="fill-red" x="791" y="0" width="18" height="18"/>
+        <text class="step" x="800" y="13.5" text-anchor="middle">3</text>
+        <rect class="fill-red" x="924" y="0" width="18" height="18"/>
+        <text class="step" x="933" y="13.5" text-anchor="middle">4</text>
+
+        <!-- 1. the ask -->
+        <line class="ln-live" x1="270" y1="64" x2="270" y2="213" marker-end="url(#ask-mk-w)"/>
+        <text class="id t-live" x="282" y="94" style="font-size:15px">ask</text>
+        <text class="note note-bone note-i" x="282" y="122" style="font-size:12.5px">"I have a dinner invitation</text>
+        <text class="note note-bone note-i" x="282" y="139" style="font-size:12.5px">for Friday at 7pm, can you</text>
+        <text class="note note-bone note-i" x="282" y="156" style="font-size:12.5px">help me with this?"</text>
+
+        <!-- 2. the calendar explains itself -->
+        <line class="ln-live" x1="500" y1="216" x2="500" y2="67" marker-end="url(#ask-mk-w)"/>
+        <text class="note note-bone" x="512" y="150" style="font-size:12.5px">describes how it handles scheduling</text>
+
+        <!-- 3. glue, written on the fly -->
+        <rect class="n-key shadow" x="700" y="38" width="200" height="48"/>
+        <text class="lbl t-key" x="800" y="61" text-anchor="middle">LLM writes the glue</text>
+        <text class="note t-key" x="800" y="77" text-anchor="middle">on the fly</text>
+
+        <!-- 4. the event lands -->
+        <line class="ln-live" x1="933" y1="64" x2="933" y2="192" marker-end="url(#ask-mk-w)"/>
+        <text class="note note-bone" x="922" y="146" text-anchor="end" style="font-size:12.5px">Friday, 7pm</text>
+        <rect class="n-live shadow" x="864" y="196" width="134" height="44"/>
+        <text class="lbl t-live" x="931" y="223" text-anchor="middle">Event created</text>
+      </svg>
+      <svg class="dg ask-tall" viewBox="0 0 380 356" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An email abject asks a calendar abject: I have a dinner invitation for Friday at 7pm, can you help me with this? The calendar describes how it handles scheduling, an LLM writes the glue code, and the event gets created">
+          <defs>
+            <marker id="ask-mk" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path class="mk-live" d="M 0 0 L 10 5 L 0 10 z"/>
+            </marker>
+          </defs>
+
+          <!-- Two abjects that have never met, and their lifelines -->
+          <line class="ln-bone-dash" x1="80" y1="50" x2="80" y2="350"/>
+          <line class="ln-bone-dash" x1="300" y1="50" x2="300" y2="350"/>
+          <rect class="n shadow" x="10" y="10" width="140" height="40"/>
+          <text class="lbl lbl-sm" x="80" y="35" text-anchor="middle">Email abject</text>
+          <rect class="n shadow" x="230" y="10" width="140" height="40"/>
+          <text class="lbl lbl-sm" x="300" y="35" text-anchor="middle">Calendar abject</text>
+
+          <!-- 1. the ask -->
+          <text class="id t-live" x="190" y="86" text-anchor="middle">ask</text>
+          <line class="ln-live" x1="82" y1="96" x2="297" y2="96" marker-end="url(#ask-mk)"/>
+          <text class="note note-bone note-i" x="190" y="113" text-anchor="middle" style="font-size:11px">"I have a dinner invitation</text>
+          <text class="note note-bone note-i" x="190" y="127" text-anchor="middle" style="font-size:11px">for Friday at 7pm, can you</text>
+          <text class="note note-bone note-i" x="190" y="141" text-anchor="middle" style="font-size:11px">help me with this?"</text>
+
+          <!-- 2. the calendar explains itself -->
+          <text class="note note-bone" x="190" y="158" text-anchor="middle" style="font-size:11px">describes how it</text>
+          <text class="note note-bone" x="190" y="171" text-anchor="middle" style="font-size:11px">handles scheduling</text>
+          <line class="ln-live" x1="298" y1="178" x2="83" y2="178" marker-end="url(#ask-mk)"/>
+
+          <!-- 3. glue, written on the fly -->
+          <rect class="n-key shadow" x="18" y="204" width="190" height="46"/>
+          <text class="lbl lbl-sm t-key" x="113" y="225" text-anchor="middle">LLM writes the glue</text>
+          <text class="note t-key" x="113" y="241" text-anchor="middle">on the fly</text>
+
+          <!-- 4. the event lands -->
+          <text class="note note-bone" x="190" y="276" text-anchor="middle" style="font-size:11px">Friday, 7pm</text>
+          <line class="ln-live" x1="82" y1="286" x2="233" y2="286" marker-end="url(#ask-mk)"/>
+          <rect class="n-live shadow" x="236" y="266" width="128" height="40"/>
+          <text class="lbl lbl-sm t-live" x="300" y="291" text-anchor="middle">Event created</text>
+        </svg>
+      <figcaption class="dg-cap"><span class="cap-line">Two objects that have never seen each other before, working it out in plain English.</span></figcaption>
+    </figure>
+
+    <div class="ledger ask-ledger">
       {useCases.map((u) => (
-        <div class="card ask-card">
-          <span class="ask-glyph">{u.glyph}</span>
-          <h3>{u.actor}</h3>
-          <p>{u.action}</p>
+        <div>
+          <span class="ix" aria-hidden="true">{u.glyph}</span>
+          <h3 class="t">{u.actor}</h3>
+          <p class="n">{u.action}</p>
         </div>
       ))}
     </div>
@@ -45,63 +154,46 @@ const useCases = [
 </section>
 
 <style>
-  .ask-section {
-    background: transparent;
+  .ask-quote { margin: 0 0 2.5rem; }
+
+  /* The prose set in two newspaper columns. */
+  .ask-prose {
+    columns: 2;
+    column-gap: 3.5rem;
+    column-rule: 1px solid var(--rule-mid);
+    margin-bottom: 4.5rem;
   }
 
-  .ask-subtitle {
-    text-align: center;
-    color: var(--void-purple);
-    font-style: italic;
-    font-size: 1.1rem;
-    margin-top: -2rem;
-    margin-bottom: 2rem;
+  .ask-prose p {
+    font-size: 1.08rem;
+    line-height: 1.75;
+    color: var(--bone-2);
+    margin-bottom: 1.2em;
+    break-inside: avoid-column;
   }
 
-  .ask-explanation {
-    max-width: 680px;
-    margin: 0 auto 2.5rem;
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 0.95rem;
-    line-height: 1.7;
-  }
+  .ask-prose em { color: var(--bone-heading); }
 
-  .ask-explanation em {
-    color: var(--eldritch);
-    font-style: italic;
-  }
+  /* The exchange as a hero drawing; the tall version on narrow screens. */
+  .ask-hero { margin: 0 0 5rem; }
+  .ask-hero .ask-wide { max-width: 1060px; margin: 0 0 1.2rem; }
+  .ask-hero .ask-tall { display: none; max-width: 440px; margin: 0 auto 1.2rem; }
 
-  .ask-uses {
-    margin-bottom: 2.5rem;
-  }
-
-  .ask-card {
-    text-align: center;
-  }
-
-  .ask-glyph {
-    display: inline-block;
-    font-family: var(--font-mono);
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: var(--void-purple);
-    background: var(--void-purple-glow);
-    border: 1px solid rgba(139, 123, 255, 0.2);
-    padding: 0.4rem 0.6rem;
-    border-radius: 6px;
-    margin-bottom: 0.75rem;
-  }
-
-  .ask-card h3 {
-    color: var(--void-purple);
-  }
+  .ask-ledger { margin-bottom: 3rem; }
+  .ask-ledger .ix { font-size: 1rem; font-weight: 600; }
+  .ask-ledger .t { font-size: 1.2rem; line-height: 1.2; }
+  .ask-ledger .n { margin: 0; }
 
   .ask-cta {
     display: flex;
     flex-wrap: wrap;
-    justify-content: center;
-    gap: 0.75rem;
-    margin-top: 1rem;
+    gap: 1rem;
+  }
+
+  @media (max-width: 900px) {
+    .ask-hero .ask-wide { display: none; }
+    .ask-hero .ask-tall { display: block; }
+    .ask-prose { columns: 1; }
+    .ask-prose p { max-width: 36.5rem; }
   }
 </style>

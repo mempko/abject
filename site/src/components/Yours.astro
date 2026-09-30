@@ -1,0 +1,93 @@
+---
+/**
+ * 04 Yours: compact. Four plain columns (your machine, any mind, your
+ * devices, open source) with the provider count set as a big stat and the
+ * fourteen providers as a strip.
+ */
+import SectionHead from './ui/SectionHead.astro';
+
+const providers = [
+  'Ollama', 'PeerLLM', 'Claude Code CLI', 'Codex CLI', 'Antigravity CLI', 'Anthropic', 'OpenAI',
+  'Google Gemini', 'OpenRouter', 'DeepSeek', 'xAI Grok', 'Moonshot Kimi', 'MiniMax', 'Meta',
+];
+---
+
+<section id="yours" class="yours-section">
+  <div class="container">
+    <SectionHead num="04" kicker="Yours" title="Software you control" />
+
+    <div class="cols">
+      <div class="col">
+        <h3>On your machine</h3>
+        <p>
+          Everything runs on your machine. Your abjects, what they learned and your chats live
+          on your disk. No account, no telemetry, no subscription.
+        </p>
+      </div>
+      <div class="col col-mind">
+        <div class="stat">
+          <span class="big" aria-hidden="true">14</span>
+          <span class="cap">model providers</span>
+        </div>
+        <h3>Any model</h3>
+        <p>
+          A free local model through Ollama, an API key, or a coding CLI you already log into.
+          Switch any time. <a href="/install#mind">Pick a model</a>
+        </p>
+      </div>
+      <div class="col">
+        <h3>Across your devices</h3>
+        <p>
+          Your machines talk to each other peer to peer, over encrypted WebRTC. Pair your phone
+          with a QR code and your desktop opens in its browser. <a href="/install#phone">How pairing works</a>
+        </p>
+      </div>
+      <div class="col">
+        <h3>Open source</h3>
+        <p>
+          Free and open source under the GPL-3.0. Every abject carries its own source code, so
+          you can open it and change it.
+          <a href="https://github.com/mempko/abject" target="_blank" rel="noopener">The code on GitHub</a>
+        </p>
+      </div>
+    </div>
+
+    <ul class="strip minds" aria-label="Supported model providers">
+      {providers.map((p) => <li>{p}</li>)}
+    </ul>
+  </div>
+</section>
+
+<style>
+  .yours-section :global(.section-head) { margin-bottom: 2.2rem; }
+
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 4px solid var(--red);
+  }
+
+  .col { display: flex; flex-direction: column; padding: 1.4rem 1.4rem 1.6rem 0; }
+  .col + .col { padding-left: 1.4rem; border-left: var(--rule-w) solid var(--rule); }
+
+  .col h3 { font-size: 1.25rem; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+  .col p { font-size: 0.97rem; line-height: 1.6; color: var(--bone-3); }
+  .col p a { white-space: nowrap; }
+
+  .col-mind .stat { margin-bottom: 0.6rem; }
+  .col-mind .big { font-size: clamp(3.5rem, 6vw, 5rem); }
+
+  .minds { list-style: none; margin-top: 1.2rem; font-size: 0.86rem; letter-spacing: 0.14em; gap: 0.35rem 1.4rem; }
+
+  @media (max-width: 900px) {
+    .cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .col:nth-child(3) { padding-left: 0; border-left: none; }
+    .col:nth-child(n + 3) { border-top: var(--rule-w) solid var(--rule); }
+  }
+
+  @media (max-width: 560px) {
+    .cols { grid-template-columns: 1fr; }
+    .col, .col + .col { padding: 1.2rem 0 1.3rem; border-left: none; }
+    .col + .col { border-top: var(--rule-w) solid var(--rule); }
+  }
+</style>

@@ -1,102 +1,147 @@
 ---
+/**
+ * Site footer: a red band closing the page, then a colophon in three
+ * columns (the mark, the pages, the community) and the small print.
+ */
 ---
 
-<footer>
-  <div class="container footer-content">
+<footer class="site-footer">
+  <div class="footer-band" aria-hidden="true">
+    <span>Local first</span><span>Message passing</span><span>Open source</span><span>Peer to peer</span>
+  </div>
+  <div class="container footer-grid">
     <div class="footer-brand">
-      <span class="footer-logo">
-        <span class="bracket">{'{'}</span>abject<span class="bracket">{'}'}</span>
-      </span>
+      <a href="/" class="footer-logo" aria-label="Abject home">
+        <span class="footer-eye" aria-hidden="true"></span>
+        <span>Abject</span>
+      </a>
       <p>Created by <a href="https://mempko.com" target="_blank" rel="noopener">Maxim Khailo</a></p>
+      <p class="footer-flavor">Try it, break it, build something horrible with it. Join the horror.</p>
     </div>
-    <div class="footer-right">
-      <p class="footer-flavor">Made with message passing, design by contract, and a strictly supervised amount of hallucination</p>
-      <div class="footer-links">
-        <a href="/theory">Theory</a>
-        <span class="sep">|</span>
-        <a href="/changelog">Changelog</a>
-        <span class="sep">|</span>
-        <a href="https://github.com/mempko/abject" target="_blank" rel="noopener">GitHub</a>
-        <span class="sep">|</span>
-        <a href="https://www.reddit.com/r/AbjectWorld/" target="_blank" rel="noopener">Reddit</a>
-        <span class="sep">|</span>
-        <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">Discord</a>
-        <span class="sep">|</span>
-        <span class="license">GPL-3.0-or-later</span>
-      </div>
-    </div>
+    <nav class="footer-col" aria-label="Pages">
+      <h4>Pages</h4>
+      <a href="/install">Install</a>
+      <a href="/why">Why Abject</a>
+      <a href="/theory">Theory</a>
+      <a href="/ask-protocol">Ask Protocol</a>
+      <a href="/about">About</a>
+      <a href="/changelog">Changelog</a>
+    </nav>
+    <nav class="footer-col" aria-label="Community">
+      <h4>Community</h4>
+      <a href="https://github.com/mempko/abject" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://www.reddit.com/r/AbjectWorld/" target="_blank" rel="noopener">Reddit</a>
+      <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">Discord</a>
+      <a href="/links">Links</a>
+    </nav>
+  </div>
+  <div class="container footer-small">
+    <span class="mono">GPL-3.0-or-later</span>
+    <span class="mono">The horror is thematic. The containment is real.</span>
   </div>
 </footer>
 
 <style>
-  footer {
-    border-top: 1px solid var(--border);
-    padding: 2.5rem 0;
+  .site-footer {
+    margin-top: 2rem;
+    border-top: 1.5px solid var(--rule);
+    background: rgba(6, 7, 10, 0.92);
   }
 
-  .footer-content {
+  .footer-band {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
     flex-wrap: wrap;
-    gap: 1rem;
+    justify-content: center;
+    gap: 0.4rem 2.5rem;
+    padding: 0.7rem 1rem;
+    background: var(--red);
+    color: var(--on-red);
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.9rem;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+  }
+
+  .footer-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr;
+    gap: 2.5rem;
+    padding-top: 3rem;
+    padding-bottom: 2.5rem;
   }
 
   .footer-logo {
-    font-family: var(--font-mono);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-family: var(--font-display);
     font-weight: 700;
-    color: var(--eldritch);
-    font-size: 1rem;
+    font-size: 1.6rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+    margin-bottom: 0.6rem;
   }
 
-  .bracket {
-    color: var(--eldritch);
+  .footer-eye {
+    width: 26px;
+    height: 26px;
+    border: 3px solid var(--red);
+    border-radius: 50%;
+    position: relative;
   }
 
-  .footer-brand p {
-    color: var(--text-dim);
-    font-size: 0.85rem;
-    margin-top: 0.25rem;
+  .footer-eye::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 5px;
+    height: 13px;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--living);
   }
 
-  .footer-right {
-    text-align: right;
-    min-width: 0;
-  }
+  .footer-brand p { color: var(--bone-3); font-size: 0.95rem; }
 
   .footer-flavor {
-    color: var(--text-dim);
-    font-size: 0.8rem;
+    margin-top: 0.6rem;
+    max-width: 380px;
     font-style: italic;
-    margin-bottom: 0.35rem;
+    color: var(--bone-meta) !important;
   }
 
-  .footer-links {
+  .footer-col { display: flex; flex-direction: column; gap: 0.45rem; }
+
+  .footer-col h4 {
+    font-size: 0.8rem;
+    letter-spacing: 0.18em;
+    color: var(--bone-meta);
+    margin-bottom: 0.4rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1.5px solid var(--red);
+    width: fit-content;
+  }
+
+  .footer-col a { color: var(--bone-2); font-size: 0.97rem; }
+  .footer-col a:hover { color: var(--bone-heading); }
+
+  .footer-small {
     display: flex;
-    align-items: center;
-    justify-content: flex-end;
+    justify-content: space-between;
     flex-wrap: wrap;
-    gap: 0.5rem 0.75rem;
-    font-size: 0.9rem;
+    gap: 0.5rem 2rem;
+    padding-top: 1.1rem;
+    padding-bottom: 1.6rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.78rem;
+    color: var(--bone-meta);
   }
 
-  @media (max-width: 600px) {
-    .footer-right {
-      text-align: left;
-    }
-
-    .footer-links {
-      justify-content: flex-start;
-    }
-  }
-
-  .sep {
-    color: var(--border);
-  }
-
-  .license {
-    color: var(--text-dim);
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
+  @media (max-width: 720px) {
+    .footer-grid { grid-template-columns: 1fr 1fr; }
+    .footer-brand { grid-column: 1 / -1; }
   }
 </style>

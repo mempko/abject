@@ -14,56 +14,124 @@ interface Entry {
 }
 
 const entries = changelog as Entry[];
+
+/* Minor-version series ("0.10") mark the eras of the timeline. */
+const series = (v: string) => v.split('.').slice(0, 2).join('.');
+const rows = entries.map((entry, i) => ({
+  entry,
+  era: i === 0 || series(entry.version) !== series(entries[i - 1].version) ? series(entry.version) : '',
+}));
+const newest = entries[0];
+const oldest = entries[entries.length - 1];
 ---
 
 <Layout
   title="Changelog - Abject"
-  description="Every major Abject release: what arrived, what got fixed, and how the organism grew."
+  description="Every major Abject release, newest first: what's new, what got fixed, and what we learned along the way."
 >
   <Header />
   <main class="changelog">
-    <div class="changelog-container">
+    <div class="container">
 
-      <header class="changelog-hero">
-        <p class="changelog-eyebrow">// CHANGELOG</p>
-        <h1>How the Organism Grew</h1>
-        <p class="changelog-thesis">
-          Every major release, newest first: what arrived, what got fixed, and what it
-          taught us. Patch releases fold into the entry above them.
-        </p>
+      <header class="hero">
+        <div class="hero-text">
+          <p class="kicker"><span class="sigil" aria-hidden="true"></span><span>Changelog</span></p>
+          <h1 class="hero-title">What Changed</h1>
+          <span class="hero-bar" aria-hidden="true"></span>
+          <p class="lede">
+            Every major release, newest first. What's new, what got fixed, and what we learned along
+            the way. Small patch releases are folded into the entry above them.
+          </p>
+        </div>
+        {newest && oldest && (
+          <p class="hero-count" aria-hidden="true">
+            <span class="count-num">{entries.length}</span>
+            <span class="count-range mono">v{oldest.version} &rarr; <span class="count-latest">v{newest.version}</span></span>
+          </p>
+        )}
       </header>
 
-      {entries.map((entry) => (
-        <article class="release" id={`v${entry.version}`}>
-          <header class="release-header">
-            <a class="release-version" href={`#v${entry.version}`}>v{entry.version}</a>
-            <time class="release-date" datetime={entry.date}>{entry.date}</time>
-          </header>
-          <h2 class="release-title">{entry.title}</h2>
-          <p class="release-summary">{entry.summary}</p>
+    </div>
 
-          {entry.highlights.length > 0 && (
-            <>
-              <h3 class="release-list-label">Highlights</h3>
-              <ul class="release-list">
-                {entry.highlights.map((item) => <li>{item}</li>)}
-              </ul>
-            </>
-          )}
+    {newest && (
+      <section class="field-red cut-top latest-field" aria-labelledby="latest-title">
+        <div class="container">
+          <article class="latest" id={`v${newest.version}`}>
+            <header class="latest-meta">
+              <a class="latest-version" href={`#v${newest.version}`}>v{newest.version}</a>
+              <p class="latest-stamp">
+                <time datetime={newest.date}>{newest.date}</time>
+                <span class="tag latest-tag">Latest</span>
+              </p>
+            </header>
+            <div class="latest-body">
+              <h2 class="latest-title" id="latest-title">{newest.title}</h2>
+              <p class="latest-summary">{newest.summary}</p>
 
-          {entry.fixes.length > 0 && (
-            <>
-              <h3 class="release-list-label release-list-label-fixes">Fixes</h3>
-              <ul class="release-list release-list-fixes">
-                {entry.fixes.map((item) => <li>{item}</li>)}
-              </ul>
-            </>
-          )}
-        </article>
-      ))}
+              {newest.highlights.length > 0 && (
+                <>
+                  <h3 class="latest-label">Highlights</h3>
+                  <ul class="latest-list">
+                    {newest.highlights.map((item) => <li>{item}</li>)}
+                  </ul>
+                </>
+              )}
+
+              {newest.fixes.length > 0 && (
+                <>
+                  <h3 class="latest-label latest-label-fixes">Fixes</h3>
+                  <ul class="latest-list latest-list-fixes">
+                    {newest.fixes.map((item) => <li>{item}</li>)}
+                  </ul>
+                </>
+              )}
+            </div>
+          </article>
+        </div>
+      </section>
+    )}
+
+    <div class="container">
+      <div class="timeline">
+        {rows.slice(1).map(({ entry, era }) => (
+          <>
+            {era && (
+              <div class="era" aria-hidden="true"><span class="era-num">{era}</span></div>
+            )}
+            <article class="release" id={`v${entry.version}`}>
+              <header class="release-meta">
+                <a class="release-version" href={`#v${entry.version}`}>v{entry.version}</a>
+                <time class="release-date" datetime={entry.date}>{entry.date}</time>
+              </header>
+              <div class="release-body">
+                <h2 class="release-title">{entry.title}</h2>
+                <p class="release-summary">{entry.summary}</p>
+
+                {entry.highlights.length > 0 && (
+                  <>
+                    <h3 class="release-list-label">Highlights</h3>
+                    <ul class="release-list">
+                      {entry.highlights.map((item) => <li>{item}</li>)}
+                    </ul>
+                  </>
+                )}
+
+                {entry.fixes.length > 0 && (
+                  <>
+                    <h3 class="release-list-label release-list-label-fixes">Fixes</h3>
+                    <ul class="release-list release-list-fixes">
+                      {entry.fixes.map((item) => <li>{item}</li>)}
+                    </ul>
+                  </>
+                )}
+              </div>
+            </article>
+          </>
+        ))}
+      </div>
 
       <p class="changelog-tail">
-        The full commit history lives on
+        The full commit history is on
         <a href="https://github.com/mempko/abject/releases" target="_blank" rel="noopener">GitHub Releases</a>.
       </p>
 
@@ -73,120 +141,385 @@ const entries = changelog as Entry[];
 </Layout>
 
 <style>
+  /* ── Page frame ── */
   .changelog {
-    padding: 140px 24px 80px;
-    position: relative;
-    z-index: 1;
+    --meta-col: 11rem;
+    --rail-gap: 2.6rem;
+    padding-top: calc(69px + clamp(3rem, 7vw, 5.5rem));
+    padding-bottom: clamp(4rem, 8vw, 7rem);
   }
 
-  .changelog-container {
-    max-width: 720px;
-    margin: 0 auto;
+  /* ── Hero ── */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+    gap: clamp(2rem, 5vw, 4.5rem);
+    align-items: end;
+    margin-bottom: clamp(3rem, 6vw, 4.5rem);
   }
 
-  .changelog-hero {
-    margin-bottom: 56px;
+  .hero-title {
+    font-size: clamp(2.6rem, 6.2vw, 5.2rem);
+    line-height: 0.98;
+    margin-bottom: 1.4rem;
   }
 
-  .changelog-eyebrow {
-    font-family: var(--font-mono);
+  .hero-bar {
+    display: block;
+    width: 180px;
+    height: 8px;
+    margin-bottom: 1.6rem;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
+  }
+
+  .hero .lede {
+    font-size: clamp(1.06rem, 1.45vw, 1.2rem);
+    line-height: 1.75;
+  }
+
+  /* Big type against small meta: the count of entries and the range. */
+  .hero-count {
+    justify-self: end;
+    display: grid;
+    justify-items: end;
+    gap: 0.6rem;
+    margin: 0;
+  }
+
+  .count-num {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(6rem, 13vw, 11rem);
+    line-height: 0.8;
+    color: transparent;
+    -webkit-text-stroke: 1.5px var(--rule-strong);
+  }
+
+  .count-range {
     font-size: 0.85rem;
-    letter-spacing: 0.12em;
-    color: var(--eldritch);
-    margin-bottom: 12px;
+    color: var(--bone-meta);
   }
 
-  .changelog-hero h1 {
-    font-size: clamp(2rem, 5vw, 2.8rem);
-    line-height: 1.15;
-    margin-bottom: 16px;
+  .count-latest { color: var(--living); }
+
+  /* ── Timeline: a meta column, a rail, and the entries ── */
+  .timeline {
+    position: relative;
+    margin-top: clamp(2rem, 4vw, 3rem);
+    max-width: calc(var(--meta-col) + var(--rail-gap) + 800px);
   }
 
-  .changelog-thesis {
-    color: var(--text-secondary);
-    font-size: 1.05rem;
-    line-height: 1.7;
+  .timeline::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(var(--meta-col) + var(--rail-gap) / 2);
+    width: 1.5px;
+    background: var(--rule-mid);
+  }
+
+  .era {
+    position: relative;
+    display: grid;
+    grid-template-columns: var(--meta-col) 1fr;
+    column-gap: var(--rail-gap);
+    align-items: end;
+    padding: 2.8rem 0 0.6rem;
+  }
+
+  .era::after {
+    content: '';
+    grid-column: 2;
+    height: 1.5px;
+    margin-bottom: 0.9rem;
+    background: var(--rule);
+  }
+
+  .era:first-child { padding-top: 0; }
+
+  .era-num {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 3.4rem;
+    line-height: 0.9;
+    letter-spacing: 0.02em;
+    color: transparent;
+    -webkit-text-stroke: 1.5px var(--rule-strong);
+    text-align: right;
   }
 
   .release {
     position: relative;
-    padding: 28px 0 36px;
-    border-top: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: var(--meta-col) minmax(0, 1fr);
+    column-gap: var(--rail-gap);
+    padding: 1.8rem 0 2rem;
+    scroll-margin-top: 90px;
   }
 
-  .release-header {
+  .release + .release .release-body { border-top: 1px solid var(--rule); }
+  .release + .release { padding-top: 0; }
+  .release + .release .release-body { padding-top: 1.8rem; }
+  .release + .release .release-meta { padding-top: 1.8rem; }
+
+  /* The node on the rail. */
+  .release::before {
+    content: '';
+    position: absolute;
+    left: calc(var(--meta-col) + var(--rail-gap) / 2 - 5px);
+    top: 2.35rem;
+    width: 11px;
+    height: 11px;
+    background: var(--void);
+    border: 1.5px solid var(--rule-strong);
+  }
+
+  .release + .release::before { top: 2.35rem; }
+
+  .release-meta {
     display: flex;
-    align-items: baseline;
-    gap: 14px;
-    margin-bottom: 10px;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.45rem;
+    text-align: right;
   }
 
   .release-version {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border: var(--rule-w) solid var(--rule-strong);
+    background: var(--panel);
     font-family: var(--font-mono);
-    font-size: 1.1rem;
+    font-size: 0.95rem;
     font-weight: 600;
-    color: var(--eldritch);
+    color: var(--bone-heading);
     text-decoration: none;
+    transition: border-color 0.15s, color 0.15s;
   }
 
-  .release-version:hover {
-    text-decoration: underline;
-  }
+  .release-version:hover { border-color: var(--red); color: var(--bone-heading); }
 
   .release-date {
     font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-    opacity: 0.7;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--bone-meta);
   }
 
   .release-title {
-    font-size: 1.5rem;
-    color: var(--text-primary);
-    margin-bottom: 10px;
+    font-size: 1.55rem;
+    line-height: 1.15;
+    letter-spacing: 0.02em;
+    margin-bottom: 0.7rem;
   }
 
   .release-summary {
-    color: var(--text-secondary);
+    color: var(--bone-2);
     line-height: 1.7;
-    margin-bottom: 18px;
+    margin-bottom: 0.4rem;
   }
 
   .release-list-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1.2rem 0 0.55rem;
     font-family: var(--font-mono);
-    font-size: 0.8rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--eldritch-dim);
-    margin: 18px 0 8px;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    color: var(--bone-meta);
+  }
+
+  .release-list-label::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    background: var(--red);
+  }
+
+  .release-list-label-fixes::before {
+    background: transparent;
+    border: 1.5px solid var(--bone-meta);
   }
 
   .release-list {
+    list-style: none;
     margin: 0;
-    padding-left: 20px;
-    color: var(--text-secondary);
-    line-height: 1.65;
+    padding: 0;
   }
 
   .release-list li {
-    margin-bottom: 6px;
+    position: relative;
+    padding: 0.2rem 0 0.2rem 1.25rem;
+    color: var(--bone-3);
+    line-height: 1.65;
   }
 
-  .release-list li::marker {
-    color: var(--eldritch-dim);
+  .release-list li::before {
+    content: '';
+    position: absolute;
+    left: 0.15rem;
+    top: 0.8em;
+    width: 6px;
+    height: 6px;
+    background: var(--red-deep);
   }
 
-  .release-list-fixes li::marker {
-    color: var(--text-secondary);
+  .release-list-fixes li::before {
+    background: transparent;
+    border: 1.5px solid var(--bone-faint);
   }
 
+  /* ── The latest release, on the red field ── */
+  .latest-field { margin-bottom: clamp(1rem, 3vw, 2rem); }
+
+  .latest {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr);
+    gap: clamp(2rem, 5vw, 4.5rem);
+    align-items: start;
+    scroll-margin-top: 90px;
+  }
+
+  .latest-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+
+  .latest-version {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(3.6rem, 9vw, 7.5rem);
+    line-height: 0.85;
+    letter-spacing: -0.01em;
+    color: var(--on-red);
+    text-decoration: none;
+  }
+
+  .latest-version:hover { color: #16130f; }
+
+  .latest-stamp {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    letter-spacing: 0.06em;
+    color: var(--on-red);
+  }
+
+  .latest-tag { background: #16130f; border-color: #16130f; color: var(--on-red); }
+
+  .latest-title {
+    font-size: clamp(1.9rem, 3.6vw, 2.9rem);
+    line-height: 1.02;
+    margin-bottom: 1rem;
+  }
+
+  .latest-body .latest-summary {
+    font-size: 1.12rem;
+    line-height: 1.7;
+    color: var(--on-red);
+    margin-bottom: 0.4rem;
+  }
+
+  .latest-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1.4rem 0 0.55rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    color: #16130f;
+  }
+
+  .latest-label::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    background: #16130f;
+  }
+
+  .latest-label-fixes::before { background: transparent; border: 1.5px solid #16130f; }
+
+  .latest-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid var(--field-rule);
+  }
+
+  .latest-list li {
+    position: relative;
+    padding: 0.55rem 0 0.55rem 1.25rem;
+    border-bottom: 1px solid var(--field-rule);
+    line-height: 1.65;
+  }
+
+  .latest-list li::before {
+    content: '';
+    position: absolute;
+    left: 0.15rem;
+    top: 1.15em;
+    width: 6px;
+    height: 6px;
+    background: #16130f;
+  }
+
+  .latest-list-fixes li::before { background: transparent; border: 1.5px solid #16130f; }
+
+  /* ── Tail ── */
   .changelog-tail {
-    border-top: 1px solid var(--border);
-    padding-top: 28px;
-    color: var(--text-secondary);
+    max-width: calc(var(--meta-col) + var(--rail-gap) + 800px);
+    margin-top: 2rem;
+    padding: 1.2rem 1.4rem;
+    border: var(--rule-w) solid var(--rule-strong);
+    border-left: 5px solid var(--red);
+    background: var(--panel);
+    box-shadow: var(--print-sm);
+    color: var(--bone-2);
   }
 
-  .changelog-tail a {
-    color: var(--eldritch-dim);
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .latest { grid-template-columns: minmax(0, 1fr); gap: 1.4rem; }
+    .hero { grid-template-columns: 1fr; }
+    .hero-count { justify-self: start; justify-items: start; }
+  }
+
+  @media (max-width: 720px) {
+    .changelog { --rail-x: 0.45rem; }
+
+    .timeline::before { left: var(--rail-x); }
+
+    .era,
+    .release {
+      grid-template-columns: 1fr;
+      padding-left: 1.9rem;
+    }
+
+    .era::after { display: none; }
+    .era-num { text-align: left; font-size: 2.6rem; }
+
+    .release-meta {
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.4rem 0.8rem;
+      margin-bottom: 0.9rem;
+      text-align: left;
+    }
+
+    .release + .release .release-meta { border-top: 1px solid var(--rule); }
+    .release + .release .release-body { padding-top: 0; border-top: none; }
+
+    .release::before,
+    .release + .release::before { left: calc(var(--rail-x) - 5px); top: 2.3rem; }
   }
 </style>

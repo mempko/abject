@@ -1,0 +1,27 @@
+---
+/**
+ * A window card: the site's unit of content, drawn like an Abject window.
+ * A title band with the eye sigil and window buttons, then the body slot.
+ * `focus` wears the red band and red print shadow (one per group at most:
+ * it marks the thing to look at first).
+ */
+interface Props {
+  title: string;
+  focus?: boolean;
+  /** Hide the window buttons (for small cards). */
+  plain?: boolean;
+  class?: string;
+  as?: 'div' | 'article' | 'section' | 'li';
+}
+
+const { title, focus = false, plain = false, class: klass = '', as: Tag = 'div' } = Astro.props;
+---
+
+<Tag class:list={['win', { focus }, klass]}>
+  <div class="win-bar">
+    <span class="sigil" aria-hidden="true"></span>
+    <span class="title">{title}</span>
+    {!plain && <span class="btns" aria-hidden="true">? &minus; &#9633; &times;</span>}
+  </div>
+  <div class="win-body"><slot /></div>
+</Tag>

@@ -1,51 +1,62 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  num?: string;
+}
+
+const { num = '13' } = Astro.props;
 ---
 
 <section id="lineage" class="lineage-section">
   <div class="container">
-    <h2 class="section-title">From the Ashes of Fire★</h2>
+    <div class="lineage-top">
+      <SectionHead num={num} kicker="Lineage" title="It Started With Fire★" />
 
-    <div class="lineage-narrative">
-      <p>
-        Abject grew from the ashes of <a href="https://firestr.com" target="_blank" rel="noopener" class="fire-link">Fire★</a>, a peer-to-peer
-        platform for creating and sharing distributed applications. Fire★ called it
-        <strong>Grass Computing</strong>: software you can touch, shape, and share directly.
-        No cloud. No landlords.
-      </p>
-      <p>
-        Fire★ proved the vision: encrypted P2P communication, live collaborative coding,
-        apps that spread through conversations. But it dreamed in C++ and Lua.
-      </p>
-      <p>
-        Abject is the next incarnation. The same soul in a new body: TypeScript and WASM,
-        Canvas compositing, and an LLM that negotiates between incompatible minds.
-        The grass still grows. Now it thinks.
-      </p>
+      <div class="lineage-narrative">
+        <p>
+          In 2014 I released a project called <a href="https://firestr.com" target="_blank" rel="noopener" class="fire-link">Fire★</a>,
+          the <strong>Grass Computing Platform</strong>. It let people build peer-to-peer apps with a
+          built-in collaborative editor. You'd create conversations and launch apps in them, and
+          people could copy the apps and hack on them together. There was no cloud in the middle.
+        </p>
+        <p>
+          It made things much easier, but people still needed to learn programming to use it to
+          its fullest. Fire★ was written in C++ with apps in Lua.
+        </p>
+        <p class="lineage-last">
+          Abject is its spiritual successor. It's the same idea with TypeScript and WASM, a canvas
+          desktop, and an LLM that works out how objects that were never designed together can
+          talk. This time you don't need to know programming to use it.
+        </p>
+      </div>
     </div>
 
-    <div class="evolution">
-      <div class="evo-card evo-fire">
+    <div class="split evolution">
+      <div class="evo evo-fire ghost">
+        <p class="side-label">2014</p>
         <h3>Fire★</h3>
         <ul>
           <li>C++ / Qt / Lua</li>
           <li>RSA 4096 encryption</li>
-          <li>Manual app sharing</li>
+          <li>Apps copied and shared by hand</li>
           <li>firelocator for peer discovery</li>
           <li><a href="https://firestr.com" target="_blank" rel="noopener" class="evo-link">firestr.com</a></li>
         </ul>
       </div>
 
-      <div class="evo-arrow">
-        <span class="arrow-glyph">→</span>
+      <div class="rule evo-rule" aria-hidden="true">
+        <span class="evo-arrow"></span>
       </div>
 
-      <div class="evo-card evo-abjects">
+      <div class="evo evo-abjects">
+        <p class="side-label hand">Today</p>
         <h3>Abject</h3>
         <ul>
           <li>TypeScript / WASM / Canvas</li>
           <li>ECDSA/ECDH + AES-256-GCM</li>
-          <li>LLM-mediated protocol negotiation</li>
-          <li>Signaling server for introductions, peers relay for each other after</li>
+          <li>Objects work out how to talk, with an LLM</li>
+          <li>A signaling server introduces peers, then peers relay for each other</li>
           <li><span class="evo-link">abject.world</span></li>
         </ul>
       </div>
@@ -54,135 +65,107 @@
 </section>
 
 <style>
-  .lineage-section {
-    background: transparent;
-  }
-
-  .lineage-narrative {
-    max-width: 680px;
-    margin: 0 auto 3rem;
-    text-align: center;
+  .lineage-top {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 1rem 4rem;
+    align-items: start;
+    margin-bottom: 4.5rem;
   }
 
   .lineage-narrative p {
-    color: var(--text-secondary);
-    font-size: 1.05rem;
+    color: var(--bone-2);
+    font-size: 1.06rem;
     line-height: 1.8;
-    margin-bottom: 1rem;
+    margin-bottom: 1.1rem;
+    max-width: 62ch;
   }
 
-  .lineage-narrative .fire {
-    color: #ff9f43;
+  .lineage-narrative strong { color: var(--bone-heading); }
+
+  .lineage-narrative .lineage-last {
+    color: var(--bone);
+    padding-left: 1rem;
+    border-left: 3px solid var(--red);
   }
 
-  .lineage-narrative strong {
-    color: var(--text-primary);
-  }
+  .fire-link { font-weight: 700; }
 
+  /* The split: the ancestor ghosted on the left, Abject on the hand side. */
   .evolution {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 1.5rem;
-    max-width: 700px;
-    margin: 0 auto;
+    grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr);
+    gap: 3.5rem;
   }
 
-  .evo-card {
-    flex: 1;
-    background: var(--bg-card);
-    border-radius: 12px;
-    padding: 1.5rem 1.75rem;
-    border: 1px solid var(--border);
+  .evo h3 {
+    font-size: clamp(3rem, 7vw, 5.6rem);
+    line-height: 0.9;
+    letter-spacing: 0.01em;
+    margin-bottom: 1.4rem;
   }
 
-  .evo-fire {
-    border-color: rgba(255, 159, 67, 0.2);
-  }
+  .evo-fire h3 { color: var(--brass); }
+  .evo-abjects h3 { color: var(--bone-heading); }
 
-  .evo-fire:hover {
-    border-color: rgba(255, 159, 67, 0.4);
-    box-shadow: 0 0 20px rgba(255, 159, 67, 0.08);
-  }
+  .evo ul { list-style: none; border-top: 1px solid var(--rule-mid); }
 
-  .evo-fire h3 {
-    color: #ff9f43;
-    margin-bottom: 0.75rem;
+  .evo li {
     font-family: var(--font-mono);
+    font-size: 0.84rem;
+    line-height: 1.5;
+    color: var(--bone-2);
+    padding: 0.55rem 0 0.55rem 1.3rem;
+    border-bottom: 1px solid var(--rule);
+    position: relative;
   }
 
-  .evo-abjects {
-    border-color: var(--border-accent);
+  .evo li::before {
+    content: '\25A0';
+    position: absolute;
+    left: 0;
+    top: 0.62rem;
+    font-size: 0.55rem;
+    color: var(--bone-faint);
   }
 
-  .evo-abjects:hover {
-    border-color: rgba(91, 229, 160, 0.4);
-    box-shadow: 0 0 20px var(--eldritch-glow);
-  }
-
-  .evo-abjects h3 {
-    color: var(--eldritch);
-    margin-bottom: 0.75rem;
-    font-family: var(--font-mono);
-  }
-
-  .evo-card ul {
-    list-style: none;
-    padding: 0;
-  }
-
-  .evo-card li {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-    padding: 0.25rem 0;
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-  }
-
-  .fire-link {
-    color: #ff9f43;
-    font-weight: 700;
-    text-decoration: none;
-    border-bottom: 1px solid rgba(255, 159, 67, 0.3);
-    transition: border-color 0.2s;
-  }
-
-  .fire-link:hover {
-    border-color: #ff9f43;
-  }
+  .evo-abjects li::before { color: var(--red); }
+  .evo-abjects li { color: var(--bone); }
 
   .evo-link {
-    color: var(--text-dim);
+    font-family: var(--font-mono);
     font-style: italic;
-    text-decoration: none;
-    border-bottom: 1px solid rgba(90, 90, 112, 0.3);
-    transition: border-color 0.2s;
+    color: var(--bone-meta);
   }
 
-  .evo-link:hover {
-    border-color: var(--text-dim);
-  }
+  a.evo-link { color: var(--living); }
+
+  /* A big red wedge hung on the rule, pointing from the old to the new. */
+  .evo-rule { position: relative; }
 
   .evo-arrow {
-    display: flex;
-    align-items: center;
-    flex-shrink: 0;
+    position: absolute;
+    left: 50%;
+    top: 42%;
+    width: 64px;
+    height: 76px;
+    transform: translate(-40%, -50%);
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
   }
 
-  .arrow-glyph {
-    font-family: var(--font-mono);
-    font-size: 1.5rem;
-    color: var(--void-purple);
-    text-shadow: 0 0 12px var(--void-purple-glow);
+  @media (max-width: 900px) {
+    .lineage-top { grid-template-columns: 1fr; margin-bottom: 3rem; }
   }
 
-  @media (max-width: 600px) {
-    .evolution {
-      flex-direction: column;
-    }
-
+  @media (max-width: 640px) {
+    .evolution { grid-template-columns: 1fr; gap: 1.5rem; }
+    .evo-rule { height: 6px; margin: 1.5rem 0; }
     .evo-arrow {
-      transform: rotate(90deg);
+      top: 50%;
+      width: 56px;
+      height: 44px;
+      transform: translate(-50%, -30%);
+      clip-path: polygon(0 0, 100% 0, 50% 100%);
     }
   }
 </style>

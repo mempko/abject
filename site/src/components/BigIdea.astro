@@ -1,0 +1,476 @@
+---
+/**
+ * 00 The big idea: every object can be asked. The foundation the rest of
+ * the page is built on, set as the page's biggest type on the paper
+ * ground: the sentence, the signature ask(question), the ask demo (a call
+ * and a reply window), then a hub of what is built on it (make, team,
+ * find, connect), each use taken from the code, and the thesis.
+ */
+import Win from './ui/Win.astro';
+
+const uses = [
+  {
+    key: 'make',
+    word: 'Make',
+    who: 'ObjectCreator asks the objects it will use',
+    text: 'Before writing a new object, the creator learns how to use the objects it will depend on, mainly by asking them.',
+    href: '#make',
+    link: '01 Say it, and it’s running',
+  },
+  {
+    key: 'team',
+    word: 'Team',
+    who: 'the ScrumMaster asks each agent',
+    text: 'Before each sprint, the ScrumMaster asks each agent whether it can help. They answer or pass.',
+    href: '#team',
+    link: '02 A team that asks, plans and replans',
+  },
+  {
+    key: 'find',
+    word: 'Find',
+    who: 'agents ask the registry',
+    text: 'Agents find the right object by asking the registry: is there an object that handles this?',
+    href: '/ask-protocol',
+    link: 'The Ask Protocol',
+  },
+  {
+    key: 'connect',
+    word: 'Connect',
+    who: 'the proxy generator asks both sides',
+    text: 'When two objects don’t speak the same messages, the proxy generator asks both of them and writes a proxy that sits between them.',
+    href: '/ask-protocol',
+    link: 'The Ask Protocol',
+  },
+];
+---
+
+<section id="big-idea" class="big-section field-paper cut-top cut-bottom">
+  <div class="container">
+    <p class="kicker big-kicker"><span class="num">00</span><span>The big idea</span></p>
+    <h2 class="big-title">Every abject can be <span class="asked">asked.</span></h2>
+    <p class="signature" aria-label="ask, question, returns an answer">
+      <span class="sig-fn">ask</span><span class="sig-p">(</span><span class="sig-arg">question</span><span class="sig-p">)</span>
+      <span class="sig-arrow" aria-hidden="true">&rarr;</span>
+      <span class="sig-ret">answer</span>
+    </p>
+
+    <div class="everything">
+      <h3 class="every-lead">What is an abject?</h3>
+      <p class="every-def">
+        Abject is short for AI Object. An abject is an object, a little computer that sends
+        and receives messages. Everything in the system is an abject, and every abject
+        implements the Ask Protocol. And I do mean everything:
+      </p>
+      <ul class="every-list">
+        <li>every window and widget</li>
+        <li>every agent</li>
+        <li>the ScrumMaster that plans</li>
+        <li>the reviewer that learns</li>
+        <li>the registry</li>
+        <li>the knowledge base</li>
+        <li>the link to your model</li>
+        <li>whatever you make next</li>
+      </ul>
+      <p class="every-note">
+        An AI agent is just another abject. We don&rsquo;t need a special protocol between
+        agents and software, or between agents and agents. We just need objects that can talk.
+      </p>
+    </div>
+
+    <div class="big-split">
+      <div class="big-text">
+        <p class="big-lede">
+          Every abject has a mandatory message handler called <code>ask</code>. You send it a
+          question in plain English and it answers in plain English. Abjects can describe
+          themselves without anyone writing documentation, schemas, or anything else.
+        </p>
+        <p class="big-lede lineage">
+          The whole system is a bunch of objects sending each other messages, Smalltalk or
+          Erlang style, where each object has this <code>ask</code> handler.
+        </p>
+      </div>
+
+      <div class="ask-demo">
+        <p class="ask-call">
+          <span class="ask-you">you</span><span class="ask-op">&gt;</span><code class="ask-code">{'ask({ question: "what are you?" })'}</code><span class="ask-cursor" aria-hidden="true"></span>
+        </p>
+        <div class="ask-reply">
+          <Win title="Reply from: abject">
+            <p>
+              I&rsquo;m an abject: a small object with a window, a mailbox and my own
+              source code. I handle messages like any other object, and when someone
+              asks me something, I answer in plain English. Like now.
+            </p>
+          </Win>
+        </div>
+      </div>
+    </div>
+
+    <p class="hub-label">What is built on it</p>
+    <div class="hub">
+      <svg class="spokes" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <line x1="50" y1="50" x2="30" y2="26" />
+        <line x1="50" y1="50" x2="70" y2="26" />
+        <line x1="50" y1="50" x2="30" y2="74" />
+        <line x1="50" y1="50" x2="70" y2="74" />
+      </svg>
+
+      <div class="core" aria-hidden="true">
+        <span class="core-fn">ask</span><span class="core-p">()</span>
+      </div>
+
+      {uses.map((u) => (
+        <article class:list={['use', `use-${u.key}`]}>
+          <h3 class="use-word">{u.word}</h3>
+          <p class="use-who">{u.who}</p>
+          <p class="use-text">{u.text}</p>
+          <a class="use-link" href={u.href}>{u.link} &#9654;</a>
+        </article>
+      ))}
+    </div>
+
+    <p class="thesis-lead">
+      Objects that can explain themselves don&rsquo;t need documentation or plumbing between
+      them. The rest of Abject is built on that.
+    </p>
+    <p class="thesis">All you have to do is ask.</p>
+    <p class="big-links">
+      <a href="/ask-protocol">The Ask Protocol &rarr;</a>
+      <a href="/theory">The theory &rarr;</a>
+    </p>
+  </div>
+</section>
+
+<script>
+  // The ask demo types its call and then shows the reply, once, when it
+  // scrolls into view. Without JS or with reduced motion, all is visible.
+  const demo = document.querySelector('#big-idea .ask-demo');
+  if (demo && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    demo.setAttribute('data-armed', '');
+    new IntersectionObserver((entries, obs) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          demo.classList.add('play');
+          obs.disconnect();
+        }
+      }
+    }, { threshold: 0.3 }).observe(demo);
+  }
+</script>
+
+<style>
+  /* ── The sentence and the signature: the biggest type on the page ── */
+  .big-kicker { color: var(--field-ink-2); }
+
+  .big-title {
+    font-size: clamp(3rem, 9vw, 8rem);
+    font-weight: 700;
+    line-height: 0.92;
+    letter-spacing: -0.005em;
+    color: #16130f;
+    max-width: 12ch;
+    margin-bottom: 1.6rem;
+  }
+
+  .asked {
+    display: inline-block;
+    background: var(--red);
+    color: var(--on-red);
+    padding: 0 0.12em 0.02em;
+    box-shadow: 0.06em 0.06em 0 #16130f;
+  }
+
+  .signature {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: clamp(1.7rem, 5vw, 4.2rem);
+    line-height: 1.1;
+    color: #16130f;
+    padding: 0.9rem 0 1rem;
+    border-top: 4px solid #16130f;
+    border-bottom: 1.5px solid rgba(22, 19, 15, 0.35);
+  }
+
+  .sig-fn { color: var(--red); }
+  .sig-p { color: rgba(22, 19, 15, 0.55); }
+  .sig-arg { font-style: italic; }
+  .sig-arrow { color: rgba(22, 19, 15, 0.55); font-weight: 400; margin: 0 0.4em; }
+  .sig-ret { font-style: italic; }
+
+  /* ── Everything is an abject ── */
+  .everything {
+    display: grid;
+    grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
+    gap: 0.4rem 2.5rem;
+    align-items: baseline;
+    margin-top: 2.2rem;
+    padding-bottom: 1.6rem;
+    border-bottom: 1.5px solid rgba(22, 19, 15, 0.35);
+  }
+
+  .every-lead {
+    grid-row: span 3;
+    font-family: var(--font-display);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: clamp(1.7rem, 3.4vw, 2.6rem);
+    line-height: 1;
+    color: #16130f;
+  }
+
+  .every-list {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1.4rem;
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.98rem;
+    color: #16130f;
+  }
+
+  .every-list li::before {
+    content: '';
+    display: inline-block;
+    width: 0.5em;
+    height: 0.5em;
+    margin-right: 0.5em;
+    background: var(--red);
+    vertical-align: 0.1em;
+  }
+
+  .every-def { color: #2b2620; font-size: 1.12rem; line-height: 1.55; margin-bottom: 0.5rem; }
+
+  .every-note { color: #2b2620; font-size: 1.08rem; line-height: 1.55; margin-top: 0.4rem; }
+
+  .every-note code { background: rgba(22, 19, 15, 0.06); border-color: rgba(22, 19, 15, 0.2); color: #16130f; }
+
+  /* ── The explanation beside the demo ── */
+  .big-split {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 3.5rem;
+    align-items: start;
+    margin-top: 2.6rem;
+  }
+
+  .big-lede { font-size: 1.12rem; line-height: 1.6; color: #2b2620; }
+  .big-lede + .big-lede { margin-top: 0.9rem; }
+  .big-lede.lineage { font-size: 1rem; color: #5a5247; }
+
+  .ask-call {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-family: var(--font-mono);
+    font-size: 0.98rem;
+    margin-bottom: 1rem;
+    color: #16130f;
+  }
+
+  .ask-you {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--red);
+    color: var(--on-red);
+    padding: 0.05rem 0.5rem;
+  }
+
+  .ask-op { color: #5a5247; }
+
+  .ask-code {
+    display: inline-block;
+    color: #16130f !important;
+    background: none !important;
+    border: none !important;
+    padding: 0 !important;
+    font-size: 1em;
+  }
+
+  .ask-cursor {
+    display: inline-block;
+    width: 0.55em;
+    height: 1.1em;
+    background: #16130f;
+    animation: cursor-blink 1.1s steps(1) infinite;
+  }
+
+  @keyframes cursor-blink { 50% { opacity: 0; } }
+
+  .ask-reply { margin-left: 1.5rem; }
+  .ask-reply :global(.win) { box-shadow: 8px 8px 0 #16130f; }
+  .ask-reply p { color: var(--bone-2) !important; font-size: 1rem; line-height: 1.7; }
+
+  .ask-demo[data-armed] .ask-code { width: 0; overflow: hidden; white-space: nowrap; }
+  .ask-demo[data-armed].play .ask-code { animation: ask-type 1.3s steps(34, end) 0.3s forwards; }
+  .ask-demo[data-armed] .ask-reply { opacity: 0; transform: translateY(10px); }
+  .ask-demo[data-armed].play .ask-reply { animation: reply-in 0.45s ease 1.85s forwards; }
+
+  @keyframes ask-type { from { width: 0; } to { width: 34ch; } }
+  @keyframes reply-in { to { opacity: 1; transform: none; } }
+
+  /* ── The hub: ask() at the centre, four uses on its spokes ── */
+  .hub-label {
+    margin-top: 4rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #5a5247;
+  }
+
+  .hub {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 13rem) minmax(0, 1fr);
+    grid-template-areas:
+      'make core team'
+      'find core connect';
+    gap: 2.5rem 2rem;
+    margin-top: 1.2rem;
+    align-items: center;
+  }
+
+  .spokes {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+  }
+
+  .spokes line {
+    stroke: #16130f;
+    stroke-width: 2;
+    vector-effect: non-scaling-stroke;
+    stroke-dasharray: 6 5;
+  }
+
+  .core {
+    grid-area: core;
+    z-index: 1;
+    justify-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 12rem;
+    height: 12rem;
+    border-radius: 50%;
+    background: #16130f;
+    box-shadow: 8px 8px 0 var(--red);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 2.3rem;
+    color: var(--on-red);
+  }
+
+  .core-fn { color: var(--red-hot); }
+
+
+  .use {
+    position: relative;
+    z-index: 1;
+    padding: 1.1rem 1.2rem 1.2rem;
+    background: #efe6d1;
+    border-top: 4px solid #16130f;
+  }
+
+  .use-make { grid-area: make; }
+  .use-team { grid-area: team; }
+  .use-find { grid-area: find; }
+  .use-connect { grid-area: connect; }
+
+  .use-word {
+    font-size: clamp(1.8rem, 3.2vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1;
+    color: #16130f;
+    margin-bottom: 0.35rem;
+  }
+
+  .use-who {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--red-deep) !important;
+    margin-bottom: 0.5rem;
+  }
+
+  .use-text { font-size: 0.97rem; line-height: 1.55; color: #2b2620; margin-bottom: 0.6rem; }
+
+  .use-link { font-family: var(--font-mono); font-size: 0.8rem; }
+
+  /* ── The thesis ── */
+  .thesis-lead {
+    margin-top: 4rem;
+    max-width: 760px;
+    font-size: 1.15rem;
+    line-height: 1.6;
+    color: #2b2620;
+  }
+
+  .thesis {
+    position: relative;
+    margin-top: 1rem;
+    padding-left: 2.2rem;
+    max-width: 980px;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(2.2rem, 5vw, 4rem);
+    line-height: 1.1;
+    text-transform: uppercase;
+    color: #16130f;
+  }
+
+  .thesis::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.18em;
+    width: 1.2rem;
+    height: 0.9em;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+  }
+
+  .big-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.8rem;
+    margin-top: 1.4rem;
+    padding-left: 2.2rem;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+  }
+
+  @media (max-width: 900px) {
+    .everything { grid-template-columns: 1fr; }
+    .every-lead { grid-row: auto; }
+    .big-split { grid-template-columns: 1fr; gap: 2rem; }
+    .hub {
+      grid-template-columns: 1fr;
+      grid-template-areas: 'core' 'make' 'team' 'find' 'connect';
+      gap: 1.2rem;
+      padding-left: 1.4rem;
+      border-left: 2px dashed #16130f;
+    }
+    .spokes { display: none; }
+    .core { justify-self: start; width: 9rem; height: 9rem; font-size: 1.8rem; margin-left: -1.4rem; }
+  }
+
+  @media (max-width: 560px) {
+    .big-title { font-size: clamp(2.8rem, 13vw, 4rem); }
+    .big-lede { font-size: 1.08rem; }
+    .ask-call { font-size: 0.72rem; gap: 0.4rem; }
+    .ask-reply { margin-left: 0; }
+    .signature { font-size: clamp(1.4rem, 7.4vw, 2rem); }
+  }
+</style>

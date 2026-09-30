@@ -19,24 +19,27 @@ const top = latest?.highlights.slice(0, 3) ?? [];
 {latest && (
   <section id="whats-new" class="new-section">
     <div class="container">
-      <div class="new-box">
-        <div class="new-head">
-          <span class="new-eyebrow">// LATEST RELEASE</span>
-          <span class="new-version">v{latest.version}</span>
-          <time class="new-date" datetime={latest.date}>{fmtDate(latest.date)}</time>
+      <p class="kicker"><span class="num">08</span><span>New</span></p>
+      <h2 class="poster-quote new-title">{latest.title}</h2>
+
+      <div class="new-grid">
+        <div class="stat new-stat">
+          <span class="big">v{latest.version}</span>
+          <span class="cap">Latest release &middot; <time datetime={latest.date}>{fmtDate(latest.date)}</time></span>
         </div>
-        <h2 class="new-title">{latest.title}</h2>
-        <p class="new-summary">{latest.summary}</p>
-        <ul class="new-list">
-          {top.map((h) => <li>{h}</li>)}
+
+        <div class="new-body">
+          <p class="new-summary">{latest.summary}</p>
+          <ol class="new-list">
+            {top.map((h) => <li>{h}</li>)}
+          </ol>
+        </div>
+
+        <ul class="new-links">
+          <li><a href={`/changelog#v${latest.version}`}>Full notes for this release</a></li>
+          <li><a href="/changelog">All releases</a></li>
+          <li><a href="https://github.com/mempko/abject/releases" target="_blank" rel="noopener">GitHub Releases</a></li>
         </ul>
-        <p class="new-links">
-          <a href={`/changelog#v${latest.version}`}>Full notes for this release</a>
-          <span class="sep">|</span>
-          <a href="/changelog">Every release</a>
-          <span class="sep">|</span>
-          <a href="https://github.com/mempko/abject/releases" target="_blank" rel="noopener">GitHub Releases</a>
-        </p>
       </div>
     </div>
   </section>
@@ -44,80 +47,94 @@ const top = latest?.highlights.slice(0, 3) ?? [];
 
 <style>
   .new-section {
-    padding: calc(var(--section-gap) * 0.6) 0;
-  }
-
-  .new-box {
-    max-width: 860px;
-    margin: 0 auto;
-    padding: 1.75rem 2rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border-accent);
-    border-radius: 12px;
-    box-shadow: 0 0 24px var(--eldritch-glow);
-  }
-
-  .new-head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0.75rem;
-    margin-bottom: 0.6rem;
-    font-family: var(--font-mono);
-  }
-
-  .new-eyebrow {
-    font-size: 0.75rem;
-    letter-spacing: 0.12em;
-    color: var(--text-dim);
-  }
-
-  .new-version {
-    font-size: 0.9rem;
-    font-weight: 700;
-    color: var(--eldritch);
-  }
-
-  .new-date {
-    font-size: 0.8rem;
-    color: var(--text-dim);
+    padding: calc(var(--section-gap) * 0.8) 0;
   }
 
   .new-title {
-    font-size: 1.4rem;
-    margin-bottom: 0.5rem;
+    margin: 0.4rem 0 3rem;
+    max-width: 22ch;
   }
 
+  .new-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 4fr) minmax(0, 5fr) minmax(0, 3fr);
+    gap: 2.5rem;
+    align-items: start;
+    padding-top: 2rem;
+    border-top: var(--rule-w) solid var(--rule-strong);
+  }
+
+  .new-stat .big { font-size: clamp(3.4rem, 7vw, 6rem); }
+
+  .new-stat .cap { margin-top: 0.6rem; }
+
   .new-summary {
-    color: var(--text-secondary);
-    font-size: 0.98rem;
-    line-height: 1.7;
-    margin-bottom: 0.9rem;
+    color: var(--bone);
+    font-size: 1.08rem;
+    line-height: 1.65;
+    margin-bottom: 1.2rem;
   }
 
   .new-list {
-    padding-left: 1.25rem;
-    color: var(--text-secondary);
-    font-size: 0.92rem;
-    line-height: 1.6;
-    margin-bottom: 1rem;
+    list-style: none;
+    counter-reset: hl;
+    border-top: 1px solid var(--rule-mid);
   }
 
   .new-list li {
-    margin-bottom: 0.35rem;
+    counter-increment: hl;
+    display: grid;
+    grid-template-columns: 2.6rem 1fr;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--rule);
+    color: var(--bone-2);
+    font-size: 0.97rem;
+    line-height: 1.65;
   }
 
-  .new-list li::marker {
-    color: var(--eldritch);
+  .new-list li::before {
+    content: counter(hl, decimal-leading-zero);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--red);
+    line-height: 2.1;
   }
 
   .new-links {
-    font-size: 0.85rem;
-    color: var(--text-dim);
+    list-style: none;
+    border-top: 1px solid var(--rule-mid);
   }
 
-  .new-links .sep {
-    margin: 0 0.5rem;
-    opacity: 0.5;
+  .new-links li { border-bottom: 1px solid var(--rule); }
+
+  .new-links a {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.7rem 0;
+    font-family: var(--font-mono);
+    font-size: 0.84rem;
+    text-decoration: none;
+  }
+
+  .new-links a::after {
+    content: '\25B6';
+    font-size: 0.6rem;
+    color: var(--red);
+    transition: transform 0.15s;
+  }
+
+  .new-links a:hover::after { transform: translateX(3px); }
+
+  @media (max-width: 1000px) {
+    .new-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .new-body { grid-column: 1 / -1; grid-row: 2; }
+  }
+
+  @media (max-width: 640px) {
+    .new-grid { grid-template-columns: 1fr; gap: 2rem; }
+    .new-body { grid-row: auto; }
+    .new-title { margin-bottom: 2rem; }
   }
 </style>

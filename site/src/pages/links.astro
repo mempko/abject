@@ -10,43 +10,48 @@ import Footer from '../components/Footer.astro';
 >
   <Header />
   <main class="links">
-    <div class="links-container">
-      <header class="links-hero">
-        <p class="links-eyebrow">// TAKE IT WITH YOU</p>
-        <h1>Point Your Phone at a Square</h1>
-        <p class="links-thesis">
+    <div class="container">
+      <header class="hero">
+        <p class="kicker"><span class="sigil" aria-hidden="true"></span><span>Take it with you</span></p>
+        <h1 class="hero-title">Point Your Phone at a Square</h1>
+        <span class="hero-bar" aria-hidden="true"></span>
+        <p class="lede">
           The website, the source, and the human responsible.
         </p>
       </header>
 
-      <div class="qr-row">
-        <a class="qr-card" href="https://abject.world" aria-label="abject.world QR code">
-          <div class="qr-tile">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for abject.world"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m7 0h1m1 0h1m1 0h7M4 5.5h1m5 0h1m2 0h2m1 0h2m1 0h2m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m2 0h2m3 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m3 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h4m2 0h3m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m1 0h2m4 0h1M4 12.5h1m1 0h5m6 0h4m1 0h5M4 13.5h1m6 0h2m1 0h1m1 0h1m3 0h1m2 0h1m3 0h1M4 14.5h4m2 0h2m1 0h1m1 0h1m2 0h2m2 0h2m1 0h1m1 0h2M9 15.5h1m1 0h1m2 0h1m5 0h1m7 0h1M7 16.5h2m1 0h4m1 0h1m5 0h2m1 0h1m1 0h3M4 17.5h1m1 0h1m1 0h2m1 0h1m4 0h2m5 0h1m1 0h1m1 0h1M4 18.5h1m1 0h1m3 0h2m2 0h1m2 0h3m3 0h3m1 0h2M4 19.5h1m1 0h1m1 0h1m2 0h3m2 0h2m1 0h2m2 0h2m3 0h1M4 20.5h1m2 0h2m1 0h1m1 0h2m2 0h1m1 0h7m1 0h1M12 21.5h1m7 0h1m3 0h2M4 22.5h7m4 0h2m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m1 0h2m2 0h1m1 0h1m3 0h2m2 0h1M4 24.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h6m1 0h3M4 25.5h1m1 0h3m1 0h1m1 0h1m3 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h1m1 0h1m2 0h3m5 0h2m1 0h1M4 27.5h1m5 0h1m5 0h2m1 0h7m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m2 0h8"/></svg>
-          </div>
-          <p class="qr-name">The Website</p>
-          <p class="qr-url">abject.world</p>
-        </a>
-
-        <a class="qr-card" href="https://github.com/mempko/abject" aria-label="GitHub repository QR code">
-          <div class="qr-tile">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 37 37" shape-rendering="crispEdges" role="img" aria-label="QR code for github.com/mempko/abject"><path fill="#ffffff" d="M0 0h37v37H0z"/><path stroke="#000000" d="M4 4.5h7m3 0h1m1 0h4m3 0h2m1 0h7M4 5.5h1m5 0h1m2 0h2m2 0h4m1 0h1m1 0h1m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m1 0h1m2 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h3m3 0h2m1 0h1m1 0h1m2 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m2 0h1m5 0h2m1 0h1m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h3m1 0h1m1 0h1m1 0h1m3 0h1M4 12.5h1m1 0h5m3 0h2m4 0h2m4 0h5M4 13.5h1m2 0h1m1 0h1m3 0h1m3 0h3m1 0h4m1 0h3m3 0h1M6 14.5h2m1 0h5m2 0h6m2 0h1m3 0h1M4 15.5h1m3 0h2m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m4 0h1m4 0h1m1 0h1M5 16.5h2m3 0h2m3 0h2m1 0h2m1 0h3m5 0h2M4 17.5h1m1 0h4m2 0h1m2 0h1m3 0h10m3 0h1M4 18.5h1m3 0h1m1 0h1m5 0h1m4 0h1m2 0h2m2 0h3M4 19.5h2m1 0h1m3 0h3m1 0h1m2 0h1m1 0h1m2 0h6m2 0h1M4 20.5h1m1 0h2m2 0h1m1 0h2m2 0h1m4 0h1m1 0h1m1 0h1m1 0h1m1 0h2M4 21.5h2m1 0h1m1 0h1m2 0h1m4 0h3m2 0h2m1 0h4m1 0h1m1 0h1M4 22.5h1m1 0h1m1 0h1m1 0h2m1 0h3m1 0h3m2 0h1m1 0h1m1 0h3m1 0h1M4 23.5h1m1 0h2m1 0h1m1 0h2m4 0h1m1 0h2m3 0h3m4 0h1M4 24.5h1m2 0h1m2 0h3m5 0h4m1 0h6m1 0h3M12 25.5h5m3 0h1m1 0h1m1 0h1m3 0h5M4 26.5h7m4 0h2m2 0h6m1 0h1m1 0h3M4 27.5h1m5 0h1m1 0h1m3 0h1m1 0h1m3 0h3m3 0h1m2 0h1M4 28.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h1m1 0h1m2 0h5m1 0h2M4 29.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h2m1 0h5m4 0h4M4 30.5h1m1 0h3m1 0h1m1 0h3m1 0h1m2 0h13M4 31.5h1m5 0h1m6 0h4m1 0h1m1 0h2m1 0h1m1 0h1m1 0h1M4 32.5h7m1 0h3m1 0h2m1 0h1m1 0h1m1 0h1m2 0h3m1 0h1"/></svg>
-          </div>
-          <p class="qr-name">The Source</p>
-          <p class="qr-url">github.com/mempko/abject</p>
-        </a>
-
-        <a class="qr-card" href="https://mempko.com" aria-label="mempko.com QR code">
-          <div class="qr-tile">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for mempko.com"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m4 0h3m2 0h1m1 0h7M4 5.5h1m5 0h1m4 0h1m2 0h3m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h2m6 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m3 0h2m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m3 0h5m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m2 0h1m1 0h1M4 12.5h1m1 0h5m2 0h1m2 0h1m1 0h2m2 0h5M7 13.5h2m2 0h4m1 0h1m3 0h1m2 0h1m3 0h1M5 14.5h1m1 0h1m2 0h1m2 0h2m1 0h1m2 0h1m1 0h3m1 0h1m1 0h2M6 15.5h3m3 0h1m2 0h2m1 0h1m1 0h5m3 0h1M5 16.5h1m1 0h4m3 0h2m5 0h2m1 0h1m1 0h3M4 17.5h4m5 0h1m2 0h3m4 0h1m1 0h1m1 0h1M4 18.5h1m1 0h2m2 0h3m4 0h5m1 0h3m1 0h2M4 19.5h1m3 0h2m1 0h4m1 0h2m2 0h5m3 0h1M4 20.5h1m1 0h2m1 0h2m3 0h1m1 0h1m1 0h1m1 0h5m1 0h1M12 21.5h3m4 0h2m3 0h2M4 22.5h7m3 0h3m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m2 0h1m2 0h1m1 0h1m3 0h2M4 24.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h1M4 25.5h1m1 0h3m1 0h1m1 0h3m1 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h3m2 0h5m3 0h2m1 0h1M4 27.5h1m5 0h1m2 0h1m2 0h2m1 0h2m1 0h4m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m3 0h7"/></svg>
-          </div>
-          <p class="qr-name">The Human</p>
-          <p class="qr-url">mempko.com</p>
-        </a>
-      </div>
+      <ol class="qr-index">
+        <li class="qr-entry focus">
+          <a class="qr-card" href="https://abject.world" aria-label="abject.world QR code">
+            <p class="qr-name">The Website</p>
+            <div class="qr-tile">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for abject.world"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m7 0h1m1 0h1m1 0h7M4 5.5h1m5 0h1m2 0h2m1 0h2m1 0h2m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m2 0h2m3 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m3 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h4m2 0h3m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m1 0h2m4 0h1M4 12.5h1m1 0h5m6 0h4m1 0h5M4 13.5h1m6 0h2m1 0h1m1 0h1m3 0h1m2 0h1m3 0h1M4 14.5h4m2 0h2m1 0h1m1 0h1m2 0h2m2 0h2m1 0h1m1 0h2M9 15.5h1m1 0h1m2 0h1m5 0h1m7 0h1M7 16.5h2m1 0h4m1 0h1m5 0h2m1 0h1m1 0h3M4 17.5h1m1 0h1m1 0h2m1 0h1m4 0h2m5 0h1m1 0h1m1 0h1M4 18.5h1m1 0h1m3 0h2m2 0h1m2 0h3m3 0h3m1 0h2M4 19.5h1m1 0h1m1 0h1m2 0h3m2 0h2m1 0h2m2 0h2m3 0h1M4 20.5h1m2 0h2m1 0h1m1 0h2m2 0h1m1 0h7m1 0h1M12 21.5h1m7 0h1m3 0h2M4 22.5h7m4 0h2m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m1 0h2m2 0h1m1 0h1m3 0h2m2 0h1M4 24.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h6m1 0h3M4 25.5h1m1 0h3m1 0h1m1 0h1m3 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h1m1 0h1m2 0h3m5 0h2m1 0h1M4 27.5h1m5 0h1m5 0h2m1 0h7m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m2 0h8"/></svg>
+            </div>
+            <p class="qr-url">abject.world</p>
+          </a>
+        </li>
+        <li class="qr-entry">
+          <a class="qr-card" href="https://github.com/mempko/abject" aria-label="GitHub repository QR code">
+            <p class="qr-name">The Source</p>
+            <div class="qr-tile">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 37 37" shape-rendering="crispEdges" role="img" aria-label="QR code for github.com/mempko/abject"><path fill="#ffffff" d="M0 0h37v37H0z"/><path stroke="#000000" d="M4 4.5h7m3 0h1m1 0h4m3 0h2m1 0h7M4 5.5h1m5 0h1m2 0h2m2 0h4m1 0h1m1 0h1m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h1m1 0h1m2 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h3m3 0h2m1 0h1m1 0h1m2 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m2 0h1m5 0h2m1 0h1m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h3m1 0h1m1 0h1m1 0h1m3 0h1M4 12.5h1m1 0h5m3 0h2m4 0h2m4 0h5M4 13.5h1m2 0h1m1 0h1m3 0h1m3 0h3m1 0h4m1 0h3m3 0h1M6 14.5h2m1 0h5m2 0h6m2 0h1m3 0h1M4 15.5h1m3 0h2m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m4 0h1m4 0h1m1 0h1M5 16.5h2m3 0h2m3 0h2m1 0h2m1 0h3m5 0h2M4 17.5h1m1 0h4m2 0h1m2 0h1m3 0h10m3 0h1M4 18.5h1m3 0h1m1 0h1m5 0h1m4 0h1m2 0h2m2 0h3M4 19.5h2m1 0h1m3 0h3m1 0h1m2 0h1m1 0h1m2 0h6m2 0h1M4 20.5h1m1 0h2m2 0h1m1 0h2m2 0h1m4 0h1m1 0h1m1 0h1m1 0h1m1 0h2M4 21.5h2m1 0h1m1 0h1m2 0h1m4 0h3m2 0h2m1 0h4m1 0h1m1 0h1M4 22.5h1m1 0h1m1 0h1m1 0h2m1 0h3m1 0h3m2 0h1m1 0h1m1 0h3m1 0h1M4 23.5h1m1 0h2m1 0h1m1 0h2m4 0h1m1 0h2m3 0h3m4 0h1M4 24.5h1m2 0h1m2 0h3m5 0h4m1 0h6m1 0h3M12 25.5h5m3 0h1m1 0h1m1 0h1m3 0h5M4 26.5h7m4 0h2m2 0h6m1 0h1m1 0h3M4 27.5h1m5 0h1m1 0h1m3 0h1m1 0h1m3 0h3m3 0h1m2 0h1M4 28.5h1m1 0h3m1 0h1m1 0h1m2 0h1m3 0h1m1 0h1m2 0h5m1 0h2M4 29.5h1m1 0h3m1 0h1m1 0h1m1 0h2m1 0h2m1 0h5m4 0h4M4 30.5h1m1 0h3m1 0h1m1 0h3m1 0h1m2 0h13M4 31.5h1m5 0h1m6 0h4m1 0h1m1 0h2m1 0h1m1 0h1m1 0h1M4 32.5h7m1 0h3m1 0h2m1 0h1m1 0h1m1 0h1m2 0h3m1 0h1"/></svg>
+            </div>
+            <p class="qr-url">github.com/mempko/abject</p>
+          </a>
+        </li>
+        <li class="qr-entry">
+          <a class="qr-card" href="https://mempko.com" aria-label="mempko.com QR code">
+            <p class="qr-name">The Human</p>
+            <div class="qr-tile">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33" shape-rendering="crispEdges" role="img" aria-label="QR code for mempko.com"><path fill="#ffffff" d="M0 0h33v33H0z"/><path stroke="#000000" d="M4 4.5h7m4 0h3m2 0h1m1 0h7M4 5.5h1m5 0h1m4 0h1m2 0h3m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h1m1 0h3m1 0h1m1 0h1m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h1m1 0h2m6 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h1m3 0h2m2 0h1m1 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m3 0h5m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m2 0h1m1 0h1M4 12.5h1m1 0h5m2 0h1m2 0h1m1 0h2m2 0h5M7 13.5h2m2 0h4m1 0h1m3 0h1m2 0h1m3 0h1M5 14.5h1m1 0h1m2 0h1m2 0h2m1 0h1m2 0h1m1 0h3m1 0h1m1 0h2M6 15.5h3m3 0h1m2 0h2m1 0h1m1 0h5m3 0h1M5 16.5h1m1 0h4m3 0h2m5 0h2m1 0h1m1 0h3M4 17.5h4m5 0h1m2 0h3m4 0h1m1 0h1m1 0h1M4 18.5h1m1 0h2m2 0h3m4 0h5m1 0h3m1 0h2M4 19.5h1m3 0h2m1 0h4m1 0h2m2 0h5m3 0h1M4 20.5h1m1 0h2m1 0h2m3 0h1m1 0h1m1 0h1m1 0h5m1 0h1M12 21.5h3m4 0h2m3 0h2M4 22.5h7m3 0h3m3 0h1m1 0h1m1 0h1m1 0h3M4 23.5h1m5 0h1m1 0h1m2 0h1m2 0h1m1 0h1m3 0h2M4 24.5h1m1 0h3m1 0h1m1 0h2m1 0h1m3 0h6m1 0h1m1 0h1M4 25.5h1m1 0h3m1 0h1m1 0h3m1 0h3m1 0h3m1 0h5M4 26.5h1m1 0h3m1 0h1m1 0h3m2 0h5m3 0h2m1 0h1M4 27.5h1m5 0h1m2 0h1m2 0h2m1 0h2m1 0h4m2 0h1M4 28.5h7m1 0h3m1 0h1m1 0h1m3 0h7"/></svg>
+            </div>
+            <p class="qr-url">mempko.com</p>
+          </a>
+        </li>
+      </ol>
 
       <p class="links-footnote">
-        Your phone's camera app reads these. Nothing to install&mdash;that would be missing the point.
+        Your phone's camera app reads these. There's nothing to install. That would be missing the point.
       </p>
     </div>
   </main>
@@ -56,106 +61,130 @@ import Footer from '../components/Footer.astro';
 <style>
   .links {
     min-height: 70vh;
-    display: flex;
-    align-items: center;
+    padding-top: calc(69px + clamp(3rem, 6vw, 5rem));
+    padding-bottom: clamp(4rem, 8vw, 6rem);
   }
 
-  .links-container {
-    /* Wider than the prose pages: three presentation-sized QR tiles abreast. */
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 4rem 2rem 5rem;
-    width: 100%;
+  /* ── Hero ── */
+  .hero { margin-bottom: clamp(2.5rem, 5vw, 3.5rem); }
+
+  .hero-title {
+    font-size: clamp(2.6rem, 6.2vw, 5.2rem);
+    line-height: 0.98;
+    margin-bottom: 1.4rem;
   }
 
-  .links-hero {
-    text-align: center;
-    margin-bottom: 3.5rem;
+  .hero-bar {
+    display: block;
+    width: 180px;
+    height: 8px;
+    margin-bottom: 1.6rem;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
   }
 
-  .links-eyebrow {
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    letter-spacing: 0.15em;
-    color: var(--accent);
-    margin-bottom: 1rem;
+  .hero .lede { font-size: clamp(1.08rem, 1.5vw, 1.25rem); }
+
+  /* ── The index: three ruled columns, numbered ── */
+  .qr-index {
+    list-style: none;
+    counter-reset: qr;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: var(--rule-w) solid var(--rule-strong);
+    border-bottom: var(--rule-w) solid var(--rule-strong);
   }
 
-  .links-hero h1 {
-    font-family: var(--font-display);
-    font-size: clamp(2rem, 4vw, 3rem);
-    color: var(--text-primary);
-    margin-bottom: 1rem;
-  }
-
-  .links-thesis {
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-  }
-
-  .qr-row {
-    display: flex;
-    justify-content: center;
-    align-items: stretch;
-    gap: clamp(1rem, 2.5vw, 2.5rem);
-    flex-wrap: wrap;
-  }
+  /* Three presentation-sized QR tiles abreast, each in its own ruled column. */
+  .qr-entry { counter-increment: qr; }
+  .qr-entry + .qr-entry { border-left: 1px solid var(--rule-mid); }
 
   .qr-card {
     display: flex;
     flex-direction: column;
-    align-items: center;
-    flex: 1 1 240px;
-    max-width: 420px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1.75rem 1.75rem 1.5rem;
+    height: 100%;
+    padding: clamp(1.2rem, 2.5vw, 2rem) clamp(1rem, 1.8vw, 1.5rem);
     text-decoration: none;
-    transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+    transition: background-color 0.15s;
   }
 
-  .qr-card:hover {
-    border-color: var(--border-accent);
-    transform: translateY(-3px);
-    box-shadow: 0 8px 30px var(--accent-glow);
-  }
-
-  .qr-tile {
-    background: #ffffff;
-    border-radius: 8px;
-    padding: 0.6rem;
-    line-height: 0;
-    width: 100%;
-    max-width: 360px;
-  }
-
-  .qr-tile svg {
-    width: 100%;
-    height: auto;
-    display: block;
-  }
+  .qr-card:hover { background: var(--panel); }
 
   .qr-name {
-    font-family: var(--font-mono);
-    font-size: 1rem;
-    letter-spacing: 0.08em;
-    color: var(--accent);
-    margin-top: 1.25rem;
+    display: flex;
+    align-items: baseline;
+    gap: 0.8rem;
+    margin-bottom: 1.3rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(1.3rem, 2.2vw, 1.8rem);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+  }
+
+  .qr-name::before {
+    content: counter(qr, decimal-leading-zero);
+    font-size: 0.8em;
+    color: var(--red);
+  }
+
+  /* QR codes need their white quiet zone: keep the tile white and square. */
+  .qr-tile {
+    width: 100%;
+    max-width: 380px;
+    padding: 0.6rem;
+    line-height: 0;
+    background: #ffffff;
+    border: var(--rule-w) solid var(--rule-strong);
+    box-shadow: var(--print);
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+
+  .qr-entry.focus .qr-tile { box-shadow: var(--print-red); border-color: var(--red); }
+
+  .qr-card:hover .qr-tile { transform: translate(-2px, -2px); box-shadow: 8px 8px 0 var(--shadow-ink); }
+  .qr-entry.focus .qr-card:hover .qr-tile { box-shadow: 8px 8px 0 var(--red); }
+
+  .qr-tile svg {
+    display: block;
+    width: 100%;
+    height: auto;
   }
 
   .qr-url {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 1.4rem;
     font-family: var(--font-mono);
     font-size: 0.95rem;
-    color: var(--text-dim);
-    margin-top: 0.35rem;
+    color: var(--living);
+    word-break: break-word;
   }
 
+  .qr-url::before {
+    content: '\25B6' / '';
+    font-size: 0.6rem;
+    color: var(--red);
+    transition: transform 0.15s;
+  }
+
+  .qr-card:hover .qr-url::before { transform: translateX(3px); }
+
   .links-footnote {
-    text-align: center;
-    color: var(--text-dim);
-    font-size: 0.9rem;
-    margin-top: 3rem;
-    font-style: italic;
+    margin-top: 2rem;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--bone-meta);
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 860px) {
+    .qr-index { grid-template-columns: 1fr; }
+    .qr-entry + .qr-entry { border-left: none; border-top: 1px solid var(--rule-mid); }
+    .qr-tile { max-width: 320px; }
   }
 </style>

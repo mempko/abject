@@ -1,0 +1,177 @@
+---
+/**
+ * 05 Get Abject: this section's head, then the Downloads block (owned
+ * elsewhere, imported as is; its own head is hidden here because this one
+ * replaces it, and #downloads and the release wiring stay intact), then a
+ * four-step start strung on a stepper and the four questions people ask
+ * first, on the paper ground. The rest live on /install and /why.
+ */
+import SectionHead from './ui/SectionHead.astro';
+import Downloads from './Downloads.astro';
+
+const steps = [
+  { n: 'I', t: 'Install', time: 'two minutes', body: 'Download the build for your machine and open it. The builds are not code-signed yet, so the OS pauses once.', link: { href: '/install#first-launch', text: 'What to click' } },
+  { n: 'II', t: 'Pick a model', time: 'one minute', body: 'Settings opens by itself on the AI tab. Paste an API key, point it at Ollama, or choose a coding CLI you already log into.', link: { href: '/install#mind', text: 'Every provider' } },
+  { n: 'III', t: 'Ask for something', time: 'one sentence', key: true, body: 'Click Chat and describe what you want. A window appears. Close the chat and the window stays, still working.', link: { href: '/install#first-abject', text: 'Your first abject' } },
+  { n: 'IV', t: 'Say yes, or no', time: 'when it asks', body: 'The first time an abject wants a shell, a file outside its sandbox or a new website, it asks you first and waits.', link: { href: '/install#first-abject', text: 'How permissions work' } },
+];
+
+const faq = [
+  {
+    q: 'Do I have to know how to code?',
+    a: 'No. Describe what you want and an abject appears, window and all. Every abject carries its own source code if you are curious, but you never have to look at it.',
+  },
+  {
+    q: 'Do I need an API key or an AI subscription?',
+    a: 'It needs a model to think with. Bring an API key from Anthropic, OpenAI, Google, OpenRouter, DeepSeek, xAI, Moonshot, MiniMax or Meta. Or run a free local model with Ollama, private and entirely on your hardware. Or reuse the Claude Code, Codex or Antigravity CLI you already log into, or the models another machine on your mesh shares with you. The first time you open it, the settings ask which one to use.',
+  },
+  {
+    q: 'Is it safe to let this thing touch my machine?',
+    a: 'Abjects can only reach what you allow. Files, the shell, the network and the clipboard are capabilities an abject has to be granted. Without one it cannot use it, no matter how politely it asks, and the first request for anything new stops at a prompt and waits for you. Generated code runs in a locked-down interpreter in worker threads, with no direct access to the filesystem, the network or the process. Everything lives on your machine. The horror is thematic. The containment is real.',
+  },
+  {
+    q: 'What does it cost?',
+    a: 'Nothing. It is free and open source under the GPL-3.0. No account, no telemetry, no subscription. The only cost is LLM tokens, and with Ollama that is just electricity.',
+  },
+];
+---
+
+<div class="get">
+  <section id="get" class="get-head">
+    <div class="container">
+      <SectionHead num="05" kicker="Get Abject" title="Get Abject">
+        A desktop app for Linux, Windows and macOS. Download it, open it, pick a model, and start
+        asking.
+      </SectionHead>
+    </div>
+  </section>
+
+  <Downloads head={false} />
+
+  <section class="get-start field-paper cut-top">
+    <div class="container">
+      <div class="start-grid">
+        <div class="start">
+          <h3 class="start-title">From download to your first abject in five minutes</h3>
+          <ol class="stepper start-steps">
+            {steps.map((s) => (
+              <li class:list={{ key: s.key }}>
+                <span class="step-n">{s.n}</span>
+                <p class="step-time">{s.time}</p>
+                <h4 class="step-t">{s.t}</h4>
+                <p class="step-b">{s.body}</p>
+                <a class="step-a" href={s.link.href}>{s.link.text}&nbsp;&rarr;</a>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        <div class="faq">
+          <h3 class="start-title">First questions</h3>
+          {faq.map((f) => (
+            <details class="faq-item">
+              <summary>
+                <span class="faq-q">{f.q}</span>
+                <span class="faq-x" aria-hidden="true"></span>
+              </summary>
+              <p>{f.a}</p>
+            </details>
+          ))}
+          <p class="faq-more">
+            More questions answered in the <a href="/install">install guide</a> and on
+            <a href="/why">why Abject</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<style>
+  /* One section in three parts: the head, the Downloads block, the start. */
+  .get-head { padding-bottom: 0; }
+  .get-head :global(.section-head) { margin-bottom: 0; }
+
+  /* This section's head stands in for the Downloads block's own. */
+  .get :global(#downloads) { padding-top: 2.5rem; }
+  .get :global(#downloads .dl-meta) { margin-top: 0; }
+
+  .start-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    gap: 4rem;
+    align-items: start;
+  }
+
+  .start-title {
+    font-size: 1.5rem;
+    letter-spacing: 0.04em;
+    margin-bottom: 1.4rem;
+  }
+
+  /* The stepper, inked for paper (the global one is drawn for the void). */
+  .start-steps { grid-auto-flow: row; list-style: none; }
+  .start-steps > li { padding: 0 0 1.6rem 2.4rem; }
+  .start-steps > li::before { left: 0.45rem; right: auto; top: 0; bottom: 0; width: 2px; height: auto; background: rgba(22, 19, 15, 0.35); }
+  .start-steps > li::after { background: #16130f; }
+  .start-steps > li.key::after { background: var(--red); }
+  .start-steps > li:last-child::before { bottom: auto; height: 1rem; }
+
+  .start-steps .step-n { display: inline-block; font-size: 1.9rem; font-weight: 700; color: rgba(22, 19, 15, 0.4); margin-right: 0.6rem; }
+  .start-steps > li.key .step-n { color: var(--red); }
+
+  .step-time {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #5a5247;
+    vertical-align: 0.35rem;
+  }
+
+  .step-t { font-size: 1.15rem; margin: 0.2rem 0 0.3rem; }
+  .key .step-t { display: table; background: var(--red); color: var(--on-red); padding: 0.1rem 0.45rem; margin-left: -0.45rem; }
+  .step-b { font-size: 0.95rem; line-height: 1.55; }
+  .step-a { font-family: var(--font-mono); font-size: 0.8rem; }
+
+  /* The questions: ruled rows that open in place. */
+  .faq-item { border-top: 1.5px solid rgba(22, 19, 15, 0.28); }
+  .faq-item:last-of-type { border-bottom: 1.5px solid rgba(22, 19, 15, 0.28); }
+
+  .faq-item summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.95rem 0.2rem;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .faq-item summary::-webkit-details-marker { display: none; }
+  .faq-item summary:hover { background: rgba(22, 19, 15, 0.05); }
+  .faq-item summary:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+
+  .faq-q {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.08rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #16130f;
+  }
+
+  .faq-x { position: relative; flex: 0 0 18px; width: 18px; height: 18px; }
+  .faq-x::before, .faq-x::after { content: ''; position: absolute; left: 0; right: 0; top: 8px; height: 2px; background: var(--red); transition: transform 0.15s; }
+  .faq-x::after { transform: rotate(90deg); }
+  .faq-item[open] .faq-x::after { transform: rotate(0deg); }
+
+  .faq-item p { padding: 0 0.2rem 1.1rem; font-size: 0.95rem; line-height: 1.65; }
+
+  .faq-more { margin-top: 1.2rem; font-size: 0.92rem; }
+
+  @media (max-width: 900px) {
+    .start-grid { grid-template-columns: 1fr; gap: 3rem; }
+  }
+</style>

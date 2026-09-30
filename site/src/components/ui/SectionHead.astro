@@ -1,0 +1,35 @@
+---
+/**
+ * The standard section header: a numbered kicker, the display-face title
+ * with its red wedge rule, and an optional lede (default slot).
+ */
+interface Props {
+  /** Section number shown in red, e.g. '03'. */
+  num?: string;
+  /** Short label after the number, e.g. 'Sightings'. */
+  kicker?: string;
+  title: string;
+  /** Centre the header (for the few centred intros). */
+  center?: boolean;
+  /** Show the living-light mark in the kicker (for live things). */
+  live?: boolean;
+  /** Heading level (default h2). */
+  as?: 'h1' | 'h2' | 'h3';
+  id?: string;
+}
+
+const { num, kicker, title, center = false, live = false, as: Tag = 'h2', id } = Astro.props;
+const hasLede = Astro.slots.has('default');
+---
+
+<header class:list={['section-head', { center }]}>
+  {(num || kicker) && (
+    <p class="kicker">
+      {num && <span class="num">{num}</span>}
+      {live && <span class="live" aria-hidden="true"></span>}
+      {kicker && <span>{kicker}</span>}
+    </p>
+  )}
+  <Tag class="section-title" id={id}>{title}</Tag>
+  {hasLede && <div class="lede"><slot /></div>}
+</header>

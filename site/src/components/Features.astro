@@ -1,48 +1,60 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  /** Section number shown in the header (the page decides). */
+  num?: string;
+}
+
+const { num = '06' } = Astro.props;
+
 const features = [
   {
     icon: '{>}',
     abjects: 'ObjectCreator · Chat',
-    title: 'Speak it into existence.',
-    hook: '"A todo list that syncs my calendar." Type those words. A window appears.',
-    desc: 'You describe. The system interviews the objects that already exist, writes a new one, and gives it a window, a mailbox, and a voice. Not a chat answer that scrolls away: a real running object with source code you can open and read. It was born knowing its neighbors.',
+    title: 'Describe what you want.',
+    hook: '"A todo list that syncs my calendar." Type that and a window appears.',
+    desc: 'The system asks the objects that already exist what they can do, then writes a new object and gives it a window, a mailbox and its own ask handler. It is not a chat answer that scrolls away. It is a real running object with source code you can open and read, and it already knows how to talk to its neighbors.',
   },
   {
     icon: '{@}',
     abjects: 'IdentityObject · PeerRegistry',
-    title: 'Your address is a public key.',
-    hook: 'No accounts. No signup. No cloud asking for your email.',
-    desc: 'Your machine\'s true name is a cryptographic key it generated itself. Nobody issued it, so nobody can revoke it. Sharing with a friend is like handing them a key, not giving a landlord a copy: every message is sealed end to end, and the relay that introduces you never sees a byte of the conversation.',
+    title: 'Your machine makes its own identity.',
+    hook: 'There is no signup and no cloud asking for your email.',
+    desc: 'On first run your machine generates a cryptographic key, and that key is its address. Nobody issued it, so nobody can revoke it. When you share with a friend, every message is encrypted end to end. The server that introduces you never sees the conversation.',
   },
   {
     icon: '{=}',
     abjects: 'ScrumMaster · GoalManager · TupleSpace',
-    title: 'Post a goal. The team runs it in scrums.',
-    hook: 'A planner that re-plans every round, instead of praying the first plan survives.',
-    desc: 'Create a goal and the ScrumMaster convenes the team: it asks each agent what it can do, assigns the round\'s tasks, and reviews what actually happened when the round ends, failures included. Then it plans the next round, as many as the work needs. The goal syncs across your peers, so it survives the machine it started on.',
+    title: 'Give it a goal. A team works it in sprints.',
+    hook: 'The plan is rewritten every round instead of frozen at the start.',
+    desc: 'When you create a goal, the ScrumMaster asks each agent what it can do and assigns the round\'s tasks. When the round ends it reviews what actually happened, failures included, and plans the next round. It keeps going for as many rounds as the work needs. Goals sync across your peers, so a goal survives the machine it started on.',
   },
   {
     icon: '{!}',
     abjects: 'Negotiator · ProxyGenerator · HealthMonitor',
-    title: 'Break it. It tries to grow back.',
-    hook: 'Error rate crosses 10%. The LLM drafts a replacement from the crash data.',
-    desc: 'When a proxy starts failing, Abject collects the recent errors and asks the LLM to generate a smarter proxy with those failures as context. The hot-swap is invisible when it works; when it doesn\'t, you find out in the logs instead of in production. The replacement accounts for exactly the mistakes that killed its predecessor.',
+    title: 'Broken connections heal themselves.',
+    hook: 'When a connection fails more than 10% of the time, the LLM writes a replacement from the errors.',
+    desc: 'Objects that were not built for each other talk through a proxy. When a proxy starts failing, Abject collects the recent errors and asks the LLM to write a better proxy with those failures in front of it. Then it swaps the new one in. When that works you never notice. When it doesn\'t, you find out in the logs.',
   },
   {
     icon: '{~}',
     abjects: 'SkillRegistry',
-    title: 'Drop a SKILL.md. The agents already know.',
-    hook: 'Claude Code or OpenClaw format. Both work, both at once.',
-    desc: 'Skills are markdown files. No build, no install, no registry to register with. Drop one in the skills folder, rescan, and the next abject that needs that ability reads it. MCP servers you already configured for other tools are imported the same way, and a catalog browser finds more. The system grows by adoption, not by programming.',
+    title: 'Skills are just markdown files.',
+    hook: 'Claude Code and OpenClaw skills both work, at the same time.',
+    desc: 'Drop a SKILL.md into the skills folder and rescan. The next agent that needs that ability reads it. There is no build step and no registry to sign up for. MCP servers you already set up for other tools are imported the same way, and a catalog browser finds more.',
   },
   {
     icon: '{*}',
     abjects: 'KnowledgeBase',
-    title: 'What one abject learns, its workspace knows.',
-    hook: 'A full-text memory, replicated to every peer in a shared workspace.',
-    desc: 'Save a fact. Save a snippet. Save a lesson from a goal that went sideways. Every abject in the workspace can search it, ranked, and agents recall it into later work. Share the workspace and the memory replicates to every peer over the CRDT; keep it private and it never leaves. Workspaces are the privacy boundary, and memory respects it.',
+    title: 'It remembers what it learns.',
+    hook: 'Learning happens when things go wrong. The lessons go into a knowledge base.',
+    desc: 'Facts, snippets and lessons from goals that went sideways all go into a knowledge base with full-text search. Agents pull the relevant ones into their next task. Each workspace has its own knowledge. Keep a workspace private and its knowledge never leaves your machine. Share it and the knowledge syncs to every peer in it.',
   },
 ];
+
+// Mosaic tiles: one wide red tile, one wide paper tile, the rest outlined.
+const tiles = ['w2 solid-red', 'outline', 'outline', 'outline', 'w2 paper', 'outline'];
 
 const capabilities = [
   { icon: '{W}', name: 'Web Browsing', desc: 'Headless Playwright automation' },
@@ -50,206 +62,221 @@ const capabilities = [
   { icon: '{$}', name: 'Shell Execution', desc: 'Run commands on the host' },
   { icon: '{/}', name: 'Host Filesystem', desc: 'Read and write real files' },
   { icon: '{#}', name: 'Screenshots', desc: 'Capture canvas, widgets, pages' },
-  { icon: '{C}', name: 'Scheduled Tasks', desc: 'Cron-like per-workspace jobs' },
-  { icon: '{K}', name: 'Knowledge Base', desc: 'Ranked full-text memory, peer-synced' },
+  { icon: '{C}', name: 'Scheduled Tasks', desc: 'Cron-style jobs per workspace' },
+  { icon: '{K}', name: 'Knowledge Base', desc: 'Full-text memory, synced to peers' },
   { icon: '{.}', name: 'Portable Skills', desc: 'Claude Code & OpenClaw formats' },
   { icon: '{P}', name: 'File Transfer', desc: 'Peer-to-peer, encrypted' },
   { icon: '{M}', name: 'Media & Speech', desc: 'Audio, video, text to speech and back' },
-  { icon: '{&}', name: 'Shared State', desc: 'LWW-CRDT across peers' },
+  { icon: '{&}', name: 'Shared State', desc: 'Synced across peers (LWW-CRDT)' },
   { icon: '{!}', name: 'Permission Gates', desc: 'Prompts, allow lists, standing rules' },
   { icon: '{⚙}', name: 'Other Languages', desc: 'C++ abjects as sandboxed WASM' },
 ];
 ---
 
-<section id="features">
+<section id="features" class="features-section">
   <div class="container">
-    <h2 class="section-title">The Standard Bestiary</h2>
-    <p class="features-intro">
-      Every one of these is an abject: a running object you can message, kill, restart, fork, or ask what it just did.
-    </p>
-    <div class="feature-grid">
-      {features.map((f) => (
-        <div class="card feature-card">
-          <div class="card-header">
-            <span class="card-icon">{f.icon}</span>
-            <span class="card-abjects">{f.abjects}</span>
-          </div>
+    <SectionHead num={num} kicker="Capabilities" title="Everything Is an Abject">
+      <p>
+        Everything in the system is an abject, and I do mean everything. Each one below is a
+        running object. You can message it, stop it, restart it, fork it, or ask it what it just did.
+      </p>
+    </SectionHead>
+
+    <div class="mosaic bestiary">
+      {features.map((f, i) => (
+        <article class:list={['tile', tiles[i]]}>
+          <p class="tile-tags">
+            {f.abjects.split(' · ').map((a) => <span class="tile-tag">{a}</span>)}
+          </p>
           <h3>{f.title}</h3>
           <p class="hook">{f.hook}</p>
-          <p>{f.desc}</p>
-        </div>
+          <p class="desc">{f.desc}</p>
+          <span class="tile-glyph" aria-hidden="true">{f.icon}</span>
+        </article>
       ))}
     </div>
 
     <div id="capabilities" class="cap-block">
-      <h3 class="cap-heading">What the Abjects Can Touch</h3>
-      <p class="cap-intro">
-        Every capability is an abject. Every abject can ask any other what it does.
-        The system's reach grows by spawning new abjects, not by adding framework plugins.
-      </p>
-      <div class="cap-grid">
-        {capabilities.map((c) => (
-          <div class="cap-pill">
-            <span class="cap-icon">{c.icon}</span>
-            <div class="cap-text">
-              <span class="cap-name">{c.name}</span>
-              <span class="cap-desc">{c.desc}</span>
-            </div>
-          </div>
-        ))}
+      <div class="cap-head">
+        <p class="cap-kicker"><span class="cap-square" aria-hidden="true">&#9632;</span> Built in</p>
+        <h3 class="cap-heading">What Abjects Can Use</h3>
+        <p class="cap-intro">
+          Every capability is an abject too, so any abject can ask it what it does. To give the
+          system a new ability you add a new abject, not a plugin.
+        </p>
       </div>
+      <ul class="ledger cap-ledger">
+        {capabilities.map((c) => (
+          <li>
+            <span class="ix">{c.icon}</span>
+            <span class="t">{c.name}</span>
+            <span class="n">{c.desc}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   </div>
 </section>
 
 <style>
-  .features-intro {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 1rem;
-    max-width: 640px;
-    margin: -1.5rem auto 2.5rem;
-    line-height: 1.7;
-  }
-
-  .feature-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
+  /* ── The bestiary: a mosaic of six tiles ── */
+  .bestiary {
+    grid-auto-flow: dense;
     gap: 1.25rem;
   }
 
-  @media (max-width: 900px) {
-    .feature-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-
-  @media (max-width: 520px) {
-    .feature-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .card-header {
+  .tile {
+    position: relative;
     display: flex;
-    align-items: center;
-    gap: 0.7rem;
-    margin-bottom: 0.75rem;
+    flex-direction: column;
+    padding: 1.6rem 1.5rem 1rem;
+    overflow: hidden;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+
+  .tile:hover { transform: translate(-2px, -2px); box-shadow: var(--print); }
+  .tile.solid-red:hover { box-shadow: 6px 6px 0 var(--red-deep); }
+
+  .tile-tags {
+    display: flex;
     flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 1.1rem;
+    position: relative;
+    z-index: 1;
   }
 
-  .card-icon {
-    display: inline-block;
+  .tile-tag {
     font-family: var(--font-mono);
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: var(--eldritch);
-    background: var(--eldritch-glow);
-    border: 1px solid var(--border-accent);
-    padding: 0.4rem 0.6rem;
-    border-radius: 6px;
+    font-size: 0.68rem;
+    letter-spacing: 0.02em;
+    padding: 0.1rem 0.45rem;
+    border: 1px solid var(--rule-mid);
+    color: var(--bone-3);
   }
 
-  .card-abjects {
+  .tile h3 {
+    position: relative;
+    z-index: 1;
+    font-size: 1.35rem;
+    line-height: 1.1;
+    margin-bottom: 0.85rem;
+  }
+
+  .tile.w2 h3 { font-size: clamp(1.7rem, 2.8vw, 2.4rem); line-height: 1.02; max-width: 16ch; }
+
+  .tile .hook {
+    position: relative;
+    z-index: 1;
+    font-style: italic;
+    color: var(--bone);
+    font-size: 0.97rem;
+    line-height: 1.5;
+    margin-bottom: 0.8rem;
+  }
+
+  .tile .desc {
+    position: relative;
+    z-index: 1;
+    color: var(--bone-3);
+    font-size: 0.93rem;
+    line-height: 1.62;
+  }
+
+  .tile.w2 .hook { font-size: 1.1rem; max-width: 46ch; }
+  .tile.w2 .desc { max-width: 58ch; }
+
+  /* A big mono glyph printed into the corner of each tile. */
+  .tile-glyph {
+    margin-top: auto;
+    padding-top: 0.9rem;
+    align-self: flex-end;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 2.6rem;
+    line-height: 1;
+    color: var(--bone-faint);
+    opacity: 0.55;
+    pointer-events: none;
+  }
+
+  .tile.outline h3 { color: var(--bone-heading); }
+
+  /* The red tile. */
+  .tile.solid-red .tile-tag { border-color: rgba(246, 239, 219, 0.6); color: var(--on-red); }
+  .tile.solid-red .hook { color: var(--on-red); }
+  .tile.solid-red .desc { color: rgba(246, 239, 219, 0.88); }
+  .tile.solid-red h3 { font-size: clamp(2.2rem, 4.4vw, 3.8rem); line-height: 0.95; margin-bottom: 1.2rem; }
+  .tile.solid-red .tile-glyph { color: var(--on-red); opacity: 0.35; font-size: 6.5rem; }
+
+  /* The paper tile: ink on the agitprop ground. */
+  .tile.paper .tile-tag { border-color: rgba(22, 19, 15, 0.35); color: #3f392f; }
+  .tile.paper .hook { color: #16130f; border-left: 3px solid var(--red); padding-left: 0.7rem; }
+  .tile.paper .desc { color: #3f392f; }
+  .tile.paper .tile-glyph { color: var(--red); opacity: 0.8; font-size: 5rem; }
+
+  /* ── What the abjects can touch: a two-column ledger ── */
+  .cap-block {
+    margin-top: 5.5rem;
+    scroll-margin-top: 90px;
+  }
+
+  .cap-head {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 1rem 3rem;
+    align-items: end;
+    margin-bottom: 1.75rem;
+  }
+
+  .cap-kicker {
+    grid-column: 1 / -1;
     font-family: var(--font-mono);
     font-size: 0.78rem;
-    font-weight: 500;
-    color: var(--text-dim);
-    letter-spacing: 0.01em;
-    line-height: 1.4;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
   }
 
-  .feature-card .hook {
-    color: var(--void-purple);
-    font-style: italic;
-    font-size: 0.9rem;
-    margin-bottom: 0.5rem;
-    line-height: 1.5;
-  }
-
-  .cap-block {
-    margin-top: 4rem;
-    scroll-margin-top: 80px;
-  }
+  .cap-square { color: var(--red); margin-right: 0.35rem; }
 
   .cap-heading {
-    text-align: center;
-    font-size: 1.5rem;
-    color: var(--text-primary);
-    margin-bottom: 0.75rem;
+    font-size: clamp(1.5rem, 2.8vw, 2.2rem);
+    line-height: 1.05;
   }
 
   .cap-intro {
-    text-align: center;
-    color: var(--text-secondary);
+    color: var(--bone-2);
     font-size: 1rem;
-    max-width: 640px;
-    margin: 0 auto 2rem;
-    line-height: 1.6;
+    line-height: 1.65;
   }
 
-  .cap-grid {
+  .cap-ledger {
+    list-style: none;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 0.75rem;
-    max-width: 900px;
-    margin: 0 auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(7, auto);
+    grid-auto-flow: column;
+    column-gap: 3rem;
   }
 
-  .cap-pill {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.7rem 0.9rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    transition: border-color 0.2s, box-shadow 0.2s;
+  .cap-ledger > li {
+    grid-template-columns: 3.5rem minmax(0, 0.9fr) minmax(0, 1.2fr);
+    padding: 0.8rem 0;
   }
 
-  .cap-pill:hover {
-    border-color: var(--border-accent);
-    box-shadow: 0 0 12px var(--eldritch-glow);
+  .cap-ledger .ix { color: var(--brass); font-weight: 700; }
+  .cap-ledger .t { font-size: 1rem; }
+  .cap-ledger .n { font-family: var(--font-mono); font-size: 0.76rem; color: var(--bone-meta); }
+
+  @media (max-width: 900px) {
+    .cap-head { grid-template-columns: 1fr; }
+    .cap-ledger { grid-template-columns: 1fr; grid-template-rows: none; grid-auto-flow: row; }
   }
 
-  .cap-icon {
-    font-family: var(--font-mono);
-    font-size: 0.85rem;
-    font-weight: 700;
-    color: var(--eldritch);
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .cap-text {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-
-  .cap-name {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    line-height: 1.3;
-  }
-
-  .cap-desc {
-    font-size: 0.7rem;
-    color: var(--text-dim);
-    line-height: 1.3;
-  }
-
-  @media (max-width: 768px) {
-    .cap-grid {
-      grid-template-columns: repeat(3, 1fr);
-    }
-  }
-
-  @media (max-width: 520px) {
-    .cap-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
+  @media (max-width: 640px) {
+    .tile { padding: 1.3rem 1.2rem 0.9rem; }
+    .tile-glyph, .tile.solid-red .tile-glyph, .tile.paper .tile-glyph { font-size: 2.4rem; }
+    .cap-ledger > li { grid-template-columns: 3rem minmax(0, 1fr); row-gap: 0.15rem; }
   }
 </style>

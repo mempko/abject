@@ -1,4 +1,16 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  num?: string;
+  /** Just the stat and the ledger, no section or header (for a page that
+      already introduces the providers, like /install's "Pick a mind"). */
+  bare?: boolean;
+}
+
+const { num = '07', bare = false } = Astro.props;
+const Wrap = bare ? 'div' : 'section';
+
 const providers = [
   { name: 'Ollama', note: 'local, free, private', tag: 'local' },
   { name: 'PeerLLM', note: 'a peer serves models to you', tag: 'mesh' },
@@ -15,101 +27,207 @@ const providers = [
   { name: 'MiniMax', note: 'API key' },
   { name: 'Meta', note: 'API key' },
 ];
+
+const tiers = ['smart', 'balanced', 'fast', 'code'];
 ---
 
-<section id="providers" class="providers-section">
-  <div class="container">
-    <h2 class="section-title">Runs on Your Terms</h2>
-    <p class="providers-intro">
-      Abject needs a mind to borrow and is flexible about whose. Bring an API key, run a
-      free local model, reuse a coding subscription you already pay for, or let a friend's
-      machine serve you models over the mesh. Route cheap jobs to cheap models and the hard
-      ones to the smart one; the four tiers (smart, balanced, fast, code) are yours to point
-      anywhere.
-    </p>
-    <ul class="providers-grid">
-      {providers.map((p) => (
-        <li class={`provider ${p.tag ? `provider-${p.tag}` : ''}`}>
-          <span class="provider-name">{p.name}</span>
-          <span class="provider-note">{p.note}</span>
-        </li>
-      ))}
-    </ul>
-    <p class="providers-foot">
-      Fourteen providers, one settings tab. Switch any time; the abjects never notice.
-    </p>
+<Wrap id={bare ? undefined : 'providers'} class:list={[bare ? 'providers-bare' : 'providers-section']}>
+  <div class:list={[{ container: !bare }]}>
+    <div class:list={['minds', { 'minds-bare': bare }]}>
+      {!bare && (
+        <div class="minds-head">
+          <SectionHead num={num} kicker="Models" title="Use Any Model">
+            <p>
+              Abject needs an LLM to think with, and you choose which one. Bring an API key, run a
+              free local model, reuse a coding subscription you already pay for, or let a friend's
+              machine serve you models over the mesh. There are four tiers (smart, balanced, fast
+              and code), and you point each one at whatever model you want. Send the cheap jobs to
+              a cheap model and the hard ones to the smart one.
+            </p>
+          </SectionHead>
+
+          <ol class="tier-strip" aria-label="Model tiers">
+            {tiers.map((t, i) => (
+              <li><span class="tier-i">{String(i + 1).padStart(2, '0')}</span>{t}</li>
+            ))}
+          </ol>
+
+          <div class="stat minds-stat">
+            <span class="big" aria-hidden="true">14</span>
+            <p class="providers-foot">
+              Fourteen providers in one settings tab. You can switch any time and the abjects won't notice.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {bare && (
+        <div class="stat minds-stat bare-stat">
+          <span class="big" aria-hidden="true">14</span>
+          <p class="providers-foot">
+            Fourteen providers in one settings tab. You can switch any time and the abjects won't notice.
+          </p>
+        </div>
+      )}
+
+      <ol class="ledger providers-ledger" aria-label="Supported model providers">
+        {providers.map((p, i) => (
+          <li class:list={['provider', p.tag && `provider-${p.tag}`]}>
+            <span class="ix">{String(i + 1).padStart(2, '0')}</span>
+            <span class="t provider-name">
+              {p.tag === 'mesh' && <span class="provider-live" aria-hidden="true"></span>}
+              {p.name}
+            </span>
+            <span class="n provider-note">
+              {p.note}
+              {p.tag && <span class="provider-tag">{p.tag}</span>}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </div>
   </div>
-</section>
+</Wrap>
 
 <style>
-  .providers-intro {
-    text-align: center;
-    max-width: 700px;
-    margin: -1.5rem auto 2.5rem;
-    color: var(--text-secondary);
-    font-size: 1.02rem;
-    line-height: 1.75;
+  .minds {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 3.5rem;
+    align-items: start;
   }
 
-  .providers-grid {
+  .minds-head :global(.section-head) { margin-bottom: 2rem; }
+
+  .tier-strip {
     list-style: none;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: 0.75rem;
-    max-width: 1000px;
-    margin: 0 auto;
+    grid-template-columns: repeat(4, auto);
+    border-top: var(--rule-w) solid var(--rule-mid);
+    border-left: var(--rule-w) solid var(--rule-mid);
+    width: fit-content;
+    max-width: 100%;
   }
 
-  .provider {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    padding: 0.8rem 1rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    transition: border-color 0.2s, box-shadow 0.2s;
+  .tier-strip li {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.9rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--bone);
+    padding: 0.45rem 0.85rem;
+    border-right: var(--rule-w) solid var(--rule-mid);
+    border-bottom: var(--rule-w) solid var(--rule-mid);
   }
 
-  .provider:hover {
-    border-color: var(--border-accent);
-    box-shadow: 0 0 16px var(--eldritch-glow);
+  .tier-i {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 400;
+    color: var(--red);
+    margin-right: 0.45rem;
+    letter-spacing: 0.04em;
   }
 
-  .provider-local {
-    border-color: rgba(91, 229, 160, 0.45);
+  .minds-stat { margin-top: 2.75rem; }
+
+  /* The bare list: the stat sits on top of the ledger, in one column. */
+  .minds.minds-bare { display: block; }
+  .bare-stat { margin: 0 0 1.25rem; flex-direction: row; align-items: flex-end; gap: 1.25rem; }
+  .bare-stat .big { font-size: clamp(4.5rem, 8vw, 6.5rem); }
+  .bare-stat .providers-foot { border-top: none; padding-top: 0; margin: 0 0 0.4rem; }
+  .minds-bare .providers-ledger > li { grid-template-columns: 2.6rem minmax(0, 1fr) minmax(0, 1.3fr); padding: 0.62rem 0.6rem; }
+
+  .minds-stat .big { font-size: clamp(6rem, 13vw, 11rem); }
+
+  .providers-foot {
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
+    border-top: var(--rule-w) solid var(--rule-mid);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--bone-3);
+    max-width: 34ch;
   }
 
-  .provider-mesh {
-    border-color: rgba(139, 123, 255, 0.45);
+  /* The ledger: fourteen ruled rows, index, name, note. */
+  .providers-ledger { list-style: none; margin-top: 0.4rem; }
+
+  .providers-ledger > li {
+    grid-template-columns: 3rem minmax(0, 1fr) minmax(0, 1.25fr);
+    padding: 0.78rem 0.7rem;
+    transition: background-color 0.15s;
   }
+
+  .providers-ledger > li:hover { background: var(--panel); }
 
   .provider-name {
-    font-family: var(--font-mono);
-    font-size: 0.88rem;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .provider-local .provider-name {
-    color: var(--eldritch);
-  }
-
-  .provider-mesh .provider-name {
-    color: var(--void-purple);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
   }
 
   .provider-note {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    font-family: var(--font-mono);
     font-size: 0.78rem;
-    color: var(--text-dim);
+    color: var(--bone-meta);
   }
 
-  .providers-foot {
-    text-align: center;
-    margin-top: 1.75rem;
+  .provider-tag {
+    flex: 0 0 auto;
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--text-dim);
-    font-style: italic;
+    font-size: 0.64rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 0.04rem 0.45rem;
+    border: 1px solid var(--rule-mid);
+    color: var(--bone-3);
+  }
+
+  .provider-cli .provider-tag { border-color: rgba(201, 164, 92, 0.6); color: var(--brass); }
+
+  .provider-mesh .provider-tag { border-color: rgba(91, 229, 160, 0.5); color: var(--living); }
+
+  .provider-live {
+    width: 7px;
+    height: 7px;
+    background: var(--living);
+    box-shadow: 0 0 8px var(--living-glow);
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+
+  /* The local mind is the one to try first: it wears the red. */
+  .providers-ledger > .provider-local {
+    background: var(--red);
+    border-bottom-color: var(--red);
+    box-shadow: var(--print-sm);
+    position: relative;
+    z-index: 1;
+  }
+
+  .providers-ledger > .provider-local:hover { background: var(--red-hot); }
+  .provider-local .ix { color: var(--on-red); }
+  .provider-local .provider-name { color: var(--on-red); }
+  .provider-local .provider-note { color: rgba(246, 239, 219, 0.88); }
+  .provider-local .provider-tag { border-color: rgba(246, 239, 219, 0.7); color: var(--on-red); }
+
+  @media (max-width: 1000px) {
+    .minds { grid-template-columns: 1fr; gap: 2.5rem; }
+    .minds-stat { display: flex; flex-direction: row; align-items: flex-end; gap: 1.5rem; }
+    .minds-stat .big { font-size: 6rem; }
+    .providers-foot { border-top: none; padding-top: 0; }
+  }
+
+  @media (max-width: 640px) {
+    .tier-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+    .minds-stat { flex-direction: column; align-items: flex-start; gap: 0.3rem; }
+    .providers-ledger > li,
+    .minds-bare .providers-ledger > li { grid-template-columns: 2.4rem minmax(0, 1fr); row-gap: 0.1rem; }
+    .provider-note { grid-column: 2; }
   }
 </style>

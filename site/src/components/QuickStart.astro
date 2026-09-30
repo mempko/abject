@@ -1,20 +1,28 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+interface Props {
+  num?: string;
+}
+
+const { num = '14' } = Astro.props;
 ---
 
-<section id="summon">
+<section id="summon" class="summon-section">
   <div class="container">
-    <h2 class="section-title">Summon the System</h2>
-    <p class="qs-subtitle">
-      The from-source ritual, for developers. If you just want to <em>use</em> Abject,
-      the download above is everything you need; it arrives pre-summoned.
-    </p>
+    <SectionHead num={num} kicker="For developers" title="Build It From Source">
+      <p>
+        This is for developers who want to hack on it. If you just want to <em>use</em> Abject,
+        the download is all you need.
+      </p>
+    </SectionHead>
+
     <div class="qs-grid">
-      <div class="qs-code">
-        <div class="code-header">
-          <span class="code-dot dot-green"></span>
-          <span class="code-dot dot-purple"></span>
-          <span class="code-dot dot-red"></span>
-          <span class="code-title">terminal</span>
+      <div class="win focus qs-code">
+        <div class="win-bar">
+          <span class="sigil" aria-hidden="true"></span>
+          <span class="title">terminal</span>
+          <span class="btns" aria-hidden="true">? &minus; &#9633; &times;</span>
         </div>
         <pre><code><span class="c"># Clone the repository</span>
 <span class="cmd">git clone</span> https://github.com/mempko/abject
@@ -36,121 +44,103 @@
 <span class="c"># Chat from the terminal (optional)</span>
 <span class="cmd">pnpm commune</span>         <span class="c"># tabbed TUI on :7723</span></code></pre>
       </div>
+
       <div class="qs-info">
-        <h3>Three processes. One living system.</h3>
-        <p>
-          The <strong>backend</strong> is the depths: all Abjects live here. Registry, Factory,
-          LLM, Negotiator, Supervisor, and your own Abjects: an actor system passing messages
-          in a Node.js process with worker threads.
-        </p>
-        <p>
-          The <strong>browser client</strong> is the surface: a thin Canvas renderer that
-          forwards input events and displays composited frames over WebSocket.
-          It sees only what the depths allow.
-        </p>
-        <p>
-          The <strong>signaling server</strong> enables peer discovery: how instances
-          find each other for encrypted WebRTC connections.
-        </p>
+        <h3>It runs as three processes.</h3>
+        <ol class="qs-procs">
+          <li>
+            <span class="qs-i" aria-hidden="true">01</span>
+            <p>
+              The <strong>backend</strong> is where all the abjects live: the Registry, Factory,
+              LLM, Negotiator, Supervisor and your own abjects. It's a Node.js process with worker
+              threads, full of objects passing messages.
+            </p>
+          </li>
+          <li>
+            <span class="qs-i" aria-hidden="true">02</span>
+            <p>
+              The <strong>browser client</strong> draws the desktop. It's a thin canvas renderer
+              that sends your input to the backend and shows the frames it gets back over a
+              WebSocket.
+            </p>
+          </li>
+          <li>
+            <span class="qs-i" aria-hidden="true">03</span>
+            <p>
+              The <strong>signaling server</strong> introduces peers to each other so they can open
+              encrypted WebRTC connections.
+            </p>
+          </li>
+        </ol>
       </div>
     </div>
   </div>
 </section>
 
 <style>
-  .qs-subtitle {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 1rem;
-    max-width: 640px;
-    margin: -1.5rem auto 2.5rem;
-    line-height: 1.7;
-  }
-
-  .qs-subtitle em {
-    color: var(--eldritch);
-  }
+  .summon-section :global(.lede em) { color: var(--bone-heading); font-style: italic; }
 
   .qs-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 2rem;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 3rem;
     align-items: start;
   }
 
-  .qs-code {
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 0 30px var(--eldritch-glow);
-  }
-
-  .code-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0.75rem 1rem;
-    background: var(--bg-card);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .code-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-  }
-
-  .dot-green { background: var(--eldritch); }
-  .dot-purple { background: var(--void-purple); }
-  .dot-red { background: var(--ichor); }
-
-  .code-title {
-    margin-left: 0.5rem;
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--text-dim);
-  }
-
   .qs-code pre {
-    border: none;
-    border-radius: 0;
     margin: 0;
-    padding: 1.25rem 1.5rem;
+    border: none;
+    border-left: 4px solid var(--red);
+    background: var(--sunken);
+    padding: 1.3rem 1.5rem 1.4rem;
+    font-size: 0.86rem;
+    line-height: 1.7;
   }
 
-  .qs-code code .c {
-    color: var(--text-dim);
-  }
+  .qs-code code .c { color: var(--bone-meta); }
 
-  .qs-code code .cmd {
-    color: var(--eldritch);
-    font-weight: 600;
-  }
-
-  .qs-info {
-    padding-top: 0.5rem;
-  }
+  .qs-code code .cmd { color: var(--red-hot); font-weight: 700; }
 
   .qs-info h3 {
-    color: var(--text-primary);
-    margin-bottom: 1.25rem;
+    font-size: clamp(1.4rem, 2.4vw, 1.9rem);
+    line-height: 1.1;
+    margin-bottom: 1.5rem;
   }
 
-  .qs-info p {
-    color: var(--text-secondary);
-    margin-bottom: 1rem;
-    font-size: 0.95rem;
+  .qs-procs {
+    list-style: none;
+    border-top: var(--rule-w) solid var(--rule-mid);
   }
 
-  .qs-info strong {
-    color: var(--eldritch);
+  .qs-procs li {
+    display: grid;
+    grid-template-columns: 2.6rem 1fr;
+    padding: 1rem 0;
+    border-bottom: var(--rule-w) solid var(--rule);
+  }
+
+  .qs-i {
+    font-family: var(--font-display);
     font-weight: 600;
+    font-size: 1rem;
+    letter-spacing: 0.06em;
+    color: var(--red);
+    line-height: 1.6;
   }
 
-  @media (max-width: 768px) {
-    .qs-grid {
-      grid-template-columns: 1fr;
-    }
+  .qs-procs p {
+    color: var(--bone-2);
+    font-size: 0.97rem;
+    line-height: 1.65;
+  }
+
+  .qs-procs strong { color: var(--bone-heading); }
+
+  @media (max-width: 900px) {
+    .qs-grid { grid-template-columns: 1fr; gap: 2.5rem; }
+  }
+
+  @media (max-width: 520px) {
+    .qs-code pre { padding: 1.1rem 1rem 1.2rem; font-size: 0.8rem; }
   }
 </style>

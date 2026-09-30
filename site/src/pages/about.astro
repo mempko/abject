@@ -2,243 +2,422 @@
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import SectionHead from '../components/ui/SectionHead.astro';
 ---
 
 <Layout
   title="About - Abject"
-  description="Abject is an open-source, peer-to-peer desktop platform for local-first AI objects. Built by mempko, successor to Fire★. GPL-3.0. No company, no investors, no surveillance."
+  description="About Abject and why I built it: an open-source, peer-to-peer desktop platform for AI objects that live on your own machine. Built by Maxim Khailo (mempko), the spiritual successor to Fire★. GPL-3.0, with no company, no investors, and no tracking."
 >
   <Header />
   <main class="about">
-    <div class="about-container">
+    <div class="container">
 
-      <header class="about-hero">
-        <p class="about-eyebrow">// ABOUT</p>
-        <h1>The Grass Still Grows. Now It Thinks.</h1>
-        <p class="about-thesis">
-          Abject is an open-source desktop platform for AI objects that live on your own machine,
-          find each other over peer-to-peer connections, and explain themselves in plain English.
-          It is licensed under GPL-3.0. It is not a company. It is not selling you a subscription.
-          It is a thing that exists because it should.
-        </p>
+      <header class="hero">
+        <div class="hero-text">
+          <p class="kicker"><span class="sigil" aria-hidden="true"></span><span>About</span></p>
+          <h1 class="hero-title">I May Have Created Something Horrible</h1>
+          <span class="hero-bar" aria-hidden="true"></span>
+          <p class="lede">
+            Abject is an open-source desktop platform for AI objects that live on your own machine,
+            find each other over peer-to-peer connections, and explain themselves in plain English.
+            We call them Abjects. As in AI Object. As in abject horror. The name fits. It's licensed
+            under GPL-3.0, it isn't a company, and it isn't selling you a subscription.
+          </p>
+        </div>
+
+        <div class="hero-mark" aria-hidden="true">
+          <svg viewBox="0 0 360 360" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <filter id="about-pupil-glow" x="-100%" y="-40%" width="300%" height="180%">
+                <feGaussianBlur stdDeviation="6" result="b"/>
+                <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+            </defs>
+            <!-- structure: rings and a slanted rule -->
+            <circle cx="180" cy="180" r="168" fill="none" stroke="rgba(231,225,206,0.14)" stroke-width="1.5"/>
+            <circle cx="180" cy="180" r="138" fill="none" stroke="rgba(231,225,206,0.28)" stroke-width="1.5" stroke-dasharray="2 7"/>
+            <line x1="12" y1="300" x2="348" y2="228" stroke="rgba(231,225,206,0.28)" stroke-width="1.5"/>
+            <!-- the red wedge crossing the eye -->
+            <polygon points="0,236 360,122 360,168 0,282" fill="#d32f22" opacity="0.9"/>
+            <!-- the eye -->
+            <circle cx="180" cy="180" r="92" fill="#06070a" stroke="#d32f22" stroke-width="14"/>
+            <ellipse class="pupil" cx="180" cy="180" rx="15" ry="58" fill="#5be5a0" filter="url(#about-pupil-glow)"/>
+            <!-- small marks -->
+            <rect x="300" y="36" width="18" height="18" fill="#d32f22"/>
+            <rect x="326" y="36" width="18" height="18" fill="none" stroke="#8d8778" stroke-width="1.5"/>
+            <polygon points="24,48 44,58 24,68" fill="#c9a45c"/>
+          </svg>
+        </div>
       </header>
 
-      <section class="about-section">
-        <h2>Why This Exists</h2>
-        <p>
-          Most people never use a computer to compute. They read, they watch, they scroll:
-          consumption, inside sealed apps somebody else wrote. That is not a law of nature;
-          it is an information monopoly. Software stayed hard to make, so making it stayed
-          a profession. LLMs just cracked that open. For the first time, anyone who can say
-          what they want can have software that is personal, connected, and theirs. Abject
-          exists so that happens on your machine, under your control, with nobody collecting rent.
-        </p>
-        <p>
-          Every popular AI agent framework today puts a single planner on top and tools beneath.
-          That works for short demos and breaks on the things you actually want it to do for weeks
-          at a time. Hierarchies snap; meshes route around damage. The internet has known this
-          for fifty years.
-        </p>
-        <p>
-          There is also a longer bet here. Sixty years of software has been pyramid building:
-          applications on frameworks on libraries on operating systems, each layer taxed by the
-          one below, complexity growing until the parts no longer fit in a context window. Most
-          of the industry is using LLMs to stack the pyramid faster. Abject uses them to start
-          from a smaller foundation instead: message-passing objects, with the LLM handling the
-          ambiguity that rigid interfaces never could.
-        </p>
-        <p>
-          So Abject takes the pattern that already runs the world (TCP/IP, Smalltalk's objects,
-          Erlang's actors, the cells in your body) and adds one small primitive: every object can
-          explain itself to any other object in plain English. The LLM is just a service one
-          object asks when it needs to think. The architecture is older than the LLM.
-        </p>
-        <p>
-          The result is a system you own. Your machine runs your agents. Your tokens come from
-          your account, or from a local model that costs nothing. Your goals live on your peers,
-          not on someone else's server. Anthropic can change its pricing at midnight and your
-          abjects will not notice.
-        </p>
+      <section class="sec">
+        <span class="sec-big" aria-hidden="true">01</span>
+        <SectionHead num="01" title="Why I Built This" />
+        <div class="prose">
+          <p>
+            Most people don't use computers to compute. They use them like an old media: they read
+            text and look at images and videos. We've built a lot of closed systems with app stores
+            so that people consume instead of create. That's possible because we engineers created
+            information monopolies. People download an app because they don't have the knowledge to
+            create their own. I don't think that's great for humanity. Now that LLMs can program
+            competently in the small, regular people can create their own software that they control.
+            Abject is an Abject-Oriented OS for people to be able to create software that's connected
+            and personal to them, on their own machine.
+          </p>
+          <p>
+            I also think AI agents are the wrong abstraction. They don't scale. Agent frameworks are
+            hierarchical, with a single planner on top and tools beneath, and I'm deeply against
+            hierarchies of any form. They work for short demos and break on the things you actually
+            want done over weeks. The internet has no top, and it has kept running for more than fifty
+            years.
+          </p>
+          <p>
+            There is also a longer bet here. Software development over the last 60 years has been
+            the equivalent of pyramid building: applications on frameworks on libraries on operating
+            systems. Software grows until its parts no longer fit in an LLM's context window. I call
+            this the Window Tax. Most of the industry is using LLMs to stack the pyramid faster. I would
+            rather abandon the pyramid and start from a smaller foundation: objects sending messages,
+            with the LLM handling the ambiguity that rigid interfaces never could.
+          </p>
+          <p>
+            Objects talking to objects is what works. We have proof. It runs the world. The internet
+            works this way, and so do the cells in your body. Smalltalk and Erlang were built on the
+            same idea. Abject takes that pattern and adds one thing.
+            Every object has a message handler called ask, so it can explain itself to any other
+            object in plain English. The LLM is just a service an object asks when it needs to think.
+            The architecture is older than the LLM.
+          </p>
+          <p>
+            The result is a system you own. Your machine runs your agents. Your tokens come from your
+            own account, or from a local model that costs nothing. Your goals live on your peers, not on
+            someone else's server. If a provider changes its prices overnight, you point your abjects at
+            a different model and keep going.
+          </p>
+        </div>
       </section>
 
-      <section class="about-section">
-        <h2>Who Built It</h2>
-        <p>
-          Abject is built by <strong>Maxim Khailo</strong> (<a href="https://github.com/mempko" target="_blank" rel="noopener">mempko</a> on GitHub),
-          a software engineer who has spent years building open-source distributed systems.
-        </p>
-        <p>
-          The motivation predates the project. Max came to the United States in the late 80s
-          as a refugee from the Donbas, in the former Soviet Union. The first computer was a
-          hand-me-down from a friend of his father's; the programming education was standing in
-          bookstores memorizing tech books there was no money to buy. Somewhere in there he found
-          Engelbart and Kay and the idea that a computer is a rocketship for the mind.
-          Abject is that idea, paid forward.
-        </p>
-        <p>
-          Before Abject came <a href="https://firestr.com" target="_blank" rel="noopener">Fire★</a>,
-          a peer-to-peer platform for creating and sharing distributed applications, written in C++ and Lua,
-          released under the GNU GPL. Fire★ called what it did <em>Grass Computing</em>:
-          software you can touch, shape, and share directly. No cloud. No landlords. It proved
-          the vision works. It also proved that the vision needs an LLM to negotiate between objects
-          built by people who never met. That gap is what Abject closes.
-        </p>
+      <section class="sec">
+        <span class="sec-big" aria-hidden="true">02</span>
+        <SectionHead num="02" title="Who I Am" />
+        <div class="prose">
+          <p>
+            I'm <strong>Maxim Khailo</strong> (<a href="https://github.com/mempko" target="_blank" rel="noopener">mempko</a> on GitHub).
+            I've been programming for 30 years, and I have always loved object-oriented systems like
+            Smalltalk and Erlang.
+          </p>
+          <p>
+            I came to the USA in the late 80s as a refugee from the former Soviet Union, from an area
+            called Donbas. When I was in middle school my father got an old computer from a friend, and
+            my love affair with technology and programming started. We were poor, so I learned
+            programming by going to bookstores, reading the latest tech books, and trying to memorize
+            them. Then I would go home and program. I read the ideas of Doug Engelbart and Alan Kay and
+            fell in love with the idea that a computer can be a rocketship for the mind. But programming
+            isn't easy, and most people don't know how to do it.
+          </p>
+          <p class="lineage">
+            In 2014 I released <a href="https://firestr.com" target="_blank" rel="noopener">Fire★</a>,
+            the <em>Grass Computing</em> Platform. It let people build peer-to-peer apps with a built-in
+            collaborative editor, and it was written in C++ and Lua and released under the GNU GPL. You'd
+            create conversations and launch apps, and people could copy them and hack on them together,
+            with no cloud in the middle. But people still needed to learn programming to use it to its
+            fullest, and objects built by people who never met had no way to work out how to talk to each
+            other. Abject is its spiritual successor.</p>
+          <p class="whatif">
+            What if objects could explain themselves? What if you didn't need to understand APIs to
+            make software components work together? What if you didn't even need to know programming to
+            use computers to their fullest? That's what the Abject project is about.
+          </p>
+        </div>
       </section>
 
-      <section class="about-section">
-        <h2>The Ideas, Longform</h2>
-        <p>
-          The condensed argument lives on <a href="/theory">the theory page</a>. These are the
-          essays it was distilled from.
-        </p>
-        <ul class="about-list">
-          <li><strong><a href="https://blog.mempko.com/a-love-letter-to-object-orientation/" target="_blank" rel="noopener">A Love Letter to Object Orientation</a>.</strong> Kay's big idea was messaging, not classes. Compression instead of abstraction, theory over artifact, and why the objects are the expendable part.</li>
-          <li><strong><a href="https://blog.mempko.com/an-abject-horror/" target="_blank" rel="noopener">An Abject Horror</a>.</strong> The announcement: why agents are the wrong abstraction, and what a self-aware object runtime is.</li>
-          <li><strong><a href="https://blog.mempko.com/entering-the-architecture-age/" target="_blank" rel="noopener">Entering the Architecture Age</a>.</strong> The software pyramid, the Window Tax, and why the big idea is messaging.</li>
-          <li><strong><a href="https://blog.mempko.com/let-the-information-monopolies-crumble/" target="_blank" rel="noopener">Let the Information Monopolies Crumble!</a></strong> The human case: computers are for computing, and everyone should get to.</li>
+      <section class="sec">
+        <SectionHead num="03" title="The Essays" />
+        <div class="prose">
+          <p>
+            The short version of the argument is on <a href="/theory">the theory page</a>. These are
+            the blog posts where I worked it out.
+          </p>
+          <ol class="ledger essays">
+            <li><span class="ix" aria-hidden="true">01</span><strong class="t"><a href="https://blog.mempko.com/a-love-letter-to-object-orientation/" target="_blank" rel="noopener">A Love Letter to Object Orientation</a>.</strong> <span class="n">Alan Kay's big idea was messaging, not classes. Why an object explaining itself is compression, not abstraction, and why the objects are the expendable part.</span></li>
+            <li><span class="ix" aria-hidden="true">02</span><strong class="t"><a href="https://blog.mempko.com/an-abject-horror/" target="_blank" rel="noopener">An Abject Horror</a>.</strong> <span class="n">The announcement. Why AI agents are the wrong abstraction, and what a self-aware object runtime is.</span></li>
+            <li><span class="ix" aria-hidden="true">03</span><strong class="t"><a href="https://blog.mempko.com/entering-the-architecture-age/" target="_blank" rel="noopener">Entering the Architecture Age</a>.</strong> <span class="n">The software pyramid, the Window Tax, and why the big idea is messaging.</span></li>
+            <li><span class="ix" aria-hidden="true">04</span><strong class="t"><a href="https://blog.mempko.com/let-the-information-monopolies-crumble/" target="_blank" rel="noopener">Let the Information Monopolies Crumble!</a></strong> <span class="n">Why people should use computers to compute, and why the information monopolies should crumble.</span></li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="sec">
+        <SectionHead num="04" title="What Abject Isn't" />
+        <ul class="mosaic nots">
+          <li class="not-startup solid-red"><strong>Not a startup.</strong> There are no investors, no board, and no exit strategy. Nobody has a plan to monetize you.</li>
+          <li class="not-saas outline"><strong>Not a SaaS.</strong> Your data, your tokens, and your machine stay yours. The signaling server is open source, so you can run your own.</li>
+          <li class="not-telemetry paper"><strong>Not telemetry-funded.</strong> Nothing phones home. The only connections it makes are to the model provider you chose, to the signaling server that introduces peers (open source, run your own), and to whatever an abject is asked to fetch, within the domain rules you set.</li>
+          <li class="not-closed"><strong>Not closed.</strong> It's GPL-3.0-or-later. Fork it, change it, ship it. Just keep it free.</li>
         </ul>
       </section>
 
-      <section class="about-section">
-        <h2>What This Isn't</h2>
-        <ul class="about-list">
-          <li><strong>Not a startup.</strong> No investors. No board. No exit strategy. No roadmap to monetize you.</li>
-          <li><strong>Not a SaaS.</strong> Your data, your tokens, your machine. The signaling server is open source; run your own.</li>
-          <li><strong>Not telemetry-funded.</strong> Nothing phones home. The only connections it makes are to the model provider you chose, to the signaling server that introduces peers (open source, run your own), and to whatever an abject is asked to fetch, within the domain rules you set.</li>
-          <li><strong>Not closed.</strong> GPL-3.0-or-later. Fork it. Modify it. Ship it. Just keep it free.</li>
+      <section class="sec">
+        <SectionHead num="05" title="How To Reach Me" />
+        <ul class="contact">
+          <li><strong>Email:</strong> <span><a href="mailto:max@mempko.com">max@mempko.com</a></span></li>
+          <li><strong>GitHub:</strong> <span><a href="https://github.com/mempko/abject" target="_blank" rel="noopener">mempko/abject</a> (issues, PRs welcome)</span></li>
+          <li><strong>Reddit:</strong> <span><a href="https://www.reddit.com/r/AbjectWorld/" target="_blank" rel="noopener">r/AbjectWorld</a></span></li>
+          <li><strong>Discord:</strong> <span><a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">join here</a></span></li>
         </ul>
       </section>
-
-      <section class="about-section">
-        <h2>How To Reach Me</h2>
-        <ul class="about-list">
-          <li><strong>Email:</strong> <a href="mailto:max@mempko.com">max@mempko.com</a></li>
-          <li><strong>GitHub:</strong> <a href="https://github.com/mempko/abject" target="_blank" rel="noopener">mempko/abject</a> (issues, PRs welcome)</li>
-          <li><strong>Reddit:</strong> <a href="https://www.reddit.com/r/AbjectWorld/" target="_blank" rel="noopener">r/AbjectWorld</a></li>
-          <li><strong>Discord:</strong> <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">join here</a></li>
-        </ul>
-      </section>
-
-      <p class="about-coda">
-        Abject is a long-term project. It will be slow. It will be weird. It will keep being free.
-      </p>
 
     </div>
+
+    <section class="field-red cut-top coda-field" aria-label="Coda">
+      <div class="container">
+        <p class="poster-quote coda">
+          Abject is a long-term project, and it will stay free. Try it, break it, build something horrible with it. <span class="coda-free">Join the horror.</span>
+        </p>
+      </div>
+    </section>
   </main>
   <Footer />
 </Layout>
 
 <style>
+  /* ── Page frame ── */
   .about {
-    min-height: 100vh;
-    padding-top: 96px;
-    padding-bottom: 4rem;
-    position: relative;
-    z-index: 1;
+    padding-top: calc(69px + clamp(3rem, 7vw, 5.5rem));
   }
 
-  .about-container {
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 0 1.5rem;
+  /* ── Hero: the poster column plus the eye, offset right ── */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+    gap: clamp(2rem, 5vw, 4.5rem);
+    align-items: center;
+    margin-bottom: clamp(1rem, 3vw, 2rem);
   }
 
-  .about-hero {
-    margin-bottom: 3.5rem;
+  .hero-title {
+    font-size: clamp(2.4rem, 5.4vw, 4.5rem);
+    line-height: 0.98;
+    margin-bottom: 1.4rem;
   }
 
-  .about-eyebrow {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--eldritch);
-    letter-spacing: 0.15em;
-    margin-bottom: 0.75rem;
+  .hero-bar {
+    display: block;
+    width: 180px;
+    height: 8px;
+    margin-bottom: 1.6rem;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
   }
 
-  .about-hero h1 {
-    font-size: clamp(1.8rem, 4vw, 2.6rem);
-    line-height: 1.2;
-    margin-bottom: 1.25rem;
-  }
-
-  .about-thesis {
-    color: var(--text-secondary);
-    font-size: 1.05rem;
+  .hero .lede {
+    font-size: clamp(1.06rem, 1.45vw, 1.2rem);
     line-height: 1.75;
   }
 
-  .about-section {
-    margin-bottom: 3rem;
+  .hero-mark { justify-self: end; width: 100%; max-width: 380px; }
+  .hero-mark svg { display: block; width: 100%; height: auto; }
+  .pupil { animation: breathe 7s ease-in-out infinite; }
+
+  /* ── Sections ── */
+  .sec {
+    position: relative;
+    padding: clamp(3.5rem, 7vw, 5.5rem) 0 0;
   }
 
-  .about-section h2 {
-    font-size: 1.4rem;
-    color: var(--text-primary);
-    margin-bottom: 1rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--border);
+  .sec :global(.section-head) { margin-bottom: 2rem; }
+
+  /* Big outlined numeral in the right margin of the two prose sections. */
+  .sec-big {
+    position: absolute;
+    right: 0;
+    top: clamp(2.5rem, 5vw, 4rem);
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(8rem, 15vw, 14rem);
+    line-height: 0.8;
+    color: transparent;
+    -webkit-text-stroke: 1.5px var(--rule-mid);
+    pointer-events: none;
+    user-select: none;
   }
 
-  .about-section p {
-    color: var(--text-secondary);
-    font-size: 1rem;
+  .prose {
+    max-width: 760px;
+    position: relative;
+  }
+
+  .prose p {
+    color: var(--bone-2);
+    font-size: 1.06rem;
     line-height: 1.8;
-    margin-bottom: 1rem;
+    margin-bottom: 1.15rem;
   }
 
-  .about-section p:last-child {
-    margin-bottom: 0;
+  .prose p:last-child { margin-bottom: 0; }
+
+  /* Fire★: a note hung on a brass rule. */
+    .prose .whatif {
+    margin-top: 1.8rem;
+    font-size: 1.15rem;
+    color: var(--bone);
   }
 
-  .about-section a {
-    color: var(--eldritch-dim);
-    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
-    padding-bottom: 1px;
-    transition: color 0.2s, border-color 0.2s;
+  .lineage {
+    margin-top: 1.6rem;
+    padding: 0.2rem 0 0.2rem 1.4rem;
+    border-left: 6px solid var(--brass);
   }
 
-  .about-section a:hover {
-    color: var(--eldritch);
-    border-bottom-color: var(--eldritch);
+  /* ── 03: the essays as a ledger ── */
+  .essays {
+    list-style: none;
+    padding: 0;
+    margin: 1.8rem 0 0;
   }
 
-  .about-list {
+  .essays .t { line-height: 1.3; }
+
+  .essays .t a {
+    color: var(--bone-heading);
+    text-decoration: underline;
+    text-decoration-color: rgba(91, 229, 160, 0.45);
+    text-decoration-thickness: 1.5px;
+    text-underline-offset: 4px;
+  }
+
+  .essays .t a:hover { color: var(--living); text-decoration-color: var(--red); }
+  .essays .n { line-height: 1.65; }
+
+  /* ── 04: what this isn't, as a mosaic ── */
+  .nots {
     list-style: none;
     padding: 0;
     margin: 0;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-rows: auto;
+    grid-template-areas:
+      'startup saas tele tele'
+      'closed closed tele tele';
+    line-height: 1.65;
+    color: var(--bone-2);
   }
 
-  .about-list li {
-    color: var(--text-secondary);
-    font-size: 1rem;
-    line-height: 1.7;
-    padding: 0.75rem 0;
-    border-bottom: 1px solid var(--border);
+  .not-startup { grid-area: startup; }
+  .not-saas { grid-area: saas; }
+  .not-telemetry { grid-area: tele; }
+  .not-closed { grid-area: closed; }
+
+  .nots .solid-red { color: rgba(246, 239, 219, 0.9); }
+  .nots .paper { color: #3f392f; }
+
+  .nots strong {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-bottom: 0.7rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.35rem;
+    letter-spacing: 0.04em;
+    line-height: 1.1;
+    text-transform: uppercase;
+    color: var(--bone-heading);
   }
 
-  .about-list li:last-child {
-    border-bottom: none;
+  .nots .solid-red strong { color: var(--on-red); }
+  .nots .paper strong { color: #16130f; font-size: clamp(1.6rem, 2.8vw, 2.3rem); }
+  .nots .not-closed strong { font-size: clamp(1.5rem, 2.4vw, 2rem); }
+  .nots .paper { font-size: 1.08rem; }
+
+  /* A struck square: the mark for a thing this is not. */
+  .nots strong::before {
+    content: '';
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--red);
+    background: linear-gradient(135deg, transparent 44%, var(--red) 44%, var(--red) 56%, transparent 56%);
   }
 
-  .about-list strong {
-    color: var(--text-primary);
+  .nots .solid-red strong::before {
+    border-color: var(--on-red);
+    background: linear-gradient(135deg, transparent 44%, var(--on-red) 44%, var(--on-red) 56%, transparent 56%);
   }
 
-  .about-list code {
+  /* ── 05: contact columns between heavy rules ── */
+  .contact {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 3px solid var(--bone-heading);
+    border-bottom: var(--rule-w) solid var(--rule-strong);
+  }
+
+  .contact li {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 1.3rem 1.3rem 1.5rem 0;
+    color: var(--bone-3);
+  }
+
+  .contact li + li { padding-left: 1.3rem; border-left: 1px solid var(--rule-mid); }
+
+  .contact strong {
     font-family: var(--font-mono);
-    font-size: 0.9rem;
-    color: var(--eldritch);
-    background: var(--eldritch-glow);
-    padding: 0.1rem 0.35rem;
-    border-radius: 3px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--red);
   }
 
-  .about-coda {
-    margin-top: 4rem;
-    text-align: center;
-    font-family: var(--font-mono);
-    font-style: italic;
-    color: var(--text-dim);
-    font-size: 0.95rem;
+  .contact a {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: clamp(1.2rem, 1.8vw, 1.5rem);
+    letter-spacing: 0.03em;
+    text-decoration: none;
+    color: var(--bone-heading);
+    word-break: break-word;
+  }
+
+  .contact a:hover { color: var(--living); }
+
+  /* ── Coda: the closing line on the red field ── */
+  .coda-field {
+    margin-top: clamp(4rem, 8vw, 6rem);
+  }
+
+  .coda {
+    font-size: clamp(1.8rem, 4.4vw, 3.4rem);
+    max-width: 1060px;
+    color: var(--on-red);
+  }
+
+  .coda-free { color: #16130f; }
+
+  /* ── Responsive ── */
+  @media (max-width: 1080px) {
+    .sec-big { display: none; }
+  }
+
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; }
+    .hero-mark { justify-self: start; max-width: 220px; }
+    .nots { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-areas: 'startup saas' 'tele tele' 'closed closed'; }
+    .contact { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .contact li + li:nth-child(3) { padding-left: 0; border-left: none; }
+    .contact li:nth-child(n + 3) { border-top: 1px solid var(--rule-mid); }
+  }
+
+  @media (max-width: 640px) {
+    .nots { grid-template-columns: 1fr; grid-template-areas: 'startup' 'saas' 'tele' 'closed'; }
+    .contact { grid-template-columns: 1fr; }
+    .contact li, .contact li + li { padding-left: 0; border-left: none; }
+    .contact li + li { border-top: 1px solid var(--rule-mid); }
   }
 </style>

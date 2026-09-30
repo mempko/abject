@@ -5,42 +5,109 @@ import Footer from '../components/Footer.astro';
 import Symbiogenesis from '../components/Symbiogenesis.astro';
 import AskProtocol from '../components/AskProtocol.astro';
 import Emergence from '../components/Emergence.astro';
+import WhyDifferent from '../components/WhyDifferent.astro';
+import Architecture from '../components/Architecture.astro';
+import Features from '../components/Features.astro';
+import Spreading from '../components/Spreading.astro';
+import Lineage from '../components/Lineage.astro';
+import Faq from '../components/Faq.astro';
+
+// The page reads as one piece: the argument (01 to 04), then how it is built
+// (05 to 08), then the conceptual questions.
+const index = [
+  { num: '01', href: '#why', label: 'The short answer' },
+  { num: '02', href: '#symbiogenesis', label: 'Symbiogenesis' },
+  { num: '03', href: '#ask-protocol', label: 'The Ask Protocol' },
+  { num: '04', href: '#emergence', label: 'Emergence' },
+  { part: "How it's built", href: '#how-its-built' },
+  { num: '05', href: '#architecture', label: 'Architecture' },
+  { num: '06', href: '#features', label: 'Capabilities' },
+  { num: '07', href: '#spreading', label: 'The mesh' },
+  { num: '08', href: '#lineage', label: 'Lineage' },
+  { num: '09', href: '#faq', label: 'Fair questions' },
+];
+
+const built = [
+  { href: '#architecture', label: 'Architecture' },
+  { href: '#features', label: 'Capabilities' },
+  { href: '#spreading', label: 'The mesh' },
+  { href: '#lineage', label: 'Lineage' },
+];
 ---
 
 <Layout
   title="Why Abject? - Abject"
-  description="How Abject differs from chatbots, agent frameworks, tool protocols, and orchestration layers: the actor model with one house rule, goals run as scrums, and objects that interview each other."
+  description="Why AI agents are the wrong abstraction and what Abject does instead: objects that talk to each other, Smalltalk or Erlang style, where every object answers ask. How it compares to agent frameworks, tool protocols and orchestration, how goals get done in sprints, and how it is built."
 >
   <Header />
   <main class="why-page">
-    <header class="why-hero">
-      <div class="container">
-        <p class="why-eyebrow">// WHY ABJECT</p>
-        <h1>The Long Answer</h1>
-        <p class="why-thesis">
-          The short answer fits on the front page: an actor system where every actor can be
-          interviewed. This page is the comparison in full, for anyone who has already built
-          on the frameworks named below and wants to know exactly where the line is drawn.
-        </p>
-        <p class="why-nav">
-          <a href="#symbiogenesis">Symbiogenesis</a>
-          <span class="sep">|</span>
-          <a href="#ask-protocol">The Ask Protocol</a>
-          <span class="sep">|</span>
-          <a href="#emergence">Emergence</a>
-        </p>
+    <header class="page-hero">
+      <div class="container page-hero-grid">
+        <div class="page-hero-main">
+          <p class="kicker"><span class="sigil" aria-hidden="true"></span><span>Why Abject</span></p>
+          <h1 class="page-hero-title band">The Long Answer</h1>
+          <p class="lede page-hero-lede">
+            The short answer comes first. Then the long one: how Abject compares to the agent
+            frameworks and tool protocols you may already be building on, how it gets a goal
+            done, and how the whole thing is built.
+          </p>
+        </div>
+        <nav class="rindex rindex-big" aria-label="On this page">
+          <p class="rindex-label">On this page</p>
+          <ol>
+            {index.map((i) => i.part ? (
+              <li class="ri-part">
+                <a href={i.href}>{i.part}</a>
+              </li>
+            ) : (
+              <li>
+                <a href={i.href}>
+                  <span class="ri-n">{i.num}</span>
+                  <span class="ri-t">{i.label}</span>
+                  <span class="ri-go" aria-hidden="true">&#9654;</span>
+                </a>
+              </li>
+            ))}
+          </ol>
+        </nav>
       </div>
     </header>
-    <Symbiogenesis />
-    <AskProtocol />
-    <Emergence />
+
+    <WhyDifferent num="01" kicker="In brief" title="The Short Answer" fullHref="#symbiogenesis" />
+    <Symbiogenesis num="02" />
+    <AskProtocol num="03" />
+    <Emergence num="04" />
+
+    <!-- Part two: the machinery under the argument -->
+    <section id="how-its-built" class="part-head">
+      <div class="container">
+        <p class="part-kicker"><span class="part-mark" aria-hidden="true"></span>Part two</p>
+        <h2 class="part-title band">How it's built</h2>
+        <p class="part-lede">
+          That's the argument. Here is how it's built: the layers, what an abject can do, the
+          peer-to-peer mesh, and where the idea came from.
+        </p>
+        <nav class="strip part-strip" aria-label="How it's built">
+          {built.map((b) => <a href={b.href}>{b.label}</a>)}
+        </nav>
+      </div>
+    </section>
+
+    <Architecture num="05" />
+    <Features num="06" />
+    <Spreading num="07" />
+    <Lineage num="08" />
+    <Faq num="09" only={['name', 'llm', 'actors']} />
+
     <section class="why-end">
       <div class="container">
-        <p class="why-end-line">Convinced, or at least curious?</p>
-        <p class="why-end-cta">
-          <a href="/#downloads" class="btn btn-primary">Download Abject</a>
-          <a href="/theory" class="btn btn-outline">Read the theory &rarr;</a>
-        </p>
+        <div class="why-end-inner">
+          <p class="why-end-line">Try it, break it, build something horrible with it.</p>
+          <p class="why-end-cta">
+            <a href="/#downloads" class="btn btn-primary">Download Abject</a>
+            <a href="/theory" class="btn btn-outline">Read the theory &rarr;</a>
+          </p>
+        </div>
       </div>
     </section>
   </main>
@@ -48,57 +115,549 @@ import Emergence from '../components/Emergence.astro';
 </Layout>
 
 <style>
-  .why-hero {
-    padding: calc(64px + 5rem) 0 1rem;
-    text-align: center;
+  /* ── Page hero: title in the display face, kicker, lede, ruled index ── */
+  .page-hero {
+    padding: calc(66px + 5.5rem) 0 1rem;
   }
 
-  .why-eyebrow {
+  .page-hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 330px);
+    gap: 3.5rem;
+    align-items: end;
+  }
+
+  .page-hero-title {
+    font-size: clamp(3rem, 9vw, 7.4rem);
+    line-height: 0.92;
+    letter-spacing: -0.01em;
+    margin-bottom: 1.6rem;
+  }
+
+  .page-hero-title::after {
+    content: '';
+    display: block;
+    width: 140px;
+    height: 6px;
+    margin-top: 1.4rem;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 100%, 0 100%);
+  }
+
+  .page-hero-lede {
+    font-size: 1.2rem;
+    line-height: 1.7;
+    max-width: 38rem;
+    color: var(--bone-2);
+  }
+
+  /* ── Part two: big type between two rules, the four sections as a strip ── */
+  .part-head {
+    padding: 7rem 0 1rem;
+    scroll-margin-top: 40px;
+  }
+
+  .part-kicker {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
     font-family: var(--font-mono);
     font-size: 0.8rem;
-    letter-spacing: 0.15em;
-    color: var(--eldritch);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
     margin-bottom: 1rem;
   }
 
-  .why-hero h1 {
-    margin-bottom: 1.25rem;
+  .part-mark {
+    width: 26px;
+    height: 14px;
+    background: var(--red);
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
   }
 
-  .why-thesis {
-    max-width: 680px;
-    margin: 0 auto 1.5rem;
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-    line-height: 1.75;
+  .part-title {
+    font-size: clamp(3rem, 10vw, 8rem);
+    line-height: 0.9;
+    letter-spacing: -0.01em;
+    margin-bottom: 1.5rem;
   }
 
-  .why-nav {
+  .part-lede {
+    max-width: 40rem;
+    font-size: 1.2rem;
+    line-height: 1.65;
+    color: var(--bone-2);
+    margin-bottom: 2rem;
+  }
+
+  .part-strip a {
+    color: var(--bone-2);
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+
+  .part-strip a:hover { color: var(--bone-heading); }
+
+  /* A part row inside the ruled index. */
+  .rindex .ri-part a {
+    display: block;
+    padding: 1.1rem 0 0.5rem;
+    border-bottom: 3px solid var(--red);
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--text-dim);
+    font-size: 0.72rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
   }
 
-  .why-nav .sep {
-    margin: 0 0.6rem;
-    opacity: 0.5;
-  }
+  .rindex .ri-part a:hover { padding-left: 0; color: var(--bone-heading); }
 
-  .why-end {
-    text-align: center;
-    padding-top: 0;
+  /* ── Closing call ── */
+  .why-end { padding-top: 2rem; }
+
+  .why-end-inner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1.5rem 2.5rem;
+    border-top: 4px solid var(--red);
+    padding-top: 2.5rem;
   }
 
   .why-end-line {
     font-family: var(--font-display);
-    font-size: 1.4rem;
-    margin-bottom: 1.25rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    font-size: clamp(1.7rem, 3.6vw, 2.6rem);
+    line-height: 1.05;
+    color: var(--bone-heading);
   }
 
   .why-end-cta {
     display: flex;
     gap: 1rem;
-    justify-content: center;
     flex-wrap: wrap;
+  }
+
+  @media (max-width: 900px) {
+    .page-hero-grid { grid-template-columns: 1fr; gap: 2.5rem; }
+    .page-hero-grid .rindex { max-width: 420px; }
+  }
+
+  @media (max-width: 768px) {
+    .page-hero { padding-top: calc(66px + 3rem); }
+  }
+</style>
+
+<!--
+  The long-form, comparison and diagram vocabulary shared by the three
+  sections on this page (Symbiogenesis, AskProtocol, Emergence).
+-->
+<style is:global>
+  .why-page .why-sec { padding: 6rem 0 4rem; }
+
+  /* ── Reading column ── */
+  .why-page .prose { max-width: 36.5rem; }
+
+  .why-page .prose p {
+    font-size: 1.12rem;
+    line-height: 1.75;
+    color: var(--bone-2);
+    margin-bottom: 1.25em;
+  }
+
+  .why-page .prose p.standfirst {
+    font-size: 1.2rem;
+    line-height: 1.65;
+    color: var(--bone);
+  }
+
+  .why-page .prose em { color: var(--bone-heading); }
+
+  /* Text column plus an offset ruled index. */
+  .why-page .poster {
+    display: grid;
+    grid-template-columns: minmax(0, 36.5rem) minmax(0, 1fr);
+    gap: 3rem 5rem;
+    align-items: start;
+    margin-bottom: 5rem;
+  }
+
+  .why-page .poster > .prose { max-width: none; }
+  .why-page .poster-side { position: sticky; top: 92px; }
+
+  /* ── Ruled index: plain rows between rules, no frame ── */
+  .why-page .rindex-label {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+    padding-bottom: 0.6rem;
+    border-bottom: 3px solid var(--red);
+  }
+
+  .why-page .rindex ol { list-style: none; }
+
+  .why-page .rindex a {
+    display: grid;
+    grid-template-columns: 2.2rem minmax(0, 1fr) auto;
+    gap: 0.15rem 0.6rem;
+    align-items: baseline;
+    padding: 0.8rem 0;
+    border-bottom: 1px solid var(--rule-mid);
+    color: var(--bone);
+    text-decoration: none;
+    transition: color 0.15s, padding-left 0.15s;
+  }
+
+  .why-page .rindex .ri-n {
+    grid-row: span 2;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+    color: var(--red);
+  }
+
+  .why-page .rindex .ri-t {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .why-page .rindex .ri-s {
+    grid-column: 2 / 4;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    color: var(--bone-meta);
+  }
+
+  .why-page .rindex .ri-go { font-size: 0.65rem; color: var(--bone-faint); transition: color 0.15s; }
+
+  .why-page .rindex a:hover { color: var(--bone-heading); padding-left: 0.35rem; }
+  .why-page .rindex a:hover .ri-go { color: var(--red); }
+
+  .why-page .rindex-big .ri-t { font-size: 1.2rem; }
+  .why-page .rindex-big .ri-n { font-size: 1.15rem; }
+  .why-page .rindex-big a { padding: 0.95rem 0; }
+
+  /* ── Comparison rows ── */
+  .why-page .cmp { scroll-margin-top: 90px; margin-bottom: 6rem; }
+
+  .why-page .cmp-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem 1rem;
+    margin-bottom: 2rem;
+    padding-bottom: 0.9rem;
+    border-bottom: var(--rule-w) solid var(--rule-mid);
+  }
+
+  .why-page .cmp-letter {
+    display: inline-grid;
+    place-items: center;
+    width: 2.1rem;
+    height: 2.1rem;
+    background: var(--red);
+    color: var(--on-red);
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.15rem;
+    align-self: center;
+  }
+
+  .why-page .cmp-title { font-size: clamp(1.35rem, 2.4vw, 1.8rem); letter-spacing: 0.04em; }
+
+  .why-page .cmp-systems {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--bone-meta);
+    letter-spacing: 0.02em;
+  }
+
+  .why-page .cmp p.cmp-text {
+    font-size: 1.02rem;
+    line-height: 1.72;
+    color: var(--bone-2);
+    max-width: 34rem;
+  }
+
+  .why-page .cmp .ghost p.cmp-text { color: var(--bone-2); }
+  .why-page .cmp .side-label .sub { font-family: var(--font-mono); letter-spacing: 0.1em; font-size: 0.72rem; color: var(--bone-meta); margin-left: 0.3rem; }
+  .why-page .cmp .side-label.hand .sub { color: var(--bone-3); }
+
+  /* The inversion: a split with the old way ghosted. */
+  .why-page .inv-split { align-items: center; margin-bottom: 6.5rem; }
+  .why-page .inv-split .dg { margin-bottom: 1rem; }
+
+  /* Split rows: diagram above its text, on the void. */
+  .why-page .split .dg { max-width: 460px; margin: 0 0 1.6rem; }
+  .why-page .split > div:not(.rule) { min-width: 0; }
+
+  /* Big-diagram rows: the two halves read as one large drawing, the two
+     texts in columns beneath. */
+  .why-page .bigdg {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+    gap: 2.5rem;
+    align-items: center;
+    padding: 1.5rem 0 2rem;
+  }
+
+  .why-page .bigdg-div { align-self: stretch; background: repeating-linear-gradient(180deg, var(--rule-strong) 0 6px, transparent 6px 12px); }
+  .why-page .bigdg .dg { max-width: 540px; margin: 0 auto; }
+
+  .why-page .bigdg-texts {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 2.5rem;
+    border-top: var(--rule-w) solid var(--rule-mid);
+    padding-top: 1.5rem;
+  }
+
+  .why-page .bigdg-texts .side-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 0.85rem;
+    color: var(--bone-meta);
+    margin-bottom: 0.8rem;
+  }
+
+  .why-page .bigdg-texts .side-label.hand { color: var(--red); }
+
+  /* Field rows: a full-bleed ground (paper or red) for one comparison. */
+  .why-page .cmp-field { padding: calc(4.5rem + 3.5vw) 0; margin: 0 0 6rem; }
+  /* Both cut edges at once: a band that slants up to the right. */
+  .why-page .cmp-field.cut-top.cut-bottom { clip-path: polygon(0 3.5vw, 100% 0, 100% calc(100% - 3.5vw), 0 100%); }
+  .why-page .field-paper .cmp-head, .why-page .field-red .cmp-head { border-bottom-color: var(--field-rule); }
+  .why-page .field-paper .cmp-systems, .why-page .field-red .cmp-systems { color: var(--field-ink-2); }
+  .why-page .field-red .cmp-letter { background: #16130f; color: var(--on-red); }
+
+  .why-page .field-pair {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1.5px minmax(0, 1fr);
+    gap: 2.75rem;
+  }
+
+  .why-page .field-pair > .fp-rule { background: var(--field-rule); }
+  .why-page .field-pair .dg { max-width: 460px; margin: 0 0 1.6rem; }
+
+  .why-page .field-pair .fp-label {
+    font-family: var(--font-display);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    font-size: clamp(1.8rem, 3.2vw, 2.6rem);
+    line-height: 1;
+    color: var(--field-ink);
+    margin-bottom: 0.3rem;
+  }
+
+  .why-page .field-paper .field-pair .fp-label.hand { color: var(--red); }
+  .why-page .field-red .field-pair .fp-label.ghosted { color: rgba(22, 19, 15, 0.7); }
+  .why-page .field-red .field-pair .fp-label.hand { color: var(--on-red); }
+  .why-page .field-pair .fp-label.ghosted { opacity: 0.55; }
+  .why-page .field-paper .field-pair .fp-label.ghosted { opacity: 0.45; }
+
+  .why-page .field-pair .fp-sub {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--field-ink-2);
+    margin-bottom: 1.4rem;
+  }
+
+  .why-page .field-pair p.cmp-text { color: var(--field-ink-2); }
+
+  /* ── Diagram annotations in mono beneath a drawing ── */
+  .why-page .dg-cap {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--bone-meta);
+  }
+
+  .why-page .dg-cap .cap-line { display: block; }
+  .why-page .dg-cap .cap-line::before { content: '\25A0'; color: var(--red); margin-right: 0.55rem; font-size: 0.7em; vertical-align: 0.12em; }
+
+  /* A diagram too wide for a phone scrolls inside its own box. */
+  .why-page .fig-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* ── SVG diagram vocabulary (on the void) ──
+   * structure in bone, the old or dead way muted, flows and live links in
+   * living green, the key element in red. Square corners; hard shadows on
+   * boxes only (never a filter on a line: Chromium drops axis-aligned ones). */
+  .why-page .dg { display: block; width: 100%; height: auto; overflow: visible; }
+  .why-page .dg text { font-family: var(--font-mono); font-size: 11px; fill: var(--bone-3); }
+  .why-page .dg .lbl { font-family: var(--font-display); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; font-size: 14px; fill: var(--bone-heading); }
+  .why-page .dg .lbl-sm { font-size: 11.5px; }
+  .why-page .dg .lbl-xs { font-size: 9.5px; letter-spacing: 0.06em; }
+  .why-page .dg .note { font-size: 10.5px; fill: var(--bone-meta); }
+  .why-page .dg .note-i { font-style: italic; }
+  .why-page .dg .note-live { fill: var(--living); }
+  .why-page .dg .note-red { fill: var(--red-hot); }
+  .why-page .dg .note-bone { fill: var(--bone-2); }
+  .why-page .dg .head { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; fill: var(--bone-meta); }
+  /* Object identifiers (ObjectCreator, TupleSpace) keep their camel case in mono. */
+  .why-page .dg .id { font-family: var(--font-mono); font-weight: 600; font-size: 12.5px; fill: var(--bone-heading); }
+  .why-page .dg .id-sm { font-size: 10.5px; }
+  .why-page .dg .id.t-key { fill: var(--on-red); }
+  .why-page .dg .id.t-live { fill: var(--living); }
+  .why-page .dg .step { font-family: var(--font-display); font-weight: 600; font-size: 12px; fill: var(--on-red); }
+  .why-page .dg .cursor { animation: blink 1.4s steps(1) infinite; }
+
+  .why-page .dg .n { fill: var(--panel); stroke: rgba(231, 225, 206, 0.55); stroke-width: 1.5; }
+  .why-page .dg .n-dash { fill: var(--panel); stroke: rgba(231, 225, 206, 0.5); stroke-width: 1.3; stroke-dasharray: 5 3; }
+  .why-page .dg .n-frame { fill: rgba(16, 17, 21, 0.6); stroke: rgba(231, 225, 206, 0.3); stroke-width: 1.3; }
+  .why-page .dg .n-old { fill: var(--sunken); stroke: var(--diagram-muted-stroke); stroke-width: 1.2; }
+  .why-page .dg .n-dead { fill: var(--sunken); stroke: var(--diagram-muted-stroke); stroke-width: 1; opacity: 0.45; }
+  .why-page .dg .n-key { fill: var(--red); stroke: var(--red); stroke-width: 1.5; }
+  .why-page .dg .n-live { fill: var(--panel); stroke: var(--living); stroke-width: 1.8; }
+  .why-page .dg .n-fail { fill: var(--sunken); stroke: var(--red); stroke-width: 1.4; }
+  .why-page .dg .shadow { filter: drop-shadow(4px 4px 0 rgba(0, 0, 0, 0.9)); }
+
+  .why-page .dg .t-old { fill: var(--diagram-muted); }
+  .why-page .dg .t-old-hi { fill: var(--bone-3); }
+  .why-page .dg .t-key { fill: var(--on-red); }
+  .why-page .dg .t-live { fill: var(--living); }
+  .why-page .dg .t-red { fill: var(--red-hot); }
+
+  .why-page .dg .ln-old { stroke: var(--diagram-muted); stroke-width: 1.2; fill: none; }
+  .why-page .dg .ln-old-dash { stroke: var(--diagram-muted); stroke-width: 1; stroke-dasharray: 4 3; fill: none; }
+  .why-page .dg .ln-live { stroke: var(--living); stroke-width: 1.7; fill: none; }
+  .why-page .dg .ln-live-dash { stroke: var(--living); stroke-width: 1.4; stroke-dasharray: 6 3; fill: none; }
+  .why-page .dg .ln-live-dim { stroke: var(--living-dim); stroke-width: 1.1; fill: none; opacity: 0.85; }
+  .why-page .dg .ln-bone { stroke: rgba(231, 225, 206, 0.5); stroke-width: 1.2; fill: none; }
+  .why-page .dg .ln-bone-dash { stroke: rgba(231, 225, 206, 0.45); stroke-width: 1.1; stroke-dasharray: 4 3; fill: none; }
+  .why-page .dg .ln-red { stroke: var(--red); stroke-width: 2.2; fill: none; }
+  .why-page .dg .ln-rule { stroke: var(--rule-mid); stroke-width: 1; fill: none; }
+
+  .why-page .dg .mk-old { fill: var(--diagram-muted); }
+  .why-page .dg .mk-live { fill: var(--living); }
+  .why-page .dg .mk-bone { fill: rgba(231, 225, 206, 0.6); }
+  .why-page .dg .mk-red { fill: var(--red); }
+
+  .why-page .dg .fill-live { fill: var(--living); }
+  .why-page .dg .fill-live-dim { fill: rgba(91, 229, 160, 0.35); }
+  .why-page .dg .fill-red { fill: var(--red); }
+  .why-page .dg .fill-bone { fill: rgba(231, 225, 206, 0.16); }
+  .why-page .dg .fill-band { fill: var(--band); }
+
+  /* ── The same vocabulary inked on paper: ink structure, red accents ── */
+  .why-page .field-paper .dg text { fill: #3f392f; }
+  .why-page .field-paper .dg .lbl, .why-page .field-paper .dg .id { fill: #16130f; }
+  .why-page .field-paper .dg .note, .why-page .field-paper .dg .note-bone { fill: #3f392f; }
+  .why-page .field-paper .dg .note-live { fill: #16130f; }
+  .why-page .field-paper .dg .t-old, .why-page .field-paper .dg .t-old-hi { fill: rgba(22, 19, 15, 0.55); }
+  .why-page .field-paper .dg .t-key, .why-page .field-paper .dg .id.t-key { fill: var(--on-red); }
+  .why-page .field-paper .dg .n { fill: #efe6d1; stroke: #16130f; stroke-width: 1.6; }
+  .why-page .field-paper .dg .n-old { fill: #e6dcc4; stroke: rgba(22, 19, 15, 0.4); }
+  .why-page .field-paper .dg .n-key { fill: var(--red); stroke: #16130f; }
+  .why-page .field-paper .dg .shadow { filter: drop-shadow(4px 4px 0 rgba(22, 19, 15, 0.85)); }
+  .why-page .field-paper .dg .ln-live { stroke: #16130f; stroke-width: 1.8; }
+  .why-page .field-paper .dg .mk-live { fill: #16130f; }
+  .why-page .field-paper .dg .ln-old, .why-page .field-paper .dg .ln-old-dash { stroke: rgba(22, 19, 15, 0.45); }
+  .why-page .field-paper .dg .mk-old { fill: rgba(22, 19, 15, 0.45); }
+  .why-page .field-paper .dg .ln-bone-dash { stroke: var(--red); stroke-width: 1.3; }
+  .why-page .field-paper .dg .mk-bone { fill: var(--red); }
+
+  /* ── ...and on the red ground: ink and bone ── */
+  .why-page .field-red .dg text { fill: var(--on-red); }
+  .why-page .field-red .dg .lbl, .why-page .field-red .dg .id { fill: var(--on-red); }
+  .why-page .field-red .dg .note, .why-page .field-red .dg .note-bone, .why-page .field-red .dg .head { fill: rgba(246, 239, 219, 0.85); }
+  .why-page .field-red .dg .note-live { fill: #16130f; }
+  .why-page .field-red .dg .t-old, .why-page .field-red .dg .t-old-hi { fill: rgba(22, 19, 15, 0.72); }
+  .why-page .field-red .dg .n { fill: var(--red-deep); stroke: var(--on-red); stroke-width: 1.4; }
+  .why-page .field-red .dg .n-frame { fill: rgba(22, 19, 15, 0.14); stroke: rgba(246, 239, 219, 0.6); }
+  .why-page .field-red .dg .n-old { fill: rgba(22, 19, 15, 0.08); stroke: rgba(22, 19, 15, 0.55); }
+  .why-page .field-red .dg .n-fail { fill: rgba(22, 19, 15, 0.08); stroke: #16130f; }
+  .why-page .field-red .dg .n-key { fill: #16130f; stroke: #16130f; }
+  .why-page .field-red .dg .shadow { filter: drop-shadow(4px 4px 0 rgba(22, 19, 15, 0.8)); }
+  .why-page .field-red .dg .ln-live, .why-page .field-red .dg .ln-live-dash { stroke: #16130f; }
+  .why-page .field-red .dg .mk-live, .why-page .field-red .dg .fill-live { fill: #16130f; }
+  .why-page .field-red .dg .ln-old, .why-page .field-red .dg .ln-old-dash { stroke: rgba(22, 19, 15, 0.6); }
+  .why-page .field-red .dg .mk-old { fill: rgba(22, 19, 15, 0.6); }
+  .why-page .field-red .dg .ln-red { stroke: #16130f; }
+  .why-page .field-red .dg .t-red { fill: #16130f; }
+
+  /* ── Closing thesis: big type, a red-ruled statement, a definition ── */
+  .why-page .closing { max-width: 50rem; }
+
+  .why-page .statement {
+    font-family: var(--font-display);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.01em;
+    font-size: clamp(2rem, 5vw, 3.8rem);
+    line-height: 1;
+    color: var(--bone-heading);
+    margin-bottom: 2.25rem;
+  }
+
+  .why-page .statement .red { color: var(--red); }
+
+  .why-page .ruled {
+    border-left: 5px solid var(--red);
+    padding: 0.3rem 0 0.3rem 1.6rem;
+    margin: 0 0 2rem;
+    max-width: 44rem;
+  }
+
+  .why-page .ruled p {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: clamp(1.25rem, 2.3vw, 1.6rem);
+    line-height: 1.4;
+    letter-spacing: 0.01em;
+    color: var(--bone-heading);
+  }
+
+  .why-page .poster-quote em { font-style: normal; color: var(--red); }
+
+  .why-page .defn {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.9rem;
+    align-items: baseline;
+    max-width: 44rem;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    line-height: 1.65;
+    color: var(--bone-3);
+    border-top: 1px solid var(--rule-mid);
+    border-bottom: 1px solid var(--rule-mid);
+    padding: 1rem 0;
+    margin-top: 2.5rem;
+  }
+
+  .why-page .defn::before { content: '\25A0'; color: var(--red); font-size: 0.8em; }
+  .why-page .defn em { color: var(--bone-heading); font-style: italic; }
+
+  @media (max-width: 1000px) {
+    .why-page .poster { grid-template-columns: 1fr; }
+    .why-page .poster > .prose { max-width: 36.5rem; }
+    .why-page .poster-side { position: static; max-width: 36.5rem; }
+  }
+
+  @media (max-width: 760px) {
+    .why-page .bigdg, .why-page .bigdg-texts, .why-page .field-pair { grid-template-columns: 1fr; gap: 1.75rem; }
+    .why-page .bigdg-div { height: 1px; background: repeating-linear-gradient(90deg, var(--rule-strong) 0 6px, transparent 6px 12px); }
+    .why-page .field-pair > .fp-rule { height: 1.5px; }
+  }
+
+  @media (max-width: 768px) {
+    .why-page .why-sec { padding: 4rem 0 2.5rem; }
+    .why-page .prose p { font-size: 1.05rem; }
+    .why-page .prose p.standfirst { font-size: 1.12rem; }
+    .why-page .cmp { margin-bottom: 4.5rem; }
+    .why-page .cmp-field { padding: calc(3rem + 3.5vw) 0; margin-bottom: 4.5rem; }
   }
 </style>

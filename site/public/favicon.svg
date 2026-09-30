@@ -1,4 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="4" fill="#05060a"/>
-  <text x="16" y="22" font-family="monospace" font-size="14" font-weight="bold" fill="#5be5a0" text-anchor="middle">{a}</text>
+  <rect width="32" height="32" fill="#06070a"/>
+  <circle cx="16" cy="16" r="11" fill="none" stroke="#e7e1ce" stroke-width="2.5"/>
+  <circle cx="16" cy="16" r="6.5" fill="none" stroke="#d32f22" stroke-width="2.5"/>
+  <ellipse cx="16" cy="16" rx="1.6" ry="4.6" fill="#5be5a0"/>
+  <polygon points="0,26 12,22 0,32" fill="#d32f22"/>
 </svg>

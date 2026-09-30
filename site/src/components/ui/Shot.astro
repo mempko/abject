@@ -1,0 +1,159 @@
+---
+/**
+ * A screenshot in an Abject window frame: a title band with the eye sigil,
+ * the image, and an optional caption. Slots come from src/data/shots.ts, so
+ * a new screenshot drops in by editing one list. A slot still waiting for
+ * its shot renders a designed placeholder (never a broken image).
+ *
+ * Clicking an image opens it large in the shared lightbox (see Lightbox).
+ * A slot with a `video` plays it as a muted loop while it is on screen
+ * (paused off screen and under reduced motion, where the still shows).
+ */
+import { SHOTS, type ShotId } from '../../data/shots';
+
+interface Props {
+  id: ShotId;
+  /** Wear the focused (red) band and red print shadow. */
+  focus?: boolean;
+  /** Override the manifest caption; pass '' to hide it. */
+  caption?: string;
+  /** Hide the window band (plain ruled frame). */
+  bare?: boolean;
+  eager?: boolean;
+  /** Show the still even when the slot has a clip. */
+  still?: boolean;
+  class?: string;
+}
+
+const { id, focus = false, caption, bare = false, eager = false, still = false, class: klass = '' } = Astro.props;
+// An unknown id renders a titled placeholder (and warns at build time)
+// rather than failing the whole page.
+const known = (SHOTS as Record<string, import('../../data/shots').ShotSlot>)[id];
+if (!known) console.warn(`[Shot] unknown shot id "${String(id)}"; rendering a placeholder`);
+const slot: import('../../data/shots').ShotSlot = known ?? {
+  file: '', title: String(id), alt: String(id), aspect: 16 / 10, retake: true, want: '',
+};
+const clip = still ? undefined : slot.video;
+const text = caption ?? slot.caption ?? '';
+const ratio = `${slot.aspect}`;
+---
+
+<figure class:list={['shot', 'shot-frame', { focus, bare }, klass]}>
+  {!bare && (
+    <div class="win-bar shot-bar">
+      <span class="sigil" aria-hidden="true"></span>
+      <span class="title">{slot.title}</span>
+      <span class="btns" aria-hidden="true">? &minus; &#9633; &times;</span>
+    </div>
+  )}
+  {clip ? (
+    <button class="shot-open" type="button" data-full={slot.src ?? clip.poster} aria-label={`Enlarge: ${slot.alt}`}>
+      <video
+        class="shot-clip"
+        style={`aspect-ratio: ${ratio}`}
+        poster={clip.poster ?? slot.src}
+        muted
+        loop
+        playsinline
+        preload="metadata"
+        aria-label={slot.alt}
+      >
+        <source src={clip.mp4} type="video/mp4" />
+        {clip.webm && <source src={clip.webm} type="video/webm" />}
+      </video>
+    </button>
+  ) : slot.src ? (
+    <button class="shot-open" type="button" data-full={slot.src} aria-label={`Enlarge: ${slot.alt}`}>
+      <img
+        src={slot.src}
+        alt={slot.alt}
+        style={`aspect-ratio: ${ratio}`}
+        loading={eager ? 'eager' : 'lazy'}
+        decoding="async"
+        fetchpriority={eager ? 'high' : undefined}
+      />
+    </button>
+  ) : (
+    <div class="shot-pending" style={`aspect-ratio: ${ratio}`} role="img" aria-label={slot.alt}>
+      <span class="shot-pending-eye" aria-hidden="true"></span>
+      <span class="shot-pending-label">{slot.title}</span>
+    </div>
+  )}
+  {text && <figcaption>{text}</figcaption>}
+</figure>
+
+<script>
+  // Clips play only while visible, and never under reduced motion.
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const clips = document.querySelectorAll<HTMLVideoElement>('video.shot-clip');
+  if (!reduce && 'IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const v = e.target as HTMLVideoElement;
+        if (e.isIntersecting) v.play().catch(() => {});
+        else v.pause();
+      }
+    }, { threshold: 0.25 });
+    clips.forEach((v) => io.observe(v));
+  }
+</script>
+
+<style>
+  .shot-frame { margin: 0; }
+  .shot-bar { height: 30px; font-size: 0.74rem; }
+  .shot-frame.focus .shot-bar { background: var(--red); color: var(--on-red); border-bottom-color: var(--red); }
+  .shot-frame.focus .shot-bar .btns { color: rgba(246, 239, 219, 0.8); }
+  .shot-frame.focus .sigil { color: var(--on-red); }
+
+  .shot-open {
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: zoom-in;
+  }
+
+  .shot-open img, .shot-open video { display: block; width: 100%; height: auto; object-fit: cover; background: var(--sunken); }
+
+  .shot-pending {
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 1rem;
+    width: 100%;
+    background:
+      repeating-linear-gradient(-45deg, rgba(231, 225, 206, 0.035) 0 1px, transparent 1px 12px),
+      var(--sunken);
+  }
+
+  .shot-pending-eye {
+    width: 64px;
+    height: 64px;
+    border: 3px solid var(--red);
+    border-radius: 50%;
+    position: relative;
+    opacity: 0.8;
+  }
+
+  .shot-pending-eye::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 10px;
+    height: 34px;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--living);
+    box-shadow: 0 0 14px var(--living-glow);
+  }
+
+  .shot-pending-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.9rem;
+    color: var(--bone-3);
+  }
+</style>

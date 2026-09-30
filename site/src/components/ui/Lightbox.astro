@@ -1,0 +1,59 @@
+---
+/**
+ * One shared lightbox for every screenshot on a page: any element with a
+ * `data-full` attribute opens its image large. Include once per page (the
+ * Layout does).
+ */
+---
+
+<dialog class="lightbox" aria-label="Enlarged screenshot">
+  <form method="dialog" class="lightbox-close-form">
+    <button class="lightbox-close" aria-label="Close">&times;</button>
+  </form>
+  <img src="" alt="" />
+</dialog>
+
+<script>
+  const box = document.querySelector('.lightbox') as HTMLDialogElement | null;
+  const img = box?.querySelector('img') as HTMLImageElement | null;
+  document.addEventListener('click', (e) => {
+    const trigger = (e.target as HTMLElement | null)?.closest('[data-full]') as HTMLElement | null;
+    if (!trigger || !box || !img) return;
+    e.preventDefault();
+    img.src = trigger.dataset.full ?? '';
+    img.alt = trigger.querySelector('img')?.alt ?? 'Enlarged screenshot';
+    box.showModal();
+  });
+  box?.addEventListener('click', (e) => { if (e.target === box) box.close(); });
+</script>
+
+<style>
+  .lightbox {
+    max-width: min(96vw, 2000px);
+    max-height: 94vh;
+    margin: auto;
+    padding: 0;
+    border: 1.5px solid var(--rule-strong);
+    background: var(--void);
+    box-shadow: var(--print-red);
+    overflow: visible;
+  }
+
+  .lightbox::backdrop { background: rgba(6, 7, 10, 0.88); }
+
+  .lightbox img { display: block; max-width: 100%; max-height: 92vh; }
+
+  .lightbox-close-form { position: absolute; top: -18px; right: -18px; }
+
+  .lightbox-close {
+    width: 36px;
+    height: 36px;
+    font-size: 1.4rem;
+    line-height: 1;
+    border: none;
+    background: var(--red);
+    color: var(--on-red);
+    cursor: pointer;
+    box-shadow: var(--print-sm);
+  }
+</style>

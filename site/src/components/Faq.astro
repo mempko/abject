@@ -1,49 +1,80 @@
 ---
+import SectionHead from './ui/SectionHead.astro';
+
+type QuestionId = 'name' | 'code' | 'key' | 'llm' | 'actors' | 'safe' | 'terminal' | 'cost';
+
+interface Props {
+  num?: string;
+  /** Show only these questions, in this order (default: all of them). */
+  only?: QuestionId[];
+  /** 'paper' is the full-bleed paper field; 'void' sits on the page ground. */
+  ground?: 'paper' | 'void';
+}
+
+const { num = '09', only, ground = 'paper' } = Astro.props;
+
 const questions = [
   {
+    id: 'name',
     q: 'Why is it called Abject?',
-    a: 'It is short for "AI object," and yes, the dictionary meaning is "utterly hopeless." Anyone who has maintained object-oriented code knows the two meanings are compatible. Abject is object-oriented programming that admits what it is: objects written by fallible people (and now fallible machines), expected to misbehave, and therefore surrounded by contracts, sandboxes, and supervisors. The name is a joke at software\'s expense, not a prophecy.',
+    a: 'Abject is short for AI Object. We call them Abjects: as in AI Object, and as in abject horror. The name fits. Anyone who has maintained object-oriented code knows the two meanings go together. The objects are written by people who make mistakes, and now by machines that make mistakes too, so every one of them runs inside contracts, sandboxes and supervisors. The horror is a joke about software, not a prediction.',
   },
   {
+    id: 'code',
     q: 'Do I have to know how to code?',
-    a: 'No. Describe what you want and an abject appears, window and all. Every abject carries its own source code, so the curious can always open the hood, but you never have to. If you can complain, you can program.',
+    a: 'No. Describe what you want and an abject appears, window and all. Every abject carries its own source code, so you can open it up if you\'re curious, but you never have to. That\'s the whole point: regular people creating their own software that they control. If you can complain, you can program.',
   },
   {
+    id: 'key',
     q: 'Do I need an API key or an AI subscription?',
-    a: 'Abject needs a mind to borrow, and it is flexible about whose. Bring an API key from Anthropic, OpenAI, Google, OpenRouter, DeepSeek, xAI, Moonshot, MiniMax, or Meta; run a local Ollama model (free, private, entirely on your hardware); reuse the Claude Code, Codex, or Antigravity CLI you already log into; or let another machine on the mesh serve you its models. On first boot the app opens its settings and asks which mind to summon.',
+    a: 'Abject needs an LLM to think with, and you choose which one. Use an API key from Anthropic, OpenAI, Google, OpenRouter, DeepSeek, xAI, Moonshot, MiniMax or Meta. Run a local model with Ollama, which is free and never leaves your machine. Reuse the Claude Code, Codex or Antigravity CLI you\'re already logged into. Or let another machine on the mesh serve you its models. On first launch the app opens its settings and asks you to pick one.',
   },
   {
+    id: 'llm',
     q: 'Does an LLM read every message?',
-    a: 'No. Messages between abjects are ordinary typed payloads on a message bus: fast, deterministic, and LLM-free. The LLM is a service an abject calls when it actually needs to think: negotiating a protocol with a stranger, generating a new object, or answering a question in plain English. The rest of the time it is just objects passing messages, the way software has done since Smalltalk.',
+    a: 'No. Messages between abjects are ordinary typed messages on a message bus. They\'re fast, predictable, and no LLM touches them. An abject calls the LLM only when it needs to think: when it works out how to talk to an object it has never met, writes a new object, or answers a question in plain English. The rest of the time it\'s just objects passing messages, the way software has done since Smalltalk.',
   },
   {
+    id: 'actors',
     q: 'Why LLMs? Why not just actors?',
-    a: 'Abjects ARE actors. Each one has a mailbox and handles messages one at a time, exactly as Erlang or Akka would. The distinction is a single requirement: every actor must implement an ask handler, and that is the only handler that may need an LLM. Classic actor systems compose only when their developers agreed on message shapes beforehand; ask lets actors that have never met interview each other and generate their own glue. So: an actor system where every actor can be asked. A simple idea with some crazy cool benefits.',
+    a: 'Abjects are actors. Each one has a mailbox and handles one message at a time, like in Erlang. The difference is that every object in the system has a mandatory message handler called ask, and that\'s the only handler that may need an LLM. Classic actor systems only work together when their developers agreed on the messages ahead of time. With ask, two objects that have never met can ask each other how they work and write their own glue. It\'s a simple idea. Is it useful? Oh, it\'s very useful.',
   },
   {
+    id: 'safe',
     q: 'Is it safe to let this thing touch my machine?',
-    a: 'Abjects reach only what you grant. Files, shell, network, and clipboard are permission-gated capabilities: an abject born without one cannot use it, no matter how politely it asks, and the first request for anything new stops at a prompt that waits for you. Generated code runs in a locked-down interpreter inside worker threads, with no direct access to the filesystem, the network, or the process; abjects written in other languages run as WebAssembly with the same discipline. Everything lives on your machine. The horror is thematic. The containment is real.',
+    a: 'Abjects can only reach what you allow. Files, the shell, the network and the clipboard are capabilities you have to grant. An abject created without one can\'t use it, no matter how politely it asks, and the first time anything asks for something new, a prompt waits for you. Code the LLM writes runs in a locked-down interpreter in worker threads, with no direct access to the filesystem, the network or the process. Abjects written in other languages run as WebAssembly under the same rules. Everything stays on your machine. The horror is the theme. The sandbox is real.',
   },
   {
+    id: 'terminal',
     q: 'Do I need the terminal?',
-    a: 'No. Download the desktop app and open it like anything else. The terminal ritual further down is for developers who want to build from source and commune with the depths directly.',
+    a: 'No. Download the desktop app and open it like any other app. Building from source is for developers who want to hack on it.',
   },
   {
+    id: 'cost',
     q: 'What does it cost?',
-    a: 'Nothing. Free and open source under GPL-3.0. No account, no telemetry, no subscription, no trial that expires at the worst moment. The only cost is LLM tokens, and with Ollama even that rounds down to electricity.',
+    a: 'Nothing. It\'s free and open source under GPL-3.0. There\'s no account, no telemetry and no subscription. You pay for LLM tokens if you use a paid provider, and with Ollama even that is just your electricity bill.',
   },
 ];
+
+const shown = only ? only.map((id) => questions.find((q) => q.id === id)!).filter(Boolean) : questions;
 ---
 
-<section id="faq" class="faq-section">
-  <div class="container">
-    <h2 class="section-title">Fair Questions</h2>
-    <p class="faq-subtitle">Reasonable things to ask before installing software that talks back.</p>
+<section id="faq" class:list={['faq-section', ground === 'paper' ? 'field-paper on-paper' : 'on-void']}>
+  <div class="container faq-layout">
+    <div class="faq-head">
+      <SectionHead num={num} kicker="Questions" title="Fair Questions">
+        <p>The things people usually ask before they install it.</p>
+      </SectionHead>
+    </div>
 
     <div class="faq-list">
-      {questions.map((item) => (
+      {shown.map((item, i) => (
         <details class="faq-item">
-          <summary class="faq-q">{item.q}</summary>
+          <summary class="faq-q">
+            <span class="faq-n" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span>
+            <span class="faq-text">{item.q}</span>
+            <span class="faq-toggle" aria-hidden="true"></span>
+          </summary>
           <p class="faq-a">{item.a}</p>
         </details>
       ))}
@@ -52,75 +83,149 @@ const questions = [
 </section>
 
 <style>
-  .faq-section {
-    background: transparent;
+  /* The questions sit on the paper ground, cut on a slant top and bottom. */
+  .faq-section.on-paper {
+    clip-path: polygon(0 3.5vw, 100% 0, 100% calc(100% - 3.5vw), 0 100%);
+    padding: calc(var(--section-gap) + 3.5vw) 0;
+    margin: 2rem 0;
   }
 
-  .faq-subtitle {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 1rem;
-    max-width: 640px;
-    margin: -1.5rem auto 2.5rem;
-    line-height: 1.7;
+  /* On the void the same accordion is drawn in bone. */
+  .faq-section.on-void {
+    --field-ink: var(--bone-heading);
+    --field-ink-2: var(--bone-2);
+    --field-rule: var(--rule-mid);
   }
+
+  .on-void .faq-q:hover { background: var(--panel); }
+  .on-void .faq-q:hover .faq-toggle { background: var(--panel-2); }
+
+  .faq-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
+    gap: 3.5rem;
+    align-items: start;
+  }
+
+  .faq-head {
+    position: sticky;
+    top: 110px;
+  }
+
+  .faq-head :global(.section-title) { font-size: clamp(2.4rem, 5vw, 4.2rem); }
 
   .faq-list {
-    max-width: 720px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
+    border-top: 3px solid var(--field-ink);
   }
 
   .faq-item {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 1rem 1.5rem;
-    transition: border-color 0.3s, box-shadow 0.3s;
+    border-bottom: 1px solid var(--field-rule);
+    position: relative;
   }
 
-  .faq-item:hover,
-  .faq-item[open] {
-    border-color: var(--border-accent);
-    box-shadow: 0 0 16px var(--eldritch-glow);
+  .faq-item::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: -1px;
+    bottom: -1px;
+    width: 5px;
+    background: var(--red);
+    transform: scaleY(0);
+    transform-origin: top;
+    transition: transform 0.2s ease-out;
   }
+
+  .faq-item[open]::before { transform: scaleY(1); }
 
   .faq-q {
+    display: grid;
+    grid-template-columns: 2.6rem 1fr 28px;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1.15rem 0.25rem 1.15rem 1rem;
     cursor: pointer;
-    color: var(--text-primary);
-    font-family: var(--font-display);
-    font-size: 1.05rem;
-    font-weight: 600;
     list-style: none;
-    position: relative;
-    padding-right: 2rem;
+    transition: background-color 0.15s;
   }
 
-  .faq-q::-webkit-details-marker {
-    display: none;
-  }
+  .faq-q::-webkit-details-marker { display: none; }
+  .faq-q::marker { content: ''; }
 
-  .faq-q::after {
-    content: '{+}';
-    position: absolute;
-    right: 0;
-    top: 50%;
-    transform: translateY(-50%);
+  .faq-q:hover { background: rgba(22, 19, 15, 0.05); }
+
+  .faq-n {
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--eldritch);
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--red);
+    letter-spacing: 0.06em;
   }
 
-  .faq-item[open] .faq-q::after {
-    content: '{-}';
+  .faq-text {
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--field-ink);
+    line-height: 1.25;
   }
+
+  /* An inked square with a drawn plus; open, it fills red and shows a minus. */
+  .faq-toggle {
+    position: relative;
+    width: 28px;
+    height: 28px;
+    border: 2px solid var(--field-ink);
+    transition: background-color 0.15s, border-color 0.15s;
+  }
+
+  .faq-toggle::before,
+  .faq-toggle::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 12px;
+    height: 2px;
+    background: var(--field-ink);
+    transform: translate(-50%, -50%);
+    transition: transform 0.2s;
+  }
+
+  .faq-toggle::after { transform: translate(-50%, -50%) rotate(90deg); }
+
+  .faq-q:hover .faq-toggle { background: rgba(22, 19, 15, 0.08); }
+
+  .faq-item[open] .faq-toggle { background: var(--red); border-color: var(--red); }
+  .faq-item[open] .faq-toggle::before,
+  .faq-item[open] .faq-toggle::after { background: var(--on-red); }
+  .faq-item[open] .faq-toggle::after { transform: translate(-50%, -50%) rotate(0deg); }
 
   .faq-a {
-    margin-top: 0.75rem;
-    color: var(--text-secondary);
-    font-size: 0.95rem;
+    padding: 0 3rem 1.5rem calc(1rem + 2.6rem + 0.75rem);
+    color: var(--field-ink-2);
+    font-size: 1.02rem;
     line-height: 1.7;
+    max-width: 72ch;
+    animation: faq-in 0.22s ease-out;
+  }
+
+  @keyframes faq-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  @media (max-width: 900px) {
+    .faq-layout { grid-template-columns: 1fr; gap: 0; }
+    .faq-head { position: static; }
+  }
+
+  @media (max-width: 640px) {
+    .faq-q { grid-template-columns: 2rem 1fr 26px; gap: 0.6rem; padding: 1rem 0 1rem 0.75rem; }
+    .faq-text { font-size: 1rem; }
+    .faq-toggle { width: 26px; height: 26px; }
+    .faq-a { padding: 0 0.25rem 1.3rem calc(0.75rem + 2rem + 0.6rem); font-size: 0.97rem; }
   }
 </style>

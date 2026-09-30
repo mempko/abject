@@ -1,40 +1,65 @@
 ---
+/**
+ * The landing page: the hero, 00 the big idea (every object can be asked),
+ * then the three things built on it (01 make, 02 the team, 03 learning),
+ * then 04 yours and 05 get it.
+ * Everything else lives on /why and /install; the script at the bottom
+ * sends old landing anchors to their new homes.
+ */
 import Layout from '../layouts/Layout.astro';
 import Header from '../components/Header.astro';
 import Hero from '../components/Hero.astro';
-import Sightings from '../components/Sightings.astro';
-import Examples from '../components/Examples.astro';
-import FirstAbject from '../components/FirstAbject.astro';
-import WhyDifferent from '../components/WhyDifferent.astro';
-import Features from '../components/Features.astro';
-import Providers from '../components/Providers.astro';
-import WhatsNew from '../components/WhatsNew.astro';
-import Faq from '../components/Faq.astro';
-import Downloads from '../components/Downloads.astro';
-import Architecture from '../components/Architecture.astro';
-import Spreading from '../components/Spreading.astro';
-import Lineage from '../components/Lineage.astro';
-import QuickStart from '../components/QuickStart.astro';
+import BigIdea from '../components/BigIdea.astro';
+import SayIt from '../components/SayIt.astro';
+import Team from '../components/Team.astro';
+import Learns from '../components/Learns.astro';
+import Yours from '../components/Yours.astro';
+import GetAbject from '../components/GetAbject.astro';
 import Footer from '../components/Footer.astro';
 ---
 
-<Layout title="Abject: An Abject-Oriented OS">
+<Layout
+  title="Abject: An Abject-Oriented OS"
+  description="An Abject-Oriented OS for people to create software that's connected and personal to them. Every object answers ask in plain English. Free and open source."
+>
   <Header />
   <main>
     <Hero />
-    <Sightings />
-    <Examples />
-    <FirstAbject />
-    <WhyDifferent />
-    <Features />
-    <Providers />
-    <WhatsNew />
-    <Faq />
-    <Downloads />
-    <Architecture />
-    <Spreading />
-    <Lineage />
-    <QuickStart />
+    <BigIdea />
+    <SayIt />
+    <Team />
+    <Learns />
+    <Yours />
+    <GetAbject />
   </main>
   <Footer />
+  <script is:inline>
+    // Old landing anchors, now elsewhere: keep shared links working. Only
+    // hashes that no longer exist on this page are redirected.
+    (function () {
+      var moved = {
+        capabilities: '/why#capabilities',
+        features: '/why#features',
+        architecture: '/why#architecture',
+        spreading: '/why#spreading',
+        lineage: '/why#lineage',
+        why: '/why#why',
+        summon: '/install#summon',
+        providers: '/install#mind',
+        faq: '/install#faq',
+        'first-abject': '/install#first-abject',
+        'whats-new': '/changelog',
+        sightings: '#make',
+        scene: '#make',
+        examples: '#make'
+      };
+      function follow() {
+        var id = decodeURIComponent(location.hash.slice(1));
+        if (!id || document.getElementById(id) || !moved[id]) return;
+        location.replace(moved[id]);
+      }
+      follow();
+      window.addEventListener('hashchange', follow);
+    })();
+  </script>
 </Layout>

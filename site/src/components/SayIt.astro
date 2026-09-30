@@ -1,0 +1,272 @@
+---
+/**
+ * 01 Say it, and it's running. The proof first: the live desktop tour.
+ * Then real requests beside what stayed on the desktop (a ledger with the
+ * captures), and a compact strip showing it can look like anything: 3D in
+ * a window, materials, every window a slab in one scene, your own widgets.
+ */
+import SectionHead from './ui/SectionHead.astro';
+import Shot from './ui/Shot.astro';
+import type { ShotId } from '../data/shots';
+
+const requests: { say: string; quoted: boolean; got: string; shot?: ShotId }[] = [
+  {
+    say: 'Show me the Sun, the Earth, and the Moon, live, and keep it fresh.',
+    quoted: true,
+    got: 'A NASA viewer streaming the Sun and the Earth, refreshing itself every minute.',
+    shot: 'nasaViewer',
+  },
+  {
+    say: 'A task list, then a Kanban board over the same tasks.',
+    quoted: false,
+    got: 'Two windows on one set of tasks: inbox, next actions, projects on one side; To Do, In Progress, Done on the other, kept in sync.',
+    shot: 'tasksPair',
+  },
+  {
+    say: 'A client for my TiddlyWiki, so I can explore ten years of notes as a graph.',
+    quoted: false,
+    got: 'A graph of 474 notes and 14,615 links, clustered by tag. I didn’t have to switch to Obsidian to get it.',
+    shot: 'wikigraph',
+  },
+  {
+    say: 'When is low tide in Seattle tomorrow?',
+    quoted: true,
+    got: 'The answer came with a live NOAA tide widget, and the widget stayed on the desktop.',
+  },
+];
+
+const palettes = [
+  { name: 'Red Sigil', color: '#d32f22' },
+  { name: 'green', color: '#37ff8c' },
+  { name: 'cyan', color: '#3be0d8' },
+];
+---
+
+<section id="make" class="make-section">
+  <div class="container">
+    <SectionHead num="01" kicker="Make" title="Say it, and it's running">
+      Describe what you want in plain English and a real object appears on the desktop. It
+      has a window, a mailbox and its own source code, and it keeps working after you close the
+      chat. You never have to look at the code, but it&rsquo;s there if you want to.
+    </SectionHead>
+
+    <div class="tour">
+      <span class="pin live-pin" aria-hidden="true"></span>
+      <Shot id="tour" focus />
+    </div>
+
+    <div class="requests">
+      <p class="req-label"><span class="req-label-mark" aria-hidden="true"></span>Things I asked for, and what stayed on the desktop</p>
+      <ol class="req-list">
+        {requests.map((r, i) => (
+          <li class="req">
+            <span class="req-n" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span>
+            <p class:list={['req-say', { quoted: r.quoted }]}>
+              {r.quoted ? <>&ldquo;{r.say}&rdquo;</> : r.say}
+            </p>
+            <div class:list={['req-got', { bare: !r.shot }]}>
+              {r.shot && (
+                <div class="req-shot">
+                  <Shot id={r.shot} bare caption="" />
+                </div>
+              )}
+              <p class="req-got-text"><span class="req-arrow" aria-hidden="true">&#9654;</span> {r.got}</p>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+
+    <div class="look">
+      <h3 class="look-title">Make it look like anything</h3>
+      <div class="look-grid">
+        <div class="look-tile look-3d">
+          <Shot id="scene3d" bare caption="3D Pong in its own window, with real meshes, lights and a glowing ball." />
+        </div>
+        <div class="look-tile look-mat">
+          <Shot
+            id="materials"
+            bare
+            caption="Gold, chrome, glass, ceramic, neon, hologram. Each one is a single word, and you never write a shader."
+          />
+        </div>
+        <div class="look-tile look-exp">
+          <Shot id="expose" caption="Every window lives in one 3D scene. Press F3 and they all spread out so you can pick one." />
+        </div>
+        <div class="look-tile look-own">
+          <h4>Your own widgets</h4>
+          <p>
+            You (and your abjects) can add new widgets, materials, looks and window effects.
+            Each space can have its own colors.
+          </p>
+          <ul class="chips" aria-label="Three spaces, three palettes">
+            {palettes.map((p) => (
+              <li><span class="chip" style={`--chip: ${p.color}`} aria-hidden="true"></span>{p.name}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .make-section { overflow-x: clip; }
+
+  /* The proof: the live tour, full width, with the living pin. */
+  .tour { position: relative; margin-bottom: 4.5rem; }
+
+  .pin {
+    position: absolute;
+    top: -14px;
+    left: -14px;
+    z-index: 5;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    background: var(--void);
+    border: 2px solid var(--red);
+    box-shadow: var(--print-sm);
+  }
+
+  .pin::after {
+    content: '';
+    width: 8px;
+    height: 8px;
+    background: var(--living);
+    box-shadow: 0 0 8px var(--living-glow);
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+
+  /* Real requests: a ledger. The sentence set large on the left, what it
+     became on the right, with the capture when there is one. */
+  .req-label {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+    margin-bottom: 0.8rem;
+  }
+
+  .req-label-mark { width: 8px; height: 8px; background: var(--red); }
+
+  .req-list { list-style: none; border-top: 4px solid var(--red); }
+
+  .req {
+    display: grid;
+    grid-template-columns: 3.4rem minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: 1.6rem;
+    align-items: center;
+    padding: 1.5rem 0;
+    border-bottom: var(--rule-w) solid var(--rule);
+  }
+
+  .req-n {
+    align-self: center;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 2.2rem;
+    line-height: 1;
+    color: var(--red);
+  }
+
+  .req-say {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(1.35rem, 2.3vw, 1.9rem);
+    line-height: 1.15;
+    letter-spacing: 0.01em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+  }
+
+  .req-say:not(.quoted) { color: var(--bone-2); }
+
+  .req-got {
+    display: grid;
+    grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+    gap: 1.1rem;
+    align-items: center;
+  }
+
+  .req-got.bare { grid-template-columns: 1fr; }
+
+  .req-shot { transform: rotate(-1deg); }
+  .req:nth-child(even) .req-shot { transform: rotate(1.2deg); }
+
+  .req-shot :global(.shot) { box-shadow: var(--print-sm); }
+
+  .req-got-text {
+    font-size: 0.97rem;
+    line-height: 1.55;
+    color: var(--bone-2);
+  }
+
+  .req-arrow { color: var(--red); font-size: 0.7rem; margin-right: 0.2rem; }
+
+  /* It can look like anything: a strip of four, three captures and a
+     solid red tile. */
+  .look { margin-top: 4rem; }
+
+  .look-title {
+    font-size: 1.5rem;
+    letter-spacing: 0.05em;
+    margin-bottom: 1.4rem;
+  }
+
+  .look-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 1.45fr) minmax(0, 1fr);
+    gap: 1.25rem;
+    align-items: start;
+  }
+
+  .look-own {
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 1.3rem;
+    background: var(--red);
+    color: var(--on-red);
+    box-shadow: var(--print);
+  }
+
+  .look-own h4 { color: var(--on-red); font-size: 1.15rem; }
+  .look-own p { color: var(--on-red); font-size: 0.93rem; line-height: 1.55; }
+
+  .chips { list-style: none; display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; margin-top: auto; padding-top: 0.6rem; }
+
+  .chips li {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--on-red);
+  }
+
+  .chip { width: 16px; height: 11px; background: var(--chip); outline: 1.5px solid rgba(22, 19, 15, 0.7); }
+
+  @media (max-width: 1000px) {
+    .req { grid-template-columns: 3rem minmax(0, 1fr); gap: 0.9rem 1.2rem; }
+    .req-got { grid-column: 2; grid-template-columns: minmax(0, 13rem) minmax(0, 1fr); }
+    .look-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 560px) {
+    .req-got { grid-template-columns: 1fr; }
+    .req-shot { max-width: 260px; }
+    .look-grid { gap: 1rem; }
+    .look-exp, .look-own { grid-column: 1 / -1; }
+    .tour { margin-bottom: 3rem; }
+    .pin { top: -12px; left: -8px; }
+  }
+</style>

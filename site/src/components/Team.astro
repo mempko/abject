@@ -1,0 +1,251 @@
+---
+/**
+ * 02 A team that asks, plans and replans. The scrum loop drawn as the hero
+ * of the section (goal, ask the team, assign, act, review, and the next
+ * round rewritten), then four plain facts about how the team runs. The
+ * asking itself is the big idea (00), so this section points back to it.
+ */
+import SectionHead from './ui/SectionHead.astro';
+
+const facts = [
+  { t: 'Asked, not assumed', n: 'This is the big idea at work. Each agent is asked what it can do for the goal, and it answers or passes. The ScrumMaster assigns the tasks from the answers.' },
+  { t: 'Failures count', n: 'A sprint ends when its tasks finish or fail. The ScrumMaster reviews what really happened, including what failed, and the team decides to stop or run another sprint.' },
+  { t: 'Plans change', n: 'Finding something new in the middle of a task isn\u2019t a defect in the plan, it\u2019s expected. An agent can replan: it says what it found and asks the others what should change.' },
+  { t: 'Goals outlive the machine', n: 'Goals sync across your peers, so a goal survives the machine it started on.' },
+];
+---
+
+<section id="team" class="team-section">
+  <div class="container">
+    <SectionHead num="02" kicker="Team" title="A team that asks, plans and replans">
+      You describe the goal: what you want, not how to get it. A team of agents works on it
+      in sprints, like Scrum. They agree on who does what, and each task completes or fails.
+      Then the ScrumMaster reviews what happened and the team plans the next sprint, learning
+      from what failed. Rinse and repeat until the goal is done. The agents are abjects too.
+    </SectionHead>
+
+    <figure class="loop" aria-labelledby="loop-cap">
+      <svg class="loop-wide" viewBox="0 0 1160 380" role="img" aria-labelledby="loop-cap">
+        <defs>
+          <marker id="tm-live" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-live" />
+          </marker>
+          <marker id="tm-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-red" />
+          </marker>
+          <marker id="tm-bone" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-bone" />
+          </marker>
+        </defs>
+
+        <!-- stages -->
+        <rect class="n-goal" x="20" y="130" width="130" height="70" />
+        <text class="t-stage on-red" x="85" y="173" text-anchor="middle">GOAL</text>
+        <text class="t-note" x="85" y="226" text-anchor="middle">from you</text>
+
+        <rect class="n-box" x="215" y="130" width="190" height="70" />
+        <text class="t-stage" x="310" y="173" text-anchor="middle">ASK THE TEAM</text>
+        <text class="t-quote" x="310" y="112" text-anchor="middle">&ldquo;Can you do this?&rdquo;</text>
+        <text class="t-note" x="322" y="226" text-anchor="middle">each agent answers,</text>
+        <text class="t-note" x="322" y="244" text-anchor="middle">or replies PASS</text>
+
+        <rect class="n-box" x="470" y="130" width="150" height="70" />
+        <text class="t-stage" x="545" y="173" text-anchor="middle">ASSIGN</text>
+        <text class="t-note" x="545" y="226" text-anchor="middle">the ScrumMaster</text>
+        <text class="t-note" x="545" y="244" text-anchor="middle">picks who does what</text>
+
+        <rect class="n-box" x="685" y="130" width="150" height="70" />
+        <text class="t-stage" x="760" y="173" text-anchor="middle">ACT</text>
+        <text class="t-note" x="760" y="226" text-anchor="middle">the agents do</text>
+        <text class="t-note" x="760" y="244" text-anchor="middle">the work</text>
+
+        <rect class="n-key" x="900" y="130" width="150" height="70" />
+        <text class="t-stage" x="975" y="173" text-anchor="middle">REVIEW</text>
+        <text class="t-note" x="975" y="96" text-anchor="middle">what really happened,</text>
+        <text class="t-note" x="975" y="114" text-anchor="middle">failures included</text>
+
+        <!-- flow between stages (living: work moving) -->
+        <line class="f-live" x1="150" y1="165" x2="211" y2="165" marker-end="url(#tm-live)" />
+        <line class="f-live" x1="405" y1="165" x2="466" y2="165" marker-end="url(#tm-live)" />
+        <line class="f-live" x1="620" y1="165" x2="681" y2="165" marker-end="url(#tm-live)" />
+        <line class="f-live" x1="835" y1="165" x2="896" y2="165" marker-end="url(#tm-live)" />
+
+        <!-- replan mid-task: a small loop over ACT -->
+        <path class="f-red thin" d="M 725 130 C 725 72, 795 72, 795 126" marker-end="url(#tm-red)" />
+        <text class="t-red" x="760" y="62" text-anchor="middle">replan mid-task</text>
+
+        <!-- outcomes -->
+        <path class="f-bone" d="M 1050 150 L 1098 104" marker-end="url(#tm-bone)" />
+        <text class="t-out" x="1104" y="98">DONE</text>
+        <path class="f-bone" d="M 1050 182 L 1098 226" marker-end="url(#tm-bone)" />
+        <text class="t-out dim" x="1104" y="242">FAIL</text>
+
+        <!-- next sprint: a new plan -->
+        <path class="f-red" d="M 1036 200 L 1036 318 Q 1036 330 1024 330 L 233 330 Q 221 330 221 318 L 221 206" marker-end="url(#tm-red)" />
+        <text class="t-round" x="642" y="358" text-anchor="middle">NEXT SPRINT: A NEW PLAN FROM WHAT REALLY HAPPENED</text>
+      </svg>
+
+      <svg class="loop-tall" viewBox="0 0 360 700" role="img" aria-labelledby="loop-cap">
+        <defs>
+          <marker id="tv-live" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-live" />
+          </marker>
+          <marker id="tv-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-red" />
+          </marker>
+          <marker id="tv-bone" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="m-bone" />
+          </marker>
+        </defs>
+
+        <rect class="n-goal" x="48" y="16" width="150" height="54" />
+        <text class="t-stage on-red" x="123" y="50" text-anchor="middle">GOAL</text>
+        <text class="t-note" x="212" y="48">from you</text>
+
+        <rect class="n-box" x="48" y="118" width="150" height="54" />
+        <text class="t-stage" x="123" y="152" text-anchor="middle">ASK</text>
+        <text class="t-note" x="212" y="140">&ldquo;can you do this?&rdquo;</text>
+        <text class="t-note" x="212" y="158">answer, or PASS</text>
+
+        <rect class="n-box" x="48" y="220" width="150" height="54" />
+        <text class="t-stage" x="123" y="254" text-anchor="middle">ASSIGN</text>
+        <text class="t-note" x="212" y="244">the ScrumMaster</text>
+        <text class="t-note" x="212" y="262">picks who</text>
+
+        <rect class="n-box" x="48" y="322" width="150" height="54" />
+        <text class="t-stage" x="123" y="356" text-anchor="middle">ACT</text>
+        <path class="f-red thin" d="M 198 332 C 236 332, 236 366, 202 366" marker-end="url(#tv-red)" />
+        <text class="t-red small" x="244" y="354">replan</text>
+
+        <rect class="n-key" x="48" y="424" width="150" height="54" />
+        <text class="t-stage" x="123" y="458" text-anchor="middle">REVIEW</text>
+        <text class="t-note" x="212" y="446">what really</text>
+        <text class="t-note" x="212" y="464">happened</text>
+
+        <line class="f-live" x1="123" y1="70" x2="123" y2="114" marker-end="url(#tv-live)" />
+        <line class="f-live" x1="123" y1="172" x2="123" y2="216" marker-end="url(#tv-live)" />
+        <line class="f-live" x1="123" y1="274" x2="123" y2="318" marker-end="url(#tv-live)" />
+        <line class="f-live" x1="123" y1="376" x2="123" y2="420" marker-end="url(#tv-live)" />
+
+        <path class="f-bone" d="M 100 478 L 80 530" marker-end="url(#tv-bone)" />
+        <text class="t-out" x="46" y="552">DONE</text>
+        <path class="f-bone" d="M 146 478 L 166 530" marker-end="url(#tv-bone)" />
+        <text class="t-out dim" x="150" y="552">FAIL</text>
+
+        <path class="f-red" d="M 48 451 L 26 451 Q 16 451 16 441 L 16 155 Q 16 145 26 145 L 44 145" marker-end="url(#tv-red)" />
+        <text class="t-round" x="16" y="600">NEXT SPRINT:</text>
+        <text class="t-round" x="16" y="622">A NEW PLAN</text>
+      </svg>
+
+      <figcaption id="loop-cap" class="loop-cap">
+        The sprint loop. The team is asked who can help, the tasks are assigned and done, and
+        the ScrumMaster reviews what really happened. Then another sprint, planned from that
+        review, until the goal is done or failed.
+      </figcaption>
+    </figure>
+
+    <ol class="facts">
+      {facts.map((f, i) => (
+        <li>
+          <span class="ix">{String(i + 1).padStart(2, '0')}</span>
+          <div>
+            <h3 class="fact-t">{f.t}</h3>
+            <p class="fact-n">{f.n}</p>
+          </div>
+        </li>
+      ))}
+    </ol>
+    <p class="team-links">
+      <a href="#big-idea">&uarr; The big idea</a>
+      <a href="/why#emergence">How the scrum works &rarr;</a>
+      <a href="/ask-protocol">The Ask Protocol &rarr;</a>
+    </p>
+  </div>
+</section>
+
+
+<style>
+  /* ── The loop, drawn on the void ── */
+  .loop { margin: 0.5rem 0 4.5rem; }
+
+  .loop svg { display: block; width: 100%; height: auto; }
+  .loop-tall { display: none !important; max-width: 420px; }
+
+  .n-box { fill: var(--panel); stroke: var(--rule-strong); stroke-width: 1.5; }
+  .n-goal { fill: var(--red); }
+  .n-key { fill: var(--panel); stroke: var(--red); stroke-width: 3; }
+
+  .t-stage {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 22px;
+    letter-spacing: 0.08em;
+    fill: var(--bone-heading);
+  }
+
+  .t-stage.on-red { fill: var(--on-red); }
+
+  .t-note { font-family: var(--font-mono); font-size: 13px; fill: var(--bone-3); }
+
+  .t-quote { font-family: var(--font-mono); font-size: 14px; fill: var(--bone); }
+
+  .t-red { font-family: var(--font-mono); font-size: 13px; fill: var(--red-hot); letter-spacing: 0.04em; }
+  .t-red.small { font-size: 12px; }
+
+  .t-out { font-family: var(--font-display); font-weight: 600; font-size: 18px; letter-spacing: 0.1em; fill: var(--bone-heading); }
+  .t-out.dim { fill: var(--diagram-muted); }
+
+  .t-round { font-family: var(--font-display); font-weight: 600; font-size: 16px; letter-spacing: 0.12em; fill: var(--red-hot); }
+
+  .f-live { stroke: var(--living); stroke-width: 2.5; fill: none; }
+  .f-red { stroke: var(--red); stroke-width: 3; fill: none; }
+  .f-red.thin { stroke-width: 2; }
+  .f-bone { stroke: var(--bone-3); stroke-width: 1.5; fill: none; }
+
+  .m-live { fill: var(--living); }
+  .m-red { fill: var(--red); }
+  .m-bone { fill: var(--bone-3); }
+
+  .loop-cap {
+    margin-top: 1rem;
+    max-width: 760px;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    line-height: 1.6;
+    color: var(--bone-meta);
+  }
+
+  /* ── Four facts: a two-by-two ruled grid on the void ── */
+  .facts {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 3rem;
+    border-top: 4px solid var(--red);
+  }
+
+  .facts li {
+    display: grid;
+    grid-template-columns: 3rem minmax(0, 1fr);
+    gap: 0.6rem;
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .facts .ix { font-family: var(--font-mono); font-size: 0.8rem; color: var(--red); letter-spacing: 0.08em; padding-top: 0.2rem; }
+
+  .fact-t { font-size: 1.1rem; letter-spacing: 0.06em; margin-bottom: 0.3rem; }
+  .fact-n { font-size: 0.95rem; line-height: 1.6; color: var(--bone-3); }
+
+  .team-links { display: flex; flex-wrap: wrap; gap: 0.5rem 1.6rem; margin-top: 1.4rem; font-family: var(--font-mono); font-size: 0.86rem; }
+
+  @media (max-width: 800px) {
+    .facts { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 700px) {
+    .loop-wide { display: none !important; }
+    .loop-tall { display: block !important; margin: 0 auto; }
+  }
+
+</style>

@@ -1,5 +1,12 @@
 ---
+/**
+ * The front poster: the headline set big with its red band, the eye sigil
+ * pierced by a red wedge, the pitch and the download block on the left,
+ * the three things that make Abject what it is as a numbered index (each
+ * links to its section), the desktop screenshot, and the dictionary joke.
+ */
 import { latestRelease, platformAssets, fmtSize } from '../lib/releases';
+import Shot from './ui/Shot.astro';
 
 const rel = await latestRelease();
 const pa = platformAssets(rel);
@@ -13,112 +20,108 @@ const direct = {
   mac: pa.macArmDmg,
   macAlt: pa.macX64Dmg,
 };
+
+const things = [
+  { n: '01', href: '#make', text: "Say it, and it's running" },
+  { n: '02', href: '#team', text: 'A team that asks, plans and replans' },
+  { n: '03', href: '#learns', text: 'It gets smarter every time', key: true },
+];
 ---
 
 <section class="hero">
-  <div class="hero-bg"></div>
-  <div class="container hero-content">
-    <h1>
-      An <span class="accent">Abject-Oriented</span> OS
-    </h1>
-    <p class="hero-hook">
-      Describe what you want. An <em>abject</em> appears, window and all,
-      and it keeps working after you stop talking to it.
-    </p>
-    <p class="hero-sub">
-      For anyone, not just developers. Free, open source, and local-first:
-      your machine, your data, no cloud, no code required.
-    </p>
-    <div class="hero-actions">
-      <a
-        href="#downloads"
-        class="btn btn-primary hero-dl"
-        id="hero-dl"
-        data-linux-url={direct.linux?.url}
-        data-linux-size={fmtSize(direct.linux?.size)}
-        data-linux-alt-url={direct.linuxAlt?.url}
-        data-win-url={direct.win?.url}
-        data-win-size={fmtSize(direct.win?.size)}
-        data-mac-url={direct.mac?.url}
-        data-mac-size={fmtSize(direct.mac?.size)}
-        data-mac-alt-url={direct.macAlt?.url}
-      >Download</a>
-      <a href="#summon" class="btn btn-outline">Build from Source</a>
-    </div>
-    <p class="hero-meta">
-      {rel.version && <span class="hero-version">v{rel.version}</span>}
-      <span>Linux &middot; Windows &middot; macOS</span>
-      <span class="hero-meta-sep">&middot;</span>
-      <span>free and open source, GPL-3.0</span>
-      <span class="hero-meta-sep">&middot;</span>
-      <a href="/install">install guide</a>
-      <span id="hero-dl-alt" class="hero-dl-alt"></span>
-    </p>
-    <p class="hero-needs">
-      Needs a mind to borrow: an API key, a free local model through Ollama,
-      or the coding CLI you already log into. You pick on first launch.
-    </p>
+  <div class="container">
+    <div class="hero-poster">
+      <h1 class="hero-title">
+        <span class="t-line t-an">An</span>
+        <span class="t-line t-red"><span class="t-red-ink">Abject-Oriented</span></span>
+        <span class="t-line t-os">OS</span>
+      </h1>
 
-    <figure class="hero-shot">
-      <button class="sighting-frame hero-shot-frame" type="button" data-full="/gallery/desktop.webp" aria-label="Enlarge screenshot">
-        <img
-          src="/gallery/desktop.webp"
-          alt="A full Abject desktop: a chat window creating a weather abject, a Seattle tide schedule widget, and a large colorful graph of wiki notes, with a sidebar of running abjects"
-          width="1600"
-          height="1000"
-          decoding="async"
-          fetchpriority="high"
-        />
-      </button>
-      <figcaption class="hero-shot-caption">
-        A real desktop, mid-sentence: a weather abject being spoken into existence while
-        the tide schedule and a map of 427 wiki notes keep running. Nothing staged.
-      </figcaption>
-    </figure>
+      <svg class="hero-mark" viewBox="0 0 320 320" aria-hidden="true" focusable="false">
+        <circle class="mark-well" cx="186" cy="138" r="104" />
+        <line class="mark-rule" x1="18" y1="286" x2="306" y2="22" />
+        <line class="mark-rule" x1="40" y1="60" x2="300" y2="236" />
+        <circle class="mark-ring" cx="186" cy="138" r="104" />
+        <ellipse class="mark-pupil" cx="186" cy="138" rx="15" ry="58" />
+        <polygon class="mark-wedge" points="0,318 0,272 84,302" />
+        <rect class="mark-square" x="274" y="252" width="22" height="22" />
+      </svg>
 
-    <div class="hero-glyphs">
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}?{'}'}</span>
-        <span class="glyph-text">Objects that explain themselves</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}!{'}'}</span>
-        <span class="glyph-text">Objects that repair their own plumbing</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{'{'}*{'}'}</span>
-        <span class="glyph-text">Software that grows by adoption</span>
-      </div>
-    </div>
-
-    <h2 class="section-title hero-desc-heading">What are Abjects?</h2>
-    <div class="ask-demo">
-      <p class="ask-call">
-        <span class="ask-you">you</span><span class="ask-op">&gt;</span><code class="ask-code">{'ask({ question: "what are you?" })'}</code><span class="ask-cursor" aria-hidden="true"></span>
-      </p>
-      <div class="ask-reply">
-        <div class="ask-reply-bar">
-          <span class="ask-reply-title"><span class="ask-reply-icon">💬</span> reply from: abject</span>
-          <span class="ask-reply-controls" aria-hidden="true">?&ensp;&minus;&ensp;&times;</span>
+      <div class="hero-copy">
+        <p class="hero-hook">
+          Describe what you want and an <em>abject</em> appears, window and all.
+          It keeps working after you stop talking to it, and it learns from
+          every goal.
+        </p>
+        <p class="hero-sub">
+          Software that&rsquo;s connected and personal to you, and you don&rsquo;t
+          need to know how to program. It&rsquo;s free, open source, and it runs
+          on your machine.
+        </p>
+        <div class="hero-actions">
+          <a
+            href="#downloads"
+            class="btn btn-primary hero-dl"
+            id="hero-dl"
+            data-linux-url={direct.linux?.url}
+            data-linux-size={fmtSize(direct.linux?.size)}
+            data-linux-alt-url={direct.linuxAlt?.url}
+            data-win-url={direct.win?.url}
+            data-win-size={fmtSize(direct.win?.size)}
+            data-mac-url={direct.mac?.url}
+            data-mac-size={fmtSize(direct.mac?.size)}
+            data-mac-alt-url={direct.macAlt?.url}
+          >Download</a>
+          <a href="/install#summon" class="btn btn-outline">Build from Source</a>
         </div>
-        <div class="ask-reply-body">
-          <p>
-            Not an app. A small living object: a window, an agent, a tool, a peer.
-            I carry my own description, talk to my neighbors through messages, and
-            answer for myself in plain English. Which is what I am doing right now.
-            Politely.
-          </p>
-          <p>
-            Engineers will recognize my species: an actor, but one you can interview.
-            <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
-          </p>
-        </div>
+        <p class="hero-meta">
+          {rel.version && <span class="hero-version">v{rel.version}</span>}
+          <span>Linux &middot; Windows &middot; macOS</span>
+          <span class="hero-meta-sep">&middot;</span>
+          <span>free and open source, GPL-3.0</span>
+          <span class="hero-meta-sep">&middot;</span>
+          <a href="/install">install guide</a>
+          <span id="hero-dl-alt" class="hero-dl-alt"></span>
+        </p>
+        <p class="hero-needs">
+          It needs a model to think with: an API key, a free local model through
+          Ollama, or a coding CLI you already log into. You pick one the first
+          time you open it.
+        </p>
       </div>
+
+      <nav class="hero-claims" aria-label="One idea, and three things it makes possible">
+        <p class="claims-label">One idea</p>
+        <a class="idea" href="#big-idea">
+          <span class="idea-n">00</span>
+          <span class="idea-text">Everything is an abject, and every abject can be asked</span>
+          <span class="claim-go" aria-hidden="true">&#9654;</span>
+        </a>
+        <p class="claims-label">Three things it makes possible</p>
+        <ol>
+          {things.map((c) => (
+            <li class:list={['claim', { key: c.key }]}>
+              <a href={c.href}>
+                <span class="claim-n">{c.n}</span>
+                <span class="claim-text">{c.text}</span>
+                <span class="claim-go" aria-hidden="true">&#9654;</span>
+              </a>
+            </li>
+          ))}
+        </ol>
+      </nav>
     </div>
+
+    <div class="hero-shot">
+      <Shot id="hero" focus eager caption="A real desktop: a graph of 474 notes and 14,615 links, the list of chats, and a chat working on a goal to upgrade a fish tank." />
+    </div>
+
     <p class="hero-tagline">
-      abject <span class="dim">(n.)</span> 1. an AI object. 2. &lsquo;utterly hopeless&rsquo;.
-      Anyone who has maintained object-oriented code knows the two meanings are compatible.
+      <span class="tag-word">abject</span>
+      We call them abjects. As in AI Object. As in abject horror.
+      <span class="tag-joke">The name fits.</span>
     </p>
+    </div>
   </div>
 </section>
 
@@ -162,388 +165,327 @@ const direct = {
     }
   }
 
-  const demo = document.querySelector('.ask-demo');
-  if (demo && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    demo.setAttribute('data-armed', '');
-    new IntersectionObserver((entries, obs) => {
-      for (const e of entries) {
-        if (e.isIntersecting) {
-          demo.classList.add('play');
-          obs.disconnect();
-        }
-      }
-    }, { threshold: 0.5 }).observe(demo);
-  }
 </script>
 
 <style>
   .hero {
     position: relative;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    padding-top: 64px;
-    padding-bottom: 0;
+    padding-top: calc(66px + 3rem);
+    padding-bottom: calc(var(--section-gap) * 0.5);
     overflow: hidden;
   }
 
-  .hero-bg {
-    position: absolute;
-    inset: 0;
-    background:
-      radial-gradient(ellipse 60% 50% at 50% 30%, rgba(91, 229, 160, 0.07) 0%, transparent 60%),
-      radial-gradient(ellipse 40% 40% at 70% 20%, rgba(139, 123, 255, 0.05) 0%, transparent 50%),
-      radial-gradient(ellipse 30% 30% at 30% 60%, rgba(91, 229, 160, 0.04) 0%, transparent 50%);
-    pointer-events: none;
-    animation: pulse-glow 8s ease-in-out infinite;
-  }
-
-  .hero-content {
+  /* ── The poster: headline, eye mark, copy ── */
+  .hero-poster {
     position: relative;
-    text-align: center;
-    padding-top: 4rem;
-    padding-bottom: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 4fr);
+    grid-template-areas:
+      'title title'
+      'copy  claims';
+    column-gap: 4rem;
+    align-items: start;
   }
 
-  h1 {
-    margin-bottom: 1.5rem;
-    text-shadow: 0 0 40px rgba(91, 229, 160, 0.1);
-    animation: glitch 12s infinite;
+  .hero-title {
+    grid-area: title;
+    position: relative;
+    z-index: 1;
+    font-size: clamp(2.9rem, 7.9vw, 7.2rem);
+    font-weight: 700;
+    line-height: 0.94;
+    letter-spacing: 0.005em;
+    margin-bottom: 2.4rem;
   }
 
-  .accent {
-    color: var(--eldritch);
-    text-shadow: 0 0 30px var(--eldritch-glow-strong);
+  .t-line { display: block; }
+
+  .t-an { color: var(--bone-heading); }
+
+  /* The red band: a block that bleeds off the left edge of the page and
+     ends in a wedge, with the word set in the on-red ink. */
+  .t-red {
+    position: relative;
+    width: max-content;
+    max-width: 100%;
+    margin: 0.06em 0 0.1em;
+    padding: 0.06em 0.34em 0.02em 0;
+    background: var(--red);
+    color: var(--on-red);
+    clip-path: polygon(-100vw 0, 100% 0, calc(100% - 0.22em) 100%, -100vw 100%);
   }
+
+  .t-red::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    width: 100vw;
+    background: var(--red);
+  }
+
+  .t-red-ink { position: relative; }
+
+  .t-os { color: var(--bone-heading); }
+
+  /* The eye sits at the top right, where the backdrop's eclipse hangs, so
+     the watermark seems to come into focus behind the headline. */
+  .hero-mark {
+    position: absolute;
+    top: 0.5rem;
+    right: -0.5rem;
+    width: clamp(150px, 22vw, 310px);
+    height: auto;
+    overflow: visible;
+  }
+
+  .mark-well { fill: var(--void); }
+
+  .mark-rule {
+    stroke: var(--bone);
+    stroke-opacity: 0.22;
+    stroke-width: 1.5;
+  }
+
+  .mark-ring {
+    fill: none;
+    stroke: var(--red);
+    stroke-width: 20;
+  }
+
+  .mark-pupil {
+    fill: var(--living);
+    filter: drop-shadow(0 0 10px var(--living-glow));
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: eye-blink 9s ease-in-out infinite;
+  }
+
+  .mark-wedge { fill: var(--red); }
+  .mark-square { fill: var(--brass); }
+
+  @keyframes eye-blink {
+    0%, 93%, 100% { transform: scaleY(1); }
+    96% { transform: scaleY(0.08); }
+  }
+
+  .hero-copy { grid-area: copy; max-width: 640px; }
 
   .hero-hook {
-    max-width: 640px;
-    margin: 0 auto 1rem;
-    color: var(--text-primary);
-    font-size: 1.3rem;
-    line-height: 1.6;
+    color: var(--bone);
+    font-size: 1.4rem;
+    line-height: 1.5;
+    margin-bottom: 1rem;
   }
 
   .hero-hook em {
-    color: var(--eldritch);
+    color: var(--bone-heading);
+    font-style: italic;
+    border-bottom: 3px solid var(--red);
   }
 
   .hero-sub {
-    max-width: 620px;
-    margin: 0 auto 2rem;
-    color: var(--text-secondary);
-    font-size: 1rem;
-    line-height: 1.7;
+    color: var(--bone-2);
+    font-size: 1.05rem;
+    line-height: 1.65;
+    margin-bottom: 2.1rem;
   }
 
   .hero-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 1rem;
-    justify-content: center;
-    margin-bottom: 0.9rem;
+    margin-bottom: 1.2rem;
   }
 
   .hero-dl {
-    min-width: 160px;
-    justify-content: center;
+    min-width: 200px;
+    padding: 1.05rem 2rem;
+    font-size: 1.12rem;
   }
+
+  .hero-actions .btn-outline { padding: 1.05rem 1.8rem; font-size: 1.05rem; }
 
   .hero-meta {
     font-family: var(--font-mono);
     font-size: 0.8rem;
-    color: var(--text-dim);
-    margin-bottom: 0.5rem;
+    color: var(--bone-meta);
+    margin-bottom: 1.1rem;
     display: flex;
     flex-wrap: wrap;
-    justify-content: center;
     gap: 0 0.5rem;
   }
 
-  .hero-version {
-    color: var(--eldritch-dim);
-    font-weight: 600;
-  }
+  .hero-version { color: var(--brass); font-weight: 600; }
 
-  .hero-meta a {
-    color: var(--eldritch-dim);
-  }
-
-  .hero-meta a:hover {
-    color: var(--eldritch);
+  .hero-meta a,
+  .hero-meta :global(a) {
+    color: var(--living);
     text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: rgba(91, 229, 160, 0.45);
   }
+
+  .hero-meta a:hover,
+  .hero-meta :global(a:hover) { color: var(--bone-heading); text-decoration-color: var(--red); }
 
   .hero-needs {
     max-width: 560px;
-    margin: 0 auto 2.5rem;
-    font-size: 0.9rem;
-    color: var(--text-dim);
+    padding-left: 0.9rem;
+    border-left: 3px solid var(--red);
+    font-size: 0.92rem;
+    color: var(--bone-3);
     line-height: 1.6;
   }
 
-  .hero-shot {
-    max-width: 960px;
-    margin: 0 auto 2.5rem;
-  }
+  /* ── The three things: a numbered index beside the copy; each row links
+     to its section, and the third (the one that learns) wears the red. ── */
+  .hero-claims { grid-area: claims; margin-top: 0.4rem; }
 
-  .hero-shot-frame {
-    display: block;
-    width: 100%;
-    padding: 0;
-    background: none;
-    border: 1px solid var(--border-accent);
-    border-radius: 12px;
-    overflow: hidden;
-    cursor: zoom-in;
-    box-shadow: 0 0 48px rgba(91, 229, 160, 0.12), 0 24px 64px rgba(0, 0, 0, 0.5);
-    transition: box-shadow 0.3s, border-color 0.3s;
-  }
-
-  .hero-shot-frame:hover {
-    border-color: var(--eldritch);
-    box-shadow: 0 0 64px rgba(91, 229, 160, 0.2), 0 24px 64px rgba(0, 0, 0, 0.5);
-  }
-
-  .hero-shot-frame img {
-    display: block;
-    width: 100%;
-    height: auto;
-  }
-
-  .hero-shot-caption {
+  .claims-label {
     font-family: var(--font-mono);
-    font-size: 0.85rem;
-    color: var(--text-dim);
-    font-style: italic;
-    margin-top: 0.75rem;
+    font-size: 0.74rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+    margin-bottom: 0.6rem;
   }
 
-  .hero-glyphs {
-    display: flex;
-    gap: 2rem;
-    justify-content: center;
-    margin-bottom: 1rem;
-    padding: 0.5rem 0;
-    flex-wrap: wrap;
-  }
-
-  .hero-glyph {
-    display: flex;
-    align-items: center;
+  /* The one idea leads, on a paper slab; the three follow from it. */
+  .idea {
+    display: grid;
+    grid-template-columns: 3.2rem 1fr auto;
+    align-items: baseline;
     gap: 0.6rem;
-  }
-
-  .glyph-icon {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: var(--eldritch);
-    background: var(--eldritch-glow);
-    border: 1px solid var(--border-accent);
-    padding: 0.25rem 0.45rem;
-    border-radius: 5px;
-    animation: breathe 4s ease-in-out infinite;
-  }
-
-  .hero-glyph:nth-child(2) .glyph-icon {
-    color: var(--void-purple);
-    background: var(--void-purple-glow);
-    border-color: rgba(139, 123, 255, 0.2);
-    animation-delay: 1.3s;
-  }
-
-  .hero-glyph:nth-child(3) .glyph-icon {
-    animation-delay: 2.6s;
-  }
-
-  .glyph-text {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    letter-spacing: 0.01em;
-  }
-
-  @keyframes breathe {
-    0%, 100% { box-shadow: 0 0 6px rgba(91, 229, 160, 0.1); }
-    50% { box-shadow: 0 0 14px rgba(91, 229, 160, 0.25); }
-  }
-
-  .hero-desc-heading {
-    margin-top: var(--section-gap);
-    margin-bottom: 0;
-  }
-
-  /* ── The ask demo: the section performs the protocol it describes ── */
-  .ask-demo {
-    max-width: 620px;
-    margin: 2rem auto 2.5rem;
-    text-align: left;
-  }
-
-  .ask-call {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    margin-bottom: 0.9rem;
-  }
-
-  .ask-you {
-    color: var(--void-purple);
-  }
-
-  .ask-op {
-    color: var(--text-dim);
-  }
-
-  .ask-code {
-    display: inline-block;
-    color: var(--eldritch);
-    background: none;
-    border: none;
-    padding: 0;
-    font-size: 1em;
-  }
-
-  .ask-cursor {
-    display: inline-block;
-    width: 0.55em;
-    height: 1.1em;
-    background: var(--eldritch);
-    box-shadow: 0 0 8px var(--eldritch-glow-strong);
-    animation: cursor-blink 1.1s steps(1) infinite;
-  }
-
-  @keyframes cursor-blink {
-    50% { opacity: 0; }
-  }
-
-  .ask-reply {
-    background: var(--bg-card);
-    border: 1px solid var(--border-accent);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 0 24px var(--eldritch-glow);
-  }
-
-  .ask-reply-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.5rem 0.9rem;
-    background: rgba(18, 18, 30, 0.75);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .ask-reply-title {
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
-    color: var(--text-secondary);
-    letter-spacing: 0.06em;
-  }
-
-  .ask-reply-icon {
-    font-size: 0.85em;
-    margin-right: 0.15rem;
-  }
-
-  .ask-reply-controls {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--text-dim);
-    letter-spacing: 0.05em;
-    user-select: none;
-  }
-
-  .ask-reply-body {
-    padding: 1.35rem 1.6rem;
-  }
-
-  .ask-reply-body p {
-    color: var(--text-secondary);
-    font-size: 1.05rem;
-    line-height: 1.8;
-    margin-bottom: 0.9rem;
-  }
-
-  .ask-reply-body p:last-child {
-    margin-bottom: 0;
-  }
-
-  /* Orchestrated reveal: armed by JS only when motion is welcome.
-     Without JS (or with reduced motion) everything is simply visible. */
-  .ask-demo[data-armed] .ask-code {
-    width: 0;
-    overflow: hidden;
-    white-space: nowrap;
-  }
-
-  .ask-demo[data-armed].play .ask-code {
-    animation: ask-type 1.3s steps(34, end) 0.3s forwards;
-  }
-
-  .ask-demo[data-armed] .ask-reply {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-
-  .ask-demo[data-armed].play .ask-reply {
-    animation: reply-in 0.55s ease 1.85s forwards;
-  }
-
-  @keyframes ask-type {
-    from { width: 0; }
-    to { width: 34ch; }
-  }
-
-  @keyframes reply-in {
-    to { opacity: 1; transform: none; }
-  }
-
-  .thesis-link {
-    display: inline-block;
-    margin-top: 0.25rem;
-    color: var(--eldritch-dim);
-    font-size: 0.9rem;
+    margin-bottom: 1.4rem;
+    padding: 1rem 0.8rem 1.05rem 0.7rem;
+    background: #efe6d1;
+    box-shadow: var(--print);
     text-decoration: none;
-    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
-    padding-bottom: 1px;
-    transition: color 0.2s, border-color 0.2s;
+    transition: transform 0.12s, box-shadow 0.12s;
   }
 
-  .thesis-link:hover {
-    color: var(--eldritch);
-    border-bottom-color: var(--eldritch);
+  .idea:hover { transform: translate(-1px, -1px); box-shadow: 7px 7px 0 var(--shadow-ink); }
+
+  .idea-n {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 2.1rem;
+    line-height: 1;
+    color: var(--red);
   }
 
+  .idea-text {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1.3rem;
+    line-height: 1.15;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #16130f;
+  }
+
+  .idea .claim-go { color: var(--red); }
+
+  .hero-claims ol {
+    list-style: none;
+    border-top: 4px solid var(--red);
+    border-bottom: var(--rule-w) solid var(--rule-mid);
+    background: rgba(6, 7, 10, 0.72);
+  }
+
+  .claim + .claim { border-top: var(--rule-w) solid var(--rule-mid); }
+
+  .claim a {
+    display: grid;
+    grid-template-columns: 3.2rem 1fr auto;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 1.05rem 0.4rem 1.1rem 0;
+    text-decoration: none;
+    transition: background-color 0.15s, padding 0.15s;
+  }
+
+  .claim a:hover { background: rgba(211, 47, 34, 0.1); padding-left: 0.4rem; }
+
+  .claim-n {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 2.1rem;
+    line-height: 1;
+    color: var(--red);
+  }
+
+  .claim-text {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.15rem;
+    line-height: 1.2;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
+  }
+
+  .claim-go { font-size: 0.75rem; color: var(--bone-faint); }
+  .claim a:hover .claim-go { color: var(--red); }
+
+  .claim.key a { background: var(--red); padding-left: 0.6rem; }
+  .claim.key .claim-n, .claim.key .claim-text, .claim.key .claim-go { color: var(--on-red); }
+  .claim.key a:hover { background: var(--red-hot); }
+
+  /* ── The desktop screenshot ── */
+  .hero-shot { margin-top: 4.5rem; }
+
+  /* ── The dictionary joke, as a footnote under the screenshot ── */
   .hero-tagline {
+    margin-top: 1.6rem;
+    max-width: 900px;
     font-family: var(--font-mono);
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    max-width: 560px;
-    margin-left: auto;
-    margin-right: auto;
-    margin-bottom: 0;
-    font-style: italic;
+    font-size: 0.82rem;
     line-height: 1.7;
+    color: var(--bone-3);
   }
 
-  .hero-tagline .dim {
-    opacity: 0.6;
+  .tag-word {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-heading);
   }
 
-  @media (max-width: 600px) {
-    .hero-actions {
-      flex-direction: column;
-      align-items: center;
+  .hero-tagline .dim { color: var(--bone-meta); }
+
+  .tag-n { color: var(--red); font-weight: 600; margin: 0 0.2rem 0 0.4rem; }
+
+  .tag-joke { font-style: italic; color: var(--bone-meta); margin-left: 0.4rem; }
+
+  /* ── Narrow screens ── */
+  @media (max-width: 980px) {
+    .hero-poster {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas:
+        'title'
+        'copy'
+        'claims';
     }
-    .hero-glyphs {
-      flex-direction: column;
-      align-items: center;
-      gap: 1rem;
-    }
-    .ask-call {
-      font-size: 0.78rem;
-    }
+    .hero-claims { margin-top: 2.5rem; max-width: 640px; }
+  }
+
+  @media (max-width: 640px) {
+    .hero { padding-top: calc(66px + 2.5rem); }
+    .hero-title { font-size: clamp(2.3rem, 11.4vw, 4rem); margin-bottom: 3.6rem; }
+    /* On a phone the eye drops beside the short OS line, under the band. */
+    .hero-mark { top: calc(clamp(2.3rem, 11.4vw, 4rem) * 2); right: 0; width: 26vw; }
+    .hero-hook { font-size: 1.2rem; }
+    .hero-actions { flex-direction: column; align-items: stretch; }
+    .hero-dl { min-width: 0; }
+    .hero-shot { margin-top: 3rem; }
+    .claim a { padding: 1rem 0.2rem 1.1rem 0; }
+    .claim.key a { padding-left: 0.5rem; }
+    .tag-joke { display: block; margin: 0.3rem 0 0; }
   }
 </style>
