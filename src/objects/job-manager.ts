@@ -589,7 +589,8 @@ export class JobManager extends Abject {
 Jobs run in a sandboxed environment. Only these helpers and built-ins are available:
 - \`call(target, method, payload)\` — invoke a method on another object. Returns the method's reply.
 - \`dep(name)\` — resolve a dependency by name. Returns a Promise<AbjectId> (a string).
-- \`find(query)\` — find objects in the registry. Returns a Promise<AbjectId | undefined>.
+- \`find(query)\` — find objects in the registry. Returns a Promise<AbjectId | null>. A miss is not proof of absence; ask the Registry.
+- \`ask(question)\` — ask the Registry "which object does X?" from its whole catalog. \`ask(target, question)\` asks one object (AbjectId or registered name) about itself. Returns its answer as text.
 - \`id\` — this object's AbjectId
 - \`progress(pct)\` — report progress (0-100)
 - Built-ins: ${SANDBOX_BUILTIN_NAMES.join(', ')}
