@@ -3,7 +3,9 @@
  *
  * Three panes (same idiom as WorkspaceBrowser):
  *   Pane 1 (left):   Joined + shared workspaces
- *   Pane 2 (middle): Active peer members of the selected workspace
+ *   Pane 2 (middle): Active peer members of the selected workspace, over a
+ *                    Map of them (a 3D graph: you at the centre, measured
+ *                    latency as edge weight; the header's Map toggle)
  *   Pane 3 (right):  Detail — presence, latency, catalog items, shared goals backlog
  *
  * Presence comes from PeerRegistry (getConnectedPeers). There is no RTT field
@@ -15,6 +17,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { invariant } from '../core/contracts.js';
 import type { WorkspaceMemberInfo } from './workspace-share-registry.js';
 import { sectionHeaderStyle, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
@@ -125,6 +128,17 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
   private selectedWorkspaceIndex = -1;
   private selectedMemberIndex = -1;
+
+  // ── Map (a nodeGraph under the member list: you at the centre, the
+  //    members around you, measured latency as edge weight) ──
+  /** Members column: a vertical split of the member list over the map. */
+  private memberSplitId?: AbjectId;
+  private mapToggleId?: AbjectId;
+  private mapGraphId?: AbjectId;
+  /** The map shows (the header toggle); on by default. */
+  private mapOn = true;
+  /** Members whose round trip was just measured: the map pulses out and back. */
+  private pingedPeers: string[] = [];
 
   /** True once the working stream node is in the window's scene. */
   private workStreamAdded = false;
@@ -340,6 +354,10 @@ export class WorkspaceCollaboratorInspector extends Abject {
     this.detailButtonIds.clear();
     this.workStreamAdded = false;
     this.workInFlight = 0;
+    this.memberSplitId = undefined;
+    this.mapToggleId = undefined;
+    this.mapGraphId = undefined;
+    this.pingedPeers = [];
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -523,6 +541,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
     for (const m of this.members) {
       if (!m.online) continue;
       m.latencyMs = await this.measureLatency(m.peerId);
+      if (m.latencyMs !== undefined) this.pingedPeers.push(m.peerId);
     }
   }
 
@@ -635,7 +654,34 @@ export class WorkspaceCollaboratorInspector extends Abject {
       return;
     }
 
-    const idx = this.readIndex(payload);
+    if (from === this.mapToggleId && aspect === 'change') {
+      const v = payload['value'];
+      await this.setMapOn(v === true || v === 'true');
+      return;
+    }
+
+    if (from === this.mapGraphId && (aspect === 'nodeSelected' || aspect === 'nodeFocused')) {
+      await this.onMapSelection(payload['value']);
+      return;
+    }
+
+    // Lists report selectionChanged as JSON { index, value, label }: the
+    // value (workspace or peer id) names the row even while a search filters
+    // the list; a plain index is accepted too.
+    const pick = (ids: string[]): number | undefined => {
+      const raw = payload['value'];
+      if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+        try {
+          const sel = JSON.parse(raw) as { index?: number; value?: string };
+          if (typeof sel.value === 'string' && ids.includes(sel.value)) return ids.indexOf(sel.value);
+          if (typeof sel.index === 'number') return sel.index;
+        } catch { /* not JSON: fall through */ }
+      }
+      return this.readIndex(payload);
+    };
+    const idx = from === this.workspaceListId ? pick(this.workspaces.map((w) => w.workspaceId))
+      : from === this.memberListId ? pick(this.members.map((m) => m.peerId))
+      : this.readIndex(payload);
 
     if (from === this.workspaceListId && idx !== undefined) {
       this.selectedWorkspaceIndex = idx;
@@ -646,6 +692,11 @@ export class WorkspaceCollaboratorInspector extends Abject {
 
     if (from === this.memberListId && idx !== undefined) {
       this.selectedMemberIndex = idx;
+      // The map selects the same member.
+      const m = this.members[idx];
+      if (this.mapGraphId && this.mapOn && m) {
+        await this.request(request(this.id, this.mapGraphId, 'select', { id: `peer:${m.peerId}` })).catch(() => { /* not on the map */ });
+      }
       await this.rebuildDetailPane();
       return;
     }
@@ -808,12 +859,41 @@ export class WorkspaceCollaboratorInspector extends Abject {
             text: '',
             style: { color: this.theme.textMeta, fontSize: 11 },
           },
+          // [7] Members column: the member list over its map
+          {
+            type: 'splitPane',
+            windowId,
+            orientation: 'vertical',
+            dividerPosition: this.mapOn ? 0.42 : 1,
+            minSize: 0,
+          },
+          // [8] Map toggle
+          { type: 'checkbox', windowId, rect: r0, checked: this.mapOn, text: 'Map' },
+          // [9] The map: you at the centre, the members around you
+          {
+            type: 'nodeGraph',
+            windowId,
+            rect: r0,
+            title: 'Collaborators',
+            emptyText: 'No collaborators here yet',
+            directed: false,
+            groups: [
+              { id: 'self', label: 'You', color: '$textPrimary', shape: 'icosphere', material: 'ceramic' },
+              { id: 'owner', label: 'Owner', color: '$statusInfo', shape: 'roundedBox' },
+              { id: 'member', label: 'Members', color: '$statusSuccess', shape: 'sphere' },
+            ],
+            hint: 'Closer = faster round trip · click to inspect',
+            style: { visible: this.mapOn },
+          },
         ],
       })
     );
 
-    const [outerSplit, innerSplit, titleLabel, refreshBtn, workspaceList, memberList, statusLabel] =
-      widgetIds;
+    const [outerSplit, innerSplit, titleLabel, refreshBtn, workspaceList, memberList, statusLabel,
+      memberSplit, mapToggle, mapGraph] = widgetIds;
+    this.memberSplitId = memberSplit;
+    this.mapToggleId = mapToggle;
+    this.mapGraphId = mapGraph;
 
     this.outerSplitId = outerSplit;
     this.innerSplitId = innerSplit;
@@ -836,6 +916,11 @@ export class WorkspaceCollaboratorInspector extends Abject {
             preferredSize: { height: 30 },
           },
           {
+            widgetId: mapToggle,
+            sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+            preferredSize: { width: 70, height: 28 },
+          },
+          {
             widgetId: this.refreshBtnId,
             sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
             preferredSize: { width: 80, height: 28 },
@@ -851,7 +936,13 @@ export class WorkspaceCollaboratorInspector extends Abject {
     });
 
     await this.request(
-      request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.memberListId })
+      request(this.id, memberSplit, 'setTopChild', { widgetId: this.memberListId })
+    );
+    await this.request(
+      request(this.id, memberSplit, 'setBottomChild', { widgetId: mapGraph })
+    );
+    await this.request(
+      request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: memberSplit })
     );
     await this.request(
       request(this.id, this.innerSplitId, 'setRightChild', { widgetId: this.detailPaneId })
@@ -868,6 +959,8 @@ export class WorkspaceCollaboratorInspector extends Abject {
     this.send(request(this.id, this.refreshBtnId, 'addDependent', {}));
     this.send(request(this.id, this.workspaceListId, 'addDependent', {}));
     this.send(request(this.id, this.memberListId, 'addDependent', {}));
+    this.send(request(this.id, mapToggle, 'addDependent', {}));
+    this.send(request(this.id, mapGraph, 'addDependent', {}));
   }
 
   private async rebuildWorkspaceList(): Promise<void> {
@@ -875,7 +968,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
     const items = this.workspaces.map(w => {
       const label = w.name && w.name !== w.workspaceId ? w.name : w.workspaceId;
       const owner = w.ownerPeerId ? ` \u2190 ${w.ownerPeerId.slice(0, 8)}` : ' (hosted)';
-      return `${label}${owner}`;
+      return { label: `${label}${owner}`, value: w.workspaceId };
     });
     try {
       await this.request(
@@ -895,7 +988,7 @@ export class WorkspaceCollaboratorInspector extends Abject {
       const dot = m.online ? '\u25C9' : '\u25A1'; // ◉ online, □ offline
       const name = m.peerName || m.peerId.slice(0, 12);
       const lat = m.latencyMs === undefined ? '' : `  ${m.latencyMs}ms`;
-      return `${dot} ${name}${lat}`;
+      return { label: `${dot} ${name}${lat}`, value: m.peerId };
     });
     try {
       await this.request(
@@ -907,6 +1000,100 @@ export class WorkspaceCollaboratorInspector extends Abject {
     } catch {
       /* widget gone */
     }
+    await this.syncCollabMap();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Map
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Edge weight from a measured round trip: a quick peer sits close on a
+   * heavy edge, a slow one farther out on a light one.
+   */
+  private static latencyWeight(ms: number | undefined): number {
+    if (ms === undefined) return 0.6;
+    return Math.max(0.5, Math.min(4, 240 / Math.max(30, ms)));
+  }
+
+  /**
+   * Draw the selected workspace's collaborators: you at the centre, each
+   * member around you (the owner marked), online members breathing in the
+   * living light, offline ones see-through on a dashed edge, and the
+   * measured round trip as edge weight (and in the label). Members whose
+   * latency was just measured get a pulse out and back: the ping itself.
+   * Runs whenever the member list does; nothing polls for it.
+   */
+  private async syncCollabMap(): Promise<void> {
+    const pinged = this.pingedPeers;
+    this.pingedPeers = [];
+    if (!this.mapGraphId || !this.mapOn) return;
+    const ws = this.selectedWorkspace();
+    const nodes: Array<Record<string, unknown>> = [];
+    const edges: Array<Record<string, unknown>> = [];
+    if (ws && this.members.length > 0) {
+      nodes.push({ id: 'self', label: 'You', group: 'self', size: 12, center: true });
+      for (const m of this.members) {
+        const id = `peer:${m.peerId}`;
+        const name = m.peerName || m.peerId.slice(0, 12);
+        const owner = !!ws.ownerPeerId && m.peerId === ws.ownerPeerId;
+        nodes.push({
+          id,
+          label: m.latencyMs === undefined ? name : `${name} · ${m.latencyMs} ms`,
+          group: owner ? 'owner' : 'member',
+          size: owner ? 10 : 8,
+          active: m.online,
+          ...(m.online ? {} : { ghost: true }),
+        });
+        edges.push({
+          from: 'self', to: id,
+          weight: WorkspaceCollaboratorInspector.latencyWeight(m.online ? m.latencyMs : undefined),
+          ...(m.online ? {} : { style: 'dashed' }),
+        });
+      }
+    }
+    try {
+      await this.request(request(this.id, this.mapGraphId, 'setGraph', { nodes, edges }));
+      const sel = this.members[this.selectedMemberIndex];
+      await this.request(request(this.id, this.mapGraphId, 'select', {
+        id: sel ? `peer:${sel.peerId}` : null,
+      }));
+      for (const peerId of pinged) {
+        if (!this.members.some((m) => m.peerId === peerId)) continue;
+        await this.request(request(this.id, this.mapGraphId, 'pulse', { from: 'self', to: `peer:${peerId}` }));
+        await this.request(request(this.id, this.mapGraphId, 'pulse', { from: `peer:${peerId}`, to: 'self' }));
+      }
+    } catch {
+      /* map gone */
+    }
+  }
+
+  /** Show or hide the map under the member list (the header toggle). */
+  private async setMapOn(on: boolean): Promise<void> {
+    this.mapOn = on;
+    try {
+      if (this.memberSplitId) {
+        await this.request(request(this.id, this.memberSplitId, 'update', { dividerPosition: on ? 0.42 : 1 }));
+      }
+      if (this.mapGraphId) {
+        await this.request(request(this.id, this.mapGraphId, 'update', { style: { visible: on } }));
+      }
+    } catch { /* window gone */ }
+    if (on) await this.syncCollabMap();
+  }
+
+  /** A map click: the member (or you: the workspace overview) opens in the detail pane. */
+  private async onMapSelection(value: unknown): Promise<void> {
+    let id: string | undefined;
+    try { id = (JSON.parse(String(value)) as { id?: string }).id; } catch { return; }
+    if (!id) return;
+    const idx = id.startsWith('peer:') ? this.members.findIndex((m) => `peer:${m.peerId}` === id) : -1;
+    if (idx === this.selectedMemberIndex) return;
+    this.selectedMemberIndex = idx;
+    if (this.memberListId) {
+      await this.request(request(this.id, this.memberListId, 'update', { selectedIndex: idx })).catch(() => { /* gone */ });
+    }
+    await this.rebuildDetailPane();
   }
 
   private async updateStatus(): Promise<void> {
@@ -1173,6 +1360,12 @@ export class WorkspaceCollaboratorInspector extends Abject {
       } catch { /* decoration only */ }
     }
     return sectionId;
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(this.selectedMemberIndex >= -1, 'the member selection is an index or -1');
+    invariant(this.mapGraphId === undefined || this.windowId !== undefined, 'the map lives in the open window');
   }
 }
 

@@ -6,8 +6,9 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { invariant, require, ensure } from '../core/contracts.js';
 import {
   emptyStateMarkdown, emptyStateStyle, livingStyle, eyeSigilOps, removeSigilOps, sigilStreamOps,
 } from './ui-kit.js';
@@ -49,6 +50,140 @@ const HANDSHAKE_STREAM_RATE = 10;
 const HANDSHAKE_WATCH_MS = 25_000;
 
 type SlabEffect = 'shake' | 'flash' | 'burst' | 'pulse';
+
+/** Tab indices, in the tab bar's order. */
+const IDENTITY_TAB = 0;
+const CONTACTS_TAB = 1;
+const SERVERS_TAB = 2;
+const INTROS_TAB = 3;
+const FRONTENDS_TAB = 4;
+const WEB_TAB = 5;
+/** Tab index of the Map: the peer topology as a 3D graph beside the lists. */
+const MAP_TAB = 6;
+/** Map node id of this peer (held at the centre). */
+const SELF_NODE = 'self';
+
+/**
+ * A burst of network events (a busy signaling server announces its peer list
+ * several times a second) settles into one pass over the visible tab.
+ */
+const REFRESH_COALESCE_MS = 250;
+
+/** What the tabs read, by source. */
+type NetData = 'identity' | 'contacts' | 'servers' | 'signalingPeers' | 'networkPeers' | 'discovery' | 'blocked' | 'intros' | 'frontends' | 'web';
+
+/** What each tab shows, by source (in tab order). */
+const TAB_DATA: ReadonlyArray<readonly NetData[]> = [
+  /* Identity */ ['identity', 'contacts', 'networkPeers'],
+  /* Contacts */ ['contacts'],
+  /* Servers & Peers */ ['servers', 'signalingPeers', 'contacts', 'networkPeers', 'discovery', 'blocked'],
+  /* Introductions */ ['intros', 'contacts'],
+  /* Frontends */ ['frontends'],
+  /* Web Access */ ['web'],
+  /* Map */ ['identity', 'contacts', 'servers', 'signalingPeers', 'networkPeers', 'frontends'],
+];
+
+/**
+ * What each PeerRegistry event can change. A pass after events re-reads only
+ * these sources (the rest come from the last read); selecting a tab reads
+ * everything it shows.
+ */
+const REGISTRY_EVENT_DATA: ReadonlyMap<string, readonly NetData[]> = new Map<string, readonly NetData[]>([
+  // The registry lists a signaling peer only while no connection to it is
+  // open or being tried, so connection events change that list too.
+  ['contactConnected', ['contacts', 'networkPeers', 'signalingPeers', 'discovery']],
+  // Also sent when a network peer (not a contact) leaves, or an attempt fails.
+  ['contactDisconnected', ['contacts', 'networkPeers', 'signalingPeers', 'discovery']],
+  ['contactIntroduced', ['discovery']],
+  ['introductionReceived', ['intros']],
+  ['signalingStateChanged', ['servers', 'signalingPeers']],
+  ['signalingPeersUpdated', ['signalingPeers']],
+  ['networkPeerConnected', ['networkPeers', 'signalingPeers', 'discovery']],
+  ['networkPeerDisconnected', ['networkPeers', 'signalingPeers', 'discovery']],
+  ['peerBlocked', ['blocked', 'contacts', 'networkPeers', 'signalingPeers', 'intros']],
+  ['peerUnblocked', ['blocked', 'contacts', 'networkPeers', 'signalingPeers', 'intros']],
+]);
+
+interface ContactSnap { peerId: string; name: string; state: string; addedAt: number }
+interface ServerSnap { url: string; status: string }
+interface SignalingPeerSnap { peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string; serverUrl: string }
+interface NetworkPeerSnap { peerId: string; name: string; connectedAt: number }
+interface FrontendSnap { clientId: string; kind: string; peerId: string; name: string; connectedAt: number; ready: boolean }
+interface IntroSnap { peerId: string; name: string; fromPeerId: string; receivedAt: number }
+interface DiscoverySnap { cacheSize: number; connectedNetworkPeers: number }
+
+/**
+ * One pass's reads. Each source is asked at most once per pass, and what it
+ * answers also lands in the window's snapshot (the map and the map strip's
+ * actions read from there).
+ */
+interface NetReads {
+  identity(): Promise<{ peerId: string; name: string }>;
+  contacts(): Promise<ContactSnap[]>;
+  servers(): Promise<ServerSnap[]>;
+  signalingPeers(): Promise<SignalingPeerSnap[]>;
+  networkPeers(): Promise<NetworkPeerSnap[]>;
+  discovery(): Promise<DiscoverySnap>;
+  blocked(): Promise<string[]>;
+  intros(): Promise<IntroSnap[]>;
+  frontends(): Promise<FrontendSnap[]>;
+}
+
+/** What a row button does; the row's key says to whom. */
+type RowAction =
+  | 'removeServer' | 'addSignalingPeer' | 'block' | 'trust' | 'unblock'
+  | 'acceptIntro' | 'rejectIntro' | 'disconnectFrontend' | 'revokeFrontend';
+
+/** A row button's action: what it does, for whom, and what the row knew of them when drawn. */
+interface RowButtonAction { kind: RowAction; key: string; peer?: SignalingPeerSnap }
+
+/** One widget of a keyed row. A `width` makes it fixed size; without one it takes the row's spare width. */
+interface RowCell { spec: Record<string, unknown>; height: number; width?: number; action?: RowButtonAction }
+
+/**
+ * A row as the data wants it. `sig` sums up what the row shows: a row whose
+ * sig is unchanged costs nothing; one whose sig changed is repainted in place
+ * with `updates` (one per cell, undefined leaves that cell).
+ */
+interface RowSpec { key: string; sig: string; height: number; cells: RowCell[]; updates: Array<Record<string, unknown> | undefined> }
+
+/** A row on screen: its HBox, its cells, and the sig it shows. */
+interface LiveRow { rowId: AbjectId; cellIds: AbjectId[]; sig: string }
+
+/** The keyed rows of one card, in display order (after the card's fixed children). */
+interface RowSet { parentId: AbjectId; rows: Map<string, LiveRow>; order: string[] }
+
+/** Layout policy of a row inside its card. */
+const ROW_POLICY = { vertical: 'fixed', horizontal: 'expanding' } as const;
+
+/** Keys made unique in order (a peer listed twice keeps two rows, as before). */
+function uniqueKeys<T extends { key: string }>(rows: T[]): T[] {
+  const seen = new Map<string, number>();
+  return rows.map((r) => {
+    const n = (seen.get(r.key) ?? 0) + 1;
+    seen.set(r.key, n);
+    return n === 1 ? r : { ...r, key: `${r.key}#${n}` };
+  });
+}
+
+/** What the window last read about the network; the map is drawn from it. */
+interface NetSnapshot {
+  peerId: string;
+  peerName: string;
+  contacts: ContactSnap[];
+  servers: ServerSnap[];
+  signalingPeers: SignalingPeerSnap[];
+  networkPeers: NetworkPeerSnap[];
+  frontends: FrontendSnap[];
+}
+
+/** What a map node stands for: the strip under the map names it and offers its action. */
+interface MapNodeInfo {
+  text: string;
+  /** The tab listing it ("Show in list"). */
+  tab: number;
+  action?: { label: string; kind: 'toggleContact' | 'trust' | 'addSignalingPeer' | 'disconnectFrontend'; key: string };
+}
 
 /**
  * A long link shortened in the middle so its start (the host) and its end
@@ -94,40 +229,80 @@ export class PeerNetwork extends Abject {
   /** True while the sigil's handshake stream is emitting (rate > 0). */
   private streamOn = false;
 
-  // Identity section widgets
+  // Keeping the tabs current. Each tab is built the first time it shows and
+  // then updated in place: registry events mark the visible tab due, a burst
+  // settles into one pass, and that pass changes only what differs (rows
+  // come and go by key, labels change text). Hidden tabs and a minimized
+  // window do nothing but remember; they catch up when they show.
+  /** Tabs whose widgets exist. */
+  private builtTabs: Set<number> = new Set();
+  /** The visible tab has changes to show. */
+  private refreshDue = false;
+  /** The next pass reads everything its tab shows (a tab just selected, or this window's own action). */
+  private fullDue = false;
+  /** Sources events changed since the last pass (a pass after events re-reads only these). */
+  private staleData: Set<NetData> = new Set();
+  /** What each source last answered (a pass reuses what did not change). */
+  private readCache: Map<NetData, unknown> = new Map();
+  /** Coalesces a burst of events into one pass. */
+  private flushTimer?: ReturnType<typeof setTimeout>;
+  private flushing = false;
+  private flushAgain = false;
+  /** True while the window is minimized. */
+  private minimized = false;
+  /** Keyed rows per card (servers, signalingPeers, network, blocked, intros, frontends). */
+  private rowSets: Map<string, RowSet> = new Map();
+  /** Row buttons: what each does and for whom. */
+  private rowActions: Map<AbjectId, RowButtonAction> = new Map();
+  /** Last update sent to each long-lived widget, so an unchanged value sends nothing. */
+  private lastSent: Map<AbjectId, string> = new Map();
+  /** Visibility this window last gave a widget (absent: visible). */
+  private shownState: Map<AbjectId, boolean> = new Map();
+
+  // Identity tab
   private nameInputId?: AbjectId;
   private saveNameBtnId?: AbjectId;
   private copyPeerIdBtnId?: AbjectId;
   private copyIdentityBtnId?: AbjectId;
+  private peerIdLabelId?: AbjectId;
+  /** The identity name the name field was last given (the field is left alone while it holds). */
+  private shownPeerName?: string;
 
-  // Signaling section widgets
+  // Servers & Peers tab
   private signalingInputId?: AbjectId;
   private signalingConnectBtnId?: AbjectId;
-  private signalingRemoveButtons: Map<AbjectId, string> = new Map();
+  private sigCardId?: AbjectId;
+  private sigEmptyId?: AbjectId;
+  private spCardId?: AbjectId;
+  private netCardId?: AbjectId;
+  private netMeshId?: AbjectId;
+  private netEmptyId?: AbjectId;
+  private blockedCardId?: AbjectId;
 
-  // Contacts section widgets
+  // Contacts tab
   private addContactInputId?: AbjectId;
   private addContactBtnId?: AbjectId;
   private contactListId?: AbjectId;
-  private connectButtons: Map<AbjectId, string> = new Map();
-  private removeButtons: Map<AbjectId, string> = new Map();
-  private introduceButtons: Map<AbjectId, string> = new Map();
-  private acceptIntroButtons: Map<AbjectId, string> = new Map();
-  private rejectIntroButtons: Map<AbjectId, string> = new Map();
+  /**
+   * The Contacts card: rebuilt only when it flips between its empty state
+   * and the list (the list fills the tab, the empty state sizes to itself).
+   * `ids` are the card first, then its title, hint and content.
+   */
+  private contactsCard?: { kind: 'empty' | 'list'; ids: AbjectId[] };
+  /** Peer ids in the order the contacts list shows them. */
+  private contactListPeers: string[] = [];
+  /** What the contacts list was last given (items and selection). */
+  private contactListSig?: string;
 
-  // Network peers section widgets
-  private promoteButtons: Map<AbjectId, string> = new Map();
-  private blockButtons: Map<AbjectId, string> = new Map();
-  private unblockButtons: Map<AbjectId, string> = new Map();
+  // Introductions tab
+  private introCardId?: AbjectId;
+  private introEmptyId?: AbjectId;
 
-  // Signaling peers section widgets
-  private signalingPeerAddButtons: Map<AbjectId, { peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }> = new Map();
-
-  // Frontends section
+  // Frontends tab
   private uiServerId?: AbjectId;
   private remoteUIAccessId?: AbjectId;
-  private frontendDisconnectButtons: Map<AbjectId, string> = new Map();
-  private frontendRevokeButtons: Map<AbjectId, string> = new Map();
+  private feCardId?: AbjectId;
+  private feEmptyId?: AbjectId;
   // Pairing widgets (Frontends tab)
   private remoteEnableCheckboxId?: AbjectId;
   private remoteStatusLabelId?: AbjectId;
@@ -141,12 +316,12 @@ export class PeerNetwork extends Abject {
   private lastQrExpires?: number;
   private lastQrDataUrl?: string;
   private lastQrUrl?: string;
-  private refreshing = false;
-  private refreshPending = false;
-  private frontendsListAreaId?: AbjectId;
 
   // Web Access section widgets
   private webGatewayId?: AbjectId;
+  /** The Web Access tab was built with the gateway present (else it shows the unavailable note). */
+  private webBuiltWithGateway = false;
+  private webUnavailableId?: AbjectId;
   private webAccessStatusId?: AbjectId;
   private webToggleBtnId?: AbjectId;
   private webRoutesId?: AbjectId;
@@ -159,6 +334,28 @@ export class PeerNetwork extends Abject {
 
   // Discovery dep
   private peerDiscoveryId?: AbjectId;
+
+  // Map tab (built once per window; its pass redraws it with one setGraph)
+  private mapGraphId?: AbjectId;
+  private mapDetailLabelId?: AbjectId;
+  private mapActionBtnId?: AbjectId;
+  private mapShowBtnId?: AbjectId;
+  /** Selected map node (the contacts list selection follows it, and back). */
+  private mapSelectedId?: string;
+  /** Node ids the map holds now (select and pulse only reach these). */
+  private mapNodeIds: Set<string> = new Set();
+  private mapInfo: Map<string, MapNodeInfo> = new Map();
+  private snapshot: NetSnapshot = { peerId: '', peerName: '', contacts: [], servers: [], signalingPeers: [], networkPeers: [], frontends: [] };
+  /**
+   * Map nodes that were live (active) at the last redraw while the map
+   * showed; a node that comes alive since pulses. Unset while the map is
+   * hidden, so showing it replays nothing.
+   */
+  private mapLive?: Set<string>;
+  /** The selection the map widget holds (it keeps one across setGraph). */
+  private mapWidgetSelection?: string;
+  /** What the strip under the map shows now (skip unchanged updates). */
+  private mapStripSig?: string;
 
   constructor() {
     super({
@@ -219,6 +416,11 @@ for managing your identity, signaling servers, and contacts.
 - Contacts: add contacts by peer ID, connect/disconnect, introduce contacts to each other
 - Network peers: view connected peers discovered through signaling, promote to contacts
 - Discovered peers: view peers found via gossip-based discovery
+- Map tab: the same network as a 3D map with this peer at the centre (contacts, network
+  peers, signaling servers and the peers visible on them, paired frontends). Live links
+  breathe in the living light; a link that opens, or a handshake you start, sends light
+  along its edge. Click a node for its details, its action and Show in list; the
+  contacts list and the map share their selection.
 
 ### Notes
 - This is a UI object; it renders its own window via WidgetManager.
@@ -249,7 +451,12 @@ Interface: abjects:peer-network`;
    * a tab's ScrollableVBox; `expanding` fills the space the tab has left.
    */
   private async sectionCard(parentId: AbjectId, title: string, description: string, hintHeight = 18, expanding = false): Promise<AbjectId> {
-    const { sectionId } = await this.request<{ sectionId: AbjectId }>(
+    return (await this.sectionCardParts(parentId, title, description, hintHeight, expanding)).sectionId;
+  }
+
+  /** sectionCard, also returning the card's title and hint ids (for a card that is later replaced). */
+  private async sectionCardParts(parentId: AbjectId, title: string, description: string, hintHeight = 18, expanding = false): Promise<{ sectionId: AbjectId; titleId: AbjectId; hintId?: AbjectId }> {
+    return this.request<{ sectionId: AbjectId; titleId: AbjectId; hintId?: AbjectId }>(
       request(this.id, this.widgetManagerId!, 'createSection', {
         parentLayoutId: parentId,
         windowId: this.windowId,
@@ -259,7 +466,6 @@ Interface: abjects:peer-network`;
         expanding,
       })
     );
-    return sectionId;
   }
 
   /**
@@ -272,6 +478,143 @@ Interface: abjects:peer-network`;
       spec: { type: 'label', windowId: this.windowId, text: emptyStateMarkdown(title, hint), style: emptyStateStyle(t) },
       height: 64,
     };
+  }
+
+  /** Create one widget from a spec and place it in a layout at a fixed height (and width, when given). */
+  private async addWidget(layoutId: AbjectId, spec: Record<string, unknown>, height: number, width?: number): Promise<AbjectId> {
+    const { widgetIds: [widgetId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [spec] })
+    );
+    await this.request(request(this.id, layoutId, 'addLayoutChild', {
+      widgetId,
+      sizePolicy: { vertical: 'fixed', horizontal: width !== undefined ? 'fixed' : 'expanding' },
+      preferredSize: width !== undefined ? { width, height } : { height },
+    }));
+    return widgetId;
+  }
+
+  /**
+   * Update a long-lived widget only when the payload differs from the last
+   * one it was given here (the widget keeps its own copy; resending the same
+   * text would only cost a message and a redraw).
+   */
+  private async updateIfChanged(widgetId: AbjectId | undefined, payload: Record<string, unknown>): Promise<void> {
+    if (!widgetId) return;
+    const sig = JSON.stringify(payload);
+    if (this.lastSent.get(widgetId) === sig) return;
+    this.lastSent.set(widgetId, sig);
+    try {
+      await this.request(request(this.id, widgetId, 'update', payload));
+    } catch {
+      this.lastSent.delete(widgetId); // gone or busy: the next pass sends again
+    }
+  }
+
+  /** Show or hide a widget, sending only on a change (its layout drops a hidden widget from the flow). */
+  private async setShown(widgetId: AbjectId | undefined, shown: boolean): Promise<void> {
+    if (!widgetId || (this.shownState.get(widgetId) ?? true) === shown) return;
+    this.shownState.set(widgetId, shown);
+    try {
+      await this.request(request(this.id, widgetId, 'update', { style: { visible: shown } }));
+    } catch {
+      this.shownState.delete(widgetId);
+    }
+  }
+
+  /** Destroy widgets this window made (fire and forget; a second destroy is harmless). */
+  private destroyWidgets(ids: AbjectId[]): void {
+    for (const id of ids) {
+      this.rowActions.delete(id);
+      this.lastSent.delete(id);
+      this.shownState.delete(id);
+      try { this.send(event(this.id, id, 'destroy', {})); } catch { /* already gone */ }
+    }
+  }
+
+  /**
+   * Bring one card's keyed rows in line with the data. Rows whose subject
+   * left are detached and destroyed; rows whose content changed are repainted
+   * in place; new rows are created. Rows already in the wanted order stay
+   * where they are; any that must move are detached and re-appended (moved,
+   * not rebuilt). An unchanged list sends nothing.
+   */
+  private async syncRows(name: string, parentId: AbjectId, specs: RowSpec[]): Promise<void> {
+    const windowId = this.windowId;
+    let set = this.rowSets.get(name);
+    if (!set || set.parentId !== parentId) {
+      set = { parentId, rows: new Map(), order: [] };
+      this.rowSets.set(name, set);
+    }
+    const want = new Map(specs.map((s) => [s.key, s]));
+    require(want.size === specs.length, `syncRows(${name}): row keys are unique`);
+    for (const key of set.order) {
+      if (want.has(key)) continue;
+      const row = set.rows.get(key)!;
+      set.rows.delete(key);
+      await this.request(request(this.id, parentId, 'removeLayoutChild', { widgetId: row.rowId })).catch(() => { /* card gone */ });
+      this.destroyWidgets([...row.cellIds, row.rowId]);
+    }
+    const kept = set.order.filter((k) => want.has(k));
+    set.order = kept;
+    for (const key of kept) {
+      const row = set.rows.get(key)!;
+      const spec = want.get(key)!;
+      if (row.sig === spec.sig) continue;
+      row.sig = spec.sig;
+      for (let i = 0; i < row.cellIds.length; i++) {
+        const update = spec.updates[i];
+        if (update) await this.request(request(this.id, row.cellIds[i], 'update', update)).catch(() => { /* gone */ });
+      }
+    }
+    let inPlace = 0;
+    while (inPlace < kept.length && kept[inPlace] === specs[inPlace].key) inPlace++;
+    for (const key of kept.slice(inPlace)) {
+      await this.request(request(this.id, parentId, 'removeLayoutChild', { widgetId: set.rows.get(key)!.rowId })).catch(() => { /* gone */ });
+    }
+    for (const spec of specs.slice(inPlace)) {
+      if (this.windowId !== windowId) return; // the window closed mid-pass
+      const row = set.rows.get(spec.key);
+      if (row) {
+        await this.request(request(this.id, parentId, 'addLayoutChild', {
+          widgetId: row.rowId, sizePolicy: ROW_POLICY, preferredSize: { height: spec.height },
+        })).catch(() => { /* gone */ });
+      } else {
+        set.rows.set(spec.key, await this.createRow(parentId, spec));
+      }
+    }
+    set.order = specs.map((s) => s.key);
+    ensure(set.order.length === set.rows.size, `syncRows(${name}): every wanted row is on screen`);
+  }
+
+  /** One keyed row: an HBox in the card, its cells in one create, its buttons wired to their actions. */
+  private async createRow(parentId: AbjectId, spec: RowSpec): Promise<LiveRow> {
+    const rowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: parentId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, parentId, 'addLayoutChild', {
+      widgetId: rowId, sizePolicy: ROW_POLICY, preferredSize: { height: spec.height },
+    }));
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: spec.cells.map((c) => c.spec) })
+    );
+    await this.request(request(this.id, rowId, 'addLayoutChildren', {
+      children: spec.cells.map((c, i) => ({
+        widgetId: widgetIds[i],
+        sizePolicy: { vertical: 'fixed', horizontal: c.width !== undefined ? 'fixed' : 'expanding' },
+        preferredSize: c.width !== undefined ? { width: c.width, height: c.height } : { height: c.height },
+      })),
+    }));
+    for (let i = 0; i < spec.cells.length; i++) {
+      const action = spec.cells[i].action;
+      if (!action) continue;
+      this.rowActions.set(widgetIds[i], action);
+      await this.request(request(this.id, widgetIds[i], 'addDependent', {}));
+    }
+    return { rowId, cellIds: widgetIds, sig: spec.sig };
   }
 
   /** Style for the remote UI status line: phosphor while enabled, muted when off. */
@@ -352,6 +695,8 @@ Interface: abjects:peer-network`;
       if (!key.startsWith('signal:')) await this.reportContactOutcome(key);
     }, HANDSHAKE_WATCH_MS);
     await this.syncPeerSigil();
+    // The handshake leaves this peer: one mote along the edge on the map.
+    await this.pulseOnMap(key.startsWith('signal:') ? `sig:${key.slice('signal:'.length)}` : `peer:${key}`, 1);
   }
 
   /** Ask the registry how a watched handshake ended and say so. */
@@ -395,6 +740,485 @@ Interface: abjects:peer-network`;
     await this.setStatus(text, color);
   }
 
+  // ========== MAP TAB ==========
+
+  /**
+   * Show one tab and hide the rest (a hidden tab takes its map scene with
+   * it). `fromCode` also moves the tab bar, for "Show in list".
+   */
+  private async selectTab(idx: number, fromCode = false): Promise<void> {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= this.tabContents.length) return;
+    if (fromCode && this.tabBarId) {
+      await this.request(request(this.id, this.tabBarId, 'update', { selectedIndex: idx })).catch(() => { /* gone */ });
+    }
+    // Only the tab that leaves and the tab that arrives change.
+    for (let i = 0; i < this.tabContents.length; i++) {
+      await this.setShown(this.tabContents[i], i === idx);
+    }
+    this.selectedTab = idx;
+    // A tab bar click means the window is on screen, whatever we last heard.
+    this.minimized = false;
+    if (idx !== MAP_TAB) this.mapLive = undefined;
+    await this.syncPeerSigil();
+    // The tab shows what is true now: built on first show, then brought up
+    // to date (a pass changes only what differs; the map redraws with one
+    // setGraph, and unchanged data moves nothing).
+    this.fullDue = true;
+    this.refreshDue = true;
+    await this.flush();
+  }
+
+  // ========== KEEPING TABS CURRENT ==========
+
+  /**
+   * An event changed these sources. Only the visible tab acts, and only if
+   * it shows one of them, once a burst settles; hidden tabs read fresh when
+   * selected, and a minimized window only remembers what changed.
+   */
+  private markStale(data: readonly NetData[]): void {
+    if (!this.windowId) return;
+    const shows = TAB_DATA[this.selectedTab];
+    const touched = data.filter((d) => shows.includes(d));
+    if (touched.length === 0) return;
+    for (const d of touched) this.staleData.add(d);
+    this.refreshDue = true;
+    if (this.minimized || this.flushTimer !== undefined) return;
+    this.flushTimer = this.setTimer(async () => {
+      this.flushTimer = undefined;
+      await this.flush();
+    }, REFRESH_COALESCE_MS);
+  }
+
+  /**
+   * After this window's own action (add, remove, connect, ...): bring the
+   * visible tab up to date now, reading everything it shows.
+   */
+  private async refresh(): Promise<void> {
+    if (!this.windowId) return;
+    this.minimized = false;
+    this.fullDue = true;
+    this.refreshDue = true;
+    await this.flush();
+  }
+
+  /**
+   * Bring the visible tab up to date if it is due. One pass at a time; a
+   * request that arrives mid-pass runs another pass after it (for whichever
+   * tab is visible then).
+   */
+  private async flush(): Promise<void> {
+    if (!this.windowId || this.minimized) return;
+    if (this.flushing) {
+      this.flushAgain = true;
+      return;
+    }
+    this.flushing = true;
+    try {
+      do {
+        this.flushAgain = false;
+        if (!this.refreshDue) continue;
+        const fresh: 'all' | Set<NetData> = this.fullDue ? 'all' : new Set(this.staleData);
+        this.refreshDue = false;
+        this.fullDue = false;
+        this.staleData.clear();
+        await this.syncTab(this.selectedTab, fresh);
+      } while (this.flushAgain && this.windowId !== undefined && !this.minimized);
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  /** One pass over one tab: build it the first time, then change what differs. */
+  private async syncTab(tab: number, fresh: 'all' | Set<NetData>): Promise<void> {
+    require(Number.isInteger(tab) && tab >= 0 && tab <= MAP_TAB, 'syncTab: a tab index');
+    const windowId = this.windowId;
+    const reads = this.newReads(fresh);
+    try {
+      switch (tab) {
+        case IDENTITY_TAB: await this.syncIdentityTab(reads); break;
+        case CONTACTS_TAB: await this.syncContactsTab(reads); break;
+        case SERVERS_TAB: await this.syncServersTab(reads); break;
+        case INTROS_TAB: await this.syncIntrosTab(reads); break;
+        case FRONTENDS_TAB: await this.syncFrontendsTab(reads); break;
+        case WEB_TAB: await this.syncWebTab(); break;
+        case MAP_TAB: await this.syncMapTab(reads); break;
+      }
+    } catch (err) {
+      if (this.windowId === windowId) throw err;
+      // The window closed mid-pass; its widgets went with it.
+    }
+  }
+
+  /**
+   * Readers for one pass. A source in `fresh` (or never read) is asked,
+   * once however many cards need it; any other source answers with what it
+   * said last. Answers also land in the snapshot the map draws from. A
+   * source that does not answer reads as empty, as a busy registry always has.
+   */
+  private newReads(fresh: 'all' | Set<NetData>): NetReads {
+    const snap = this.snapshot;
+    const ask = async <T>(to: AbjectId | undefined, method: string, fallback: T): Promise<T> => {
+      if (!to) return fallback;
+      try {
+        return (await this.request<T>(request(this.id, to, method, {}))) ?? fallback;
+      } catch {
+        return fallback;
+      }
+    };
+    const source = <T>(key: NetData, read: () => Promise<T>): (() => Promise<T>) => {
+      let pending: Promise<T> | undefined;
+      return () => (pending ??= (async () => {
+        if (fresh !== 'all' && !fresh.has(key) && this.readCache.has(key)) return this.readCache.get(key) as T;
+        const value = await read();
+        this.readCache.set(key, value);
+        return value;
+      })());
+    };
+    return {
+      identity: source('identity', async () => {
+        const id = await ask<{ peerId: string; name?: string } | null>(this.identityId, 'exportPublicKeys', null);
+        if (id) {
+          snap.peerId = id.peerId;
+          snap.peerName = id.name ?? '';
+        }
+        return { peerId: snap.peerId, name: snap.peerName };
+      }),
+      contacts: source('contacts', async () => (snap.contacts = await ask<ContactSnap[]>(this.peerRegistryId, 'listContacts', []))),
+      servers: source('servers', async () => (snap.servers = await ask<ServerSnap[]>(this.peerRegistryId, 'listSignalingServers', []))),
+      signalingPeers: source('signalingPeers', async () => (snap.signalingPeers = await ask<SignalingPeerSnap[]>(this.peerRegistryId, 'listSignalingPeers', []))),
+      networkPeers: source('networkPeers', async () => (snap.networkPeers = await ask<NetworkPeerSnap[]>(this.peerRegistryId, 'listNetworkPeers', []))),
+      discovery: source('discovery', () => ask<DiscoverySnap>(this.peerDiscoveryId, 'getDiscoveryStats', { cacheSize: 0, connectedNetworkPeers: 0 })),
+      blocked: source('blocked', () => ask<string[]>(this.peerRegistryId, 'listBlockedPeers', [])),
+      intros: source('intros', () => ask<IntroSnap[]>(this.peerRegistryId, 'listPendingIntroductions', [])),
+      frontends: source('frontends', async () => {
+        await this.ensureFrontendDeps();
+        return (snap.frontends = await ask<FrontendSnap[]>(this.uiServerId, 'listFrontendClients', []));
+      }),
+    };
+  }
+
+  /** Live peer connections drive the Identity tab's eye sigil. */
+  private async notePeersLive(reads: NetReads): Promise<void> {
+    const [contacts, networkPeers] = await Promise.all([reads.contacts(), reads.networkPeers()]);
+    this.peersLive = contacts.some((c) => c.state === 'connected') || networkPeers.length > 0;
+    await this.syncPeerSigil();
+  }
+
+  /** The Map tab's pass: read what the map draws, then one setGraph. */
+  private async syncMapTab(reads: NetReads): Promise<void> {
+    await Promise.all([reads.identity(), reads.contacts(), reads.servers(), reads.signalingPeers(), reads.networkPeers(), reads.frontends()]);
+    await this.notePeersLive(reads);
+    await this.syncPeerMap();
+  }
+
+  private mapShown(): boolean {
+    return this.selectedTab === MAP_TAB && this.mapGraphId !== undefined;
+  }
+
+  /** The Map tab: the graph, then a strip naming the selection with its action. */
+  private async buildMapTab(mapTabId: AbjectId): Promise<void> {
+    const t = this.theme;
+    const { widgetIds: [graphId, detailId, actionId, showId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        {
+          type: 'nodeGraph', windowId: this.windowId, title: 'Peer network',
+          emptyText: 'Reading the network', directed: false,
+          groups: [
+            { id: 'self', label: 'This peer', color: '$textPrimary', shape: 'icosphere', material: 'ceramic' },
+            { id: 'contacts', label: 'Contacts', color: '$statusInfo', shape: 'sphere' },
+            { id: 'network', label: 'Network peers', color: '$statusSuccess', shape: 'sphere' },
+            { id: 'servers', label: 'Signaling servers', color: '$textSecondary', shape: 'cylinder' },
+            { id: 'discoverable', label: 'On your servers', color: '$textSecondary', shape: 'icosphere' },
+            { id: 'frontends', label: 'Frontends', color: '$accentTertiary', shape: 'roundedBox' },
+          ],
+          hint: 'Drag to turn · wheel to zoom · click a node for its details',
+        },
+        { type: 'label', windowId: this.windowId, text: '', style: { color: t.textMeta, fontSize: 12, selectable: true } },
+        { type: 'button', windowId: this.windowId, text: 'Connect', style: { ...this.positiveButtonStyle(), fontSize: 11, visible: false } },
+        { type: 'button', windowId: this.windowId, text: 'Show in list', style: { fontSize: 11, visible: false } },
+      ] })
+    );
+    this.mapGraphId = graphId;
+    this.mapDetailLabelId = detailId;
+    this.mapActionBtnId = actionId;
+    this.mapShowBtnId = showId;
+    await this.request(request(this.id, mapTabId, 'addLayoutChild', {
+      widgetId: graphId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    const stripId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: mapTabId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, mapTabId, 'addLayoutChild', {
+      widgetId: stripId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+    await this.request(request(this.id, stripId, 'addLayoutChildren', { children: [
+      { widgetId: detailId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 30 } },
+      { widgetId: actionId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 100, height: 28 } },
+      { widgetId: showId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 100, height: 28 } },
+    ] }));
+    for (const id of [graphId, actionId, showId]) {
+      await this.request(request(this.id, id, 'addDependent', {}));
+    }
+  }
+
+  /**
+   * Redraw the map from the last snapshot: this peer at the centre; contacts,
+   * network peers, signaling servers (with the peers visible on them) and
+   * paired frontends around it. Live links breathe in the living light and
+   * are drawn solid; offline ones are see-through and dashed. Runs in the
+   * Map tab's pass (when it shows, and after network events while it
+   * shows); one setGraph, and nodes keep their places. A link that comes
+   * alive while the map shows pulses.
+   */
+  private async syncPeerMap(): Promise<void> {
+    if (!this.mapGraphId || !this.mapShown()) return;
+    const snap = this.snapshot;
+    const nodes: Array<Record<string, unknown>> = [];
+    const edges: Array<Record<string, unknown>> = [];
+    const info = new Map<string, MapNodeInfo>();
+    const shortId = (id: string) => (id ? `${id.slice(0, 12)}...` : '');
+    const liveCount = snap.contacts.filter((c) => c.state === 'connected').length + snap.networkPeers.length;
+
+    nodes.push({ id: SELF_NODE, label: snap.peerName || 'This peer', group: 'self', size: 14, center: true });
+    info.set(SELF_NODE, {
+      text: `This peer · ${snap.peerName || 'unnamed'} · ${shortId(snap.peerId)} · ${liveCount} live connection${liveCount === 1 ? '' : 's'}`,
+      tab: 0,
+    });
+
+    for (const c of snap.contacts) {
+      const id = `peer:${c.peerId}`;
+      const live = c.state === 'connected';
+      const name = c.name || shortId(c.peerId);
+      nodes.push({
+        id, label: name, group: 'contacts', size: 9, active: live,
+        ...(c.state === 'connecting' ? { color: '$statusWarning' } : {}),
+        ...(!live && c.state !== 'connecting' ? { ghost: true } : {}),
+      });
+      edges.push({ from: SELF_NODE, to: id, weight: live ? 2.5 : 0.6, ...(live ? {} : { style: 'dashed' }) });
+      info.set(id, {
+        text: `${name} · contact · ${c.state} · ${shortId(c.peerId)}`,
+        tab: 1,
+        action: { label: live ? 'Disconnect' : 'Connect', kind: 'toggleContact', key: c.peerId },
+      });
+    }
+    for (const p of snap.networkPeers) {
+      const id = `peer:${p.peerId}`;
+      if (info.has(id)) continue;
+      const name = p.name || shortId(p.peerId);
+      nodes.push({ id, label: name, group: 'network', size: 8, active: true });
+      edges.push({ from: SELF_NODE, to: id, weight: 2.5 });
+      info.set(id, {
+        text: `${name} · network peer · connected ${this.formatDuration(Date.now() - p.connectedAt)}`,
+        tab: 2,
+        action: { label: 'Trust', kind: 'trust', key: p.peerId },
+      });
+    }
+    for (const s of snap.servers) {
+      const id = `sig:${s.url}`;
+      const live = s.status === 'connected';
+      let host = s.url;
+      try { host = new URL(s.url).host || s.url; } catch { /* not a URL: show it whole */ }
+      nodes.push({
+        id, label: host, group: 'servers', size: 10, active: live,
+        ...(s.status === 'connecting' ? { color: '$statusWarning' } : {}),
+        ...(!live && s.status !== 'connecting' ? { ghost: true } : {}),
+      });
+      edges.push({ from: SELF_NODE, to: id, weight: live ? 1.5 : 0.6, ...(live ? {} : { style: 'dashed' }) });
+      info.set(id, { text: `${s.url} · signaling server · ${live ? 'connected' : s.status === 'connecting' ? 'connecting' : 'offline'}`, tab: 2 });
+    }
+    for (const sp of snap.signalingPeers) {
+      const server = `sig:${sp.serverUrl}`;
+      if (!info.has(server)) continue;
+      const known = `peer:${sp.peerId}`;
+      if (info.has(known)) {
+        edges.push({ id: `seen:${sp.peerId}`, from: server, to: known, weight: 0.4, style: 'dashed' });
+        continue;
+      }
+      const id = `sp:${sp.peerId}`;
+      if (info.has(id)) continue;
+      const name = sp.name || shortId(sp.peerId);
+      nodes.push({ id, label: name, group: 'discoverable', size: 6, ghost: true });
+      edges.push({ from: server, to: id, weight: 0.5, style: 'dashed' });
+      info.set(id, {
+        text: `${name} · visible on ${sp.serverUrl}`,
+        tab: 2,
+        action: { label: 'Add contact', kind: 'addSignalingPeer', key: sp.peerId },
+      });
+    }
+    for (const fe of snap.frontends) {
+      const id = `fe:${fe.clientId}`;
+      const kind = fe.kind === 'webrtc' ? 'P2P' : 'WS';
+      const name = fe.name?.trim() || shortId(fe.peerId) || fe.clientId.slice(0, 10);
+      nodes.push({ id, label: `${kind} ${name}`, group: 'frontends', size: 7, active: fe.ready, ...(fe.ready ? {} : { ghost: true }) });
+      edges.push({ from: SELF_NODE, to: id, weight: 1.5, ...(fe.ready ? {} : { style: 'dashed' }) });
+      info.set(id, {
+        text: `${kind} frontend · ${name} · connected ${formatRelative(Date.now() - fe.connectedAt)}`,
+        tab: 4,
+        action: { label: 'Disconnect', kind: 'disconnectFrontend', key: fe.clientId },
+      });
+    }
+
+    try {
+      await this.request(request(this.id, this.mapGraphId, 'setGraph', { nodes, edges }));
+    } catch {
+      return; // the window went away mid-refresh
+    }
+    this.mapInfo = info;
+    this.mapNodeIds = new Set(info.keys());
+    if (this.mapSelectedId && !this.mapNodeIds.has(this.mapSelectedId)) this.mapSelectedId = undefined;
+    if (this.mapSelectedId && this.mapSelectedId !== this.mapWidgetSelection) {
+      // Chosen in the contacts list while the map was hidden.
+      await this.request(request(this.id, this.mapGraphId, 'select', { id: this.mapSelectedId })).catch(() => { /* gone */ });
+    }
+    this.mapWidgetSelection = this.mapSelectedId;
+    await this.updateMapStrip();
+
+    // A link that came alive while the map showed: light flows out to it.
+    const live = new Set(nodes.filter((n) => n.active === true).map((n) => n.id as string));
+    const before = this.mapLive;
+    this.mapLive = live;
+    if (before) {
+      for (const id of live) if (!before.has(id)) await this.pulseOnMap(id, 2);
+    }
+  }
+
+  /** One flow of light from this peer to a node on the map (while the map shows). */
+  private async pulseOnMap(nodeId: string, count: number): Promise<void> {
+    if (!this.mapShown() || !this.mapNodeIds.has(nodeId)) return;
+    await this.request(request(this.id, this.mapGraphId!, 'pulse', { from: SELF_NODE, to: nodeId, count }))
+      .catch(() => { /* not placed yet */ });
+  }
+
+  /**
+   * Select a node: the map (unless the click came from it), the strip under
+   * it, and the contacts list when it is a contact.
+   */
+  private async selectOnMap(nodeId: string, via: 'map' | 'list'): Promise<void> {
+    this.mapSelectedId = nodeId;
+    if (via === 'map') this.mapWidgetSelection = nodeId;
+    if (via === 'list' && this.mapGraphId && this.mapNodeIds.has(nodeId)) {
+      await this.request(request(this.id, this.mapGraphId, 'select', { id: nodeId })).catch(() => { /* not on the map yet */ });
+      this.mapWidgetSelection = nodeId;
+    }
+    if (via === 'map' && this.contactListId && nodeId.startsWith('peer:')) {
+      // The row as the contacts list shows it (the list may be a pass behind the snapshot).
+      const idx = this.contactListPeers.indexOf(nodeId.slice('peer:'.length));
+      if (idx >= 0) {
+        await this.request(request(this.id, this.contactListId, 'update', { selectedIndex: idx })).catch(() => { /* list gone */ });
+      }
+    }
+    await this.updateMapStrip();
+  }
+
+  /** The strip under the map: the selection's facts, its action, and Show in list. */
+  private async updateMapStrip(): Promise<void> {
+    if (!this.mapDetailLabelId) return;
+    const info = this.mapSelectedId ? this.mapInfo.get(this.mapSelectedId) : undefined;
+    const text = info?.text ?? 'Click a peer, server or frontend for its details.';
+    // Every refresh redraws the map; the strip only changes when its content does.
+    const sig = JSON.stringify([text, info?.action?.label ?? null, !!info]);
+    if (sig === this.mapStripSig) return;
+    this.mapStripSig = sig;
+    try {
+      await this.request(request(this.id, this.mapDetailLabelId, 'update', {
+        text, style: { color: info ? this.theme.textHeading : this.theme.textMeta },
+      }));
+      if (this.mapActionBtnId) {
+        await this.request(request(this.id, this.mapActionBtnId, 'update', {
+          ...(info?.action ? { text: info.action.label } : {}),
+          style: { visible: !!info?.action },
+        }));
+      }
+      if (this.mapShowBtnId) {
+        await this.request(request(this.id, this.mapShowBtnId, 'update', { style: { visible: !!info } }));
+      }
+    } catch { /* widgets gone */ }
+  }
+
+  /** The strip's action: the same operation the lists offer for that row. */
+  private async runMapAction(): Promise<void> {
+    const action = this.mapSelectedId ? this.mapInfo.get(this.mapSelectedId)?.action : undefined;
+    if (!action) return;
+    switch (action.kind) {
+      case 'toggleContact':
+        await this.toggleConnection(action.key);
+        return;
+      case 'trust':
+        await this.promoteNetworkPeer(action.key);
+        return;
+      case 'addSignalingPeer':
+        await this.addSignalingPeerContact(action.key, true);
+        return;
+      case 'disconnectFrontend':
+        await this.disconnectFrontend(action.key);
+        return;
+    }
+  }
+
+  /** A row button: the operation its row offers, for that row's subject. */
+  private async runRowAction({ kind, key, peer }: RowButtonAction): Promise<void> {
+    switch (kind) {
+      case 'removeServer': await this.removeSignalingServer(key); return;
+      case 'addSignalingPeer': await this.addSignalingPeerContact(key, false, peer); return;
+      case 'block': await this.blockPeer(key); return;
+      case 'trust': await this.promoteNetworkPeer(key); return;
+      case 'unblock': await this.unblockPeer(key); return;
+      case 'acceptIntro': await this.acceptIntroduction(key); return;
+      case 'rejectIntro': await this.rejectIntroduction(key); return;
+      case 'disconnectFrontend': await this.disconnectFrontend(key); return;
+      case 'revokeFrontend':
+        if (!this.remoteUIAccessId) return;
+        try {
+          await this.request(request(this.id, this.remoteUIAccessId, 'revokeClient', { peerId: key }));
+        } catch {
+          await this.reject('Could not revoke that frontend.');
+        }
+        return;
+    }
+  }
+
+  /**
+   * Make a peer seen on a signaling server a contact (its keys as the server
+   * listed them: the row's own copy, or the last read). From the map, the new
+   * contact stays selected there.
+   */
+  private async addSignalingPeerContact(peerId: string, selectOnMap: boolean, known?: SignalingPeerSnap): Promise<void> {
+    const sp = known ?? this.snapshot.signalingPeers.find((p) => p.peerId === peerId);
+    if (!this.peerRegistryId) return;
+    if (!sp) {
+      await this.reject('Could not add that peer as a contact.');
+      return;
+    }
+    try {
+      await this.request(request(this.id, this.peerRegistryId, 'addContact', {
+        peerId: sp.peerId, name: sp.name, publicSigningKey: sp.publicSigningKey, publicExchangeKey: sp.publicExchangeKey,
+      }));
+    } catch {
+      await this.reject('Could not add that peer as a contact.');
+      return;
+    }
+    if (selectOnMap) this.mapSelectedId = `peer:${sp.peerId}`;
+    // Adding emits no registry event, so show the new contact now.
+    await this.refresh();
+    await this.acknowledge('Contact added!');
+  }
+
+  private async disconnectFrontend(clientId: string): Promise<void> {
+    if (!this.uiServerId) return;
+    try {
+      await this.request(request(this.id, this.uiServerId, 'disconnectFrontendClient', { clientId }));
+    } catch {
+      await this.reject('Could not disconnect that frontend.');
+    }
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
@@ -405,15 +1229,19 @@ Interface: abjects:peer-network`;
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
     this.remoteUIAccessId = await this.discoverDep('RemoteUIAccess') ?? undefined;
 
-    // Subscribe to PeerRegistry events so the window auto-refreshes
-    if (this.peerRegistryId) {
-      await this.request(request(this.id, this.peerRegistryId, 'addDependent', {}));
-    }
-    if (this.uiServerId) {
-      try { await this.request(request(this.id, this.uiServerId, 'addDependent', {})); } catch { /* best effort */ }
-    }
-    if (this.remoteUIAccessId) {
-      try { await this.request(request(this.id, this.remoteUIAccessId, 'addDependent', {})); } catch { /* best effort */ }
+    // Their events are subscribed while the window is open (show/hide).
+  }
+
+  /**
+   * Registry, frontend and gateway events only matter while the window is
+   * open: show subscribes, hide unsubscribes, so a closed window costs the
+   * network nothing.
+   */
+  private async listenToNetwork(on: boolean): Promise<void> {
+    const method = on ? 'addDependent' : 'removeDependent';
+    for (const id of [this.peerRegistryId, this.uiServerId, this.remoteUIAccessId, this.webGatewayId]) {
+      if (!id) continue;
+      try { await this.request(request(this.id, id, method, {})); } catch { /* best effort */ }
     }
   }
 
@@ -427,6 +1255,20 @@ Interface: abjects:peer-network`;
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    // Minimized, the window only remembers that its tab is due; restored, it
+    // catches up once.
+    this.on('windowMinimized', async (msg: AbjectMessage) => {
+      if ((msg.payload as { windowId?: AbjectId } | undefined)?.windowId !== this.windowId || !this.windowId) return;
+      this.minimized = true;
+      this.cancelTimer(this.flushTimer);
+      this.flushTimer = undefined;
+    });
+    this.on('windowRestored', async (msg: AbjectMessage) => {
+      if ((msg.payload as { windowId?: AbjectId } | undefined)?.windowId !== this.windowId || !this.minimized) return;
+      this.minimized = false;
+      await this.flush();
+    });
 
     this.on('windowResized', async (msg: AbjectMessage) => {
       const { windowId, width, height } = msg.payload as { windowId?: AbjectId; width: number; height: number };
@@ -443,14 +1285,34 @@ Interface: abjects:peer-network`;
 
       // Tab bar change — show/hide tab content
       if (fromId === this.tabBarId && aspect === 'change') {
-        const idx = parseInt(value as string);
-        for (let i = 0; i < this.tabContents.length; i++) {
-          await this.request(request(this.id, this.tabContents[i], 'update', {
-            style: { visible: i === idx },
-          }));
-        }
-        this.selectedTab = idx;
-        await this.syncPeerSigil();
+        await this.selectTab(parseInt(value as string));
+        return;
+      }
+
+      // Map: a click selects (the strip names it, the contacts list follows);
+      // a double-click also brings it close (the widget's focus).
+      if (fromId === this.mapGraphId && (aspect === 'nodeSelected' || aspect === 'nodeFocused')) {
+        try {
+          const id = (JSON.parse(value as string) as { id?: string }).id;
+          if (id) await this.selectOnMap(id, 'map');
+        } catch { /* malformed payload */ }
+        return;
+      }
+      if (fromId === this.mapActionBtnId && aspect === 'click') {
+        await this.runMapAction();
+        return;
+      }
+      if (fromId === this.mapShowBtnId && aspect === 'click') {
+        const info = this.mapSelectedId ? this.mapInfo.get(this.mapSelectedId) : undefined;
+        if (info) await this.selectTab(info.tab, true);
+        return;
+      }
+      // Contacts list selection: the map selects the same contact.
+      if (fromId === this.contactListId && aspect === 'selectionChanged') {
+        try {
+          const peerId = (JSON.parse(value as string) as { value?: string }).value;
+          if (peerId) await this.selectOnMap(`peer:${peerId}`, 'list');
+        } catch { /* malformed payload */ }
         return;
       }
 
@@ -471,7 +1333,7 @@ Interface: abjects:peer-network`;
             await this.reject('Could not change the web gateway.');
           }
         }
-        await this.rebuildWebAccessTab();
+        await this.refreshWebAccessTab();
         return;
       }
 
@@ -483,6 +1345,8 @@ Interface: abjects:peer-network`;
             const port = raw.length === 0 ? 0 : Number(raw);
             if (raw.length === 0 || (Number.isInteger(port) && port >= 0 && port <= 65535)) {
               await this.request(request(this.id, this.webGatewayId, 'setPort', { port }));
+              // Applied: the field empties again, ready for the next change.
+              await this.request(request(this.id, this.webPortInputId, 'update', { text: '' })).catch(() => { /* gone */ });
               await this.acknowledge(raw.length === 0 ? 'Port set to automatic.' : `Port ${port} applied.`);
             } else {
               // Keep the typed value in place so it can be corrected.
@@ -493,7 +1357,7 @@ Interface: abjects:peer-network`;
             await this.reject('Could not apply the port.');
           }
         }
-        await this.rebuildWebAccessTab();
+        await this.refreshWebAccessTab();
         return;
       }
 
@@ -501,15 +1365,14 @@ Interface: abjects:peer-network`;
       if (fromId === this.webMintBtnId && aspect === 'click') {
         if (this.webGatewayId) {
           try {
-            const minted = await this.request<{ id: string; name: string; secret: string }>(
+            const minted = await this.request<{ id: string; name: string; token?: string; secret?: string }>(
               request(this.id, this.webGatewayId, 'mintToken', { name: 'token' })
             );
-            await this.rebuildWebAccessTab();
-            if (this.webTokenResultId) {
-              await this.request(request(this.id, this.webTokenResultId, 'update', {
-                text: `Token secret (shown once): ${minted.secret}`,
-              }));
-            }
+            await this.updateWebAccessData();
+            // The gateway answers with the plaintext as `token`.
+            await this.updateIfChanged(this.webTokenResultId, {
+              text: `Token secret (shown once): ${minted.token ?? minted.secret ?? ''}`,
+            });
             this.windowEffect('flash');
           } catch {
             await this.reject('Could not create a token.');
@@ -518,9 +1381,11 @@ Interface: abjects:peer-network`;
         return;
       }
 
-      if (aspect === 'click' && this.signalingRemoveButtons.has(fromId)) {
-        const url = this.signalingRemoveButtons.get(fromId)!;
-        await this.removeSignalingServer(url);
+      // Row buttons (servers, signaling peers, network and blocked peers,
+      // introductions, frontends): the row's operation for the row's subject.
+      const rowAction = aspect === 'click' ? this.rowActions.get(fromId) : undefined;
+      if (rowAction) {
+        await this.runRowAction(rowAction);
         return;
       }
 
@@ -565,70 +1430,6 @@ Interface: abjects:peer-network`;
         return;
       }
 
-      if (aspect === 'click' && this.connectButtons.has(fromId)) {
-        const peerId = this.connectButtons.get(fromId)!;
-        await this.toggleConnection(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.removeButtons.has(fromId)) {
-        const peerId = this.removeButtons.get(fromId)!;
-        await this.removeContact(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.introduceButtons.has(fromId)) {
-        const contactId = this.introduceButtons.get(fromId)!;
-        await this.introduceContact(contactId);
-        return;
-      }
-
-      if (aspect === 'click' && this.acceptIntroButtons.has(fromId)) {
-        const peerId = this.acceptIntroButtons.get(fromId)!;
-        await this.acceptIntroduction(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.rejectIntroButtons.has(fromId)) {
-        const peerId = this.rejectIntroButtons.get(fromId)!;
-        await this.rejectIntroduction(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.promoteButtons.has(fromId)) {
-        const peerId = this.promoteButtons.get(fromId)!;
-        await this.promoteNetworkPeer(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.blockButtons.has(fromId)) {
-        const peerId = this.blockButtons.get(fromId)!;
-        await this.blockPeer(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.unblockButtons.has(fromId)) {
-        const peerId = this.unblockButtons.get(fromId)!;
-        await this.unblockPeer(peerId);
-        return;
-      }
-
-      if (aspect === 'click' && this.signalingPeerAddButtons.has(fromId)) {
-        const peer = this.signalingPeerAddButtons.get(fromId)!;
-        if (this.peerRegistryId) {
-          try {
-            await this.request(request(this.id, this.peerRegistryId, 'addContact', peer));
-          } catch {
-            await this.reject('Could not add that peer as a contact.');
-            return;
-          }
-          // Adding emits no registry event, so show the new contact now.
-          await this.refresh();
-          await this.acknowledge('Contact added!');
-        }
-        return;
-      }
-
       // Frontends tab — toggle remote UI access
       if (fromId === this.remoteEnableCheckboxId && aspect === 'change') {
         if (this.remoteUIAccessId) {
@@ -669,41 +1470,11 @@ Interface: abjects:peer-network`;
         return;
       }
 
-      // Frontends tab — disconnect a connected UI client
-      if (aspect === 'click' && this.frontendDisconnectButtons.has(fromId)) {
-        const clientId = this.frontendDisconnectButtons.get(fromId)!;
-        if (this.uiServerId) {
-          try {
-            await this.request(request(this.id, this.uiServerId, 'disconnectFrontendClient', { clientId }));
-          } catch {
-            await this.reject('Could not disconnect that frontend.');
-          }
-        }
-        return;
-      }
-
-      // Frontends tab — revoke a paired remote UI client (WebRTC only)
-      if (aspect === 'click' && this.frontendRevokeButtons.has(fromId)) {
-        const peerId = this.frontendRevokeButtons.get(fromId)!;
-        if (this.remoteUIAccessId) {
-          try {
-            await this.request(request(this.id, this.remoteUIAccessId, 'revokeClient', { peerId }));
-          } catch {
-            await this.reject('Could not revoke that frontend.');
-          }
-        }
-        return;
-      }
-
-      // PeerRegistry events — auto-refresh
-      if (fromId === this.peerRegistryId && (
-        aspect === 'contactConnected' || aspect === 'contactDisconnected' ||
-        aspect === 'contactIntroduced' || aspect === 'signalingStateChanged' ||
-        aspect === 'introductionReceived' ||
-        aspect === 'networkPeerConnected' || aspect === 'networkPeerDisconnected' ||
-        aspect === 'signalingPeersUpdated' ||
-        aspect === 'peerBlocked' || aspect === 'peerUnblocked'
-      )) {
+      // PeerRegistry events: the handshake watch reacts at once; the tabs
+      // the event touches are marked due (the visible one catches up after
+      // the burst settles).
+      const eventData = fromId === this.peerRegistryId ? REGISTRY_EVENT_DATA.get(aspect) : undefined;
+      if (eventData) {
         const eventPeerId = (value as { peerId?: string } | undefined)?.peerId;
         if (aspect === 'contactConnected') {
           const watched = eventPeerId !== undefined && eventPeerId === this.handshakeKey;
@@ -721,14 +1492,21 @@ Interface: abjects:peer-network`;
           await this.endHandshake();
           await this.reject('Could not connect to that peer. They may be offline.');
         }
-        await this.refresh();
+        // (The map redraws in its pass; a link that came alive pulses there.)
+        this.markStale(eventData);
         return;
       }
 
-      // UIServer / RemoteUIAccess events — auto-refresh
+      // UIServer / RemoteUIAccess events: the Frontends tab and the map.
       if ((fromId === this.uiServerId && aspect === 'frontendClientsChanged') ||
           (fromId === this.remoteUIAccessId && aspect === 'clientsChanged')) {
-        await this.refresh();
+        this.markStale(['frontends']);
+        return;
+      }
+
+      // The web gateway changed (on, off, port, routes, tokens).
+      if (fromId === this.webGatewayId && aspect === 'gatewayChanged') {
+        this.markStale(['web']);
         return;
       }
     });
@@ -742,7 +1520,8 @@ Interface: abjects:peer-network`;
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = 620;
+    // Wide enough for seven tabs (the Map tab included) at the old tab width.
+    const winW = 720;
     const winH = 700;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
@@ -772,7 +1551,7 @@ Interface: abjects:peer-network`;
     // Tab bar
     const { widgetIds: [_tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions', 'Frontends', 'Web Access'], selectedIndex: 0 },
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions', 'Frontends', 'Web Access', 'Map'], selectedIndex: 0 },
       ] })
     );
     this.tabBarId = _tabBarId;
@@ -798,13 +1577,26 @@ Interface: abjects:peer-network`;
         widgetId: tabVBox,
         sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
       }));
-      if (i > 0) {
-        await this.request(request(this.id, tabVBox, 'update', {
-          style: { visible: false },
-        }));
-      }
+      if (i > 0) await this.setShown(tabVBox, false);
       this.tabContents.push(tabVBox);
     }
+
+    // The Map tab (index MAP_TAB): the same network as a 3D graph. A plain
+    // VBox (the graph fills it; it never scrolls), built once per window.
+    const mapTabId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createDetachedVBox', {
+        windowId: this.windowId,
+        margins: { top: 12, right: TAB_MARGIN, bottom: 8, left: TAB_MARGIN },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: mapTabId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    await this.setShown(mapTabId, false);
+    this.tabContents.push(mapTabId);
+    await this.buildMapTab(mapTabId);
 
     // Status line under the tabs. Actions on every tab report here, so it
     // lives outside the tabs and stays visible whichever tab is selected.
@@ -832,77 +1624,36 @@ Interface: abjects:peer-network`;
       preferredSize: { height: 18 },
     }));
 
-    await this.populateTabs();
+    await this.listenToNetwork(true);
+
+    // Each tab is built the first time it shows; the Identity tab now.
+    this.minimized = false;
+    this.fullDue = true;
+    this.refreshDue = true;
+    await this.flush();
 
     this.changed('visibility', true);
     return true;
   }
 
-  /** Populate tab content. Called from show() and refresh(). */
-  private async populateTabs(): Promise<void> {
-    // Clear widget refs and button maps (old widgets destroyed by clearLayoutChildren)
-    this.nameInputId = undefined;
-    this.saveNameBtnId = undefined;
-    this.copyPeerIdBtnId = undefined;
-    this.copyIdentityBtnId = undefined;
-    // statusLabelId is not reset: the status line lives outside the tabs and
-    // persists across refreshes (reset only in hide()).
-    this.addContactInputId = undefined;
-    this.addContactBtnId = undefined;
-    this.contactListId = undefined;
-    this.signalingInputId = undefined;
-    this.signalingConnectBtnId = undefined;
-    this.connectButtons.clear();
-    this.removeButtons.clear();
-    this.introduceButtons.clear();
-    this.acceptIntroButtons.clear();
-    this.rejectIntroButtons.clear();
-    this.signalingRemoveButtons.clear();
-    this.promoteButtons.clear();
-    this.blockButtons.clear();
-    this.unblockButtons.clear();
-    this.signalingPeerAddButtons.clear();
-    this.webAccessStatusId = undefined;
-    this.webToggleBtnId = undefined;
-    this.webRoutesId = undefined;
-    this.webMintBtnId = undefined;
-    this.webTokenResultId = undefined;
-    this.webTokensId = undefined;
-    // NOTE: frontendDisconnectButtons / frontendRevokeButtons and the pairing
-    // widget refs (remoteEnableCheckboxId, remoteQrImageId, frontendsListAreaId,
-    // etc.) are NOT reset here. The Frontends tab is refreshed in place —
-    // refresh() skips clearing it, populateFrontendsTab() clears just its
-    // list area before rebuilding rows. Their refs are reset only in hide().
+  // ========== TAB 0: IDENTITY ==========
 
-    // Fetch identity info
-    let peerId = '';
-    let peerName = '';
-    if (this.identityId) {
-      try {
-        const identity = await this.request<{ peerId: string; name: string }>(
-          request(this.id, this.identityId, 'exportPublicKeys', {})
-        );
-        peerId = identity.peerId;
-        peerName = identity.name ?? '';
-      } catch { /* identity not ready */ }
+  /** Display name (the field is only rewritten when the identity's name changes) and the peer id. */
+  private async syncIdentityTab(reads: NetReads): Promise<void> {
+    const { peerId, name } = await reads.identity();
+    const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
+    if (!this.builtTabs.has(IDENTITY_TAB)) {
+      this.builtTabs.add(IDENTITY_TAB);
+      await this.buildIdentityTab(this.tabContents[IDENTITY_TAB], name, `Peer ID: ${truncatedPeerId}`);
+    } else if (name !== this.shownPeerName && this.nameInputId) {
+      this.shownPeerName = name;
+      await this.request(request(this.id, this.nameInputId, 'update', { text: name })).catch(() => { /* gone */ });
     }
+    await this.updateIfChanged(this.peerIdLabelId, { text: `Peer ID: ${truncatedPeerId}` });
+    await this.notePeersLive(reads);
+  }
 
-    // Fetch contacts
-    interface ContactInfo {
-      peerId: string; name: string; state: string; addedAt: number;
-    }
-    let contacts: ContactInfo[] = [];
-    if (this.peerRegistryId) {
-      try {
-        contacts = await this.request<ContactInfo[]>(
-          request(this.id, this.peerRegistryId, 'listContacts', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    // ========== TAB 0: IDENTITY ==========
-    const tab0 = this.tabContents[0];
-
+  private async buildIdentityTab(tab0: AbjectId, peerName: string, peerIdText: string): Promise<void> {
     // ── 1 · Display Name (card) ──
     const nameCard = await this.sectionCard(tab0, '1 · Display Name',
       'The name other peers see when you connect.');
@@ -930,6 +1681,7 @@ Interface: abjects:peer-network`;
     );
     this.nameInputId = _nameInputId;
     this.saveNameBtnId = _saveNameBtnId;
+    this.shownPeerName = peerName;
     await this.request(request(this.id, this.nameInputId, 'addDependent', {}));
     await this.request(request(this.id, nameRowId, 'addLayoutChild', {
       widgetId: this.nameInputId,
@@ -947,17 +1699,9 @@ Interface: abjects:peer-network`;
     const identityCard = await this.sectionCard(tab0, '2 · Your Identity',
       'Share your identity JSON with someone so they can add you as a contact.');
 
-    const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
-    const { widgetIds: [peerIdValueId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: `Peer ID: ${truncatedPeerId}`, style: { color: this.theme.textMeta, fontSize: 12, selectable: true } },
-      ] })
-    );
-    await this.request(request(this.id, identityCard, 'addLayoutChild', {
-      widgetId: peerIdValueId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
-    }));
+    this.peerIdLabelId = await this.addWidget(identityCard,
+      { type: 'label', windowId: this.windowId, text: peerIdText, style: { color: this.theme.textMeta, fontSize: 12, selectable: true } }, 18);
+    this.lastSent.set(this.peerIdLabelId, JSON.stringify({ text: peerIdText }));
 
     // Copy buttons row
     const copyRowId = await this.request<AbjectId>(
@@ -996,10 +1740,64 @@ Interface: abjects:peer-network`;
     }));
 
     // (The status line lives under the tabs; see show().)
+  }
 
-    // ========== TAB 1: CONTACTS ==========
-    const tab1 = this.tabContents[1];
+  // ========== TAB 1: CONTACTS ==========
 
+  /**
+   * The add-contact field (built once; what was typed survives network
+   * events) and the contacts list, updated in place with its items. The
+   * contacts card itself is replaced only when it flips between empty and
+   * listing.
+   */
+  private async syncContactsTab(reads: NetReads): Promise<void> {
+    const tab1 = this.tabContents[CONTACTS_TAB];
+    if (!this.builtTabs.has(CONTACTS_TAB)) {
+      this.builtTabs.add(CONTACTS_TAB);
+      await this.buildAddContactCard(tab1);
+    }
+    const contacts = await reads.contacts();
+    // Contacts as a single rich list: state badge + inline actions per row.
+    const items = contacts.map((contact) => {
+      const isConnected = contact.state === 'connected';
+      const stateColor = contact.state === 'connected' ? this.liveColor()
+        : contact.state === 'connecting' ? this.theme.statusWarning
+        : this.theme.textMeta;
+      const actions: Array<{ id: string; label: string; color?: string; textColor?: string }> = [
+        { id: 'connect', label: isConnected ? 'Disconnect' : 'Connect' },
+      ];
+      if (isConnected) {
+        actions.push({ id: 'introduce', label: 'Introduce' });
+      }
+      actions.push(
+        { id: 'remove', label: 'Remove', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
+        { id: 'block', label: 'Block', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
+      );
+      return {
+        label: contact.name || contact.peerId.slice(0, 12) + '...',
+        value: contact.peerId,
+        detail: contact.peerId.slice(0, 24),
+        badge: { text: contact.state, color: stateColor },
+        actions,
+      };
+    });
+    // The contact selected on the map stays selected here.
+    const selectedIndex = contacts.findIndex((c) => `peer:${c.peerId}` === this.mapSelectedId);
+    const kind = contacts.length > 0 ? 'list' : 'empty';
+    if (this.contactsCard?.kind !== kind) {
+      await this.buildContactsCard(tab1, kind, items, selectedIndex);
+    } else if (kind === 'list' && this.contactListId) {
+      const sig = JSON.stringify([items, selectedIndex]);
+      if (sig !== this.contactListSig) {
+        this.contactListSig = sig;
+        await this.request(request(this.id, this.contactListId, 'update', { items, selectedIndex }))
+          .catch(() => { this.contactListSig = undefined; });
+      }
+    }
+    this.contactListPeers = contacts.map((c) => c.peerId);
+  }
+
+  private async buildAddContactCard(tab1: AbjectId): Promise<void> {
     // ── Add a Contact (card) ──
     const addCard = await this.sectionCard(tab1, 'Add a Contact',
       "Paste a peer's identity JSON (they copy it from their Identity tab).");
@@ -1039,67 +1837,157 @@ Interface: abjects:peer-network`;
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 60, height: 32 },
     }));
+  }
 
-    // ── Contacts (card): with contacts it fills the rest of the tab so the
-    //    list stretches; the empty state sizes to its content. ──
-    const contactsCard = await this.sectionCard(tab1, 'Contacts',
-      'Connect, introduce, or remove each contact from its row.', 18, contacts.length > 0);
-
-    if (contacts.length === 0) {
+  /**
+   * The Contacts card: with contacts it fills the rest of the tab so the
+   * list stretches; the empty state sizes to its content. Replaces the card
+   * it had (the last card of the tab, so it goes back in the same place).
+   */
+  private async buildContactsCard(tab1: AbjectId, kind: 'empty' | 'list', items: unknown[], selectedIndex: number): Promise<void> {
+    if (this.contactsCard) {
+      const [cardId, ...parts] = this.contactsCard.ids;
+      this.contactsCard = undefined;
+      this.contactListId = undefined;
+      this.contactListSig = undefined;
+      await this.request(request(this.id, tab1, 'removeLayoutChild', { widgetId: cardId })).catch(() => { /* gone */ });
+      this.destroyWidgets([...parts, cardId]);
+    }
+    const { sectionId, titleId, hintId } = await this.sectionCardParts(tab1, 'Contacts',
+      'Connect, introduce, or remove each contact from its row.', 18, kind === 'list');
+    const ids = [sectionId, titleId, ...(hintId ? [hintId] : [])];
+    if (kind === 'empty') {
       const empty = this.emptySpec('No contacts yet', 'Paste a peer\'s identity JSON above, or trust a peer from the Servers & Peers tab.');
-      const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
-      );
-      await this.request(request(this.id, contactsCard, 'addLayoutChild', {
-        widgetId: emptyLabelId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: empty.height },
-      }));
+      ids.push(await this.addWidget(sectionId, empty.spec, empty.height));
     } else {
-      // Contacts as a single rich list: state badge + inline actions per row.
-      const items = contacts.map((contact) => {
-        const isConnected = contact.state === 'connected';
-        const stateColor = contact.state === 'connected' ? this.liveColor()
-          : contact.state === 'connecting' ? this.theme.statusWarning
-          : this.theme.textMeta;
-        const actions: Array<{ id: string; label: string; color?: string; textColor?: string }> = [
-          { id: 'connect', label: isConnected ? 'Disconnect' : 'Connect' },
-        ];
-        if (isConnected) {
-          actions.push({ id: 'introduce', label: 'Introduce' });
-        }
-        actions.push(
-          { id: 'remove', label: 'Remove', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
-          { id: 'block', label: 'Block', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
-        );
-        return {
-          label: contact.name || contact.peerId.slice(0, 12) + '...',
-          value: contact.peerId,
-          detail: contact.peerId.slice(0, 24),
-          badge: { text: contact.state, color: stateColor },
-          actions,
-        };
-      });
-
       const { widgetIds: [contactListId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'list', windowId: this.windowId, items },
+          { type: 'list', windowId: this.windowId, items, ...(selectedIndex >= 0 ? { selectedIndex } : {}) },
         ] })
       );
       this.contactListId = contactListId;
-      await this.request(request(this.id, this.contactListId, 'addDependent', {}));
-      await this.request(request(this.id, contactsCard, 'addLayoutChild', {
-        widgetId: this.contactListId,
+      this.contactListSig = JSON.stringify([items, selectedIndex]);
+      await this.request(request(this.id, contactListId, 'addDependent', {}));
+      await this.request(request(this.id, sectionId, 'addLayoutChild', {
+        widgetId: contactListId,
         sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
       }));
+      ids.push(contactListId);
     }
+    this.contactsCard = { kind, ids };
+  }
 
-    // ========== TAB 2: SERVERS & PEERS ==========
-    const tab2 = this.tabContents[2];
+  // ========== TAB 2: SERVERS & PEERS ==========
 
+  /**
+   * Four cards in a fixed order (servers, peers seen on them, live network
+   * peers, blocked peers) whose rows come and go by key. The peers card and
+   * the blocked card hide while they have nothing to list.
+   */
+  private async syncServersTab(reads: NetReads): Promise<void> {
+    if (!this.builtTabs.has(SERVERS_TAB)) {
+      this.builtTabs.add(SERVERS_TAB);
+      await this.buildServersTab(this.tabContents[SERVERS_TAB]);
+    }
+    const [servers, signalingPeers, contacts, networkPeers, discovery, blocked] = await Promise.all([
+      reads.servers(), reads.signalingPeers(), reads.contacts(), reads.networkPeers(), reads.discovery(), reads.blocked(),
+    ]);
+    const windowId = this.windowId;
+
+    // Signaling servers: url and status per row; a status change recolours in place.
+    await this.setShown(this.sigEmptyId, servers.length === 0);
+    await this.syncRows('servers', this.sigCardId!, uniqueKeys(servers.map(({ url, status }) => {
+      const urlColor = status === 'connected' ? this.liveColor()
+        : status === 'connecting' ? this.theme.statusWarning
+        : this.theme.statusError;
+      const statusText = status === 'connected' ? 'connected'
+        : status === 'connecting' ? 'connecting...'
+        : 'offline';
+      return {
+        key: url, sig: `${statusText}|${urlColor}`, height: 28,
+        cells: [
+          { spec: { type: 'label', windowId, text: url, style: { color: urlColor, fontSize: 12, selectable: true } }, height: 28 },
+          { spec: { type: 'label', windowId, text: statusText, style: { color: urlColor, fontSize: 11, selectable: true } }, height: 28, width: 80 },
+          { spec: { type: 'button', windowId, text: 'Remove', style: { fontSize: 11 } }, height: 26, width: 70, action: { kind: 'removeServer' as const, key: url } },
+        ],
+        updates: [{ style: { color: urlColor } }, { text: statusText, style: { color: urlColor } }, undefined],
+      };
+    })));
+
+    // Peers visible on the signaling servers (a busy server churns these).
+    await this.syncRows('signalingPeers', this.spCardId!, uniqueKeys(signalingPeers.map((sp) => {
+      const displayName = sp.name || sp.peerId.slice(0, 12) + '...';
+      return {
+        key: `${sp.serverUrl} ${sp.peerId}`, sig: displayName, height: 28,
+        cells: [
+          { spec: { type: 'label', windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 28 },
+          { spec: { type: 'button', windowId, text: 'Add', style: this.rowPositiveStyle() }, height: 26, width: 60, action: { kind: 'addSignalingPeer' as const, key: sp.peerId, peer: sp } },
+        ],
+        updates: [{ text: displayName }, undefined],
+      };
+    })));
+    await this.setShown(this.spCardId, signalingPeers.length > 0);
+
+    // Network peers: the mesh status, connected contacts (no Trust), then
+    // the live network peers; or the card's empty state.
+    const connectedContacts = contacts.filter((c) => c.state === 'connected');
+    const hasNet = connectedContacts.length > 0 || networkPeers.length > 0 || discovery.cacheSize > 0;
+    const hasSignaling = servers.some((s) => s.status === 'connected');
+    const blockStyle = { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 };
+    await this.setShown(this.netEmptyId, !hasNet);
+    await this.setShown(this.netMeshId, hasNet);
+    if (hasNet) {
+      const meshStatus = `Mesh: ${connectedContacts.length + networkPeers.length} direct, ${discovery.cacheSize} discoverable${!hasSignaling && networkPeers.length > 0 ? ' | Relay active' : ''}`;
+      await this.updateIfChanged(this.netMeshId, { text: meshStatus });
+    }
+    const netRows: RowSpec[] = [];
+    for (const contact of connectedContacts) {
+      const name = contact.name || contact.peerId.slice(0, 12) + '...';
+      netRows.push({
+        key: `c:${contact.peerId}`, sig: name, height: 30,
+        cells: [
+          { spec: { type: 'label', windowId, text: name, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 30 },
+          { spec: { type: 'label', windowId, text: 'contact', style: { color: this.liveColor(), fontSize: 11, selectable: true } }, height: 30, width: 50 },
+          { spec: { type: 'button', windowId, text: 'Block', style: blockStyle }, height: 28, width: 60, action: { kind: 'block', key: contact.peerId } },
+        ],
+        updates: [{ text: name }, undefined, undefined],
+      });
+    }
+    for (const netPeer of networkPeers) {
+      const name = netPeer.name || netPeer.peerId.slice(0, 12) + '...';
+      const duration = this.formatDuration(Date.now() - netPeer.connectedAt);
+      netRows.push({
+        key: `n:${netPeer.peerId}`, sig: `${name}|${duration}`, height: 30,
+        cells: [
+          { spec: { type: 'label', windowId, text: name, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 30 },
+          { spec: { type: 'label', windowId, text: duration, style: { color: this.liveColor(), fontSize: 11, selectable: true } }, height: 30, width: 50 },
+          { spec: { type: 'button', windowId, text: 'Trust', style: this.rowPositiveStyle() }, height: 28, width: 60, action: { kind: 'trust', key: netPeer.peerId } },
+          { spec: { type: 'button', windowId, text: 'Block', style: blockStyle }, height: 28, width: 60, action: { kind: 'block', key: netPeer.peerId } },
+        ],
+        updates: [{ text: name }, { text: duration }, undefined, undefined],
+      });
+    }
+    await this.syncRows('network', this.netCardId!, uniqueKeys(netRows));
+
+    // Blocked peers.
+    await this.syncRows('blocked', this.blockedCardId!, uniqueKeys(blocked.map((bPeerId) => ({
+      key: bPeerId, sig: '', height: 28,
+      cells: [
+        { spec: { type: 'label', windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.textMeta, fontSize: 12, selectable: true } }, height: 28 },
+        { spec: { type: 'button', windowId, text: 'Unblock', style: this.rowPositiveStyle() }, height: 26, width: 70, action: { kind: 'unblock' as const, key: bPeerId } },
+      ],
+      updates: [],
+    }))));
+    await this.setShown(this.blockedCardId, blocked.length > 0);
+
+    await this.notePeersLive(reads);
+  }
+
+  private async buildServersTab(tab2: AbjectId): Promise<void> {
     // ── Signaling Servers (card): add a server, then its list ──
     const sigCard = await this.sectionCard(tab2, 'Signaling Servers',
       'A signaling server introduces peers to each other so they can connect directly.');
+    this.sigCardId = sigCard;
 
     // Signaling URL input + Connect button row
     const sigRowId = await this.request<AbjectId>(
@@ -1136,431 +2024,62 @@ Interface: abjects:peer-network`;
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
+    const sigEmpty = this.emptySpec('No signaling servers', 'Enter a server URL above and press Connect to find peers on the network.');
+    this.sigEmptyId = await this.addWidget(sigCard, sigEmpty.spec, sigEmpty.height);
 
-    // List configured signaling servers with status
-    let signalingServers: Array<{ url: string; status: string }> = [];
-    if (this.peerRegistryId) {
-      try {
-        signalingServers = await this.request<Array<{ url: string; status: string }>>(
-          request(this.id, this.peerRegistryId, 'listSignalingServers', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    for (const { url, status } of signalingServers) {
-      const serverRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: sigCard,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, sigCard, 'addLayoutChild', {
-        widgetId: serverRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 28 },
-      }));
-
-      const urlColor = status === 'connected' ? this.liveColor()
-        : status === 'connecting' ? this.theme.statusWarning
-        : this.theme.statusError;
-      const statusText = status === 'connected' ? 'connected'
-        : status === 'connecting' ? 'connecting...'
-        : 'offline';
-
-      // Batch: url label + status label + remove button
-      const { widgetIds: [urlLabelId, statusLabelId, removeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: url, style: { color: urlColor, fontSize: 12, selectable: true } },
-          { type: 'label', windowId: this.windowId, text: statusText, style: { color: urlColor, fontSize: 11, selectable: true } },
-          { type: 'button', windowId: this.windowId, text: 'Remove', style: { fontSize: 11 } },
-        ] })
-      );
-      await this.request(request(this.id, serverRowId, 'addLayoutChild', {
-        widgetId: urlLabelId,
-        sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-        preferredSize: { height: 28 },
-      }));
-      await this.request(request(this.id, serverRowId, 'addLayoutChild', {
-        widgetId: statusLabelId,
-        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 80, height: 28 },
-      }));
-      await this.request(request(this.id, removeBtnId, 'addDependent', {}));
-      await this.request(request(this.id, serverRowId, 'addLayoutChild', {
-        widgetId: removeBtnId,
-        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 70, height: 26 },
-      }));
-      this.signalingRemoveButtons.set(removeBtnId, url);
-    }
-
-    if (signalingServers.length === 0) {
-      const empty = this.emptySpec('No signaling servers', 'Enter a server URL above and press Connect to find peers on the network.');
-      const { widgetIds: [emptySigId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
-      );
-      await this.request(request(this.id, sigCard, 'addLayoutChild', {
-        widgetId: emptySigId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: empty.height },
-      }));
-    }
-
-    // Signaling Peers subsection
-    interface SignalingPeerInfo {
-      peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string; serverUrl: string;
-    }
-    let signalingPeers: SignalingPeerInfo[] = [];
-    if (this.peerRegistryId) {
-      try {
-        signalingPeers = await this.request<SignalingPeerInfo[]>(
-          request(this.id, this.peerRegistryId, 'listSignalingPeers', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    if (signalingPeers.length > 0) {
-      // ── Signaling Peers (card) ──
-      const spCard = await this.sectionCard(tab2, 'Signaling Peers',
-        'Peers visible on your signaling servers. Add one to make it a contact.');
-
-      this.signalingPeerAddButtons.clear();
-
-      for (const sp of signalingPeers) {
-        const spRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: spCard,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, spCard, 'addLayoutChild', {
-          widgetId: spRowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 28 },
-        }));
-
-        const displayName = sp.name || sp.peerId.slice(0, 12) + '...';
-
-        // Batch: name label + add button
-        const { widgetIds: [spNameId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Add', style: this.rowPositiveStyle() },
-          ] })
-        );
-        await this.request(request(this.id, spRowId, 'addLayoutChild', {
-          widgetId: spNameId,
-          sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-          preferredSize: { height: 28 },
-        }));
-        await this.request(request(this.id, addBtnId, 'addDependent', {}));
-        await this.request(request(this.id, spRowId, 'addLayoutChild', {
-          widgetId: addBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 60, height: 26 },
-        }));
-        this.signalingPeerAddButtons.set(addBtnId, {
-          peerId: sp.peerId,
-          name: sp.name,
-          publicSigningKey: sp.publicSigningKey,
-          publicExchangeKey: sp.publicExchangeKey,
-        });
-      }
-    }
-
-    // Network Peers subsection
-    interface NetworkPeerInfo {
-      peerId: string; name: string; connectedAt: number;
-    }
-    let networkPeers: NetworkPeerInfo[] = [];
-    if (this.peerRegistryId) {
-      try {
-        networkPeers = await this.request<NetworkPeerInfo[]>(
-          request(this.id, this.peerRegistryId, 'listNetworkPeers', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    let discoveryStats = { cacheSize: 0, connectedNetworkPeers: 0 };
-    if (this.peerDiscoveryId) {
-      try {
-        discoveryStats = await this.request<{ cacheSize: number; connectedNetworkPeers: number }>(
-          request(this.id, this.peerDiscoveryId, 'getDiscoveryStats', {})
-        );
-      } catch { /* PeerDiscovery not ready */ }
-    }
-
-    const connectedContacts = contacts.filter(c => c.state === 'connected');
+    // ── Signaling Peers (card), shown while it lists someone ──
+    this.spCardId = await this.sectionCard(tab2, 'Signaling Peers',
+      'Peers visible on your signaling servers. Add one to make it a contact.');
 
     // ── Network Peers (card): the mesh status and each live peer, or its
     //    empty state ──
-    const netCard = await this.sectionCard(tab2, 'Network Peers',
+    this.netCardId = await this.sectionCard(tab2, 'Network Peers',
       'Peers connected to you right now. Trust one to make it a contact.');
+    this.netMeshId = await this.addWidget(this.netCardId,
+      { type: 'label', windowId: this.windowId, text: '', style: livingStyle(this.theme, 11) }, 18);
+    const netEmpty = this.emptySpec('No peers connected', 'Peers appear here once you connect to a signaling server or a contact comes online.');
+    this.netEmptyId = await this.addWidget(this.netCardId, netEmpty.spec, netEmpty.height);
 
-    if (connectedContacts.length > 0 || networkPeers.length > 0 || discoveryStats.cacheSize > 0) {
-      const hasSignaling = await this.hasSignalingServer();
-      const meshStatus = `Mesh: ${contacts.filter(c => c.state === 'connected').length + networkPeers.length} direct, ${discoveryStats.cacheSize} discoverable${!hasSignaling && networkPeers.length > 0 ? ' | Relay active' : ''}`;
-
-      const { widgetIds: [meshStatusId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: meshStatus, style: livingStyle(this.theme, 11) },
-        ] })
-      );
-      await this.request(request(this.id, netCard, 'addLayoutChild', {
-        widgetId: meshStatusId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
-      }));
-
-      // Connected contacts (trusted peers) — shown without Trust button
-      for (const contact of connectedContacts) {
-        const cRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: netCard,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, netCard, 'addLayoutChild', {
-          widgetId: cRowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        // Batch: name label + tag label + block button
-        const { widgetIds: [cNameId, cTagId, cBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.liveColor(), fontSize: 11, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
-          ] })
-        );
-        await this.request(request(this.id, cRowId, 'addLayoutChild', {
-          widgetId: cNameId,
-          sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-          preferredSize: { height: 30 },
-        }));
-        await this.request(request(this.id, cRowId, 'addLayoutChild', {
-          widgetId: cTagId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 50, height: 30 },
-        }));
-        await this.request(request(this.id, cBlockBtnId, 'addDependent', {}));
-        await this.request(request(this.id, cRowId, 'addLayoutChild', {
-          widgetId: cBlockBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 60, height: 28 },
-        }));
-        this.blockButtons.set(cBlockBtnId, contact.peerId);
-      }
-
-      for (const netPeer of networkPeers) {
-        const npRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: netCard,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, netCard, 'addLayoutChild', {
-          widgetId: npRowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        const duration = this.formatDuration(Date.now() - netPeer.connectedAt);
-
-        // Batch: name label + duration label + trust button + block button
-        const { widgetIds: [npNameId, durationId, promoteBtnId, npBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
-            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.liveColor(), fontSize: 11, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Trust', style: this.rowPositiveStyle() },
-            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
-          ] })
-        );
-        await this.request(request(this.id, npRowId, 'addLayoutChild', {
-          widgetId: npNameId,
-          sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-          preferredSize: { height: 30 },
-        }));
-        await this.request(request(this.id, npRowId, 'addLayoutChild', {
-          widgetId: durationId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 50, height: 30 },
-        }));
-        await this.request(request(this.id, promoteBtnId, 'addDependent', {}));
-        await this.request(request(this.id, npRowId, 'addLayoutChild', {
-          widgetId: promoteBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 60, height: 28 },
-        }));
-        this.promoteButtons.set(promoteBtnId, netPeer.peerId);
-        await this.request(request(this.id, npBlockBtnId, 'addDependent', {}));
-        await this.request(request(this.id, npRowId, 'addLayoutChild', {
-          widgetId: npBlockBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 60, height: 28 },
-        }));
-        this.blockButtons.set(npBlockBtnId, netPeer.peerId);
-      }
-    } else {
-      const empty = this.emptySpec('No peers connected', 'Peers appear here once you connect to a signaling server or a contact comes online.');
-      const { widgetIds: [emptyNetId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
-      );
-      await this.request(request(this.id, netCard, 'addLayoutChild', {
-        widgetId: emptyNetId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: empty.height },
-      }));
-    }
-
-    // Live peer connections drive the Identity tab's eye sigil.
-    this.peersLive = connectedContacts.length > 0 || networkPeers.length > 0;
-    await this.syncPeerSigil();
-
-    // Blocked Peers subsection
-    let blockedPeers: string[] = [];
-    if (this.peerRegistryId) {
-      try {
-        blockedPeers = await this.request<string[]>(
-          request(this.id, this.peerRegistryId, 'listBlockedPeers', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    if (blockedPeers.length > 0) {
-      // ── Blocked Peers (card) ──
-      const blockedCard = await this.sectionCard(tab2, 'Blocked Peers',
-        'Unblock a peer to let it connect to you again.');
-
-      for (const bPeerId of blockedPeers) {
-        const bRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: blockedCard,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, blockedCard, 'addLayoutChild', {
-          widgetId: bRowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 28 },
-        }));
-
-        // Batch: name label + unblock button
-        const { widgetIds: [bNameId, unblockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.textMeta, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Unblock', style: this.rowPositiveStyle() },
-          ] })
-        );
-        await this.request(request(this.id, bRowId, 'addLayoutChild', {
-          widgetId: bNameId,
-          sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-          preferredSize: { height: 28 },
-        }));
-        await this.request(request(this.id, unblockBtnId, 'addDependent', {}));
-        await this.request(request(this.id, bRowId, 'addLayoutChild', {
-          widgetId: unblockBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 70, height: 26 },
-        }));
-        this.unblockButtons.set(unblockBtnId, bPeerId);
-      }
-    }
-
-    // ========== TAB 3: INTRODUCTIONS ==========
-    const tab3 = this.tabContents[3];
-
-    interface PendingIntro {
-      peerId: string; name: string; fromPeerId: string; receivedAt: number;
-    }
-    let pendingIntros: PendingIntro[] = [];
-    if (this.peerRegistryId) {
-      try {
-        pendingIntros = await this.request<PendingIntro[]>(
-          request(this.id, this.peerRegistryId, 'listPendingIntroductions', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
-
-    // ── Pending Introductions (card) ──
-    const introCard = await this.sectionCard(tab3, 'Pending Introductions',
-      'When a contact introduces you to someone they know, accept to add that peer as a contact.', 34);
-
-    if (pendingIntros.length === 0) {
-      const empty = this.emptySpec('No pending introductions', 'Introductions from your connected contacts will wait here for your answer.');
-      const { widgetIds: [emptyIntroId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
-      );
-      await this.request(request(this.id, introCard, 'addLayoutChild', {
-        widgetId: emptyIntroId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: empty.height },
-      }));
-    } else {
-      for (const intro of pendingIntros) {
-        const introRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: introCard,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, introCard, 'addLayoutChild', {
-          widgetId: introRowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        const introName = intro.name || intro.peerId.slice(0, 12) + '...';
-        const fromContact = contacts.find(c => c.peerId === intro.fromPeerId);
-        const fromName = fromContact?.name || intro.fromPeerId.slice(0, 12) + '...';
-
-        // Batch: intro label + accept button + reject button
-        const { widgetIds: [introLabel, acceptBtnId, rejectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
-            { type: 'button', windowId: this.windowId, text: 'Accept', style: this.rowPositiveStyle() },
-            { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
-          ] })
-        );
-        await this.request(request(this.id, introRowId, 'addLayoutChild', {
-          widgetId: introLabel,
-          sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-          preferredSize: { height: 30 },
-        }));
-        await this.request(request(this.id, acceptBtnId, 'addDependent', {}));
-        await this.request(request(this.id, introRowId, 'addLayoutChild', {
-          widgetId: acceptBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 65, height: 28 },
-        }));
-        this.acceptIntroButtons.set(acceptBtnId, intro.peerId);
-        await this.request(request(this.id, rejectBtnId, 'addDependent', {}));
-        await this.request(request(this.id, introRowId, 'addLayoutChild', {
-          widgetId: rejectBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 65, height: 28 },
-        }));
-        this.rejectIntroButtons.set(rejectBtnId, intro.peerId);
-      }
-    }
-
-    // ========== TAB 4: FRONTENDS ==========
-    await this.populateFrontendsTab(this.tabContents[4]);
-
-    // ========== TAB 5: WEB ACCESS ==========
-    await this.populateWebAccessTab(this.tabContents[5]);
+    // ── Blocked Peers (card), shown while it lists someone ──
+    this.blockedCardId = await this.sectionCard(tab2, 'Blocked Peers',
+      'Unblock a peer to let it connect to you again.');
   }
 
-  /** Populate the Frontends tab — currently connected UI clients (WS + WebRTC). */
-  private async populateFrontendsTab(tab4: AbjectId): Promise<void> {
-    // Lazy-discover in case the deps weren't ready in onInit.
+  // ========== TAB 3: INTRODUCTIONS ==========
+
+  private async syncIntrosTab(reads: NetReads): Promise<void> {
+    if (!this.builtTabs.has(INTROS_TAB)) {
+      this.builtTabs.add(INTROS_TAB);
+      // ── Pending Introductions (card) ──
+      this.introCardId = await this.sectionCard(this.tabContents[INTROS_TAB], 'Pending Introductions',
+        'When a contact introduces you to someone they know, accept to add that peer as a contact.', 34);
+      const empty = this.emptySpec('No pending introductions', 'Introductions from your connected contacts will wait here for your answer.');
+      this.introEmptyId = await this.addWidget(this.introCardId, empty.spec, empty.height);
+    }
+    const [pendingIntros, contacts] = await Promise.all([reads.intros(), reads.contacts()]);
+    const windowId = this.windowId;
+    await this.setShown(this.introEmptyId, pendingIntros.length === 0);
+    await this.syncRows('intros', this.introCardId!, uniqueKeys(pendingIntros.map((intro) => {
+      const introName = intro.name || intro.peerId.slice(0, 12) + '...';
+      const fromContact = contacts.find((c) => c.peerId === intro.fromPeerId);
+      const fromName = fromContact?.name || intro.fromPeerId.slice(0, 12) + '...';
+      const text = `${introName} (from ${fromName})`;
+      return {
+        key: intro.peerId, sig: text, height: 30,
+        cells: [
+          { spec: { type: 'label', windowId, text, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } }, height: 30 },
+          { spec: { type: 'button', windowId, text: 'Accept', style: this.rowPositiveStyle() }, height: 28, width: 65, action: { kind: 'acceptIntro' as const, key: intro.peerId } },
+          { spec: { type: 'button', windowId, text: 'Reject', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } }, height: 28, width: 65, action: { kind: 'rejectIntro' as const, key: intro.peerId } },
+        ],
+        updates: [{ text }, undefined, undefined],
+      };
+    })));
+  }
+
+  // ========== TAB 4: FRONTENDS ==========
+
+  /** Find UIServer and RemoteUIAccess if they were not ready at init, and listen to them. */
+  private async ensureFrontendDeps(): Promise<void> {
     if (!this.uiServerId) {
       this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
       if (this.uiServerId) {
@@ -1573,125 +2092,44 @@ Interface: abjects:peer-network`;
         try { await this.request(request(this.id, this.remoteUIAccessId, 'addDependent', {})); } catch { /* best effort */ }
       }
     }
+  }
 
-    // ── Pair a new frontend (QR generation) ── built once; persists across refreshes
-    if (!this.remoteEnableCheckboxId) {
+  /** The Frontends tab: pairing (built once), then one row per connected UI client (WS + WebRTC). */
+  private async syncFrontendsTab(reads: NetReads): Promise<void> {
+    await this.ensureFrontendDeps();
+    const tab4 = this.tabContents[FRONTENDS_TAB];
+    if (!this.builtTabs.has(FRONTENDS_TAB)) {
+      this.builtTabs.add(FRONTENDS_TAB);
+      // ── Pair a new frontend (QR generation) ──
       await this.buildPairingSection(tab4);
+      // ── Connected Frontends (card) ──
+      this.feCardId = await this.sectionCard(tab4, 'Connected Frontends',
+        'Browsers and phones showing this desktop. Disconnect or revoke from each row.');
+      const empty = this.emptySpec('No frontends connected', 'Browsers and paired phones showing this desktop appear here.');
+      this.feEmptyId = await this.addWidget(this.feCardId, empty.spec, empty.height);
     } else {
       await this.refreshRemoteStatusLabel();
     }
 
-    // ── Connected Frontends (card). Its rows live in an auto-sized inner
-    //    area we can clear/rebuild without touching the card's title and
-    //    hint or the pairing card above; the card follows the area's height. ──
-    if (!this.frontendsListAreaId) {
-      const connectedCard = await this.sectionCard(tab4, 'Connected Frontends',
-        'Browsers and phones showing this desktop. Disconnect or revoke from each row.');
-      this.frontendsListAreaId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedVBox', {
-          parentLayoutId: connectedCard,
-          autoSize: true,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-    } else {
-      await this.request(request(this.id, this.frontendsListAreaId, 'clearLayoutChildren', {}));
-      this.frontendDisconnectButtons.clear();
-      this.frontendRevokeButtons.clear();
-    }
-    const listArea = this.frontendsListAreaId;
-
-    interface FrontendClient {
-      clientId: string;
-      kind: 'websocket' | 'webrtc' | string;
-      peerId: string;
-      name: string;
-      connectedAt: number;
-      ready: boolean;
-    }
-
-    let clients: FrontendClient[] = [];
-    if (this.uiServerId) {
-      try {
-        clients = await this.request<FrontendClient[]>(
-          request(this.id, this.uiServerId, 'listFrontendClients', {})
-        );
-      } catch { /* UIServer not reachable */ }
-    }
-
-    if (clients.length === 0) {
-      const empty = this.emptySpec('No frontends connected', 'Browsers and paired phones showing this desktop appear here.');
-      const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [empty.spec] })
-      );
-      await this.request(request(this.id, listArea, 'addLayoutChild', {
-        widgetId: emptyId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: empty.height },
-      }));
-      return;
-    }
-
-    for (const c of clients) {
-      const rowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: listArea,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, listArea, 'addLayoutChild', {
-        widgetId: rowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
+    const clients = await reads.frontends();
+    const windowId = this.windowId;
+    const destructive = { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 };
+    await this.setShown(this.feEmptyId, clients.length === 0);
+    await this.syncRows('frontends', this.feCardId!, uniqueKeys(clients.map((c) => {
       const isWebRTC = c.kind === 'webrtc';
       const kindLabel = isWebRTC ? 'P2P' : 'WS';
       const displayName = c.name?.trim()
         || (c.peerId ? c.peerId.slice(0, 12) + '…' : '')
         || c.clientId;
-      const relAgo = formatRelative(Date.now() - c.connectedAt);
-      const text = `${kindLabel}  /  ${displayName}  /  ${relAgo}`;
-
-      const specs: Array<Record<string, unknown>> = [
-        { type: 'label', windowId: this.windowId, text, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
-        { type: 'button', windowId: this.windowId, text: 'Disconnect', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
+      const text = `${kindLabel}  /  ${displayName}  /  ${formatRelative(Date.now() - c.connectedAt)}`;
+      const cells: RowCell[] = [
+        { spec: { type: 'label', windowId, text, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } }, height: 30 },
+        { spec: { type: 'button', windowId, text: 'Disconnect', style: destructive }, height: 28, width: 90, action: { kind: 'disconnectFrontend', key: c.clientId } },
       ];
-      if (isWebRTC) {
-        specs.push({ type: 'button', windowId: this.windowId, text: 'Revoke', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } });
-      }
-
-      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs })
-      );
-      const [labelId, disconnectBtnId, revokeBtnId] = widgetIds;
-
-      await this.request(request(this.id, rowId, 'addLayoutChild', {
-        widgetId: labelId,
-        sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
-        preferredSize: { height: 30 },
-      }));
-
-      await this.request(request(this.id, disconnectBtnId, 'addDependent', {}));
-      await this.request(request(this.id, rowId, 'addLayoutChild', {
-        widgetId: disconnectBtnId,
-        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 90, height: 28 },
-      }));
-      this.frontendDisconnectButtons.set(disconnectBtnId, c.clientId);
-
-      if (isWebRTC && revokeBtnId) {
-        await this.request(request(this.id, revokeBtnId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: revokeBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 70, height: 28 },
-        }));
-        this.frontendRevokeButtons.set(revokeBtnId, c.peerId);
-      }
-    }
+      // Revoke a paired remote UI client (WebRTC only).
+      if (isWebRTC) cells.push({ spec: { type: 'button', windowId, text: 'Revoke', style: destructive }, height: 28, width: 70, action: { kind: 'revokeFrontend', key: c.peerId } });
+      return { key: `${c.kind} ${c.clientId}`, sig: text, height: 32, cells, updates: [{ text }] };
+    })));
   }
 
   /**
@@ -1751,6 +2189,7 @@ Interface: abjects:peer-network`;
       ] })
     );
     this.remoteStatusLabelId = statusLabelId;
+    this.lastSent.set(statusLabelId, JSON.stringify({ text: formatRemoteStatus(status), style: this.remoteStatusStyle(status.enabled) }));
     await this.request(request(this.id, pairCard, 'addLayoutChild', {
       widgetId: this.remoteStatusLabelId,
       sizePolicy: { vertical: 'fixed' },
@@ -1895,25 +2334,39 @@ Interface: abjects:peer-network`;
     }
   }
 
-  /** Populate the Web Access tab — HTTP gateway status, toggle, routes, and API tokens. */
-  private async populateWebAccessTab(tab5: AbjectId): Promise<void> {
+  /**
+   * The Web Access tab's pass. Built once (with the gateway's cards, or a
+   * note while the gateway is not running, replaced once it is); afterwards
+   * its labels follow the gateway (its gatewayChanged events mark the tab due).
+   */
+  private async syncWebTab(): Promise<void> {
     if (!this.webGatewayId) {
       this.webGatewayId = await this.discoverDep('WebGateway') ?? undefined;
       if (this.webGatewayId) {
         try { await this.request(request(this.id, this.webGatewayId, 'addDependent', {})); } catch { /* best effort */ }
       }
     }
+    const tab5 = this.tabContents[WEB_TAB];
+    if (this.builtTabs.has(WEB_TAB) && (this.webBuiltWithGateway || !this.webGatewayId)) {
+      await this.updateWebAccessData();
+      return;
+    }
+    if (this.webUnavailableId) {
+      // The gateway came up since the note was shown: the cards replace it.
+      await this.request(request(this.id, tab5, 'removeLayoutChild', { widgetId: this.webUnavailableId })).catch(() => { /* gone */ });
+      this.destroyWidgets([this.webUnavailableId]);
+      this.webUnavailableId = undefined;
+    }
+    this.builtTabs.add(WEB_TAB);
+    this.webBuiltWithGateway = this.webGatewayId !== undefined;
+    await this.populateWebAccessTab(tab5);
+  }
+
+  /** Populate the Web Access tab — HTTP gateway status, toggle, routes, and API tokens. */
+  private async populateWebAccessTab(tab5: AbjectId): Promise<void> {
     if (!this.webGatewayId) {
-      const { widgetIds: [unavailableId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-            this.emptySpec('Web Gateway is not available', 'The HTTP gateway serves workspaces to browsers and scripts. It appears here once the gateway object is running.').spec,
-        ] })
-      );
-      await this.request(request(this.id, tab5, 'addLayoutChild', {
-        widgetId: unavailableId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 64 },
-      }));
+      const note = this.emptySpec('Web Gateway is not available', 'The HTTP gateway serves workspaces to browsers and scripts. It appears here once the gateway object is running.');
+      this.webUnavailableId = await this.addWidget(tab5, note.spec, note.height);
       return;
     }
 
@@ -2002,54 +2455,45 @@ Interface: abjects:peer-network`;
       this.webGatewayEnabled = !!status.enabled;
       const routes = await this.request<RouteInfo[]>(request(this.id, this.webGatewayId, 'getRoutes', {}));
       const tokens = await this.request<TokenInfo[]>(request(this.id, this.webGatewayId, 'listTokens', {}));
-      if (this.webAccessStatusId) {
-        await this.request(request(this.id, this.webAccessStatusId, 'update', {
-          text: status.enabled
-            ? `ON — ${status.baseUrl} (${status.routes} route(s) across ${status.workspaces} workspace(s))`
-            : 'OFF — the HTTP listener is not running.',
-          style: status.enabled
-            ? { ...livingStyle(this.theme), wordWrap: true, selectable: true }
-            : { color: this.theme.textMeta, fontSize: 12, wordWrap: true, selectable: true },
-        }));
-      }
-      if (this.webRoutesId) {
-        await this.request(request(this.id, this.webRoutesId, 'update', {
-          text: routes.length
-            ? routes.map(r => `${r.path} — ${r.abject} (${r.access})`).join('\n')
-            : 'No routes yet. Enable serving on a workspace to expose it here.',
-        }));
-      }
-      if (this.webTokensId) {
-        await this.request(request(this.id, this.webTokensId, 'update', {
-          text: tokens.length
-            ? tokens.map(t => `${t.name} — created ${new Date(t.createdAt).toISOString().slice(0, 10)} (${t.id.slice(0, 8)})`).join('\n')
-            : 'No API tokens.',
-        }));
-      }
-      if (this.webToggleBtnId) {
-        await this.request(request(this.id, this.webToggleBtnId, 'update', { text: status.enabled ? 'Disable' : 'Enable' }));
-      }
+      // Each label changes only when its text does.
+      await this.updateIfChanged(this.webAccessStatusId, {
+        text: status.enabled
+          ? `ON — ${status.baseUrl} (${status.routes} route(s) across ${status.workspaces} workspace(s))`
+          : 'OFF — the HTTP listener is not running.',
+        style: status.enabled
+          ? { ...livingStyle(this.theme), wordWrap: true, selectable: true }
+          : { color: this.theme.textMeta, fontSize: 12, wordWrap: true, selectable: true },
+      });
+      await this.updateIfChanged(this.webRoutesId, {
+        text: routes.length
+          ? routes.map(r => `${r.path} — ${r.abject} (${r.access})`).join('\n')
+          : 'No routes yet. Enable serving on a workspace to expose it here.',
+      });
+      await this.updateIfChanged(this.webTokensId, {
+        text: tokens.length
+          ? tokens.map(t => `${t.name} — created ${new Date(t.createdAt).toISOString().slice(0, 10)} (${t.id.slice(0, 8)})`).join('\n')
+          : 'No API tokens.',
+      });
+      await this.updateIfChanged(this.webToggleBtnId, { text: status.enabled ? 'Disable' : 'Enable' });
     } catch { /* gateway not ready */ }
   }
 
-  /** Clear and rebuild just the Web Access tab in place. */
-  private async rebuildWebAccessTab(): Promise<void> {
+  /**
+   * After a gateway action (toggle, port): the tab's labels read fresh and a
+   * token secret shown earlier leaves (it is shown once).
+   */
+  private async refreshWebAccessTab(): Promise<void> {
     if (!this.windowId || !this.webGatewayId) return;
-    const tab5 = this.tabContents[5];
-    if (!tab5) return;
-    await this.request(request(this.id, tab5, 'clearLayoutChildren', {}));
-    await this.populateWebAccessTab(tab5);
+    await this.updateIfChanged(this.webTokenResultId, { text: '' });
+    await this.updateWebAccessData();
   }
 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
-
+    // The window counts as closed from here on: events, timers and a pass
+    // still in flight see no window and stand down while it is destroyed.
+    const windowId = this.windowId;
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.tabBarId = undefined;
@@ -2069,18 +2513,41 @@ Interface: abjects:peer-network`;
     this.signalingConnectBtnId = undefined;
     this.addContactInputId = undefined;
     this.addContactBtnId = undefined;
-    this.connectButtons.clear();
-    this.removeButtons.clear();
-    this.introduceButtons.clear();
-    this.acceptIntroButtons.clear();
-    this.rejectIntroButtons.clear();
-    this.signalingRemoveButtons.clear();
-    this.promoteButtons.clear();
-    this.blockButtons.clear();
-    this.unblockButtons.clear();
-    this.signalingPeerAddButtons.clear();
-    this.frontendDisconnectButtons.clear();
-    this.frontendRevokeButtons.clear();
+    this.contactListId = undefined;
+    this.contactsCard = undefined;
+    this.contactListPeers = [];
+    this.contactListSig = undefined;
+    this.peerIdLabelId = undefined;
+    this.shownPeerName = undefined;
+    this.sigCardId = undefined;
+    this.sigEmptyId = undefined;
+    this.spCardId = undefined;
+    this.netCardId = undefined;
+    this.netMeshId = undefined;
+    this.netEmptyId = undefined;
+    this.blockedCardId = undefined;
+    this.introCardId = undefined;
+    this.introEmptyId = undefined;
+    this.feCardId = undefined;
+    this.feEmptyId = undefined;
+    // The window took every widget with it: forget the tabs, rows and what
+    // they were last given, and any pass that was waiting.
+    this.builtTabs.clear();
+    this.rowSets.clear();
+    this.rowActions.clear();
+    this.lastSent.clear();
+    this.shownState.clear();
+    this.refreshDue = false;
+    this.fullDue = false;
+    this.staleData.clear();
+    this.readCache.clear();
+    this.cancelTimer(this.flushTimer);
+    this.flushTimer = undefined;
+    this.minimized = false;
+    this.webBuiltWithGateway = false;
+    this.webUnavailableId = undefined;
+    this.webPortInputId = undefined;
+    this.webPortApplyBtnId = undefined;
     this.webAccessStatusId = undefined;
     this.webToggleBtnId = undefined;
     this.webRoutesId = undefined;
@@ -2094,7 +2561,23 @@ Interface: abjects:peer-network`;
     this.remoteQrUrlLabelId = undefined;
     this.remoteQrLinkCaptionId = undefined;
     this.remoteCopyLinkBtnId = undefined;
-    this.frontendsListAreaId = undefined;
+    this.mapGraphId = undefined;
+    this.mapDetailLabelId = undefined;
+    this.mapActionBtnId = undefined;
+    this.mapShowBtnId = undefined;
+    this.mapSelectedId = undefined;
+    this.mapNodeIds.clear();
+    this.mapInfo.clear();
+    this.mapLive = undefined;
+    this.mapWidgetSelection = undefined;
+    this.mapStripSig = undefined;
+
+    await this.listenToNetwork(false);
+    // Shown again while this one closed: the new window listens.
+    if (this.windowId) await this.listenToNetwork(true);
+    await this.request(
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', { windowId })
+    );
 
     this.changed('visibility', false);
     return true;
@@ -2102,40 +2585,16 @@ Interface: abjects:peer-network`;
 
   // ========== HELPERS ==========
 
-  private async refresh(): Promise<void> {
-    if (!this.windowId) return;
-    if (this.refreshing) {
-      this.refreshPending = true;
-      return;
-    }
-    this.refreshing = true;
-    try {
-      do {
-        this.refreshPending = false;
-        for (let i = 0; i < this.tabContents.length; i++) {
-          // The Frontends tab has persistent pairing widgets (checkbox, Generate
-          // button, QR image). populateFrontendsTab() clears its inner list area
-          // in place, so we skip the full teardown here to avoid flicker.
-          if (i === 4 && this.remoteEnableCheckboxId) continue;
-          await this.request(request(this.id, this.tabContents[i], 'clearLayoutChildren', {}));
-        }
-        await this.populateTabs();
-      } while (this.refreshPending && this.windowId);
-    } finally {
-      this.refreshing = false;
-    }
-  }
-
   private async refreshRemoteStatusLabel(): Promise<void> {
     if (!this.remoteStatusLabelId || !this.remoteUIAccessId) return;
     try {
       const status = await this.request<{ enabled: boolean; peerId: string; signalingUrl: string; connectedCount: number }>(
         request(this.id, this.remoteUIAccessId, 'getStatus', {})
       );
-      await this.request(request(this.id, this.remoteStatusLabelId, 'update', {
+      await this.updateIfChanged(this.remoteStatusLabelId, {
         text: formatRemoteStatus(status),
         style: this.remoteStatusStyle(status.enabled),
-      }));
+      });
     } catch { /* best effort */ }
   }
 
@@ -2170,6 +2629,8 @@ Interface: abjects:peer-network`;
       await this.reject('Could not save the name.');
       return;
     }
+    // The field already says it; a later pass leaves the field alone.
+    this.shownPeerName = name.trim();
 
     await this.acknowledge('Name saved!');
   }
@@ -2488,18 +2949,6 @@ Interface: abjects:peer-network`;
     }
   }
 
-  private async hasSignalingServer(): Promise<boolean> {
-    if (!this.peerRegistryId) return false;
-    try {
-      const servers = await this.request<Array<{ url: string; status: string }>>(
-        request(this.id, this.peerRegistryId, 'listSignalingServers', {})
-      );
-      return servers.some(s => s.status === 'connected');
-    } catch {
-      return false;
-    }
-  }
-
   private formatDuration(ms: number): string {
     const seconds = Math.floor(ms / 1000);
     if (seconds < 60) return `${seconds}s`;
@@ -2507,6 +2956,17 @@ Interface: abjects:peer-network`;
     if (minutes < 60) return `${minutes}m`;
     const hours = Math.floor(minutes / 60);
     return `${hours}h`;
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(this.mapSelectedId === undefined || this.mapSelectedId === SELF_NODE || /^(peer|sig|sp|fe):/.test(this.mapSelectedId),
+      'the map selection names a map node (this peer, a peer, a server, a peer on a server, or a frontend)');
+    invariant(this.tabContents.length <= MAP_TAB + 1, 'the window has at most its six list tabs plus the Map');
+    invariant(Number.isInteger(this.selectedTab) && this.selectedTab >= 0 && this.selectedTab <= MAP_TAB,
+      'the selected tab is one of the seven');
+    invariant(this.windowId !== undefined || (this.flushTimer === undefined && !this.minimized),
+      'a closed window has no pass waiting and is not minimized');
   }
 
   private async removeContact(peerId: string): Promise<void> {

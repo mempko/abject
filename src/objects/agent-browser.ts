@@ -1,9 +1,16 @@
 /**
  * AgentBrowser -- UI for browsing registered agents and event watchers.
  *
- * Two-tab layout:
+ * Tabs:
  *   Tab 0 (Agents):    Live list of all registered agents with status
  *   Tab 1 (Watchers):  TriggerManager rules plus watcher-tagged objects
+ *   Tab 2 (Sessions):  Durable task sessions
+ *   Tab 3 (Map):       The same world as a 3D graph beside a list of its
+ *                      nodes: agents, the goals they work on, delegation
+ *                      between agents, and trigger rules wired from their
+ *                      source object to their target. Busy agents breathe
+ *                      in the living light; a delegation or a trigger fire
+ *                      flows along its edge. Selection syncs both ways.
  *
  * The Watchers tab merges two sources: declarative rules from the built-in
  * TriggerManager (toggled/removed via enableTrigger/disableTrigger/
@@ -20,6 +27,7 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
+import type { IconName } from '../ui/icons.js';
 import { emptyStateMarkdown, emptyStateStyle, eyeSigilOps, removeSigilOps } from './ui-kit.js';
 
 const log = new Log('AgentBrowser');
@@ -29,7 +37,12 @@ const AGENT_BROWSER_INTERFACE: InterfaceId = 'abjects:agent-browser';
 const WIN_W = 620;
 const WIN_H = 420;
 
-const TAB_LABELS = ['Agents', 'Watchers', 'Sessions'];
+const TAB_LABELS = ['Agents', 'Watchers', 'Sessions', 'Map'];
+const MAP_TAB = 3;
+/** Map rebuilds coalesce: a busy task checkpoints often, the map follows at most this often. */
+const MAP_RELOAD_MS = 400;
+/** Goals shown on the map (the most recently active). */
+const MAP_GOALS = 12;
 
 /** Scene node prefix for the "an agent is at work" eye sigil. */
 const SIGIL_PREFIX = 'agent-browser-working';
@@ -57,7 +70,22 @@ const TAB_EMPTY: Array<[string, string, string, string]> = [
     'Select a session',
     'Pick one from the list to inspect its outcome and usage, pause or resume it, or fork a fresh attempt.',
   ],
+  [
+    'Nothing to map yet',
+    'Agents, the goals they work on and the watchers that wake them appear here as a map once agents exist.',
+    'Select a node',
+    'Pick one on the map or in the list.',
+  ],
 ];
+
+/** A TriggerManager rule as the map needs it. */
+interface TriggerRuleInfo {
+  id: string; name: string; sourceName: string; aspect: string; enabled: boolean;
+  fireCount: number; lastError?: string; action: { targetName: string; method: string };
+}
+
+/** One row of the Map tab's list: a node of the map. */
+interface MapRow { nodeId: string; label: string; secondary: string; iconName: IconName; iconColor: string }
 
 interface AgentInfo {
   agentId: string;
@@ -109,6 +137,8 @@ export class AgentBrowser extends Abject {
   private windowSize?: { width: number; height: number };
 
   private activeTab = 0;
+  /** Per tab: the value (id) of the row last selected there, restored on return. */
+  private selectedValueByTab = new Map<number, string>();
   private agents: AgentInfo[] = [];
   private sessions: SessionRecord[] = [];
   private sessionStoreId?: AbjectId;
@@ -116,6 +146,17 @@ export class AgentBrowser extends Abject {
   private selectedIndex = -1;
   /** When the last trigger-failure glitch played. */
   private lastTriggerGlitchAt = 0;
+
+  // -- Map tab --
+  /** The map (a nodeGraph widget), visible on the Map tab. */
+  private graphId?: AbjectId;
+  private triggerRules: TriggerRuleInfo[] = [];
+  private mapRows: MapRow[] = [];
+  /** Map node id of each trigger's target and source, for pulses. */
+  private triggerEnds = new Map<string, { source: string; target: string }>();
+  /** Sessions already seen, so a new child session reads as a delegation. */
+  private knownSessionIds = new Set<string>();
+  private mapReloadTimer?: ReturnType<typeof setTimeout>;
 
   constructor() {
     super({
@@ -316,6 +357,23 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     );
     this.listEmptyId = listEmptyId;
     this.detailEmptyId = detailEmptyId;
+
+    // The Map tab's graph: it takes the detail pane's place on that tab.
+    const { widgetIds: [graphId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'nodeGraph', windowId: this.windowId, title: 'Agents at work', emptyText: 'No agents yet',
+          directed: true, style: { visible: false },
+          groups: [
+            { id: 'agents', label: 'Agents', color: '$textPrimary', material: 'ceramic', shape: 'sphere' },
+            { id: 'goals', label: 'Goals', color: '$statusInfo', shape: 'icosphere' },
+            { id: 'triggers', label: 'Watchers', color: '$accentTertiary', shape: 'roundedBox' },
+            { id: 'objects', label: 'Objects', color: '$textSecondary', shape: 'box' },
+          ],
+        }],
+      })
+    );
+    this.graphId = graphId;
     await this.request(request(this.id, leftLayoutId, 'addLayoutChild', {
       widgetId: this.listEmptyId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
@@ -413,6 +471,10 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
+    await this.request(request(this.id, rightOuterId, 'addLayoutChild', {
+      widgetId: this.graphId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
 
     // Assign panes to split
     await this.request(request(this.id, splitId, 'setLeftChild', { widgetId: leftLayoutId }));
@@ -434,6 +496,10 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     if (this.triggerManagerId) {
       this.send(request(this.id, this.triggerManagerId, 'addDependent', {}));
     }
+    this.send(request(this.id, this.graphId, 'addDependent', {}));
+    // Sessions drive busy state, delegations and the map, on every tab.
+    await this.ensureSessionStore();
+    if (this.sessionStoreId) this.send(request(this.id, this.sessionStoreId, 'addDependent', {}));
 
     // Populate (agents always load so the eye sigil reflects work on any tab)
     if (this.activeTab !== 0) await this.loadAgents();
@@ -455,6 +521,11 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     if (this.triggerManagerId) {
       this.send(request(this.id, this.triggerManagerId, 'removeDependent', {}));
     }
+    if (this.sessionStoreId) {
+      this.send(request(this.id, this.sessionStoreId, 'removeDependent', {}));
+    }
+    this.cancelTimer(this.mapReloadTimer);
+    this.mapReloadTimer = undefined;
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -483,6 +554,11 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     this.agents = [];
     this.watches = [];
     this.selectedIndex = -1;
+    this.graphId = undefined;
+    this.triggerRules = [];
+    this.mapRows = [];
+    this.triggerEnds.clear();
+    this.knownSessionIds.clear();
     this.changed('visibility', false);
     return true;
   }
@@ -495,7 +571,9 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       case 0: await this.loadAgents(); break;
       case 1: await this.loadWatches(); break;
       case 2: await this.loadSessions(); break;
+      case MAP_TAB: await this.loadMapData(); await this.pushMap(); break;
     }
+    await this.applyPaneMode();
     for (const [id, text] of [[this.editBtnId, this.activeTab === 2 ? 'Inspect' : 'Edit'], [this.toggleBtnId, this.activeTab === 2 ? 'Resume' : 'Toggle'], [this.deleteBtnId, this.activeTab === 2 ? 'Fork' : 'Delete']] as const) {
       if (id) await this.request(request(this.id, id, 'update', { text, disabled: false, style: this.buttonStyle(id) }));
     }
@@ -508,7 +586,29 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     }
     await this.rebuildList();
     await this.clearDetail();
+    await this.restoreTabSelection();
     await this.updateSigil();
+  }
+
+  /**
+   * Bring back the row this tab had selected (by value, so a reordered or
+   * refreshed list still finds it), with its detail or map selection; with
+   * nothing to restore, clear the list's highlight so it never disagrees
+   * with the empty detail pane.
+   */
+  private async restoreTabSelection(): Promise<void> {
+    if (!this.listWidgetId) return;
+    const value = this.selectedValueByTab.get(this.activeTab);
+    const index = value === undefined ? -1 : this.buildListItems().findIndex((item) => item.value === value);
+    this.selectedIndex = index;
+    await this.request(request(this.id, this.listWidgetId, 'update', { selectedIndex: index })).catch(() => {});
+    if (index < 0) return;
+    if (this.activeTab === MAP_TAB) {
+      const row = this.mapRows[index];
+      if (row && this.graphId) await this.request(request(this.id, this.graphId, 'select', { id: row.nodeId })).catch(() => {});
+      return;
+    }
+    await this.showDetailForSelection();
   }
 
   /**
@@ -543,6 +643,7 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
 
   /** Swap the detail pane (and its buttons) with the "select an item" state. */
   private async applyDetailEmpty(empty: boolean): Promise<void> {
+    if (this.activeTab === MAP_TAB) return; // the map holds the right pane there
     if (!this.detailLayoutId || !this.detailEmptyId || !this.btnRowId || this.detailEmptyShown === empty) return;
     this.detailEmptyShown = empty;
     try {
@@ -617,13 +718,17 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
     this.playWindowEffect(this.windowId, effect, color);
   }
 
+  private async ensureSessionStore(): Promise<void> {
+    if (!this.sessionStoreId) this.sessionStoreId = await this.discoverDep('TaskSession') ?? undefined;
+  }
+
   private async loadSessions(): Promise<void> {
-    if (!this.sessionStoreId) {
-      this.sessionStoreId = await this.discoverDep('TaskSession') ?? undefined;
-      if (this.sessionStoreId) this.send(request(this.id, this.sessionStoreId, 'addDependent', {}));
-    }
-    this.sessions = this.agentAbjectId ? await this.request<SessionRecord[]>(request(this.id, this.agentAbjectId, 'getSessions', {})) : [];
+    await this.ensureSessionStore();
+    this.sessions = this.agentAbjectId
+      ? await this.request<SessionRecord[]>(request(this.id, this.agentAbjectId, 'getSessions', {})).catch(() => [] as SessionRecord[])
+      : [];
     this.sessions.sort((a,b) => b.updatedAt - a.updatedAt);
+    for (const s of this.sessions) this.knownSessionIds.add(s.id);
   }
 
   private async loadAgents(): Promise<void> {
@@ -734,6 +839,9 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
             iconColor: w.lastError ? this.theme.statusError : (w.enabled ? this.theme.accentSecondary : this.theme.textMeta),
           };
         });
+      case MAP_TAB: return this.mapRows.map((r): ListItem => ({
+        label: r.label, value: r.nodeId, secondary: r.secondary, iconName: r.iconName, iconColor: r.iconColor,
+      }));
       case 2: return this.sessions.map((s): ListItem => ({
         label: s.intent.slice(0, 100), value: s.id, secondary: `${s.agentName} · ${s.status} · attempt ${s.attempt}`,
         iconName: s.status === 'running' ? 'activity' : 'dot',
@@ -809,7 +917,15 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
   // -- Event handling --
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
-    if (fromId === this.sessionStoreId && aspect === 'sessionUpdated' && this.activeTab === 2) {
+    if (fromId === this.sessionStoreId && aspect === 'sessionUpdated') {
+      const id = (value as { id?: string } | undefined)?.id;
+      if (id && !this.knownSessionIds.has(id)) {
+        this.knownSessionIds.add(id);
+        await this.onNewSession(id);
+      }
+      // Busy state, the eye sigil and the map follow session activity (coalesced).
+      this.scheduleMapReload();
+      if (this.activeTab !== 2) return;
       const selected = this.sessions[this.selectedIndex]?.id;
       await this.loadSessions(); await this.rebuildList();
       this.selectedIndex = this.sessions.findIndex(s => s.id === selected);
@@ -817,11 +933,24 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       return;
     }
     // Tab bar change
-    if (fromId === this.tabBarId && aspect === 'tabSelected') {
-      const data = value as { index: number } | undefined;
-      if (data && typeof data.index === 'number') {
-        this.activeTab = data.index;
+    // The tab bar reports 'change' with the index (older builds: 'tabSelected' with { index }).
+    if (fromId === this.tabBarId && (aspect === 'change' || aspect === 'tabSelected')) {
+      const index = typeof value === 'number' ? value : (value as { index?: number } | undefined)?.index;
+      if (typeof index === 'number' && index >= 0 && index < TAB_LABELS.length && index !== this.activeTab) {
+        this.activeTab = index;
         await this.loadTabData();
+      }
+      return;
+    }
+
+    // Map: a node clicked on the map selects its row.
+    if (fromId === this.graphId && (aspect === 'nodeSelected' || aspect === 'nodeFocused')) {
+      const id = (typeof value === 'string' ? JSON.parse(value) as { id?: string } : value as { id?: string })?.id;
+      const row = id ? this.mapRows.findIndex(r => r.nodeId === id) : -1;
+      if (this.activeTab === MAP_TAB && row >= 0 && this.listWidgetId) {
+        this.selectedIndex = row;
+        this.selectedValueByTab.set(MAP_TAB, this.mapRows[row].nodeId);
+        await this.request(request(this.id, this.listWidgetId, 'update', { selectedIndex: row })).catch(() => {});
       }
       return;
     }
@@ -831,8 +960,15 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       try {
         const data = JSON.parse(value as string) as { index: number; value: string; label: string };
         this.selectedIndex = data.index;
+        if (data.index >= 0 && data.value !== undefined) this.selectedValueByTab.set(this.activeTab, String(data.value));
+        else this.selectedValueByTab.delete(this.activeTab);
       } catch {
         this.selectedIndex = -1;
+      }
+      if (this.activeTab === MAP_TAB) {
+        const row = this.mapRows[this.selectedIndex];
+        if (row && this.graphId) await this.request(request(this.id, this.graphId, 'select', { id: row.nodeId })).catch(() => {});
+        return;
       }
       await this.showDetailForSelection();
       return;
@@ -867,6 +1003,13 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         }
         await this.updateSigil();
       }
+      if (aspect === 'taskCompleted') {
+        const t = value as { agentId?: string; goalId?: string | null; success?: boolean } | undefined;
+        if (t?.agentId && t.goalId) {
+          this.mapPulse(`agent:${t.agentId}`, `goal:${t.goalId}`, t.success === false ? '$statusError' : '$accentSecondary');
+        }
+        this.scheduleMapReload();
+      }
       return;
     }
 
@@ -888,9 +1031,22 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
         this.lastTriggerGlitchAt = Date.now();
         this.playEffect('glitch');
       }
+      if (aspect === 'triggerFired' || aspect === 'triggerFailed') {
+        const triggerId = (value as { triggerId?: string } | undefined)?.triggerId;
+        const ends = triggerId ? this.triggerEnds.get(triggerId) : undefined;
+        if (ends && triggerId) {
+          if (aspect === 'triggerFired') {
+            this.mapPulse(ends.source, `trigger:${triggerId}`, '$accentSecondary');
+            this.mapPulse(`trigger:${triggerId}`, ends.target, '$accentSecondary');
+          } else {
+            this.mapPulse(`trigger:${triggerId}`, ends.target, '$statusError');
+          }
+        }
+      }
       if (aspect === 'triggerFired' || aspect === 'triggerFailed'
           || aspect === 'triggerAdded' || aspect === 'triggerRemoved'
           || aspect === 'triggerUpdated') {
+        this.scheduleMapReload();
         if (this.activeTab === 1) {
           await this.loadWatches();
           await this.rebuildList();
@@ -899,6 +1055,201 @@ to Registry for new watcher objects, and to TriggerManager for rule activity.
       }
       return;
     }
+  }
+
+  // -- Map tab --
+
+  /** Show the map in the right pane on the Map tab, the detail pane elsewhere. */
+  private async applyPaneMode(): Promise<void> {
+    if (!this.graphId || !this.detailLayoutId || !this.detailEmptyId || !this.btnRowId) return;
+    const map = this.activeTab === MAP_TAB;
+    const updates: Array<Promise<unknown>> = [
+      this.request(request(this.id, this.graphId, 'update', { style: { visible: map } })),
+    ];
+    if (map) {
+      for (const id of [this.detailLayoutId, this.detailEmptyId, this.btnRowId]) {
+        updates.push(this.request(request(this.id, id, 'update', { style: { visible: false } })));
+      }
+      this.detailEmptyShown = undefined; // re-applied when a detail tab comes back
+    }
+    await Promise.all(updates).catch(() => { /* widgets may be gone */ });
+  }
+
+  private async loadTriggerRules(): Promise<void> {
+    if (!this.triggerManagerId) { this.triggerRules = []; return; }
+    try {
+      this.triggerRules = await this.request<TriggerRuleInfo[]>(
+        request(this.id, this.triggerManagerId, 'listTriggers', {}), 5000);
+    } catch (err) {
+      log.warn('Failed to load trigger rules for the map:', err);
+      this.triggerRules = [];
+    }
+  }
+
+  private async loadMapData(): Promise<void> {
+    await this.loadAgents();
+    await this.loadTriggerRules();
+    await this.loadSessions();
+  }
+
+  /**
+   * Build the map from agents, sessions and trigger rules: agents, the most
+   * recently active goals (agent to goal: works on it), delegation between
+   * agents (a child session's agent under its parent's), and each trigger
+   * rule wired from its source object to its target. Returns the graph and
+   * the list rows for the Map tab.
+   */
+  private buildMap(): { nodes: Array<Record<string, unknown>>; edges: Array<Record<string, unknown>>; rows: MapRow[] } {
+    const t = this.theme;
+    const nodes = new Map<string, Record<string, unknown>>();
+    const edgeWeights = new Map<string, { from: string; to: string; weight: number; style?: string }>();
+    const rows: MapRow[] = [];
+    const addEdge = (from: string, to: string, style?: string) => {
+      if (from === to || !nodes.has(from) || !nodes.has(to)) return;
+      const key = `${from}>${to}`;
+      const e = edgeWeights.get(key);
+      if (e) e.weight++;
+      else edgeWeights.set(key, { from, to, weight: 1, ...(style ? { style } : {}) });
+    };
+
+    const agentByName = new Map<string, string>();
+    for (const a of this.agents) {
+      const id = `agent:${a.agentId}`;
+      const busy = a.status === 'busy' || a.activeTasks > 0;
+      agentByName.set(a.name, id);
+      nodes.set(id, { id, label: a.name, group: 'agents', size: 9 + Math.min(6, a.activeTasks * 2), active: busy });
+      rows.push({
+        nodeId: id, label: a.name, secondary: busy ? `agent · ${a.activeTasks || 1} active` : 'agent · idle',
+        iconName: busy ? 'activity' : 'dot', iconColor: busy ? t.accentSecondary : t.textMeta,
+      });
+    }
+    const agentOf = (s: SessionRecord): string | undefined =>
+      (s.agentId && nodes.has(`agent:${s.agentId}`)) ? `agent:${s.agentId}` : agentByName.get(s.agentName);
+
+    // Goals: the most recently active, labelled by their root task's intent.
+    const byId = new Map(this.sessions.map(s => [s.id, s]));
+    const goals = new Map<string, { label: string; running: boolean; updatedAt: number }>();
+    for (const s of this.sessions) {
+      if (!s.goalId) continue;
+      const g = goals.get(s.goalId) ?? { label: '', running: false, updatedAt: 0 };
+      if (!s.parentId || !g.label) g.label = s.intent;
+      g.running ||= s.status === 'running';
+      g.updatedAt = Math.max(g.updatedAt, s.updatedAt);
+      goals.set(s.goalId, g);
+    }
+    const recentGoals = [...goals.entries()].sort((a, b) => b[1].updatedAt - a[1].updatedAt).slice(0, MAP_GOALS);
+    for (const [goalId, g] of recentGoals) {
+      const id = `goal:${goalId}`;
+      const label = g.label.length > 40 ? `${g.label.slice(0, 39)}\u2026` : g.label || 'Goal';
+      nodes.set(id, { id, label, group: 'goals', size: 8, active: g.running });
+    }
+    for (const s of this.sessions) {
+      const agent = agentOf(s);
+      if (!agent) continue;
+      if (s.goalId) addEdge(agent, `goal:${s.goalId}`);
+      const parent = s.parentId ? byId.get(s.parentId) : undefined;
+      const parentAgent = parent ? agentOf(parent) : undefined;
+      if (parentAgent) addEdge(parentAgent, agent);
+    }
+
+    // Trigger rules: source object -> rule -> target (an agent when it names one).
+    this.triggerEnds.clear();
+    const endpoint = (name: string): string => {
+      const agent = agentByName.get(name);
+      if (agent) return agent;
+      const id = `obj:${name}`;
+      if (!nodes.has(id)) nodes.set(id, { id, label: name, group: 'objects', size: 7 });
+      return id;
+    };
+    const triggerRows: MapRow[] = [];
+    for (const r of this.triggerRules) {
+      const id = `trigger:${r.id}`;
+      nodes.set(id, {
+        id, label: r.name.length > 36 ? `${r.name.slice(0, 35)}\u2026` : r.name, group: 'triggers', size: 7,
+        ghost: !r.enabled, ...(r.lastError ? { color: '$statusError' } : {}),
+      });
+      const source = endpoint(r.sourceName);
+      const target = endpoint(r.action.targetName);
+      this.triggerEnds.set(r.id, { source, target });
+      addEdge(source, id);
+      const fires = edgeWeights.get(`${id}>${target}`);
+      if (!fires) edgeWeights.set(`${id}>${target}`, { from: id, to: target, weight: 1 + Math.log2(1 + r.fireCount) });
+      triggerRows.push({
+        nodeId: id, label: r.name, secondary: `watcher · ${r.fireCount} fires${r.lastError ? ', error' : ''}`,
+        iconName: r.enabled ? 'eye' : 'dot', iconColor: r.lastError ? t.statusError : (r.enabled ? t.accentSecondary : t.textMeta),
+      });
+    }
+    const goalRows: MapRow[] = recentGoals.map(([goalId, g]) => ({
+      nodeId: `goal:${goalId}`, label: g.label || 'Goal', secondary: g.running ? 'goal · running' : 'goal',
+      iconName: g.running ? 'activity' : 'dot', iconColor: g.running ? t.accentSecondary : t.textMeta,
+    }));
+    return {
+      nodes: [...nodes.values()],
+      edges: [...edgeWeights.values()],
+      rows: [...rows, ...triggerRows, ...goalRows],
+    };
+  }
+
+  /** Send the map to the graph widget (warm: nodes keep their places). */
+  private async pushMap(): Promise<void> {
+    if (!this.graphId) return;
+    const { nodes, edges, rows } = this.buildMap();
+    this.mapRows = rows;
+    await this.request(request(this.id, this.graphId, 'setGraph', { nodes, edges }))
+      .catch((err) => log.warn('Map update failed:', err instanceof Error ? err.message : String(err)));
+  }
+
+  /**
+   * Coalesced refresh after activity: agents (busy state and the eye
+   * sigil) always, and the map with its list while the Map tab shows.
+   */
+  private scheduleMapReload(): void {
+    if (this.mapReloadTimer || !this.windowId) return;
+    this.mapReloadTimer = this.setTimer(async () => {
+      this.mapReloadTimer = undefined;
+      if (!this.windowId) return;
+      if (this.activeTab === MAP_TAB) {
+        const selected = this.mapRows[this.selectedIndex]?.nodeId;
+        await this.loadMapData();
+        await this.pushMap();
+        await this.rebuildList();
+        const idx = selected ? this.mapRows.findIndex(r => r.nodeId === selected) : -1;
+        this.selectedIndex = idx;
+        if (idx >= 0 && this.listWidgetId) {
+          await this.request(request(this.id, this.listWidgetId, 'update', { selectedIndex: idx })).catch(() => {});
+        }
+      } else {
+        await this.loadAgents();
+        if (this.activeTab === 0) {
+          await this.rebuildList();
+          if (this.selectedIndex >= 0) await this.showDetailForSelection();
+        }
+      }
+      await this.updateSigil();
+    }, MAP_RELOAD_MS);
+  }
+
+  /** A session not seen before: a child of another session is a delegation, which flows along its edge. */
+  private async onNewSession(id: string): Promise<void> {
+    if (this.activeTab !== MAP_TAB || !this.sessionStoreId) return;
+    const s = await this.request<SessionRecord | null>(request(this.id, this.sessionStoreId, 'get', { id })).catch(() => null);
+    if (!s?.parentId) return;
+    const parent = this.sessions.find(x => x.id === s.parentId)
+      ?? await this.request<SessionRecord | null>(request(this.id, this.sessionStoreId, 'get', { id: s.parentId })).catch(() => null);
+    if (!parent) return;
+    const agentNode = (rec: SessionRecord) => {
+      if (rec.agentId) return `agent:${rec.agentId}`;
+      const a = this.agents.find(x => x.name === rec.agentName);
+      return a ? `agent:${a.agentId}` : undefined;
+    };
+    const from = agentNode(parent), to = agentNode(s);
+    if (from && to && from !== to) this.mapPulse(from, to, '$accentSecondary', 2);
+  }
+
+  /** A one-shot flow along a map edge (only while the map shows; a node not on it is skipped). */
+  private mapPulse(from: string, to: string, color: string, count = 1): void {
+    if (this.activeTab !== MAP_TAB || !this.graphId) return;
+    this.request(request(this.id, this.graphId, 'pulse', { from, to, color, count })).catch(() => { /* node not on the map */ });
   }
 
   private async handleEdit(): Promise<void> {

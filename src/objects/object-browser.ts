@@ -28,6 +28,7 @@ import {
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { invariant } from '../core/contracts.js';
 
 const log = new Log('ObjectBrowser');
 import type { CatalogSnapshot, CatalogRegistrySource } from './object-catalog.js';
@@ -121,6 +122,19 @@ export class ObjectBrowser extends Abject {
   /** Grouped cards in pane 4 (destroying one takes its rows with it). */
   private pane4SectionIds: AbjectId[] = [];
 
+  // ── Pane 4 views: Detail (the scrollable pane above) and Map ──
+  /** Pane 4's box: its Detail | Map tab bar over the two views. */
+  private pane4BoxId?: AbjectId;
+  private pane4TabBarId?: AbjectId;
+  /** 0 = Detail, 1 = Map. */
+  private pane4Tab = 0;
+  /** Relations map of the selection (a nodeGraph widget). */
+  private relationsGraphId?: AbjectId;
+  /** Node ids the map holds now (select/pulse only reach these). */
+  private relationsNodeIds: Set<string> = new Set();
+  /** The node the map is centred on; a new centre resets the view. */
+  private relationsCenter?: string;
+
   // ── Navigation ──
   private tabs: InvestigationTab[] = [];
   private activeTabIndex = 0;
@@ -211,7 +225,8 @@ Pane 1: Scope filter (All objects, per-workspace, remote workspaces).
 Pane 2: Object kinds grouped by manifest name.
 Pane 3: Methods and events for the selected kind.
 Pane 4: Detail view with signature, status, source, send-message form,
-         and implementors/senders cross-references.
+         and implementors/senders cross-references. Its Map tab shows the
+         same relations as a 3D map with the selection at the centre.
 
 ### Show / hide the object browser window
 
@@ -237,6 +252,8 @@ Pane 4: Detail view with signature, status, source, send-message form,
 - Select a kind in Pane 2 to see its methods/events in Pane 3.
 - Select a method/event in Pane 3 to see its detail in Pane 4.
 - Use the inline message form in Pane 4 to send messages to live instances.
+- Pane 4's Map tab: a kind with its methods, senders and uses, or a method with
+  its implementors and senders; double-click a node to open it like the lists do.
 - Open investigation tabs for parallel browsing sessions with independent history.
 
 ### IMPORTANT
@@ -299,6 +316,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
         await this.readCatalogSnapshot();
         await this.rebuildPane1();
         await this.rebuildPane2();
+        await this.syncRelationsMap();
       }
     });
     this.on('sourcesChanged', async () => {
@@ -418,6 +436,12 @@ Pane 4: Detail view with signature, status, source, send-message form,
     this.msgResponseLabelId = undefined;
     this.msgResponseLayoutId = undefined;
     this.pane4SectionIds = [];
+    this.pane4BoxId = undefined;
+    this.pane4TabBarId = undefined;
+    this.pane4Tab = 0;
+    this.relationsGraphId = undefined;
+    this.relationsNodeIds.clear();
+    this.relationsCenter = undefined;
   }
 
   // ── Tab management ────────────────────────────────────────────────
@@ -721,18 +745,44 @@ Pane 4: Detail view with signature, status, source, send-message form,
     await this.addToLayout(pane3BoxId, pane3HeaderId, { vertical: 'fixed' }, { height: 22 });
     await this.addToLayout(pane3BoxId, this.pane3ListId, { vertical: 'expanding' });
 
-    // Pane 4: Detail (detached scrollable vbox, right child of rightSplit)
+    // Pane 4: a Detail | Map tab bar (like pane 1's) over two views of the
+    // selection: the detail (a detached scrollable vbox) and the relations map.
+    this.pane4BoxId = await wm('createDetachedVBox', {
+      windowId: this.windowId,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 2,
+    }) as AbjectId;
+    const { widgetIds: [pane4TabBarId, relationsGraphId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Detail', 'Map'], selectedIndex: this.pane4Tab, closable: false },
+        {
+          type: 'nodeGraph', windowId: this.windowId, title: 'Relations',
+          emptyText: 'Choose an object kind to map its relations', directed: true,
+          hint: 'Drag to turn · wheel to zoom · double-click to open',
+          groups: this.relationsGroups(),
+          style: { visible: this.pane4Tab === 1 },
+        },
+      ]})
+    );
+    this.pane4TabBarId = pane4TabBarId;
+    this.relationsGraphId = relationsGraphId;
     this.pane4LayoutId = await wm('createDetachedScrollableVBox', {
       windowId: this.windowId,
       margins: { top: 8, right: 12, bottom: 8, left: 12 },
       spacing: 6,
     }) as AbjectId;
+    await this.addDep(this.pane4TabBarId);
+    await this.addDep(this.relationsGraphId);
+    await this.addToLayout(this.pane4BoxId, this.pane4TabBarId, { vertical: 'fixed' }, { height: 32 });
+    await this.addToLayout(this.pane4BoxId, this.pane4LayoutId, { vertical: 'expanding' });
+    await this.addToLayout(this.pane4BoxId, this.relationsGraphId, { vertical: 'expanding' });
+    await this.switchPane4TabVisibility();
 
     // Wire nested split pane children
     await this.request(request(this.id, this.leftSplitId, 'setLeftChild', { widgetId: this.pane1VBoxId }));
     await this.request(request(this.id, this.leftSplitId, 'setRightChild', { widgetId: pane2BoxId }));
     await this.request(request(this.id, this.rightSplitId, 'setLeftChild', { widgetId: pane3BoxId }));
-    await this.request(request(this.id, this.rightSplitId, 'setRightChild', { widgetId: this.pane4LayoutId }));
+    await this.request(request(this.id, this.rightSplitId, 'setRightChild', { widgetId: this.pane4BoxId }));
     await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.leftSplitId }));
     await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.rightSplitId }));
 
@@ -799,6 +849,175 @@ Pane 4: Detail view with signature, status, source, send-message form,
             style: { visible: i === this.activePaneTab },
           }));
         } catch { /* widget gone */ }
+      }
+    }
+  }
+
+  // ── Pane 4 Map: the relations of the selection ────────────────────
+
+  private async switchPane4TabVisibility(): Promise<void> {
+    const views: Array<[AbjectId | undefined, boolean]> = [
+      [this.pane4LayoutId, this.pane4Tab === 0],
+      [this.relationsGraphId, this.pane4Tab === 1],
+    ];
+    for (const [id, visible] of views) {
+      if (!id) continue;
+      try {
+        await this.request(request(this.id, id, 'update', { style: { visible } }));
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /** Legend and looks of the relations map's node groups ($tokens, so every palette works). */
+  private relationsGroups(): Array<Record<string, unknown>> {
+    return [
+      { id: 'selected', label: 'Selected', color: '$textPrimary', shape: 'icosphere', material: 'ceramic' },
+      { id: 'methods', label: 'Methods', color: '$textSecondary', shape: 'box' },
+      { id: 'events', label: 'Events', color: '$statusWarning', shape: 'cone' },
+      { id: 'implementors', label: 'Implementors', color: '$statusInfo', shape: 'sphere' },
+      { id: 'senders', label: 'Senders', color: '$statusSuccess', shape: 'capsule' },
+      { id: 'uses', label: 'Uses', color: '$accentTertiary', shape: 'roundedBox' },
+    ];
+  }
+
+  /** Kinds in scope whose source quotes `name` ('name' or "name"): who looks it up or sends it. */
+  private kindsQuoting(name: string, regs: ObjectRegistration[]): string[] {
+    const pattern = new RegExp(`['"]${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`);
+    const out = new Set<string>();
+    for (const reg of regs) {
+      const source = (reg as unknown as { source?: string }).source;
+      if (source && pattern.test(source)) out.add(reg.manifest.name);
+    }
+    return [...out].sort();
+  }
+
+  /**
+   * Send the map the relations of the current selection, with the selection
+   * at the centre:
+   * - a method or event: the kinds that implement (declare) it and the kinds
+   *   whose source sends (mentions) it, the same data as Implementors and
+   *   Senders in the detail pane;
+   * - a kind: its methods and events, the kinds whose source names it
+   *   (senders), and the kinds its own source names (uses).
+   * Only while the Map tab shows; switching to it syncs.
+   */
+  private async syncRelationsMap(): Promise<void> {
+    if (!this.relationsGraphId || this.pane4Tab !== 1 || !this.windowId) return;
+    const state = this.currentState;
+    const regs = this.getFilteredRegistrations();
+    const nodes: Array<Record<string, unknown>> = [];
+    const edges: Array<Record<string, unknown>> = [];
+    const have = new Set<string>();
+    const addKind = (name: string, group: string, size = 8) => {
+      const id = `kind:${name}`;
+      if (have.has(id)) return id;
+      have.add(id);
+      nodes.push({ id, label: name, group, size, data: { kind: 'kind', name } });
+      return id;
+    };
+    const CAP = 48;
+    let center: string | undefined;
+
+    if (state.selectedKind && state.selectedItem) {
+      const { type, name } = state.selectedItem;
+      center = `item:${type}:${name}`;
+      have.add(center);
+      nodes.push({ id: center, label: type === 'event' ? name : `${name}()`, group: 'selected', size: 13, center: true, data: { kind: type, name } });
+      const implementors = new Set<string>();
+      for (const reg of regs) {
+        const iface = reg.manifest.interface as (InterfaceDeclaration & { events?: MethodDeclaration[] }) | undefined;
+        const list = type === 'event' ? iface?.events : iface?.methods;
+        if (list?.some((m) => m.name === name)) implementors.add(reg.manifest.name);
+      }
+      for (const kind of [...implementors].sort().slice(0, CAP)) {
+        const id = addKind(kind, 'implementors', kind === state.selectedKind ? 11 : 8);
+        edges.push({ id: `impl:${kind}`, from: id, to: center, weight: 2 });
+      }
+      for (const kind of this.kindsQuoting(name, regs).slice(0, CAP)) {
+        const id = addKind(kind, 'senders');
+        edges.push({ id: `send:${kind}`, from: id, to: center, style: 'dashed' });
+      }
+    } else if (state.selectedKind) {
+      const kindName = state.selectedKind;
+      center = addKind(kindName, 'selected', 13);
+      nodes[nodes.length - 1].center = true;
+      for (const m of this.getMethodsAndEvents(kindName).slice(0, CAP)) {
+        const id = `item:${m.type}:${m.name}`;
+        if (have.has(id)) continue;
+        have.add(id);
+        nodes.push({ id, label: m.type === 'event' ? m.name : `${m.name}()`, group: m.type === 'event' ? 'events' : 'methods', size: 5, data: { kind: m.type, name: m.name } });
+        edges.push({ from: center, to: id, weight: 2 });
+      }
+      for (const kind of this.kindsQuoting(kindName, regs).filter((k) => k !== kindName).slice(0, CAP)) {
+        const id = addKind(kind, 'senders');
+        edges.push({ id: `send:${kind}`, from: id, to: center, style: 'dashed' });
+      }
+      // What its own source names: the kinds in scope it looks up.
+      const own = this.getRegistrationsForKind(kindName)
+        .map((r) => (r as unknown as { source?: string }).source)
+        .find((s): s is string => typeof s === 'string');
+      if (own) {
+        const kinds = [...new Set(regs.map((r) => r.manifest.name))].filter((k) => k !== kindName);
+        let used = 0;
+        for (const kind of kinds.sort()) {
+          if (used >= CAP) break;
+          if (!new RegExp(`['"]${kind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`).test(own)) continue;
+          // A kind that is also a sender keeps its sender look.
+          const id = addKind(kind, 'uses');
+          edges.push({ id: `use:${kind}`, from: center, to: id });
+          used++;
+        }
+      }
+    }
+
+    try {
+      await this.request(request(this.id, this.relationsGraphId, 'setGraph', { nodes, edges }));
+    } catch (err) {
+      log.warn('relations map update failed:', err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.relationsNodeIds = have;
+    // The lists' selection is the centre. A new centre clears the map's own
+    // pick and resets the view (a double-click that navigated here had
+    // zoomed in on the node it opened).
+    if (center !== this.relationsCenter) {
+      this.relationsCenter = center;
+      await this.request(request(this.id, this.relationsGraphId, 'select', { id: null })).catch(() => { /* gone */ });
+      await this.request(request(this.id, this.relationsGraphId, 'focusNode', {})).catch(() => { /* gone */ });
+    }
+  }
+
+  /** Double-click on the map: open that kind or method the way the lists do. */
+  private async openRelationsNode(value: unknown): Promise<void> {
+    let id: string | undefined;
+    try { id = (JSON.parse(String(value)) as { id?: string }).id; } catch { return; }
+    if (!id || !this.relationsNodeIds.has(id)) return;
+    const state = this.currentState;
+    if (id.startsWith('kind:')) {
+      const kind = id.slice('kind:'.length);
+      if (kind === state.selectedKind && !state.selectedItem) return;
+      await this.handlePane4Action(`navKind:${kind}`);
+      return;
+    }
+    if (id.startsWith('item:')) {
+      const [type, ...rest] = id.slice('item:'.length).split(':');
+      const name = rest.join(':');
+      if (state.selectedItem?.name === name && state.selectedItem.type === type) return;
+      if (!state.selectedKind || (type !== 'method' && type !== 'event')) return;
+      // Navigate as a methods-list click does (names may hold colons, so
+      // the item is built here rather than parsed from a list value).
+      this.navigateTo({
+        pane1Filter: { ...state.pane1Filter },
+        selectedKind: state.selectedKind,
+        selectedItem: { type, name },
+        label: `${state.label} > ${name}()`,
+      });
+      await this.rebuildPane4();
+      await this.updateBreadcrumb();
+      // The methods list follows the map.
+      const idx = this.currentMethods.findIndex((m) => m.type === type && m.name === name);
+      if (idx >= 0 && this.pane3ListId) {
+        await this.request(request(this.id, this.pane3ListId, 'update', { selectedIndex: idx })).catch(() => { /* gone */ });
       }
     }
   }
@@ -883,6 +1102,9 @@ Pane 4: Detail view with signature, status, source, send-message form,
         'Choose a scope on the left, then an object kind to see its description, status and actions. Pick a method to read its signature and send it a message.',
       ));
     }
+
+    // The map follows every navigation (lists, breadcrumbs, back/forward).
+    await this.syncRelationsMap();
   }
 
   private async clearPane4(): Promise<void> {
@@ -1813,6 +2035,23 @@ Pane 4: Detail view with signature, status, source, send-message form,
       return;
     }
 
+    // Pane 4 tab bar (Detail / Map)
+    if (fromId === this.pane4TabBarId && aspect === 'change') {
+      const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
+      if (idx === 0 || idx === 1) {
+        this.pane4Tab = idx;
+        await this.switchPane4TabVisibility();
+        await this.syncRelationsMap();
+      }
+      return;
+    }
+
+    // Relations map: a double-click opens the node like the lists do.
+    if (fromId === this.relationsGraphId && aspect === 'nodeFocused') {
+      await this.openRelationsNode(value);
+      return;
+    }
+
     // Pane 1 tab bar (Scope / Local / Discovered)
     if (fromId === this.pane1TabBarId && aspect === 'change') {
       const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
@@ -2357,5 +2596,12 @@ Pane 4: Detail view with signature, status, source, send-message form,
     if (obj.kind === 'reference') return obj.reference as string;
     if (obj.kind === 'object') return 'object';
     return 'any';
+  }
+
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    invariant(this.pane4Tab === 0 || this.pane4Tab === 1, 'pane 4 shows Detail (0) or Map (1)');
+    invariant(this.relationsCenter === undefined || this.relationsNodeIds.has(this.relationsCenter),
+      'the map centre is a node of the map');
   }
 }

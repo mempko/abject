@@ -14,6 +14,13 @@
  * the linked pattern), names with no written pattern yet as dimmed
  * "unwritten" labels, and a reverse "Linked from" row of the patterns
  * whose Links name this one.
+ *
+ * On the Patterns tab a map sits beside the list: the pattern language as a
+ * 3D graph (the nodeGraph widget), one node per pattern and a see-through
+ * node per unwritten link name. Selection syncs both ways: a click on the
+ * map opens the pattern in the detail pane and the list, and choosing a
+ * pattern in the list or through a link chip selects it on the map. A
+ * newly woven pattern arrives as a flow of living light along its links.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -21,8 +28,6 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { chromeCase } from '../core/theme-data.js';
-import { fontStacks } from './widgets/widget-types.js';
 import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
 import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
@@ -37,27 +42,8 @@ const WIN_H = 540;
 /** Minimum gap between arrival flashes, so a curation pass reads as one signal. */
 const ARRIVAL_FLASH_GAP_MS = 1500;
 
-/** A node in the pattern language map. Ghost nodes are dangling link names. */
-interface GraphNode {
-  /** Absent for ghost (unwritten) nodes. */
-  entry?: KnowledgeEntry;
-  title: string;
-  norm: string;
-  /** Abstract force-layout coordinates. */
-  ax: number;
-  ay: number;
-  /** Last-drawn screen coordinates (hit-testing). */
-  sx: number;
-  sy: number;
-  r: number;
-}
-
-interface GraphEdge {
-  from: number;
-  to: number;
-  /** True when the edge points at a ghost node. */
-  ghost: boolean;
-}
+/** Map node id prefix for unwritten (ghost) patterns: a dangling link name. */
+const GHOST_PREFIX = 'unwritten:';
 
 /**
  * Vector icon names for knowledge types. ListWidget renders these at the
@@ -97,12 +83,10 @@ export class KnowledgeBrowser extends Abject {
   private localPeerId = '';
 
   private innerSplitId?: AbjectId;
-  private graphCanvasId?: AbjectId;
-  /** Pattern language map: all workspace patterns + ghost nodes for dangling links. */
-  private graphNodes: GraphNode[] = [];
-  private graphEdges: GraphEdge[] = [];
-  /** View offset applied on top of the fitted layout (centers the selection). */
-  private graphPan = { x: 0, y: 0 };
+  /** Pattern language map (a nodeGraph widget), shown on the Patterns tab. */
+  private graphId?: AbjectId;
+  /** Pattern ids on the map, with each pattern's outgoing link targets (map node ids). */
+  private graphLinks = new Map<string, string[]>();
 
   private linksRowId?: AbjectId;
   private linkedFromRowId?: AbjectId;
@@ -182,25 +166,6 @@ export class KnowledgeBrowser extends Abject {
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       await this.handleChanged(msg.routing.from, aspect, value);
-    });
-
-    // Raw input from the pattern-map canvas: node clicks select; resizes refit.
-    this.on('input', async (msg: AbjectMessage) => {
-      if (msg.routing.from !== this.graphCanvasId || !this.graphActive()) return;
-      const { type, x, y } = msg.payload as { type?: string; x?: number; y?: number };
-      if (type === 'canvasResize') {
-        await this.drawGraph();
-        return;
-      }
-      if (type !== 'mousedown' || typeof x !== 'number' || typeof y !== 'number') return;
-
-      let hit: GraphNode | undefined;
-      let hitDist = Infinity;
-      for (const node of this.graphNodes) {
-        const d = Math.hypot(node.sx - x, node.sy - y);
-        if (d <= Math.max(node.r + 6, 14) && d < hitDist) { hit = node; hitDist = d; }
-      }
-      if (hit?.entry) await this.selectPattern(hit.entry);
     });
   }
 
@@ -296,10 +261,10 @@ export class KnowledgeBrowser extends Abject {
       preferredSize: { width: 80, height: 26 },
     }));
 
-    // Split panes: outer = list | rest; inner = graph | detail. The graph
-    // pane exists only visually on the Patterns tab (inner divider collapses
-    // to 0 elsewhere), so the other tabs keep their two-pane layout.
-    const { widgetIds: [splitId, innerSplitId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Split panes: outer = list | rest; inner = map | detail. The map pane
+    // exists only visually on the Patterns tab (inner divider collapses to 0
+    // elsewhere), so the other tabs keep their two-pane layout.
+    const { widgetIds: [splitId, innerSplitId, graphId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           {
@@ -316,28 +281,25 @@ export class KnowledgeBrowser extends Abject {
             dividerPosition: 0,
             minSize: 0,
           },
+          // The pattern language map (hidden until the Patterns tab is active).
+          {
+            type: 'nodeGraph',
+            windowId: this.windowId,
+            title: 'Pattern language',
+            emptyText: 'No patterns yet',
+            directed: true,
+            groups: [
+              { id: 'pattern', label: 'Written', color: '$textPrimary', material: 'ceramic', shape: 'sphere' },
+              { id: 'unwritten', label: 'Unwritten', color: '$textSecondary', shape: 'icosphere' },
+            ],
+            style: { visible: false },
+          },
         ],
       })
     );
     this.splitPaneId = splitId;
     this.innerSplitId = innerSplitId;
-
-    // Pattern language map canvas (hidden until the Patterns tab is active).
-    // Input events (clicks for node selection, canvasResize) come back to
-    // this object via the canvas's `input` event.
-    this.graphCanvasId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createCanvas', {
-        windowId: this.windowId,
-        inputTargetId: this.id,
-      })
-    );
-    // createCanvas registers the canvas as a DIRECT window child filling the
-    // content area (its no-layout default). Here the split pane manages it,
-    // and a widget with two parents gets its backdrop layer re-anchored to
-    // whichever render pass ran last (hovering the window snapped the map to
-    // the top-left corner). Detach it so only the split pane positions it.
-    await this.request(request(this.id, this.windowId, 'removeChild', { widgetId: this.graphCanvasId }));
-    await this.request(request(this.id, this.graphCanvasId, 'update', { style: { visible: false } }));
+    this.graphId = graphId;
 
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.splitPaneId,
@@ -484,7 +446,7 @@ export class KnowledgeBrowser extends Abject {
     // Wire split panes: outer = list | inner; inner = graph | detail
     await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.leftLayoutId }));
     await this.request(request(this.id, this.splitPaneId, 'setRightChild', { widgetId: this.innerSplitId }));
-    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.graphCanvasId }));
+    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.graphId }));
     await this.request(request(this.id, this.innerSplitId, 'setRightChild', { widgetId: this.detailLayoutId }));
 
     // Subscribe to events
@@ -495,6 +457,7 @@ export class KnowledgeBrowser extends Abject {
     this.send(request(this.id, this.restoreBtnId, 'addDependent', {}));
     this.send(request(this.id, this.archivedToggleId, 'addDependent', {}));
     this.send(request(this.id, this.curateBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.graphId, 'addDependent', {}));
     if (this.knowledgeBaseId) {
       this.send(request(this.id, this.knowledgeBaseId, 'addDependent', {}));
     }
@@ -557,10 +520,8 @@ export class KnowledgeBrowser extends Abject {
     this.archivedToggleId = undefined;
     this.curateBtnId = undefined;
     this.innerSplitId = undefined;
-    this.graphCanvasId = undefined;
-    this.graphNodes = [];
-    this.graphEdges = [];
-    this.graphPan = { x: 0, y: 0 };
+    this.graphId = undefined;
+    this.graphLinks.clear();
     this.linksRowId = undefined;
     this.linkedFromRowId = undefined;
     this.linkRowWidgets = [];
@@ -934,17 +895,17 @@ export class KnowledgeBrowser extends Abject {
   // ─── Pattern language map (graph pane) ─────────────────────────────
 
   private graphActive(): boolean {
-    return TAB_TYPES[this.activeTab] === 'pattern' && !!this.graphCanvasId;
+    return TAB_TYPES[this.activeTab] === 'pattern' && !!this.graphId;
   }
 
-  /** Collapse or expand the graph pane to match the active tab. */
+  /** Collapse or expand the map pane to match the active tab. */
   private async updateGraphPane(): Promise<void> {
-    if (!this.innerSplitId || !this.graphCanvasId) return;
+    if (!this.innerSplitId || !this.graphId) return;
     const active = TAB_TYPES[this.activeTab] === 'pattern';
     await this.request(request(this.id, this.innerSplitId, 'update', {
       dividerPosition: active ? 0.5 : 0,
     })).catch(() => { /* window torn down */ });
-    await this.request(request(this.id, this.graphCanvasId, 'update', {
+    await this.request(request(this.id, this.graphId, 'update', {
       style: { visible: active },
     })).catch(() => { /* window torn down */ });
     if (active) await this.loadGraph();
@@ -953,253 +914,74 @@ export class KnowledgeBrowser extends Abject {
   /**
    * Build the language map from ALL workspace patterns (the search box
    * filters the list, never the map): one node per pattern, one directed
-   * edge per Links reference, and a ghost node per dangling link name.
+   * edge per Links reference, and a see-through node per dangling link
+   * name. The map widget keeps existing nodes where they are and springs
+   * the rest into place.
    */
   private async loadGraph(): Promise<void> {
-    if (!this.knowledgeBaseId || !this.graphCanvasId) return;
+    if (!this.knowledgeBaseId || !this.graphId) return;
 
     const patterns = await this.request<KnowledgeEntry[]>(
       request(this.id, this.knowledgeBaseId, 'list', { type: 'pattern', limit: 200 }),
     ).catch(() => [] as KnowledgeEntry[]);
 
-    const nodes: GraphNode[] = patterns.map(p => ({
-      entry: p,
-      title: p.title,
-      norm: this.normalizeTitle(p.title),
-      ax: 0, ay: 0, sx: 0, sy: 0,
-      r: 9 + Math.min(6, p.usefulCount),
+    const byNorm = new Map(patterns.map((p) => [this.normalizeTitle(p.title), p.id]));
+    const nodes: Array<Record<string, unknown>> = patterns.map((p) => ({
+      id: p.id,
+      label: p.title,
+      group: 'pattern',
+      size: 8 + Math.min(6, p.usefulCount),
     }));
-    const byNorm = new Map(nodes.map((node, i) => [node.norm, i]));
-
-    const edges: GraphEdge[] = [];
-    for (let i = 0; i < patterns.length; i++) {
-      for (const name of this.parsePatternLinks(patterns[i].content)) {
+    const ghosts = new Set<string>();
+    const edges: Array<Record<string, unknown>> = [];
+    const seen = new Set<string>();
+    this.graphLinks.clear();
+    for (const p of patterns) {
+      const targets: string[] = [];
+      for (const name of this.parsePatternLinks(p.content)) {
         const norm = this.normalizeTitle(name);
         let target = byNorm.get(norm);
-        if (target === undefined) {
-          nodes.push({ title: name, norm, ax: 0, ay: 0, sx: 0, sy: 0, r: 7 });
-          target = nodes.length - 1;
-          byNorm.set(norm, target);
+        const ghost = target === undefined;
+        if (ghost) {
+          target = `${GHOST_PREFIX}${norm}`;
+          if (!ghosts.has(target)) {
+            ghosts.add(target);
+            nodes.push({ id: target, label: name, group: 'unwritten', ghost: true, size: 6 });
+          }
         }
-        if (target !== i) edges.push({ from: i, to: target, ghost: !nodes[target].entry });
+        if (target === p.id || seen.has(`${p.id}>${target}`)) continue;
+        seen.add(`${p.id}>${target}`);
+        targets.push(target!);
+        edges.push({ from: p.id, to: target, ...(ghost ? { style: 'dashed' } : {}) });
       }
+      this.graphLinks.set(p.id, targets);
     }
 
-    this.layoutGraph(nodes, edges);
-    this.graphNodes = nodes;
-    this.graphEdges = edges;
-    this.graphPan = { x: 0, y: 0 };
-    await this.drawGraph();
-  }
-
-  /**
-   * Deterministic force-directed layout in abstract space: seeded on a
-   * circle in title order, then relaxed with pairwise repulsion, springs
-   * along edges, and light gravity. Small graphs (≤ ~200 nodes) converge
-   * in a few hundred cheap iterations.
-   */
-  private layoutGraph(nodes: GraphNode[], edges: GraphEdge[]): void {
-    const n = nodes.length;
-    if (n === 0) return;
-    if (n === 1) { nodes[0].ax = 0; nodes[0].ay = 0; return; }
-
-    const order = nodes.map((_, i) => i)
-      .sort((a, b) => nodes[a].norm.localeCompare(nodes[b].norm));
-    order.forEach((nodeIdx, k) => {
-      const angle = (2 * Math.PI * k) / n;
-      nodes[nodeIdx].ax = Math.cos(angle);
-      nodes[nodeIdx].ay = Math.sin(angle);
-    });
-
-    const REPULSION = 0.5, SPRING = 0.08, REST = 0.55, GRAVITY = 0.04, STEPS = 240;
-    const fx = new Array<number>(n), fy = new Array<number>(n);
-    for (let step = 0; step < STEPS; step++) {
-      const cool = 1 - step / STEPS;
-      fx.fill(0); fy.fill(0);
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          let dx = nodes[i].ax - nodes[j].ax;
-          let dy = nodes[i].ay - nodes[j].ay;
-          let d2 = dx * dx + dy * dy;
-          if (d2 < 1e-6) { dx = 0.01 * (((i + j) % 5) - 2 || 1); dy = 0.013; d2 = dx * dx + dy * dy; }
-          const d = Math.sqrt(d2);
-          const f = REPULSION / d2 / n;
-          fx[i] += (dx / d) * f; fy[i] += (dy / d) * f;
-          fx[j] -= (dx / d) * f; fy[j] -= (dy / d) * f;
-        }
-      }
-      for (const e of edges) {
-        const a = nodes[e.from], b = nodes[e.to];
-        const dx = b.ax - a.ax, dy = b.ay - a.ay;
-        const d = Math.sqrt(dx * dx + dy * dy) || 1e-3;
-        const f = SPRING * (d - REST);
-        fx[e.from] += (dx / d) * f; fy[e.from] += (dy / d) * f;
-        fx[e.to] -= (dx / d) * f; fy[e.to] -= (dy / d) * f;
-      }
-      for (let i = 0; i < n; i++) {
-        fx[i] -= nodes[i].ax * GRAVITY;
-        fy[i] -= nodes[i].ay * GRAVITY;
-        const cap = 0.12 * cool;
-        nodes[i].ax += Math.max(-cap, Math.min(cap, fx[i]));
-        nodes[i].ay += Math.max(-cap, Math.min(cap, fy[i]));
-      }
+    await this.request(request(this.id, this.graphId, 'setGraph', { nodes, edges }))
+      .catch((err) => log.warn('pattern map update failed:', err instanceof Error ? err.message : String(err)));
+    if (this.selectedId && patterns.some((p) => p.id === this.selectedId)) {
+      await this.request(request(this.id, this.graphId, 'select', { id: this.selectedId })).catch(() => {});
     }
+    log.info(`Pattern map: ${nodes.length} nodes (${ghosts.size} unwritten), ${edges.length} links`);
   }
 
-  /** Fit the abstract layout to the canvas (plus pan), render, and record screen coords for hit-testing. */
-  private async drawGraph(): Promise<void> {
+  /** Show the selection on the map (brought into view when it is outside). */
+  private async selectOnMap(entryId: string | undefined): Promise<void> {
     if (!this.graphActive()) return;
-    // Snapshot nodes+edges together: loadGraph replaces both synchronously,
-    // and a resize-triggered draw awaiting getCanvasSize must not mix a
-    // stale node array with fresh edge indices.
-    const nodes = this.graphNodes;
-    const edges = this.graphEdges;
-
-    const size = await this.request<{ width: number; height: number }>(
-      request(this.id, this.graphCanvasId!, 'getCanvasSize', {}),
-    ).catch(() => null);
-    if (!size || size.width < 60 || size.height < 60) return;
-    const W = size.width, H = size.height;
-    const t = this.theme;
-    if (nodes.length > 0) {
-      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-      for (const nd of nodes) {
-        minX = Math.min(minX, nd.ax); maxX = Math.max(maxX, nd.ax);
-        minY = Math.min(minY, nd.ay); maxY = Math.max(maxY, nd.ay);
-      }
-      const margin = 52;
-      const scale = Math.min(
-        (W - 2 * margin) / Math.max(maxX - minX, 0.01),
-        (H - 2 * margin) / Math.max(maxY - minY, 0.01),
-      );
-      for (const nd of nodes) {
-        nd.sx = (nd.ax - (minX + maxX) / 2) * scale + W / 2 + this.graphPan.x;
-        nd.sy = (nd.ay - (minY + maxY) / 2) * scale + H / 2 + this.graphPan.y;
-      }
-    }
-
-    const cmds: Array<{ type: string; surfaceId: string; params: Record<string, unknown> }> = [];
-    const c = (type: string, params: Record<string, unknown>) => cmds.push({ type, surfaceId: 'c', params });
-
-    // Red Sigil map: patterns are ring sigils on the void. The selected
-    // pattern is marked in red (the human hand); what it links to is drawn
-    // in red, what links back to it glows in the living light.
-    const { body, display } = fontStacks(t);
-    c('clear', { color: t.canvasBg });
-    c('text', { x: 12, y: 18, text: `\u25C9  ${chromeCase(t, 'Pattern language')}`, fill: t.textSecondary, font: `bold 11px ${display}` });
-    c('line', { x1: 12, y1: 24, x2: 52, y2: 24, stroke: t.accent, lineWidth: 2 });
-
-    if (nodes.length === 0) {
-      c('text', {
-        x: W / 2, y: H / 2 - 8, align: 'center',
-        text: chromeCase(t, 'No patterns yet'),
-        fill: t.textSecondary, font: `bold 13px ${display}`,
-      });
-      c('text', {
-        x: W / 2, y: H / 2 + 12, align: 'center',
-        text: 'The language grows as goals complete and lessons are woven in.',
-        fill: t.textTertiary, font: `11px ${body}`,
-      });
-    }
-
-    const selIdx = nodes.findIndex(nd => !!nd.entry && nd.entry.id === this.selectedId);
-    const related = new Set<number>();
-    for (const e of edges) {
-      if (e.from === selIdx) related.add(e.to);
-      if (e.to === selIdx) related.add(e.from);
-    }
-
-    for (const e of edges) {
-      const a = nodes[e.from], b = nodes[e.to];
-      const outgoing = selIdx >= 0 && e.from === selIdx;
-      const incoming = selIdx >= 0 && e.to === selIdx;
-      const stroke = outgoing ? t.accent
-        : incoming ? t.accentSecondary
-          : e.ghost ? t.textTertiary : t.divider;
-      const lineWidth = outgoing || incoming ? 2 : 1.2;
-      if (e.ghost) c('setLineDash', { segments: [4, 4] });
-      c('line', { x1: a.sx, y1: a.sy, x2: b.sx, y2: b.sy, stroke, lineWidth });
-      if (e.ghost) c('setLineDash', { segments: [] });
-      // Arrowhead just outside the target node's rim
-      const dx = b.sx - a.sx, dy = b.sy - a.sy;
-      const d = Math.hypot(dx, dy) || 1;
-      const ux = dx / d, uy = dy / d;
-      const tipX = b.sx - ux * (b.r + 3), tipY = b.sy - uy * (b.r + 3);
-      c('polygon', {
-        points: [
-          { x: tipX, y: tipY },
-          { x: tipX - ux * 7 - uy * 4, y: tipY - uy * 7 + ux * 4 },
-          { x: tipX - ux * 7 + uy * 4, y: tipY - uy * 7 - ux * 4 },
-        ],
-        fill: stroke,
-      });
-    }
-
-    for (let i = 0; i < nodes.length; i++) {
-      const nd = nodes[i];
-      const selected = i === selIdx;
-      const isRelated = related.has(i);
-      if (!nd.entry) {
-        // Unwritten pattern: a dashed ring with no eye.
-        c('setLineDash', { segments: [3, 3] });
-        c('circle', { cx: nd.sx, cy: nd.sy, radius: nd.r, stroke: t.textTertiary, lineWidth: 1 });
-        c('setLineDash', { segments: [] });
-      } else {
-        // Ring sigil: bone outer ring, red inner ring, pupil at the centre.
-        if (selected) {
-          c('circle', { cx: nd.sx, cy: nd.sy, radius: nd.r + 5, stroke: t.accent, lineWidth: 2.5 });
-        }
-        c('circle', {
-          cx: nd.sx, cy: nd.sy, radius: nd.r,
-          fill: t.windowBg,
-          stroke: selected ? t.accent : t.textPrimary,
-          lineWidth: selected ? 2.2 : 1.6,
-        });
-        c('circle', {
-          cx: nd.sx, cy: nd.sy, radius: Math.max(3, nd.r * 0.55),
-          stroke: t.accent, lineWidth: 1.2,
-        });
-        c('circle', {
-          cx: nd.sx, cy: nd.sy, radius: selected || isRelated ? 2.5 : 1.8,
-          fill: selected || isRelated ? t.accentSecondary : t.textSecondary,
-        });
-      }
-      const label = nd.title.length > 20 ? `${nd.title.slice(0, 19)}…` : nd.title;
-      c('text', {
-        x: nd.sx, y: nd.sy + nd.r + (selected ? 17 : 13), text: label, align: 'center',
-        fill: nd.entry
-          ? (selected ? t.accent : isRelated ? t.accentSecondary : t.textPrimary)
-          : t.textTertiary,
-        font: selected ? `bold 11px ${display}` : `10px ${display}`,
-      });
-      if (!nd.entry) {
-        c('text', {
-          x: nd.sx, y: nd.sy + nd.r + 24, text: '(unwritten)', align: 'center',
-          fill: t.textTertiary, font: `9px ${body}`,
-        });
-      }
-    }
-
-    await this.request(request(this.id, this.graphCanvasId!, 'draw', { commands: cmds }))
-      .catch(err => log.warn('graph draw failed:', err instanceof Error ? err.message : String(err)));
-    log.info(`Pattern map drawn: ${nodes.length} nodes, ${edges.length} edges (${W}x${H})`);
+    await this.request(request(this.id, this.graphId!, 'select', { id: entryId ?? null }))
+      .catch(() => { /* not on the map (yet) */ });
   }
 
-  /** Pan the map so the given pattern's node sits at the canvas center, and redraw. */
-  private async centerGraphOn(entryId: string): Promise<void> {
+  /** A newly woven pattern arrives as living light flowing along its links. */
+  private async pulseNewPattern(entryId: string): Promise<void> {
     if (!this.graphActive()) return;
-    const size = await this.request<{ width: number; height: number }>(
-      request(this.id, this.graphCanvasId!, 'getCanvasSize', {}),
-    ).catch(() => null);
-    const node = this.graphNodes.find(nd => nd.entry?.id === entryId);
-    if (size && node) {
-      this.graphPan.x += size.width / 2 - node.sx;
-      this.graphPan.y += size.height / 2 - node.sy;
+    for (const target of (this.graphLinks.get(entryId) ?? []).slice(0, 6)) {
+      await this.request(request(this.id, this.graphId!, 'pulse', { from: entryId, to: target, count: 2 }))
+        .catch(() => { /* node not placed yet */ });
     }
-    await this.drawGraph();
   }
 
-  /** Shared selection path for graph clicks: sync list, detail pane, and map. */
+  /** Shared selection path for map clicks and link chips: sync list, detail pane, and map. */
   private async selectPattern(entry: KnowledgeEntry): Promise<void> {
     this.selectedId = entry.id;
     const idx = this.filteredEntries.findIndex(e => e.id === entry.id);
@@ -1208,7 +990,7 @@ export class KnowledgeBrowser extends Abject {
         .catch(() => { /* list gone */ });
     }
     await this.showDetail(idx >= 0 ? this.filteredEntries[idx] : entry);
-    await this.centerGraphOn(entry.id);
+    await this.selectOnMap(entry.id);
   }
 
   private typeColor(type: KnowledgeType): string {
@@ -1320,9 +1102,21 @@ export class KnowledgeBrowser extends Abject {
         const entry = this.filteredEntries.find(e => e.id === entryId);
         if (entry) {
           await this.showDetail(entry);
-          if (entry.type === 'pattern') await this.centerGraphOn(entry.id);
+          if (entry.type === 'pattern') await this.selectOnMap(entry.id);
         }
       }
+      return;
+    }
+
+    // Map: a click (or double-click) on a pattern node opens it; unwritten
+    // names have no entry to open.
+    if (fromId === this.graphId && (aspect === 'nodeSelected' || aspect === 'nodeFocused')) {
+      const data = typeof value === 'string' ? JSON.parse(value) as { id?: string } : value as { id?: string };
+      const id = data?.id;
+      if (!id || id.startsWith(GHOST_PREFIX)) return;
+      const entry = this.filteredEntries.find(e => e.id === id) ?? this.entries.find(e => e.id === id)
+        ?? await this.request<KnowledgeEntry | null>(request(this.id, this.knowledgeBaseId!, 'get', { id })).catch(() => null);
+      if (entry) await this.selectPattern(entry);
       return;
     }
 
@@ -1387,7 +1181,11 @@ export class KnowledgeBrowser extends Abject {
           this.playEffect('flash');
         }
         await this.loadEntries();
-        if (this.graphActive()) await this.loadGraph();
+        if (this.graphActive()) {
+          await this.loadGraph();
+          const added = value as { id?: string; type?: string } | undefined;
+          if (aspect === 'entryAdded' && added?.type === 'pattern' && added.id) await this.pulseNewPattern(added.id);
+        }
         if (this.selectedId && aspect === 'entryUpdated') {
           const entry = this.filteredEntries.find(e => e.id === this.selectedId);
           if (entry) await this.showDetail(entry);
