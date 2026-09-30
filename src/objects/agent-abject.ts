@@ -299,6 +299,12 @@ export interface AgentConfig {
   queueName?: string;
   directExecution?: boolean;
   skipFirstObservation?: boolean;
+  /**
+   * Think tier for step 0 when skipFirstObservation is set. Without an
+   * observation there is no observe hint, so the first think would fall to
+   * the 'smart' default; agents that skip observation name their tier here.
+   */
+  firstThinkTier?: string;
   terminalActions?: Record<string, TerminalActionConfig>;
   intermediateActions?: string[];
   /**
@@ -329,6 +335,7 @@ interface ResolvedAgentConfig {
   queueName?: string;
   directExecution: boolean;
   skipFirstObservation: boolean;
+  firstThinkTier?: string;
   terminalActions: Record<string, TerminalActionConfig>;
   intermediateActions: string[];
   actions?: string[];
@@ -719,6 +726,7 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
     queueName: partial.queueName ?? DEFAULT_CONFIG.queueName,
     directExecution: partial.directExecution ?? DEFAULT_CONFIG.directExecution,
     skipFirstObservation: partial.skipFirstObservation ?? DEFAULT_CONFIG.skipFirstObservation,
+    firstThinkTier: partial.firstThinkTier,
     terminalActions: partial.terminalActions ?? { ...DEFAULT_CONFIG.terminalActions },
     intermediateActions: partial.intermediateActions ?? [...DEFAULT_CONFIG.intermediateActions],
     actions: partial.actions,
@@ -795,6 +803,7 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
     queueName: override.queueName ?? base.queueName,
     directExecution: override.directExecution ?? base.directExecution,
     skipFirstObservation: override.skipFirstObservation ?? base.skipFirstObservation,
+    firstThinkTier: override.firstThinkTier ?? base.firstThinkTier,
     terminalActions: override.terminalActions ?? base.terminalActions,
     intermediateActions: override.intermediateActions ?? base.intermediateActions,
     actions: override.actions ?? base.actions,
@@ -3087,6 +3096,7 @@ The registered object must implement these handlers to participate in the agent 
           case 'observing': {
             // Skip observation on step 0 if configured
             if (task.step === 0 && entry.config.skipFirstObservation) {
+              if (entry.config.firstThinkTier) entry.observeTier = entry.config.firstThinkTier;
               setPhase('thinking');
               break;
             }

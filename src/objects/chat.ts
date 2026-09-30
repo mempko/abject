@@ -25,6 +25,12 @@ import { Log } from '../core/timed-log.js';
 const log = new Log('Chat');
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 
+/**
+ * Think tier for every Chat step, including step 0 (which skips observation,
+ * so it carries the tier through firstThinkTier instead of the observe hint).
+ */
+const CHAT_THINK_TIER = 'balanced';
+
 const DEFAULT_WIN_W = 640;
 const DEFAULT_WIN_H = 620;
 
@@ -523,6 +529,7 @@ export class Chat extends Abject {
         },
         intermediateActions: ['reply'],
         skipFirstObservation: true,
+        firstThinkTier: CHAT_THINK_TIER,
       },
     }));
   }
@@ -980,8 +987,8 @@ export class Chat extends Abject {
       // the top tier. The self-audit re-prompt (runChatTask) is the net for
       // the confabulation a lighter model could invite. If the configured
       // balanced model proves too weak here (parse retries, worse routing),
-      // this is the one line to move back to 'smart'.
-      return { observation: this.buildGoalStateObservation(), tier: 'balanced' };
+      // CHAT_THINK_TIER is the one line to move back to 'smart'.
+      return { observation: this.buildGoalStateObservation(), tier: CHAT_THINK_TIER };
     });
 
     this.on('agentAct', (msg: AbjectMessage) => {
