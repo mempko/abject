@@ -1435,10 +1435,10 @@ export class ScrumMaster extends Abject {
     const context = this.goalManagerId ? await this.request<unknown>(request(this.id, this.goalManagerId, 'getGoal', { goalId })) : null;
     const question = `Goal ${goalId} and current planning context:\n${safeStringify(context, 12000)}\n\n` + ((action.question as string | undefined) ?? this.defaultPollQuestion());
 
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string }>>(
+    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; joinsPlanning?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
-    const eligible = team.filter(a => a.name !== 'Chat' && a.name !== 'ScrumMaster');
+    const eligible = team.filter(a => a.name !== 'Chat' && a.name !== 'ScrumMaster' && a.joinsPlanning !== false);
     const targets = requestedMembers && requestedMembers.length > 0
       ? eligible.filter(a => requestedMembers.includes(a.name))
       : eligible;

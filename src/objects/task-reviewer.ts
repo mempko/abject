@@ -230,11 +230,13 @@ export class TaskReviewer extends Abject {
 
     // Register as an agent so reviews run through the shared OTA loop.
     // canExecute: false keeps the scrum dispatcher from assigning it work;
-    // it only ever runs tasks it starts itself.
+    // it only ever runs tasks it starts itself. joinsPlanning: false keeps
+    // planning polls from asking it at all: its answer is always PASS.
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'TaskReviewer',
       description: 'Internal post-task reviewer. Reviews finished transcripts to grow the knowledge base; it does not take on user goals.',
       canExecute: false,
+      joinsPlanning: false,
       config: {
         snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask', completionMethod: 'completeReview',
         maxSteps: 10,

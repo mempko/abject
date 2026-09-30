@@ -348,6 +348,13 @@ interface RegisteredAgent {
   config: ResolvedAgentConfig;
   /** Whether this agent can execute tasks from TupleSpace. Agents that only create tasks (like Chat) set this to false. */
   canExecute: boolean;
+  /**
+   * Whether planners poll this agent for contributions. Advisory agents that
+   * cannot execute may still join planning; an internal agent whose answer to
+   * every planning poll is PASS sets this to false instead of paying an LLM
+   * call per poll to say so.
+   */
+  joinsPlanning: boolean;
   registeredAt: number;
 }
 
@@ -932,6 +939,8 @@ export class AgentAbject extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'What this agent does' },
                 { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Default system prompt', optional: true },
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Default agent config', optional: true },
+                { name: 'canExecute', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether dispatchers may assign this agent tasks (default true)', optional: true },
+                { name: 'joinsPlanning', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether planners poll this agent for contributions (default true)', optional: true },
               ],
               returns: { kind: 'object', properties: { agentId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -1522,8 +1531,8 @@ The registered object must implement these handlers to participate in the agent 
     ]);
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, systemPrompt, config, canExecute } =
-        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
+      const { name, description, systemPrompt, config, canExecute, joinsPlanning } =
+        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean; joinsPlanning?: boolean };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -1534,6 +1543,7 @@ The registered object must implement these handlers to participate in the agent 
         systemPrompt,
         config: resolved,
         canExecute: canExecute ?? true,
+        joinsPlanning: joinsPlanning ?? true,
         registeredAt: Date.now(),
       });
 
@@ -1567,6 +1577,7 @@ The registered object must implement these handlers to participate in the agent 
           name: agent.name,
           description: agent.description,
           canExecute: agent.canExecute,
+          joinsPlanning: agent.joinsPlanning,
           status: activeTasks > 0 ? 'busy' : 'idle',
           activeTasks,
         };
