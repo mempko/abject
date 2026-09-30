@@ -24,6 +24,8 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { goalHealthQuestions } from '../core/decision-questions.js';
+import { choiceOf } from '../llm/decision.js';
 
 const log = new Log('GoalObserver');
 
@@ -205,7 +207,7 @@ decisions belong to ScrumMaster.
   private async sweep(): Promise<void> {
     if (!this.goalManagerId) return;
 
-    let goals: Array<{ id: string; status: string; updatedAt: number; createdAt?:number; lastMeaningfulProgressAt?:number }>;
+    let goals: Array<{ id: string; status: string; updatedAt: number; createdAt?:number; lastMeaningfulProgressAt?:number; title?: string; progress?: Array<{ timestamp: number; agentName: string; message: string; phase?: string }> }>;
     try {
       goals = await this.request<Array<{ id: string; status: string; updatedAt: number }>>(
         request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
@@ -222,6 +224,7 @@ decisions belong to ScrumMaster.
     // does not grow with every goal ever warned about.
     const activeIds = new Set(goals.map(g => g.id));
     for (const id of this.warningsIssued) if (!activeIds.has(id)) this.warningsIssued.delete(id);
+    for (const id of this.healthCheckedAt.keys()) if (!activeIds.has(id)) this.healthCheckedAt.delete(id);
 
     for (const goal of goals) {
       // Stale check
@@ -238,20 +241,64 @@ decisions belong to ScrumMaster.
           if(!this.warningsIssued.has(goal.id)){this.warningsIssued.add(goal.id);this.changed('goalWarning',{goalId:goal.id,reason:'No recent accepted evidence; runtime still owns active work',health});}
           continue;
         }
+        // The time backstop stands, but a confident "progressing" or
+        // "waiting" reading holds the auto-fail for another sweep.
+        const judged = await this.judgeHealth(goal, age).catch(() => undefined);
+        if (judged?.hold && age < this.staleFailMs * 2) {
+          log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min but judged ${judged.health}; holding the auto-fail`);
+          continue;
+        }
         log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min — auto-failing`);
         await this.autoFailGoal(goal.id, `Goal stale for ${Math.round(age / 60000)} minutes with no progress`);
         continue;
       }
       if (age >= this.staleWarnMs && !this.warningsIssued.has(goal.id)) {
-        log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min — warning`);
+        const judged = await this.judgeHealth(goal, age).catch(() => undefined);
+        if (judged?.hold) continue;
+        log.info(`sweep: goal ${goal.id.slice(0, 8)} stale for ${Math.round(age / 60000)} min — warning${judged ? ` (${judged.health})` : ''}`);
         this.warningsIssued.add(goal.id);
-        this.changed('goalWarning', { goalId: goal.id, reason: 'stale' });
+        this.changed('goalWarning', { goalId: goal.id, reason: judged?.health === 'looping' ? 'looping' : 'stale' });
         continue;
       }
 
       // No task-level auto-fail under the Scrum model — ScrumMaster owns
       // those decisions. Staleness above is the only auto-fail trigger.
     }
+  }
+
+  /** A goal's last health judgment, reused until the recheck interval passes. */
+  private healthCheckedAt = new Map<string, { at: number; judged?: { health: string; hold: boolean } }>();
+  private static readonly HEALTH_RECHECK_MS = 5 * 60_000;
+
+  /**
+   * How a quiet goal stands (site goal.health). Acting, a confident
+   * "progressing" or "waiting on something outside" holds the warning or the
+   * auto-fail for now; "looping" names itself in the warning. The timers stay
+   * the backstop: nothing is failed on a judgment alone.
+   */
+  private async judgeHealth(
+    goal: { id: string; title?: string; progress?: Array<{ timestamp: number; agentName: string; message: string; phase?: string }> },
+    age: number,
+  ): Promise<{ health: string; hold: boolean } | undefined> {
+    const last = this.healthCheckedAt.get(goal.id);
+    if (last && Date.now() - last.at < GoalObserver.HEALTH_RECHECK_MS) return last.judged;
+    if (await this.decisionSiteMode('goal.health') === 'off') return undefined;
+    this.healthCheckedAt.set(goal.id, { at: Date.now() });
+    const now = Date.now();
+    const outcome = await this.askDecision('goal.health', {
+      title: goal.title ?? '',
+      quiet_minutes: Math.round(age / 60000),
+      progress: (goal.progress ?? []).slice(-10).map(p => ({ agent: p.agentName, phase: p.phase, message: p.message.slice(0, 200), minutes_ago: Math.round((now - p.timestamp) / 60000) })),
+    }, goalHealthQuestions(), { goalId: goal.id, onBehalfOf: 'GoalObserver', timeoutMs: 20000 });
+    const health = choiceOf(outcome, 'health');
+    if (!outcome || !health) return undefined;
+    const p = health.probabilities[health.choice] ?? 0;
+    log.info(`[decision:${outcome.mode}] goal.health ${goal.id.slice(0, 8)}: ${health.choice}@${p.toFixed(2)} after ${Math.round(age / 60000)} quiet min`);
+    if (outcome.mode === 'shadow' || p < 0.8) return undefined;
+    const hold = outcome.mode === 'act' && ['progressing', 'waiting_external'].includes(health.choice);
+    const judged = { health: health.choice, hold };
+    this.healthCheckedAt.set(goal.id, { at: Date.now(), judged });
+    return judged;
   }
 
   private async autoFailGoal(goalId: string, reason: string): Promise<void> {

@@ -13,7 +13,8 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
-import { LLMProviderDescription } from '../llm/provider.js';
+import { LLMProviderDescription, servesChat } from '../llm/provider.js';
+import type { DecisionGates } from '../core/decision-sites.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 
 const log = new Log('GlobalSettings');
@@ -105,6 +106,17 @@ const STORAGE_KEY_FALLBACK_PROVIDER = 'global-settings:tierFallbackProvider';
 const STORAGE_KEY_FALLBACK_MODEL = 'global-settings:tierFallbackModel';
 // Prompt-cache keepalive toggle (default off — pings spend real money)
 const STORAGE_KEY_CACHE_KEEPALIVE = 'global-settings:cacheKeepalive';
+// Decision route: a decision model (e.g. TypeSafe Jev) or a chat model emulating one; unset = auto
+const STORAGE_KEY_DECISION_PROVIDER = 'global-settings:decisionProvider';
+const STORAGE_KEY_DECISION_MODEL = 'global-settings:decisionModel';
+// Decision gates: off | shadow | on | full (see src/core/decision-sites.ts)
+const STORAGE_KEY_DECISION_GATES = 'global-settings:decisionGates';
+const DECISION_GATE_OPTIONS: Array<{ gates: DecisionGates; label: string }> = [
+  { gates: 'on', label: 'On (each site at its default)' },
+  { gates: 'shadow', label: 'Shadow (log only)' },
+  { gates: 'full', label: 'Full (every site at its highest mode)' },
+  { gates: 'off', label: 'Off' },
+];
 
 /**
  * Provider list, labels, default tier models, credential metadata, and
@@ -155,7 +167,7 @@ interface TierPreset {
  * persistence, same preset handling; only the label, the storage keys, and
  * the default pick differ.
  */
-type AuxRowKey = 'vision' | 'fallback';
+type AuxRowKey = 'vision' | 'fallback' | 'decision';
 interface AuxRowSpec {
   label: string;
   storageProvider: string;
@@ -164,12 +176,19 @@ interface AuxRowSpec {
   preferVision: boolean;
   /** How the save-time credential toast names the row. */
   toastName: string;
+  /**
+   * The Decision row: offers decision providers as well as chat ones, lists
+   * decision models ahead of chat models, and its empty choice means Auto
+   * (a keyed decision provider, else emulation on the Fast tier).
+   */
+  decision?: boolean;
 }
 const AUX_ROWS: Record<AuxRowKey, AuxRowSpec> = {
   vision: { label: 'Vision', storageProvider: STORAGE_KEY_VISION_PROVIDER, storageModel: STORAGE_KEY_VISION_MODEL, preferVision: true, toastName: 'Vision fallback' },
   fallback: { label: 'Fallback', storageProvider: STORAGE_KEY_FALLBACK_PROVIDER, storageModel: STORAGE_KEY_FALLBACK_MODEL, preferVision: false, toastName: 'Tier fallback' },
+  decision: { label: 'Decision', storageProvider: STORAGE_KEY_DECISION_PROVIDER, storageModel: STORAGE_KEY_DECISION_MODEL, preferVision: false, toastName: 'Decision model', decision: true },
 };
-const AUX_ROW_KEYS: AuxRowKey[] = ['vision', 'fallback'];
+const AUX_ROW_KEYS: AuxRowKey[] = ['vision', 'fallback', 'decision'];
 /** One aux row's widgets and the intended model id (same stale-label protection as the tier rows). */
 interface AuxRowState {
   providerSelectId?: AbjectId;
@@ -178,7 +197,7 @@ interface AuxRowState {
   desiredModelId: string | null;
 }
 type AuxModel = { provider: string | null; model: string | null };
-const emptyAuxModels = (): Record<AuxRowKey, AuxModel> => ({ vision: { provider: null, model: null }, fallback: { provider: null, model: null } });
+const emptyAuxModels = (): Record<AuxRowKey, AuxModel> => ({ vision: { provider: null, model: null }, fallback: { provider: null, model: null }, decision: { provider: null, model: null } });
 
 // Legacy keys for migration
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -255,9 +274,13 @@ export class GlobalSettings extends Abject {
   // Optional aux rows (vision substitute, tier fallback): provider dropdown
   // (with a leading 'None'), model dropdown, capability label, and the
   // intended model id, keyed by row.
-  private auxRows: Record<AuxRowKey, AuxRowState> = { vision: { desiredModelId: null }, fallback: { desiredModelId: null } };
+  private auxRows: Record<AuxRowKey, AuxRowState> = { vision: { desiredModelId: null }, fallback: { desiredModelId: null }, decision: { desiredModelId: null } };
   /** Provider-dropdown label meaning "this row is not configured". */
   private static readonly AUX_NONE_LABEL = 'None';
+  /** The Decision row's empty choice: a keyed decision provider, else emulation on the Fast tier. */
+  private static readonly AUX_AUTO_LABEL = 'Auto';
+  private decisionGates: DecisionGates = 'on';
+  private decisionGatesSelectId?: AbjectId;
 
   // Prompt-cache keepalive: LLMObject pings large prompt prefixes between
   // agent steps so provider caches stay warm. Off by default (it spends
@@ -536,6 +559,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageModel })
         );
       }
+      const savedGates = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_DECISION_GATES })
+      );
+      if (savedGates && DECISION_GATE_OPTIONS.some(o => o.gates === savedGates)) this.decisionGates = savedGates as DecisionGates;
       this.cacheKeepaliveEnabled = (await this.request<boolean | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CACHE_KEEPALIVE })
       )) === true;
@@ -710,12 +737,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ? undefined
       : (fallback ? Object.fromEntries(TIER_NAMES.map(tier => [tier, [fallback]])) : null);
 
+    // Decision route: Auto (null) is a keyed decision provider, else Fast-tier emulation.
+    const decisionRoute = aux === undefined
+      ? undefined
+      : (aux.decision.provider && aux.decision.model ? { provider: aux.decision.provider, model: aux.decision.model } : null);
+
     await this.request(request(this.id, this.llmId, 'configure', {
       credentials: credMap,
       tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
       tierFallbacks,
       visionFallback: vision,
       cacheKeepalive: { enabled: this.cacheKeepaliveEnabled },
+      decisionRoute,
+      decisionPolicy: { gates: this.decisionGates },
     }));
   }
 
@@ -908,7 +942,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return;
       }
 
-      // Aux row (vision substitute, tier fallback) dropdowns
+      // Decision gates dropdown (persisted + applied on Save)
+      if (fromId === this.decisionGatesSelectId && aspect === 'change') {
+        const label = await this.request<string>(request(this.id, this.decisionGatesSelectId, 'getValue', {}));
+        this.decisionGates = DECISION_GATE_OPTIONS.find(o => o.label === label)?.gates ?? 'on';
+        return;
+      }
+
+      // Aux row (vision substitute, tier fallback, decision route) dropdowns
       for (const key of AUX_ROW_KEYS) {
         const row = this.auxRows[key];
         if (fromId === row.providerSelectId && aspect === 'change') {
@@ -1419,8 +1460,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         { type: 'label', windowId: this.windowId, text: 'Provider',
           style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'select', windowId: this.windowId,
-          options: this.providerLabels(),
-          selectedIndex: Math.max(0, this.providerIds().indexOf(this.activeAiProvider)) },
+          options: this.credentialProviderLabels(),
+          selectedIndex: Math.max(0, this.credentialProviderIds().indexOf(this.activeAiProvider)) },
       ]})
     );
     this.providerSelectorId = providerSelectorId;
@@ -1812,6 +1853,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     for (const key of AUX_ROW_KEYS) {
       await this.renderAuxRow(key, tiersCard, savedAux[key]);
     }
+    await this.renderDecisionGatesRow(tiersCard);
 
     // ── Cache keepalive row ──
     // Opt-in: LLMObject re-reads large prompt prefixes on a timer between
@@ -2068,6 +2110,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.auxRows[key] = { desiredModelId: this.auxRows[key].desiredModelId };
     }
     this.cacheKeepaliveCheckboxId = undefined;
+    this.decisionGatesSelectId = undefined;
     this.presetSelectId = undefined;
     this.presetNameInputId = undefined;
     this.presetApplyBtnId = undefined;
@@ -2241,6 +2284,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ...Object.values(this.tierProviderSelectIds),
       ...Object.values(this.tierModelSelectIds),
       ...AUX_ROW_KEYS.flatMap(key => [this.auxRows[key].providerSelectId, this.auxRows[key].modelSelectId]),
+      this.decisionGatesSelectId,
       this.presetSelectId,
       this.presetApplyBtnId,
       this.presetSaveBtnId,
@@ -2373,7 +2417,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     for (const key of AUX_ROW_KEYS) {
       const row = this.auxRows[key];
-      if (!row.providerSelectId) continue;
+      // Presets carry chat routing; the Decision row keeps its own choice.
+      if (!row.providerSelectId || key === 'decision') continue;
       const wanted = preset[key] ?? null;
       const providerOptions = [GlobalSettings.AUX_NONE_LABEL, ...providerLabels];
       const vIdx = wanted ? providerIds.indexOf(wanted.provider) : -1;
@@ -2493,14 +2538,53 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     return this.providerDescById.get(id);
   }
 
-  /** All provider ids in dropdown order. */
+  /** Chat provider ids in dropdown order (the tier rows, presets, and chat aux rows). */
   private providerIds(): string[] {
+    return this.providerDescriptions.filter(servesChat).map(d => d.id);
+  }
+
+  /** Chat provider labels in dropdown order. */
+  private providerLabels(): string[] {
+    return this.providerDescriptions.filter(servesChat).map(d => d.label);
+  }
+
+  /** Every provider, decision-only ones included: the credential panel and the Decision row. */
+  private credentialProviderIds(): string[] {
     return this.providerDescriptions.map(d => d.id);
   }
 
-  /** All provider labels in dropdown order. */
-  private providerLabels(): string[] {
+  private credentialProviderLabels(): string[] {
     return this.providerDescriptions.map(d => d.label);
+  }
+
+  /** An aux row's provider ids: the Decision row also offers decision-only providers. */
+  private auxProviderIds(key: AuxRowKey): string[] {
+    return AUX_ROWS[key].decision ? this.credentialProviderIds() : this.providerIds();
+  }
+
+  /**
+   * An aux row's model list for one provider. The Decision row lists the
+   * provider's decision models first (answered natively), then its chat
+   * models (which emulate a decision model).
+   */
+  private auxModelList(key: AuxRowKey, provider: LLMProviderName): ModelInfo[] {
+    const chat = this.providerModelCache.get(provider) ?? [];
+    if (!AUX_ROWS[key].decision) return chat;
+    const desc = this.descById(provider);
+    const decisionModels = desc?.decisionModels ?? [];
+    const seen = new Set(decisionModels.map(m => m.id));
+    const chatModels = desc && servesChat(desc) ? chat.filter(m => !seen.has(m.id)) : [];
+    return [...decisionModels, ...chatModels];
+  }
+
+  /** The label beside an aux row's model: vision capability, or native vs emulated for decisions. */
+  private auxCapLabel(key: AuxRowKey, provider: LLMProviderName, modelName: string): { text: string; color: string } {
+    if (!AUX_ROWS[key].decision) return this.capabilityLabelFor(provider, modelName);
+    const desc = this.descById(provider);
+    const native = (desc?.decisionModels ?? []).some(m => m.name === modelName || m.id === modelName);
+    return native
+      ? { text: 'native', color: this.theme.statusSuccess }
+      : { text: 'emulated', color: this.theme.textTertiary };
   }
 
   /** Resolve a dropdown label back to its provider id. */
@@ -2628,7 +2712,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Figure out the new provider
     const newLabel = await this.request<string>(request(this.id, this.providerSelectorId, 'getValue', {}));
-    const newProvider = this.idForLabel(newLabel) ?? this.providerIds()[0];
+    const newProvider = this.idForLabel(newLabel) ?? this.credentialProviderIds()[0];
     this.activeAiProvider = newProvider;
 
     const desc = this.descById(newProvider);
@@ -2858,6 +2942,42 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * leading 'None', model dropdown, capability label. Same row shape as the
    * tiers; 'None' disables the row.
    */
+  /**
+   * How far built-in decision sites may act: off, shadow (log only), on
+   * (each site at its default), full (each site at its highest mode).
+   */
+  private async renderDecisionGatesRow(tiersCard: AbjectId): Promise<void> {
+    const rowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: tiersCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, tiersCard, 'addLayoutChild', {
+      widgetId: rowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    const selected = Math.max(0, DECISION_GATE_OPTIONS.findIndex(o => o.gates === this.decisionGates));
+    const { widgetIds: [labelId, selectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Gates',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'select', windowId: this.windowId,
+          options: DECISION_GATE_OPTIONS.map(o => o.label), selectedIndex: selected },
+      ]})
+    );
+    this.decisionGatesSelectId = selectId;
+    await this.request(request(this.id, selectId, 'addDependent', {}));
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: labelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 },
+    }));
+    await this.request(request(this.id, rowId, 'addLayoutChild', {
+      widgetId: selectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 },
+    }));
+  }
+
   private async renderAuxRow(key: AuxRowKey, tiersCard: AbjectId, saved: AuxModel): Promise<void> {
     const spec = AUX_ROWS[key];
     const row = this.auxRows[key];
@@ -2888,9 +3008,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       preferredSize: { width: 65, height: 32 },
     }));
 
-    const providerIds = this.providerIds();
+    const providerIds = this.auxProviderIds(key);
     const savedProvider = saved.provider;
-    const providerOptions = [GlobalSettings.AUX_NONE_LABEL, ...this.providerLabels()];
+    const emptyLabel = spec.decision ? GlobalSettings.AUX_AUTO_LABEL : GlobalSettings.AUX_NONE_LABEL;
+    const providerOptions = [emptyLabel, ...providerIds.map(id => this.labelForId(id) ?? id)];
     const savedProviderIdx = savedProvider ? providerIds.indexOf(savedProvider) : -1;
     const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -2908,10 +3029,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
 
     const activeProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
-    const modelList = activeProvider ? (this.providerModelCache.get(activeProvider) ?? []) : [];
+    const modelList = activeProvider ? this.auxModelList(key, activeProvider) : [];
     const modelOptions = activeProvider
       ? (modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'])
-      : ['(none)'];
+      : [spec.decision ? '(decision model if keyed, else Fast tier)' : '(none)'];
     let modelIdx = 0;
     if (saved.model && modelList.length > 0) {
       const idx = modelList.findIndex(m => m.id === saved.model);
@@ -2934,7 +3055,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
 
     const cap = activeProvider
-      ? this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '')
+      ? this.auxCapLabel(key, activeProvider, modelOptions[modelIdx] ?? '')
       : { text: '', color: this.theme.textTertiary };
     const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -2969,7 +3090,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, row.modelSelectId, 'getValue', {})
     );
     if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
-      const modelList = this.providerModelCache.get(provider) ?? [];
+      const modelList = this.auxModelList(key, provider);
       const info = modelList.find(m => m.name === modelName);
       out.provider = provider;
       out.model = info ? info.id : modelName;
@@ -2985,7 +3106,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const label = await this.request<string>(
       request(this.id, row.providerSelectId, 'getValue', {})
     );
-    if (label === GlobalSettings.AUX_NONE_LABEL) return null;
+    if (label === GlobalSettings.AUX_NONE_LABEL || label === GlobalSettings.AUX_AUTO_LABEL) return null;
     return this.idForLabel(label) ?? null;
   }
 
@@ -2996,8 +3117,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const provider = await this.auxSelectedProvider(key);
 
     if (!provider) {
+      const empty = AUX_ROWS[key].decision ? '(decision model if keyed, else Fast tier)' : '(none)';
       await this.request(
-        request(this.id, row.modelSelectId, 'update', { options: ['(none)'], selectedIndex: 0 })
+        request(this.id, row.modelSelectId, 'update', { options: [empty], selectedIndex: 0 })
       );
       await this.updateAuxCapLabel(key, '', this.theme.textTertiary);
       return;
@@ -3006,7 +3128,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const currentLabel = await this.request<string>(
       request(this.id, row.modelSelectId, 'getValue', {})
     );
-    const modelList = this.providerModelCache.get(provider) ?? [];
+    const modelList = this.auxModelList(key, provider);
     const options = modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'];
 
     // Same intended-id preservation as the tier rows. The vision row exists
@@ -3022,7 +3144,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(
       request(this.id, row.modelSelectId, 'update', { options, selectedIndex })
     );
-    const cap = this.capabilityLabelFor(provider, options[selectedIndex] ?? '');
+    const cap = this.auxCapLabel(key, provider, options[selectedIndex] ?? '');
     await this.updateAuxCapLabel(key, cap.text, cap.color);
   }
 
@@ -3036,9 +3158,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const modelName = await this.request<string>(
         request(this.id, row.modelSelectId, 'getValue', {})
       );
-      const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
+      const info = this.auxModelList(key, provider).find(m => m.name === modelName);
       row.desiredModelId = info?.id ?? null;
-      const cap = this.capabilityLabelFor(provider, modelName);
+      const cap = this.auxCapLabel(key, provider, modelName);
       await this.updateAuxCapLabel(key, cap.text, cap.color);
     } catch { /* widget gone */ }
   }
@@ -4712,6 +4834,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         // Persist the cache-keepalive opt-in
         await this.request(request(this.id, this.storageId, 'set', {
           key: STORAGE_KEY_CACHE_KEEPALIVE, value: this.cacheKeepaliveEnabled,
+        }));
+        await this.request(request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_DECISION_GATES, value: this.decisionGates,
         }));
       }
 

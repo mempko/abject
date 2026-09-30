@@ -49,7 +49,9 @@ import { safeStringify } from '../core/format.js';
 import {
   deriveContractEdges, validateDataFlow, transitiveDependentCounts,
 } from '../core/task-graph.js';
-import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement } from '../core/claims.js';
+import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement, readReportVerdict } from '../core/claims.js';
+import { reportQuestions, interjectionQuestions, roundOutcomeQuestions } from '../core/decision-questions.js';
+import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
 
 const log = new Log('ScrumMaster');
 
@@ -405,8 +407,8 @@ export class ScrumMaster extends Abject {
         if (parentId) return; // only top-level goals
         try { if (await this.isRemoteGoal(goalId)) { log.info(`ignoring remote goal ${goalId.slice(0, 8)} (passive observer mode)`); return; } } catch { /* default to owned */ }
         // Defer one tick so the creator (e.g. Chat) has time to settle.
-        this.setTimer(() => this.enqueueScrumTask(goalId, 0).catch(err =>
-          log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
+        this.setTimer(() => this.startGoal(goalId).catch(err =>
+          log.warn(`startGoal(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         ), 200);
       } else if (aspect === 'goalReadyForCompletion') {
         const { goalId, scrumNumber, doneTaskIds } = value as {
@@ -446,7 +448,9 @@ export class ScrumMaster extends Abject {
             this.forceFullScrum.add(goalId);
           }
         }
-        await this.enqueueScrumTask(goalId, scrumNumber).catch(err =>
+        const review = await this.decideRoundReview(goalId, scrumNumber).catch(() => undefined);
+        if (review?.completed) return;
+        await this.enqueueScrumTask(goalId, scrumNumber, 1, review?.note).catch(err =>
           log.warn(`enqueueScrumTask(${goalId.slice(0, 8)}) threw: ${err instanceof Error ? err.message : String(err)}`),
         );
       } else if (aspect === 'observationRecorded') {
@@ -883,6 +887,11 @@ export class ScrumMaster extends Abject {
       return;
     }
 
+    // A note that changes nothing in flight can wait for the next boundary
+    // scrum instead of costing one now (site scrum.interjection).
+    const triage = pending > 0 && !hasDiscovery ? await this.decideInterjection(goalId).catch(() => undefined) : undefined;
+    if (triage?.defer) return;
+
     log.info(`User interjection on goal ${goalId.slice(0, 8)} mid-round — enqueueing interjection check`);
     const { taskId } = await this.request<{ taskId: string }>(
       request(this.id, this.agentAbjectId, 'enqueueTask', {
@@ -892,7 +901,7 @@ export class ScrumMaster extends Abject {
           `Weigh pending userInterjections and material observations against the plan and in-flight work. Ask affected collaborators what changed and what experiment would distinguish explanations. ` +
           `If the current work already covers them, continue_scrum. If they change the plan, stage tasks and dispatch_scrum ` +
           `(outstanding tasks are cancelled automatically). If they mean stop, fail_goal with a friendly explanation. ` +
-          `If they are ambiguous, ask_user.`,
+          `If they are ambiguous, ask_user.` + (triage?.hint ? ` ${triage.hint}` : ''),
         goalId,
       }),
     );
@@ -949,8 +958,9 @@ export class ScrumMaster extends Abject {
         const inTrouble = ((snap.data.failed as unknown[] | undefined)?.length ?? 0) > 0
           || snap.data.loopWarning !== undefined
           || pendingNotes.length > 0;
+        const tier = await this.decideScrumTier(goalId, snap.data, pendingNotes.length, inTrouble ? 'smart' : 'balanced');
         return {
-          tier: inTrouble ? 'smart' : 'balanced',
+          tier,
           observation:
             `Scrum for this goal. Its full state is below — you already have it, so decide your action directly (no need to call review_scrum first):\n\n` +
             `${JSON.stringify(snap.data, null, 2)}\n\n` +
@@ -1274,7 +1284,9 @@ export class ScrumMaster extends Abject {
     // retrying the same fix. Surface it deterministically so the planner weighs
     // fail_goal-with-diagnosis against yet another near-identical retry.
     const roundsSpent = goal.currentScrumNumber ?? 0;
-    let loopWarning: string | undefined;
+    let loopWarning: string | undefined = roundsSpent >= 2 && roundsSpent < 4 && failed.length >= 2
+      ? await this.judgeRepeatingFailure(goalId, roundsSpent, failed, goal.scratchpad ?? {}).catch(() => undefined)
+      : undefined;
     if (roundsSpent >= 4) {
       loopWarning =
         `This goal has already run ${roundsSpent} scrum rounds and accumulated ${failed.length} failed task(s). ` +
@@ -1320,6 +1332,7 @@ export class ScrumMaster extends Abject {
         })),
         failed: failed.map(t => ({
           id: t.id,
+          ...(Object.hasOwn(scratchpad, `learning/failure/${t.id}`) ? { failureClass: scratchpad[`learning/failure/${t.id}`] } : {}),
           ...(Object.hasOwn(scratchpad, `tasks/${t.id}/result`) ? { resultKey: `tasks/${t.id}/result` } : {}),
           ...(Object.hasOwn(scratchpad, `learning/task/${t.id}`) ? { evidenceKey: `learning/task/${t.id}` } : {}),
           description: (t.fields.description as string ?? '').slice(0, 300),
@@ -2122,6 +2135,279 @@ Rules:
    * action or state asserted with no evidence cited); the caller then runs a
    * review scrum instead.
    */
+  // ═══════════════════════════════════════════════════════════════════
+  // Decisions (decision sites in planning)
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // A decision model judges the planning questions whose answer is a pick:
+  // is a new goal one step one agent owns, do a round's results satisfy the
+  // goal, does a mid-goal note change anything in flight. Each names its site
+  // (src/core/decision-sites.ts); shadow logs, advise hands the verdict to the
+  // scrum as a note, act takes the reversible shortcut. A null answer leaves
+  // the scrum exactly as it was.
+
+  /** First scrum for a new goal, or a decided quick dispatch that skips it. */
+  private async startGoal(goalId: string): Promise<void> {
+    const decided = await this.decideQuickDispatch(goalId).catch(err => {
+      log.warn(`quick-dispatch decision for ${goalId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    });
+    if (decided?.dispatched) return;
+    await this.enqueueScrumTask(goalId, 0, 1, decided?.note);
+  }
+
+  /**
+   * Is the new goal one step that one roster agent clearly owns (site
+   * scrum.quick-dispatch)? The owner options are the live roster, described
+   * by each agent's own registration text, so the judgment reads the same
+   * self-descriptions the planner trusts for an obvious owner.
+   */
+  private async decideQuickDispatch(goalId: string): Promise<{ dispatched: boolean; note?: string } | undefined> {
+    if (await this.decisionSiteMode('scrum.quick-dispatch') === 'off') return undefined;
+    const snap = await this.buildReviewSnapshot(goalId);
+    if (!('data' in snap) || !snap.data.quickDispatchAvailable) return undefined;
+    const goal = snap.data.goal as { title: string; description: string };
+    const roster = (snap.data.team as Array<{ name: string; description: string }>).slice(0, 254);
+    if (roster.length === 0) return undefined;
+    const owners: Record<string, string> = {};
+    for (const a of roster) owners[a.name] = a.description.slice(0, 600) || a.name;
+    owners.unclear = 'No roster description clearly covers the whole request.';
+    const questions: Record<string, DecisionQuestion> = {
+      shape: {
+        type: 'choice',
+        instructions: 'Classify how the work in `goal` is shaped, before deciding who does it.',
+        criteria: {
+          single_step: 'One concrete action or lookup that one agent does end to end in one task.',
+          independent_parts: 'Two or more parts obtainable without each other, then combined.',
+          research_then_build: 'What to build depends on facts nobody has yet.',
+          multi_step_chain: 'Dependent steps, coordination, or a verification round.',
+          already_satisfied: 'The conversation or scratchpad already holds the answer.',
+          needs_user: 'Ambiguous in a way only the user can settle.',
+        },
+      },
+      owner: {
+        type: 'choice',
+        instructions: 'Pick the agent whose own description clearly covers the whole of `goal` right now. Judge only from these descriptions, and honour what a description says the agent does not do.',
+        criteria: owners,
+      },
+      needs_profile_or_target: {
+        type: 'noul',
+        instructions: 'Does `goal` depend on a specific named browser profile, login state, or existing object that has to be passed along explicitly?',
+      },
+    };
+    const outcome = await this.askDecision('scrum.quick-dispatch', {
+      goal: { title: goal.title, description: goal.description.slice(0, 3000) },
+      ...(snap.data.conversationContext ? { conversation: safeStringify(snap.data.conversationContext, 2000) } : {}),
+    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
+    const shape = choiceOf(outcome, 'shape');
+    const owner = choiceOf(outcome, 'owner');
+    if (!outcome || !shape || !owner) return undefined;
+    const shapeP = shape.probabilities.single_step ?? 0;
+    const ownerP = owner.probabilities[owner.choice] ?? 0;
+    const needsHint = noulOf(outcome, 'needs_profile_or_target') ?? 1;
+    const clear = shape.choice === 'single_step' && shapeP >= 0.85 && owner.choice !== 'unclear'
+      && ownerP >= 0.75 && owner.confidence >= 0.4 && needsHint < 0.3;
+    log.info(`[decision:${outcome.mode}] scrum.quick-dispatch ${goalId.slice(0, 8)}: shape=${shape.choice}@${(shape.probabilities[shape.choice] ?? 0).toFixed(2)} owner=${owner.choice}@${ownerP.toFixed(2)} needs_hint=${needsHint.toFixed(2)} clear=${clear}`);
+    if (outcome.mode === 'shadow') return undefined;
+    if (outcome.mode === 'act' && clear) {
+      // Claim the round-0 scrum so nothing else plans this goal; a failed
+      // commit falls back to a full scrum (fallBackToFullScrum clears it).
+      this.scrummedRounds.add(`${goalId}#0`);
+      await this.commitQuickDispatch(goalId, { agentName: owner.choice, task: goal.description }, `decided-quick-dispatch:${goalId}`);
+      return { dispatched: true };
+    }
+    if (clear) return { dispatched: false, note: `Runtime check: this goal reads as one step that ${owner.choice} owns (p=${ownerP.toFixed(2)}); quick_dispatch fits unless the snapshot says otherwise.` };
+    if (owner.choice === 'unclear' || ownerP < 0.5) {
+      const top = Object.entries(owner.probabilities).filter(([k]) => k !== 'unclear').sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k);
+      return { dispatched: false, note: `Runtime check: no single roster description clearly owns this goal; if you poll, ${top.join(', ')} look most relevant.` };
+    }
+    return undefined;
+  }
+
+  /**
+   * Do a finished round's results satisfy the goal (site scrum.review)? Only
+   * for a clean round: nothing failed, no pending notes, no loop warning.
+   * Acting on a confident, grounded "satisfied" completes the goal with the
+   * same synthesis complete_goal uses; otherwise the verdict rides to the
+   * review scrum as a note.
+   */
+  private async decideRoundReview(goalId: string, scrumNumber: number): Promise<{ completed: boolean; note?: string } | undefined> {
+    if (await this.decisionSiteMode('scrum.review') === 'off') return undefined;
+    if (this.oneShotGoals.has(goalId) || this.forceFullScrum.has(goalId)) return undefined;
+    const snap = await this.buildReviewSnapshot(goalId);
+    if (!('data' in snap)) return undefined;
+    const data = snap.data;
+    const failed = (data.failed as unknown[] | undefined) ?? [];
+    const pending = ((data.userInterjections as Array<{ status: string }> | undefined) ?? []).filter(n => n.status === 'pending');
+    if (failed.length > 0 || pending.length > 0 || data.loopWarning !== undefined) return undefined;
+    const goal = await this.fetchGoalForSynthesis(goalId);
+    const scratchpad = goal?.scratchpad ?? {};
+    const completed = ((data.completed as Array<{ id: string; description: string; resultKey?: string }>) ?? []).map(t => ({
+      description: t.description,
+      result: t.resultKey ? safeStringify(scratchpad[t.resultKey], 1500) : undefined,
+    }));
+    if (completed.length === 0) return undefined;
+    const outcome = await this.askDecision('scrum.review', {
+      goal: data.goal,
+      completed,
+      verification: renderVerificationRecord(verificationRecordOf(scratchpad)).slice(0, 3000),
+      expected: safeStringify((data.recentPlans as Array<{ expectedObservations?: unknown }> | undefined)?.at(-1)?.expectedObservations ?? null, 1000),
+    }, roundOutcomeQuestions(), { goalId, onBehalfOf: 'ScrumMaster' });
+    const round = choiceOf(outcome, 'round_outcome');
+    const grounded = noulOf(outcome, 'results_grounded') ?? 0;
+    if (!outcome || !round) return undefined;
+    const p = round.probabilities[round.choice] ?? 0;
+    log.info(`[decision:${outcome.mode}] scrum.review ${goalId.slice(0, 8)} round ${scrumNumber}: ${round.choice}@${p.toFixed(2)} grounded=${grounded.toFixed(2)}`);
+    if (outcome.mode === 'shadow') return undefined;
+    if (outcome.mode === 'act' && round.choice === 'satisfied' && p >= 0.9 && grounded >= 0.8) {
+      this.scrummedRounds.add(`${goalId}#${scrumNumber}`);
+      await this.commitCompleteGoal(goalId, {});
+      return { completed: true };
+    }
+    if (p < 0.7) return undefined;
+    return { completed: false, note: `Runtime check: this round's results read as "${round.choice.replace(/_/g, ' ')}" (p=${p.toFixed(2)}; evidence cited: ${grounded >= 0.5 ? 'yes' : 'thin'}). Weigh that as you review.` };
+  }
+
+  /**
+   * Read a quick-dispatched result (site scrum.one-shot). The claim shapes
+   * stay the floor; advising, the reading can only add scrutiny (an
+   * unsupported claim or a partial result the shapes missed goes to review);
+   * acting, it can also pass a plain answer the shapes misjudged.
+   */
+  private async judgeOneShotResult(goalId: string, taskId: string, text: string, scratchpad: Record<string, unknown>): Promise<{ claim: boolean; bareAck: boolean }> {
+    const shaped = { claim: looksLikeUngroundedClaim(text), bareAck: looksLikeBareAcknowledgement(text) };
+    if (await this.decisionSiteMode('scrum.one-shot') === 'off') return shaped;
+    const goal = await this.fetchGoalForSynthesis(goalId);
+    const questions: Record<string, DecisionQuestion> = {
+      ...reportQuestions(),
+      answers_goal: { type: 'noul', instructions: 'Would the person who asked `request` be satisfied reading only `text`?' },
+    };
+    const outcome = await this.askDecision('scrum.one-shot', {
+      request: goal ? `${goal.title}\n${(goal.description ?? '').slice(0, 1500)}` : '',
+      text: text.slice(0, 4000),
+      receipts: safeStringify(scratchpad[`verification/${taskId}`] ?? null, 1500),
+    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
+    const verdict = outcome ? readReportVerdict(outcome.answers as Parameters<typeof readReportVerdict>[0]) : undefined;
+    if (!outcome || !verdict) return shaped;
+    const answers = noulOf(outcome, 'answers_goal') ?? 0;
+    const partial = verdict.kind === 'partial_or_failure' && verdict.kindP >= 0.6;
+    const flaggedClaim = verdict.ungrounded || partial;
+    log.info(`[decision:${outcome.mode}] scrum.one-shot ${goalId.slice(0, 8)}: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} answers_goal=${answers.toFixed(2)} shapes=${JSON.stringify(shaped)}`);
+    if (outcome.mode === 'shadow') return shaped;
+    if (outcome.mode === 'advise') return { claim: shaped.claim || flaggedClaim, bareAck: shaped.bareAck || verdict.bareAck };
+    const solid = ['answer', 'grounded_action'].includes(verdict.kind) && verdict.kindP >= 0.75 && answers >= 0.7;
+    return {
+      claim: flaggedClaim || (shaped.claim && !solid),
+      bareAck: verdict.bareAck || (shaped.bareAck && !solid),
+    };
+  }
+
+  /**
+   * Does a mid-goal note change the in-flight plan (site scrum.interjection)?
+   * Acting on a confident "no" defers it: the note stays pending, so the next
+   * boundary scrum still weighs it, and nothing the user typed is dropped.
+   */
+  private async decideInterjection(goalId: string): Promise<{ defer: boolean; hint?: string } | undefined> {
+    if (await this.decisionSiteMode('scrum.interjection') === 'off' || !this.goalManagerId) return undefined;
+    const goal = await this.request<{
+      title: string; description: string; scratchpad?: Record<string, unknown>;
+      interjections?: Array<{ note: string; at: number; status: string }>; pendingQuestion?: { question: string };
+    } | null>(request(this.id, this.goalManagerId, 'getGoal', { goalId })).catch(() => null);
+    if (!goal) return undefined;
+    const notes = (goal.interjections ?? []).filter(i => i.status === 'pending');
+    if (notes.length === 0) return undefined;
+    const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+      request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
+    ).catch(() => [] as Array<{ id: string; fields: Record<string, unknown> }>);
+    const inFlight = tasks.filter(t => !['done', 'permanently_failed', 'cancelled'].includes(String(t.fields.status)))
+      .map(t => ({ description: String(t.fields.description ?? '').slice(0, 200), status: t.fields.status }));
+    const outcome = await this.askDecision('scrum.interjection', {
+      goal: { title: goal.title, description: goal.description.slice(0, 2000) },
+      note: notes.map(n => n.note).join('\n').slice(0, 2000),
+      pending_question: goal.pendingQuestion?.question?.slice(0, 1000) ?? null,
+      in_flight: inFlight.slice(0, 12),
+      latest_plan: safeStringify(((goal.scratchpad?.['learning/plans'] as unknown[]) ?? []).at(-1) ?? null, 1000),
+    }, interjectionQuestions(!!goal.pendingQuestion), { goalId, onBehalfOf: 'ScrumMaster' });
+    const intent = choiceOf(outcome, 'intent');
+    const conflicts = noulOf(outcome, 'conflicts') ?? 1;
+    if (!outcome || !intent) return undefined;
+    const p = intent.probabilities[intent.choice] ?? 0;
+    log.info(`[decision:${outcome.mode}] scrum.interjection ${goalId.slice(0, 8)}: ${intent.choice}@${p.toFixed(2)} conflicts=${conflicts.toFixed(2)}`);
+    if (outcome.mode === 'shadow') return undefined;
+    const benign = ['acknowledge', 'status', 'constraint'].includes(intent.choice) && p >= 0.85 && conflicts < 0.2;
+    if (outcome.mode === 'act' && benign && inFlight.length > 0) {
+      const status = intent.choice === 'status'
+        ? `Working on it: ${inFlight.slice(0, 3).map(t => t.description.slice(0, 80)).join('; ')}.`
+        : 'Noted. The current work continues, and your note will be weighed at the next planning step.';
+      await this.request(request(this.id, this.goalManagerId, 'reportGoalProgress', { goalId, message: status }), 10000).catch(() => { /* best effort */ });
+      return { defer: true };
+    }
+    if (p < 0.7) return undefined;
+    return { defer: false, hint: `Runtime check: the pending note reads as "${intent.choice}" (p=${p.toFixed(2)}; conflicts with in-flight work: ${conflicts >= 0.5 ? 'likely' : 'unlikely'}).` };
+  }
+
+  /**
+   * An early loop warning (site scrum.loop): rounds that keep dispatching the
+   * same kind of task against the same target and failing the same way.
+   * The four-round rule stays the floor; this can only raise it earlier.
+   */
+  private async judgeRepeatingFailure(
+    goalId: string, rounds: number, failed: Array<{ id: string; fields: Record<string, unknown> }>, scratchpad: Record<string, unknown>,
+  ): Promise<string | undefined> {
+    if (await this.decisionSiteMode('scrum.loop') === 'off') return undefined;
+    const outcome = await this.askDecision('scrum.loop', {
+      rounds,
+      failed: failed.slice(-8).map(t => ({ description: String(t.fields.description ?? '').slice(0, 200), error: String(t.fields.error ?? '').slice(0, 300) })),
+      recent_plans: safeStringify(((scratchpad['learning/plans'] as unknown[]) ?? []).slice(-3), 1500),
+    }, {
+      repeating_failure: { type: 'noul', instructions: 'Do the rounds keep dispatching the same kind of task against the same target and failing the same way?' },
+    }, { goalId, onBehalfOf: 'ScrumMaster' });
+    const p = noulOf(outcome, 'repeating_failure');
+    if (!outcome || p === undefined) return undefined;
+    log.info(`[decision:${outcome.mode}] scrum.loop ${goalId.slice(0, 8)}: repeating_failure=${p.toFixed(2)} after ${rounds} rounds`);
+    if (outcome.mode === 'shadow' || p < 0.7) return undefined;
+    return `This goal has run ${rounds} scrum rounds, and a runtime check reads the failures as the same fix failing the same way (p=${p.toFixed(2)}). ` +
+      `Another near-identical retry is unlikely to help: change strategy decisively, or fail_goal with a precise diagnosis (what recurs, what was tried, what would unblock it).`;
+  }
+
+  /**
+   * The first scrum think's tier (site scrum.tier): how hard is the decision
+   * the snapshot presents? Obvious or routine → balanced; nuanced or a hard
+   * diagnosis → smart. Without an answer, the trouble heuristic stands.
+   */
+  private async decideScrumTier(goalId: string | undefined, data: Record<string, unknown>, pendingNotes: number, heuristic: 'smart' | 'balanced'): Promise<'smart' | 'balanced'> {
+    if (!goalId || await this.decisionSiteMode('scrum.tier') === 'off') return heuristic;
+    const failed = (data.failed as Array<{ description: string; error: string }> | undefined) ?? [];
+    const outcome = await this.askDecision('scrum.tier', {
+      goal: data.goal,
+      completed: ((data.completed as unknown[] | undefined) ?? []).length,
+      failed: failed.slice(0, 3).map(f => ({ description: f.description, error: f.error.slice(0, 300) })),
+      pending_notes: pendingNotes,
+      loop_warning: data.loopWarning !== undefined,
+      quick_dispatch_available: !!data.quickDispatchAvailable,
+    }, {
+      difficulty: {
+        type: 'score',
+        instructions: 'How hard is the planning decision this goal state presents?',
+        criteria: [
+          'Obvious: complete, or retry a transient failure',
+          'Routine planning',
+          'Nuanced: conflicting evidence, or steering that changes the plan',
+          'Hard diagnosis: repeated or unexplained failures',
+        ],
+      },
+    }, { goalId, onBehalfOf: 'ScrumMaster' });
+    const difficulty = scoreOf(outcome, 'difficulty');
+    if (!outcome || !difficulty) return heuristic;
+    const level = topLevel(difficulty);
+    const judged: 'smart' | 'balanced' = level <= 1 ? 'balanced' : 'smart';
+    if (outcome.mode !== 'act' || (difficulty.probabilities[String(level)] ?? 0) < 0.6) {
+      if (judged !== heuristic) log.info(`[decision:${outcome.mode}] scrum.tier ${goalId.slice(0, 8)}: would think on ${judged} (level ${level}); heuristic ${heuristic}`);
+      return heuristic;
+    }
+    return judged;
+  }
+
   /**
    * Close a quick-dispatched goal with its single task's result. Returns
    * false when the fast path cannot stand behind the result and a review
@@ -2143,11 +2429,12 @@ Rules:
     // completeTask mirrors the agent's result to this scratchpad key.
     const mirrored = goal?.scratchpad?.[`tasks/${taskId}/result`];
     const text = mirrored === undefined ? '' : typeof mirrored === 'string' ? mirrored : safeStringify(mirrored, 4000);
-    if (looksLikeUngroundedClaim(text)) return false;
+    const { claim, bareAck } = await this.judgeOneShotResult(goalId, taskId, text, goal?.scratchpad ?? {});
+    if (claim) return false;
 
     let result: unknown = mirrored;
     let resultText = text;
-    if (looksLikeBareAcknowledgement(text)) {
+    if (bareAck) {
       const synthesis = await this.synthesizeCompletionText(goalId);
       if (synthesis === ScrumMaster.SYNTHESIS_FALLBACK) {
         log.warn(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" and synthesis was unavailable`);

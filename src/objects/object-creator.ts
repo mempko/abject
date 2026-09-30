@@ -20,7 +20,7 @@ import { domainFailure, type ResultContract } from '../core/result-contract.js';
  */
 
 import { encodeAgentState } from '../core/agent-session-codec.js';
-import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, SpawnRequest, SpawnResult } from '../core/types.js';
+import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, ObjectSummary, SpawnRequest, SpawnResult } from '../core/types.js';
 import { Abject, DEFERRED_REPLY, isTemporaryAskResponse } from '../core/abject.js';
 import { Capabilities } from '../core/capability.js';
 import { request, event } from '../core/message.js';
@@ -34,6 +34,7 @@ import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
+import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
 import * as acorn from 'acorn';
 
 const log = new Log('OBJECT-CREATOR');
@@ -327,6 +328,38 @@ interface LoopState {
    * is told not to finish until it is deployed. Compiling is not deploying.
    */
   lastDeployedSource?: string;
+
+  // ── Runtime decisions the (synchronous) renderers read ──
+  /**
+   * Members of a large source a decision model judged the goal most likely
+   * touches (site object-creator.members), computed once per target load.
+   * `key` names the load (target id, or a hash of a target-less draft).
+   */
+  memberRelevance?: { key: string; mode: string; relevant: Array<{ name: string; p: number }> };
+  /** Judged evidence of the calls that counted as exercising the live object since `deployTurn` (site object-creator.evidence). */
+  callEvidence?: { deployTurn: number; calls: Array<{ method: string; verdict: string; p: number }> };
+  /** Soft hints from task-start decisions (kind, target, persisted draft), shown once in the first observation. */
+  dispatchHints?: string[];
+}
+
+/**
+ * Per-task decision bookkeeping that never reaches a renderer: the agent's
+ * step budget (from agentObserve), tier hysteresis, and in-flight judgments.
+ * Promises here are dropped by the session codec, which is fine: a restored
+ * task simply asks again.
+ */
+interface DecisionMemo {
+  budget?: { step: number; maxSteps: number; extensionsLeft: number };
+  /** Consecutive tier verdicts that agreed the next step writes no code (object-creator.tier hysteresis). */
+  lightStreak?: number;
+  /** The member-relevance judgment in flight, and the load it is for. */
+  membersKey?: string;
+  membersJob?: Promise<void>;
+  /** Advisor cadence: the trigger and turn of the last ask. */
+  advisorTrigger?: string;
+  advisorTurn?: number;
+  /** Advisor lines that arrived for `turn`; rendered on that turn's or the next observation. */
+  advice?: { turn: number; lines: string[] };
 }
 
 /** Per-task bookkeeping: the caller's message to deferred-reply to, plus loop state. */
@@ -346,6 +379,8 @@ interface TaskExtra {
    * rendered. Consumed (and cleared) by handleObserve.
    */
   lastLlmContent?: ContentPart[];
+  /** Runtime-decision bookkeeping (see DecisionMemo). */
+  decisions?: DecisionMemo;
 }
 
 /**
@@ -1296,11 +1331,29 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (!parsed || parsed.members.length === 0) {
       return { ok: true, summary: `read_draft: ${total} lines`, data: numbered(base) };
     }
+    const relevance = this.relevanceLine(state, base);
     return {
       ok: true,
       summary: `read_draft: outline (${parsed.members.length} members, ${total} lines)`,
-      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${this.sourceOutline(base)}`,
+      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${this.sourceOutline(base)}${relevance ? `\n${relevance}` : ''}`,
     };
+  }
+
+  /**
+   * The member-relevance line for an outlined source (site
+   * object-creator.members, advise): the members a decision model judged the
+   * goal most likely touches, limited to those still in `source`. Undefined
+   * when the source is small enough to be shown in full, when nothing was
+   * judged relevant, or when the site only shadows.
+   */
+  private relevanceLine(state: LoopState, source: string): string | undefined {
+    const rel = state.memberRelevance;
+    if (!rel || rel.key !== this.relevanceKey(state) || rel.mode === 'shadow' || rel.relevant.length === 0) return undefined;
+    if (source.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) return undefined;
+    const present = new Set((this.parseHandlerMembers(source)?.members ?? []).map(m => m.name));
+    const names = rel.relevant.filter(r => present.has(r.name)).map(r => r.name);
+    if (names.length === 0) return undefined;
+    return `LIKELY RELEVANT (p≥0.6): ${names.join(', ')}. Read these first; others only if an edit needs them.`;
   }
 
   /**
@@ -1937,20 +1990,138 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * land in `pendingAdvice` and the next observation shows them. A small,
    * call-clean change skips the review entirely: the reviewer's cost is
    * roughly constant per call and its yield on a few clean lines is low.
+   *
+   * For a modify, a decision model may overrule the line count both ways
+   * (site object-creator.review, act): review a small change that could
+   * misbehave in ways the call check cannot see, skip a large clean one that
+   * could not. A null or unsure judgment keeps the line-count rule.
    */
-  private scheduleSemanticAdvice(state: LoopState, previousLive?: string): string {
+  private async scheduleSemanticAdvice(state: LoopState, previousLive?: string): Promise<string> {
     if (!state.draftSource) return '';
     if (previousLive !== undefined) {
       const changed = ObjectCreator.changedLineCount(previousLive, state.draftSource);
       const callsClean = (state.lastValidation?.calls ?? []).length === 0;
-      if (changed < ObjectCreator.SEMANTIC_REVIEW_MIN_CHANGED_LINES && callsClean) {
-        return `Semantic review skipped for a small, call-clean change (${changed} changed line${changed === 1 ? '' : 's'}).`;
+      const small = changed < ObjectCreator.SEMANTIC_REVIEW_MIN_CHANGED_LINES && callsClean;
+      const judged = await this.judgeReviewWorth(state, previousLive, changed, callsClean, !small);
+      const review = judged?.review ?? !small;
+      if (!review) {
+        return small
+          ? `Semantic review skipped for a small, call-clean change (${changed} changed line${changed === 1 ? '' : 's'}).`
+          : `Semantic review skipped: a runtime check judged this call-clean change (${changed} changed lines) unlikely to misbehave in ways the call check misses (p=${judged!.p.toFixed(2)}).`;
       }
     }
     void this.adviseSemantics(state)
       .then(advice => { if (advice) state.pendingAdvice = advice; })
       .catch(() => { /* advisory */ });
     return 'Semantic review is running beside you; findings, if any, appear under CHECKS in a later observation.';
+  }
+
+  private static readonly REVIEW_QUESTIONS: Record<string, DecisionQuestion> = {
+    review_worthwhile: {
+      type: 'noul',
+      instructions: 'A change was just deployed; `hunks` shows the lines it added (+) and removed (-). Could it misbehave at runtime in a way a method-name check cannot catch: a new or changed payload shape sent to a dependency (`newCallSites`), a new enum-like value, a consumed result without await, an event name or payload change, or logic that could defeat a stated requirement in `goal`?',
+    },
+  };
+
+  /**
+   * Whether a deployed modify is worth the semantic review (site
+   * object-creator.review). Returns an override only when acting on a
+   * confident verdict that disagrees with the line-count rule; shadow and
+   * advise log beside the deploy without holding it.
+   */
+  private async judgeReviewWorth(
+    state: LoopState, previousLive: string, changed: number, callsClean: boolean, heuristicReview: boolean,
+  ): Promise<{ review: boolean; p: number } | undefined> {
+    const site = 'object-creator.review';
+    const mode = await this.decisionSiteMode(site);
+    if (mode === 'off') return undefined;
+    const draft = state.draftSource!;
+    const ask = (): ReturnType<ObjectCreator['askDecision']> => this.askDecision(site, {
+      goal: state.goal.slice(0, 600),
+      changedLines: changed,
+      changedMembers: this.changedMembers(previousLive, draft),
+      newCallSites: ObjectCreator.newCallSites(previousLive, draft),
+      callsClean,
+      hunks: ObjectCreator.changeHunks(previousLive, draft, 4000),
+    }, ObjectCreator.REVIEW_QUESTIONS, { ...this.decisionScopeFor(state), timeoutMs: 8000 });
+    const logVerdict = (outcomeMode: string, p: number): void =>
+      log.info(`[decision:${outcomeMode}] ObjectCreator ${site}: review_worthwhile=${p.toFixed(2)} (${changed} changed lines, calls ${callsClean ? 'clean' : 'flagged'}; line-count rule says ${heuristicReview ? 'review' : 'skip'})`);
+
+    if (mode !== 'act') {
+      // Shadow (or advise, which has nothing for the model to read here): judge beside the deploy.
+      void ask().then(outcome => {
+        const p = noulOf(outcome, 'review_worthwhile');
+        if (outcome && p !== undefined) logVerdict(outcome.mode, p);
+      });
+      return undefined;
+    }
+    const outcome = await ask();
+    const p = noulOf(outcome, 'review_worthwhile');
+    if (!outcome || p === undefined) return undefined;
+    logVerdict(outcome.mode, p);
+    if (outcome.mode !== 'act') return undefined;
+    if (heuristicReview && callsClean && p <= 0.2) return { review: false, p };
+    if (!heuristicReview && p >= 0.7) return { review: true, p };
+    return undefined;
+  }
+
+  /** Members added, removed, or rewritten between two versions of a source (bounded). */
+  private changedMembers(before: string, after: string): string[] {
+    const spans = (source: string): Map<string, string> => {
+      const parsed = this.parseHandlerMembers(source);
+      return new Map((parsed?.members ?? []).map(m => [m.name, source.slice(m.start, m.end)]));
+    };
+    const a = spans(before), b = spans(after);
+    const out: string[] = [];
+    for (const [name, text] of b) {
+      if (!a.has(name)) out.push(`${name} (added)`);
+      else if (a.get(name) !== text) out.push(name);
+    }
+    for (const name of a.keys()) if (!b.has(name)) out.push(`${name} (removed)`);
+    return out.slice(0, 40);
+  }
+
+  /** `this.call(dep, 'method', { keys })` sites in a source, as dep|method|keys signatures. */
+  private static callSites(source: string): Array<{ dep: string; method: string; payloadKeys: string[] }> {
+    const varToDep = new Map<string, string>();
+    const decl = /(?:const|let|var)\s+(\w+)\s*=\s*(?:await\s+)?this\.(?:dep|find)\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    let mv: RegExpExecArray | null;
+    while ((mv = decl.exec(source)) !== null) varToDep.set(mv[1], mv[2]);
+    const call = /this\.call\s*\(\s*([^,]+?)\s*,\s*['"]([^'"]+)['"]\s*(?:,\s*\{([^{}]*)\})?/g;
+    const out: Array<{ dep: string; method: string; payloadKeys: string[] }> = [];
+    let mc: RegExpExecArray | null;
+    while ((mc = call.exec(source)) !== null) {
+      const raw = mc[1].trim();
+      const dep = raw.match(/this\.(?:dep|find)\s*\(\s*['"]([^'"]+)['"]/)?.[1] ?? varToDep.get(raw) ?? raw.slice(0, 40);
+      const keys = mc[3] ? [...mc[3].matchAll(/(?:^|,)\s*(?:\.\.\.)?\s*['"]?(\w+)['"]?\s*(?=[:,]|$)/g)].map(k => k[1]) : [];
+      out.push({ dep, method: mc[2], payloadKeys: [...new Set(keys)].sort() });
+    }
+    return out;
+  }
+
+  /** Call sites present in `after` whose dep, method, or payload keys are not in `before` (bounded). */
+  private static newCallSites(before: string, after: string): Array<{ dep: string; method: string; payloadKeys: string[] }> {
+    const sig = (c: { dep: string; method: string; payloadKeys: string[] }): string => `${c.dep}|${c.method}|${c.payloadKeys.join(',')}`;
+    const known = new Set(ObjectCreator.callSites(before).map(sig));
+    const seen = new Set<string>();
+    return ObjectCreator.callSites(after).filter(c => {
+      const s = sig(c);
+      if (known.has(s) || seen.has(s)) return false;
+      seen.add(s);
+      return true;
+    }).slice(0, 20);
+  }
+
+  /** Added (+) and removed (-) lines between two sources, in source order, clipped to `maxChars`. */
+  private static changeHunks(before: string, after: string, maxChars: number): string {
+    const a = new Set(before.split('\n').map(l => l.trim()).filter(Boolean));
+    const b = new Set(after.split('\n').map(l => l.trim()).filter(Boolean));
+    const lines = [
+      ...after.split('\n').filter(l => l.trim() && !a.has(l.trim())).map(l => `+ ${l}`),
+      ...before.split('\n').filter(l => l.trim() && !b.has(l.trim())).map(l => `- ${l}`),
+    ];
+    const text = lines.join('\n');
+    return text.length > maxChars ? `${text.slice(0, maxChars)}… [+${text.length - maxChars} chars]` : text;
   }
 
   /** Lines present in one text and not the other, as a cheap size of a change. */
@@ -2202,7 +2373,7 @@ ${source}
     state.deployTurn = state.turn;
     state.exercisedSinceDeploy = false;
     state.visualSinceDeploy = false;
-    const reviewNote = this.scheduleSemanticAdvice(state);
+    const reviewNote = await this.scheduleSemanticAdvice(state);
 
     return {
       ok: true,
@@ -2379,7 +2550,7 @@ ${source}
     state.deployTurn = state.turn;
     state.exercisedSinceDeploy = false;
     state.visualSinceDeploy = false;
-    const reviewNote = this.scheduleSemanticAdvice(state, previousLive);
+    const reviewNote = await this.scheduleSemanticAdvice(state, previousLive);
 
     return {
       ok: true,
@@ -2969,6 +3140,9 @@ ${source}
       }
       if ((resolvedId === live || ownedWidget) && !readOnly.has(method) && !(response && typeof response === 'object' && (response as { success?: unknown }).success === false)) {
         state.exercisedSinceDeploy = true;
+        // The denylist knows method names, not behavior: judge beside the loop
+        // whether this call drove what the user asked for (advisory only).
+        void this.judgeCallEvidence(state, target, method, payload, response);
       }
     }
 
@@ -2978,6 +3152,81 @@ ${source}
         + (pinnedToSpawn ? ` [routed to just-spawned ${resolvedId}]` : ''),
       data: response,
     };
+  }
+
+  private static readonly EVIDENCE_QUESTIONS: Record<string, DecisionQuestion> = {
+    call_evidence: {
+      type: 'choice',
+      instructions: 'After deploying the object `target`, the agent called `method` on it with a payload carrying `payloadKeys`, and got `responseSummary`. What does this call show about the behavior `goal` asks for?',
+      criteria: {
+        exercises_requested: 'It drove a behavior the goal asks for and the response shows its effect.',
+        exercises_other: 'It drove a real behavior, but not one the goal asks for.',
+        read_only: 'It only read state, configuration, or data; no behavior was driven.',
+        failed_or_noop: 'It failed, was refused, or changed nothing.',
+      },
+    },
+  };
+
+  /**
+   * Judge what an exercising call proves (site object-creator.evidence,
+   * advise). The verdict annotates the GATE line; the gate itself keeps its
+   * strictness either way.
+   */
+  private async judgeCallEvidence(state: LoopState, target: string, method: string, payload: Record<string, unknown>, response: unknown): Promise<void> {
+    const site = 'object-creator.evidence';
+    const deployTurn = state.deployTurn;
+    if (deployTurn === undefined || await this.decisionSiteMode(site) === 'off') return;
+    const outcome = await this.askDecision(site, {
+      goal: state.goal.slice(0, 600),
+      target,
+      method,
+      payloadKeys: Object.keys(payload).slice(0, 20),
+      responseSummary: ObjectCreator.clip(response, 300),
+    }, ObjectCreator.EVIDENCE_QUESTIONS, this.decisionScopeFor(state));
+    const verdict = choiceOf(outcome, 'call_evidence');
+    if (!outcome || !verdict) return;
+    const p = verdict.probabilities[verdict.choice] ?? 0;
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ObjectCreator ${site}: ${target}.${method} → ${verdict.choice}@${p.toFixed(2)}`);
+      return;
+    }
+    // A later deploy starts a fresh record; a verdict for an older deploy is dropped.
+    if (state.deployTurn !== deployTurn) return;
+    if (state.callEvidence?.deployTurn !== deployTurn) state.callEvidence = { deployTurn, calls: [] };
+    state.callEvidence.calls.push({ method, verdict: verdict.choice, p });
+    if (state.callEvidence.calls.length > 5) state.callEvidence.calls.shift();
+  }
+
+  /**
+   * The soft note the GATE line carries when the calls that satisfied it were
+   * judged not to drive a requested behavior. Empty when any call since the
+   * deploy was judged to, or when nothing was judged with confidence.
+   */
+  private evidenceNote(state: LoopState): string {
+    const ev = state.callEvidence;
+    if (!ev || ev.deployTurn !== state.deployTurn || ev.calls.length === 0) return '';
+    if (ev.calls.some(c => c.verdict === 'exercises_requested' && c.p >= 0.7)) return '';
+    const last = [...ev.calls].reverse().find(c => c.p >= 0.7 && c.verdict !== 'exercises_requested');
+    if (!last) return '';
+    const judged = last.verdict === 'read_only' ? 'judged read-only'
+      : last.verdict === 'failed_or_noop' ? 'judged a failure or no-op'
+        : 'judged to drive a behavior other than the one requested';
+    return ` Runtime check: exercised via ${last.method}, ${judged} (p=${last.p.toFixed(2)}); drive a requested behavior and read its result.`;
+  }
+
+  /** Any value as bounded text, for decision states. */
+  private static clip(value: unknown, max: number): string {
+    let text: string;
+    try { text = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value); } catch { text = String(value); }
+    return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text;
+  }
+
+  /** Who a decision about this loop is for, so the ledger ties it to the task and goal. */
+  private decisionScopeFor(state: LoopState): { goalId?: string; taskId?: string; onBehalfOf: string } {
+    for (const extra of this.tasks.values()) {
+      if (extra.state === state) return { goalId: extra.goalId, taskId: extra.taskId, onBehalfOf: this.manifest.name };
+    }
+    return { onBehalfOf: this.manifest.name };
   }
 
   /**
@@ -3273,6 +3522,8 @@ ${source}
         callerId,
         deferredMsg: msg,
         explicitTaskId: explicitTaskId ?? tupleId,
+        // No dispatcher named the kind: a decision model may judge it (and a target).
+        inferKind: requested === undefined,
       });
       return DEFERRED_REPLY;
     });
@@ -3280,8 +3531,11 @@ ${source}
     // ── AgentAbject callbacks ──
     this.on('agentObserve', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
-      const { taskId } = msg.payload as { taskId: string; step: number };
-      return this.handleObserve(taskId);
+      const { taskId, step, maxSteps, extensionsLeft } = msg.payload as { taskId: string; step: number; maxSteps?: number; extensionsLeft?: number };
+      const budget = typeof step === 'number' && typeof maxSteps === 'number'
+        ? { step, maxSteps, extensionsLeft: extensionsLeft ?? 0 }
+        : undefined;
+      return this.handleObserve(taskId, budget);
     });
 
     this.on('snapshotTask', async (msg: AbjectMessage) => {
@@ -3417,6 +3671,12 @@ ${source}
     explicitTaskId?: string;
     callerId?: AbjectId;
     deferredMsg?: AbjectMessage;
+    /**
+     * The kind was inferred (no dispatcher named it), so a decision model may
+     * judge it, and the target when none was given (site object-creator.kind).
+     * An explicit kind or target is never overridden.
+     */
+    inferKind?: boolean;
   }): Promise<void> {
     if (!this.agentAbjectId) {
       const result: CreationResult = { success: false, error: 'AgentAbject not available' };
@@ -3424,13 +3684,23 @@ ${source}
       return;
     }
 
+    let kind = args.kind;
+    let targetIdOrName = args.targetIdOrName;
+    const dispatchHints: string[] = [];
+    if (args.inferKind) {
+      const judged = await this.judgeTaskKind(args.prompt, kind, targetIdOrName, { goalId: args.goalId, taskId: args.explicitTaskId, onBehalfOf: this.manifest.name });
+      if (judged.kind) kind = judged.kind;
+      if (judged.target) targetIdOrName = judged.target;
+      dispatchHints.push(...judged.hints);
+    }
+
     let targetObjectId: AbjectId | undefined;
     let targetName: string | undefined;
-    if (args.targetIdOrName) {
-      const resolved = await this.resolveTarget(args.targetIdOrName);
+    if (targetIdOrName) {
+      const resolved = await this.resolveTarget(targetIdOrName);
       if (resolved) {
         targetObjectId = resolved;
-        targetName = args.targetIdOrName.includes('-') && args.targetIdOrName.length > 20 ? undefined : args.targetIdOrName;
+        targetName = targetIdOrName.includes('-') && targetIdOrName.length > 20 ? undefined : targetIdOrName;
       }
     }
 
@@ -3439,7 +3709,7 @@ ${source}
     // effort — if this fails (object not yet registered, no source on file),
     // the agent falls back to fetching it explicitly.
     let targetSource: string | undefined;
-    if (args.kind === 'modify' && targetObjectId && this.registryId) {
+    if (kind === 'modify' && targetObjectId && this.registryId) {
       try {
         const src = await this.sendRequest<string | null>(
           this.registryId, 'getSource', { objectId: targetObjectId }, 5000,
@@ -3451,7 +3721,7 @@ ${source}
     }
 
     const state: LoopState = {
-      kind: args.kind,
+      kind,
       goal: args.prompt,
       targetObjectId,
       targetName,
@@ -3461,14 +3731,18 @@ ${source}
       turn: 0,
       turnLog: [],
       renderedGuides: new Set(),
+      ...(dispatchHints.length ? { dispatchHints } : {}),
     };
 
     // Resume authored work from a prior task in this goal, if any: a
     // persisted draft means a previous loop ended before deploying, and
     // adopting it turns "re-author from failure prose" into "finish and ship".
-    if (args.goalId && args.kind !== 'investigate') {
+    // A task that names no draft may still continue one; a decision model
+    // judges which (site object-creator.draft).
+    if (args.goalId && kind !== 'investigate') {
       const draftKey = args.prompt.match(/objectcreator:staged-draft\/[\w-]+/)?.[0];
       if (draftKey) await this.loadPersistedDraft(args.goalId, state, draftKey);
+      else await this.judgePersistedDraft(args.goalId, state, { goalId: args.goalId, taskId: args.explicitTaskId, onBehalfOf: this.manifest.name });
     }
 
     const taskId = args.explicitTaskId ?? `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3591,9 +3865,541 @@ ${source}
     } catch { /* absence of a persisted draft is the normal case */ }
   }
 
+  // ── Runtime decisions (object-creator.* decision sites) ───────────────
+  //
+  // A decision model judges the authoring loop's recurring questions: what the
+  // next step will do (and so its tier), which members of a large source the
+  // goal touches, whether the agent has read enough or should spend its last
+  // steps verifying, what kind of task a dispatch is, and which saved draft it
+  // continues. Each site's mode comes back with its answer (shadow logs,
+  // advise adds text the agent reads, act takes effect), and a null or unsure
+  // answer always leaves the heuristic path exactly as it was.
+
+  /** How long an observation waits for this turn's judgments before rendering without them. */
+  private static readonly OBSERVE_JUDGMENT_WAIT_MS = 6000;
+
+  /** Questions per member at most; a larger source is prefiltered by overlap with the goal. */
+  private static readonly MEMBER_QUESTION_CAP = 40;
+
+  private static readonly TIER_QUESTIONS: Record<string, DecisionQuestion> = {
+    next_step: {
+      type: 'choice',
+      instructions: 'From the object author\'s state (`lastAction`, `recent`, and the draft and deploy flags), predict what its NEXT response must do.',
+      criteria: {
+        author_code: 'Write or rewrite source or manifest text.',
+        fix_failure: 'The last action failed or surfaced a problem that needs diagnosis and a code change.',
+        read_source: 'Navigate existing source: read a member, search it, or read a line range.',
+        discover: 'Ask or describe a dependency to learn how to use it.',
+        deploy_or_check: 'A mechanical deploy or check with nothing to write.',
+        exercise_live: 'Drive the deployed object and read the result.',
+        report: 'Write the final done or fail report.',
+      },
+    },
+  };
+
+  private static readonly ADVISOR_QUESTIONS: Record<string, DecisionQuestion> = {
+    ready_to_edit: {
+      type: 'noul',
+      instructions: 'Has the agent already seen enough of the existing source to make the change `goal` asks for? `membersRead` lists the members it has read; `relevantMembers`, when present, lists the members the goal most likely touches.',
+    },
+    rereading: {
+      type: 'noul',
+      instructions: 'Is the agent re-reading source it has already seen (`recent`, `membersRead`) without a new question the read would answer?',
+    },
+    endgame: {
+      type: 'choice',
+      instructions: 'The agent has `stepsRemaining` steps left; up to `extensionsLeft` extensions of 10 steps may follow, granted only while the run shows progress. What should the remaining budget go to?',
+      criteria: {
+        keep_building: 'The change is still being written; continue authoring.',
+        deploy_now: 'Deploy the staged change now, leaving room to verify it.',
+        exercise_now: 'Drive the deployed object now: call a requested behavior and read the result.',
+        screenshot_now: 'Capture and inspect the deployed UI now.',
+        finish_now: 'The work is deployed and verified; write the final report now.',
+      },
+    },
+  };
+
+  private static readonly KIND_CRITERIA: Record<string, string> = {
+    create_new: 'Build a new object that does not exist yet.',
+    modify_existing: 'Change, fix, or extend an object that already exists.',
+    clone_variant: 'Make a copy or variant of an existing object under a new name, leaving the original as it is.',
+    investigate_only: 'Answer a question about an object (how it works, why it fails) with a written report; nothing is changed.',
+    compose: 'Combine several existing objects behind one interface.',
+  };
+
+  /** Words too common to say what a goal is about, for the member prefilter. */
+  private static readonly STOP_WORDS = new Set([
+    'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'when', 'then', 'than', 'are', 'was', 'has', 'have',
+    'not', 'but', 'all', 'any', 'can', 'its', 'make', 'use', 'add', 'new', 'should', 'would', 'could', 'will', 'there',
+    'their', 'them', 'they', 'what', 'which', 'while', 'where', 'also', 'more', 'each', 'only', 'other', 'some', 'such',
+    'const', 'let', 'var', 'await', 'async', 'return', 'function', 'true', 'false', 'null', 'undefined',
+  ]);
+
+  /** A promise's value, or undefined once `ms` have passed. */
+  private static async within<T>(job: Promise<T>, ms: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), ms); });
+    try { return await Promise.race([job, timeout]); } finally { clearTimeout(timer); }
+  }
+
+  private static words(text: string): Set<string> {
+    return new Set(text.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/)
+      .filter(w => w.length >= 3 && !ObjectCreator.STOP_WORDS.has(w)));
+  }
+
+  /** A turn that only read: source navigation, a retained guide, or a describe/ask/state read. */
+  private static isReadOnlyTurn(t: { action: string; summary: string }): boolean {
+    if (t.action === 'read_draft' || t.action === 'read_guide') return true;
+    return t.action === 'call'
+      && /^call \S+\.(describe|ask|getSource|getState|getData|probe|discover|lookup|search|listSummaries|resolveType)\b/.test(t.summary);
+  }
+
+  /** How many of the latest turns only read (turns, not actions: a batched turn counts once). */
+  private static readStreak(turnLog: LoopState['turnLog']): number {
+    const turns = new Set<number>();
+    for (let i = turnLog.length - 1; i >= 0 && ObjectCreator.isReadOnlyTurn(turnLog[i]); i--) turns.add(turnLog[i].turn);
+    return turns.size;
+  }
+
+  /** Whether the latest read-only streak includes reading source (not only asking or describing dependencies). */
+  private static streakReadsSource(turnLog: LoopState['turnLog']): boolean {
+    for (let i = turnLog.length - 1; i >= 0 && ObjectCreator.isReadOnlyTurn(turnLog[i]); i--) {
+      const t = turnLog[i];
+      if (t.action === 'read_draft' || /^call \S+\.getSource\b/.test(t.summary)) return true;
+    }
+    return false;
+  }
+
+  private static recentTurns(state: LoopState, n = 8): Array<Record<string, unknown>> {
+    return state.turnLog.slice(-n).map(t => ({ turn: t.turn, action: t.action, ok: t.ok, summary: t.summary.slice(0, 200) }));
+  }
+
+  /** Which load a member-relevance judgment belongs to: the target, or this task's own draft. */
+  private relevanceKey(state: LoopState): string {
+    return state.targetObjectId ?? 'staged-draft';
+  }
+
+  /** Whether the loop's object (as drafted, or as a UI surface in its source) has a window. */
+  private static authorsUI(state: LoopState): boolean {
+    if (state.draftManifest?.requiredCapabilities?.some(c => c.capability === Capabilities.UI_SURFACE)) return true;
+    return /\bcreateWindow\b|WidgetManager/.test(state.draftSource ?? state.targetSource ?? '');
+  }
+
+  // ── object-creator.tier ──
+
+  /** The tier a judged next step warrants. */
+  private static tierForStep(step: string, kind: LoopState['kind']): 'smart' | 'balanced' | 'code' {
+    if (step === 'author_code' || step === 'fix_failure') return kind === 'investigate' ? 'smart' : 'code';
+    if (step === 'report') return kind === 'investigate' ? 'smart' : 'balanced';
+    return 'balanced';
+  }
+
+  private tierState(extra: TaskExtra): Record<string, unknown> {
+    const state = extra.state;
+    const last = state.turnLog.at(-1);
+    const source = state.draftSource ?? state.targetSource;
+    return {
+      kind: state.kind,
+      goal: state.goal.slice(0, 600),
+      turn: state.turn,
+      maxSteps: extra.decisions?.budget?.maxSteps ?? null,
+      lastAction: last ? { action: last.action, ok: last.ok, summary: last.summary.slice(0, 200) } : null,
+      recent: ObjectCreator.recentTurns(state),
+      draftStaged: !!state.draftSource,
+      undeployed: !!state.draftSource && state.draftSource !== state.lastDeployedSource,
+      deployed: state.deployTurn !== undefined,
+      exercisedSinceDeploy: !!state.exercisedSinceDeploy,
+      visualSinceDeploy: !!state.visualSinceDeploy,
+      semanticsFresh: state.semanticReviewedSource === state.draftSource,
+      consecutiveReadOnly: ObjectCreator.readStreak(state.turnLog),
+      sourceLines: source ? source.split('\n').length : 0,
+    };
+  }
+
+  /**
+   * The next think's tier: the heuristic (chooseObserveTier), which a decision
+   * model may lower to balanced when the next step writes no code (site
+   * object-creator.tier, act). Asymmetric by design: only a step the heuristic
+   * sent to the reasoning tier is judged, the verdict must put authoring and
+   * fixing together under 0.2 with its pick at 0.6 or more, and two such
+   * verdicts in a row are needed before the tier drops.
+   */
+  private async decideObserveTier(extra: TaskExtra): Promise<'smart' | 'balanced' | 'code'> {
+    const site = 'object-creator.tier';
+    const state = extra.state;
+    const memo = (extra.decisions ??= {});
+    const heuristic = this.chooseObserveTier(state);
+    if (heuristic === 'balanced' || state.turnLog.length === 0) return heuristic;
+    if (await this.decisionSiteMode(site) === 'off') return heuristic;
+    const outcome = await this.askDecision(site, this.tierState(extra), ObjectCreator.TIER_QUESTIONS, { ...this.decisionScopeFor(state), timeoutMs: 5000 });
+    const pick = choiceOf(outcome, 'next_step');
+    if (!outcome || !pick) {
+      memo.lightStreak = 0;
+      return heuristic;
+    }
+    const pTop = pick.probabilities[pick.choice] ?? 0;
+    const pWrite = (pick.probabilities.author_code ?? 0) + (pick.probabilities.fix_failure ?? 0);
+    const light = ObjectCreator.tierForStep(pick.choice, state.kind) === 'balanced' && pWrite < 0.2 && pTop >= 0.6;
+    memo.lightStreak = light ? (memo.lightStreak ?? 0) + 1 : 0;
+    const downgrade = light && memo.lightStreak >= 2;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${state.turn}: next_step=${pick.choice}@${pTop.toFixed(2)} write=${pWrite.toFixed(2)}; would think on ${downgrade ? 'balanced' : heuristic} (heuristic ${heuristic})`);
+      return heuristic;
+    }
+    return downgrade ? 'balanced' : heuristic;
+  }
+
+  // ── object-creator.members ──
+
+  /**
+   * Start the member-relevance judgment for a large source, once per target
+   * load. Returns the new job, for the observation that started it to wait on;
+   * a job already in flight from an earlier turn is not waited on again (its
+   * answer reaches whichever observation renders after it lands).
+   */
+  private memberRelevanceJob(extra: TaskExtra): Promise<void> {
+    const state = extra.state;
+    const memo = (extra.decisions ??= {});
+    const base = state.targetSource ?? state.draftSource;
+    if (!base || base.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) return Promise.resolve();
+    const key = this.relevanceKey(state);
+    if (state.memberRelevance?.key === key) return Promise.resolve();
+    if (memo.membersKey === key && memo.membersJob) return Promise.resolve();
+    memo.membersKey = key;
+    const job = this.judgeMemberRelevance(extra, key, base)
+      .catch(() => { /* advisory */ })
+      .finally(() => { if (memo.membersJob === job) memo.membersJob = undefined; });
+    memo.membersJob = job;
+    return job;
+  }
+
+  /** What a judge sees of each member: where it is, how it starts, what it calls. Capped, goal-prefiltered. */
+  private memberDigests(source: string, goal: string): Array<{ name: string; lines: string; signature: string; firstLines: string; callsTo: string[] }> {
+    const parsed = this.parseHandlerMembers(source);
+    if (!parsed) return [];
+    const names = new Set(parsed.members.map(m => m.name).filter(Boolean));
+    const all = parsed.members.filter(m => m.name).map((m, order) => {
+      const text = source.slice(m.start, m.end);
+      const sl = source.slice(0, m.start).split('\n').length;
+      const el = sl + text.split('\n').length - 1;
+      const [first, ...rest] = text.split('\n');
+      const calls = new Set<string>();
+      for (const c of text.matchAll(/this\.(\w+)\s*\(/g)) if (names.has(c[1]) && c[1] !== m.name) calls.add(c[1]);
+      for (const c of text.matchAll(/this\.(?:dep|find)\s*\(\s*['"]([^'"]+)['"]/g)) calls.add(c[1]);
+      return {
+        order, text,
+        digest: { name: m.name, lines: `${sl}-${el}`, signature: first.trim().slice(0, 120), firstLines: rest.join('\n').trim().slice(0, 200), callsTo: [...calls].slice(0, 8) },
+      };
+    });
+    if (all.length <= ObjectCreator.MEMBER_QUESTION_CAP) return all.map(a => a.digest);
+    const goalWords = ObjectCreator.words(goal);
+    return all.map(a => {
+      let score = 0;
+      for (const w of ObjectCreator.words(a.digest.name)) if (goalWords.has(w)) score += 3;
+      const body = ObjectCreator.words(a.text);
+      for (const w of goalWords) if (body.has(w)) score += 1;
+      return { ...a, score };
+    })
+      .sort((x, y) => y.score - x.score || x.order - y.order)
+      .slice(0, ObjectCreator.MEMBER_QUESTION_CAP)
+      .sort((x, y) => x.order - y.order)
+      .map(a => a.digest);
+  }
+
+  /**
+   * Which members of a large source the goal most likely touches (site
+   * object-creator.members, advise): one yes/no per member, cached on the
+   * loop state for the outline's LIKELY RELEVANT line. A failed judgment is
+   * cached as empty so a broken model is not asked again every turn.
+   */
+  private async judgeMemberRelevance(extra: TaskExtra, key: string, base: string): Promise<void> {
+    const site = 'object-creator.members';
+    const state = extra.state;
+    if (await this.decisionSiteMode(site) === 'off') return;
+    const members = this.memberDigests(base, state.goal);
+    if (members.length === 0) {
+      state.memberRelevance = { key, mode: 'none', relevant: [] };
+      return;
+    }
+    const questions: Record<string, DecisionQuestion> = {};
+    members.forEach((m, i) => {
+      questions[`m_${i}`] = { type: 'noul', instructions: `Will fulfilling \`goal\` most likely require editing or closely understanding \`members[${i}]\` (${m.name})?` };
+    });
+    const outcome = await this.askDecision(site, {
+      goal: state.goal.slice(0, 1500),
+      objectName: state.targetName ?? state.draftManifest?.name ?? '(staged draft)',
+      members,
+    }, questions, this.decisionScopeFor(state));
+    if (!outcome) {
+      state.memberRelevance = { key, mode: 'none', relevant: [] };
+      return;
+    }
+    const relevant = members
+      .map((m, i) => ({ name: m.name, p: noulOf(outcome, `m_${i}`) ?? 0 }))
+      .filter(r => r.p >= 0.6)
+      .sort((a, b) => b.p - a.p)
+      .slice(0, 12);
+    state.memberRelevance = { key, mode: outcome.mode, relevant };
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: ${relevant.length}/${members.length} members likely relevant${relevant.length ? `: ${relevant.map(r => `${r.name}@${r.p.toFixed(2)}`).join(', ')}` : ''}`);
+  }
+
+  // ── object-creator.advisor ──
+
+  /** Members the agent has read with read_draft (by name, or by a line range that overlaps them). */
+  private membersRead(state: LoopState): string[] {
+    const source = state.draftSource ?? state.targetSource;
+    if (!source) return [];
+    const lineOf = (i: number): number => source.slice(0, i).split('\n').length;
+    const spans = (this.parseHandlerMembers(source)?.members ?? []).filter(m => m.name)
+      .map(m => ({ name: m.name, sl: lineOf(m.start), el: lineOf(m.end) }));
+    const read = new Set<string>();
+    for (const t of state.turnLog) {
+      if (t.action !== 'read_draft' || !t.ok) continue;
+      const what = t.summary.replace(/^read_draft:\s*/, '');
+      const range = what.match(/^lines (\d+)-(\d+)/);
+      if (range) {
+        const a = Number(range[1]), b = Number(range[2]);
+        for (const s of spans) if (s.sl <= b && s.el >= a) read.add(s.name);
+      } else if (spans.some(s => s.name === what)) {
+        read.add(what);
+      }
+    }
+    return [...read].slice(0, 60);
+  }
+
+  /**
+   * The advisor (site object-creator.advisor, advise): after three read-only
+   * turns, has the agent read enough to edit, or is it re-reading? Under 30%
+   * of the step budget, what should the rest go to? Asked at most every third
+   * turn per trigger; its lines land in `memo.advice` for the renderer.
+   */
+  private async judgeAdvisor(extra: TaskExtra): Promise<void> {
+    const site = 'object-creator.advisor';
+    const state = extra.state;
+    const memo = (extra.decisions ??= {});
+    const turn = state.turn;
+    const budget = memo.budget;
+    const source = state.draftSource ?? state.targetSource;
+    const readStreak = ObjectCreator.readStreak(state.turnLog);
+    const reading = !!source && readStreak >= 3 && ObjectCreator.streakReadsSource(state.turnLog);
+    const stepsRemaining = budget ? Math.max(0, budget.maxSteps - budget.step) : undefined;
+    const lowBudget = !!budget && stepsRemaining! < 0.3 * budget.maxSteps && state.kind !== 'investigate';
+    if (!reading && !lowBudget) return;
+    const trigger = [reading ? 'reading' : '', lowBudget ? 'budget' : ''].filter(Boolean).join('+');
+    if (trigger === memo.advisorTrigger && turn - (memo.advisorTurn ?? -Infinity) < 3) return;
+    if (await this.decisionSiteMode(site) === 'off') return;
+    memo.advisorTrigger = trigger;
+    memo.advisorTurn = turn;
+
+    const Q = ObjectCreator.ADVISOR_QUESTIONS;
+    const questions: Record<string, DecisionQuestion> = {
+      ...(reading && state.kind !== 'investigate' ? { ready_to_edit: Q.ready_to_edit } : {}),
+      ...(reading ? { rereading: Q.rereading } : {}),
+      ...(lowBudget ? { endgame: Q.endgame } : {}),
+    };
+    const relevantMembers = state.memberRelevance?.key === this.relevanceKey(state)
+      ? state.memberRelevance.relevant.map(r => r.name) : [];
+    const membersRead = this.membersRead(state);
+    const authorsUI = ObjectCreator.authorsUI(state);
+    const outcome = await this.askDecision(site, {
+      goal: state.goal.slice(0, 600),
+      kind: state.kind,
+      turn,
+      stepsRemaining: stepsRemaining ?? null,
+      maxSteps: budget?.maxSteps ?? null,
+      extensionsLeft: budget?.extensionsLeft ?? null,
+      consecutiveReadOnly: readStreak,
+      recent: ObjectCreator.recentTurns(state),
+      membersRead,
+      relevantMembers,
+      sourceLines: source ? source.split('\n').length : 0,
+      sourceShownInFull: !!source && source.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS,
+      draftStaged: !!state.draftSource,
+      undeployed: !!state.draftSource && state.draftSource !== state.lastDeployedSource,
+      deployed: state.deployTurn !== undefined,
+      exercisedSinceDeploy: !!state.exercisedSinceDeploy,
+      visualSinceDeploy: !!state.visualSinceDeploy,
+      authorsUI,
+    }, questions, this.decisionScopeFor(state));
+    if (!outcome) return;
+
+    const lines: string[] = [];
+    const ready = noulOf(outcome, 'ready_to_edit');
+    const rereading = noulOf(outcome, 'rereading');
+    const endgame = choiceOf(outcome, 'endgame');
+    if (ready !== undefined && ready >= 0.75) {
+      const readRelevant = relevantMembers.length > 0 && relevantMembers.every(m => membersRead.includes(m));
+      lines.push(readRelevant
+        ? 'ADVISOR: you have read the members the goal most likely touches; the next step can be edit_source.'
+        : 'ADVISOR: you have likely seen enough of the source to make the change; the next step can be edit_source.');
+    }
+    if (rereading !== undefined && rereading >= 0.75) {
+      lines.push('ADVISOR: recent reads revisit source you have already seen. Act on what you have, or name the new question the next read answers.');
+    }
+    const endP = endgame ? endgame.probabilities[endgame.choice] ?? 0 : 0;
+    if (endgame && endP >= 0.75 && endgame.choice !== 'keep_building') {
+      const n = stepsRemaining ?? 0;
+      const verb = state.kind === 'create' && !state.spawnedObjectId ? 'deploy_spawn' : 'deploy_update';
+      const text: Record<string, string> = {
+        deploy_now: `${verb} now to leave room to exercise${authorsUI ? ' and screenshot' : ''}.`,
+        exercise_now: 'exercise the live object now: drive a requested behavior and read the result.',
+        screenshot_now: 'capture and inspect the live window now.',
+        finish_now: 'the work reads as deployed and verified, so the next step can be done with the evidence you have.',
+      };
+      if (text[endgame.choice]) lines.push(`ADVISOR: about ${n} step${n === 1 ? '' : 's'} left; ${text[endgame.choice]}`);
+    }
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ObjectCreator ${site} turn ${turn} (${trigger}): ready_to_edit=${ready?.toFixed(2) ?? '-'} rereading=${rereading?.toFixed(2) ?? '-'} endgame=${endgame ? `${endgame.choice}@${endP.toFixed(2)}` : '-'}${lines.length ? `; would show ${lines.length} line(s)` : ''}`);
+      return;
+    }
+    if (lines.length) memo.advice = { turn, lines };
+  }
+
+  // ── object-creator.kind ──
+
+  /** Registered user objects (the ones an authoring task can target), for the target choice. */
+  private async userObjectCandidates(): Promise<Array<{ name: string; description: string }>> {
+    if (!this.registryId) return [];
+    try {
+      const all = await this.sendRequest<ObjectSummary[]>(this.registryId, 'listSummaries', {}, 5000);
+      const seen = new Set<string>();
+      const out: Array<{ name: string; description: string }> = [];
+      for (const s of all ?? []) {
+        if (typeof s.typeId !== 'string' || !s.typeId.includes('/user/') || seen.has(s.name)) continue;
+        seen.add(s.name);
+        out.push({ name: s.name, description: (s.description ?? '').slice(0, 120) });
+        if (out.length >= 254) break;
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Judge an undeclared task's kind, and its target when none was given (site
+   * object-creator.kind), in one request at task start. Acting needs p ≥ 0.85
+   * and only ever moves toward what the task text says: to investigate, or to
+   * modify with a confidently named target. An explicit kind never reaches
+   * here, and an explicit target is never replaced. Other confident verdicts
+   * (p ≥ 0.6) become soft hints in the first observation.
+   */
+  private async judgeTaskKind(
+    prompt: string,
+    heuristic: LoopState['kind'],
+    givenTarget: string | undefined,
+    scope: { goalId?: string; taskId?: string; onBehalfOf: string },
+  ): Promise<{ kind?: LoopState['kind']; target?: string; hints: string[] }> {
+    const site = 'object-creator.kind';
+    const out: { kind?: LoopState['kind']; target?: string; hints: string[] } = { hints: [] };
+    if (await this.decisionSiteMode(site) === 'off') return out;
+    const questions: Record<string, DecisionQuestion> = {
+      task_kind: { type: 'choice', instructions: 'What kind of authoring work does `task` ask for?', criteria: ObjectCreator.KIND_CRITERIA },
+    };
+    const candidates = givenTarget ? [] : await this.userObjectCandidates();
+    if (candidates.length > 0) {
+      const criteria: Record<string, string> = {};
+      candidates.forEach((c, i) => { criteria[`obj_${i}`] = `"${c.name}": ${c.description}`; });
+      criteria.none = 'None of these: the task builds something new, or concerns an object not listed.';
+      questions.target_object = { type: 'choice', instructions: 'Which existing object does `task` concern, if any?', criteria };
+    }
+    const outcome = await this.askDecision(site, { task: prompt.slice(0, 1500), givenTarget: givenTarget ?? null }, questions, { ...scope, timeoutMs: 15000 });
+    const kindPick = choiceOf(outcome, 'task_kind');
+    if (!outcome || !kindPick) return out;
+    const kp = kindPick.probabilities[kindPick.choice] ?? 0;
+    const targetPick = choiceOf(outcome, 'target_object');
+    const target = targetPick && targetPick.choice !== 'none' ? candidates[Number(targetPick.choice.slice(4))]?.name : undefined;
+    const tp = target ? targetPick!.probabilities[targetPick!.choice] ?? 0 : 0;
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: task_kind=${kindPick.choice}@${kp.toFixed(2)}${targetPick ? ` target=${target ?? 'none'}@${(targetPick.probabilities[targetPick.choice] ?? 0).toFixed(2)}` : ''} (dispatch inferred ${heuristic}${givenTarget ? ` with target ${givenTarget}` : ''})`);
+    if (outcome.mode === 'shadow') return out;
+
+    const act = outcome.mode === 'act';
+    const confidentTarget = act && target && tp >= 0.85 ? target : undefined;
+    if (act && kp >= 0.85) {
+      if (kindPick.choice === 'investigate_only' && heuristic !== 'investigate') out.kind = 'investigate';
+      else if (kindPick.choice === 'modify_existing' && heuristic === 'create' && confidentTarget) out.kind = 'modify';
+    }
+    if (confidentTarget && (out.kind ?? heuristic) !== 'create') out.target = confidentTarget;
+    if (out.kind || out.target) log.info(`[${this.manifest.name}] Task judged ${out.kind ?? heuristic}${out.target ? ` of ${out.target}` : ''} (${site})`);
+
+    const effective = out.kind ?? heuristic;
+    const fmt = (p: number): string => p.toFixed(2);
+    if (target && !out.target && tp >= 0.6) out.hints.push(`Possible existing target: ${target} (p=${fmt(tp)}); load_target if right.`);
+    if (!out.kind && kp >= 0.6) {
+      if (kindPick.choice === 'investigate_only' && effective !== 'investigate') {
+        out.hints.push(`This task reads as a question to answer with a written report (p=${fmt(kp)}); if so, finish with done and the report, and leave the source as it is.`);
+      } else if (kindPick.choice === 'modify_existing' && effective === 'create' && !(target && tp >= 0.6)) {
+        out.hints.push(`This task reads as a change to an existing object (p=${fmt(kp)}); find it and load_target it before editing.`);
+      } else if (kindPick.choice === 'clone_variant') {
+        out.hints.push(`This task reads as a variant of an existing object (p=${fmt(kp)}); clone_object copies one server-side under a new name.`);
+      } else if (kindPick.choice === 'compose') {
+        out.hints.push(`This task reads as combining existing objects (p=${fmt(kp)}); compose_organism joins them behind one interface.`);
+      }
+    }
+    return out;
+  }
+
+  // ── object-creator.draft ──
+
+  /**
+   * A task that names no persisted draft may still continue one: when the
+   * goal scratchpad holds drafts this loop could adopt, a decision model picks
+   * which, or none (site object-creator.draft). Acting at p ≥ 0.8 adopts it
+   * through loadPersistedDraft, so the same target checks apply.
+   */
+  private async judgePersistedDraft(goalId: string, state: LoopState, scope: { goalId?: string; taskId?: string; onBehalfOf: string }): Promise<void> {
+    const site = 'object-creator.draft';
+    if (!this.goalManagerId || await this.decisionSiteMode(site) === 'off') return;
+    let scratch: Record<string, unknown> | null = null;
+    try {
+      scratch = await this.sendRequest<Record<string, unknown> | null>(this.goalManagerId, 'readGoalData', { goalId }, 10000);
+    } catch { return; }
+    if (!scratch || typeof scratch !== 'object') return;
+    const drafts: Array<{ key: string; targetName: string | null; manifestName: string | null; lines: number; savedAt: string | null; at: number }> = [];
+    for (const [key, value] of Object.entries(scratch)) {
+      if (!key.startsWith(`${GOAL_DRAFT_KEY}/`) || typeof value !== 'string' || !value) continue;
+      try {
+        const p = JSON.parse(value) as { targetName?: string; targetObjectId?: string; manifest?: AbjectManifest; source?: string; savedAt?: number };
+        if (!p.source) continue;
+        // The same checks the loader applies: a draft for another target is not ours.
+        if (state.targetObjectId && p.targetObjectId !== state.targetObjectId) continue;
+        if (p.targetName && state.targetName && p.targetName !== state.targetName) continue;
+        drafts.push({
+          key,
+          targetName: p.targetName ?? null,
+          manifestName: p.manifest?.name ?? null,
+          lines: p.source.split('\n').length,
+          savedAt: typeof p.savedAt === 'number' ? new Date(p.savedAt).toISOString() : null,
+          at: typeof p.savedAt === 'number' ? p.savedAt : 0,
+        });
+      } catch { /* not a draft record */ }
+    }
+    if (drafts.length === 0) return;
+    const shown = drafts.sort((a, b) => b.at - a.at).slice(0, 254).map(({ at: _at, ...d }) => d);
+    const criteria: Record<string, string> = {};
+    shown.forEach((d, i) => { criteria[`d_${i}`] = `\`drafts[${i}]\`: the draft saved for "${d.targetName ?? d.manifestName ?? 'an unnamed object'}" (${d.lines} lines)`; });
+    criteria.none = 'None: this task starts its own work rather than continuing a saved draft.';
+    const outcome = await this.askDecision(site, { task: state.goal.slice(0, 1500), drafts: shown }, {
+      draft: { type: 'choice', instructions: 'Earlier tasks in this goal saved the staged drafts in `drafts` when they ended before deploying. Which one does `task` continue?', criteria },
+    }, { ...scope, timeoutMs: 15000 });
+    const pick = choiceOf(outcome, 'draft');
+    if (!outcome || !pick) return;
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const chosen = pick.choice === 'none' ? undefined : shown[Number(pick.choice.slice(2))];
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: draft=${chosen?.key ?? 'none'}@${p.toFixed(2)} of ${shown.length}`);
+    if (!chosen || outcome.mode === 'shadow') return;
+    if (outcome.mode === 'act' && p >= 0.8) {
+      await this.loadPersistedDraft(goalId, state, chosen.key);
+      return;
+    }
+    if (p >= 0.6) {
+      (state.dispatchHints ??= []).push(`A staged draft an earlier task in this goal saved may be the one this task continues: goal scratchpad key '${chosen.key}' (${chosen.targetName ?? chosen.manifestName ?? 'unnamed'}, ${chosen.lines} lines; p=${p.toFixed(2)}). If so, continue from it rather than re-authoring.`);
+    }
+  }
+
   // ── Observe / Act ─────────────────────────────────────────────────────
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; tier: string; llmContent?: ContentPart[] }> {
+  private async handleObserve(taskId: string, budget?: DecisionMemo['budget']): Promise<{ observation: string; tier: string; llmContent?: ContentPart[] }> {
     // Look up by AgentAbject-assigned ticketId; AgentAbject calls back with the
     // taskId we sent on startTask, so look for an entry whose state matches.
     // Since we keyed by ticketId, find by taskId-in-context: AgentAbject passes
@@ -3603,7 +4409,21 @@ ${source}
       return { observation: 'No active task. Reply with done({result: "no task"}).', tier: 'smart' };
     }
     extra.state.turn += 1;
-    const observation = this.renderObservation(extra.state);
+    const memo = (extra.decisions ??= {});
+    if (budget) memo.budget = budget;
+
+    // This turn's judgments run together: the tier (needed only once the
+    // observation is built), member relevance for a large source, and the
+    // advisor. The observation waits a bounded time for the last two; an
+    // answer that arrives later still reaches a following observation.
+    const tierJob = extra.lastLlmContent ? undefined : this.decideObserveTier(extra).catch(() => this.chooseObserveTier(extra.state));
+    await ObjectCreator.within(
+      Promise.all([this.memberRelevanceJob(extra), this.judgeAdvisor(extra).catch(() => { /* advisory */ })]),
+      ObjectCreator.OBSERVE_JUDGMENT_WAIT_MS,
+    );
+    const advice = memo.advice && memo.advice.turn >= extra.state.turn - 1 ? memo.advice.lines : [];
+    memo.advice = undefined;
+    const observation = this.renderObservation(extra.state, advice);
 
     // A screenshot staged by the previous act rides in as an image part, and
     // judging a rendered image is a reasoning step — force the smart tier so
@@ -3617,7 +4437,7 @@ ${source}
       return { observation, tier: 'smart', llmContent };
     }
 
-    return { observation, tier: this.chooseObserveTier(extra.state) };
+    return { observation, tier: tierJob ? await tierJob : this.chooseObserveTier(extra.state) };
   }
 
   /**
@@ -3795,7 +4615,11 @@ ${source}
 
   // ── Observation renderer ──────────────────────────────────────────────
 
-  private renderObservation(state: LoopState): string {
+  /**
+   * `advice` carries this turn's ADVISOR lines (site object-creator.advisor);
+   * they render beside the GATE line, where the agent weighs what to do next.
+   */
+  private renderObservation(state: LoopState, advice: string[] = []): string {
     const lines: string[] = [];
 
     lines.push('TASK');
@@ -3809,6 +4633,11 @@ ${source}
       lines.push(`  target: (new object)`);
     }
     lines.push(`  goal:   "${state.goal.slice(0, 400).replace(/\n/g, ' ')}"`);
+    // Task-start judgments (kind, target, saved draft) that stayed hints: shown once.
+    if (state.dispatchHints?.length) {
+      for (const hint of state.dispatchHints) lines.push(`  hint:   ${hint}`);
+      state.dispatchHints = undefined;
+    }
     lines.push('');
 
     lines.push('KNOWN OBJECTS (from describe / ask so far)');
@@ -3857,6 +4686,8 @@ ${source}
     // it every turn is what used to blow the conversation budget, so it renders
     // as a structural outline; read_draft({handler}) pulls any member's exact text.
     const targetLabel = state.targetName ?? state.targetObjectId?.slice(0, 8) ?? 'target';
+    // The LIKELY RELEVANT line (site object-creator.members) follows the first outline of a large source.
+    let relevanceShown = false;
     if (state.targetSource && state.renderedTargetSource !== state.targetSource) {
       const n = state.targetSource.split('\n').length;
       if (state.targetSource.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) {
@@ -3868,6 +4699,8 @@ ${source}
       } else {
         lines.push(`EXISTING SOURCE of ${targetLabel} (${n} lines — LIVE code, too large to inline)`);
         lines.push(this.sourceOutline(state.targetSource));
+        const relevance = this.relevanceLine(state, state.targetSource);
+        if (relevance) { lines.push(relevance); relevanceShown = true; }
         lines.push('Read any member with read_draft({handler:"name"}) before you change it.');
       }
       state.renderedTargetSource = state.targetSource;
@@ -3889,6 +4722,8 @@ ${source}
         const changed = current !== state.renderedSource;
         lines.push(`SOURCE OUTLINE (${nLines} lines — ${origin}${state.renderedSource === undefined ? '' : changed ? ', changed since last shown' : ', unchanged'})`);
         lines.push(this.sourceOutline(current));
+        const relevance = relevanceShown ? undefined : this.relevanceLine(state, current);
+        if (relevance) lines.push(relevance);
         lines.push('Full text is not re-pasted each turn. read_draft({handler:"name"}) shows a member exactly as it stands now; read_draft({grep:"..."}) searches it.');
       }
       state.renderedSource = current;
@@ -3919,7 +4754,14 @@ ${source}
     // is never a surprise.
     if (state.draftSource && state.kind !== 'investigate') {
       const gate = this.gateVerdict(state);
-      lines.push(gate.ok ? `GATE: satisfied — ${gate.note}` : `GATE: NOT satisfied — ${gate.reason}`);
+      // A satisfied gate may carry a judged note on what its exercising calls
+      // proved (site object-creator.evidence); the gate's strictness is unchanged.
+      lines.push(gate.ok ? `GATE: satisfied — ${gate.note}${this.evidenceNote(state)}` : `GATE: NOT satisfied — ${gate.reason}`);
+      lines.push('');
+    }
+
+    if (advice.length > 0) {
+      lines.push(...advice);
       lines.push('');
     }
 

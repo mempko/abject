@@ -20,6 +20,7 @@ import { require, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { type DecisionQuestion } from '../llm/decision.js';
 import {
   type ExposureSelectors,
   type ExposureSelectorsInput,
@@ -201,6 +202,19 @@ export class Registry extends Abject {
                 },
               },
               {
+                name: 'findCapable',
+                description: 'Which registered objects perform a requested capability directly through their methods, judged by a decision model over the catalog. Returns { matches: [{ id, name, description, methods, p }], none, emulated } ranked by probability, or { matches: [], answered: false } when no judgment was available (ask instead). An empty result is not proof of absence.',
+                parameters: [
+                  { name: 'need', type: { kind: 'primitive', primitive: 'string' }, description: 'The capability wanted, in plain words (e.g. "play a sound", "fetch a web page")' },
+                  { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Maximum matches (default 3, at most 10)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  matches: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+                  none: { kind: 'primitive', primitive: 'number' },
+                  emulated: { kind: 'primitive', primitive: 'boolean' },
+                } },
+              },
+              {
                 name: 'search',
                 description: 'Find objects by a text query matched against name, description, tags, and method names (case-insensitive substring). Returns a small ranked list of {id, name, typeId?, description, matchedOn}. The cheapest way to locate an object when you know roughly what it is called or does.',
                 parameters: [
@@ -327,11 +341,12 @@ If a caller is asking you ("what is the AbjectId for X?", "which object can do Y
 
 ### Discovery methods (ordered by preference for LLM-driven callers)
 1. \`ask({ question })\` — **preferred.** Ask me a question in natural language. I answer directly using the catalog.
-2. \`search({ query, limit? })\` — Compact text search over names, descriptions, tags, and method names (case-insensitive substring). Returns a small ranked list of \`{ id, name, typeId?, description, matchedOn }\`. The cheapest programmatic way to locate an object by rough name or capability.
-3. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
-4. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape. EXACT match only: those four keys are the whole vocabulary, and free text (\`{ query: 'canvas' }\`, or a name like \`'something 3D'\`) matches nothing and is REJECTED with an error. Rough names and "what can do X" belong in \`search\` or \`ask\`.
-5. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
-6. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\`, \`search\`, or \`listSummaries\` instead.
+2. \`findCapable({ need, limit? })\` — Structured "which object does X": ranked \`{ id, name, description, methods, p }\` matches judged over the whole catalog. Use it when code needs ids rather than prose.
+3. \`search({ query, limit? })\` — Compact text search over names, descriptions, tags, and method names (case-insensitive substring). Returns a small ranked list of \`{ id, name, typeId?, description, matchedOn }\`. The cheapest programmatic way to locate an object by rough name or capability.
+4. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
+5. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape. EXACT match only: those four keys are the whole vocabulary, and free text (\`{ query: 'canvas' }\`, or a name like \`'something 3D'\`) matches nothing and is REJECTED with an error. Rough names and "what can do X" belong in \`search\` or \`ask\`.
+6. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
+7. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\`, \`search\`, or \`listSummaries\` instead.
 
 ### Subscription & mutation
 - \`subscribe()\` / \`unsubscribe()\` — Receive \`objectRegistered\` / \`objectUnregistered\` events.
@@ -383,6 +398,60 @@ Each line shows one registered object: id, name, description, and non-meta metho
     return 'balanced';
   }
 
+  /** Keywords of a need, for ranking a catalog too large for one decision. */
+  private static needWords(text: string): string[] {
+    return [...new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 3))];
+  }
+
+  private async findCapable(need: string, max: number, callerId: AbjectId): Promise<{ matches: Array<{ id: AbjectId; name: string; description: string; methods: string[]; p: number }>; none?: number; emulated?: boolean; answered?: false }> {
+    let catalog = this.catalogForCaller(callerId)
+      .filter(reg => reg.id !== this.id && reg.manifest.interface.methods.some(m => !Registry.META_METHODS.has(m.name)));
+    if (catalog.length === 0) return { matches: [], answered: false };
+    if (catalog.length > 254) {
+      // One choice takes at most 255 options: keep the objects sharing the most words with the need.
+      const words = Registry.needWords(need);
+      const score = (reg: ObjectRegistration): number => {
+        const text = `${reg.name ?? reg.manifest.name} ${reg.manifest.description} ${reg.manifest.interface.methods.map(m => m.name).join(' ')}`.toLowerCase();
+        return words.filter(w => text.includes(w)).length;
+      };
+      catalog = [...catalog].sort((a, b) => score(b) - score(a)).slice(0, 254);
+    }
+    const byKey = new Map<string, ObjectRegistration>();
+    const criteria: Record<string, string> = {};
+    for (const reg of catalog) {
+      const base = (reg.name ?? reg.manifest.name ?? 'object').replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 36) || 'object';
+      let key = base;
+      for (let n = 2; byKey.has(key) || key === 'none'; n++) key = `${base}_${n}`;
+      byKey.set(key, reg);
+      const methods = reg.manifest.interface.methods.filter(m => !Registry.META_METHODS.has(m.name)).map(m => m.name);
+      criteria[key] = `${reg.manifest.description.slice(0, 300)} Methods: ${methods.slice(0, 20).join(', ')}`;
+    }
+    criteria.none = 'No listed object performs this capability directly.';
+    const questions: Record<string, DecisionQuestion> = {
+      best: {
+        type: 'choice',
+        instructions: 'Pick the registered object that performs `need` directly through its methods. Prefer the object that owns the capability over a general-purpose agent.',
+        criteria,
+      },
+    };
+    const outcome = await this.askDecision('registry.find', { need: need.slice(0, 1000) }, questions, { onBehalfOf: 'Registry' });
+    const best = outcome?.answers.best;
+    if (!outcome || best?.type !== 'choice') return { matches: [], answered: false };
+    const matches = Object.entries(best.probabilities)
+      .filter(([k, p]) => k !== 'none' && byKey.has(k) && p >= 0.05)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, max)
+      .map(([k, p]) => {
+        const reg = byKey.get(k)!;
+        return {
+          id: reg.id, name: reg.name ?? reg.manifest.name, description: reg.manifest.description,
+          methods: reg.manifest.interface.methods.filter(m => !Registry.META_METHODS.has(m.name)).map(m => m.name), p,
+        };
+      });
+    log.info(`[decision:${outcome.mode}] registry.find "${need.slice(0, 60)}": ${matches.map(m => `${m.name}@${m.p.toFixed(2)}`).join(', ') || 'none'}`);
+    return { matches, none: best.probabilities.none ?? 0, emulated: outcome.emulated };
+  }
+
   protected override async handleAsk(question: string, callerId?: AbjectId): Promise<string> {
     return this.askLlm(this.askPromptFor(question, callerId), question, this.askTier());
   }
@@ -422,6 +491,16 @@ Each line shows one registered object: id, name, description, and non-meta metho
       validateDiscoveryQuery(query);
       const results = await this.handleDiscover(query);
       return this.filterForCaller(results, msg.routing.from);
+    });
+
+    // Structured capability lookup (site registry.find): a decision model picks
+    // the objects whose methods perform the need, over the caller's catalog.
+    this.on('findCapable', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
+      const { need, limit } = msg.payload as { need?: string; limit?: number };
+      requireNonEmpty(need ?? '', 'need');
+      const max = typeof limit === 'number' && limit > 0 ? Math.min(Math.floor(limit), 10) : 3;
+      return this.findCapable(need!, max, msg.routing.from);
     });
 
     // Compact text search: the cheap "where is X / who does Y" lookup agents

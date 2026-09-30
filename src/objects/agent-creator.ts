@@ -13,6 +13,8 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
+import { noulOf } from '../llm/decision.js';
+import { askScopeQuestions } from '../core/decision-questions.js';
 
 const log = new Log('AgentCreator');
 
@@ -78,8 +80,8 @@ export class AgentCreator extends Abject {
     log.info('Registered with AgentAbject as advisory-only');
   }
 
-  protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
+  /** What this object advises on and leaves to others: its ask answers and its scope check both read it. */
+  private static readonly ASK_GUIDE = `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
 
 I provide design advice for new autonomous behavior that requires multiple cooperating objects: an agent with an LLM decision loop, a scheduler that fires on a recurring trigger, a watcher that reacts to events.
 
@@ -94,10 +96,40 @@ Examples I can advise on:
 - Running an existing agent — ObjectAgent invokes existing objects.
 
 I am advisory-only and do not execute creation tasks. ObjectCreator implements the design through ScrumMaster-planned tasks. When invited to a Sprint Plan, describe the proposed composition and the implementation work to assign to ObjectCreator. If the goal needs only a single object or only modifications, reply PASS so the work routes to ObjectCreator.`;
+
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + AgentCreator.ASK_GUIDE;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
+    const outOfScope = await this.askScopeGate(question);
+    if (outOfScope) return outOfScope;
     return this.askLlm(this.askPrompt(question), question, 'fast');
+  }
+
+  /**
+   * Whether a question is plainly outside what this object advises on, judged
+   * against its own description (site agent.ask-scope, act): a PASS with its
+   * reason, without the LLM call. Most goals get PASS here anyway, so the
+   * shortcut needs a near-certain judgment (in-scope p < 0.15). Undefined
+   * keeps the full answer path.
+   */
+  private async askScopeGate(question: string): Promise<string | undefined> {
+    const site = 'agent.ask-scope';
+    if (await this.decisionSiteMode(site) === 'off') return undefined;
+    const outcome = await this.askDecision(site, {
+      agent: { name: this.manifest.name, description: `${this.manifest.description}${AgentCreator.ASK_GUIDE}` },
+      question: question.slice(0, 3000),
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 5000 });
+    const p = noulOf(outcome, 'in_scope');
+    if (!outcome || p === undefined) return undefined;
+    const pass = p < 0.15;
+    if (outcome.mode !== 'act' || !pass) {
+      if (outcome.mode !== 'act') log.info(`[decision:${outcome.mode}] AgentCreator ${site}: in_scope=${p.toFixed(2)}${pass ? ' (would PASS)' : ''}`);
+      return undefined;
+    }
+    log.info(`[decision:act] AgentCreator ${site}: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    return `PASS: judged outside what I advise on (in-scope p=${p.toFixed(2)}); I advise on new autonomous behavior built from several cooperating objects (an agent, a scheduler, a watcher).`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

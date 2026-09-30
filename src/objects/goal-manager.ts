@@ -16,6 +16,8 @@ import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { canonical, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
 import { Log } from '../core/timed-log.js';
+import { failureQuestions, producesQuestions, FAILURE_KINDS, type FailureKind } from '../core/decision-questions.js';
+import { choiceOf, noulOf } from '../llm/decision.js';
 import { CONVERSATION_CONTEXT_KEY, conversationBriefing, type ConversationContext } from '../core/conversation-context.js';
 const log = new Log('GoalManager');
 
@@ -299,6 +301,87 @@ export class GoalManager extends Abject {
   }
 
   /** Publish one scratchpad key as its own LWW register. */
+  // ── Decisions (decision sites in the goal lifecycle) ──────────────────
+
+  /** How long a failure's classification may hold back the round-complete signal. */
+  private static readonly FAILURE_CLASSIFY_WAIT_MS = 8000;
+
+  /** Failure kinds that describe a whole task (see decision-questions.ts). */
+  private static readonly TASK_FAILURE_KINDS: readonly FailureKind[] = FAILURE_KINDS;
+
+  /** Errors the runtime itself writes: their class is known without a model. */
+  private static readonly KNOWN_FAILURES: Array<[RegExp, FailureKind]> = [
+    [/^Stopped by user|cancelled by the user/i, 'cancelled'],
+    [/Task was cancelled or superseded|superseded/i, 'cancelled'],
+    [/budget exhausted|Goal budget/i, 'budget'],
+    [/^Completion needs review after one correction/i, 'verification'],
+    [/^Max steps \(\d+\) reached|step budget/i, 'budget'],
+  ];
+
+  /**
+   * Record why a task failed under `learning/failure/<taskId>` (site
+   * goal.failure), so the planner reads a class beside the raw error. Known
+   * runtime errors are classified by rule; the rest by a decision model.
+   * Annotation only: what to do about it stays the planner's call.
+   */
+  private async classifyTaskFailure(goalId: GoalId, taskId: string, error: string, fields: Record<string, unknown>): Promise<void> {
+    const goal = this.goals.get(goalId);
+    if (!goal || /^Upstream task/i.test(error)) return;
+    const rule = GoalManager.KNOWN_FAILURES.find(([re]) => re.test(error))?.[1];
+    let record: Record<string, unknown> | undefined;
+    if (rule) {
+      record = { kind: rule, source: 'rule', at: Date.now() };
+    } else {
+      const history = ((fields.failureHistory as Array<{ agent: string; error: string }>) ?? []).slice(-3)
+        .map(f => ({ agent: f.agent, error: String(f.error).slice(0, 300) }));
+      const outcome = await this.askDecision('goal.failure', {
+        task: String(fields.description ?? '').slice(0, 1500),
+        error: error.slice(0, 2000),
+        history,
+        produces: ((fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
+      }, {
+        ...failureQuestions(GoalManager.TASK_FAILURE_KINDS),
+        partial_work_usable: { type: 'noul', instructions: 'Did the failed attempt produce outputs later work can reuse?' },
+      }, { goalId, taskId, onBehalfOf: 'GoalManager', timeoutMs: GoalManager.FAILURE_CLASSIFY_WAIT_MS });
+      const kind = choiceOf(outcome, 'failure_kind');
+      if (!outcome || !kind) return;
+      const p = kind.probabilities[kind.choice] ?? 0;
+      log.info(`[decision:${outcome.mode}] goal.failure ${taskId.slice(0, 8)}: ${kind.choice}@${p.toFixed(2)}`);
+      if (outcome.mode === 'shadow' || p < 0.5) return;
+      record = {
+        kind: kind.choice, p: Math.round(p * 100) / 100,
+        retrySame: noulOf(outcome, 'retry_same'), partialWorkUsable: noulOf(outcome, 'partial_work_usable'),
+        source: outcome.emulated ? 'emulated decision' : 'decision model', at: Date.now(),
+      };
+    }
+    const key = `learning/failure/${taskId}`;
+    goal.scratchpad[key] = record;
+    goal.updatedAt = Date.now();
+    this.syncScratchKeyToSharedState(goal, key, record);
+    this.syncGoalToSharedState(goal);
+  }
+
+  /**
+   * Does each declared output deliver its description (site goal.produces)?
+   * Presence is checked first, by rule. Acting, a confident "empty,
+   * placeholder, or promise of later work" rejects with the output named.
+   */
+  private async judgeProduces(goal: Goal, taskId: string, fields: Record<string, unknown>): Promise<string | undefined> {
+    const produces = ((fields.produces as Array<{ key: string; description: string }>) ?? []).filter(p => p.key !== `tasks/${taskId}/result`);
+    if (produces.length === 0) return undefined;
+    if (await this.decisionSiteMode('goal.produces') === 'off') return undefined;
+    const stringify = (v: unknown): string => { try { return typeof v === 'string' ? v : JSON.stringify(v) ?? ''; } catch { return String(v); } };
+    const outputs = produces.slice(0, 16).map(p => ({ key: p.key, description: String(p.description ?? '').slice(0, 300), value: stringify(goal.scratchpad[p.key]).slice(0, 1500) }));
+    const outcome = await this.askDecision('goal.produces', {
+      task: String(fields.description ?? '').slice(0, 1500), outputs,
+    }, producesQuestions(outputs.map(o => o.key)), { goalId: goal.id, taskId, onBehalfOf: 'GoalManager', timeoutMs: 20000 });
+    if (!outcome) return undefined;
+    const failing = outputs.filter((_, i) => (noulOf(outcome, `satisfied_${i}`) ?? 1) <= 0.1);
+    log.info(`[decision:${outcome.mode}] goal.produces ${taskId.slice(0, 8)}: ${failing.length}/${outputs.length} judged unsatisfied${failing.length ? ` (${failing.map(o => o.key).join(', ')})` : ''}`);
+    if (outcome.mode !== 'act' || failing.length === 0) return undefined;
+    return failing.map(o => `Output ${o.key} does not deliver: ${o.description || 'its declared purpose'}`).join('; ');
+  }
+
   private syncScratchKeyToSharedState(goal: Goal, key: string, value: unknown): void {
     const stamp = { updatedAt: Date.now(), peerId: this.selfPeerId };
     this.scratchStamps.set(`${goal.id}::${key}`, stamp);
@@ -2441,7 +2524,9 @@ reviews results and either plans another round or completes/fails the goal.
       const tuple = tuples.find(t => t.id === taskId);
       if (!tuple || ['cancelled', 'superseded', 'permanently_failed'].includes(String(tuple.fields.status))) return { accepted: false, reason: 'Task attempt is no longer active' };
       const missing = ((tuple.fields.produces as Array<{ key: string }>) ?? []).filter(p => !(p.key in goal.scratchpad) && p.key !== `tasks/${taskId}/result`);
-      return { accepted: missing.length === 0, reason: missing.length ? `Missing required outputs: ${missing.map(p => p.key).join(', ')}` : undefined };
+      if (missing.length) return { accepted: false, reason: `Missing required outputs: ${missing.map(p => p.key).join(', ')}` };
+      const unsatisfied = await this.judgeProduces(goal, taskId, tuple.fields).catch(() => undefined);
+      return unsatisfied ? { accepted: false, reason: unsatisfied } : { accepted: true };
     });
 
     this.on('completeTask', async (msg: AbjectMessage) => {
@@ -2546,7 +2631,15 @@ reviews results and either plans another round or completes/fails the goal.
       this.emittedTerminalTasks.add(taskId);
       this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
       if (goalId) {
-        this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
+        // Classify the failure for the planner first, bounded, so the review
+        // scrum this may trigger sees the class beside the error.
+        const classified = this.classifyTaskFailure(goalId as GoalId, taskId, error ?? '', currentFields).catch(() => undefined);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        void Promise.race([classified, new Promise(resolve => { timer = setTimeout(resolve, GoalManager.FAILURE_CLASSIFY_WAIT_MS); })])
+          .finally(() => {
+            clearTimeout(timer);
+            this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
+          });
       }
       return updateResult;
     });

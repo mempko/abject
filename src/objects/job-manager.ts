@@ -67,7 +67,7 @@ export interface JobResult {
  * entries with these keys are silently dropped on submit.
  */
 const RESERVED_CONTEXT_KEYS = new Set<string>([
-  'ask', 'call', 'dep', 'find', 'id', 'progress', 'console',
+  'ask', 'decide', 'call', 'dep', 'find', 'id', 'progress', 'console',
 ]);
 
 export class JobManager extends Abject {
@@ -550,10 +550,19 @@ export class JobManager extends Abject {
       return callFn(target as AbjectId, 'ask', { question });
     };
 
+    /**
+     * Typed judgments without prose: choice / noul (yes-no) / score answers
+     * with probabilities, through the LLM's decision model (or a chat model
+     * emulating one). An explicit call, so no decision-site policy applies.
+     */
+    const decideFn = async (state: unknown, questions: Record<string, unknown>) =>
+      callFn('LLM', 'decide', { state, questions });
+
     // Caller-bound values first; built-ins second so they cannot be shadowed.
     const context: Record<string, unknown> = {
       ...(userContext ?? {}),
       ask: askFn,
+      decide: decideFn,
       call: callFn,
       dep: depFn,
       find: findFn,
@@ -590,6 +599,7 @@ Jobs run in a sandboxed environment. Only these helpers and built-ins are availa
 - \`call(target, method, payload)\` — invoke a method on another object. Returns the method's reply.
 - \`dep(name)\` — resolve a dependency by name. Returns a Promise<AbjectId> (a string).
 - \`find(query)\` — find objects in the registry. Returns a Promise<AbjectId | null>. A miss is not proof of absence; ask the Registry.
+- \`decide(state, questions)\`: typed judgments with probabilities, no prose: \`{ q1: { type: 'choice', instructions, criteria: { key: 'meaning', ... } }, q2: { type: 'noul', instructions }, q3: { type: 'score', instructions, criteria: ['low', 'mid', 'high'] } }\`. Returns \`{ answers: { q1: { choice, confidence, probabilities }, q2: { noul }, q3: { score, confidence } }, emulated, calibrated }\`. Keep control flow in code; act on confident answers.
 - \`ask(question)\` — ask the Registry "which object does X?" from its whole catalog. \`ask(target, question)\` asks one object (AbjectId or registered name) about itself. Returns its answer as text.
 - \`id\` — this object's AbjectId
 - \`progress(pct)\` — report progress (0-100)

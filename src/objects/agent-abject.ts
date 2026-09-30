@@ -29,6 +29,11 @@ import { truncateText, conversationTextChars, enforceConversationCharBudget, isC
 import type { ContextAnchor } from '../llm/provider.js';
 import type { TierCapabilities } from './llm-object.js';
 import { Log } from '../core/timed-log.js';
+import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
+import {
+  predictionQuestions, progressQuestions, stopQuestions, failureQuestions, completionQuestions,
+  finalDispositionQuestions, relevanceQuestions, delegationQuestions, FAILURE_GUIDANCE, type FailureKind,
+} from '../core/decision-questions.js';
 
 const log = new Log('AgentAbject');
 
@@ -211,6 +216,12 @@ export interface PredictionRecord {
   /** Runtime verdict compares operation status only, never the free-text claim. */
   verdictScope?: 'operation-status';
   semanticVerdict?: 'unresolved';
+  /**
+   * A decision model's judgment of the free-text prediction against the
+   * result (site agent.prediction). Advisory evidence for the reviewer, kept
+   * apart from its own assessment.
+   */
+  decisionVerdict?: { verdict: string; confidence: number; probabilities: Record<string, number>; emulated: boolean };
   patterns?: Array<{ id: string; revision?: number; applicationRef?: string; provenanceError?: string; why: string }>;
   /** True when the action failed, which contradicts any expectation of it working. */
   missed?: boolean;
@@ -451,6 +462,20 @@ interface TaskEntry {
   lastObservationLlmContent?: ContentPart[];
   /** LLM tier hint from the last observe callback (e.g. 'fast', 'balanced'). */
   observeTier?: string;
+  /** Decisions about the step just taken, collected (bounded) before the next think. */
+  pendingJudgment?: Promise<string[]>;
+  /** Hints from a judgment that outlasted its wait, carried into the following think. */
+  lateJudgment?: string[];
+  /** Emulated failure judgments spent on this task (capped: each is a chat-model call). */
+  emulatedFailureJudgments?: number;
+  /** The latest progress verdict (site agent.progress): score level 0-4 and its probability. */
+  progressVerdict?: { level: number; p: number; step: number };
+  /** Set when the stop site, at act, judged the run should end with a diagnosis. */
+  stopJudgment?: string;
+  /** An identical action to retry once without a think, after a judged-transient failure. */
+  retryCandidate?: { action: AgentAction; key: string };
+  /** Consecutive think-tier verdicts of "routine", for hysteresis before a downgrade. */
+  routineStreak?: number;
   /** JSON Schema for structured result validation. */
   responseSchema?: Record<string, unknown>;
   /** Goal ID for cross-agent progress tracking via GoalManager. */
@@ -1620,6 +1645,8 @@ The registered object must implement these handlers to participate in the agent 
       try { agreement=await this.request(request(this.id,p.agentId,'ask',{question:`Can you execute this bounded child task using executeTask? ${p.task}. Return constraints, expected evidence, and failure semantics. It shares its parent's goal budget and cancellation.`}),30000); }
       catch (err) { const d=this.delegations.get(key)!; d.status='error'; d.error=String(err); await this.checkpointSession(parent); throw err; }
       if (parent.finished || String(parent.state.phase)==='error' || this.cancelledBeforeStart.has(key)) throw new Error('Parent was cancelled during collaborator negotiation');
+      const declined = await this.delegationJudgment(parent, p.task, target, agreement);
+      if (declined) { const d=this.delegations.get(key)!; d.status='error'; d.error=declined; await this.checkpointSession(parent); throw new Error(declined); }
       this.delegations.get(key)!.status='running';
       parent.state.llmMessages.push({role:'user',content:`Child agreement ${key}: ${JSON.stringify(agreement)}`});
       // Direct receiver execution gives a same-agent child its own task context and
@@ -2378,6 +2405,8 @@ The registered object must implement these handlers to participate in the agent 
       request(this.id, entry.agentId, 'agentObserve', {
         taskId: entry.state.id,
         step: entry.state.step,
+        maxSteps: entry.state.maxSteps,
+        extensionsLeft: MAX_STEP_EXTENSIONS - (entry.state.extensionsGranted ?? 0),
       }),
       60000,
     );
@@ -2622,6 +2651,11 @@ The registered object must implement these handlers to participate in the agent 
         entry.acceptanceEvidence = decision.evidence;
         // The owning receiver may attach verification limitations to the report.
         if (decision.result !== undefined && !entry.responseSchema) entry.state.result = decision.result;
+      } else if (this.registeredAgents.get(entry.agentId)?.canExecute !== false) {
+        // No receiver-owned check: a decision model judges whether the result
+        // completes the task (site agent.completion; rejects only when acting).
+        const judged = await this.completionJudgment(entry);
+        if (judged) return judged;
       }
       if (entry.dispatchTupleId && this.goalManagerId) {
         const decision = await this.request<{ accepted: boolean; reason?: string }>(request(this.id, this.goalManagerId, 'assessTask', {
@@ -3108,7 +3142,7 @@ The registered object must implement these handlers to participate in the agent 
             const obsResult = await this.executeStep(
               entry,
               `[${agentName}] Observe (step ${task.step + 1})`,
-              `return await call('${entry.agentId}', 'agentObserve', { taskId: '${task.id}', step: ${task.step} })`,
+              `return await call('${entry.agentId}', 'agentObserve', { taskId: '${task.id}', step: ${task.step}, maxSteps: ${task.maxSteps}, extensionsLeft: ${MAX_STEP_EXTENSIONS - (task.extensionsGranted ?? 0)} })`,
               () => this.observeStep(entry),
             );
             if (cancelledExternally()) break;
@@ -3668,7 +3702,9 @@ The registered object must implement these handlers to participate in the agent 
     // spinning — grant a bounded extension instead of killing a task
     // mid-delivery. New sessions use evidence novelty; signatures are only a
     // compatibility fallback for sessions created before activity tracking.
-    const { progressing, novel } = stepProgress(task);
+    const heuristic = stepProgress(task);
+    const { novel } = heuristic;
+    const progressing = await this.judgeExtension(entry, heuristic.progressing, agentName);
     const granted = task.extensionsGranted ?? 0;
     if (progressing && granted < MAX_STEP_EXTENSIONS) {
       task.extensionsGranted = granted + 1;
@@ -3684,11 +3720,15 @@ The registered object must implement these handlers to participate in the agent 
       return;
     }
 
-    log.info(`[${agentName}] Max steps (${task.maxSteps}) reached — attempting forced final LLM call`);
-
     // The budget is spent — any still-queued batched actions must not drain,
     // and the forced-final parse below must not enqueue new ones.
     entry.pendingActions = undefined;
+
+    // A decision model may settle the outcome without the forced smart call
+    // (site agent.final, when acting).
+    if (await this.finalDisposition(entry, agentName, setPhase)) return;
+
+    log.info(`[${agentName}] Max steps (${task.maxSteps}) reached — attempting forced final LLM call`);
 
     // Try one final LLM call to synthesize accumulated data
     try {
@@ -3859,6 +3899,451 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   // ═══════════════════════════════════════════════════════════════════
+  // Runtime decisions (decision sites in the shared loop)
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // A decision model judges the loop's recurring questions: did the result
+  // bear out the prediction, is the agent progressing or looping, why did an
+  // action fail, does a done result complete the task. Every judgment names
+  // its site (src/core/decision-sites.ts), whose mode comes back with the
+  // answer: shadow logs, advise adds a hint the model reads, act takes effect.
+  // A null answer (site off, no model, failure) always leaves today's path.
+
+  /** How long the next think waits for the previous step's judgments. */
+  private static readonly JUDGMENT_WAIT_MS = 6000;
+
+  /** Failure kinds that make sense for a single action (the rest describe whole tasks). */
+  private static readonly ACTION_FAILURE_KINDS: readonly FailureKind[] = [
+    'transient', 'bad_arguments', 'wrong_approach', 'missing_capability', 'permission_denied', 'external_blocked', 'target_bug',
+  ];
+
+  private static readonly LOOP_NUDGES: Record<string, string> = {
+    same_failure_repeating: 'The same failure keeps returning, even with changed arguments. Change the approach, Ask the owner of the failing object, or fail with your findings.',
+    same_success_no_new_info: 'Recent steps succeed but return nothing you did not already have. Act on what you know, or choose an observation that could change your mind.',
+    alternating_approaches: 'You are switching back and forth between approaches without resolving the open question. Pick one, name what would prove it wrong, and test that.',
+    blocked_external: 'Progress looks blocked on something outside your reach (a permission, resource, or person). Ask for it, or report the block.',
+  };
+
+  private static readonly THINK_TIER_QUESTIONS: Record<string, DecisionQuestion> = {
+    next_step: {
+      type: 'choice',
+      instructions: 'From the agent\'s state, predict what its NEXT response must do.',
+      criteria: {
+        routine: 'A mechanical follow-up: verify, continue reading, take the obvious next call, or report a result already gathered.',
+        reasoning: 'Diagnose a failure, plan, weigh ambiguous or conflicting evidence, or compose a final answer.',
+        authoring: 'Write or modify source code or other long structured content.',
+      },
+    },
+  };
+
+  private agentNameOf(entry: TaskEntry): string {
+    return this.registeredAgents.get(entry.agentId)?.name ?? 'agent';
+  }
+
+  private decisionScope(entry: TaskEntry): { goalId?: string; taskId: string; onBehalfOf: string } {
+    return { goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id, onBehalfOf: this.agentNameOf(entry) };
+  }
+
+  /** An action without its prose fields, long strings clipped: what a judge needs to see. */
+  private static briefAction(action: AgentAction | undefined): Record<string, unknown> {
+    if (!action) return {};
+    const { reasoning: _r, expect: _e, patterns: _p, ...rest } = action as Record<string, unknown>;
+    try {
+      return JSON.parse(JSON.stringify(rest, (_k, v) => (typeof v === 'string' && v.length > 300 ? `${v.slice(0, 300)}… [+${v.length - 300} chars]` : v)));
+    } catch {
+      return { action: action.action };
+    }
+  }
+
+  private static clip(value: unknown, max: number): string {
+    let text: string;
+    try { text = typeof value === 'string' ? value : JSON.stringify(value) ?? ''; } catch { text = String(value); }
+    return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text;
+  }
+
+  /** The agent's recent acted steps, oldest first, as a judge reads them. */
+  private static recentSteps(entry: TaskEntry, n = 8): Array<Record<string, unknown>> {
+    return (entry.predictions ?? []).slice(-n).map(p => ({
+      step: p.step, action: p.action, outcome: p.outcome,
+      ...(p.expect ? { expect: p.expect.slice(0, 160) } : {}),
+      ...(p.actual ? { result: p.actual.slice(0, 300) } : {}),
+    }));
+  }
+
+  /** Start the post-action judgments for the step just recorded; the next think collects them. */
+  private startStepJudgment(entry: TaskEntry): void {
+    const task = entry.state;
+    const action = task.action, result = task.lastResult;
+    if (!action || !result || entry.config.intermediateActions.includes(String(action.action))) return;
+    const record = entry.predictions?.at(-1);
+    const scope = this.decisionScope(entry);
+    const taskSummary = AgentAbject.summarizeTask(task.task).slice(0, 600);
+    const brief = AgentAbject.briefAction(action);
+    const jobs: Array<Promise<string[]>> = [];
+
+    const expect = typeof action.expect === 'string' ? action.expect.trim() : '';
+    if (expect && record) {
+      jobs.push(this.judgePrediction(entry, record, {
+        task: taskSummary, action: brief, expect, expect_outcome: action.expectOutcome ?? null,
+        outcome: result.success ? 'success' : 'failure',
+        result: AgentAbject.clip({ data: result.data, error: result.error }, 3000),
+      }, scope));
+    }
+    const recent = AgentAbject.recentSteps(entry, 10);
+    if (recent.length >= 4) {
+      jobs.push(this.judgeProgress(entry, {
+        task: taskSummary, recent, steps_used: task.step + 1, max_steps: task.maxSteps,
+        streak: task.failStreak ? { action: task.failStreak.signature.slice(0, 120), count: task.failStreak.count, error: task.failStreak.error.slice(0, 300) } : null,
+      }, scope));
+    }
+    if (!result.success && this.failureJudgmentAffordable(entry)) {
+      jobs.push(this.judgeFailure(entry, action, {
+        task: taskSummary, action: brief,
+        error: AgentAbject.clip(result.error ?? 'unknown error', 1500),
+        partial: result.data !== undefined ? AgentAbject.clip(result.data, 800) : null,
+        history: recent.filter(r => r.outcome === 'failure').slice(-3),
+      }, scope));
+    }
+    if (jobs.length === 0) return;
+    entry.pendingJudgment = Promise.all(jobs).then(lines => lines.flat()).catch(() => []);
+  }
+
+  /** Emulated failure judgments allowed per task, where each costs a chat-model call. */
+  private static readonly MAX_EMULATED_FAILURE_JUDGMENTS = 4;
+
+  /**
+   * A decision model judges every failure; an emulated one (a chat-model
+   * call apiece) judges only the first few of a task, where the guidance
+   * matters most and the loop is not yet paying for a stuck run.
+   */
+  private failureJudgmentAffordable(entry: TaskEntry): boolean {
+    if (this.tierCapsCache?.caps.decision?.native) return true;
+    const spent = entry.emulatedFailureJudgments ?? 0;
+    if (spent >= AgentAbject.MAX_EMULATED_FAILURE_JUDGMENTS) return false;
+    entry.emulatedFailureJudgments = spent + 1;
+    return true;
+  }
+
+  private async judgePrediction(entry: TaskEntry, record: PredictionRecord, state: Record<string, unknown>, scope: ReturnType<AgentAbject['decisionScope']>): Promise<string[]> {
+    const outcome = await this.askDecision('agent.prediction', state, predictionQuestions(), scope);
+    const verdict = choiceOf(outcome, 'prediction');
+    if (!outcome || !verdict) return [];
+    record.decisionVerdict = { verdict: verdict.choice, confidence: verdict.confidence, probabilities: verdict.probabilities, emulated: outcome.emulated };
+    const p = verdict.probabilities[verdict.choice] ?? 0;
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.prediction step ${record.step}: ${verdict.choice}@${p.toFixed(2)}`);
+      return [];
+    }
+    if (p < 0.7) return [];
+    if (verdict.choice === 'contradicted') {
+      return [`Your prediction for step ${record.step} looks CONTRADICTED by its result (p=${p.toFixed(2)}). Say what you learned and adjust the plan before choosing the next action.`];
+    }
+    if (verdict.choice === 'partially_supported') {
+      return [`Your prediction for step ${record.step} looks only partly borne out (p=${p.toFixed(2)}). Note which part held and which did not.`];
+    }
+    return [];
+  }
+
+  private async judgeProgress(entry: TaskEntry, state: Record<string, unknown>, scope: ReturnType<AgentAbject['decisionScope']>): Promise<string[]> {
+    const task = entry.state;
+    const lines: string[] = [];
+    const outcome = await this.askDecision('agent.progress', state, progressQuestions(), scope);
+    const loop = choiceOf(outcome, 'loop_state');
+    const progress = scoreOf(outcome, 'progress');
+    if (outcome && progress) {
+      const level = topLevel(progress);
+      entry.progressVerdict = { level, p: progress.probabilities[String(level)] ?? 0, step: task.step };
+    }
+    if (outcome?.mode === 'shadow') {
+      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.progress: loop=${loop?.choice ?? '?'} progress=${progress?.score ?? '?'}`);
+    } else if (outcome) {
+      const nudged = (task.nudgedSignatures ??= []);
+      const loopP = loop ? loop.probabilities[loop.choice] ?? 0 : 0;
+      if (loop && loop.choice !== 'none' && loopP >= 0.7 && AgentAbject.LOOP_NUDGES[loop.choice] && !nudged.includes(`decision:${loop.choice}`)) {
+        nudged.push(`decision:${loop.choice}`);
+        lines.push(AgentAbject.LOOP_NUDGES[loop.choice]);
+      }
+      if (progress && topLevel(progress) === 0 && (progress.probabilities['0'] ?? 0) >= 0.6 && !nudged.includes('decision:regressing')) {
+        nudged.push('decision:regressing');
+        lines.push('Recent steps look to be undoing earlier work. Check what changed before continuing.');
+      }
+    }
+
+    // A repeated identical failure: should the run end now, with a diagnosis,
+    // rather than after the remaining nudges (site agent.stop)?
+    if (task.failStreak && task.failStreak.count >= 4) {
+      const stop = await this.askDecision('agent.stop', state, stopQuestions(), scope);
+      const p = noulOf(stop, 'should_end_now');
+      if (stop && p !== undefined) {
+        if (stop.mode === 'act' && p >= 0.9) {
+          entry.stopJudgment = `Stopped: \`${task.failStreak.signature.slice(0, 80)}\` failed ${task.failStreak.count} times in a row (${task.failStreak.error.slice(0, 200) || 'no error text'}), and a runtime check judged further attempts very unlikely to change the outcome (p=${p.toFixed(2)}).`;
+        } else {
+          log.info(`[decision:${stop.mode}] ${scope.onBehalfOf} agent.stop: should_end_now=${p.toFixed(2)} after ${task.failStreak.count} identical failures`);
+        }
+      }
+    }
+    return lines;
+  }
+
+  private async judgeFailure(entry: TaskEntry, action: AgentAction, state: Record<string, unknown>, scope: ReturnType<AgentAbject['decisionScope']>): Promise<string[]> {
+    const outcome = await this.askDecision('agent.failure', state, failureQuestions(AgentAbject.ACTION_FAILURE_KINDS), scope);
+    const kind = choiceOf(outcome, 'failure_kind');
+    const retry = noulOf(outcome, 'retry_same');
+    if (!outcome || !kind) return [];
+    const p = kind.probabilities[kind.choice] ?? 0;
+    const key = `retry:${JSON.stringify(AgentAbject.briefAction(action))}`;
+    const nudged = (entry.state.nudgedSignatures ??= []);
+    if (kind.choice === 'transient' && p >= 0.85 && (retry ?? 0) >= 0.8 && !nudged.includes(key)) {
+      entry.retryCandidate = { action: structuredClone(action), key };
+    }
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ${scope.onBehalfOf} agent.failure: ${kind.choice}@${p.toFixed(2)} retry_same=${retry?.toFixed(2) ?? '?'}`);
+      return [];
+    }
+    if (p < 0.6) return [];
+    return [`The last failure looks like ${kind.choice.replace(/_/g, ' ')} (p=${p.toFixed(2)}): ${FAILURE_GUIDANCE[kind.choice as FailureKind]}.`];
+  }
+
+  /**
+   * Collect the previous step's judgments (bounded wait) into one hint
+   * message, and apply the judgments promoted to act: a stop becomes the
+   * agent's error terminal; a transient failure is retried once, unchanged,
+   * with the retry visible in the transcript.
+   */
+  private async applyStepJudgment(entry: TaskEntry): Promise<AgentAction | undefined> {
+    const pending = entry.pendingJudgment;
+    entry.pendingJudgment = undefined;
+    const late = entry.lateJudgment ?? [];
+    entry.lateJudgment = undefined;
+    let lines: string[] = [];
+    if (pending) {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<string[]>(resolve => { timer = setTimeout(() => resolve([]), AgentAbject.JUDGMENT_WAIT_MS); });
+      try { lines = await Promise.race([pending.then(l => { settled = true; return l; }), timeout]); } finally { clearTimeout(timer); }
+      // A slow (emulated) judgment still lands: it joins the following think.
+      if (!settled) void pending.then(l => { if (l.length && !entry.finished) (entry.lateJudgment ??= []).push(...l); });
+    }
+    const all = [...late.map(l => `(about an earlier step) ${l}`), ...lines];
+    if (all.length) {
+      entry.state.llmMessages.push({ role: 'user', content: `[Runtime check]\n${all.map(l => `- ${l}`).join('\n')}` });
+    }
+
+    if (entry.stopJudgment) {
+      const reason = entry.stopJudgment;
+      entry.stopJudgment = undefined;
+      entry.state.stalledOut = true;
+      log.warn(`[${this.agentNameOf(entry)}] ${reason}`);
+      const errorTerminal = Object.entries(entry.config.terminalActions).find(([, v]) => v.type === 'error')?.[0];
+      if (errorTerminal) return { action: errorTerminal, reason, error: reason };
+      entry.state.error = reason;
+      return { action: '_reparse_abort', reasoning: reason };
+    }
+
+    const retry = entry.retryCandidate;
+    entry.retryCandidate = undefined;
+    if (retry && await this.decisionSiteMode('agent.transient-retry') === 'act') {
+      (entry.state.nudgedSignatures ??= []).push(retry.key);
+      entry.state.llmMessages.push({ role: 'user', content: '[Runtime retry] The last failure was judged transient, so the runtime is repeating the same action once, unchanged. Its result follows as usual.' });
+      log.info(`[${this.agentNameOf(entry)}] Retrying ${String(retry.action.action)} once after a judged-transient failure`);
+      return { ...retry.action, reasoning: 'Runtime retry after a transient failure' };
+    }
+    return undefined;
+  }
+
+  /**
+   * The next think's tier. An agent's own hint wins; without one the step
+   * defaults to smart, and a decision model may judge it routine enough for
+   * balanced (site agent.tier; downgrade only, two routine verdicts in a row).
+   */
+  private async chooseThinkTier(entry: TaskEntry): Promise<'smart' | 'balanced' | 'code'> {
+    const hinted = this.resolveThinkTier(entry.observeTier);
+    if (entry.observeTier || entry.state.step === 0 || hinted !== 'smart') return hinted;
+    if (await this.decisionSiteMode('agent.tier') === 'off') return hinted;
+    const task = entry.state;
+    const outcome = await this.askDecision('agent.tier', {
+      agent: this.agentNameOf(entry),
+      task: AgentAbject.summarizeTask(task.task).slice(0, 600),
+      last_action: AgentAbject.briefAction(task.action),
+      last_ok: task.lastResult?.success ?? null,
+      last_error: task.lastResult?.success === false ? AgentAbject.clip(task.lastResult.error ?? '', 300) : null,
+      repeated_failures: task.failStreak?.count ?? 0,
+      latest_prediction: entry.predictions?.at(-1)?.decisionVerdict?.verdict ?? null,
+      steps_used: task.step, max_steps: task.maxSteps,
+      observation: (task.observation ?? '').slice(0, 1000),
+    }, AgentAbject.THINK_TIER_QUESTIONS, this.decisionScope(entry));
+    const pick = choiceOf(outcome, 'next_step');
+    if (!outcome || !pick) return hinted;
+    const routine = pick.choice === 'routine' && (pick.probabilities.routine ?? 0) >= 0.75;
+    entry.routineStreak = routine ? (entry.routineStreak ?? 0) + 1 : 0;
+    const downgrade = routine && entry.routineStreak >= 2;
+    if (outcome.mode !== 'act') {
+      if (downgrade) log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.tier: would think on balanced (routine@${(pick.probabilities.routine ?? 0).toFixed(2)})`);
+      return hinted;
+    }
+    return downgrade ? 'balanced' : hinted;
+  }
+
+  /**
+   * Older screenshots ride along on every step once taken. When a decision
+   * model judges the next step does not need to look at images, elide all but
+   * the latest (site agent.vision, act).
+   */
+  private async maybeElideImages(entry: TaskEntry): Promise<void> {
+    const messages = entry.state.llmMessages;
+    const withImages = messages.filter(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image'));
+    if (withImages.length < 2) return;
+    if (await this.decisionSiteMode('agent.vision') === 'off') return;
+    const task = entry.state;
+    const outcome = await this.askDecision('agent.vision', {
+      task: AgentAbject.summarizeTask(task.task).slice(0, 600),
+      last_action: AgentAbject.briefAction(task.action),
+      observation: (task.observation ?? '').slice(0, 1000),
+      images_in_conversation: withImages.length,
+    }, {
+      needs_image: { type: 'noul', instructions: 'Does choosing the next action require looking at the earlier images in the conversation, rather than working from the text?' },
+    }, this.decisionScope(entry));
+    const p = noulOf(outcome, 'needs_image');
+    if (!outcome || p === undefined || p >= 0.2) return;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.vision: would elide ${withImages.length - 1} earlier image message(s) (needs_image=${p.toFixed(2)})`);
+      return;
+    }
+    let elided = 0;
+    for (const m of withImages.slice(0, -1)) {
+      m.content = (m.content as ContentPart[]).map(part => {
+        if (part.type !== 'image') return part;
+        elided++;
+        return { type: 'text', text: '[Earlier image omitted: the next step works from text; the latest image is kept.]' } as ContentPart;
+      });
+    }
+    if (elided) log.info(`[${this.agentNameOf(entry)}] Elided ${elided} earlier image part(s) (needs_image=${p.toFixed(2)})`);
+  }
+
+  /** Whether a done result completes the task (site agent.completion); a rejection reason when acting. */
+  private async completionJudgment(entry: TaskEntry): Promise<string | undefined> {
+    if (await this.decisionSiteMode('agent.completion') === 'off') return undefined;
+    const task = entry.state;
+    const outcome = await this.askDecision('agent.completion', {
+      task: AgentAbject.summarizeTask(task.task).slice(0, 1500),
+      result: AgentAbject.clip(task.result, 3000),
+      recent: AgentAbject.recentSteps(entry, 6),
+      steps_used: task.step,
+    }, completionQuestions(), this.decisionScope(entry));
+    const status = choiceOf(outcome, 'completion_status');
+    if (!outcome || !status) return undefined;
+    const p = status.probabilities[status.choice] ?? 0;
+    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.completion: ${status.choice}@${p.toFixed(2)} claims_unsupported=${noulOf(outcome, 'claims_unsupported')?.toFixed(2) ?? '?'}`);
+    if (outcome.mode !== 'act' || p < 0.8) return undefined;
+    if (status.choice === 'not_done') return `Runtime completion check: the result reads as intentions or plans rather than outcomes (p=${p.toFixed(2)}). Deliver the requested outcome, or fail with your findings`;
+    if (status.choice === 'wrong_task') return `Runtime completion check: the result reads as an answer to a different request (p=${p.toFixed(2)}). Deliver what the task asked, or fail with your findings`;
+    return undefined;
+  }
+
+  /**
+   * The extension gate: the novelty heuristic, overridden by a recent,
+   * confident progress verdict when site agent.final acts (a run that is
+   * circling gets no extension; one clearly progressing does).
+   */
+  private async judgeExtension(entry: TaskEntry, heuristic: boolean, agentName: string): Promise<boolean> {
+    const verdict = entry.progressVerdict;
+    if (!verdict || verdict.step < entry.state.step - 3 || verdict.p < 0.7) return heuristic;
+    const judged = verdict.level >= 3 ? true : verdict.level <= 2 ? false : heuristic;
+    if (judged === heuristic) return heuristic;
+    const mode = await this.decisionSiteMode('agent.final');
+    log.info(`[decision:${mode}] ${agentName} extension: heuristic=${heuristic} judged=${judged} (progress level ${verdict.level}@${verdict.p.toFixed(2)})`);
+    return mode === 'act' ? judged : heuristic;
+  }
+
+  /**
+   * At the step limit, a decision model may settle the outcome without the
+   * forced smart call (site agent.final, act): a confident fail ends with a
+   * written reason and any salvaged partial; a confident done whose last
+   * result is the deliverable completes with it. True when it settled.
+   */
+  private async finalDisposition(entry: TaskEntry, agentName: string, setPhase: (p: AgentPhase) => void): Promise<boolean> {
+    if (await this.decisionSiteMode('agent.final') === 'off') return false;
+    const task = entry.state;
+    const outcome = await this.askDecision('agent.final', {
+      task: AgentAbject.summarizeTask(task.task).slice(0, 1500),
+      recent: AgentAbject.recentSteps(entry, 8),
+      last_result: task.lastResult ? AgentAbject.clip({ success: task.lastResult.success, data: task.lastResult.data, error: task.lastResult.error }, 2000) : null,
+      steps_used: task.step,
+    }, finalDispositionQuestions(), this.decisionScope(entry));
+    const disposition = choiceOf(outcome, 'final_disposition');
+    if (!outcome || !disposition) return false;
+    const p = disposition.probabilities[disposition.choice] ?? 0;
+    const deliverable = noulOf(outcome, 'last_result_is_deliverable') ?? 0;
+    log.info(`[decision:${outcome.mode}] ${agentName} agent.final: ${disposition.choice}@${p.toFixed(2)} deliverable=${deliverable.toFixed(2)}`);
+    if (outcome.mode !== 'act' || p < 0.8) return false;
+    const last = task.lastResult;
+    const salvageable = !!last?.success && last.data != null && last.data !== '';
+    if (disposition.choice === 'fail_with_partial' || disposition.choice === 'fail_nothing') {
+      if (disposition.choice === 'fail_with_partial' && salvageable) task.result = last!.data;
+      task.error = `Could not complete the task in ${task.maxSteps} steps; a runtime check judged it ${disposition.choice === 'fail_with_partial' ? 'incomplete with useful partial work (preserved)' : 'incomplete with nothing usable'} (p=${p.toFixed(2)}).`;
+      setPhase('error');
+      return true;
+    }
+    if (disposition.choice === 'done_complete' && deliverable >= 0.9 && salvageable) {
+      task.result = last!.data;
+      setPhase('done');
+      log.info(`[${agentName}] Max steps reached; the last result was judged the deliverable`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Drop recalled knowledge a decision model judges irrelevant to this task
+   * (site agent.knowledge, act). User-authored entries are kept unless judged
+   * irrelevant with high confidence and no background value.
+   */
+  private async filterRecalledKnowledge<K extends { title: string; type: string; content: string; origin?: string; usefulCount?: number }, P extends K>(
+    entry: TaskEntry, relevant: K[], patterns: P[],
+  ): Promise<{ relevant: K[]; patterns: P[] }> {
+    const all: K[] = [...relevant, ...patterns];
+    if (all.length === 0) return { relevant, patterns };
+    if (await this.decisionSiteMode('agent.knowledge') === 'off') return { relevant, patterns };
+    const outcome = await this.askDecision('agent.knowledge', {
+      task: AgentAbject.summarizeTask(entry.state.task).slice(0, 1500),
+      entries: all.map((e, i) => ({ i, title: e.title, type: e.type, origin: e.origin ?? 'agent', useful: e.usefulCount ?? 0, snippet: e.content.slice(0, 400) })),
+    }, relevanceQuestions(all.length), this.decisionScope(entry));
+    if (!outcome) return { relevant, patterns };
+    const drop = new Set<number>();
+    all.forEach((e, i) => {
+      const s = scoreOf(outcome, `rel_${i}`);
+      if (!s) return;
+      const irrelevant = (s.probabilities['0'] ?? 0) >= 0.6 && s.score < 0.7;
+      if (irrelevant && (e.origin !== 'user' || (s.probabilities['0'] ?? 0) >= 0.9)) drop.add(i);
+    });
+    if (drop.size === 0) return { relevant, patterns };
+    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.knowledge: ${outcome.mode === 'act' ? 'dropping' : 'would drop'} ${drop.size}/${all.length}: ${[...drop].map(i => all[i].title.slice(0, 40)).join(' | ')}`);
+    if (outcome.mode !== 'act') return { relevant, patterns };
+    return {
+      relevant: relevant.filter((_, i) => !drop.has(i)),
+      patterns: patterns.filter((_, i) => !drop.has(relevant.length + i)),
+    };
+  }
+
+  /** A collaborator's reply to a delegation, classified; a reason to stop when it declined (site agent.delegation, act). */
+  private async delegationJudgment(parent: TaskEntry, childTask: string, target: RegisteredAgent | undefined, agreement: unknown): Promise<string | undefined> {
+    if (await this.decisionSiteMode('agent.delegation') === 'off') return undefined;
+    const outcome = await this.askDecision('agent.delegation', {
+      child_task: childTask.slice(0, 1500),
+      collaborator: { name: target?.name, description: target?.description?.slice(0, 600) },
+      agreement: AgentAbject.clip(agreement, 2000),
+    }, delegationQuestions(), this.decisionScope(parent));
+    const verdict = choiceOf(outcome, 'agreement');
+    if (!outcome || !verdict) return undefined;
+    const p = verdict.probabilities[verdict.choice] ?? 0;
+    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(parent)} agent.delegation to ${target?.name ?? '?'}: ${verdict.choice}@${p.toFixed(2)}`);
+    if (outcome.mode !== 'act' || p < 0.8) return undefined;
+    if (verdict.choice === 'decline_out_of_scope') return `${target?.name ?? 'The collaborator'} declined the child task as outside its role; choose another collaborator or do it yourself.`;
+    if (verdict.choice === 'needs_clarification') return `${target?.name ?? 'The collaborator'} needs the child task clarified before it can execute; restate it with the missing details.`;
+    return undefined;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // Think (LLM conversation management)
   // ═══════════════════════════════════════════════════════════════════
 
@@ -3939,6 +4424,7 @@ The registered object must implement these handlers to participate in the agent 
   ): Promise<{ tier: 'smart' | 'balanced' | 'code'; provider?: string; model?: string }> {
     const messages = entry.state.llmMessages;
     if (!AgentAbject.conversationHasImages(messages)) return { tier };
+    await this.maybeElideImages(entry);
 
     const caps = await this.tierCapabilities();
     if (!caps || caps[tier]?.vision !== false) return { tier };
@@ -3988,9 +4474,15 @@ The registered object must implement these handlers to participate in the agent 
     // Add last action result
     this.addActionResultToConversation(entry);
 
+    // Runtime checks on the step just taken (decision sites): hints the model
+    // reads before choosing, or, where a site is promoted to act, a stop or
+    // an unchanged retry after a transient failure.
+    const judged = await this.applyStepJudgment(entry);
+    if (judged) return judged;
+
     // Vision-aware tiering runs before trim so a text-only path never
     // carries image bytes into compression either
-    const route = await this.applyVisionTiering(entry, this.resolveThinkTier(entry.observeTier));
+    const route = await this.applyVisionTiering(entry, await this.chooseThinkTier(entry));
 
     // Trim against the window of the model this step will actually run on,
     // which vision tiering may just have changed.
@@ -4360,12 +4852,15 @@ The preview often answers the question on its own — when it does, just act.`, 
           add('profile', block, false);
         }
 
-        const patterns = (woven?.patterns ?? []).filter(e => e.id);
+        let patterns = (woven?.patterns ?? []).filter(e => e.id);
         const patternIds = new Set(patterns.map(e => e.id));
 
         const profileTitles = new Set((profile ?? []).map(e => e.title));
-        const relevant = (matched ?? [])
+        let relevant = (matched ?? [])
           .filter(e => !profileTitles.has(e.title) && e.type !== 'pattern' && !patternIds.has(e.id));
+        // Keyword recall ranks by words, not by use to this task: a decision
+        // model may drop entries it judges irrelevant (site agent.knowledge).
+        ({ relevant, patterns } = await this.filterRecalledKnowledge(entry, relevant, patterns));
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Where an entry says which object or agent handles a kind of work, read it as a record of what happened once, not as a rule: capabilities move as skills and tools are installed, and the agent that wrote the note is often the one it names. Decide that question from the live roster and by asking. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
@@ -5139,6 +5634,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         observation: { taskId: task.id, ...entry.predictions!.at(-1), execution: task.execution, actual },
       }));
     }
+    this.startStepJudgment(entry);
   }
 
   private addActionResultToConversation(entry: TaskEntry): void {

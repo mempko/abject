@@ -18,6 +18,9 @@ import type { MCPServerSummary, MCPServerDetail } from './mcp-registry-client.js
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
 import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
 import { formatMCPToolList } from '../core/mcp-format.js';
+import { choiceOf, noulOf } from '../llm/decision.js';
+import type { DecisionQuestion } from '../llm/decision.js';
+import { askScopeQuestions } from '../core/decision-questions.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('SkillAgent');
@@ -47,6 +50,46 @@ function maskSecret(value: string): string {
   return `(set: ${value.slice(0, 4)}…${value.slice(-2)}, ${value.length} chars)`;
 }
 
+/**
+ * A skill's line in the team roster. This is the ONLY thing a planner
+ * sees when deciding whether this agent covers a request, so it has to
+ * survive the cut: an 80-char slice through the middle of a word threw
+ * away the half of chief's description that said it queries live state,
+ * leaving a fragment about "investigating evidence" that read as a poor
+ * match for "get me chief status" — and the goal went elsewhere.
+ */
+function summarizeSkill(text: string): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= SKILL_SUMMARY_CHARS) return clean;
+  // Cut on a word boundary and mark it, rather than stopping at the
+  // first sentence: a description's later clauses are often the
+  // specific ones, and trading them for a tidy full stop is how the
+  // clause that would have matched the request goes missing.
+  const window = clean.slice(0, SKILL_SUMMARY_CHARS);
+  const space = window.lastIndexOf(' ');
+  return `${(space > 0 ? window.slice(0, space) : window).replace(/[,;:.]$/, '')}…`;
+}
+
+/** A search_catalog hit: an MCP registry server or a ClawHub skill. */
+type CatalogHit =
+  | { kind: 'mcp'; name: string; description?: string; version?: string }
+  | { kind: 'skill'; slug: string; description?: string; version?: string };
+
+/** What the last action ran and what came back, as the result judgment reads it (never env values). */
+interface LastCall {
+  action: string;
+  skill?: string;
+  command?: string;
+  url?: string;
+  server?: string;
+  tool?: string;
+  exitCode?: number;
+  httpStatus?: number;
+  ok: boolean;
+  head: string;
+  tail?: string;
+}
+
 interface TaskExtra {
   lastResult?: string;
   /**
@@ -66,6 +109,10 @@ interface TaskExtra {
    * through to a dialog, however the real skill had been granted.
    */
   loadedSkills?: string[];
+  /** The task text, for runtime decisions that judge against it. */
+  task?: string;
+  /** The last action and its output, for the result judgment (site skill.result). */
+  lastCall?: LastCall;
 }
 
 export class SkillAgent extends Abject {
@@ -93,6 +140,12 @@ export class SkillAgent extends Abject {
 
   /** Cached system prompt (rebuilt when skills change). */
   private cachedSystemPrompt?: string;
+
+  /** The roster description last registered, for the ask-scope judgment. */
+  private rosterDescription?: string;
+
+  /** Configured skill env values, kept only to redact them from decision state (rebuilt when skills change). */
+  private secretValues?: string[];
 
   constructor() {
     super({
@@ -183,7 +236,37 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   }
 
   protected override async handleAsk(question: string): Promise<string> {
+    const pass = await this.askScopePass(question);
+    if (pass) return pass;
     return this.askLlm(this.askPrompt(question) + await this.askAvailabilityContext(), question, 'fast');
+  }
+
+  /**
+   * A clearly out-of-scope question answered PASS without the LLM call (site
+   * agent.ask-scope, act). The scope read is this agent's own: its manifest
+   * (install, manage, execute), the enabled skills in its roster line, and
+   * shell execution when that is available.
+   */
+  private async askScopePass(question: string): Promise<string | undefined> {
+    if (await this.decisionSiteMode('agent.ask-scope') === 'off') return undefined;
+    const description = [
+      this.manifest.description,
+      this.rosterDescription ?? '',
+      this.shellExecutorId ? 'It also runs host CLI commands (git, test runners, gh, npm, terminal scripts) to inspect repositories, run tests, and manage PRs.' : '',
+    ].filter(Boolean).join(' ').slice(0, 4000);
+    const outcome = await this.askDecision('agent.ask-scope', {
+      agent: { name: this.manifest.name, description },
+      question: question.slice(0, 3000),
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 8000 });
+    const p = noulOf(outcome, 'in_scope');
+    if (!outcome || p === undefined) return undefined;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] SkillAgent agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS)' : ''}`);
+      return undefined;
+    }
+    if (p >= 0.1) return undefined;
+    log.info(`SkillAgent agent.ask-scope: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    return `PASS: this asks for work outside installing, managing, and running installed skills (runtime scope check, in_scope p=${p.toFixed(2)}).`;
   }
 
   protected override async askAvailabilityContext(): Promise<string> {
@@ -250,11 +333,20 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       // SkillAgent's TaskExtra, and AgentAbject's queue inFlight slot share
       // one ID. Falls back to a fresh `skill-exec-${...}` for legacy callers.
       const taskId = explicitTaskId ?? tupleId ?? `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, { goalId });
+      this.taskExtras.set(taskId, { goalId, task: description });
       this._currentGoalId = goalId;
 
       try {
-        const systemPrompt = await this.buildSystemPrompt();
+        const [systemPrompt, preselect] = await Promise.all([
+          this.buildSystemPrompt(),
+          this.preselectSkill(description, { approach, failureHistory }, { goalId, taskId }),
+        ]);
+        // An authoring task is the Task Scope's immediate fail; judged
+        // confidently, it returns before the loop spends a think on it.
+        if (preselect.failFast) {
+          log.info(`executeTask: ${preselect.failFast}`);
+          return { success: false, error: preselect.failFast };
+        }
 
         const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
         if (failureHistory && failureHistory.length > 0) {
@@ -268,6 +360,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             { role: 'assistant', content: `I will accomplish this as follows: ${approach}` },
           );
         }
+        if (preselect.note) SkillAgent.addTaskNote(initialMessages, description, preselect.note);
 
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
@@ -298,15 +391,25 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     this.on('runTask', async (msg: AbjectMessage) => {
       const { task } = msg.payload as { task: string };
       const taskId = `skill-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, {});
+      this.taskExtras.set(taskId, { task });
 
       try {
-        const systemPrompt = await this.buildSystemPrompt();
+        const [systemPrompt, preselect] = await Promise.all([
+          this.buildSystemPrompt(),
+          this.preselectSkill(task, {}, { taskId }),
+        ]);
+        if (preselect.failFast) {
+          log.info(`runTask: ${preselect.failFast}`);
+          return { success: false, result: preselect.failFast };
+        }
+        const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+        if (preselect.note) SkillAgent.addTaskNote(initialMessages, task, preselect.note);
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
             taskId,
             task,
             systemPrompt,
+            initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
               timeout: 300000,
@@ -396,6 +499,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     this.on('changed', async (msg: AbjectMessage) => {
       if (msg.routing.from === this.skillRegistryId) {
         this.cachedSystemPrompt = undefined;
+        this.secretValues = undefined;
         // Re-register so agent description reflects current skills
         await this.registerWithAgentAbject();
       }
@@ -414,25 +518,6 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     // Always append the authoring-exclusion so dispatch never mistakes "wrap
     // a skill in a new object" for a skill-execution task.
     const AUTHORING_EXCLUSION = 'Best for exercising an installed skill or MCP tool to complete the task. Object authoring (widgets, apps, agents, bridges, proxies, relays, skill wrappers) belongs with a creation agent, including when the new object would wrap a skill or MCP server handled here.';
-    /**
-     * A skill's line in the team roster. This is the ONLY thing a planner
-     * sees when deciding whether this agent covers a request, so it has to
-     * survive the cut: an 80-char slice through the middle of a word threw
-     * away the half of chief's description that said it queries live state,
-     * leaving a fragment about "investigating evidence" that read as a poor
-     * match for "get me chief status" — and the goal went elsewhere.
-     */
-    const summarizeSkill = (text: string): string => {
-      const clean = text.replace(/\s+/g, ' ').trim();
-      if (clean.length <= SKILL_SUMMARY_CHARS) return clean;
-      // Cut on a word boundary and mark it, rather than stopping at the
-      // first sentence: a description's later clauses are often the
-      // specific ones, and trading them for a tidy full stop is how the
-      // clause that would have matched the request goes missing.
-      const window = clean.slice(0, SKILL_SUMMARY_CHARS);
-      const space = window.lastIndexOf(' ');
-      return `${(space > 0 ? window.slice(0, space) : window).replace(/[,;:.]$/, '')}…`;
-    };
     let description = `Executes tasks only when they match an installed skill. ${AUTHORING_EXCLUSION}`;
     const skillNames: string[] = [];
 
@@ -452,6 +537,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       } catch { /* use default */ }
     }
 
+    this.rosterDescription = description;
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'SkillAgent',
       description,
@@ -522,9 +608,21 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     const lastResult = extra?.lastResult ?? 'No previous action result.';
     // Invoking skills/MCP tools and reading their results is mechanical work
     // balanced does well and fast; escalate to smart only when the last
-    // action errored, where recovery reasoning is worth the cost.
-    const tier = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
+    // action errored, where recovery reasoning is worth the cost. A decision
+    // model may read what the result means instead (site skill.result): an
+    // expected non-zero exit stays on balanced, a rejected credential gets
+    // smart and a hint. It runs beside the live skill-state lookups.
+    const heuristicTier = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
+    const [skillState, judged] = await Promise.all([
+      this.liveSkillState(),
+      this.judgeLastResult(taskId, extra, heuristicTier),
+    ]);
+    const hint = judged.hint ? `\n\n${judged.hint}` : '';
+    return { observation: lastResult + hint + skillState, tier: judged.tier };
+  }
 
+  /** Installed skills and connected MCP servers as they stand now, for the observation. */
+  private async liveSkillState(): Promise<string> {
     // Include current skill state so the LLM knows what's already done
     let skillState = '';
     if (this.skillRegistryId) {
@@ -564,7 +662,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       } catch { /* best effort */ }
     }
 
-    return { observation: lastResult + skillState, tier };
+    return skillState;
   }
 
   /**
@@ -589,10 +687,15 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     this.taskExtras.set(taskId, extra);
     // Per-task goal context; the shared field is only a legacy fallback
     const goalId = extra.goalId;
+    // What ran and what came back, kept for the next observation's result
+    // judgment (site skill.result). Env values never enter it.
+    const call = SkillAgent.callOf(action);
+    const record = (text: string, ok: boolean): void => { extra.lastCall = { ...call, ok, ...SkillAgent.headTail(text) }; };
     // A failure is what the next observation must show; leaving lastResult
     // alone would echo the previous success and keep the tier on balanced.
     const fail = (error: string): { success: false; error: string } => {
       extra.lastResult = `Error: ${error}`;
+      record(error, false);
       return { success: false, error };
     };
     // A command or request that ran but failed (non-zero exit, HTTP error)
@@ -600,6 +703,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     // as the error, large output rides the payload channel behind a handle.
     const failedOutput = (summary: string, text: string): AgentActionResult => {
       extra.lastResult = `Error: ${resultEcho(text)}`;
+      record(text, false);
       if (text.length <= LARGE_PAYLOAD_CHARS) return fail(text);
       return { ...bulkAwareResult(text), success: false, error: `${summary} (full output held below; read it with read_chunk)` };
     };
@@ -628,6 +732,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             }),
             PERMISSION_AWARE_TIMEOUT,
           );
+          call.exitCode = execResult.exitCode;
           if (execResult.exitCode !== 0) {
             return failedOutput(`Exit code ${execResult.exitCode}`,
               `Exit code ${execResult.exitCode}\nstdout: ${execResult.stdout}\nstderr: ${execResult.stderr}`);
@@ -649,6 +754,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               body: action.body as string | undefined,
             }),
           );
+          call.httpStatus = httpResult.status;
           result = `HTTP ${httpResult.status}\n${httpResult.body ?? ''}`;
           if (!httpResult.ok) return failedOutput(`HTTP ${httpResult.status}`, result);
           break;
@@ -731,6 +837,8 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               : `- [skill] ${h.slug}${h.version ? ' (' + h.version + ')' : ''}: ${h.description ?? ''}`,
             );
             result = `Found ${hits.length} candidates:\n${lines.join('\n')}`;
+            const ranking = await this.rankCatalogHits(taskId, query, hits);
+            if (ranking) result += `\n\n${ranking}`;
           }
           break;
         }
@@ -803,6 +911,8 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             }),
             60000,
           );
+          // New values must be redacted from decision state from now on.
+          this.secretValues = undefined;
 
           // Never echo the values back: this string lands in the agent's
           // observation and from there in the LLM context and the log.
@@ -946,6 +1056,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       // quoting it back — this agent echoes its last result as the next
       // observation, so a large one used to be paid for twice.
       extra.lastResult = resultEcho(result);
+      record(result, true);
       return bulkAwareResult(result);
     } catch (err) {
       return fail(err instanceof Error ? err.message : String(err));
@@ -982,6 +1093,260 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     const bridgeId = await this.discoverDep(`MCPBridge-${server}`);
     if (bridgeId) return { bridgeId };
     return { error: `MCP server "${server}" not running. Is it installed and enabled?` };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Runtime decisions (skill choice, result meaning, catalog ranking)
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // A decision model answers typed questions at three points, each its own
+  // site with its own policy (src/core/decision-sites.ts): which installed
+  // skill a task needs, what the last result means, and which catalog entry
+  // matches a request. Shadow logs, advise adds a line the agent reads, act
+  // takes effect. A null answer (site off, no decision model, timeout)
+  // leaves today's path. Skill env values never enter a decision state.
+
+  /** Preselect choices that are not skill names. */
+  private static readonly PRESELECT_OPTIONS: Record<string, string> = {
+    skill_management: 'The task installs, enables, disables, configures, lists, or searches for skills or MCP servers, rather than using one.',
+    authoring_out_of_scope: 'The task asks to create, build, design, wrap, or modify an object, widget, app, agent, bridge, proxy, or integration: authoring work, even when the result would wrap a skill.',
+    none: 'No installed skill covers the task; it needs general shell, HTTP, file, or web work.',
+  };
+
+  /** Characters of preloaded skill instructions; load_skill returns the whole text. */
+  private static readonly PRELOAD_CHARS = 12000;
+
+  private static readonly RESULT_QUESTIONS: Record<string, DecisionQuestion> = {
+    last_result: {
+      type: 'choice',
+      instructions: 'A skill-execution agent ran `action` and got the output in `head` (and `tail` when long); `ok` is whether the runtime reported success. What does the result mean for its next step?',
+      criteria: {
+        success: 'It worked and returned what was asked for.',
+        expected_nonzero: 'A non-zero exit or empty result that is itself a normal answer, such as a search with no matches or a check that reports a difference.',
+        auth_or_credential: 'A credential is missing, expired, or rejected: unauthorized, forbidden, an invalid token, or a sign-in required.',
+        not_found: 'The command, file, tool, resource, or endpoint does not exist.',
+        server_or_network: 'A server error, timeout, outage, rate limit, or network failure.',
+        usage_error: 'Wrong arguments, flags, parameters, or input shape for the command or tool.',
+        other_failure: 'Some other failure.',
+      },
+    },
+  };
+
+  /** Result kinds whose next step needs recovery reasoning (the smart tier). */
+  private static readonly SMART_RESULTS = new Set(['auth_or_credential', 'usage_error', 'other_failure']);
+
+  /** Credential-shaped text in a command or output, masked before a decision state leaves the process. */
+  private static readonly SECRET_PATTERNS: RegExp[] = [
+    /(\bauthorization["']?\s*[:=]\s*["']?(?:bearer\s+|basic\s+|token\s+)?)[^\s"'&,}]+/gi,
+    /(\b[\w-]*(?:api[_-]?key|token|secret|password|passwd|pwd)["']?\s*[:=]\s*["']?)[^\s"'&,}]+/gi,
+    /\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[abpr])[-_][A-Za-z0-9_-]{12,}/g,
+  ];
+
+  /** The identifying fields of an action (what ran), without its payloads or env. */
+  private static callOf(action: AgentAction): Omit<LastCall, 'ok' | 'head' | 'tail'> {
+    const text = (v: unknown, n: number): string | undefined => (typeof v === 'string' && v ? v.slice(0, n) : undefined);
+    const kind = String(action.action);
+    const call: Omit<LastCall, 'ok' | 'head' | 'tail'> = { action: kind };
+    const skill = text(action.name, 120);
+    if (skill) call.skill = skill;
+    if (kind === 'shell') { const command = text(action.command, 400); if (command) call.command = command; }
+    if (kind === 'http' || kind === 'fetch') { const url = text(action.url, 300); if (url) call.url = url; }
+    if (kind === 'mcp_tool_call' || kind === 'list_mcp_tools') {
+      const server = text(action.server, 120), tool = text(action.tool, 120);
+      if (server) call.server = server;
+      if (tool) call.tool = tool;
+    }
+    return call;
+  }
+
+  /** The first 1500 and last 1000 characters of an output (no overlap). */
+  private static headTail(text: string): { head: string; tail?: string } {
+    return text.length <= 1500 ? { head: text } : { head: text.slice(0, 1500), tail: text.slice(Math.max(1500, text.length - 1000)) };
+  }
+
+  /** Add a runtime note to the opening user message, creating one that states the task when there is none. */
+  private static addTaskNote(messages: Array<{ role: 'user' | 'assistant'; content: string }>, task: string, note: string): void {
+    if (messages[0]?.role === 'user') messages[0].content += `\n\n${note}`;
+    else messages.unshift({ role: 'user', content: `Task: ${task}\n\n${note}` });
+  }
+
+  /**
+   * Which installed skill covers a task (site skill.preselect), asked before
+   * the loop starts. Advise, and act below its thresholds, add a hint to load
+   * that skill first. Act at ≥ 0.85 preloads the skill's instructions, and
+   * the agent still sends load_skill before the skill's commands: only a real
+   * load registers the skill for the permission grants its commands run
+   * under. Act at ≥ 0.9 on an authoring task returns the scope failure at once.
+   */
+  private async preselectSkill(
+    task: string,
+    context: { approach?: string; failureHistory?: Array<{ agent: string; error: string }> },
+    scope: { goalId?: string; taskId: string },
+  ): Promise<{ note?: string; failFast?: string }> {
+    if (!this.skillRegistryId) return {};
+    if (await this.decisionSiteMode('skill.preselect') === 'off') return {};
+    const [skills, servers] = await Promise.all([
+      this.request<EnabledSkillSummary[]>(request(this.id, this.skillRegistryId, 'getEnabledSkills', {}), 5000)
+        .catch(() => [] as EnabledSkillSummary[]),
+      this.request<Array<{ name: string; tools: Array<{ name: string }> }>>(request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}), 5000)
+        .catch(() => [] as Array<{ name: string; tools: Array<{ name: string }> }>),
+    ]);
+    const candidates = skills.filter(s => !Object.hasOwn(SkillAgent.PRESELECT_OPTIONS, s.name)).slice(0, 250);
+    const criteria: Record<string, string> = {};
+    for (const s of candidates) {
+      criteria[s.name] = `The installed skill "${s.name}": ${s.description.replace(/\s+/g, ' ').trim()}`.slice(0, 255);
+    }
+    Object.assign(criteria, SkillAgent.PRESELECT_OPTIONS);
+    const outcome = await this.askDecision('skill.preselect', {
+      task: task.slice(0, 2000),
+      approach: context.approach ? context.approach.slice(0, 600) : null,
+      failureHistory: (context.failureHistory ?? []).slice(-3).map(f => ({ agent: f.agent, error: f.error.slice(0, 300) })),
+      skills: candidates.map(s => ({ name: s.name, desc: summarizeSkill(s.description) })),
+      servers: servers.map(s => ({ name: s.name, tools: s.tools.slice(0, 25).map(t => t.name) })),
+    }, {
+      skill: {
+        type: 'choice',
+        instructions: 'Which installed skill covers `task`? A skill covers it when the task names the skill or asks for something its description does. `approach` is the planned route and `failureHistory` lists earlier failed attempts, when present.',
+        criteria,
+      },
+    }, { ...scope, onBehalfOf: this.manifest.name, timeoutMs: 20000 });
+    const pick = choiceOf(outcome, 'skill');
+    if (!outcome || !pick) return {};
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const skill = candidates.find(s => s.name === pick.choice);
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] SkillAgent skill.preselect: ${pick.choice}@${p.toFixed(2)}`);
+      return {};
+    }
+    if (outcome.mode === 'act') {
+      if (pick.choice === 'authoring_out_of_scope' && p >= 0.9) {
+        return { failFast: `This task is object authoring (creating or modifying an object, app, agent, bridge, or integration), which belongs with a creation agent; handing it back for routing (runtime scope check, p=${p.toFixed(2)}).` };
+      }
+      if (skill && p >= 0.85) {
+        log.info(`SkillAgent skill.preselect: preloading "${skill.name}" (p=${p.toFixed(2)})`);
+        const instructions = skill.instructions ?? '(no instructions)';
+        const shown = instructions.length > SkillAgent.PRELOAD_CHARS
+          ? `${instructions.slice(0, SkillAgent.PRELOAD_CHARS)}\n… [${instructions.length - SkillAgent.PRELOAD_CHARS} more chars; load_skill returns the whole text]`
+          : instructions;
+        return {
+          note: `[Runtime skill check] The installed skill "${skill.name}" likely covers this task (p=${p.toFixed(2)}), so its instructions are loaded below. Before its first command, send load_skill for it (it can share a response with that command): the load registers the skill for this task's permission grants.\n\nSkill ${skill.name}: ${skill.description}\n${shown}`,
+        };
+      }
+    }
+    if (skill && p >= 0.6) {
+      return { note: `[Runtime skill check] Likely skill: ${skill.name} (p=${p.toFixed(2)}); load_skill it first.` };
+    }
+    if (pick.choice === 'authoring_out_of_scope' && p >= 0.8) {
+      return { note: `[Runtime skill check] This task reads as object authoring (p=${p.toFixed(2)}). Per Task Scope, respond with fail and a short reason so routing reaches a creation agent.` };
+    }
+    return {};
+  }
+
+  /**
+   * What the last result means (site skill.result): the think tier follows
+   * the judged kind at act, and a likely credential problem adds a hint at
+   * advise or act. Configured env values and credential-shaped text are
+   * masked in the state.
+   */
+  private async judgeLastResult(taskId: string, extra: TaskExtra | undefined, heuristic: string): Promise<{ tier: string; hint?: string }> {
+    const call = extra?.lastCall;
+    if (!call) return { tier: heuristic };
+    if (await this.decisionSiteMode('skill.result') === 'off') return { tier: heuristic };
+    const redact = await this.secretRedactor();
+    const { head, tail, command, url, ...rest } = call;
+    const outcome = await this.askDecision('skill.result', {
+      ...rest,
+      ...(command ? { command: redact(command) } : {}),
+      ...(url ? { url: redact(url) } : {}),
+      head: redact(head),
+      ...(tail ? { tail: redact(tail) } : {}),
+    }, SkillAgent.RESULT_QUESTIONS, { goalId: extra?.goalId, taskId, onBehalfOf: this.manifest.name, timeoutMs: 5000 });
+    const kind = choiceOf(outcome, 'last_result');
+    if (!outcome || !kind) return { tier: heuristic };
+    const p = kind.probabilities[kind.choice] ?? 0;
+    const judgedTier = SkillAgent.SMART_RESULTS.has(kind.choice) ? 'smart' : 'balanced';
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] SkillAgent skill.result: ${kind.choice}@${p.toFixed(2)}${judgedTier !== heuristic && p >= 0.6 ? ` (would think on ${judgedTier}, not ${heuristic})` : ''}`);
+      return { tier: heuristic };
+    }
+    const authP = kind.probabilities.auth_or_credential ?? 0;
+    const hint = authP >= 0.7
+      ? `Runtime result check: the last result looks like a missing or rejected credential (p=${authP.toFixed(2)}); set_skill_config, or ask the user for the missing credential.`
+      : undefined;
+    if (outcome.mode === 'act' && p >= 0.6) {
+      if (judgedTier !== heuristic) log.info(`SkillAgent skill.result: thinking on ${judgedTier} (${kind.choice}@${p.toFixed(2)})`);
+      return { tier: judgedTier, hint };
+    }
+    return { tier: heuristic, hint };
+  }
+
+  /**
+   * A function that masks configured skill env values and credential-shaped
+   * text. The values are read once and dropped whenever skills or their
+   * config change.
+   */
+  private async secretRedactor(): Promise<(text: string) => string> {
+    if (!this.secretValues && this.skillRegistryId) {
+      const skills = await this.request<EnabledSkillSummary[]>(
+        request(this.id, this.skillRegistryId, 'getEnabledSkills', {}), 3000,
+      ).catch(() => undefined);
+      if (skills) {
+        const values = skills.flatMap(s => Object.values(s.env ?? {})).filter(v => typeof v === 'string' && v.length >= 6);
+        this.secretValues = [...new Set(values)].sort((a, b) => b.length - a.length);
+      }
+    }
+    const secrets = this.secretValues ?? [];
+    return (text: string): string => {
+      let out = text;
+      for (const secret of secrets) out = out.split(secret).join('[redacted]');
+      for (const pattern of SkillAgent.SECRET_PATTERNS) {
+        out = out.replace(pattern, (_m, prefix: unknown) => (typeof prefix === 'string' ? `${prefix}[redacted]` : '[redacted]'));
+      }
+      return out;
+    };
+  }
+
+  /**
+   * Rank search_catalog hits against the request (site skill.catalog, advise
+   * at most): the top three with probabilities ride along in the result
+   * text. Installing stays the agent's call, since an MCP server runs
+   * someone else's code.
+   */
+  private async rankCatalogHits(taskId: string, query: string, hits: CatalogHit[]): Promise<string | undefined> {
+    if (await this.decisionSiteMode('skill.catalog') === 'off') return undefined;
+    const shown = hits.slice(0, 20);
+    const labels: Record<string, string> = { none_match: 'none of these' };
+    const criteria: Record<string, string> = {};
+    shown.forEach((h, i) => {
+      const label = h.kind === 'mcp' ? `[mcp] ${h.name}` : `[skill] ${h.slug}`;
+      labels[`entry_${i}`] = label;
+      criteria[`entry_${i}`] = `${label}: ${(h.description ?? '').replace(/\s+/g, ' ').trim()}`.slice(0, 255);
+    });
+    criteria.none_match = 'None of these entries provides what the request asks for.';
+    const extra = this.taskExtras.get(taskId);
+    const outcome = await this.askDecision('skill.catalog', {
+      request: (extra?.task ?? query).slice(0, 1500),
+      query,
+    }, {
+      catalog_match: {
+        type: 'choice',
+        instructions: 'Which catalog entry best provides what `request` asks for? `query` is the search that found these entries.',
+        criteria,
+      },
+    }, { goalId: extra?.goalId, taskId, onBehalfOf: this.manifest.name, timeoutMs: 20000 });
+    const match = choiceOf(outcome, 'catalog_match');
+    if (!outcome || !match) return undefined;
+    const ranked = Object.entries(match.probabilities)
+      .filter(([key]) => labels[key])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([key, prob], i) => `${i + 1}. ${labels[key]} (p=${prob.toFixed(2)})`);
+    if (ranked.length === 0) return undefined;
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] SkillAgent skill.catalog "${query.slice(0, 60)}": ${ranked.join('; ')}`);
+      return undefined;
+    }
+    return `Runtime match check, most likely first: ${ranked.join('; ')}.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1324,14 +1689,8 @@ When using curl, use -s (silent) and pipe JSON through jq.
 
   // ─── Catalog search + install ───────────────────────────────────
 
-  private async searchCatalog(query: string, limit: number): Promise<Array<
-    | { kind: 'mcp'; name: string; description?: string; version?: string }
-    | { kind: 'skill'; slug: string; description?: string; version?: string }
-  >> {
-    const hits: Array<
-      | { kind: 'mcp'; name: string; description?: string; version?: string }
-      | { kind: 'skill'; slug: string; description?: string; version?: string }
-    > = [];
+  private async searchCatalog(query: string, limit: number): Promise<CatalogHit[]> {
+    const hits: CatalogHit[] = [];
 
     if (this.mcpRegistryClientId) {
       try {

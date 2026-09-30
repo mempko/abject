@@ -10,7 +10,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { v4 as uuidv4 } from 'uuid';
 import { captureConversation, identifyMessages, type ConversationContext } from '../core/conversation-context.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
-import { looksLikeAbsenceClaim, looksLikeClaim } from '../core/claims.js';
+import { looksLikeAbsenceClaim, looksLikeClaim, readReportVerdict } from '../core/claims.js';
+import { reportQuestions } from '../core/decision-questions.js';
+import { choiceOf, noulOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
@@ -30,6 +32,36 @@ const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
  * so it carries the tier through firstThinkTier instead of the observe hint).
  */
 const CHAT_THINK_TIER = 'balanced';
+
+/**
+ * How a user message should be handled (site chat.route). Chat itself can
+ * only converse; anything that acts or looks at live state becomes a goal.
+ */
+const CHAT_ROUTE_QUESTIONS: Record<string, DecisionQuestion> = {
+  route: {
+    type: 'choice',
+    instructions: 'The assistant can only converse; it acts and observes by creating goals that agents carry out. Any request to do, fetch, show, change, check, or investigate something (including questions about this system\'s objects, agents, skills, or state, and approvals of an earlier proposal) becomes a goal. Pick the handling for `message`, using `recent` for context.',
+    criteria: {
+      goal: 'Asks for an action, data, or an investigation of live or system state, even if it looks like a repeat.',
+      converse: 'A greeting, thanks, small talk, or a question answerable from facts already in the conversation or recent goal results.',
+      remember: 'Shares a standing personal fact or preference worth saving.',
+      clarify: 'Ambiguous in a way only the user can settle (which of their things, the desired outcome, an irreversible choice).',
+    },
+  },
+  self_contained: {
+    type: 'noul',
+    instructions: 'Can an agent act on `message` without the earlier conversation to resolve its references (it, that, yes do it, the second one)?',
+  },
+};
+
+const ROUTE_HINTS: Record<string, string> = {
+  goal: 'a request that needs a goal',
+  converse: 'conversation you can answer directly',
+  remember: 'a personal fact worth remembering',
+  clarify: 'ambiguous in a way only the user can settle',
+};
+
+type ChatTurn = { success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean };
 
 const DEFAULT_WIN_W = 640;
 const DEFAULT_WIN_H = 620;
@@ -2268,7 +2300,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async runTaskTurn(
     userText: string,
     messages: { role: string; content: string | ContentPart[] }[],
-  ): Promise<{ success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean }> {
+  ): Promise<ChatTurn> {
     this._goalCreatedThisTurn = false;
     this._streamBuffer = '';
     this.turnContext = this.captureGoalContext();
@@ -2314,6 +2346,101 @@ A single successful creation goal is a complete turn. End it with **done**.
    */
   private mightBeUngroundedClaim(text: string): boolean {
     return looksLikeClaim(text) || looksLikeAbsenceClaim(text);
+  }
+
+  /**
+   * Whether a goal-less reply gets the audit re-prompt (site chat.audit). The
+   * claim shapes above stay the floor. A decision model reads paraphrase and
+   * promises the shapes miss: advising, it can only add an audit; acting, it
+   * may also skip one the shapes flagged on a reply it reads as clean. When
+   * the shapes see nothing, only a real decision model is worth the wait.
+   */
+  private async shouldAuditReply(userText: string, draft: string): Promise<boolean> {
+    const shaped = this.mightBeUngroundedClaim(draft);
+    const mode = await this.decisionSiteMode('chat.audit');
+    if (mode === 'off') return shaped;
+    // Advising can only add an audit, so a shaped reply is audited either way.
+    if (mode === 'advise' && shaped) return true;
+    // An emulated reading costs a chat-model call: worth it only where acting
+    // on it can skip the re-prompt the shapes asked for.
+    const nativeOnly = !(mode === 'act' && shaped);
+    const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
+      .map(e => ({ role: e.role, content: e.content.slice(0, 300) }));
+    const outcome = await this.askDecision('chat.audit', {
+      request: userText.slice(0, 1500), text: draft.slice(0, 4000), goal_created_this_turn: false, recent,
+    }, reportQuestions(), { onBehalfOf: 'Chat', nativeOnly });
+    const verdict = outcome ? readReportVerdict(outcome.answers as Parameters<typeof readReportVerdict>[0]) : undefined;
+    if (!outcome || !verdict) return shaped;
+    const flagged = verdict.ungrounded || verdict.absence || verdict.promise;
+    log.info(`[decision:${outcome.mode}] chat.audit: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} flagged=${flagged} clean=${verdict.clean} shapes=${shaped}`);
+    if (outcome.mode === 'shadow') return shaped;
+    if (outcome.mode === 'advise') return shaped || flagged;
+    if (flagged) return true;
+    return verdict.clean ? false : shaped;
+  }
+
+  /**
+   * How to handle a user message (site chat.route). Shadow runs the verdict
+   * beside the normal turn and logs whether they agree; advise hands the
+   * verdict to the routing think as a hint; act creates a clear, self-contained
+   * goal directly, skipping the routing think.
+   */
+  private async routeAndRunTurn(
+    userText: string, initialMessages: { role: string; content: string | ContentPart[] }[], newAttachment: boolean,
+  ): Promise<ChatTurn> {
+    const mode = userText.trim() ? await this.decisionSiteMode('chat.route') : 'off';
+    if (mode === 'off') return this.runTaskTurn(userText, initialMessages);
+    const routing = this.decideRoute(userText, newAttachment);
+    if (mode === 'shadow') {
+      const turn = await this.runTaskTurn(userText, initialMessages);
+      void routing.then(r => {
+        if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}; the turn ${turn.goalCreated ? 'created a goal' : 'answered without a goal'}`);
+      });
+      return turn;
+    }
+    const r = await routing;
+    if (r && r.outcome.mode === 'act' && r.route === 'goal' && r.routeP >= 0.9 && r.selfContained >= 0.85 && !newAttachment) {
+      log.info(`[decision:act] chat.route: goal@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}; creating the goal directly`);
+      return this.createRoutedGoal(userText);
+    }
+    const hinted = r && r.routeP >= 0.8
+      ? [...initialMessages, { role: 'user', content: `[Routing hint] A runtime check reads this message as ${ROUTE_HINTS[r.route] ?? r.route} (p=${r.routeP.toFixed(2)}). Decide as usual.` }]
+      : initialMessages;
+    return this.runTaskTurn(userText, hinted);
+  }
+
+  private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number; selfContained: number } | null> {
+    const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
+      .map(e => ({ role: e.role, content: e.content.slice(0, 500) }));
+    const recentGoals = [...this.liveGoals.values()].slice(-3).map(g => ({ title: g.title, status: g.status }));
+    const outcome = await this.askDecision('chat.route', {
+      message: userText.slice(0, 3000), recent, recent_goals: recentGoals, has_new_attachment: newAttachment,
+    }, CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat' });
+    const route = choiceOf(outcome, 'route');
+    if (!outcome || !route) return null;
+    return { outcome, route: route.choice, routeP: route.probabilities[route.choice] ?? 0, selfContained: noulOf(outcome, 'self_contained') ?? 0 };
+  }
+
+  /**
+   * A goal created without the routing think: the user's words verbatim as
+   * the description (the conversation rides along as context, as it does for
+   * any goal), and a title cut from the first line.
+   */
+  private async createRoutedGoal(userText: string): Promise<ChatTurn> {
+    this._goalCreatedThisTurn = false;
+    this.turnContext = this.captureGoalContext();
+    try {
+      const firstLine = userText.split('\n').find(l => l.trim())?.trim() ?? userText.trim();
+      const title = firstLine.length > 80 ? `${firstLine.slice(0, 80).trimEnd()}\u2026` : firstLine;
+      const outcome = await this.handleAgentAct({ action: 'goal', title, description: userText.trim() } as AgentAction, { id: this.id, taskId: `route-${uuidv4()}` }) as { success: boolean; error?: string };
+      if (!outcome.success) {
+        // Fall back to the normal turn: nothing was created.
+        return this.runTaskTurn(userText, this.conversationHistory.filter(e => e.media !== true).slice(-MAX_CONVERSATION_ENTRIES).map(e => ({ role: e.role, content: e.content })));
+      }
+      return { success: true, result: '', goalCreated: this._goalCreatedThisTurn };
+    } finally {
+      this.turnContext = undefined;
+    }
   }
 
   /**
@@ -2386,7 +2513,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Goal is created on the first `goal` action — Chat creates it via
       // GoalManager.createGoal, ScrumMaster runs the scrum cycle (plan,
       // execute, plan again or declare done), and emits goalCompleted.
-      let turn = await this.runTaskTurn(userText, initialMessages);
+      let turn = await this.routeAndRunTurn(userText, initialMessages, attachmentsInjected);
 
       // Self-audit: a `done` that reports an action or a verified outcome but
       // ran NO goal this turn is ungrounded — the model can't have done or
@@ -2395,7 +2522,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Scoped to goal-less, claim-shaped replies so greetings/answers skip it.
       if (turn.success && !turn.goalCreated) {
         const draft = (turn.result as string) ?? '';
-        if (draft && this.mightBeUngroundedClaim(draft)) {
+        if (draft && await this.shouldAuditReply(userText, draft)) {
           log.info('[Chat] self-audit: goal-less claim-shaped reply — re-prompting to ground or route');
           const auditMessages = [
             ...initialMessages,

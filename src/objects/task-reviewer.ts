@@ -39,8 +39,10 @@ import { request } from '../core/message.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
 import { makePattern, readPattern, serializePattern, PATTERN_FIELDS } from '../core/pattern.js';
 import type { AgentAction, PredictionRecord } from './agent-abject.js';
-import { verificationRecordOf, renderVerificationRecord } from './scrum-master.js';
+import { verificationRecordOf, renderVerificationRecord, type VerificationRecordEntry } from './scrum-master.js';
 import { learningFingerprint, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
+import { boundDecisionState, choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
+import type { DecisionMode } from '../core/decision-sites.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('TASK-REVIEWER');
@@ -66,6 +68,31 @@ const MAX_TASKS_PER_GOAL_REVIEW = 6;
 const GOAL_TRANSCRIPT_BUDGET = 40000;
 /** Goal reviews waiting for the in-flight review to finish. */
 const MAX_PENDING_GOAL_REVIEWS = 5;
+
+// Decision-model thresholds (sites reviewer.*; see src/core/decision-sites.ts).
+/** reviewer.worth (act): a routine verdict this sure settles a review without the model pass... */
+const ROUTINE_MIN_P = 0.85;
+/** ...provided owner evidence is this unlikely to contradict injected knowledge. */
+const ROUTINE_MAX_CONFLICT = 0.2;
+/** reviewer.worth (act): the day's last review slots wait for reviews judged valuable. */
+const RESERVED_REVIEW_SLOTS = 6;
+/** Worth verdicts kept per goal, so a deferred review is not judged again on every drain. */
+const WORTH_CACHE_MAX = 50;
+/** reviewer.predictions (act): below this, an automated assessment records unresolved. */
+const AUTO_ASSESS_MIN_P = 0.9;
+/** Episodes judged in one reviewer.predictions request. */
+const MAX_JUDGED_EPISODES = 48;
+/** reviewer.fidelity (act): a verdict this sure fills a missing summaryFidelity. */
+const AUTO_FIDELITY_MIN_P = 0.8;
+/** reviewer.patterns (act): a verdict this sure fills an unassessed application. */
+const AUTO_PATTERN_MIN_P = 0.85;
+/** Pattern applications judged in one reviewer.patterns request; filled per completion. */
+const MAX_JUDGED_APPLICATIONS = 24;
+const MAX_FILLED_APPLICATIONS = 12;
+/** reviewer.privacy (advise): a leak costs more than a false alarm, so warn early. */
+const PRIVACY_WARN_P = 0.5;
+/** reviewer.dedupe (act): a relation this sure turns a new entry away. */
+const DEDUPE_ACT_P = 0.85;
 
 interface TaskCompletedEvent {
   taskId: string;
@@ -95,9 +122,47 @@ interface TranscriptResponse {
 interface LearningUpdate {
   key: string;
   action: AgentAction;
-  status: 'saved' | 'rejected' | 'unresolved';
+  /** 'duplicate': turned away because the knowledge base already holds it; nothing is pending. */
+  status: 'saved' | 'rejected' | 'unresolved' | 'duplicate';
   result?: unknown;
   error?: string;
+}
+
+/** One decision-model judgment, kept on the review for priors and automated records. */
+interface Judgment {
+  choice: string;
+  /** Probability of `choice`. */
+  p: number;
+  probabilities: Record<string, number>;
+  emulated: boolean;
+  /** Settled by a rule, not a model (an unobserved outcome stays inconclusive). */
+  deterministic?: boolean;
+}
+
+/** Judgments made when a goal review launches (sites reviewer.predictions, reviewer.fidelity, reviewer.patterns). */
+interface ReviewJudgments {
+  /** Keyed `<taskId>:<step>`. */
+  predictions?: { mode: DecisionMode; byEpisode: Record<string, Judgment> };
+  fidelity?: { mode: DecisionMode; verdict: 'consistent' | 'misreported' | 'unverifiable'; p: number; staleFigure?: number; caveatDropped?: number; emulated: boolean; deterministic?: boolean };
+  /** Keyed `<taskId>:<step>:<patternId>`. */
+  patterns?: { mode: DecisionMode; byApplication: Record<string, Judgment> };
+}
+
+/** How much a finished goal or task could teach (site reviewer.worth). */
+interface WorthVerdict {
+  mode: DecisionMode;
+  level: number;
+  /** Probability of `level`. */
+  levelP: number;
+  /** Probability of level 0 (routine success). */
+  routineP: number;
+  /** Probability of level 2 or above. */
+  highP: number;
+  /** Probability that owner evidence contradicts injected knowledge. */
+  conflict: number;
+  emulated: boolean;
+  /** Deferred while the day's reserved slots wait for valuable reviews. */
+  deferred?: boolean;
 }
 
 interface ReviewTaskExtra {
@@ -112,6 +177,10 @@ interface ReviewTaskExtra {
   completionIssues?: string[];
   /** Set once the goal's summary-fidelity verdict is on record. */
   summaryFidelityRecorded?: boolean;
+  /** Decision-model judgments made at launch; priors in the dossier, automated records when a site acts. */
+  judgments?: ReviewJudgments;
+  /** Set once missing assessments were recorded from the judgments (one pass per review). */
+  automatedAssessments?: boolean;
   assessments?: Record<string, { verdict: string; explanation?: string }>;
   applicationAssessments?: Record<string, string>;
   lastResult?: string;
@@ -127,6 +196,169 @@ interface PendingGoalReview {
   goalId: string;
   outcome: 'completed' | 'failed';
   detail?: string;
+}
+
+// ── Decision questions (file-local; shared ones live in src/core/decision-questions.ts) ──
+
+const WORTH_LEVELS = [
+  'Routine success: predictions evidently supported, no errors, no knowledge conflict',
+  'Minor errors, recovered easily',
+  'Contradicted predictions, retries, a failed goal, or claims about permissions or access',
+  'A misreported summary, or owner evidence contradicting injected knowledge',
+];
+
+function worthQuestions(): Record<string, DecisionQuestion> {
+  return {
+    learning_value: {
+      type: 'score',
+      instructions: 'How much could a learning review of this finished work teach the workspace? Judge from `goal`, `user_result`, `tasks`, `injected_knowledge` and `verification`.',
+      criteria: WORTH_LEVELS,
+    },
+    knowledge_conflict: {
+      type: 'noul',
+      instructions: 'Does owner evidence (task outcomes, errors, verification receipts) contradict any claim named in `injected_knowledge`?',
+    },
+  };
+}
+
+/** One choice per episode, in GoalManager's assessment vocabulary. */
+function reviewPredictionQuestions(count: number): Record<string, DecisionQuestion> {
+  const out: Record<string, DecisionQuestion> = {};
+  for (let i = 0; i < count; i++) {
+    out[`q_${i}`] = {
+      type: 'choice',
+      instructions: `Before acting, an agent stated \`episodes[${i}].expect\`. Judge its material claims against the observed \`episodes[${i}].actual\`, reading the result by the operation's own semantics: a diff that finds differences or a search with no matches can exit non-zero as an ordinary finding, and exit 0 can still hide skipped or partial work. Judge the prediction, not whether the operation succeeded. \`prior\`, when present, is an earlier automated judgment of the same step; weigh it, and let the evidence decide.`,
+      criteria: {
+        supported: 'Every material claim in the prediction is borne out by the observed result.',
+        contradicted: 'The observed result disproves a material claim in the prediction.',
+        unresolved: 'The observation is missing, truncated where it matters, or silent on a material claim, and nothing in it disproves the prediction.',
+      },
+    };
+  }
+  return out;
+}
+
+function fidelityQuestions(): Record<string, DecisionQuestion> {
+  return {
+    fidelity: {
+      type: 'choice',
+      instructions: '`user_result` is what the user was told. `receipts` are the recorded verification runs, newest first; `task_reports` are what each task reported. Judge whether the user-facing result is faithful to that record.',
+      criteria: {
+        consistent: 'Every test or check figure in `user_result` matches the NEWEST receipt, and the caveats the tasks reported (what they did not cover, run, or verify) survive into it.',
+        misreported: 'A figure or claim in `user_result` is contradicted or unsupported by the receipts, or a caveat a task reported was dropped.',
+      },
+    },
+    stale_figure: {
+      type: 'noul',
+      instructions: 'Does `user_result` quote a test or check figure that matches an older receipt rather than the newest one?',
+    },
+    caveat_dropped: {
+      type: 'noul',
+      instructions: 'Did a caveat from `task_reports` (something a task did not cover, run, or verify) disappear from `user_result`?',
+    },
+  };
+}
+
+function patternQuestions(count: number): Record<string, DecisionQuestion> {
+  const out: Record<string, DecisionQuestion> = {};
+  for (let i = 0; i < count; i++) {
+    out[`a_${i}`] = {
+      type: 'choice',
+      instructions: `\`applications[${i}]\` records that an agent followed \`applications[${i}].pattern\` at one step, for the reason in \`why\`. From its \`episode\`, its task outcome and \`goal_outcome\`, what did following the pattern's \`therefore\` do?`,
+      criteria: {
+        helpful: 'The outcome benefited because the Therefore was followed.',
+        harmful: 'Following the Therefore contributed to a failure.',
+        inconclusive: 'It was followed, but its benefit or harm cannot be separated from other causes.',
+      },
+    };
+  }
+  return out;
+}
+
+const DETAIL_KINDS: Record<string, string> = {
+  personal_name: 'a person\'s name',
+  email_address: 'an email address',
+  account_or_id: 'an account name or identifier',
+  absolute_path: 'an absolute or home-directory file path',
+  host_or_url: 'a specific host, address, or private URL',
+  secret_or_token: 'a password, key, or token',
+  other_detail: 'another detail specific to this workspace',
+};
+
+function privacyQuestions(): Record<string, DecisionQuestion> {
+  return {
+    workspace_specific_detail: {
+      type: 'noul',
+      instructions: 'Does `skill` (its name, description, or instructions) carry details specific to one workspace or person: names, email addresses, account ids, absolute file paths, hostnames, or tokens? Generic placeholders such as <user> or ~/project do not count.',
+    },
+    generic_multistep_procedure: {
+      type: 'noul',
+      instructions: 'Is `skill` a reusable, generic procedure of several steps that other tasks could follow as written?',
+    },
+    detail_kind: {
+      type: 'choice',
+      instructions: 'If `skill` carries a workspace-specific detail, which kind is the most prominent?',
+      criteria: Object.fromEntries(Object.keys(DETAIL_KINDS).map(k => [k, `It includes ${DETAIL_KINDS[k]}.`])),
+    },
+  };
+}
+
+const ENTRY_KIND_ADVICE: Record<string, string> = {
+  route_procedure: 'save what holds true (what a thing is, what it exposes, what its output means) and leave the route to the task',
+  goal_specific_scratchpad: 'the goal scratchpad already keeps goal-specific findings; the knowledge base keeps lessons that outlive the goal',
+  user_profile_fact: 'tag user facts "profile"',
+};
+
+function dedupeQuestions(count: number): Record<string, DecisionQuestion> {
+  const relation: Record<string, string> = {};
+  for (let i = 0; i < count; i++) {
+    relation[`duplicate_of_${i}`] = `Says what \`existing[${i}]\` already says: saving it would add a second copy.`;
+    relation[`refines_${i}`] = `Corrects, narrows, or extends \`existing[${i}]\`: that entry could absorb it.`;
+  }
+  relation.new = 'Covers something none of `existing` holds.';
+  return {
+    relation: {
+      type: 'choice',
+      instructions: 'How does `new_entry` relate to the entries already in the knowledge base (`existing`)?',
+      criteria: relation,
+    },
+    entry_kind: {
+      type: 'choice',
+      instructions: 'What kind of knowledge is `new_entry`?',
+      criteria: {
+        durable_fact_or_constraint: 'A durable fact about the system, a tool, or a constraint that holds beyond this goal.',
+        route_procedure: 'The route one task took (which steps to run for a kind of question) rather than what is true.',
+        goal_specific_scratchpad: 'Findings or intermediate data specific to one goal.',
+        user_profile_fact: 'A fact about the user: a preference, a detail, or a habit.',
+      },
+    },
+  };
+}
+
+/** Text clipped for a decision state or an explanation. */
+function clipText(value: unknown, max: number): string {
+  const text = typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value) ?? '';
+  return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text;
+}
+
+function fmtP(p: number | undefined): string {
+  return p === undefined || !Number.isFinite(p) ? '?' : p.toFixed(2);
+}
+
+function judgmentFrom(answer: { choice: string; probabilities: Record<string, number> }, emulated: boolean): Judgment {
+  return { choice: answer.choice, p: answer.probabilities[answer.choice] ?? 0, probabilities: answer.probabilities, emulated };
+}
+
+/** "decision model, p=0.93" with the emulation noted: the provenance line on every automated record. */
+function provenance(j: { p: number; emulated: boolean }): string {
+  return `decision model${j.emulated ? ', emulated' : ''}, p=${fmtP(j.p)}`;
+}
+
+/** The observed side of an episode in one line: its operation outcome and, when visible, its exit code. */
+function observedLine(p: PredictionRecord): string {
+  const exit = /"exitCode"\s*:\s*(-?\d+)|exit(?:\s+code)?\s*[:=]?\s*(-?\d+)/i.exec(typeof p.actual === 'string' ? p.actual : '');
+  const code = exit ? exit[1] ?? exit[2] : undefined;
+  return `outcome=${p.outcome}${code !== undefined ? ` (exit ${code})` : ''}`;
 }
 
 export class TaskReviewer extends Abject {
@@ -145,6 +377,8 @@ export class TaskReviewer extends Abject {
   private taskExtras = new Map<string, ReviewTaskExtra>();
   /** Goal reviews that arrived while a review was in flight. */
   private pendingGoalReviews: PendingGoalReview[] = [];
+  /** Learning-value verdicts per goal (site reviewer.worth), oldest evicted first. */
+  private worthByGoal = new Map<string, WorthVerdict>();
   private preparingReview = false;
   private drainingLearning = false;
   private recoveredLegacyReviews = false;
@@ -167,7 +401,7 @@ export class TaskReviewer extends Abject {
     await this.drainLearningDecisions();
     if (this.inFlight) return;
     const pending = await this.request<PendingGoalReview[]>(request(this.id, this.goalManagerId, 'pendingReviews', {}));
-    for (const review of pending) {
+    for (const review of this.worthByGoal.size && await this.worthOrdering() ? this.sortByWorth(pending) : pending) {
       await this.onGoalTerminal(review);
       if (this.inFlight) break;
     }
@@ -221,6 +455,7 @@ export class TaskReviewer extends Abject {
     super.checkInvariants();
     invariant(this.taskCounters instanceof Map, 'taskCounters must be a Map');
     invariant(this.reviewsToday >= 0, 'reviewsToday must be non-negative');
+    invariant(this.worthByGoal.size <= WORTH_CACHE_MAX, 'worth verdicts must stay bounded');
   }
 
   protected override async onInit(): Promise<void> {
@@ -365,7 +600,9 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       this.changed('reviewCompleted', { kind: extra?.kind ?? 'review' });
 
-      // Drain a goal review that arrived while this one was running.
+      // Drain a goal review that arrived while this one was running, the
+      // one judged most valuable first when reviewer.worth acts.
+      if (this.worthByGoal.size && await this.worthOrdering()) this.sortByWorth(this.pendingGoalReviews);
       const next = this.pendingGoalReviews.shift();
       if (next) {
         this.onGoalTerminal(next).catch(err =>
@@ -561,7 +798,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
 
   /** Shared validation and receipts for individual actions and completion batches. */
   private async applyReviewAction(taskId: string, action: AgentAction) {
-    let result: { success: boolean; data?: unknown; error?: string };
+    let result: { success: boolean; data?: unknown; error?: string; duplicateOf?: string };
+    let advice: string[] = [];
     try {
       const extra = this.taskExtras.get(taskId);
       if (extra?.goalId && this.goalManagerId && action.action === 'repair_learning') {
@@ -576,6 +814,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         extra.decisions = [...(extra.decisions ?? []).filter(v => v.id !== d.id),settled];
         return {success:settled.effects.every(e => e.state==='applied' || e.state==='abandoned'),data:settled};
       }
+      // New entries are compared with what the store already holds before
+      // they are saved (site reviewer.dedupe): the verdict rides back with
+      // the result, and a confident duplicate is turned away when it acts.
+      if (action.action === 'save_entry' || (action.action === 'learn' && Array.isArray(action.effects))) {
+        const screened = await this.screenSaves(taskId, action.action === 'save_entry' ? [action] : action.effects as unknown[]);
+        advice = [...screened.rejected.map(r => r.message), ...screened.notes];
+        if (!screened.kept.length && screened.rejected.length) {
+          return this.trackReviewAction(taskId, action, { success: false, error: advice.join(' '), duplicateOf: screened.rejected[0].duplicateOf });
+        }
+        action = action.action === 'save_entry' ? screened.kept[0] as AgentAction : { ...action, effects: screened.kept };
+      }
       if (extra?.goalId && this.goalManagerId && (action.action === 'learn' || ['save_entry','update_entry','archive_entry','supersede_entry','dispute_entry','narrow_entry','confirm_entry','no_change','save_pattern','update_pattern','record_pattern_application'].includes(action.action))) {
         const app = action.application as Record<string, unknown> | undefined;
         const context = action.action === 'learn' ? (action.context ?? {}) as Record<string, unknown> : { evidence: action.evidence ?? app?.evidence, evidenceRefs: action.evidenceRefs ?? (app?.taskId ? [`learning/task/${app.taskId}`] : undefined), assessmentRefs: app?.taskId && app.step ? [`learning/assessment/${app.taskId}:${app.step}`] : undefined, scope: action.scope };
@@ -584,12 +833,25 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       } else result = await this.handleAct(taskId, action);
     }
     catch (err) { result = { success: false, error: err instanceof Error ? err.message : String(err) }; }
+    if (advice.length) {
+      // Only data and error reach the conversation, so the advice rides there;
+      // a journaled decision keeps its shape, with the advice read first.
+      const text = advice.join(' ');
+      if (!result.success) result = { ...result, error: `${result.error ?? 'Not saved'} ${text}` };
+      else if (typeof result.data === 'string') result = { ...result, data: `${result.data}\n${text}` };
+      else if (result.data && typeof result.data === 'object' && !Array.isArray(result.data)) result = { ...result, data: { advice: text, ...result.data } };
+    }
+    return this.trackReviewAction(taskId, action, result);
+  }
+
+  /** Record a learning action's outcome on the review, for the report and the one-time correction. */
+  private trackReviewAction(taskId: string, action: AgentAction, result: { success: boolean; data?: unknown; error?: string; duplicateOf?: string }) {
     const extra = this.taskExtras.get(taskId);
     if (extra && ['assess_prediction', 'record_pattern_application', 'save_entry', 'update_entry', 'archive_entry', 'forget_entry', 'mark_useful', 'save_pattern', 'update_pattern', 'merge_entries', 'author_skill'].includes(action.action)) {
       const app = action.application as Record<string, unknown> | undefined;
       const key = JSON.stringify([action.action, action.id ?? action.title ?? action.name ?? action.ids ?? '', action.taskId ?? app?.taskId ?? '', action.step ?? app?.step ?? '']);
       const updates = extra.updates ??= [];
-      const update: LearningUpdate = { key, action: structuredClone(action), status: result.success ? 'saved' : /unresolved|provenance|reference/i.test(result.error ?? '') ? 'unresolved' : 'rejected', result: result.data, error: result.error };
+      const update: LearningUpdate = { key, action: structuredClone(action), status: result.duplicateOf ? 'duplicate' : result.success ? 'saved' : /unresolved|provenance|reference/i.test(result.error ?? '') ? 'unresolved' : 'rejected', result: result.data, error: result.error };
       updates.push(update);
       return { ...result, learningStatus: update.status };
     }
@@ -664,10 +926,19 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       extra.decisions = [await this.applyDecision(decision, extra)];
     } else if (corrections.length && extra.goalId && this.goalManagerId) {
-      try { await this.proposeLearning(taskId, corrections, { evidence: batch.evidence, evidenceRefs: batch.evidenceRefs, scope: batch.scope,
-        assessmentRefs: Object.keys(extra.assessments ?? {}).map(k => `learning/assessment/${k}`),
-        selections: (extra.records ?? []).flatMap(r => r.injectedKnowledge ?? []),
-      }); } catch (err) { extra.completionIssues.push(`Corrections not acknowledged by journal: ${String(err)}`); }
+      // New entries in the batch are screened like single saves (site
+      // reviewer.dedupe); one turned away is on record, not pending.
+      const screened = await this.screenSaves(taskId, corrections);
+      for (const r of screened.rejected) {
+        (extra.updates ??= []).push({ key: JSON.stringify(['save_entry', r.item.title ?? '', '', '']), action: { ...r.item, action: 'save_entry' }, status: 'duplicate', error: r.message });
+      }
+      if (screened.notes.length) log.info(`[decision] reviewer.dedupe completion batch: ${screened.notes.join(' ')}`);
+      if (screened.kept.length) {
+        try { await this.proposeLearning(taskId, screened.kept, { evidence: batch.evidence, evidenceRefs: batch.evidenceRefs, scope: batch.scope,
+          assessmentRefs: Object.keys(extra.assessments ?? {}).map(k => `learning/assessment/${k}`),
+          selections: (extra.records ?? []).flatMap(r => r.injectedKnowledge ?? []),
+        }); } catch (err) { extra.completionIssues.push(`Corrections not acknowledged by journal: ${String(err)}`); }
+      }
     } else for (const item of corrections) {
       // Standalone/curation compatibility until an episode owner exists.
       if (item && typeof item === 'object') await this.applyReviewAction(taskId, item);
@@ -675,8 +946,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
     if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
     await this.recordSummaryFidelity(extra, batch.summaryFidelity);
-    const missing = (extra.records ?? []).flatMap(r => (r.predictions ?? [])
-      .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
+    let missing = this.missingAssessments(extra);
+    // Judged episodes still missing an assessment are recorded from the
+    // decision model's verdicts instead of an extra model turn: confident
+    // ones as judged, the rest unresolved. Episodes it could not judge still
+    // go to the correction below (site reviewer.predictions, act).
+    if (missing.length && !extra.cancelled && extra.kind === 'review' && !extra.automatedAssessments && extra.judgments?.predictions?.mode === 'act') {
+      await this.recordAutomatedAssessments(taskId, extra, missing);
+      missing = this.missingAssessments(extra);
+    }
     // A goal review owes a verdict on the user-facing summary. Missing, it is
     // asked for in the one correction; still missing after that, the report
     // says so instead of recording nothing.
@@ -694,9 +972,20 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       return { accepted: false, reason: `${parts.join('\n\n')}\nThis correction is requested once; remaining gaps settle as partial.` };
     }
-    if (fidelityMissing && !extra.cancelled) extra.completionIssues.push('No summaryFidelity verdict was given for the user-facing summary.');
+    // Still no verdict after the correction: a confident decision-model
+    // verdict is recorded with its provenance. The reviewer's own field,
+    // whenever given, is the one on record (site reviewer.fidelity, act).
+    if (fidelityMissing && !extra.cancelled) await this.recordAutomatedFidelity(extra);
+    if (fidelityMissing && !extra.cancelled && !extra.summaryFidelityRecorded) extra.completionIssues.push('No summaryFidelity verdict was given for the user-facing summary.');
+    if (!extra.cancelled && extra.kind === 'review') await this.fillPatternApplications(taskId, extra);
     const report = this.learningReport(extra, extra.cancelled);
     return { accepted: true, result: report, evidence: report };
+  }
+
+  /** Observed episodes with a stated prediction and no assessment yet; GoalManager keeps the rest unresolved. */
+  private missingAssessments(extra: ReviewTaskExtra): Array<{ taskId: string; p: PredictionRecord }> {
+    return (extra.records ?? []).flatMap(r => (r.predictions ?? [])
+      .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
   }
 
   private learningReport(extra?: ReviewTaskExtra, interrupted = false) {
@@ -709,7 +998,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const latest = new Map(updates.map(u => [u.key, u]));
     const journaled = (u: LearningUpdate) => !!u.result && typeof u.result === 'object' && (u.result as Partial<LearningDecision>).version === 1;
     const saved = [...new Map(updates.filter(u => u.status === 'saved' && !journaled(u)).map(u => [u.key, u])).values()];
-    const pending = [...latest.values()].filter(u => u.status !== 'saved' && !journaled(u));
+    const pending = [...latest.values()].filter(u => u.status !== 'saved' && u.status !== 'duplicate' && !journaled(u));
     const patternCounts = { helpful: 0, harmful: 0, inconclusive: 0, unresolved: 0 };
     const unassessedApplications: Array<{ taskId: string; step: number; id: string; applicationRef?: string }> = [];
     for (const r of extra?.records ?? []) for (const p of r.predictions ?? []) for (const applied of p.patterns ?? []) {
@@ -835,6 +1124,23 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       return;
     }
 
+    // How much could this task teach (site reviewer.worth)? Acting, a
+    // confidently routine success is released without the review, and the
+    // day's reserved slots go to valuable tasks; this one keeps the counter,
+    // as a task past the daily cap does.
+    const worth = await this.judgeWorth(undefined, () => this.worthState([record]));
+    if (worth) {
+      const plan = this.worthPlan(worth, record.phase === 'error');
+      this.logWorth(`task ${record.taskId.slice(0, 8)}`, worth, plan);
+      if (worth.mode === 'act' && plan === 'routine') {
+        this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId: ev.taskId }));
+        return;
+      }
+      if (worth.mode === 'act' && plan === 'defer') { this.taskCounters.set(agentName, count); return; }
+      // Another review may have started while this one was judged.
+      if (this.inFlight) { this.taskCounters.set(agentName, count); return; }
+    }
+
     const material =
       `## Task under review (standalone, no goal)\n` +
       this.formatTaskSection(record, record.transcript);
@@ -842,7 +1148,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     await this.launchReview(
       `Review the finished "${record.agentName}" task and capture durable learnings.`,
       material,
-      [record.taskId], undefined, [record],
+      [record.taskId], undefined, [record], { worth },
     );
   }
 
@@ -862,17 +1168,26 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     try { await this.prepareGoalReview(review); } finally { this.preparingReview = false; }
   }
 
+  /** Hold a goal review until the in-flight one finishes; GoalManager keeps it durable beyond this queue. */
+  private queueGoalReview(review: PendingGoalReview): void {
+    if (this.pendingGoalReviews.length < MAX_PENDING_GOAL_REVIEWS
+        && !this.pendingGoalReviews.some(p => p.goalId === review.goalId)) {
+      this.pendingGoalReviews.push(review);
+    }
+  }
+
   private async prepareGoalReview(review: PendingGoalReview): Promise<void> {
     if (!(await this.getKbId())) return;
     this.clearStuckReview();
     if (this.inFlight) {
-      if (this.pendingGoalReviews.length < MAX_PENDING_GOAL_REVIEWS
-          && !this.pendingGoalReviews.some(p => p.goalId === review.goalId)) {
-        this.pendingGoalReviews.push(review);
-      }
+      this.queueGoalReview(review);
       return;
     }
     if (!this.underDailyCap()) return;
+    // Judged low in value and deferred already: it waits out the day's
+    // reserved slots without fetching its evidence again (reviewer.worth, act).
+    if (this.worthByGoal.get(review.goalId)?.deferred && this.inReserveZone()
+        && await this.decisionSiteMode('reviewer.worth') === 'act') return;
 
     const goal = await this.request<{ title?: string; description?: string; result?: string; scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.goalManagerId!, 'getGoal', { goalId: review.goalId }),
@@ -931,6 +1246,38 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       return;
     }
 
+    // Decision-model judgments over the gathered evidence. Each is optional:
+    // without them the review runs exactly as before. Inside the day's
+    // reserved slots, value is judged first, so a review deferred for them
+    // spends one call (sites reviewer.worth, .predictions, .fidelity, .patterns).
+    const verification = verificationRecordOf(goal?.scratchpad ?? {});
+    const userResult = typeof goal?.result === 'string' ? goal.result : undefined;
+    const failed = review.outcome === 'failed' || all.some(r => r.phase === 'error');
+    const worthState = () => this.worthState(all, { title: goal?.title, outcome: review.outcome, detail: review.detail, userResult }, verification);
+    const subject = `goal ${review.goalId.slice(0, 8)}`;
+    let worth = this.inReserveZone() ? await this.judgeWorth(review.goalId, worthState) : undefined;
+    if (worth?.mode === 'act' && worth.highP < 0.5 && !this.routineVerdict(worth, failed)) {
+      this.markDeferred(review.goalId);
+      this.logWorth(subject, worth, 'defer');
+      return;
+    }
+    const [judgedWorth, judgments] = await Promise.all([
+      worth ? Promise.resolve(worth) : this.judgeWorth(review.goalId, worthState),
+      this.judgeReviewEvidence(review.goalId, all, review.outcome, verification, userResult),
+    ]);
+    worth = judgedWorth;
+    if (worth) {
+      const plan = this.worthPlan(worth, failed, judgments);
+      this.logWorth(subject, worth, plan);
+      if (worth.mode === 'act' && plan === 'routine') {
+        await this.settleRoutineReview(review, goalTaskIds, all, worth, judgments);
+        return;
+      }
+      if (worth.mode === 'act' && plan === 'defer') { this.markDeferred(review.goalId); return; }
+    }
+    // Another review may have started while the judgments ran; this one waits its turn.
+    if ((worth || judgments) && this.inFlight) { this.queueGoalReview(review); return; }
+
     // Split the transcript budget across tasks, larger tasks trimmed first.
     const perTask = Math.max(6000, Math.floor(GOAL_TRANSCRIPT_BUDGET / records.length));
     let material =
@@ -942,9 +1289,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     // What the user was told, next to what the capability owners recorded.
     // A summary that quotes a figure no recorded run supports is a finding
     // in its own right, whatever the goal's outcome.
-    const record = verificationRecordOf(goal?.scratchpad ?? {});
-    material += `\n### User-facing result (what the user was told)\n${(typeof goal?.result === 'string' ? goal.result : '(none recorded)').slice(0, 4000)}\n`;
-    material += `\n### Verification record (capability-owner receipts, newest first)\n${renderVerificationRecord(record)}\n`;
+    material += `\n### User-facing result (what the user was told)\n${(userResult ?? '(none recorded)').slice(0, 4000)}\n`;
+    material += `\n### Verification record (capability-owner receipts, newest first)\n${renderVerificationRecord(verification)}\n`;
     material += `\n### Plan revisions and observations\n${JSON.stringify(Object.fromEntries(Object.entries(goal?.scratchpad ?? {}).filter(([k]) => k === 'learning/plans' || k.startsWith('learning/observation/')))).slice(0, 16000)}\n`;
     material += `\nAll task outcomes (including tasks omitted from detailed transcripts):\n${all.map(r => `${r.taskId}: ${r.agentName}, ${r.phase}, ${r.error ?? ''}`).join('\n')}\n`;
     if (executionRecord) {
@@ -958,12 +1304,491 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       material += `\n\n## Task ${i + 1} of ${records.length}\n` + this.formatTaskSection(r, transcript);
     }
 
+    this.worthByGoal.delete(review.goalId);
     await this.launchReview(
       `Review the ${review.outcome} goal "${(goal?.title ?? review.goalId).slice(0, 60)}" and capture durable learnings.`,
       material,
       goalTaskIds,   // durable records retain evidence after transcript release
-      review.goalId, all,
+      review.goalId, all, { worth, judgments },
     );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Decision-model judgments (sites reviewer.*)
+  //
+  // Each site's policy mode rides back on its outcome: shadow logs what it
+  // would do, advise hands the verdict to the reviewer model as a prior,
+  // act lets a confident verdict take effect. A null outcome, a missing
+  // answer or a verdict short of its threshold leaves the review as it was.
+  // ═══════════════════════════════════════════════════════════════════
+
+  private decisionScope(goalId?: string, taskId?: string): { goalId?: string; taskId?: string; onBehalfOf: string } {
+    return { ...(goalId ? { goalId } : {}), ...(taskId ? { taskId } : {}), onBehalfOf: this.manifest.name };
+  }
+
+  /** Inside the day's last review slots, which wait for reviews judged valuable. */
+  private inReserveZone(): boolean {
+    return this.reviewsToday >= MAX_REVIEWS_PER_DAY - RESERVED_REVIEW_SLOTS;
+  }
+
+  private markDeferred(goalId: string): void {
+    const cached = this.worthByGoal.get(goalId);
+    if (cached) cached.deferred = true;
+  }
+
+  /**
+   * Whether review order follows judged value: only when reviewer.worth acts.
+   * Callers check that something was judged first, so an empty cache adds
+   * no wait to the drain.
+   */
+  private async worthOrdering(): Promise<boolean> {
+    return await this.decisionSiteMode('reviewer.worth') === 'act';
+  }
+
+  /** Valuable reviews first, deferred ones last, unjudged ones between; stable, in place. */
+  private sortByWorth<T extends { goalId: string }>(reviews: T[]): T[] {
+    const rank = (goalId: string): number => {
+      const w = this.worthByGoal.get(goalId);
+      return !w ? 1 : w.highP >= 0.5 ? 2 : w.deferred ? 0 : 1;
+    };
+    return reviews.sort((a, b) => rank(b.goalId) - rank(a.goalId));
+  }
+
+  /** What a learning-value judgment sees: outcomes, counts and names, never whole transcripts. */
+  private worthState(records: TranscriptResponse[], goal?: { title?: string; outcome: string; detail?: string; userResult?: string }, verification: VerificationRecordEntry[] = []): Record<string, unknown> {
+    return {
+      goal: goal ? { title: clipText(goal.title ?? '(unknown)', 200), outcome: goal.outcome, detail: goal.detail ? clipText(goal.detail, 300) : null } : null,
+      user_result: goal ? clipText(goal.userResult ?? '(none recorded)', 800) : null,
+      tasks: records.slice(0, 12).map(r => {
+        const predictions = r.predictions ?? [];
+        return {
+          agent: r.agentName, phase: r.phase, steps: r.steps,
+          error: r.error ? clipText(r.error, 200) : null,
+          predictions: predictions.length,
+          // A judged verdict, where the runtime made one, over the operation-status comparison.
+          contradicted_predictions: predictions.filter(p => (p.decisionVerdict?.verdict ?? p.verdict) === 'contradicted').length,
+          failed_actions: predictions.filter(p => p.outcome === 'failure').length,
+          retries: predictions.filter((p, i) => i > 0 && predictions[i - 1].outcome === 'failure' && predictions[i - 1].action === p.action).length,
+        };
+      }),
+      injected_knowledge: [...new Set(records.flatMap(r => (r.injectedKnowledge ?? []).map(k => clipText(k.title, 120))))].slice(0, 20),
+      verification: verification.length ? clipText(renderVerificationRecord(verification.slice(0, 3)), 1500) : 'none recorded',
+    };
+  }
+
+  /**
+   * How much a finished goal or standalone task could teach (site
+   * reviewer.worth). Goal verdicts are kept, so a review deferred for the
+   * day's reserved slots is judged once rather than on every drain.
+   */
+  private async judgeWorth(goalId: string | undefined, state: () => Record<string, unknown>): Promise<WorthVerdict | undefined> {
+    const mode = await this.decisionSiteMode('reviewer.worth');
+    if (mode === 'off') return undefined;
+    const cached = goalId ? this.worthByGoal.get(goalId) : undefined;
+    if (cached) return { ...cached, mode };
+    const outcome = await this.askDecision('reviewer.worth', boundDecisionState(state()), worthQuestions(), this.decisionScope(goalId));
+    const score = scoreOf(outcome, 'learning_value');
+    if (!outcome || !score) return undefined;
+    const pr = score.probabilities;
+    const level = topLevel(score);
+    const verdict: WorthVerdict = {
+      mode: outcome.mode, level, levelP: pr[String(level)] ?? 0, routineP: pr['0'] ?? 0,
+      highP: (pr['2'] ?? 0) + (pr['3'] ?? 0),
+      // Unanswered, a conflict is assumed: the routine shortcut needs a clear no.
+      conflict: noulOf(outcome, 'knowledge_conflict') ?? 1,
+      emulated: outcome.emulated,
+    };
+    if (goalId) {
+      this.worthByGoal.set(goalId, verdict);
+      while (this.worthByGoal.size > WORTH_CACHE_MAX) this.worthByGoal.delete(this.worthByGoal.keys().next().value!);
+    }
+    return verdict;
+  }
+
+  /** A routine verdict sure enough to settle a review without the model pass. */
+  private routineVerdict(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): boolean {
+    if (failed || worth.routineP < ROUTINE_MIN_P || worth.conflict >= ROUTINE_MAX_CONFLICT) return false;
+    // Sibling judgments that already see trouble keep the full review.
+    const f = judgments?.fidelity;
+    if (f && !f.deterministic && f.verdict === 'misreported' && f.p >= 0.5) return false;
+    return !Object.values(judgments?.predictions?.byEpisode ?? {}).some(j => (j.probabilities.contradicted ?? 0) >= 0.5);
+  }
+
+  private worthPlan(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): 'routine' | 'defer' | 'priority' | 'review' {
+    if (this.routineVerdict(worth, failed, judgments)) return 'routine';
+    if (worth.highP >= 0.5) return 'priority';
+    return this.inReserveZone() ? 'defer' : 'review';
+  }
+
+  private logWorth(subject: string, worth: WorthVerdict, plan: ReturnType<TaskReviewer['worthPlan']>): void {
+    const what = {
+      routine: 'settle as routine without the full review',
+      defer: `defer while the day's last ${RESERVED_REVIEW_SLOTS} review slots wait for valuable reviews`,
+      priority: 'review ahead of routine work',
+      review: 'review',
+    }[plan];
+    log.info(`[decision:${worth.mode}] reviewer.worth ${subject}: level ${worth.level}@${fmtP(worth.levelP)} routine=${fmtP(worth.routineP)} conflict=${fmtP(worth.conflict)}; ${worth.mode === 'act' ? what : `would ${what}`}`);
+  }
+
+  /**
+   * Settle a goal review judged confidently routine (site reviewer.worth,
+   * act): record what the sibling sites may record under their own act
+   * rules, acknowledge through the usual ack with a short routine report,
+   * and release the transcripts as a finished review does.
+   */
+  private async settleRoutineReview(review: PendingGoalReview, reviewedTaskIds: string[], records: TranscriptResponse[], worth: WorthVerdict, judgments?: ReviewJudgments): Promise<void> {
+    const ticket = `routine-${review.goalId}-${Date.now()}`;
+    const extra: ReviewTaskExtra = { kind: 'review', goalId: review.goalId, records, reviewedTaskIds, judgments, completionIssues: [], knowledgeScope: this.reviewScope(records) };
+    this.taskExtras.set(ticket, extra);
+    try {
+      await this.recordAutomatedAssessments(ticket, extra, this.missingAssessments(extra));
+      await this.recordAutomatedFidelity(extra);
+      await this.fillPatternApplications(ticket, extra);
+      const report = this.learningReport(extra);
+      await this.request(request(this.id, this.goalManagerId!, 'ackReview', { goalId: review.goalId, report: {
+        ...report,
+        routine: { level: worth.level, p: worth.routineP, knowledgeConflict: worth.conflict, emulated: worth.emulated },
+        summary: `Routine: settled without the full learning review (${provenance({ p: worth.routineP, emulated: worth.emulated })}; knowledge conflict p=${fmtP(worth.conflict)}). ${report.summary}`,
+      } }), 10000);
+      for (const taskId of reviewedTaskIds) this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId }));
+      this.changed('reviewCompleted', { kind: 'review', routine: true });
+      log.info(`Routine review settled for goal ${review.goalId.slice(0, 8)}: ${report.summary}`);
+    } finally {
+      this.taskExtras.delete(ticket);
+      this.worthByGoal.delete(review.goalId);
+    }
+  }
+
+  /** Predictions, summary fidelity and pattern applications, judged together when a goal review launches. */
+  private async judgeReviewEvidence(goalId: string, records: TranscriptResponse[], outcome: 'completed' | 'failed', verification: VerificationRecordEntry[], userResult?: string): Promise<ReviewJudgments | undefined> {
+    const [predictions, fidelity, patterns] = await Promise.all([
+      this.judgePredictions(goalId, records).catch(() => undefined),
+      this.judgeFidelity(goalId, records, verification, userResult).catch(() => undefined),
+      this.judgePatterns(goalId, records, outcome).catch(() => undefined),
+    ]);
+    if (!predictions && !fidelity && !patterns) return undefined;
+    return { ...(predictions ? { predictions } : {}), ...(fidelity ? { fidelity } : {}), ...(patterns ? { patterns } : {}) };
+  }
+
+  /**
+   * Were the episodes' predictions borne out (site reviewer.predictions)?
+   * One request covers every episode with a stated prediction and an
+   * observed outcome; the rest GoalManager already keeps unresolved.
+   */
+  private async judgePredictions(goalId: string, records: TranscriptResponse[]): Promise<ReviewJudgments['predictions']> {
+    const episodes = records.flatMap(r => (r.predictions ?? []).filter(p => p.expect?.trim() && p.outcome !== 'unknown').map(p => ({ r, p })))
+      .slice(0, MAX_JUDGED_EPISODES);
+    if (!episodes.length || await this.decisionSiteMode('reviewer.predictions') === 'off') return undefined;
+    const perActual = Math.min(2400, Math.max(400, Math.floor(60000 / episodes.length)));
+    const state = { episodes: episodes.map(({ r, p }, i) => ({
+      i, task: r.taskId, agent: r.agentName, step: p.step, action: p.action,
+      expect: clipText(p.expect, 600), outcome: p.outcome, actual: clipText(p.actual ?? '(no observation recorded)', perActual),
+      ...(p.decisionVerdict ? { prior: { verdict: p.decisionVerdict.verdict, confidence: p.decisionVerdict.confidence, emulated: p.decisionVerdict.emulated } } : {}),
+    })) };
+    const outcome = await this.askDecision('reviewer.predictions', boundDecisionState(state), reviewPredictionQuestions(episodes.length), this.decisionScope(goalId));
+    if (!outcome) return undefined;
+    const byEpisode: Record<string, Judgment> = {};
+    episodes.forEach(({ r, p }, i) => {
+      const answer = choiceOf(outcome, `q_${i}`);
+      if (answer) byEpisode[`${r.taskId}:${p.step}`] = judgmentFrom(answer, outcome.emulated);
+    });
+    if (!Object.keys(byEpisode).length) return undefined;
+    if (outcome.mode === 'shadow') {
+      const counts: Record<string, number> = {};
+      for (const j of Object.values(byEpisode)) counts[j.choice] = (counts[j.choice] ?? 0) + 1;
+      const sure = Object.values(byEpisode).filter(j => j.p >= AUTO_ASSESS_MIN_P).length;
+      log.info(`[decision:shadow] reviewer.predictions goal ${goalId.slice(0, 8)}: ${JSON.stringify(counts)}; ${sure}/${episodes.length} sure enough to record`);
+    }
+    return { mode: outcome.mode, byEpisode };
+  }
+
+  /**
+   * Does the user-facing result match the verification record (site
+   * reviewer.fidelity)? With no record or no result there is nothing to
+   * compare: unverifiable, settled without a call.
+   */
+  private async judgeFidelity(goalId: string, records: TranscriptResponse[], verification: VerificationRecordEntry[], userResult?: string): Promise<ReviewJudgments['fidelity']> {
+    const mode = await this.decisionSiteMode('reviewer.fidelity');
+    if (mode === 'off') return undefined;
+    if (!verification.length || !userResult?.trim()) return { mode, verdict: 'unverifiable', p: 1, emulated: false, deterministic: true };
+    type Receipt = { kind: string; command: string | null; exit: number | null; testSummary: unknown; failures: number | null; note: string | null; atMs: number };
+    const receipts = verification.flatMap((v): Receipt[] => {
+      const runs = (['verify', 'check'] as const).flatMap((kind): Receipt[] => {
+        const run = v[kind];
+        return run ? [{ kind, command: clipText(run.command, 300), exit: run.exitCode, testSummary: run.testSummary ?? null, failures: run.failureCount ?? null, note: v.gate?.note ? clipText(v.gate.note, 300) : null, atMs: run.at }] : [];
+      });
+      return runs.length ? runs : v.gate ? [{ kind: 'gate', command: null, exit: null, testSummary: null, failures: null, note: clipText(`${v.gate.ok ? 'ok' : 'NOT ok'}: ${v.gate.note}`, 300), atMs: v.at }] : [];
+    }).sort((a, b) => b.atMs - a.atMs).slice(0, 10)
+      .map(({ atMs, ...rest }) => ({ ...rest, at: Number.isFinite(atMs) ? new Date(atMs).toISOString() : 'unknown' }));
+    const state = {
+      user_result: clipText(userResult, 4000),
+      receipts,
+      task_reports: records.slice(0, 8).map(r => ({ agent: r.agentName, outcome: r.phase, report: clipText(r.phase === 'error' ? r.error ?? r.result : r.result ?? r.error ?? '', 600) })),
+    };
+    const outcome = await this.askDecision('reviewer.fidelity', boundDecisionState(state), fidelityQuestions(), this.decisionScope(goalId));
+    const answer = choiceOf(outcome, 'fidelity');
+    if (!outcome || !answer || (answer.choice !== 'consistent' && answer.choice !== 'misreported')) return undefined;
+    const judged = { mode: outcome.mode, verdict: answer.choice, p: answer.probabilities[answer.choice] ?? 0,
+      staleFigure: noulOf(outcome, 'stale_figure'), caveatDropped: noulOf(outcome, 'caveat_dropped'), emulated: outcome.emulated } as const;
+    const line = `reviewer.fidelity goal ${goalId.slice(0, 8)}: ${judged.verdict}@${fmtP(judged.p)} stale_figure=${fmtP(judged.staleFigure)} caveat_dropped=${fmtP(judged.caveatDropped)}`;
+    if (outcome.mode === 'act' && judged.verdict === 'misreported' && judged.p >= AUTO_FIDELITY_MIN_P) log.warn(`[decision:act] ${line}: the user-facing summary looks misreported`);
+    else log.info(`[decision:${outcome.mode}] ${line}`);
+    return judged;
+  }
+
+  /**
+   * Did each declared pattern application help, harm, or stay inconclusive
+   * (site reviewer.patterns)? An unobserved outcome is inconclusive by rule.
+   */
+  private async judgePatterns(goalId: string, records: TranscriptResponse[], goalOutcome: 'completed' | 'failed'): Promise<ReviewJudgments['patterns']> {
+    const applications = records.flatMap(r => (r.predictions ?? []).flatMap(p => (p.patterns ?? []).map(a => ({ r, p, a })))).slice(0, MAX_JUDGED_APPLICATIONS);
+    if (!applications.length) return undefined;
+    const siteMode = await this.decisionSiteMode('reviewer.patterns');
+    if (siteMode === 'off') return undefined;
+    const byApplication: Record<string, Judgment> = {};
+    const key = (x: typeof applications[number]) => `${x.r.taskId}:${x.p.step}:${x.a.id}`;
+    for (const x of applications) {
+      if (x.p.outcome === 'unknown') byApplication[key(x)] = { choice: 'inconclusive', p: 1, probabilities: { inconclusive: 1 }, emulated: false, deterministic: true };
+    }
+    const judged = applications.filter(x => x.p.outcome !== 'unknown');
+    let mode: DecisionMode = siteMode;
+    if (judged.length) {
+      const kb = await this.getKbId();
+      const ids = [...new Set(judged.map(x => x.a.id))];
+      const entries = new Map(await Promise.all(ids.map(async id => [id, kb
+        ? await this.request<{ title?: string; content?: string; pattern?: import('../core/pattern.js').PatternBody } | null>(request(this.id, kb, 'get', { id }), 10000).catch(() => null)
+        : null] as const)));
+      const state = { goal_outcome: goalOutcome, applications: judged.map((x, i) => {
+        const entry = entries.get(x.a.id);
+        const body = entry?.pattern ?? (entry?.content ? readPattern(entry.content, entry.title) : undefined);
+        return { i,
+          pattern: { id: x.a.id, name: entry?.title ?? body?.name ?? x.a.id, context: clipText(body?.context ?? '(unavailable)', 400), therefore: clipText(body?.therefore ?? '(unavailable)', 400) },
+          why: clipText(x.a.why, 400),
+          episode: { task: x.r.taskId, step: x.p.step, task_outcome: x.r.phase, expect: clipText(x.p.expect || '(not stated)', 400), outcome: x.p.outcome, actual: clipText(x.p.actual ?? '(no observation recorded)', 800) } };
+      }) };
+      const outcome = await this.askDecision('reviewer.patterns', boundDecisionState(state), patternQuestions(judged.length), this.decisionScope(goalId));
+      if (outcome) {
+        mode = outcome.mode;
+        judged.forEach((x, i) => {
+          const answer = choiceOf(outcome, `a_${i}`);
+          if (answer) byApplication[key(x)] = judgmentFrom(answer, outcome.emulated);
+        });
+      }
+    }
+    if (!Object.keys(byApplication).length) return undefined;
+    if (mode === 'shadow') {
+      log.info(`[decision:shadow] reviewer.patterns goal ${goalId.slice(0, 8)}: ${Object.entries(byApplication).map(([k, j]) => `${k}=${j.choice}@${fmtP(j.p)}`).join(' ')}`);
+    }
+    return { mode, byApplication };
+  }
+
+  /**
+   * Record assessments the review left missing from the judged verdicts
+   * (site reviewer.predictions, act): confident ones as judged, the rest
+   * unresolved with the probabilities that fell short. Each goes through
+   * assess_prediction, so GoalManager's first-assessment lock holds and an
+   * assessment already on record is never revised from here.
+   */
+  private async recordAutomatedAssessments(taskId: string, extra: ReviewTaskExtra, missing: Array<{ taskId: string; p: PredictionRecord }>): Promise<number> {
+    const judged = extra.judgments?.predictions;
+    if (!judged || judged.mode !== 'act' || !missing.length) return 0;
+    extra.automatedAssessments = true;
+    // Well inside the completion RPC deadline, alongside the batch's own actions.
+    const deadline = Date.now() + 8000;
+    let recorded = 0;
+    for (const { taskId: episodeTask, p } of missing) {
+      if (extra.cancelled || Date.now() >= deadline) break;
+      const j = judged.byEpisode[`${episodeTask}:${p.step}`];
+      if (!j) continue;
+      const confident = j.p >= AUTO_ASSESS_MIN_P;
+      const compared = `expected '${clipText(p.expect, 200)}' vs observed ${observedLine(p)}`;
+      const explanation = confident
+        ? `Automated assessment (${provenance(j)}): ${compared}`
+        : `Automated assessment (decision model${j.emulated ? ', emulated' : ''}): insufficient for automated assessment (p_s=${fmtP(j.probabilities.supported ?? 0)}, p_c=${fmtP(j.probabilities.contradicted ?? 0)}); ${compared}`;
+      const r = await this.applyReviewAction(taskId, { action: 'assess_prediction', taskId: episodeTask, step: p.step, verdict: confident ? j.choice : 'unresolved', explanation });
+      if (r.success) recorded++;
+    }
+    log.info(`[decision:act] reviewer.predictions goal ${extra.goalId?.slice(0, 8) ?? '?'}: recorded ${recorded} of ${missing.length} missing assessments`);
+    return recorded;
+  }
+
+  /** Record the judged summary-fidelity verdict when the review gave none (site reviewer.fidelity, act). */
+  private async recordAutomatedFidelity(extra: ReviewTaskExtra): Promise<void> {
+    const f = extra.judgments?.fidelity;
+    if (!f || f.mode !== 'act' || extra.summaryFidelityRecorded || (!f.deterministic && f.p < AUTO_FIDELITY_MIN_P)) return;
+    const explanation = f.deterministic
+      ? 'Automated assessment (rule): no verification record or user-facing result to compare.'
+      : `Automated assessment (${provenance(f)}; stale figure p=${fmtP(f.staleFigure)}, dropped caveat p=${fmtP(f.caveatDropped)}).`;
+    await this.recordSummaryFidelity(extra, { verdict: f.verdict, explanation });
+  }
+
+  /**
+   * Fill pattern applications the review left unassessed from confident
+   * verdicts (site reviewer.patterns, act), through the journaled
+   * record_pattern_application path. Applications without a recorded
+   * application reference stay unassessed: they cannot be resolved here.
+   */
+  private async fillPatternApplications(taskId: string, extra: ReviewTaskExtra): Promise<void> {
+    const judged = extra.judgments?.patterns;
+    if (!judged || judged.mode !== 'act' || !extra.goalId || !this.goalManagerId || extra.cancelled) return;
+    const effects: Array<Record<string, unknown>> = [];
+    const refs = new Set<string>();
+    for (const r of extra.records ?? []) for (const p of r.predictions ?? []) for (const a of p.patterns ?? []) {
+      const key = `${r.taskId}:${p.step}:${a.id}`;
+      const j = judged.byApplication[key];
+      if (!j || !a.applicationRef || extra.applicationAssessments?.[key]) continue;
+      if (!j.deterministic && j.p < AUTO_PATTERN_MIN_P) continue;
+      const evidence = j.deterministic
+        ? 'Automated assessment (rule): the step\'s outcome was not observed, so the effect of following the pattern stays inconclusive.'
+        : `Automated assessment (${provenance(j)}): ${j.choice} (helpful ${fmtP(j.probabilities.helpful ?? 0)}, harmful ${fmtP(j.probabilities.harmful ?? 0)}, inconclusive ${fmtP(j.probabilities.inconclusive ?? 0)}).`;
+      effects.push({ action: 'record_pattern_application', id: a.id, application: { taskId: r.taskId, step: p.step, context: clipText(a.why, 300), verdict: j.choice, evidence } });
+      refs.add(`learning/task/${r.taskId}`);
+    }
+    if (!effects.length) return;
+    try {
+      await this.proposeLearning(taskId, effects.slice(0, MAX_FILLED_APPLICATIONS), { evidence: 'Automated pattern-application assessments (decision model)', evidenceRefs: [...refs] });
+      log.info(`[decision:act] reviewer.patterns goal ${extra.goalId.slice(0, 8)}: filled ${Math.min(effects.length, MAX_FILLED_APPLICATIONS)} unassessed application(s)`);
+    } catch (err) {
+      log.warn(`Automated pattern assessments not recorded: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * The judgments the reviewer model sees as priors (advise and act). Each
+   * row is advisory; the reviewer's own reading of the evidence decides.
+   */
+  private renderPriors(worth?: WorthVerdict, judgments?: ReviewJudgments): string | undefined {
+    const shown = (mode?: DecisionMode) => mode === 'advise' || mode === 'act';
+    const lines: string[] = [];
+    let emulated = false;
+    if (worth && shown(worth.mode)) {
+      emulated ||= worth.emulated;
+      lines.push(`- Learning value: level ${worth.level} of ${WORTH_LEVELS.length - 1} (${WORTH_LEVELS[worth.level] ?? '?'}), p=${fmtP(worth.levelP)}; owner evidence contradicting injected knowledge p=${fmtP(worth.conflict)}.`);
+    }
+    const f = judgments?.fidelity;
+    if (f && shown(f.mode)) {
+      emulated ||= f.emulated;
+      lines.push(f.deterministic
+        ? '- Summary fidelity: unverifiable (no verification record or user-facing result to compare).'
+        : `- Summary fidelity: ${f.verdict} p=${fmtP(f.p)} (a stale figure p=${fmtP(f.staleFigure)}, a dropped caveat p=${fmtP(f.caveatDropped)}).`);
+    }
+    const preds = judgments?.predictions;
+    if (preds && shown(preds.mode)) {
+      // Contradicted and least certain rows lead: they are where reading pays.
+      const focus = (j: Judgment) => (j.choice === 'contradicted' ? 2 : 0) + (1 - j.p);
+      const rows = Object.entries(preds.byEpisode).sort(([, a], [, b]) => focus(b) - focus(a)).map(([k, j]) => {
+        emulated ||= j.emulated;
+        return `  ${k.replace(/:(\d+)$/, ' step $1')}: ${j.choice} p=${fmtP(j.p)} (supported ${fmtP(j.probabilities.supported ?? 0)}, contradicted ${fmtP(j.probabilities.contradicted ?? 0)}, unresolved ${fmtP(j.probabilities.unresolved ?? 0)})`;
+      });
+      if (rows.length) lines.push(`- Predictions (contradicted and least certain first; a confident supported row needs only a confirming look):\n${rows.join('\n')}`);
+    }
+    const pats = judgments?.patterns;
+    if (pats && shown(pats.mode)) {
+      const rows = Object.entries(pats.byApplication).map(([k, j]) => {
+        emulated ||= j.emulated;
+        return `  ${k}: ${j.choice}${j.deterministic ? ' (outcome unobserved)' : ` p=${fmtP(j.p)}`}`;
+      });
+      if (rows.length) lines.push(`- Pattern applications (taskId:step:patternId):\n${rows.join('\n')}`);
+    }
+    if (!lines.length) return undefined;
+    return `Automated priors (decision model${emulated ? ', emulated by a chat model' : ''}; advisory, nothing here is recorded; your reading of the evidence decides):\n${lines.join('\n')}`;
+  }
+
+  /**
+   * Compare new entries with what the knowledge base already holds (site
+   * reviewer.dedupe). Advise returns the verdict with the save; act turns a
+   * confident duplicate away unless the item carries force: true. An entry
+   * another author owns is never offered as an update target.
+   */
+  private async screenSaves(taskId: string, items: unknown[]): Promise<{ kept: unknown[]; notes: string[]; rejected: Array<{ item: Record<string, unknown>; message: string; duplicateOf: string }> }> {
+    const out = { kept: [] as unknown[], notes: [] as string[], rejected: [] as Array<{ item: Record<string, unknown>; message: string; duplicateOf: string }> };
+    for (const item of items) {
+      const input = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
+      if (!input || input.action !== 'save_entry') { out.kept.push(item); continue; }
+      const { force, ...rest } = input;
+      const verdict = await this.judgeDuplicate(taskId, rest).catch(() => undefined);
+      if (verdict?.reject && force !== true) { out.rejected.push({ item: rest, message: verdict.reject, duplicateOf: verdict.duplicateOf! }); continue; }
+      if (verdict?.note) out.notes.push(verdict.note);
+      out.kept.push(force === undefined ? item : rest);
+    }
+    return out;
+  }
+
+  private async judgeDuplicate(taskId: string, input: Record<string, unknown>): Promise<{ note?: string; reject?: string; duplicateOf?: string } | undefined> {
+    const title = typeof input.title === 'string' ? input.title : '';
+    const content = typeof input.content === 'string' ? input.content : '';
+    if (!title.trim() || !content.trim()) return undefined;
+    if (await this.decisionSiteMode('reviewer.dedupe') === 'off') return undefined;
+    const kb = await this.getKbId();
+    if (!kb) return undefined;
+    const extra = this.taskExtras.get(taskId);
+    // Full entries (not previews): the author decides whether an update is on offer.
+    const similar = await this.request<Array<{ id: string; title: string; type?: string; origin?: string; content?: string }>>(
+      request(this.id, kb, 'recall', { query: `${title}\n${content.slice(0, 400)}`, limit: 6, scope: extra?.knowledgeScope }), 10000,
+    ).catch(() => []);
+    const candidates = (Array.isArray(similar) ? similar : []).filter(e => e?.id).slice(0, 6);
+    if (!candidates.length) return undefined;
+    const tags = Array.isArray(input.tags) ? input.tags.filter((t): t is string => typeof t === 'string') : [];
+    const outcome = await this.askDecision('reviewer.dedupe', boundDecisionState({
+      new_entry: { title: clipText(title, 200), type: input.type ?? 'learned', tags, content: clipText(content, 1500) },
+      existing: candidates.map((e, i) => ({ i, title: clipText(e.title, 200), type: e.type, origin: e.origin ?? 'agent', content: clipText(e.content ?? '', 500) })),
+    }), dedupeQuestions(candidates.length), this.decisionScope(extra?.goalId, taskId));
+    const relation = choiceOf(outcome, 'relation');
+    if (!outcome || !relation) return undefined;
+    const p = relation.probabilities[relation.choice] ?? 0;
+    const kind = choiceOf(outcome, 'entry_kind');
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] reviewer.dedupe "${clipText(title, 60)}": ${relation.choice}@${fmtP(p)} kind=${kind?.choice ?? '?'}`);
+      return undefined;
+    }
+    const match = /^(duplicate_of|refines)_(\d+)$/.exec(relation.choice);
+    const target = match ? candidates[Number(match[2])] : undefined;
+    const origin = target?.origin ?? 'agent';
+    const updatable = origin === 'agent' || origin === 'reviewer';
+    const where = target ? `${target.id} ("${clipText(target.title, 80)}"; decision model${outcome.emulated ? ', emulated' : ''}, p=${fmtP(p)})` : '';
+    let note: string | undefined;
+    if (target && match![1] === 'duplicate_of') {
+      note = updatable ? `Near-duplicate of ${where}; update_entry may fit better.` : `Near-duplicate of ${origin}-authored entry ${where}; that entry already holds this and stays as its author wrote it.`;
+    } else if (target) {
+      note = updatable ? `Refines ${where}; update_entry on it may fit better than a second entry.` : `Refines ${origin}-authored entry ${where}; it stays as its author wrote it, so a separate entry suits the refinement.`;
+    }
+    const kindP = kind ? kind.probabilities[kind.choice] ?? 0 : 0;
+    const kindAdvice = kind && kindP >= 0.6 && ENTRY_KIND_ADVICE[kind.choice] && !(kind.choice === 'user_profile_fact' && tags.includes('profile'))
+      ? `It reads as ${kind.choice.replace(/_/g, ' ')} (p=${fmtP(kindP)}): ${ENTRY_KIND_ADVICE[kind.choice]}.` : undefined;
+    const turnedAway = outcome.mode === 'act' && !!target && p >= DEDUPE_ACT_P && (match![1] === 'duplicate_of' || updatable);
+    if (turnedAway) {
+      return { reject: `Not saved: ${[note, kindAdvice].filter(Boolean).join(' ')} To save it as a separate entry anyway, send it again with force: true.`, duplicateOf: target!.id };
+    }
+    const combined = [note, kindAdvice].filter(Boolean).join(' ');
+    return combined ? { note: combined } : undefined;
+  }
+
+  /**
+   * Does a reviewer-authored skill carry workspace-specific detail (site
+   * reviewer.privacy, advise only)? A warning never blocks the install: it
+   * rides with the proposal the user approves and with the tool result.
+   */
+  private async judgePrivacy(skill: { name: string; description: string; instructions: string }, scope: { goalId?: string; taskId?: string }): Promise<{ warning?: string; advice?: string } | undefined> {
+    if (await this.decisionSiteMode('reviewer.privacy') === 'off') return undefined;
+    const outcome = await this.askDecision('reviewer.privacy', boundDecisionState({
+      skill: { name: skill.name, description: clipText(skill.description, 600), instructions: clipText(skill.instructions, 12000) },
+    }), privacyQuestions(), this.decisionScope(scope.goalId, scope.taskId));
+    const detail = noulOf(outcome, 'workspace_specific_detail');
+    if (!outcome || detail === undefined) return undefined;
+    const generic = noulOf(outcome, 'generic_multistep_procedure');
+    const kind = choiceOf(outcome, 'detail_kind');
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] reviewer.privacy skill "${skill.name}": workspace_specific_detail=${fmtP(detail)} kind=${kind?.choice ?? '?'} generic=${fmtP(generic)}`);
+      return undefined;
+    }
+    const tag = `decision model${outcome.emulated ? ', emulated' : ''}`;
+    const warning = detail >= PRIVACY_WARN_P
+      ? `Review before enabling: this skill may carry workspace-specific detail (${DETAIL_KINDS[kind?.choice ?? ''] ?? DETAIL_KINDS.other_detail}; ${tag}, p=${fmtP(detail)}).`
+      : undefined;
+    const advice = generic !== undefined && generic < 0.3
+      ? `It reads less like a reusable multi-step procedure (${tag}, p=${fmtP(generic)}); a knowledge entry may suit it better.`
+      : undefined;
+    return warning || advice ? { warning, advice } : undefined;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1010,7 +1835,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   /** Budget the whole dossier; full records remain addressable through this receiver. */
-  private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}): Promise<string> {
+  private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string): Promise<string> {
     const pieces: string[] = [];
     let remaining = GOAL_TRANSCRIPT_BUDGET;
     const append = (text: string, cap: number): void => {
@@ -1039,6 +1864,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const detailsBudget = Math.max(0, rowBudget - 180);
     append(`Prediction/feedback index (${predictions.length} observations; excerpts are not complete evidence):\n` + predictions.map(({ r, p }) =>
       `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}; expected=${(p.expect || '(missing)').slice(0, detailsBudget / 2)}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, detailsBudget / 2)}`).join('\n'), 16000);
+    // Decision-model priors (advise/act) sit beside the index they annotate.
+    if (priors) append(priors, 3500);
     const kb = await this.getKbId();
     if (kb) {
       const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: task, limit: 6, previews: true, scope: this.reviewScope(records) })).catch(() => []);
@@ -1078,13 +1905,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return scopes.length === 1 ? scopes[0] : undefined;
   }
 
-  private async launchReview(task: string, material: string, reviewedTaskIds: string[], goalId?: string, records: TranscriptResponse[] = []): Promise<void> {
+  private async launchReview(task: string, material: string, reviewedTaskIds: string[], goalId?: string, records: TranscriptResponse[] = [],
+    decisions: { worth?: WorthVerdict; judgments?: ReviewJudgments } = {}): Promise<void> {
     const taskId = `review-${goalId ?? 'standalone'}-${Date.now()}`;
     this.inFlight = { ticketId: taskId, startedAt: Date.now() };
     const knowledgeScope = this.reviewScope(records);
-    this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material, knowledgeScope });
+    this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material, knowledgeScope,
+      ...(decisions.judgments ? { judgments: decisions.judgments } : {}) });
     const refs: Record<string, string> = {};
-    const dossier = await this.buildLearningDossier(task, material, records, refs);
+    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments));
     this.taskExtras.get(taskId)!.knowledgeRefs = refs;
     try {
       const { ticketId } = await this.request<{ ticketId: string }>(
@@ -1333,7 +2162,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         }
 
         case 'author_skill': {
-          result = await this.authorSkill(action);
+          result = await this.authorSkill(action, { goalId: extra.goalId, taskId });
           break;
         }
 
@@ -1520,7 +2349,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * human-installed one. New skills land disabled; the user approves them
    * in Settings before they enter any agent prompt.
    */
-  private async authorSkill(action: AgentAction): Promise<string> {
+  private async authorSkill(action: AgentAction, scope: { goalId?: string; taskId?: string } = {}): Promise<string> {
     if (!(await this.getSkillRegistryId())) throw new Error('SkillRegistry not available');
     const rawName = action.name as string;
     const description = action.description as string;
@@ -1547,11 +2376,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       );
     }
 
+    // Skills travel beyond this workspace. A judged risk of workspace-specific
+    // detail rides with the proposal: in the description the user reads
+    // before enabling, and as a review-warning field (site reviewer.privacy).
+    const privacy = await this.judgePrivacy({ name, description, instructions }, scope).catch(() => undefined);
     const content = [
       '---',
       `name: ${name}`,
-      `description: ${JSON.stringify(description)}`,
+      `description: ${JSON.stringify(privacy?.warning ? `${description} [${privacy.warning}]` : description)}`,
       'origin: reviewer',
+      ...(privacy?.warning ? [`review-warning: ${JSON.stringify(privacy.warning)}`] : []),
       '---',
       '',
       instructions.trim(),
@@ -1562,9 +2396,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       request(this.id, this.skillRegistryId!, 'installSkill', { name, content }),
       15000,
     );
-    return wasEnabled
+    const installed = wasEnabled
       ? `Updated skill "${name}" and disabled it pending the user's re-approval in Settings`
       : `Authored skill "${name}" (installed disabled; the user can enable it in Settings)`;
+    return [
+      installed,
+      privacy?.warning ? `A warning is attached for the user's approval: ${privacy.warning} Keep skills generic; personal and workspace details belong in save_entry, and author_skill again with a generic version replaces this one.` : '',
+      privacy?.advice ?? '',
+    ].filter(Boolean).join('\n');
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1586,6 +2425,8 @@ Assess the exact prediction made before the action, using the operation's actual
 An exit status has meaning within a particular command or protocol. For example, git diff --no-index returns 1 when it finds differences: a returned patch can support "the differences will be available", while contradicting "these files are identical" or "this command will exit 0". A search returning 1 with no matches can support "there are no matching records" if the intended scope was searched successfully; an unreadable input or invalid expression does not establish absence. Expected validation rejection can support a prediction when the rejection and absence of side effects are observed. Conversely, exit 0 with skipped items, partial results, or the wrong artifact does not support a claim of complete execution.
 
 Read the command or requested method and its evidence with read_evidence when the index omits them. Do not infer the semantics of an unfamiliar status, a truncated result, or a compound command from its final exit alone. A later successful command or pipeline stage may hide an earlier failure. Explain which part of the recorded expectation the output supports or contradicts. A compound prediction is supported only when its material claims are supported; a disproved material claim is contradicted, and a missing material observation is unresolved when nothing disproves it. If the operation's meaning or result coverage cannot be established from the available evidence, record unresolved with the specific gap rather than guessing. Ground any resulting knowledge correction in this semantic comparison, not merely in the runtime's status label.
+
+When the dossier carries automated priors from a decision model, read them as a second reader's notes: a confident supported episode needs only a confirming look, so spend read_evidence on the contradicted and uncertain ones. Your recorded assessment rests on the evidence you read; a prior is a place to start looking.
 
 For execution of an accepted proposal, compare the observed artifact or effect with the actual accepted selection, grouping, and wording, including omissions and additions. Use read_evidence with context:true to find the reviewed goal's conversation references, then context:true with messageId or sourceGoalId and optional key to retrieve the proposal. Read only the missing evidence; do not rerun the work. Git staging exit 0, diff statistics, and git diff --check do not prove that approved hunks landed in the intended commit. Compare full staged/committed evidence with the intended selection; if that evidence is unavailable, mark the substantive claim unresolved rather than supported. Combined-tree verification does not prove every intermediate commit was verified. Assess whether repeated inspections were justified by changed inputs or missing details before crediting a reuse pattern. Record counterexamples only for patterns actually declared, and keep specific proposal contents on the goal scratchpad.
 

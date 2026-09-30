@@ -684,6 +684,7 @@ export class LLMMonitor extends Abject {
             { id: 'balanced', label: 'Balanced tier', color: '$statusInfo', shape: 'icosphere' },
             { id: 'fast', label: 'Fast tier', color: '$statusSuccess', shape: 'icosphere' },
             { id: 'code', label: 'Code tier', color: '$statusWarning', shape: 'icosphere' },
+            { id: 'decision', label: 'Decisions', color: '$accentSecondary', shape: 'box' },
             { id: 'direct', label: 'By name', color: '$textSecondary', shape: 'sphere' },
           ],
         }],
@@ -1601,10 +1602,12 @@ export class LLMMonitor extends Abject {
   /** Fold one ledger entry into the Map's per-model totals. */
   private foldEntry(e: LLMLedgerEntry): void {
     const key = LLMMonitor.modelKey(e.provider, e.model);
+    // Decision calls (native or emulated) group as decisions whatever tier carried them.
+    const group = e.method === 'decide' ? 'decision' : e.tier;
     const m = this.eyeModels.get(key) ?? {
-      provider: e.provider, model: e.model, tier: e.tier ?? 'direct', tokens: 0, calls: 0, errors: 0, inflight: 0,
+      provider: e.provider, model: e.model, tier: group ?? 'direct', tokens: 0, calls: 0, errors: 0, inflight: 0,
     };
-    if (e.tier) m.tier = e.tier;
+    if (group) m.tier = group;
     if (e.status === 'active') {
       m.inflight++;
       this.eyeInflight.set(e.id, key);
@@ -1627,7 +1630,7 @@ export class LLMMonitor extends Abject {
   }
 
   private modelNode(key: string, m: EyeModel): Record<string, unknown> {
-    const tier = ['smart', 'balanced', 'fast', 'code'].includes(m.tier) ? m.tier : 'direct';
+    const tier = ['smart', 'balanced', 'fast', 'code', 'decision'].includes(m.tier) ? m.tier : 'direct';
     return {
       id: `model:${key}`, label: m.model || key, group: tier,
       size: 6 + Math.min(8, Math.log2(1 + m.calls) * 1.5), active: m.inflight > 0,

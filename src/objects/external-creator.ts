@@ -43,11 +43,28 @@ import type { ExternalProject } from './external-project-registry.js';
 import { ALWAYS_PROTECTED } from './external-project-registry.js';
 import type { FileEdit } from '../core/file-edit.js';
 import { Log } from '../core/timed-log.js';
+import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
+import { askScopeQuestions } from '../core/decision-questions.js';
 
 const log = new Log('ExternalCreator');
 
 const EXTERNAL_CREATOR_INTERFACE: InterfaceId = 'abjects:external-creator';
 export const EXTERNAL_CREATOR_ID = 'abjects:external-creator' as AbjectId;
+
+/** What this agent does, as registered with the runtime and as a scope check reads it. */
+const AGENT_DESCRIPTION =
+  'Works inside registered external projects on the host: a repository, a manuscript folder, a ' +
+  'data directory the user has registered. Reads, writes, and edits files there, runs shell ' +
+  'commands there, and runs the project\'s own check and verify commands, comparing against a ' +
+  'baseline so it reports only the failures it introduced. Handles software, prose, notes, and ' +
+  'data alike. Restricted to registered projects: reading or inspecting loose files elsewhere on ' +
+  'the machine (a download, a sample export, a config file) belongs elsewhere, as do changing ' +
+  'Abjects inside this system, interactive web browsing, and installed skill flows.';
+
+/** A string clipped to `max` characters, saying how much was cut. */
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text;
+}
 
 /** Goal-scratchpad keys: how one task hands off to the next in the same goal. */
 const SESSION_KEY = 'externalcreator:session';
@@ -181,6 +198,29 @@ interface CheckVerdict {
    * The verdict cannot say whose failure it is, so it never passes.
    */
   inconclusive?: boolean;
+  /**
+   * A runtime judgment of whose failures these are (site
+   * external.attribution), rendered as a labelled line under the verdict.
+   * Advisory text only: it never changes `passed` or anything the gate reads.
+   */
+  advisory?: string;
+}
+
+/** The last bash command's outcome, as the tier judgment reads it (bounded). */
+interface CommandRecord {
+  command: string;
+  exitCode: number | null;
+  stdoutTail: string;
+  stderrTail: string;
+  truncated: boolean;
+}
+
+/** The last failed action, kept until the next observation picks a tier. */
+interface FailureRecord {
+  action: string;
+  path?: string;
+  command?: CommandRecord;
+  error: string;
 }
 
 interface TaskExtra {
@@ -229,6 +269,14 @@ interface TaskExtra {
   audit: string[];
   /** The agent's own intermediate remarks, kept for the session summary. */
   decisions: string[];
+  /** The bash command run by the current action, if any (read by the tier judgment). */
+  lastCommand?: CommandRecord;
+  /** The last action's failure, when it failed (read by the tier judgment). */
+  lastFailure?: FailureRecord;
+  /** A line for the first observation from the project judgment (external.project). */
+  projectNote?: string;
+  /** The runtime ran verification itself once for this task (external.auto-verify). */
+  autoVerified?: boolean;
 }
 
 export class ExternalCreator extends Abject {
@@ -360,7 +408,38 @@ clean result I did not observe.`;
    * folder ended up dispatched here.
    */
   protected override async handleAsk(question: string, _callerId?: AbjectId): Promise<string> {
-    return this.askLlm(this.askPrompt(question) + await this.askAvailabilityContext(), question, this.askTier());
+    const availability = await this.askAvailabilityContext();
+    const scope = await this.askScopeJudgment(question, availability);
+    if (scope.pass) return scope.pass;
+    return this.askLlm(this.askPrompt(question) + availability + (scope.hint ?? ''), question, this.askTier());
+  }
+
+  /**
+   * Whether a question is within this agent's own described scope (site
+   * agent.ask-scope). Acting, a question judged clearly outside it gets PASS
+   * without the answering call; advising, the answering model sees the
+   * judgment as a hint. Null or unsure leaves the answer to the model.
+   */
+  private async askScopeJudgment(question: string, availability: string): Promise<{ pass?: string; hint?: string }> {
+    if (await this.decisionSiteMode('agent.ask-scope') === 'off') return {};
+    const outcome = await this.askDecision('agent.ask-scope', {
+      agent: { name: this.manifest.name, description: `${AGENT_DESCRIPTION}${availability}` },
+      question: clip(question, 3000),
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 15_000 });
+    const p = noulOf(outcome, 'in_scope');
+    if (!outcome || p === undefined) return {};
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ExternalCreator agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS without an answer)' : ''}`);
+      return {};
+    }
+    if (outcome.mode === 'act' && p < 0.1) {
+      log.info(`[decision:act] ExternalCreator agent.ask-scope: PASS (in_scope=${p.toFixed(2)})`);
+      return { pass: `PASS: this falls outside what I do (runtime scope check, in_scope p=${p.toFixed(2)}). I work on files inside registered external projects.` };
+    }
+    if (p < 0.2) {
+      return { hint: `\n\nRuntime scope check: this question looks outside the work described above (in_scope p=${p.toFixed(2)}). Answer PASS unless a registered project clearly applies.` };
+    }
+    return {};
   }
 
   protected override async askAvailabilityContext(): Promise<string> {
@@ -463,9 +542,12 @@ clean result I did not observe.`;
    * Work out which project a task belongs to, in decreasing order of how
    * explicit the evidence is. Guessing wrong here means editing the wrong
    * repository, so a weak signal loses to no answer at all: with nothing
-   * conclusive the loop starts unset and the agent picks.
+   * conclusive the loop starts unset and the agent picks. Where the text is
+   * inconclusive among several projects, a decision model may name a likely
+   * one (site external.project): a hint in the first observation, or, above a
+   * high bar when acting, the selection itself, disclosed to the agent.
    */
-  private async pickProject(taskText: string, data?: Record<string, unknown>): Promise<ExternalProject | undefined> {
+  private async pickProject(taskText: string, data?: Record<string, unknown>, extra?: TaskExtra): Promise<ExternalProject | undefined> {
     // `target` is what a planner sends when it means "work here"; the other
     // two are older spellings of the same intent.
     const hint = typeof data?.project === 'string' ? data.project
@@ -500,7 +582,90 @@ clean result I did not observe.`;
     if (named.length === 1) return named[0];
 
     if (all.length === 1) return all[0];
+    return this.judgeProject(taskText, data, all, extra);
+  }
+
+  private static readonly OUTSIDE_PROJECTS = 'outside_registered_projects';
+  private static readonly NOT_PROJECT_WORK = 'not_project_work';
+
+  /**
+   * Which of several registered projects an inconclusive task concerns (site
+   * external.project). Returns a project only when acting at p >= 0.9; every
+   * other answer at most leaves a note for the first observation.
+   */
+  private async judgeProject(
+    taskText: string,
+    data: Record<string, unknown> | undefined,
+    all: ExternalProject[],
+    extra?: TaskExtra,
+  ): Promise<ExternalProject | undefined> {
+    if (all.length < 2) return undefined;
+    if (await this.decisionSiteMode('external.project') === 'off') return undefined;
+    const candidates = all.slice(0, 60);
+    const criteria: Record<string, string> = {};
+    for (const p of candidates) {
+      criteria[p.name] = `The registered project "${p.name}" at ${p.root}${p.description ? `: ${p.description.slice(0, 150)}` : ''}.`;
+    }
+    criteria[ExternalCreator.OUTSIDE_PROJECTS] = 'Files or directories outside every registered project: a download, a loose file, another directory.';
+    criteria[ExternalCreator.NOT_PROJECT_WORK] = 'Not work on project files at all: a question or request that needs no project.';
+    const hints: Record<string, string> = {};
+    for (const key of ['project', 'projectPath', 'target']) {
+      if (typeof data?.[key] === 'string') hints[key] = clip(data[key] as string, 300);
+    }
+    const goal = await this.goalContext(extra);
+    const outcome = await this.askDecision('external.project', {
+      task: clip(taskText, 1500),
+      hints,
+      goal_title: goal.title ?? null,
+      previous_task_project: goal.previousProject ?? null,
+      projects: candidates.map(p => ({ name: p.name, root: p.root, description: (p.description ?? '').slice(0, 150) })),
+    }, {
+      project: {
+        type: 'choice',
+        instructions: 'Which registered project in `projects` does `task` concern? `hints`, `goal_title`, and the project the previous task in the same goal worked in are supporting context.',
+        criteria,
+      },
+    }, { goalId: extra?.goalId, taskId: extra?.taskId, onBehalfOf: this.manifest.name, timeoutMs: 30_000 });
+    const pick = choiceOf(outcome, 'project');
+    if (!outcome || !pick) return undefined;
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const project = candidates.find(c => c.name === pick.choice);
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ExternalCreator external.project: ${pick.choice}@${p.toFixed(2)}${project && p >= 0.9 ? ' (would auto-select)' : ''}`);
+      return undefined;
+    }
+    if (project && outcome.mode === 'act' && p >= 0.9) {
+      if (extra) {
+        extra.projectNote = `Project ${project.name} was auto-selected by a runtime judgment of the task (p=${p.toFixed(2)}); use set_project to change it.`;
+        this.audit(extra, `project ${project.name} auto-selected (external.project p=${p.toFixed(2)})`);
+      }
+      return project;
+    }
+    if (extra && p >= 0.5) {
+      extra.projectNote = project
+        ? `Likely project: ${project.name} (runtime judgment, p=${p.toFixed(2)}); use set_project to work there.`
+        : pick.choice === ExternalCreator.OUTSIDE_PROJECTS
+          ? `The task looks to concern files outside every registered project (runtime judgment, p=${p.toFixed(2)}). If so, fail with that reason so the goal can route it elsewhere.`
+          : `The task looks like it needs no project at all (runtime judgment, p=${p.toFixed(2)}). If so, answer from what you can establish, or fail with that reason.`;
+    }
     return undefined;
+  }
+
+  /** The goal's title and the project its previous task worked in, when known. */
+  private async goalContext(extra?: TaskExtra): Promise<{ title?: string; previousProject?: string }> {
+    if (!extra?.goalId) return {};
+    const out: { title?: string; previousProject?: string } = {};
+    this.goalManagerId = await this.resolveDep('GoalManager', this.goalManagerId);
+    if (this.goalManagerId) {
+      try {
+        const briefing = await this.call<{ title?: string } | null>(this.goalManagerId, 'getGoalBriefing', { goalId: extra.goalId, keys: [SESSION_KEY] }, 10_000);
+        if (typeof briefing?.title === 'string') out.title = briefing.title.slice(0, 300);
+      } catch { /* the title is supporting context only */ }
+    }
+    const prior = await this.readGoalData<{ summary?: string }>(extra, SESSION_KEY);
+    const previous = prior?.summary?.match(/^- Project (\S+) at /m)?.[1];
+    if (previous) out.previousProject = previous;
+    return out;
   }
 
   /**
@@ -831,7 +996,13 @@ clean result I did not observe.`;
     return { newFailures, foreignFailures };
   }
 
+  /** A verdict as the agent reads it, with any attribution advisory as its own labelled line. */
   private renderVerdict(v: CheckVerdict): string {
+    const body = this.renderVerdictBody(v);
+    return v.advisory ? `${body}\n${v.advisory}` : body;
+  }
+
+  private renderVerdictBody(v: CheckVerdict): string {
     const head = `\`${v.outcome.command}\` exited ${v.outcome.exitCode}`;
     const foreign = v.foreignFailures.length > 0
       ? `\n${v.foreignFailures.length} new failure(s) are in files this task did not write — other tasks are working in this ` +
@@ -859,6 +1030,65 @@ clean result I did not observe.`;
       ? ' (no baseline was captured, so these may or may not predate this task)'
       : ` (${v.preExisting} other failures predate this task and are not yours)`;
     return `${head} — ${v.newFailures.length} failure(s) attributable to this task${caveat}:\n${lines}${more}${foreign}`;
+  }
+
+  private static readonly ATTRIBUTION_QUESTIONS: Record<string, DecisionQuestion> = {
+    attribution: {
+      type: 'choice',
+      instructions: 'A project command (`cmd`) failed after this task changed `touchedFiles`. Compare `currentTail` with `baselineTail` (the same command before the task started) and `newSignatures`. What most likely caused the new failures?',
+      criteria: {
+        introduced_by_this_change: 'This task\'s change caused them, including knock-on failures in callers or dependents of the files it touched.',
+        pre_existing_or_flaky: 'They were already there or are flaky: the baseline shows the same failures or the test is nondeterministic.',
+        concurrent_task: 'Another task working in the same project at the same time caused them, in files this task did not touch.',
+        environment: 'The environment caused them: toolchain, services, network, resources, or timing.',
+        unknown: 'The output does not show enough to tell.',
+      },
+    },
+  };
+
+  private static readonly ATTRIBUTION_ADVICE: Record<string, string> = {
+    introduced_by_this_change: 'introduced by this change, including knock-on failures in callers. Read the failing sites and fix them before completing.',
+    pre_existing_or_flaky: 'pre-existing or flaky. Compare them with the baseline output before treating them as yours.',
+    concurrent_task: 'caused by a concurrent task in this project. Check what the other tasks in this project have written before changing their files.',
+    environment: 'environmental (toolchain, services, or resources). Check what the command needs from its environment before changing code.',
+  };
+
+  /**
+   * Whose failures a non-passing verdict shows, when the deterministic split
+   * cannot say: foreign failures, or an inconclusive run (site
+   * external.attribution, advise only). Sets `verdict.advisory` and nothing
+   * else, so the verdict and the gate stay exactly as `judge` made them.
+   */
+  private async adviseAttribution(extra: TaskExtra, verdict: CheckVerdict, baseline: CheckOutcome | undefined): Promise<void> {
+    if (verdict.passed || (!verdict.inconclusive && verdict.foreignFailures.length === 0)) return;
+    if (await this.decisionSiteMode('external.attribution') === 'off') return;
+    const tail = (s: string | undefined, n: number): string => (s ?? '').trim().slice(-n);
+    const outcome = await this.askDecision('external.attribution', {
+      cmd: verdict.outcome.command,
+      exit: verdict.outcome.exitCode,
+      verdict: verdict.inconclusive ? 'inconclusive' : 'new failures in files this task did not write',
+      failureCount: { now: verdict.outcome.failureCount ?? null, baseline: baseline?.failureCount ?? null },
+      baselineExit: baseline?.exitCode ?? null,
+      baselineTail: baseline ? tail(baseline.output, 1500) : null,
+      currentTail: tail(verdict.outcome.output, 2000),
+      touchedFiles: this.touchedFiles(extra).slice(0, 30),
+      newSignatures: [...verdict.newFailures, ...verdict.foreignFailures].slice(0, 20).map(s => clip(s, 300)),
+    }, ExternalCreator.ATTRIBUTION_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 30_000 });
+    const pick = choiceOf(outcome, 'attribution');
+    if (!outcome || !pick) return;
+    const p = pick.probabilities[pick.choice] ?? 0;
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] ExternalCreator external.attribution: ${pick.choice}@${p.toFixed(2)} for \`${verdict.outcome.command.slice(0, 80)}\``);
+      return;
+    }
+    const advice = ExternalCreator.ATTRIBUTION_ADVICE[pick.choice];
+    if (!advice || p < 0.5) return;
+    verdict.advisory = `Advisory (runtime judgment, p=${p.toFixed(2)}; not part of the verdict): these failures look ${advice}`;
+    this.audit(extra, `attribution advisory: ${pick.choice}@${p.toFixed(2)}`);
+  }
+
+  private decisionScope(extra: TaskExtra): { goalId?: string; taskId: string; onBehalfOf: string } {
+    return { goalId: extra.goalId, taskId: extra.taskId, onBehalfOf: this.manifest.name };
   }
 
   // ─── Baseline ───────────────────────────────────────────────────
@@ -1298,31 +1528,91 @@ clean result I did not observe.`;
     // A file this task just edited that no longer parses is a mechanical
     // failure with a known cause and a known undo. Restoring it beats leaving
     // source no one authored on disk while the agent works out what happened.
+    let keptNote = '';
     if (!verdict.passed && editedPath && this.looksLikeParseFailure(verdict, editedPath, extra)) {
-      const restored = await this.rollback(extra, editedPath);
-      if (restored === 'restored') {
-        return {
-          success: false,
-          error:
-            `${summary}\n\nThat edit left ${this.displayPath(extra, editedPath)} unparseable, so it was ` +
-            `REVERTED to its state at the start of this task. Nothing is half-written.\n\n${this.renderVerdict(verdict)}`,
-        };
-      }
-      if (restored === 'changed-by-other') {
-        return {
-          success: false,
-          error:
-            `${summary}\n\nThat edit left ${this.displayPath(extra, editedPath)} unparseable, but the file has since been ` +
-            `changed by another task working in this project, so it was NOT reverted (that would erase their work). ` +
-            `Read it as it stands now and fix the syntax with a fresh edit.\n\n${this.renderVerdict(verdict)}`,
-        };
+      const syntax = await this.judgeSyntax(extra, verdict, editedPath);
+      if (syntax.rollback) {
+        const advice = syntax.note ? `\n\n${syntax.note}` : '';
+        const restored = await this.rollback(extra, editedPath);
+        if (restored === 'restored') {
+          return {
+            success: false,
+            error:
+              `${summary}\n\nThat edit left ${this.displayPath(extra, editedPath)} unparseable, so it was ` +
+              `REVERTED to its state at the start of this task. Nothing is half-written.\n\n${this.renderVerdict(verdict)}${advice}`,
+          };
+        }
+        if (restored === 'changed-by-other') {
+          return {
+            success: false,
+            error:
+              `${summary}\n\nThat edit left ${this.displayPath(extra, editedPath)} unparseable, but the file has since been ` +
+              `changed by another task working in this project, so it was NOT reverted (that would erase their work). ` +
+              `Read it as it stands now and fix the syntax with a fresh edit.\n\n${this.renderVerdict(verdict)}${advice}`,
+          };
+        }
+      } else if (syntax.note) {
+        keptNote = `\n\n${syntax.note}`;
       }
     }
 
+    await this.adviseAttribution(extra, verdict, extra.baseline?.check);
     const verifiedNote = verdict.passed && checkIsVerify && extra.filesModified.size > 0
       ? '\n\nThis check is the project\'s verification, so the gate is satisfied; no separate verify step is needed.'
       : '';
-    return { success: true, data: `${summary}\n\n${this.renderVerdict(verdict)}${verifiedNote}` };
+    return { success: true, data: `${summary}\n\n${this.renderVerdict(verdict)}${verifiedNote}${keptNote}` };
+  }
+
+  /**
+   * Whether a syntax-looking failure really means the edited file no longer
+   * parses (site external.syntax). Asked only after the deterministic check
+   * said syntax, one yes/no per diagnostic in that file. Acting, the rollback
+   * happens only when at least one diagnostic reads as a parse failure
+   * (p >= 0.5); otherwise the edit stays and the agent fixes forward, with the
+   * pre-image still held. No answer keeps today's rollback.
+   */
+  private async judgeSyntax(extra: TaskExtra, verdict: CheckVerdict, editedPath: string): Promise<{ rollback: boolean; note?: string }> {
+    if (await this.decisionSiteMode('external.syntax') === 'off') return { rollback: true };
+    const rel = this.displayPath(extra, editedPath).split(path.sep).join('/');
+    const { flagged, inFile } = this.parseFailureCandidates(verdict, editedPath, extra);
+    const diagnostics = [...flagged, ...inFile.filter(s => !flagged.includes(s))].slice(0, 10).map(s => clip(s, 400));
+    if (diagnostics.length === 0) return { rollback: true };
+    const questions: Record<string, DecisionQuestion> = {};
+    diagnostics.forEach((_, i) => {
+      questions[`is_syntax_error_${i}`] = {
+        type: 'noul',
+        instructions: `Does \`diagnostics[${i}]\` mean \`file\` cannot be parsed, as opposed to a type, lint, or test failure in parseable code?`,
+      };
+    });
+    const outcome = await this.askDecision('external.syntax', {
+      file: rel, diagnostics, checkCommand: verdict.outcome.command,
+    }, questions, { ...this.decisionScope(extra), timeoutMs: 30_000 });
+    if (!outcome) return { rollback: true };
+    const ps = diagnostics.map((_, i) => noulOf(outcome, `is_syntax_error_${i}`)).filter((p): p is number => p !== undefined);
+    if (ps.length === 0) return { rollback: true };
+    const max = Math.max(...ps);
+    const parses = max < 0.5;
+    if (outcome.mode === 'act') {
+      if (!parses) return { rollback: true };
+      this.audit(extra, `syntax-looking failure in ${rel} judged parseable (max is_syntax_error=${max.toFixed(2)}); edit kept`);
+      return {
+        rollback: false,
+        note: `A diagnostic in ${rel} looked like a parse failure, but a runtime judgment reads every diagnostic there as a ` +
+          `type, lint, or test finding in parseable code (is_syntax_error at most ${max.toFixed(2)}), so the edit was kept. ` +
+          `Fix it forward from the diagnostics above.`,
+      };
+    }
+    if (parses) {
+      log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} judged parseable (max is_syntax_error=${max.toFixed(2)}); the deterministic rollback stands`);
+    }
+    if (outcome.mode === 'advise' && parses) {
+      return {
+        rollback: true,
+        note: `Runtime judgment: these diagnostics read as findings in parseable code rather than a parse failure ` +
+          `(is_syntax_error at most ${max.toFixed(2)}). If that holds, reapply the edit and fix the findings forward.`,
+      };
+    }
+    return { rollback: true };
   }
 
   /** Files this task has written, as project-relative paths (for attribution). */
@@ -1337,17 +1627,23 @@ clean result I did not observe.`;
    * else the check would have said.
    */
   private looksLikeParseFailure(verdict: CheckVerdict, editedPath: string, extra: TaskExtra): boolean {
+    return this.parseFailureCandidates(verdict, editedPath, extra).flagged.length > 0;
+  }
+
+  /** New failures naming the edited file, and those among them that look syntactic. */
+  private parseFailureCandidates(verdict: CheckVerdict, editedPath: string, extra: TaskExtra): { flagged: string[]; inFile: string[] } {
     const rel = this.displayPath(extra, editedPath).split(path.sep).join('/');
     // A bare "expected" also opens type and lint findings ("error TS2554:
     // Expected 2 arguments", ESLint's "Expected '===' and instead saw '=='"),
     // so it only counts in rustc's code-less parse form ("error: expected …").
     const syntaxish = /syntax|unexpected token|unterminated|pars(?:e|ing) error|unbalanced|indentation|\berror: expected\b/i;
-    return verdict.newFailures.some(s => {
-      if (!s.includes(rel)) return false;
+    const inFile = verdict.newFailures.filter(s => s.includes(rel));
+    const flagged = inFile.filter(s => {
       // TypeScript numbers its diagnostics: the 1xxx range is the syntactic one.
       const tsCode = s.match(/\bTS(\d{4,5})\b/)?.[1];
       return tsCode ? tsCode.startsWith('1') : syntaxish.test(s);
     });
+    return { flagged, inFile };
   }
 
   /**
@@ -1389,7 +1685,9 @@ clean result I did not observe.`;
     // action requested it. Do not guess equivalence for arbitrary shell code.
     if (cwd === extra.workRoot && [extra.project?.checkCommand, extra.project?.verifyCommand].includes(command.trim())) {
       const verified = await this.opVerify(extra, { ...action, timeout, full: command.trim() === extra.project?.verifyCommand });
-      const data = verified.data as { exitCode?: number } | undefined;
+      const data = verified.data as { exitCode?: number; verification?: string; outputTruncated?: unknown } | undefined;
+      extra.lastCommand = { command: command.slice(0, 300), exitCode: data?.exitCode ?? null,
+        stdoutTail: (data?.verification ?? '').slice(-1500), stderrTail: '', truncated: !!data?.outputTruncated };
       return { ...verified, success: verified.success && data?.exitCode === 0,
         ...(data?.exitCode !== 0 ? { error: `Command exited ${data?.exitCode}; inspect verification evidence.` } : {}) };
     }
@@ -1400,8 +1698,12 @@ clean result I did not observe.`;
     try { r = await this.runCommand(extra, command, timeout, cwd); }
     catch (err) {
       extra.unknownEffects = true; extra.mutationsSinceVerify++; this.taintVerifyBaseline(extra);
+      extra.lastCommand = { command: command.slice(0, 300), exitCode: null,
+        stdoutTail: '', stderrTail: (err instanceof Error ? err.message : String(err)).slice(-1500), truncated: false };
       throw err;
     }
+    extra.lastCommand = { command: command.slice(0, 300), exitCode: r.exitCode,
+      stdoutTail: r.stdout.slice(-1500), stderrTail: r.stderr.slice(-1500), truncated: !!r.truncated };
     const after = await this.verificationSnapshot(extra);
     if (before.revision !== after.revision) {
       this.taintVerifyBaseline(extra);
@@ -1567,6 +1869,7 @@ clean result I did not observe.`;
     if (full) extra.lastVerify = verdict; else extra.lastCheck = verdict;
     if (verdict.passed && command === (project.verifyCommand ?? project.checkCommand)) extra.mutationsSinceVerify = 0;
     this.audit(extra, `verify(${full ? 'full' : 'check'}) exit=${outcome.exitCode} new=${verdict.newFailures.length} foreign=${verdict.foreignFailures.length}${verdict.inconclusive ? ' inconclusive' : ''}`);
+    await this.adviseAttribution(extra, verdict, baseline);
 
     return { success: true, data: { verification: this.renderVerdict(verdict), command, exitCode: outcome.exitCode,
       reused: !!reusable, testSummary: outcome.testSummary, revision: outcome.revision, snapshotNote: outcome.snapshotNote,
@@ -1694,8 +1997,13 @@ clean result I did not observe.`;
    * to the result before it leaves this object. An agent that says "done" with
    * unverified changes gets its claim downgraded, with the precise reason, and
    * the caller sees the truth rather than the claim.
+   *
+   * `kind` names which refusal it is, so the completion check can tell an
+   * unverified claim (which the runtime may verify itself) from a failed or
+   * inconclusive run. An attribution advisory rides along in the reason text
+   * only; nothing here reads it.
    */
-  private gateVerdict(extra: TaskExtra): { ok: boolean; reason?: string; note: string } {
+  private gateVerdict(extra: TaskExtra): { ok: boolean; reason?: string; note: string; kind?: 'unverified' | 'inconclusive' | 'failed' } {
     const project = extra.project;
     if (!project) return { ok: true, note: 'No project was selected, so nothing was changed on disk.' };
 
@@ -1733,6 +2041,7 @@ clean result I did not observe.`;
           `${pending} Run \`${project.verifyCommand ?? project.checkCommand}\` (the verify action) ` +
           `and address anything it newly reports before claiming this is done.`,
         note: `${changed} file(s) changed, unverified.`,
+        kind: 'unverified',
       };
     }
 
@@ -1741,6 +2050,7 @@ clean result I did not observe.`;
         ok: false,
         reason: `${this.renderVerdict(latest)}\nInspect the command failure before deciding whether another run is useful.`,
         note: `${changed} file(s) changed, verification inconclusive.`,
+        kind: 'inconclusive',
       };
     }
 
@@ -1755,12 +2065,14 @@ clean result I did not observe.`;
         : foreign.length
           ? `${foreign.length} new failure(s) are in files this task did not write; establish their cause ` +
             `(concurrent work, or a knock-on effect of this change) before claiming done:\n` +
-            foreign.slice(0, 15).map(s => `  ${s}`).join('\n')
+            foreign.slice(0, 15).map(s => `  ${s}`).join('\n') +
+            (latest.advisory ? `\n${latest.advisory}` : '')
           : 'No diagnostic line was recognized; inspect the command output.';
       return {
         ok: false,
         reason: `\`${latest.outcome.command}\` exited ${latest.outcome.exitCode} and did not pass. ${detail}`,
         note: `${changed} file(s) changed, ${ours.length} new failure(s)${foreign.length ? `, ${foreign.length} in other files` : ''}.`,
+        kind: 'failed',
       };
     }
 
@@ -1792,6 +2104,143 @@ clean result I did not observe.`;
       const summary = tests ? `; tests: ${tests.passed ?? '?'} passed, ${tests.failed ?? '?'} failed, ${tests.tests ?? '?'} total` : '';
       return `${command}: exit ${outcome.exitCode}${summary}; ${applicable ? 'applies to the current project inputs' : 'historical result; current coverage is not established'}.${outcome.snapshotNote ? ` ${outcome.snapshotNote}` : ''}`;
     }).join('\n');
+  }
+
+  /**
+   * The completion check for a done claim (this agent's completionMethod).
+   *
+   * The gate decides. One addition: a claim refused only because the change
+   * is unverified may be verified by the runtime itself (site
+   * external.auto-verify, act, once per task), so the agent's one correction
+   * goes to what the verification finds rather than to running it. The gate
+   * then judges that run exactly as it judges the agent's own.
+   */
+  private async settleCandidate(extra: TaskExtra, result: unknown): Promise<{
+    accepted: boolean; reason?: string; evidence?: { taskId: string; note: string; autoVerified?: string }; result?: string;
+  }> {
+    const taskId = extra.taskId;
+    let inputs = await this.completionInputs(extra);
+    if (inputs.rejection) return { accepted: false, reason: inputs.rejection };
+    let gate = this.gateVerdict(extra);
+    const auto = !gate.ok && gate.kind === 'unverified' ? await this.autoVerify(extra) : undefined;
+    if (auto) {
+      inputs = await this.completionInputs(extra);
+      if (inputs.rejection) {
+        return { accepted: false, reason: `${auto.note}\n${inputs.rejection}`, evidence: { taskId, note: auto.note, autoVerified: auto.command } };
+      }
+      gate = this.gateVerdict(extra);
+    }
+    const note = [auto?.note, gate.note, await this.completionChecks(extra, inputs.current), inputs.warning].filter(Boolean).join('\n');
+    // After a run that did not pass, the gate still reads "unverified" (only
+    // a pass clears the mutation count); what the agent needs then is what
+    // the run found, not an instruction to run it.
+    const reason = auto && !gate.ok
+      ? [auto.note, auto.verification, auto.verification && gate.kind === 'unverified' ? 'Address what it reports, then claim done again.' : gate.reason]
+        .filter(Boolean).join('\n')
+      : gate.reason;
+    return { accepted: gate.ok, reason, evidence: { taskId, note, ...(auto ? { autoVerified: auto.command } : {}) },
+      ...(gate.ok && typeof result === 'string' ? { result: `${result}\n\nVerification: ${note}` } : {}) };
+  }
+
+  /** Whether project inputs moved after the last passing verification, plus the snapshot it was judged on. */
+  private async completionInputs(extra: TaskExtra): Promise<{ rejection?: string; current?: { revision?: string; complete: boolean }; warning?: string }> {
+    if (!extra.project) return {};
+    const current = await this.verificationSnapshot(extra);
+    const required = extra.project.verifyCommand ?? extra.project.checkCommand;
+    const latest = [extra.lastVerify, extra.lastCheck].filter((v): v is CheckVerdict => !!v && v.outcome.command === required).sort((a, b) => b.outcome.at - a.outcome.at)[0];
+    if (latest?.passed && current.complete && latest.outcome.revision && current.revision !== latest.outcome.revision) {
+      return { rejection: `Project inputs changed after ${required}. Review ${current.changed?.slice(0, 8).join(', ') || 'the changed inputs'} and verify once after those edits.` };
+    }
+    return { current, ...(!current.complete ? { warning: `Current snapshot coverage is incomplete. ${current.issues?.slice(0, 3).join('; ') ?? ''}` } : {}) };
+  }
+
+  private static readonly AUTO_VERIFY_QUESTIONS: Record<string, DecisionQuestion> = {
+    verification_unwanted: {
+      type: 'noul',
+      instructions: 'Do `task` or `projectInstructions` say not to run tests or verification here (too slow, needs services, told to skip)?',
+    },
+  };
+
+  /**
+   * Run the project's own verification on the agent's behalf (site
+   * external.auto-verify). Only for an unverified claim in a project that
+   * declares a command, at most once per task, and only when neither the task
+   * nor the project's instructions ask to skip verification. The run goes
+   * through the ordinary verify action and shows in the audit and in the note
+   * returned with the verdict.
+   */
+  private async autoVerify(extra: TaskExtra): Promise<{ note: string; command: string; verification?: string } | undefined> {
+    const project = extra.project;
+    if (!project || extra.autoVerified || extra.cancelled) return undefined;
+    const command = project.verifyCommand ?? project.checkCommand;
+    if (!command) return undefined;
+    if (await this.decisionSiteMode('external.auto-verify') === 'off') return undefined;
+    const instructions = await this.projectInstructionsExcerpt(extra, 1500);
+    const outcome = await this.askDecision('external.auto-verify', {
+      task: clip(extra.taskText, 1500),
+      ...(instructions ? { projectInstructions: instructions } : {}),
+      verifyCommand: command,
+    }, ExternalCreator.AUTO_VERIFY_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 20_000 });
+    const unwanted = noulOf(outcome, 'verification_unwanted');
+    if (!outcome || unwanted === undefined) return undefined;
+    if (unwanted >= 0.5) {
+      log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: verification_unwanted=${unwanted.toFixed(2)}; leaving \`${command}\` to the agent`);
+      return undefined;
+    }
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: would auto-verify \`${command}\` (verification_unwanted=${unwanted.toFixed(2)})`);
+      return undefined;
+    }
+
+    extra.autoVerified = true;
+    this.audit(extra, `auto-verify: done was claimed with unverified changes, so the runtime is running \`${command}\` itself (verification_unwanted=${unwanted.toFixed(2)})`);
+    this.reportProgress(extra, 'acting', `runtime verify: ${command.slice(0, 80)}`);
+    // The completion request waits on a stall timer and a verify can run for
+    // minutes: progress beats keep it, and this task's ticket, alive.
+    const heartbeat = this.setRecurringTimer(() => {
+      this.resetPendingTicketTimeouts(extra.taskId);
+      if (!this.agentAbjectId) return;
+      try {
+        this.send(event(this.id, this.agentAbjectId, 'progress', { taskId: extra.taskId, phase: 'acting', message: `runtime verification: ${command.slice(0, 80)}` }));
+      } catch { /* bus gone */ }
+    }, 10_000);
+    try {
+      const run = await this.opVerify(extra, { action: 'verify', full: Boolean(project.verifyCommand) });
+      const data = run.data as { exitCode?: number; verification?: string } | undefined;
+      this.audit(extra, `auto-verify finished: exit ${data?.exitCode ?? '?'}`);
+      return { command, verification: data?.verification,
+        note: `The runtime ran \`${command}\` itself (exit ${data?.exitCode ?? '?'}) because done was claimed with unverified changes.` };
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      this.audit(extra, `auto-verify could not run: ${why.slice(0, 200)}`);
+      return { command, note: `The runtime tried to run \`${command}\` itself because done was claimed with unverified changes, but it could not run: ${why.slice(0, 300)}` };
+    } finally {
+      this.cancelTimer(heartbeat);
+    }
+  }
+
+  /**
+   * What the project's own instruction files say about running checks, for
+   * the auto-verify judgment: lines about tests and verification first,
+   * bounded. Untrusted projects contribute nothing, as everywhere else.
+   */
+  private async projectInstructionsExcerpt(extra: TaskExtra, max: number): Promise<string | undefined> {
+    if (!extra.project?.trusted) return undefined;
+    let files: Array<{ path: string; content: string }> = [];
+    try { files = await this.loadProjectInstructions(extra); } catch { return undefined; }
+    const text = files.map(f => `${f.path}:\n${f.content}`).join('\n\n').trim();
+    if (!text) return undefined;
+    if (text.length <= max) return text;
+    const picked: string[] = [];
+    let used = 0;
+    for (const raw of text.split('\n')) {
+      if (!/\b(tests?|testing|verif\w*|checks?|lint\w*|build|ci|slow|skip\w*)\b/i.test(raw)) continue;
+      const line = clip(raw.trim(), 200);
+      if (used + line.length + 1 > max) break;
+      picked.push(line);
+      used += line.length + 1;
+    }
+    return picked.length > 0 ? picked.join('\n') : text.slice(0, max);
   }
 
   // ─── Goal scratchpad ────────────────────────────────────────────
@@ -1925,14 +2374,7 @@ clean result I did not observe.`;
     if (!this.agentAbjectId) return;
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ExternalCreator',
-      description:
-        'Works inside registered external projects on the host: a repository, a manuscript folder, a ' +
-        'data directory the user has registered. Reads, writes, and edits files there, runs shell ' +
-        'commands there, and runs the project\'s own check and verify commands, comparing against a ' +
-        'baseline so it reports only the failures it introduced. Handles software, prose, notes, and ' +
-        'data alike. Restricted to registered projects: reading or inspecting loose files elsewhere on ' +
-        'the machine (a download, a sample export, a config file) belongs elsewhere, as do changing ' +
-        'Abjects inside this system, interactive web browsing, and installed skill flows.',
+      description: AGENT_DESCRIPTION,
       config: {
         completionMethod: 'candidateComplete',
             snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
@@ -2041,22 +2483,7 @@ clean result I did not observe.`;
       const { taskId, result } = msg.payload as { taskId: string; result?: unknown };
       const extra = this.taskExtras.get(taskId);
       if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
-      let snapshotWarning: string | undefined;
-      let currentSnapshot: { revision?: string; complete: boolean } | undefined;
-      if (extra.project) {
-        const current = await this.verificationSnapshot(extra);
-        currentSnapshot = current;
-        const required = extra.project.verifyCommand ?? extra.project.checkCommand;
-        const latest = [extra.lastVerify, extra.lastCheck].filter((v): v is CheckVerdict => !!v && v.outcome.command === required).sort((a, b) => b.outcome.at - a.outcome.at)[0];
-        if (latest?.passed && current.complete && latest.outcome.revision && current.revision !== latest.outcome.revision) {
-          return { accepted: false, reason: `Project inputs changed after ${required}. Review ${current.changed?.slice(0, 8).join(', ') || 'the changed inputs'} and verify once after those edits.` };
-        }
-        if (!current.complete) snapshotWarning = `Current snapshot coverage is incomplete. ${current.issues?.slice(0, 3).join('; ') ?? ''}`;
-      }
-      const gate = this.gateVerdict(extra);
-      const note = [gate.note, await this.completionChecks(extra, currentSnapshot), snapshotWarning].filter(Boolean).join('\n');
-      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, note },
-        ...(gate.ok && typeof result === 'string' ? { result: `${result}\n\nVerification: ${note}` } : {}) };
+      return this.settleCandidate(extra, result);
     });
 
     this.onTaskMessage('taskCancelled', async (msg: AbjectMessage) => {
@@ -2131,7 +2558,7 @@ clean result I did not observe.`;
     this._currentGoalId = args.goalId;
 
     try {
-      extra.project = await this.pickProject(args.taskText, args.data);
+      extra.project = await this.pickProject(args.taskText, args.data, extra);
       let projectSetupNote: string | undefined;
       if (extra.project) {
         try {
@@ -2159,6 +2586,7 @@ clean result I did not observe.`;
           extra.workRoot = undefined;
           extra.worktree = undefined;
           extra.projectSession = undefined;
+          extra.projectNote = undefined;
         }
       }
 
@@ -2310,6 +2738,7 @@ clean result I did not observe.`;
       // First turn: everything the agent needs to stop asking.
       if (extra.project) {
         lines.push(`Project: ${extra.project.name} at ${extra.workRoot}`);
+        if (extra.projectNote) lines.push(extra.projectNote);
         if (extra.project.description) lines.push(extra.project.description);
         if (extra.worktree) {
           lines.push(`Isolation: worktree on branch ${extra.worktree.branch}. Your changes are NOT in the main checkout.`);
@@ -2336,6 +2765,7 @@ clean result I did not observe.`;
               all.map(p => `- ${p.name} — ${p.root}${p.description ? ` (${p.description})` : ''}`).join('\n') +
               `\nUse {"action":"set_project","name":"<one of these>"} before touching files.`,
         );
+        if (all.length > 0 && extra.projectNote) lines.push(extra.projectNote);
       }
     } else {
       lines.push('The previous action result is already in the conversation above.');
@@ -2358,8 +2788,67 @@ clean result I did not observe.`;
 
     // Recovery is where the strongest model earns its cost; ordinary file work
     // is what the code tier is for.
-    const tier = extra.lastResult?.startsWith('Error:') ? 'smart' : 'code';
+    const tier = extra.lastResult?.startsWith('Error:') ? await this.recoveryTier(extra) : 'code';
     return { observation: lines.join('\n'), tier };
+  }
+
+  private static readonly COMMAND_OUTCOME_QUESTIONS: Record<string, DecisionQuestion> = {
+    command_outcome: {
+      type: 'choice',
+      instructions: 'A shell command ran in a project and exited with `exitCode` (null when it could not run); `stdoutTail` and `stderrTail` are the ends of its output. What does the outcome mean for the next step?',
+      criteria: {
+        succeeded: 'The command did what it was asked; nothing in the exit status or output is a problem.',
+        expected_nonzero: 'A non-zero exit that reports a finding rather than a fault: a search with no match, a diff or comparison that found differences, a test expression that was false.',
+        tests_or_checks_failed: 'Tests, a typecheck, a linter, or a build ran and reported failures in the files.',
+        command_error: 'The command itself was wrong or could not run: bad flags or syntax, command or file not found, permission denied, a missing dependency.',
+        environment_or_infra: 'The environment got in the way: network, out of memory, a timeout, the process was killed, a service is unavailable.',
+        partial_or_truncated: 'The output is cut off or incomplete, so the outcome cannot be read from it.',
+      },
+    },
+  };
+
+  private static readonly ERROR_KIND_QUESTIONS: Record<string, DecisionQuestion> = {
+    error_kind: {
+      type: 'choice',
+      instructions: 'An `action` taken in a project failed with `error`. Is the fix plain from the message itself, or does it need diagnosis?',
+      criteria: {
+        trivial_retry: 'A mechanical slip with a plain fix: edit text that was not found or not unique, a path typo, a missing required argument.',
+        needs_diagnosis: 'The cause is unclear, or fixing it needs reasoning about the project.',
+      },
+    },
+  };
+
+  /** Think tier per judged outcome: file work stays on code; diagnosis goes to smart. */
+  private static readonly OUTCOME_TIERS: Record<string, 'code' | 'smart'> = {
+    succeeded: 'code', expected_nonzero: 'code', tests_or_checks_failed: 'code', trivial_retry: 'code',
+    command_error: 'smart', environment_or_infra: 'smart', partial_or_truncated: 'smart', needs_diagnosis: 'smart',
+  };
+
+  /**
+   * The tier after a failed action. Smart by default; a decision model may
+   * judge the failure ordinary file work (a finding, failing tests, a
+   * mismatched edit) that the code tier handles (site external.tier, act
+   * at confidence >= 0.6). Anything else, or no answer, stays smart.
+   */
+  private async recoveryTier(extra: TaskExtra): Promise<'code' | 'smart'> {
+    const failure = extra.lastFailure;
+    if (!failure || await this.decisionSiteMode('external.tier') === 'off') return 'smart';
+    const cmd = failure.command;
+    const outcome = cmd
+      ? await this.askDecision('external.tier', {
+        command: cmd.command, exitCode: cmd.exitCode, stdoutTail: cmd.stdoutTail, stderrTail: cmd.stderrTail, truncated: cmd.truncated,
+      }, ExternalCreator.COMMAND_OUTCOME_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 10_000 })
+      : await this.askDecision('external.tier', {
+        action: failure.action, ...(failure.path ? { path: failure.path } : {}), error: failure.error,
+      }, ExternalCreator.ERROR_KIND_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 10_000 });
+    const pick = choiceOf(outcome, cmd ? 'command_outcome' : 'error_kind');
+    if (!outcome || !pick) return 'smart';
+    const judged = ExternalCreator.OUTCOME_TIERS[pick.choice] ?? 'smart';
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] ExternalCreator external.tier: ${pick.choice}@${pick.confidence.toFixed(2)}${judged === 'code' ? ' (would think on code)' : ''}`);
+      return 'smart';
+    }
+    return pick.confidence >= 0.6 ? judged : 'smart';
   }
 
   private async gitStatusLine(extra: TaskExtra): Promise<string | undefined> {
@@ -2388,6 +2877,7 @@ clean result I did not observe.`;
   ): Promise<{ success: boolean; data?: unknown; error?: string; payload?: string }> {
     const extra = this.taskExtras.get(taskId);
     if (!extra) return { success: false, error: 'Task state is gone.' };
+    extra.lastCommand = undefined;
 
     const needsProject = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'verify'];
     if (needsProject.includes(action.action) && !extra.workRoot) {
@@ -2439,13 +2929,25 @@ clean result I did not observe.`;
       extra.lastResult = result.success
         ? resultEcho(rendered ?? '(no output)')
         : `Error: ${result.error}`;
+      extra.lastFailure = result.success ? undefined : this.failureRecord(extra, action, String(result.error ?? 'unknown error'));
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       extra.lastResult = `Error: ${message}`;
+      extra.lastFailure = this.failureRecord(extra, action, message);
       this.audit(extra, `action ${action.action} threw: ${message}`);
       return { success: false, error: message, ...(errorDetails(err) ? { data: errorDetails(err) } : {}) };
     }
+  }
+
+  /** A failed action as the tier judgment reads it: the command outcome when one ran, else the error. */
+  private failureRecord(extra: TaskExtra, action: AgentAction, error: string): FailureRecord {
+    return {
+      action: String(action.action),
+      ...(typeof action.path === 'string' ? { path: action.path.slice(0, 300) } : {}),
+      ...(extra.lastCommand ? { command: extra.lastCommand } : {}),
+      error: clip(error, 1500),
+    };
   }
 
   // ─── Prompts ────────────────────────────────────────────────────

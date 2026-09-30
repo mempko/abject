@@ -14,6 +14,9 @@ import { require as contractRequire } from '../core/contracts.js';
 import type { AgentAction, AgentActionResult, ObserveReply } from './agent-abject.js';
 import { LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
+import { choiceOf, noulOf, scoreOf, topLevel } from '../llm/decision.js';
+import type { DecisionQuestion } from '../llm/decision.js';
+import { askScopeQuestions } from '../core/decision-questions.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WebAgent');
@@ -48,6 +51,35 @@ interface WebTaskExtra {
    * handler's cleanup used to wipe the new task's goal context.
    */
   goalId?: string;
+  /** The task text, for the runtime decisions that judge a page against it. */
+  task?: string;
+  /** The last page-affecting action and whether it succeeded (runtime decisions read these). */
+  lastAction?: { action: string; ref?: string; expect?: string };
+  lastSuccess?: boolean;
+  /** Set when the user handed the page back; the next observation always carries a screenshot. */
+  handbackPending?: boolean;
+  /** Human-verification handoffs the runtime started on its own for this task. */
+  autoHandoffs?: number;
+  /** Sticky think tier chosen by site web.tier, switched only after two agreeing verdicts. */
+  tierState?: { current: string; pending?: string; streak: number; applied?: boolean };
+}
+
+/** A judged difficulty for the next browsing decision (site web.tier). */
+interface TierVerdict {
+  mode: 'shadow' | 'advise' | 'act';
+  tier: string;
+  sure: boolean;
+  level: number;
+  score: number;
+}
+
+/** A page as the observe-time decisions read it. */
+interface ObservedPage {
+  url: string;
+  title: string;
+  snapshot: string;
+  step: number;
+  features: { refCount: number; unnamedInteractive: number; roleHistogram: Record<string, number> };
 }
 
 // ─── WebAgent ───────────────────────────────────────────────────────
@@ -422,7 +454,38 @@ Set keepPageOpen: false to explicitly close the page when done.
   }
 
   protected override async handleAsk(question: string): Promise<string> {
+    const pass = await this.askScopePass(question);
+    if (pass) return pass;
     return this.askLlm(this.askPrompt(question), question, 'fast');
+  }
+
+  /** This agent's roster line: what it does and what it leaves to others. */
+  private static readonly ROSTER_DESCRIPTION = 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Best for interactive browser navigation on real external sites. Object source authoring goes to a creation agent; plain HTTP data fetches (JSON APIs, RSS feeds) run faster via HttpClient directly; installed skill flows go to a skill-execution agent.';
+
+  /** A URL or bare web domain: a question naming one is browsing work by definition. */
+  private static readonly URL_PATTERN = /\bhttps?:\/\/\S|\bwww\.\S|\b[a-z0-9-]+\.(?:com|org|net|io|dev|ai|app|co|edu|gov|uk|de)\b/i;
+
+  /**
+   * A clearly out-of-scope question answered PASS without the LLM call (site
+   * agent.ask-scope, act). A question that names a URL always gets the full
+   * answer: that is the one signal this agent is sure to own.
+   */
+  private async askScopePass(question: string): Promise<string | undefined> {
+    if (WebAgent.URL_PATTERN.test(question)) return undefined;
+    if (await this.decisionSiteMode('agent.ask-scope') === 'off') return undefined;
+    const outcome = await this.askDecision('agent.ask-scope', {
+      agent: { name: this.manifest.name, description: WebAgent.ROSTER_DESCRIPTION },
+      question: question.slice(0, 3000),
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 8000 });
+    const p = noulOf(outcome, 'in_scope');
+    if (!outcome || p === undefined) return undefined;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] WebAgent agent.ask-scope: in_scope=${p.toFixed(2)}${p < 0.1 ? ' (would PASS)' : ''}`);
+      return undefined;
+    }
+    if (p >= 0.1) return undefined;
+    log.info(`WebAgent agent.ask-scope: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    return `PASS: this asks for work outside operating a browser on web pages (runtime scope check, in_scope p=${p.toFixed(2)}).`;
   }
 
   protected override async onInit(): Promise<void> {
@@ -436,7 +499,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'WebAgent',
-      description: 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Best for interactive browser navigation on real external sites. Object source authoring goes to a creation agent; plain HTTP data fetches (JSON APIs, RSS feeds) run faster via HttpClient directly; installed skill flows go to a skill-execution agent.',
+      description: WebAgent.ROSTER_DESCRIPTION,
       config: {
         snapshotMethod: 'snapshotTask', restoreMethod: 'restoreTask',
         terminalActions: {
@@ -504,6 +567,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       log.info(`► runTask (${taskId}): "${task.trim().slice(0, 80)}"`);
 
       const extra: WebTaskExtra = {
+        task: task.trim(),
         startUrl: options?.startUrl,
         pageId: options?.pageId,
         pageOptions: options?.pageOptions,
@@ -531,7 +595,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
       const taskId = `web-step-${Date.now()}`;
       this.claimTaskPage(taskId, pageId);
-      this.taskExtras.set(taskId, { pageId });
+      this.taskExtras.set(taskId, { pageId, task: instruction });
 
       // For single steps, use directExecution to avoid queue deadlocks
       const { ticketId } = await this.request<{ ticketId: string }>(
@@ -606,14 +670,27 @@ Set keepPageOpen: false to explicitly close the page when done.
       // A weak parse (an unquoted word in prose) may only pick a profile that
       // already exists; it must not bring a new one into being.
       let profileFromDescription = parsed?.strong ? parsed.name : undefined;
-      if (parsed && !parsed.strong) {
-        const existing = await this.request<Array<{ name: string }>>(
+      let existingProfiles: Array<{ name: string; lastUsed?: number }> | undefined;
+      const listExisting = async (): Promise<Array<{ name: string; lastUsed?: number }>> =>
+        existingProfiles ??= await this.request<Array<{ name: string; lastUsed?: number }>>(
           request(this.id, this.webBrowserId!, 'listProfiles', {}), 10000,
-        ).catch(() => [] as Array<{ name: string }>);
+        ).catch(() => [] as Array<{ name: string; lastUsed?: number }>);
+      if (parsed && !parsed.strong) {
+        const existing = await listExisting();
         if (existing.some(p => p.name === parsed.name)) profileFromDescription = parsed.name;
         else log.info(`executeTask: ignoring weakly-parsed profile "${parsed.name}" — no such profile exists, and prose is not enough to create one`);
       }
-      const profile = profileFromData ?? profileFromDescription;
+      let profile = profileFromData ?? profileFromDescription;
+      let profileSource = profileFromData ? 'data' : 'description';
+      // Below data and a strong parse, a decision model may pick among the
+      // profiles that exist (site web.profile): it only ever selects one,
+      // never creates one, and at advise it leaves a hint instead.
+      let profileHint = '';
+      if (!profileFromData && !parsed?.strong) {
+        const judged = await this.judgeProfile(description, parsed?.name, profile, listExisting, { goalId, taskId });
+        if (judged.apply) { profile = judged.profile; profileSource = 'decision'; }
+        profileHint = judged.hint ?? '';
+      }
       // A task that talks about a profile and then runs without one is the
       // worst outcome available: the page opens in a clean slate, the site
       // shows it logged out, and the agent truthfully reports a signed-out
@@ -633,11 +710,11 @@ Set keepPageOpen: false to explicitly close the page when done.
         ? { ...(profile ? { profile } : {}), ...(headful ? { headful: true } : {}) }
         : undefined;
 
-      const extra: WebTaskExtra = { startUrl, pageOptions, goalId };
+      const extra: WebTaskExtra = { startUrl, pageOptions, goalId, task: description };
       this.taskExtras.set(taskId, extra);
 
       if (profile) {
-        log.info(`executeTask using profile="${profile}" (${profileFromData ? 'data' : 'description'})`);
+        log.info(`executeTask using profile="${profile}" (${profileSource})`);
       }
 
       try {
@@ -676,7 +753,7 @@ Set keepPageOpen: false to explicitly close the page when done.
             taskId,
             task: description,
             systemPrompt: this.buildSystemPrompt(),
-            taskPrompt: this.buildTaskPrompt(description),
+            taskPrompt: this.buildTaskPrompt(description) + profileHint,
             goalId,
             dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
@@ -746,8 +823,8 @@ Set keepPageOpen: false to explicitly close the page when done.
     this.on('agentObserve', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
-      const { taskId } = msg.payload as { taskId: string; step: number };
-      return this.handleObserve(taskId);
+      const { taskId, step } = msg.payload as { taskId: string; step: number };
+      return this.handleObserve(taskId, typeof step === 'number' ? step : 0, msg.routing.from);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
@@ -766,10 +843,14 @@ Set keepPageOpen: false to explicitly close the page when done.
           this.send(event(this.id, this.jobManagerId, 'progress', { phase: 'acting' }));
         }
       }, 60000);
+      let succeeded = false;
       try {
-        return await this.handleAct(taskId, action);
+        const result = await this.handleAct(taskId, action);
+        succeeded = result.success;
+        return result;
       } finally {
         this.cancelTimer(heartbeat);
+        this.noteAction(taskId, action, succeeded);
       }
     });
 
@@ -1075,109 +1156,150 @@ Set keepPageOpen: false to explicitly close the page when done.
     }
   }
 
-  private async handleObserve(taskId: string): Promise<ObserveReply> {
+  private async handleObserve(taskId: string, step = 0, observer?: AbjectId): Promise<ObserveReply> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { observation: 'No page open.' };
 
     try {
-      // Get ARIA snapshot (includes URL, title, and ref-annotated accessibility tree)
-      const { snapshot, url, title, generation } = await this.request<{ snapshot: string; url: string; title: string; generation: number }>(
-        request(this.id, this.webBrowserId!, 'getAriaSnapshot', { pageId: extra.pageId })
-      );
-
-      extra.generation = generation;
-      if (url && url !== 'about:blank') extra.startUrl = url;
-      const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
-
-      // Pick the think tier by INTERACTION complexity, not payload size.
-      // What makes the next decision hard is how many things there are to
-      // choose between, and a page with a handful of refs is an easy choice
-      // however much text it carries. Sizing by characters sent a raw JSON
-      // body (1 element, 102k chars) to the costly tier, producing the two
-      // most expensive calls of a run: priciest per token, longest prompt,
-      // and cold cache, since cache entries do not survive a model switch.
-      // Large payloads are a reading problem, handled by how the observation
-      // is presented, not by paying a reasoning model to skim them.
-      let tier = refCount <= WebAgent.FAST_TIER_REF_THRESHOLD ? 'balanced' : 'smart';
-
-      // Vision-aware routing: only ship a screenshot a model can actually
-      // see. If the complexity-chosen tier is text-only but the other think
-      // tier can see, use that one; a configured vision-fallback model also
-      // counts (the think loop reroutes image steps to it). Only when nothing
-      // can see is the screenshot skipped and navigation goes by the ARIA
-      // snapshot alone.
-      let visionAvailable = true;
+      // Only ship a screenshot a model can actually see. Nothing can when both
+      // think tiers are text-only and no vision-fallback model is configured;
+      // navigation then goes by the ARIA snapshot alone.
       const caps = await this.tierVision();
-      if (caps && caps[tier] === false) {
-        const other = tier === 'balanced' ? 'smart' : 'balanced';
-        if (caps[other] !== false) {
-          log.info(`Observe: '${tier}' tier model is text-only; using '${other}' for vision`);
-          tier = other;
-        } else if ('fallback' in caps && caps.fallback !== false) {
-          log.info(`Observe: think tiers are text-only; image steps will run on the vision fallback`);
-        } else {
-          visionAvailable = false;
+      const visionAvailable = !(caps && caps.smart === false && caps.balanced === false
+        && !('fallback' in caps && caps.fallback !== false));
+
+      // The runtime may look more than once before handing the page over: a
+      // page judged still loading gets a short wait and a fresh look, and a
+      // human-verification wall goes to the user first (site web.page-state).
+      const notes: string[] = [];
+      let waits = 0;
+      let handedOff = false;
+      for (;;) {
+        // Get ARIA snapshot (includes URL, title, and ref-annotated accessibility tree)
+        const { snapshot, url, title, generation } = await this.request<{ snapshot: string; url: string; title: string; generation: number }>(
+          request(this.id, this.webBrowserId!, 'getAriaSnapshot', { pageId: extra.pageId })
+        );
+
+        extra.generation = generation;
+        if (url && url !== 'about:blank') extra.startUrl = url;
+        const page: ObservedPage = { url, title, snapshot, step, features: WebAgent.pageFeatures(snapshot) };
+        const refCount = page.features.refCount;
+
+        // Pick the think tier by INTERACTION complexity, not payload size.
+        // What makes the next decision hard is how many things there are to
+        // choose between, and a page with a handful of refs is an easy choice
+        // however much text it carries. Sizing by characters sent a raw JSON
+        // body (1 element, 102k chars) to the costly tier, producing the two
+        // most expensive calls of a run: priciest per token, longest prompt,
+        // and cold cache, since cache entries do not survive a model switch.
+        // Large payloads are a reading problem, handled by how the observation
+        // is presented, not by paying a reasoning model to skim them. A
+        // decision model may judge the difficulty instead (site web.tier).
+        const heuristicTier = refCount <= WebAgent.FAST_TIER_REF_THRESHOLD ? 'balanced' : 'smart';
+
+        // The first look at a task, and the first after the user hands the
+        // page back, always carry a screenshot; otherwise a decision model may
+        // judge the accessibility tree enough on its own (site web.screenshot).
+        // The capture and every judgment run side by side, so a judgment adds
+        // no latency beyond the capture it may make unnecessary.
+        const firstLook = step === 0 || !extra.lastAction || extra.handbackPending === true;
+        const scope = { goalId: extra.goalId, taskId, onBehalfOf: this.manifest.name };
+        const [shot, skipShot, pageState, tierVerdict] = await Promise.all([
+          visionAvailable ? this.captureScreenshot(extra.pageId!) : Promise.resolve(undefined),
+          visionAvailable && !firstLook ? this.judgeScreenshot(extra, page, scope) : Promise.resolve(false),
+          this.judgePageState(extra, page, scope),
+          this.judgeTier(extra, page, scope),
+        ]);
+
+        if (pageState.act === 'wait' && waits < WebAgent.MAX_LOADING_WAITS) {
+          waits++;
+          log.info(`Observe: page looks blank or still loading (${pageState.detail}); waiting ${WebAgent.LOADING_WAIT_MS}ms and looking again`);
+          await new Promise<void>(resolve => { this.setTimer(() => resolve(), WebAgent.LOADING_WAIT_MS); });
+          continue;
         }
-      }
-      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier} vision=${visionAvailable}`);
+        if (pageState.act === 'request_human' && !handedOff && (extra.autoHandoffs ?? 0) < WebAgent.MAX_AUTO_HANDOFFS) {
+          handedOff = true;
+          extra.autoHandoffs = (extra.autoHandoffs ?? 0) + 1;
+          const handoff = await this.handVerificationToHuman(taskId, extra, url, observer);
+          notes.push(handoff.note);
+          if (handoff.completed) continue;
+        }
+        if (waits > 0) {
+          notes.unshift(`Runtime: the page looked blank or still loading, so this observation waited ${(waits * WebAgent.LOADING_WAIT_MS / 1000).toFixed(1)}s for it.`);
+        }
 
-      // Truncate very large snapshots to stay within token budget
-      let truncatedSnapshot = snapshot;
-      if (snapshot.length > WebAgent.MAX_SNAPSHOT_CHARS) {
-        truncatedSnapshot = snapshot.slice(0, WebAgent.MAX_SNAPSHOT_CHARS) + '\n... (snapshot truncated)';
-      }
+        const shipped = shot && !skipShot ? shot : undefined;
+        extra.lastScreenshot = shipped;
+        if (shipped) extra.handbackPending = undefined;
 
-      const lines: string[] = [];
-      lines.push(`URL: ${url}`);
-      lines.push(`Title: ${title}`);
-      // Which browser this is. Without it a clean slate is indistinguishable
-      // from an expired session: a checkout task that lost its profile found
-      // itself logged out, reported the user's session as expired and their
-      // cart as emptied, and asked for credentials — while the real signed-in
-      // session sat untouched in the profile the task was supposed to use.
-      lines.push(extra.pageOptions?.profile
-        ? `Browser profile: ${extra.pageOptions.profile} (persistent — logins and cookies from earlier tasks in this profile apply)`
-        : 'Browser profile: none (EPHEMERAL clean slate — no cookies, no logins, nothing from any earlier task). Being signed out here says nothing about whether the user has a session elsewhere; do not report a session as expired or a cart as emptied on this evidence.');
-      lines.push('');
-      lines.push('Page structure (ARIA snapshot):');
-      lines.push(truncatedSnapshot);
+        // Vision-aware routing: if the chosen tier is text-only but the other
+        // think tier can see, use that one; a configured vision-fallback model
+        // also counts (the think loop reroutes image steps to it). A step
+        // without a screenshot keeps its tier.
+        let tier = this.applyTierVerdict(extra, tierVerdict, heuristicTier, step);
+        if (shipped && caps && caps[tier] === false) {
+          const other = tier === 'balanced' ? 'smart' : 'balanced';
+          if (caps[other] !== false) {
+            log.info(`Observe: '${tier}' tier model is text-only; using '${other}' for vision`);
+            tier = other;
+          } else if ('fallback' in caps && caps.fallback !== false) {
+            log.info(`Observe: think tiers are text-only; image steps will run on the vision fallback`);
+          }
+        }
+        log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier} vision=${visionAvailable}${visionAvailable && !shipped ? ' screenshot=none' : ''}`);
 
-      if (!visionAvailable) {
+        // Truncate very large snapshots to stay within token budget
+        let truncatedSnapshot = snapshot;
+        if (snapshot.length > WebAgent.MAX_SNAPSHOT_CHARS) {
+          truncatedSnapshot = snapshot.slice(0, WebAgent.MAX_SNAPSHOT_CHARS) + '\n... (snapshot truncated)';
+        }
+
+        const lines: string[] = [];
+        lines.push(`URL: ${url}`);
+        lines.push(`Title: ${title}`);
+        // Which browser this is. Without it a clean slate is indistinguishable
+        // from an expired session: a checkout task that lost its profile found
+        // itself logged out, reported the user's session as expired and their
+        // cart as emptied, and asked for credentials — while the real signed-in
+        // session sat untouched in the profile the task was supposed to use.
+        lines.push(extra.pageOptions?.profile
+          ? `Browser profile: ${extra.pageOptions.profile} (persistent — logins and cookies from earlier tasks in this profile apply)`
+          : 'Browser profile: none (EPHEMERAL clean slate — no cookies, no logins, nothing from any earlier task). Being signed out here says nothing about whether the user has a session elsewhere; do not report a session as expired or a cart as emptied on this evidence.');
+        // Runtime notes sit above the tree, so they stay in view even when a
+        // long snapshot is held back behind a handle.
+        lines.push(...notes);
+        if (pageState.hint) lines.push(`Runtime page check: ${pageState.hint}`);
         lines.push('');
-        lines.push('Note: no screenshot this step; the configured models are text-only. Navigate using the ARIA snapshot refs.');
-      }
-      const observation = lines.join('\n');
+        lines.push('Page structure (ARIA snapshot):');
+        lines.push(truncatedSnapshot);
 
-      // Take screenshot for vision-enabled LLM observation. Skipped when no
-      // think tier can see images — the bytes would be stripped anyway.
-      if (visionAvailable) {
-        try {
-          const shot = await this.request<{ dataUri: string }>(
-            request(this.id, this.webBrowserId!, 'screenshotPage', { pageId: extra.pageId })
-          );
-          extra.lastScreenshot = shot.dataUri.replace(/^data:image\/\w+;base64,/, '');
-        } catch { extra.lastScreenshot = undefined; }
-      } else {
-        extra.lastScreenshot = undefined;
-      }
+        if (!visionAvailable) {
+          lines.push('');
+          lines.push('Note: no screenshot this step; the configured models are text-only. Navigate using the ARIA snapshot refs.');
+        } else if (skipShot && shot) {
+          lines.push('');
+          lines.push('No screenshot this step: the accessibility snapshot above carries what the next action needs.');
+        }
+        const observation = lines.join('\n');
 
-      // A page snapshot is bulk: it is the raw shape of whatever was loaded,
-      // and a long one is long because the page is big, not because the agent
-      // needs every line. Declaring it chunkable lets an oversized snapshot be
-      // held whole and searched instead of clipped mid-tree.
-      if (extra.lastScreenshot) {
-        return {
-          observation,
-          tier,
-          chunkable: true,
-          llmContent: [
-            { type: 'text' as const, text: `[Observation - Step]\n${observation}` },
-            { type: 'image' as const, mediaType: 'image/png' as const, data: extra.lastScreenshot },
-          ],
-        };
-      }
+        // A page snapshot is bulk: it is the raw shape of whatever was loaded,
+        // and a long one is long because the page is big, not because the agent
+        // needs every line. Declaring it chunkable lets an oversized snapshot be
+        // held whole and searched instead of clipped mid-tree.
+        if (shipped) {
+          return {
+            observation,
+            tier,
+            chunkable: true,
+            llmContent: [
+              { type: 'text' as const, text: `[Observation - Step]\n${observation}` },
+              { type: 'image' as const, mediaType: 'image/png' as const, data: shipped },
+            ],
+          };
+        }
 
-      return { observation, tier, chunkable: true };
+        return { observation, tier, chunkable: true };
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('Unknown page handle')) {
@@ -1186,6 +1308,326 @@ Set keepPageOpen: false to explicitly close the page when done.
       }
       return { observation: `Observation error: ${msg}` };
     }
+  }
+
+  /** Take a screenshot for vision-enabled observation; undefined when the capture fails. */
+  private async captureScreenshot(pageId: string): Promise<string | undefined> {
+    try {
+      const shot = await this.request<{ dataUri: string }>(
+        request(this.id, this.webBrowserId!, 'screenshotPage', { pageId })
+      );
+      return shot.dataUri.replace(/^data:image\/\w+;base64,/, '');
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Runtime decisions (observe-time judgments and profile choice)
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // Each step a decision model reads the page and answers three typed
+  // questions, each its own site with its own policy (src/core/decision-sites.ts):
+  // does the next step need the screenshot, what state is the page in, and
+  // how hard is the next choice. The sites are separate requests run side by
+  // side. Shadow logs, advise adds a line the agent reads, act takes effect.
+  // A null answer (site off, no decision model, timeout) leaves today's path.
+
+  /** How long one observe-time judgment may take before the step proceeds without it. */
+  private static readonly STEP_DECISION_TIMEOUT_MS = 5000;
+  private static readonly MAX_LOADING_WAITS = 2;
+  private static readonly LOADING_WAIT_MS = 1500;
+  /** Handoffs the runtime starts on its own per task; past this the agent gets the hint and decides. */
+  private static readonly MAX_AUTO_HANDOFFS = 2;
+  /** Actions that leave the page as it was; the page judgments look past them. */
+  private static readonly OFF_PAGE_ACTIONS = new Set(['http', 'write_scratchpad', 'read_scratchpad', 'attach_screenshot']);
+  /** Profile choices that are not profile names. */
+  private static readonly PROFILE_OPTIONS: Record<string, string> = {
+    none_ephemeral: 'No profile: a clean, signed-out browser suits the task (public pages, no account needed, or a fresh session requested).',
+    named_new_profile: 'The task names a new profile to create, one that is not in this list.',
+  };
+
+  private static readonly SCREENSHOT_QUESTIONS: Record<string, DecisionQuestion> = {
+    needs_screenshot: {
+      type: 'noul',
+      instructions: 'A browsing agent picks its next action for `task` from `snapshotHead`, the page\'s accessibility tree (`roleHistogram` and `unnamedInteractive` summarize the whole tree). Would that next action be chosen incorrectly without the rendered screenshot of the page?',
+      criteria: {
+        true: 'Canvas, image, or SVG content carries meaning the tree leaves unnamed; many buttons or links have no name; a visual CAPTCHA or puzzle is showing; the task depends on layout, color, or position; the tree is nearly empty while the title promises content; or `lastAction` left no visible trace in the tree.',
+        false: 'The tree names what the next action needs: forms with labelled fields, search results, articles, listings, or a raw JSON or text body.',
+      },
+    },
+  };
+
+  private static readonly PAGE_STATE_QUESTIONS: Record<string, DecisionQuestion> = {
+    page_state: {
+      type: 'choice',
+      instructions: 'What state is this page in, judged from its `url`, `title`, and accessibility tree (`snapshotHead`), for a browsing agent working on `task`?',
+      criteria: {
+        content_ready: 'The page shows usable content or controls for the task.',
+        human_verification: 'A human-verification check blocks the page: a "verify you are human" box, an image or slider puzzle, or a browser-check interstitial.',
+        login_required: 'The page asks the visitor to sign in, or shows a signed-out view of content that needs an account.',
+        otp_or_2fa: 'The page asks for a one-time code, a second factor, or approval on another device.',
+        consent_banner: 'A cookie or consent overlay covers the content and waits for a choice.',
+        error_page: 'The page shows an error: not found, server error, access denied, or a browser network error.',
+        loading_or_blank: 'The page is blank, a bare shell, or still showing loading indicators.',
+        paywall_or_rate_limited: 'A paywall, subscription wall, or rate-limit notice blocks the content.',
+        data_document: 'The page is a raw data document (JSON, XML, an RSS or Atom feed, CSV, plain text) rather than a rendered site.',
+      },
+    },
+  };
+
+  /** One line of guidance per page state, phrased as what to do next. */
+  private static readonly PAGE_STATE_HINTS: Record<string, string> = {
+    human_verification: 'a human-verification check is showing; request_human hands it to the user, and the task continues when they hand back',
+    login_required: 'the page asks for sign-in; sign in with credentials the task provides, or fail with auth_required so the user can sign in or name a signed-in profile',
+    otp_or_2fa: 'the page asks for a one-time code; enter one the task provides, or fail with otp_required and keepPageOpen: true',
+    consent_banner: 'a consent overlay covers the page; dismiss it first',
+    error_page: 'the page shows an error; check the URL, go back, or reach the content another way',
+    loading_or_blank: 'the page looks blank or still loading; wait for the content to appear, then look again',
+    paywall_or_rate_limited: 'a paywall or rate limit blocks the content; find it from another source, or report the block',
+    data_document: 'this page is raw data; the http action reads it directly',
+  };
+
+  private static readonly DIFFICULTY_QUESTIONS: Record<string, DecisionQuestion> = {
+    decision_difficulty: {
+      type: 'score',
+      instructions: 'How hard is the browsing agent\'s NEXT decision toward `task`, given the page (`snapshotHead`, `refCount`) and how `lastAction` went (`lastSuccess`)?',
+      criteria: [
+        'Obvious: the next step is plain from the page (one clear control, the content already in view, or the task already answered).',
+        'Routine: fill a form with known values, follow a named link, or read visible content.',
+        'Many plausible targets: the right control is one of several similar candidates.',
+        'Recovery or ambiguity: the last step failed or had no visible effect, the page is unexpected, or the route is unclear.',
+      ],
+    },
+  };
+
+  /**
+   * What a judge reads from an ARIA snapshot besides its head: how many refs
+   * it has, how many buttons and links carry no name (lines like
+   * `- button [ref=e9]`, where a named one reads `- button "Submit"`), and
+   * its most common roles.
+   */
+  private static pageFeatures(snapshot: string): ObservedPage['features'] {
+    const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
+    let unnamedInteractive = 0;
+    const roles: Record<string, number> = {};
+    for (const line of snapshot.split('\n')) {
+      const m = /^\s*-\s+([a-z][a-z-]*)\b(.*)$/.exec(line);
+      if (!m) continue;
+      roles[m[1]] = (roles[m[1]] ?? 0) + 1;
+      if ((m[1] === 'button' || m[1] === 'link') && !/^\s*"/.test(m[2])) unnamedInteractive++;
+    }
+    const roleHistogram = Object.fromEntries(Object.entries(roles).sort((a, b) => b[1] - a[1]).slice(0, 12));
+    return { refCount, unnamedInteractive, roleHistogram };
+  }
+
+  private static hostOf(url: string): string | undefined {
+    try { return new URL(url).host || undefined; } catch { return undefined; }
+  }
+
+  /** Remember the last page-affecting action and its outcome for the next observation's judgments. */
+  private noteAction(taskId: string, action: AgentAction, success: boolean): void {
+    const extra = this.taskExtras.get(taskId);
+    if (!extra || WebAgent.OFF_PAGE_ACTIONS.has(String(action.action))) return;
+    extra.lastAction = {
+      action: String(action.action),
+      ...(typeof action.ref === 'string' ? { ref: action.ref } : {}),
+      ...(typeof action.expect === 'string' && action.expect.trim() ? { expect: action.expect.trim().slice(0, 200) } : {}),
+    };
+    extra.lastSuccess = success;
+  }
+
+  /** Whether this step's screenshot can be dropped (site web.screenshot, act: needs_screenshot below 0.25). */
+  private async judgeScreenshot(extra: WebTaskExtra, page: ObservedPage, scope: { goalId?: string; taskId: string; onBehalfOf: string }): Promise<boolean> {
+    if (await this.decisionSiteMode('web.screenshot') === 'off') return false;
+    const outcome = await this.askDecision('web.screenshot', {
+      task: (extra.task ?? '').slice(0, 500),
+      url: page.url, title: page.title,
+      refCount: page.features.refCount, snapshotChars: page.snapshot.length,
+      unnamedInteractive: page.features.unnamedInteractive, roleHistogram: page.features.roleHistogram,
+      snapshotHead: page.snapshot.slice(0, 2500),
+      lastAction: extra.lastAction ?? null, lastSuccess: extra.lastSuccess ?? null,
+      step: page.step,
+    }, WebAgent.SCREENSHOT_QUESTIONS, { ...scope, timeoutMs: WebAgent.STEP_DECISION_TIMEOUT_MS });
+    const p = noulOf(outcome, 'needs_screenshot');
+    if (!outcome || p === undefined) return false;
+    const skip = p < 0.25;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] WebAgent web.screenshot step ${page.step + 1}: needs_screenshot=${p.toFixed(2)}${skip ? ' (would skip)' : ''}`);
+      return false;
+    }
+    if (skip) log.info(`Observe: no screenshot this step (needs_screenshot=${p.toFixed(2)})`);
+    return skip;
+  }
+
+  /**
+   * The page's state (site web.page-state). Advise, and act below its
+   * thresholds, add a one-line hint at p ≥ 0.8. Act hands a verification
+   * wall to the user at ≥ 0.9 and waits out a blank or loading page at
+   * ≥ 0.85; nothing here ever fails the task.
+   */
+  private async judgePageState(extra: WebTaskExtra, page: ObservedPage, scope: { goalId?: string; taskId: string; onBehalfOf: string }): Promise<{ act?: 'request_human' | 'wait'; hint?: string; detail?: string }> {
+    if (await this.decisionSiteMode('web.page-state') === 'off') return {};
+    const outcome = await this.askDecision('web.page-state', {
+      url: page.url, title: page.title, refCount: page.features.refCount,
+      snapshotHead: page.snapshot.slice(0, 3000),
+      task: (extra.task ?? '').slice(0, 500),
+      profile: extra.pageOptions?.profile ?? null,
+      lastAction: extra.lastAction ?? null,
+    }, WebAgent.PAGE_STATE_QUESTIONS, { ...scope, timeoutMs: WebAgent.STEP_DECISION_TIMEOUT_MS });
+    const verdict = choiceOf(outcome, 'page_state');
+    if (!outcome || !verdict) return {};
+    const p = verdict.probabilities[verdict.choice] ?? 0;
+    const detail = `${verdict.choice}@${p.toFixed(2)}`;
+    if (outcome.mode === 'shadow') {
+      if (verdict.choice !== 'content_ready') log.info(`[decision:shadow] WebAgent web.page-state step ${page.step + 1}: ${detail}`);
+      return {};
+    }
+    const hint = p >= 0.8 ? WebAgent.PAGE_STATE_HINTS[verdict.choice] : undefined;
+    const judged = { detail, ...(hint ? { hint: `${hint} (p=${p.toFixed(2)})` } : {}) };
+    if (outcome.mode === 'act') {
+      if (verdict.choice === 'human_verification' && p >= 0.9) return { ...judged, act: 'request_human' };
+      if (verdict.choice === 'loading_or_blank' && p >= 0.85) return { ...judged, act: 'wait' };
+    }
+    return judged;
+  }
+
+  /**
+   * The next decision's judged difficulty (site web.tier): levels 0-1 map to
+   * balanced, 2-3 to smart. `applyTierVerdict` folds it into the task's tier.
+   */
+  private async judgeTier(extra: WebTaskExtra, page: ObservedPage, scope: { goalId?: string; taskId: string; onBehalfOf: string }): Promise<TierVerdict | undefined> {
+    if (await this.decisionSiteMode('web.tier') === 'off') {
+      if (extra.tierState) extra.tierState.applied = false;
+      return undefined;
+    }
+    const outcome = await this.askDecision('web.tier', {
+      task: (extra.task ?? '').slice(0, 500),
+      url: page.url, title: page.title,
+      refCount: page.features.refCount, unnamedInteractive: page.features.unnamedInteractive,
+      snapshotHead: page.snapshot.slice(0, 2500),
+      lastAction: extra.lastAction ?? null, lastSuccess: extra.lastSuccess ?? null,
+      step: page.step,
+    }, WebAgent.DIFFICULTY_QUESTIONS, { ...scope, timeoutMs: WebAgent.STEP_DECISION_TIMEOUT_MS });
+    const difficulty = scoreOf(outcome, 'decision_difficulty');
+    if (!outcome || !difficulty) return undefined;
+    const level = topLevel(difficulty);
+    const tier = level <= 1 ? 'balanced' : 'smart';
+    const easy = (difficulty.probabilities['0'] ?? 0) + (difficulty.probabilities['1'] ?? 0);
+    return { mode: outcome.mode, tier, sure: (tier === 'balanced' ? easy : 1 - easy) >= 0.6, level, score: difficulty.score };
+  }
+
+  /**
+   * The think tier for this step. The judged tier is sticky and switches only
+   * after two agreeing, confident verdicts in a row, since every switch costs
+   * a cold prompt cache; a missed verdict keeps a tier the site already
+   * applied, so one timeout does not bounce the task between models. Called
+   * once per step, on the look that is handed over.
+   */
+  private applyTierVerdict(extra: WebTaskExtra, verdict: TierVerdict | undefined, heuristic: string, step: number): string {
+    if (!verdict) return extra.tierState?.applied ? extra.tierState.current : heuristic;
+    const ts = (extra.tierState ??= { current: heuristic, streak: 0 });
+    if (verdict.sure && verdict.tier !== ts.current) {
+      ts.streak = ts.pending === verdict.tier ? ts.streak + 1 : 1;
+      ts.pending = verdict.tier;
+      if (ts.streak >= 2) { ts.current = verdict.tier; ts.pending = undefined; ts.streak = 0; }
+    } else {
+      ts.pending = undefined;
+      ts.streak = 0;
+    }
+    if (verdict.mode !== 'act') {
+      ts.applied = false;
+      if (ts.current !== heuristic) log.info(`[decision:${verdict.mode}] WebAgent web.tier step ${step + 1}: would think on ${ts.current} (ref-count tier ${heuristic}; level ${verdict.level}, score ${verdict.score})`);
+      return heuristic;
+    }
+    ts.applied = true;
+    return ts.current;
+  }
+
+  /**
+   * Hand a human-verification wall to the user without a think (site
+   * web.page-state, act), through the same request_human path the agent
+   * uses, which falls back to an error when no viewer is available. The
+   * observe request waits on this meanwhile, so its sender and this task's
+   * ticket hear a heartbeat until the user hands back.
+   */
+  private async handVerificationToHuman(taskId: string, extra: WebTaskExtra, url: string, observer?: AbjectId): Promise<{ completed: boolean; note: string }> {
+    const reason = `Complete the human-verification check on ${WebAgent.hostOf(url) ?? 'this page'}, then hand control back`;
+    log.info(`Observe: human-verification check on ${url}; handing the page to the user before the next think`);
+    const beat = (): void => {
+      this.resetPendingTicketTimeouts(taskId);
+      try {
+        if (observer) this.send(event(this.id, observer, 'progress', { taskId, phase: 'waiting_for_human', awaitingHuman: reason }));
+        if (this.jobManagerId) this.send(event(this.id, this.jobManagerId, 'progress', { phase: 'waiting_for_human' }));
+      } catch { /* bus gone */ }
+    };
+    beat();
+    const heartbeat = this.setRecurringTimer(beat, 15000);
+    try {
+      const result = await this.handleAct(taskId, { action: 'request_human', wait: 'handback', reason });
+      return result.success
+        ? { completed: true, note: 'Runtime: a human-verification check was showing, so the page went to the user, who completed it and handed control back.' }
+        : { completed: false, note: `Runtime: a human-verification check appears to be showing, and handing it to the user did not complete: ${result.error ?? 'no reason given'}` };
+    } finally {
+      this.cancelTimer(heartbeat);
+    }
+  }
+
+  /**
+   * Which existing browser profile a task intends (site web.profile). It runs
+   * below `data.profile` and a strong parse of the description. Act at
+   * ≥ 0.85 selects an existing profile or none; it never creates one, so a
+   * named new profile stays with the description's own strong parse. Advise,
+   * and act below its threshold, add a hint to the task prompt.
+   */
+  private async judgeProfile(
+    description: string,
+    mentioned: string | undefined,
+    current: string | undefined,
+    listExisting: () => Promise<Array<{ name: string; lastUsed?: number }>>,
+    scope: { goalId?: string; taskId: string },
+  ): Promise<{ apply: boolean; profile?: string; hint?: string }> {
+    if (await this.decisionSiteMode('web.profile') === 'off') return { apply: false };
+    const reserved = new Set(Object.keys(WebAgent.PROFILE_OPTIONS));
+    const existing = (await listExisting()).filter(p => !reserved.has(p.name)).slice(0, 250);
+    if (existing.length === 0) return { apply: false };
+    const criteria: Record<string, string> = {};
+    for (const p of existing) {
+      criteria[p.name] = `The persistent browser profile "${p.name}", with the logins and cookies saved in it${p.lastUsed ? ` (last used ${new Date(p.lastUsed).toISOString().slice(0, 10)})` : ''}.`;
+    }
+    Object.assign(criteria, WebAgent.PROFILE_OPTIONS);
+    const outcome = await this.askDecision('web.profile', {
+      task: description.slice(0, 1500),
+      profile_mentioned: mentioned ?? null,
+      profiles: existing.map(p => p.name),
+    }, {
+      profile: {
+        type: 'choice',
+        instructions: 'Which browser profile does `task` intend to run in? A profile holds a site\'s signed-in session, so a task about the user\'s own account on a site usually intends the profile kept for that site.',
+        criteria,
+      },
+    }, { ...scope, onBehalfOf: this.manifest.name, timeoutMs: 15000 });
+    const pick = choiceOf(outcome, 'profile');
+    if (!outcome || !pick) return { apply: false };
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const isExisting = existing.some(e => e.name === pick.choice);
+    if (outcome.mode === 'shadow') {
+      log.info(`[decision:shadow] WebAgent web.profile: ${pick.choice}@${p.toFixed(2)} (running with ${current ?? 'no profile'})`);
+      return { apply: false };
+    }
+    if (outcome.mode === 'act' && p >= 0.85 && (isExisting || pick.choice === 'none_ephemeral')) {
+      const chosen = isExisting ? pick.choice : undefined;
+      if (chosen !== current) log.info(`WebAgent web.profile: ${chosen ? `selecting profile "${chosen}"` : 'running without a profile'} (p=${p.toFixed(2)}; the description alone gave ${current ?? 'none'})`);
+      return { apply: true, profile: chosen };
+    }
+    if (isExisting && pick.choice !== current && p >= 0.6) {
+      log.info(`[decision:${outcome.mode}] WebAgent web.profile: hinting "${pick.choice}"@${p.toFixed(2)}`);
+      return {
+        apply: false,
+        hint: `\n\n## Likely browser profile\nThe persistent profile "${pick.choice}" likely fits this task (runtime check, p=${p.toFixed(2)}), and this run uses ${current ? `"${current}"` : 'no profile'}. If the site asks for sign-in, fail with a reason naming "${pick.choice}" so the task can run again in that profile.`,
+      };
+    }
+    return { apply: false };
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1421,6 +1863,9 @@ Set keepPageOpen: false to explicitly close the page when done.
               error: `Human handoff not completed (${handoff.reason ?? 'no reason given'}). Use "fail" with a reason describing exactly what the user must do.`,
             };
           }
+          // What the user did is only visible in pixels until the next look,
+          // so that look always carries a screenshot (site web.screenshot).
+          if (waitFor === 'handback') extra.handbackPending = true;
           return {
             success: true,
             data: waitFor === 'takeover'

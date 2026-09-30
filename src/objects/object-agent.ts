@@ -16,6 +16,8 @@ import type { AgentAction } from './agent-abject.js';
 import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
+import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
+import { askScopeQuestions } from '../core/decision-questions.js';
 
 const log = new Log('ObjectAgent');
 
@@ -32,6 +34,10 @@ interface TaskExtra {
    * handler's cleanup used to wipe the new task's goal context.
    */
   goalId?: string;
+  /** The task as dispatched, for runtime decisions about its steps. */
+  task?: string;
+  /** The last action, without its prose fields (runtime decisions read it). */
+  lastAction?: Record<string, unknown>;
 }
 
 export class ObjectAgent extends Abject {
@@ -96,8 +102,8 @@ export class ObjectAgent extends Abject {
       : undefined;
   }
 
-  protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
+  /** What this agent does and leaves to others: its ask answers and its scope check both read it. */
+  private static readonly ASK_GUIDE = `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
 
 ### What I Handle
 I interact with existing objects by discovering them and sending them messages. Authoring or modifying Abject source is outside my scope (no programmatic API to change source). When asked to investigate, I report findings and stop — I don't write code.
@@ -138,6 +144,9 @@ When asked about a task, describe which objects you would message and what you w
 - Tasks that require creating, building, or making something new (apps, widgets, simulations, games, tools, agents) — those require generating new code.
 - Tasks that require **modifying, fixing, editing, or patching the source code / handlers / methods of an existing object** ("fix the _pollTelegram method", "add a parse step to handleX", "change how show() renders", "patch the bug in Y"). I have no programmatic API to change source. AbjectEditor is a GUI and does not accept edits over messages. Editing an existing object's source is ObjectCreator's job via its \`modify\` method — defer to it.
 - If a diagnosis finishes with "the fix is to change the code of object X", report the finding and stop; let the dispatcher route the follow-up fix task to a code-generation agent. Do not claim partial success by proposing a manual edit.`;
+
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + ObjectAgent.ASK_GUIDE;
   }
 
   /**
@@ -161,6 +170,8 @@ When asked about a task, describe which objects you would message and what you w
   private static readonly MAX_LOOKUP_CHARS = 1500;
 
   protected override async handleAsk(question: string): Promise<string> {
+    const outOfScope = await this.askScopeGate(question);
+    if (outOfScope) return outOfScope;
     const taskDesc = ObjectAgent.taskFromQuestion(question);
 
     // Ask Registry which objects can help with this task
@@ -183,6 +194,31 @@ When asked about a task, describe which objects you would message and what you w
     }
 
     return this.askLlm(prompt, question, 'fast');
+  }
+
+  /**
+   * Whether a question is plainly outside what this agent does, judged against
+   * its own description (site agent.ask-scope, act): a PASS with its reason,
+   * without the Registry lookup or the LLM call. This agent is the catch-all
+   * for calling existing objects, so it passes only when the judge is nearly
+   * certain (in-scope p < 0.1). Undefined keeps the full answer path.
+   */
+  private async askScopeGate(question: string): Promise<string | undefined> {
+    const site = 'agent.ask-scope';
+    if (await this.decisionSiteMode(site) === 'off') return undefined;
+    const outcome = await this.askDecision(site, {
+      agent: { name: this.manifest.name, description: `${this.manifest.description}${ObjectAgent.ASK_GUIDE}` },
+      question: question.slice(0, 3000),
+    }, askScopeQuestions(), { onBehalfOf: this.manifest.name, timeoutMs: 5000 });
+    const p = noulOf(outcome, 'in_scope');
+    if (!outcome || p === undefined) return undefined;
+    const pass = p < 0.1;
+    if (outcome.mode !== 'act' || !pass) {
+      if (outcome.mode !== 'act') log.info(`[decision:${outcome.mode}] ObjectAgent ${site}: in_scope=${p.toFixed(2)}${pass ? ' (would PASS)' : ''}`);
+      return undefined;
+    }
+    log.info(`[decision:act] ObjectAgent ${site}: PASS without an LLM call (in_scope=${p.toFixed(2)})`);
+    return `PASS: judged outside my scope (in-scope p=${p.toFixed(2)}); I send messages to existing objects and leave authoring new or changed source to others.`;
   }
 
   private setupHandlers(): void {
@@ -208,7 +244,7 @@ When asked about a task, describe which objects you would message and what you w
 
       // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
       const taskId = explicitTaskId ?? tupleId ?? `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, { taskData: data, goalId });
+      this.taskExtras.set(taskId, { taskData: data, goalId, task: description });
       this._currentGoalId = goalId;
 
       try {
@@ -265,7 +301,7 @@ When asked about a task, describe which objects you would message and what you w
     this.on('runTask', async (msg: AbjectMessage) => {
       const { task } = msg.payload as { task: string };
       const taskId = `obj-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, {});
+      this.taskExtras.set(taskId, { task });
 
       try {
         const systemPrompt = this.buildSystemPrompt();
@@ -333,8 +369,8 @@ When asked about a task, describe which objects you would message and what you w
     this.on('agentObserve', async (msg: AbjectMessage) => {
       await this.requireTaskRuntime(msg,this.agentAbjectId);
       this.resetPendingTicketTimeouts((msg.payload as { taskId?: string } | undefined)?.taskId);
-      const { taskId } = msg.payload as { taskId: string; step: number };
-      return this.handleObserve(taskId);
+      const { taskId, step, maxSteps } = msg.payload as { taskId: string; step: number; maxSteps?: number };
+      return this.handleObserve(taskId, { step, maxSteps });
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
@@ -397,7 +433,7 @@ When asked about a task, describe which objects you would message and what you w
   // Observe / Act
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
+  private async handleObserve(taskId: string, budget: { step?: number; maxSteps?: number } = {}): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
     const extra = this.taskExtras.get(taskId);
     // Tier by step difficulty: calling existing objects' methods, reading
     // state, and verifying are mechanical (balanced handles them well and
@@ -405,7 +441,9 @@ When asked about a task, describe which objects you would message and what you w
     // (working around a broken method, re-resolving a target) is where the
     // strongest reasoning earns its cost. The runtime floors 'fast' at
     // balanced anyway, and a stuck task's final call is forced smart.
-    const tier = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
+    // A decision model may judge the step instead (site object-agent.tier).
+    const heuristic = extra?.lastResult?.startsWith('Error:') ? 'smart' : 'balanced';
+    const tier = extra ? await this.decideTier(taskId, extra, heuristic, budget) : heuristic;
     const lines: string[] = [];
 
     if (extra?.lastResult) {
@@ -437,9 +475,66 @@ When asked about a task, describe which objects you would message and what you w
     return { observation, tier };
   }
 
+  private static readonly TIER_QUESTIONS: Record<string, DecisionQuestion> = {
+    next_step: {
+      type: 'choice',
+      instructions: 'An agent is accomplishing `task` by sending messages to existing objects. From `lastAction` and `lastResult`, predict what its NEXT step must do.',
+      criteria: {
+        mechanical_call: 'Make the obvious next call, read, or check.',
+        recover: 'Work around a failure: a broken method, a wrong target, a refused or malformed call.',
+        judge_evidence: 'Weigh ambiguous or conflicting results, or inspect an attached image, to decide what is true.',
+        synthesize_answer: 'Compose the final answer from results already gathered.',
+      },
+    },
+  };
+
+  /**
+   * The next think's tier: recovery and judging evidence on smart, the rest on
+   * balanced, when a decision model is confident (site object-agent.tier, act,
+   * p ≥ 0.6). Otherwise the error heuristic stands.
+   */
+  private async decideTier(taskId: string, extra: TaskExtra, heuristic: 'smart' | 'balanced', budget: { step?: number; maxSteps?: number }): Promise<'smart' | 'balanced'> {
+    const site = 'object-agent.tier';
+    if (!extra.lastResult) return heuristic; // first step: nothing to judge yet
+    if (await this.decisionSiteMode(site) === 'off') return heuristic;
+    const outcome = await this.askDecision(site, {
+      task: (extra.task ?? '').slice(0, 600),
+      lastAction: extra.lastAction ?? null,
+      lastResult: extra.lastResult.length > 500 ? `${extra.lastResult.slice(0, 500)}… [+${extra.lastResult.length - 500} chars]` : extra.lastResult,
+      imageAttached: !!extra.lastLlmContent,
+      step: budget.step ?? null,
+      maxSteps: budget.maxSteps ?? null,
+    }, ObjectAgent.TIER_QUESTIONS, { goalId: extra.goalId, taskId, onBehalfOf: this.manifest.name, timeoutMs: 5000 });
+    const pick = choiceOf(outcome, 'next_step');
+    if (!outcome || !pick) return heuristic;
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const judged = pick.choice === 'recover' || pick.choice === 'judge_evidence' ? 'smart' : 'balanced';
+    const chosen = p >= 0.6 ? judged : heuristic;
+    if (outcome.mode !== 'act') {
+      log.info(`[decision:${outcome.mode}] ObjectAgent ${site}: next_step=${pick.choice}@${p.toFixed(2)}; would think on ${chosen} (heuristic ${heuristic})`);
+      return heuristic;
+    }
+    return chosen;
+  }
+
+  /** An action as a judge reads it: its verb, target, and payload keys, prose fields left out. */
+  private static briefAction(action: AgentAction): Record<string, unknown> {
+    const clip = (v: unknown): unknown => (typeof v === 'string' && v.length > 200 ? `${v.slice(0, 200)}…` : v);
+    const payload = action.payload && typeof action.payload === 'object' ? Object.keys(action.payload as Record<string, unknown>).slice(0, 20) : undefined;
+    return {
+      action: action.action,
+      ...(action.object !== undefined ? { object: clip(action.object) } : {}),
+      ...(action.method !== undefined ? { method: clip(action.method) } : {}),
+      ...(action.question !== undefined ? { question: clip(action.question) } : {}),
+      ...(action.key !== undefined ? { key: clip(action.key) } : {}),
+      ...(payload ? { payloadKeys: payload } : {}),
+    };
+  }
+
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
+    extra.lastAction = ObjectAgent.briefAction(action);
     // Per-task goal context; the shared field is only a legacy fallback
     const goalId = extra.goalId;
     // A failure is what the next observation must show; leaving lastResult
