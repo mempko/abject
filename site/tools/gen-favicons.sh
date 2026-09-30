@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate the raster icons from public/favicon.svg.
+# Regenerate every copy of the Abject mark from public/favicon.svg: the site's
+# rasters, the client's favicon, and the desktop app icon. The mark is the eye
+# sigil every window wears (a red ring with a phosphor slit pupil); keep this
+# SVG the single source so the site, client, and app never drift apart.
 #
 # Browsers request /favicon.ico and /apple-touch-icon*.png by convention even
 # when the HTML only advertises an SVG icon, so the rasters ship alongside it
@@ -30,5 +33,11 @@ magick "$TMP/icon-16.png" "$TMP/icon-32.png" "$TMP/icon-48.png" public/favicon.i
 cp "$TMP/icon-180.png" public/apple-touch-icon.png
 cp "$TMP/icon-180.png" public/apple-touch-icon-precomposed.png
 
+# The thin client (Vite hashes it into dist-client) and the Electron app icon
+# (electron-builder reads build/icon.png for every platform).
+cp "$SRC" ../client/favicon.svg
+inkscape -w 512 -h 512 "$SRC" -o ../build/icon.png >/dev/null 2>&1
+
 echo "regenerated from $SRC:"
-ls -la public/favicon.ico public/apple-touch-icon.png public/apple-touch-icon-precomposed.png
+ls -la public/favicon.ico public/apple-touch-icon.png public/apple-touch-icon-precomposed.png \
+    ../client/favicon.svg ../build/icon.png
