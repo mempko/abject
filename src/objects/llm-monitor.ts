@@ -5,7 +5,12 @@
  * entries still in flight, Recent History is the settled ones, and Stats
  * rolls the whole ledger up by provider, model, tier, and day. Each row
  * carries the call's token counts and what it cost; the Stats tab also owns
- * the retention policy that decides how long any of it is kept.
+ * the retention policy that decides how long any of it is kept. Map shows
+ * the same calls as a 3D graph: providers and their models (grouped by
+ * tier) around The Eye, each model's recent calls an edge into the eye
+ * weighted by tokens; models with calls in flight breathe in the living
+ * light, and each finished call flows into the eye (in the error colour
+ * when it failed). The Map follows the ledger's events, not a timer.
  * Accessible from the GlobalToolbar.
  */
 
@@ -56,6 +61,24 @@ const EYE_STREAM_REACH = 110;
 const FAILURE_FX_GAP_MS = 1500;
 const DETAIL_W = 650;
 const DETAIL_H = 500;
+/** Tab indices. */
+const STATS_TAB = 2;
+const MAP_TAB = 3;
+/** Map node id of The Eye itself. */
+const EYE_NODE = 'eye';
+/** With nothing in flight, the periodic refresh only runs this often (a safety net behind the events). */
+const IDLE_REFRESH_MS = 15000;
+
+/** One model on the Map: what its recent calls add up to. */
+interface EyeModel {
+  provider: string;
+  model: string;
+  tier: string;
+  tokens: number;
+  calls: number;
+  errors: number;
+  inflight: number;
+}
 
 interface StatsSnapshot {
   stats: LLMStats;
@@ -217,6 +240,17 @@ export class LLMMonitor extends Abject {
   private viewButtons: Map<AbjectId, string> = new Map();
   private refreshTimer?: ReturnType<typeof setInterval>;
   private refreshing = false;
+  /** In-flight calls in the last snapshot: the periodic refresh ticks their elapsed times. */
+  private lastActiveCount = 0;
+  private lastRefreshAt = 0;
+  /** The window is minimized: nothing to repaint until it comes back. */
+  private minimized = false;
+
+  // Map tab
+  private graphId?: AbjectId;
+  private eyeModels = new Map<string, EyeModel>();
+  /** In-flight request id -> model key, so a completion finds its model. */
+  private eyeInflight = new Map<string, string>();
 
   /**
    * Debounce for event-driven refreshes. LLM request start/complete events can
@@ -342,6 +376,16 @@ export class LLMMonitor extends Abject {
       await this.sendEyeOps([{ op: 'update', id: `${EYE_PREFIX}-sigil`, transform: { position: this.eyePosition() } }]);
     });
 
+    // A minimized window skips the periodic refresh; coming back catches up once.
+    this.on('windowMinimized', async (msg: AbjectMessage) => {
+      if ((msg.payload as { windowId?: AbjectId } | undefined)?.windowId === this.windowId) this.minimized = true;
+    });
+    this.on('windowRestored', async (msg: AbjectMessage) => {
+      if ((msg.payload as { windowId?: AbjectId } | undefined)?.windowId !== this.windowId || !this.minimized) return;
+      this.minimized = false;
+      await this.refreshView();
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
 
@@ -357,6 +401,7 @@ export class LLMMonitor extends Abject {
         // Spend is only fetched while its tab shows, so switching to it has
         // to pull the ledger rather than wait out the refresh interval.
         await this.refreshStatsTab();
+        if (idx === MAP_TAB) await this.loadEyeMap();
         return;
       }
 
@@ -375,6 +420,7 @@ export class LLMMonitor extends Abject {
       ) {
         if (this.windowId) {
           this.scheduleRefresh();
+          this.onLedgerEvent(aspect, value);
           if (aspect === 'requestError') this.signalFailedCall(value);
           // Pausing holds every model call: ask for attention once.
           if (aspect === 'paused') this.windowEffect('pulse', '$statusWarning');
@@ -410,10 +456,12 @@ export class LLMMonitor extends Abject {
     await this.populateView();
     this.changed('visibility', true);
 
-    this.refreshTimer = setInterval(() => {
-      if (this.windowId) {
-        this.refreshView().catch(() => {});
-      }
+    // The ledger's events drive refreshes; this tick keeps the elapsed times
+    // of in-flight calls moving, and otherwise only checks in now and then.
+    this.refreshTimer = this.setRecurringTimer(() => {
+      if (!this.windowId || this.minimized) return;
+      if (this.lastActiveCount === 0 && Date.now() - this.lastRefreshAt < IDLE_REFRESH_MS) return;
+      this.refreshView().catch(() => {});
     }, 2000);
 
     return true;
@@ -422,14 +470,10 @@ export class LLMMonitor extends Abject {
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = undefined;
-    }
-    if (this.refreshDebounceTimer) {
-      clearTimeout(this.refreshDebounceTimer);
-      this.refreshDebounceTimer = undefined;
-    }
+    this.cancelTimer(this.refreshTimer);
+    this.refreshTimer = undefined;
+    this.cancelTimer(this.refreshDebounceTimer);
+    this.refreshDebounceTimer = undefined;
     this.refreshScheduled = false;
 
     await this.hideDetail();
@@ -448,6 +492,8 @@ export class LLMMonitor extends Abject {
     this.eyeShown = false;
     this.eyeWinSize = undefined;
     this.eyeStreamRate = 0;
+    this.minimized = false;
+    this.lastActiveCount = 0;
     this.clearViewTracking();
     this.changed('visibility', false);
     return true;
@@ -486,6 +532,9 @@ export class LLMMonitor extends Abject {
     this.headerSortLabels.clear();
     this.headerLabelIds = [[], []];
     this.refreshing = false;
+    this.graphId = undefined;
+    this.eyeModels.clear();
+    this.eyeInflight.clear();
   }
 
   // -- Main View --
@@ -582,7 +631,7 @@ export class LLMMonitor extends Abject {
         specs: [{
           type: 'tabBar',
           windowId: this.windowId!,
-          tabs: ['Active Requests', 'Recent History', 'Stats'],
+          tabs: ['Active Requests', 'Recent History', 'Stats', 'Map'],
           selectedIndex: 0,
           closable: false,
         }],
@@ -621,6 +670,31 @@ export class LLMMonitor extends Abject {
     this.historyTabListId = this.tabContents[1];
 
     await this.buildStatsTab();
+
+    // Map tab: the calls as a graph around The Eye.
+    const { widgetIds: [graphId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'nodeGraph', windowId: this.windowId!, title: 'Calls into The Eye', emptyText: 'No calls yet',
+          directed: true, style: { visible: false },
+          groups: [
+            { id: 'eye', label: 'The Eye', color: '$accent', material: 'ceramic', shape: 'sphere' },
+            { id: 'providers', label: 'Providers', color: '$textPrimary', shape: 'roundedBox' },
+            { id: 'smart', label: 'Smart tier', color: '$accentTertiary', shape: 'icosphere' },
+            { id: 'balanced', label: 'Balanced tier', color: '$statusInfo', shape: 'icosphere' },
+            { id: 'fast', label: 'Fast tier', color: '$statusSuccess', shape: 'icosphere' },
+            { id: 'code', label: 'Code tier', color: '$statusWarning', shape: 'icosphere' },
+            { id: 'direct', label: 'By name', color: '$textSecondary', shape: 'sphere' },
+          ],
+        }],
+      })
+    );
+    this.graphId = graphId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: graphId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    this.tabContents.push(graphId);
 
     // clearViewTracking() above reset row state, so this first refresh builds
     // every row from empty via the normal incremental reconcile path.
@@ -787,10 +861,10 @@ export class LLMMonitor extends Abject {
   private scheduleRefresh(): void {
     if (this.refreshScheduled) return;
     this.refreshScheduled = true;
-    this.refreshDebounceTimer = setTimeout(() => {
+    this.refreshDebounceTimer = this.setTimer(() => {
       this.refreshScheduled = false;
       this.refreshDebounceTimer = undefined;
-      if (this.windowId) {
+      if (this.windowId && !this.minimized) {
         this.refreshView().catch((err) => log.warn('Failed to refresh LLM monitor:', err));
       }
     }, LLMMonitor.REFRESH_DEBOUNCE_MS);
@@ -830,6 +904,8 @@ export class LLMMonitor extends Abject {
     const now = Date.now();
     const activeRequests = snapshot?.activeRequests ?? [];
     const history = snapshot?.history ?? [];
+    this.lastActiveCount = activeRequests.length;
+    this.lastRefreshAt = now;
 
     // Active tab: one row per active request. Capped (keeping the newest by
     // arrival) so a burst of concurrent requests can't create unbounded row
@@ -923,7 +999,7 @@ export class LLMMonitor extends Abject {
    * refresh every two seconds whether or not anyone is looking at spend.
    */
   private async refreshStatsTab(): Promise<void> {
-    if (this.selectedTabIndex !== 2 || !this.statsTableId || !this.llmObjectId) return;
+    if (this.selectedTabIndex !== STATS_TAB || !this.statsTableId || !this.llmObjectId) return;
 
     let report: LLMSpendReport | null = null;
     try {
@@ -1512,6 +1588,130 @@ export class LLMMonitor extends Abject {
     return { color: this.theme.textPrimary, fontSize: 11, fontWeight: 'bold' };
   }
 
+  // -- Map --
+
+  private mapShown(): boolean {
+    return this.selectedTabIndex === MAP_TAB && !!this.graphId && !!this.windowId;
+  }
+
+  private static modelKey(provider: string, model: string): string {
+    return `${provider}/${model}`;
+  }
+
+  /** Fold one ledger entry into the Map's per-model totals. */
+  private foldEntry(e: LLMLedgerEntry): void {
+    const key = LLMMonitor.modelKey(e.provider, e.model);
+    const m = this.eyeModels.get(key) ?? {
+      provider: e.provider, model: e.model, tier: e.tier ?? 'direct', tokens: 0, calls: 0, errors: 0, inflight: 0,
+    };
+    if (e.tier) m.tier = e.tier;
+    if (e.status === 'active') {
+      m.inflight++;
+      this.eyeInflight.set(e.id, key);
+    } else {
+      m.calls++;
+      m.tokens += (e.usage?.inputTokens ?? 0) + (e.usage?.outputTokens ?? 0);
+      if (e.status === 'error') m.errors++;
+    }
+    this.eyeModels.set(key, m);
+  }
+
+  /** Edge weight into the eye: half-decades of tokens, so widths change (and the layout moves) rarely. */
+  private static tokenWeight(tokens: number): number {
+    return Math.max(0.5, Math.round(Math.log10(1 + tokens) * 2) / 2);
+  }
+
+  private eyeNode(): Record<string, unknown> {
+    const inflight = [...this.eyeModels.values()].some((m) => m.inflight > 0);
+    return { id: EYE_NODE, label: 'The Eye', group: 'eye', size: 15, active: inflight, center: true };
+  }
+
+  private modelNode(key: string, m: EyeModel): Record<string, unknown> {
+    const tier = ['smart', 'balanced', 'fast', 'code'].includes(m.tier) ? m.tier : 'direct';
+    return {
+      id: `model:${key}`, label: m.model || key, group: tier,
+      size: 6 + Math.min(8, Math.log2(1 + m.calls) * 1.5), active: m.inflight > 0,
+      data: { provider: m.provider, model: m.model, tier: m.tier, calls: m.calls, tokens: m.tokens, errors: m.errors },
+    };
+  }
+
+  /** Build the whole Map from a fresh ledger snapshot (on showing the tab). */
+  private async loadEyeMap(): Promise<void> {
+    if (!this.mapShown() || !this.llmObjectId) return;
+    let snapshot: StatsSnapshot | null = null;
+    try {
+      snapshot = await this.request<StatsSnapshot>(request(this.id, this.llmObjectId, 'getStats', {}));
+    } catch (err) {
+      log.warn('Failed to fetch the ledger for the map:', err);
+    }
+    this.eyeModels.clear();
+    this.eyeInflight.clear();
+    for (const e of snapshot?.history ?? []) this.foldEntry(e);
+    for (const e of snapshot?.activeRequests ?? []) this.foldEntry(e);
+    const nodes: Array<Record<string, unknown>> = [this.eyeNode()];
+    const edges: Array<Record<string, unknown>> = [];
+    const providers = new Set<string>();
+    for (const [key, m] of this.eyeModels) {
+      if (!providers.has(m.provider)) {
+        providers.add(m.provider);
+        nodes.push({ id: `prov:${m.provider}`, label: m.provider, group: 'providers', size: 10 });
+      }
+      nodes.push(this.modelNode(key, m));
+      edges.push({ from: `prov:${m.provider}`, to: `model:${key}`, weight: 0.5 });
+      edges.push({ from: `model:${key}`, to: EYE_NODE, weight: LLMMonitor.tokenWeight(m.tokens) });
+    }
+    await this.request(request(this.id, this.graphId!, 'setGraph', { nodes, edges }))
+      .catch((err) => log.warn('Map update failed:', err instanceof Error ? err.message : String(err)));
+  }
+
+  /**
+   * Keep the Map in step with the ledger's own events: a call starting
+   * lights its model (adding it, and its provider, the first time); a call
+   * ending flows from its model into the eye, in the error colour when it
+   * failed. Edge weights move by half-decades of tokens only.
+   */
+  private onLedgerEvent(aspect: string, value: unknown): void {
+    if (!this.mapShown()) return;
+    const graph = this.graphId!;
+    const send = (method: string, payload: unknown) =>
+      this.request(request(this.id, graph, method, payload)).catch(() => { /* graph busy or gone */ });
+    if (aspect === 'requestStarted') {
+      const e = value as LLMLedgerEntry | undefined;
+      if (!e?.id || !e.provider) return;
+      const key = LLMMonitor.modelKey(e.provider, e.model);
+      const isNewModel = !this.eyeModels.has(key);
+      const isNewProvider = ![...this.eyeModels.values()].some((m) => m.provider === e.provider);
+      this.foldEntry({ ...e, status: 'active' });
+      const nodes = [this.modelNode(key, this.eyeModels.get(key)!), this.eyeNode()];
+      if (isNewProvider) nodes.push({ id: `prov:${e.provider}`, label: e.provider, group: 'providers', size: 10 });
+      void send('upsertNodes', { nodes }).then(() => {
+        if (!isNewModel) return undefined;
+        return send('upsertEdges', { edges: [
+          { from: `prov:${e.provider}`, to: `model:${key}`, weight: 0.5 },
+          { from: `model:${key}`, to: EYE_NODE, weight: 0.5 },
+        ] });
+      });
+      return;
+    }
+    if (aspect === 'requestCompleted' || aspect === 'requestError') {
+      const v = value as { id?: string; provider?: string; model?: string; usage?: { inputTokens?: number; outputTokens?: number } } | undefined;
+      if (!v?.id) return;
+      const key = this.eyeInflight.get(v.id) ?? (v.provider ? LLMMonitor.modelKey(v.provider, v.model ?? '') : undefined);
+      const m = key ? this.eyeModels.get(key) : undefined;
+      if (!key || !m) return;
+      this.eyeInflight.delete(v.id);
+      const before = LLMMonitor.tokenWeight(m.tokens);
+      m.inflight = Math.max(0, m.inflight - 1);
+      m.calls++;
+      m.tokens += (v.usage?.inputTokens ?? 0) + (v.usage?.outputTokens ?? 0);
+      if (aspect === 'requestError') m.errors++;
+      const after = LLMMonitor.tokenWeight(m.tokens);
+      void send('upsertNodes', { nodes: [this.modelNode(key, m), this.eyeNode()] });
+      if (after !== before) void send('upsertEdges', { edges: [{ from: `model:${key}`, to: EYE_NODE, weight: after }] });
+      void send('pulse', { from: `model:${key}`, to: EYE_NODE, color: aspect === 'requestError' ? '$statusError' : '$accentSecondary' });
+    }
+  }
+
   // -- The Eye --
 
   /** Sigil position: the right end of the control bar, in px from the window centre. */
@@ -1778,14 +1978,10 @@ export class LLMMonitor extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = undefined;
-    }
-    if (this.refreshDebounceTimer) {
-      clearTimeout(this.refreshDebounceTimer);
-      this.refreshDebounceTimer = undefined;
-    }
+    this.cancelTimer(this.refreshTimer);
+    this.refreshTimer = undefined;
+    this.cancelTimer(this.refreshDebounceTimer);
+    this.refreshDebounceTimer = undefined;
   }
 
   protected override askPrompt(_question: string): string {
