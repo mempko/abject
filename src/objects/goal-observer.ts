@@ -218,9 +218,19 @@ decisions belong to ScrumMaster.
 
     const now = Date.now();
 
+    // A warning covers one stall. Goals that finished drop out, so the set
+    // does not grow with every goal ever warned about.
+    const activeIds = new Set(goals.map(g => g.id));
+    for (const id of this.warningsIssued) if (!activeIds.has(id)) this.warningsIssued.delete(id);
+
     for (const goal of goals) {
       // Stale check
       const age = now - (goal.lastMeaningfulProgressAt ?? goal.createdAt ?? goal.updatedAt);
+      if (age < Math.min(this.staleWarnMs, this.staleFailMs)) {
+        // Progress resumed: a later stall is a new one and earns its own warning.
+        this.warningsIssued.delete(goal.id);
+        continue;
+      }
       if (age >= this.staleFailMs) {
         const runtime=await this.discoverDep('AgentAbject');
         const health=runtime?await this.request<{ownedWorkActive:boolean}>(request(this.id,runtime,'getGoalExecutionHealth',{goalId:goal.id})).catch(()=>null):null;
