@@ -1,5 +1,31 @@
 [
   {
+    "version": "0.12.1",
+    "date": "2026-09-30",
+    "title": "System One: typed decisions for agent judgment calls",
+    "summary": "Agents now make their key judgment calls (finding an object, reviewing a report, deciding who takes a task) by asking a model typed questions and getting answers with probabilities, rather than working it out in free text. Each decision point can be turned off, set to advise, or set to act, and every one falls back to the old behavior when there's no decision provider.",
+    "highlights": [
+      "New System One decision framework: the LLM object has a decide method that asks typed questions (choice, yes/no, score) about a state and returns every answer with its probability distribution, so callers can set their own thresholds",
+      "TypeSafe added as a decision provider (set TYPESAFE_API_KEY), with OpenRouter's System One models also available; without a decision provider, decisions run on your regular chat model",
+      "Decision points built into the system objects: Registry search ranking, Chat's report audit, ScrumMaster's quick dispatch and round review, and the plan and review steps in the creators and agents; each one can be set to off, advise, or act in Global Settings",
+      "LLM Monitor shows decision calls as their own 'Decisions' tier, whichever model handled them",
+      "Chat can now flag reports whose claims aren't grounded in what actually happened",
+      "Failed agent actions now pass along the real command or HTTP output (exit code, truncation, and a read_chunk handle for long output), so the next step can see what went wrong without re-running it",
+      "Failed tasks now stay failed, and a retry is a new corrective task scheduled by the next scrum round; tasks default to one attempt, and Chat and Goal Browser show it that way",
+      "Agents can opt out of planning polls (joinsPlanning), so internal agents like TaskReviewer no longer make an LLM call per poll just to pass",
+      "Agents that skip their first observation can set their starting think tier, so Chat's first step uses its intended lighter tier",
+      "New eye sigil favicon, now shared by the website, thin client, and desktop app"
+    ],
+    "fixes": [
+      "Review tasks can no longer be accepted without a verdict on whether the user-facing summary matches the latest verification",
+      "Stall warnings now fire once per stall: a goal that recovers and stalls again gets a new warning, and finished goals are cleared out",
+      "ExternalCreator judges task completion more accurately: better parse-error detection for Rust and TypeScript, read-only commands no longer mark a snapshot as tainted, and failures in files the task never touched are labeled foreign",
+      "Semantic review findings from an earlier draft no longer block tier promotion after the draft has changed",
+      "Requests that reach ObjectCreator through the job queue now keep the kind the dispatcher chose, where before every one was treated as a create-or-modify guess",
+      "abject.world no longer serves stale favicons and social cards from the CDN; content-hashed assets stay cached permanently and other static files revalidate every hour"
+    ]
+  },
+  {
     "version": "0.12.0",
     "date": "2026-09-30",
     "title": "A Desktop with Depth",
