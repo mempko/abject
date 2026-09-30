@@ -2949,7 +2949,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         agentName: (t.fields?.agentName as string) ?? undefined,
         claimedBy: t.claimedBy,
         attempts: (t.fields?.attempts as number) ?? 0,
-        maxAttempts: (t.fields?.maxAttempts as number) ?? 3,
+        maxAttempts: (t.fields?.maxAttempts as number) ?? 1,
         dependsOn: (t.fields?.dependsOn as string[]) ?? undefined,
       }));
       this.liveTasks.set(goalId, tasks);

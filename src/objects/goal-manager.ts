@@ -1125,7 +1125,7 @@ Goals have automatic lifecycle management:
     await call(await dep('GoalManager'), 'completeTask', { taskId: task.id, result: 'Done!' });
   }
 
-  // Fail a task (releases claim so others can retry)
+  // Fail a task (marks it permanently failed; the next scrum decides whether to schedule a corrective task)
   await call(await dep('GoalManager'), 'failTask', { taskId, error: 'Something went wrong' });
 
   // Get all tasks for a goal
@@ -2368,7 +2368,9 @@ reviews results and either plans another round or completes/fails the goal.
           namespace: ns, operationId,
           fields: {
             goalId, status: 'pending', description, data,
-            attempts: 0, maxAttempts: 3, failureHistory: [],
+            // One attempt: failTask is terminal, and a retry is a corrective
+            // task the next scrum schedules (see failTask).
+            attempts: 0, maxAttempts: 1, failureHistory: [],
             dependsOn: dependsOn ?? [],
             produces: produces ?? [],
             consumes: consumes ?? [],

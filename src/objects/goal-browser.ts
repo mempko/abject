@@ -431,7 +431,7 @@ Click the arrow to expand/collapse a goal.
         status: (t.fields.status as string) ?? 'unknown',
         description: (t.fields.description as string) ?? '',
         attempts: (t.fields.attempts as number) ?? 0,
-        maxAttempts: (t.fields.maxAttempts as number) ?? 3,
+        maxAttempts: (t.fields.maxAttempts as number) ?? 1,
         claimedBy: t.claimedBy,
         agentName: (t.fields.agentName as string) ?? undefined,
         dependsOn: (t.fields.dependsOn as string[]) ?? undefined,
