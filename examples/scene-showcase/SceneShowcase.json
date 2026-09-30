@@ -1,0 +1,191 @@
+{
+  "manifest": {
+    "name": "SceneShowcase",
+    "description": "A tour of the desktop's 3D scene vocabulary in one stage window plus a little world presence: a material-preset gallery under a studio look, a neon arcade corner with bloom, additive lines and GPU particles, an extruded gold title under a sunset sky with an orbit camera, a draggable desktop companion with a label and a trail, and a guide panel window that rides a slowly turning world node. Uses only public messages and follows the active palette.",
+    "version": "1.0.0",
+    "icon": "💎",
+    "interface": {
+      "id": "abjects:demo:scene-showcase",
+      "name": "SceneShowcase",
+      "description": "Opens the 3D showcase (stage window, guide panel, desktop companion) and switches its stations.",
+      "methods": [
+        {
+          "name": "show",
+          "description": "Opens the stage window and the guide panel (riding its world dock), adds the desktop companion, registers the showcaseEnamel material preset, and shows the saved station. Idempotent: raises the stage when already open.",
+          "parameters": [],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ windowId, hudId, station }"
+          }
+        },
+        {
+          "name": "hide",
+          "description": "Removes the companion and the dock from the desktop, closes both windows, and unregisters the showcaseEnamel preset. Station and companion position are kept in data.",
+          "parameters": [],
+          "returns": {
+            "kind": "primitive",
+            "primitive": "boolean"
+          }
+        },
+        {
+          "name": "setStation",
+          "description": "Shows one station on the stage: materials (preset gallery, studio look), arcade (neon look, bloom, particles) or title (extruded text, sunset, orbit camera).",
+          "parameters": [
+            {
+              "name": "station",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              },
+              "description": "'materials' | 'arcade' | 'title'"
+            }
+          ],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ station }"
+          }
+        },
+        {
+          "name": "summonCompanion",
+          "description": "Springs the desktop companion back to its home spot under the guide panel (a spring animate op on a world node).",
+          "parameters": [],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ position }"
+          }
+        },
+        {
+          "name": "toggleRide",
+          "description": "Attaches the guide panel window to its turning world dock, or detaches it.",
+          "parameters": [
+            {
+              "name": "ride",
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              },
+              "description": "true to ride, false to let go; omitted toggles",
+              "optional": true
+            }
+          ],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ ride }"
+          }
+        },
+        {
+          "name": "sceneInfo",
+          "description": "Reads WidgetManager getSceneParams and shows the connected screen's GPU capabilities and running stats in the guide panel.",
+          "parameters": [],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ capabilities, stats, text }"
+          }
+        },
+        {
+          "name": "getState",
+          "description": "The current station, companion position, ride state and window ids.",
+          "parameters": [],
+          "returns": {
+            "kind": "reference",
+            "reference": "{ station, ride, companion, windowId, hudId, enamelRegistered }"
+          }
+        },
+        {
+          "name": "changed",
+          "description": "Widget callback: clicks on the guide panel buttons.",
+          "parameters": [
+            {
+              "name": "aspect",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              },
+              "description": "click"
+            }
+          ],
+          "returns": {
+            "kind": "primitive",
+            "primitive": "boolean"
+          }
+        },
+        {
+          "name": "nodeInput",
+          "description": "Scene input: clicking a stage shape wobbles it; dragging the companion reports dragStart/dragEnd (its dropped position is saved); clicking it bursts sparks; cameraChange from the title station's orbit camera.",
+          "parameters": [
+            {
+              "name": "type",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              },
+              "description": "mousedown | mouseup | dragStart | dragMove | dragEnd | cameraChange | ..."
+            },
+            {
+              "name": "nodeId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              },
+              "description": "the node"
+            }
+          ],
+          "returns": {
+            "kind": "primitive",
+            "primitive": "boolean"
+          }
+        },
+        {
+          "name": "windowCloseRequested",
+          "description": "Closing the guide panel closes just the panel; closing the stage closes the whole showcase.",
+          "parameters": [
+            {
+              "name": "windowId",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              },
+              "description": "the window being closed"
+            }
+          ],
+          "returns": {
+            "kind": "primitive",
+            "primitive": "boolean"
+          }
+        }
+      ],
+      "events": [
+        {
+          "name": "opened",
+          "description": "The showcase opened.",
+          "payload": {
+            "kind": "reference",
+            "reference": "{ windowId, hudId }"
+          }
+        },
+        {
+          "name": "closed",
+          "description": "The showcase closed.",
+          "payload": {
+            "kind": "reference",
+            "reference": "{}"
+          }
+        }
+      ]
+    },
+    "requiredCapabilities": [],
+    "providedCapabilities": [
+      "abjects:demo:scene-showcase"
+    ],
+    "tags": [
+      "demo",
+      "3d",
+      "showcase",
+      "webgl",
+      "materials",
+      "particles",
+      "scriptable"
+    ]
+  },
+  "source": "({\n  // ==========================================================================\n  // MODEL: which station the stage shows, where the desktop companion lives,\n  // and whether the guide panel rides its floating dock. this.data is the\n  // durable part (it travels with a clone); window and node ids are live state.\n  // ==========================================================================\n\n  _stations() {\n    return {\n      materials: {\n        label: 'MATERIALS', title: 'MATERIAL PRESETS',\n        text: \"One param dresses a shape: material: 'gold'. Spheres on the plinth and shapes on the floor wear built-in presets (plus one this showcase registers) under look: 'studio', with a soft shadow and contact AO. Click a shape to wobble it.\"\n      },\n      arcade: {\n        label: 'ARCADE', title: 'NEON ARCADE',\n        text: \"look: 'neon' with bloom, additive neon lines for the floor grid and portal, neon 3D text, a hologram orb, and two GPU particle emitters (sparks and drifting embers).\"\n      },\n      title: {\n        label: 'TITLE', title: 'EXTRUDED TITLE',\n        text: \"kind: 'text' in gold and chrome under a sunset sky, with a soft shadow, depth of field and an instanced halo. The stage has a camera node: drag inside it to orbit, use the wheel to zoom.\"\n      }\n    };\n  },\n\n  _initData() {\n    const d = this.data;\n    if (!this._stations()[d.station]) d.station = 'materials';\n    if (!(Array.isArray(d.companion) && d.companion.length === 3 && d.companion.every(function (n) { return typeof n === 'number' && isFinite(n); }))) d.companion = null;\n    if (typeof d.ride !== 'boolean') d.ride = true;\n    return d;\n  },\n\n  _checkInvariants() {\n    const d = this._initData();\n    this.invariant(!!this._stations()[d.station], 'the current station must be one of materials, arcade, title');\n    this.invariant(!this._attached || !!this._hudId, 'only an open guide panel can ride the dock');\n    this.invariant(!this._hudId || !!this._mainId, 'the guide panel only exists alongside the stage window');\n    return true;\n  },\n\n  // Screen placement from the live display size (px, workspace coordinates).\n  async _layout() {\n    let W = 1440, H = 900;\n    try {\n      const info = await this.call(await this.dep('UIServer'), 'getDisplayInfo', {});\n      if (info && info.width > 0 && info.height > 0) { W = info.width; H = info.height; }\n    } catch (e) { /* keep the default */ }\n    const left = 184, gap = 20, hudW = 360, hudH = 520;\n    const mainW = Math.max(600, Math.min(980, W - left - hudW - gap * 2));\n    const mainH = Math.max(480, Math.min(680, H - 150));\n    const main = { x: left, y: 70, w: mainW, h: mainH };\n    return { W: W, H: H, main: main, hud: this._hudPlace(W, H, main, hudW, hudH, gap) };\n  },\n\n  // The panel sits right of the stage (its real rect: the desktop may shift it\n  // clear of the left rail), and the companion's home is just below the panel.\n  _hudPlace(W, H, main, hudW, hudH, gap) {\n    const cx = Math.round(Math.min(W - hudW / 2 - 12, main.x + main.w + gap + hudW / 2));\n    const cy = Math.round(main.y + hudH / 2 + 6);\n    return { cx: cx, cy: cy, w: hudW, h: hudH, home: [cx, Math.round(Math.min(H - 100, cy + hudH / 2 + 110)), 60] };\n  },\n\n  // ==========================================================================\n  // VIEW: the stage window's stations (window scope), the desktop companion\n  // and the dock the guide panel rides (world scope). Pure op builders.\n  // ==========================================================================\n\n  _adder(ops) {\n    return function (id, kind, transform, params, parentId) {\n      ops.push({ op: 'add', id: id, parentId: parentId || 'stage', kind: kind, transform: transform || {}, params: params || {} });\n    };\n  },\n\n  _heading(add, title, hint) {\n    const w = this._stageW || 980, h = this._stageH || 680;\n    const x = -w / 2 + 26, y = -h / 2 + 36 + 30;\n    add('heading', 'label', { position: [x, y, 0] }, { text: title, size: 18, color: '$textPrimary', background: '$windowBg', padding: 8, anchor: [0, 0.5] });\n    add('hint', 'label', { position: [x, y + 34, 0] }, { text: hint, size: 12, color: '$textSecondary', background: '$windowBg', padding: 6, anchor: [0, 0.5] });\n  },\n\n  _materialsOps() {\n    const ops = [], anims = [];\n    const add = this._adder(ops);\n    add('env', 'environment', null, { look: 'studio', exposure: 1.0, envIntensity: 1.35, ao: { radius: 28, intensity: 1 }, fxaa: true });\n    add('sky', 'sky', null, { top: '#a7adb5', horizon: '#6b7079', bottom: '#26282d' });\n    add('key', 'light', null, { lightType: 'directional', direction: [-0.45, 0.8, -0.45], color: '#fff4e6', intensity: 1.4, castShadow: true, shadow: { size: 2048, softness: 3 } });\n    add('fill', 'light', null, { lightType: 'hemisphere', color: '#e6eef8', groundColor: '#3b342e', intensity: 0.5 });\n    // A palette-coloured rim light from behind; range keeps it off the floor.\n    add('rim', 'light', { position: [0, -160, -1050] }, { lightType: 'point', color: '$accent', intensity: 1.6, range: 1000 });\n    add('floor', 'mesh', { position: [0, 250, -420], scale: [2000, 12, 1600] }, { primitive: 'box', color: '#2e3136', roughness: 0.8, metalness: 0 });\n    add('plinth', 'mesh', { position: [0, 182, -470], scale: [Math.min(1060, (this._stageW || 980) + 60), 124, 190] }, { primitive: 'roundedBox', shape: { radius: 0.05 }, color: '#464a52', roughness: 0.55 });\n\n    // Back row: classic finishes on spheres, resting on the plinth.\n    const back = ['gold', 'chrome', 'copper', 'glass', 'ceramic', 'obsidian'];\n    const sw = this._stageW || 980;\n    const backStep = Math.min(160, (sw - 110) / 5.2), frontStep = Math.min(170, (sw - 200) / 5);\n    for (let i = 0; i < back.length; i++) {\n      const g = 'mat-' + i;\n      add(g, 'group', { position: [(i - 2.5) * backStep, 65, -470] }, {});\n      add(g + '-shape', 'mesh', { scale: 110 }, { primitive: 'sphere', material: back[i], interactive: true, cursor: 'pointer' }, g);\n      add(g + '-tag', 'label', { position: [0, -74, 0] }, { text: back[i], size: 12, color: '$textPrimary', background: '$windowBg', padding: 5 }, g);\n    }\n\n    // Front row: the parametric primitives, each in another preset.\n    const enamel = this._enamel ? 'showcaseEnamel' : 'plastic';\n    const star = [[0, -0.5], [0.12, -0.15], [0.5, -0.15], [0.19, 0.07], [0.3, 0.45], [0, 0.22], [-0.3, 0.45], [-0.19, 0.07], [-0.5, -0.15], [-0.12, -0.15]];\n    const knot = [];\n    for (let k = 0; k < 96; k++) {\n      const t = (k / 96) * Math.PI * 2;\n      knot.push([(Math.sin(t) + 2 * Math.sin(2 * t)) / 6.5, (Math.cos(t) - 2 * Math.cos(2 * t)) / 6.5, -Math.sin(3 * t) / 6.5]);\n    }\n    const front = [\n      { tag: enamel + ' capsule', half: 65, t: { scale: [70, 130, 70] }, p: { primitive: 'capsule', material: enamel } },\n      { tag: 'toon roundedBox', half: 62, t: { scale: 92, rotation: [0.35, 0.6, 0] }, p: { primitive: 'roundedBox', shape: { radius: 0.18 }, material: 'toon' } },\n      { tag: 'bone lathe', half: 70, t: { scale: [100, 140, 100] }, p: { primitive: 'lathe', shape: { points: [[0.001, 0.5], [0.3, 0.5], [0.36, 0.3], [0.2, 0.05], [0.14, -0.2], [0.26, -0.44], [0.28, -0.5]] }, material: 'bone' } },\n      { tag: 'neon extrude', half: 62, t: { scale: 130 }, p: { primitive: 'extrude', shape: { outline: star, depth: 0.16, bevel: 0.02 }, material: 'neon' } },\n      { tag: 'hologram torus', half: 58, t: { scale: 130, rotation: [1.15, 0, 0.3] }, p: { primitive: 'torus', material: 'hologram', color: '$accentTertiary', rimColor: '$accentTertiary' } },\n      { tag: 'brushedMetal tube', half: 56, t: { scale: 120 }, p: { primitive: 'tube', shape: { path: knot, radius: 0.075, segments: 192, radialSegments: 14, closed: true }, material: 'brushedMetal' } }\n    ];\n    for (let i = 0; i < front.length; i++) {\n      const f = front[i];\n      const g = 'mat-' + (back.length + i);\n      add(g, 'group', { position: [(i - 2.5) * frontStep, 244 - f.half, -40] }, {});\n      const params = Object.assign({ interactive: true, cursor: 'pointer' }, f.p);\n      add(g + '-shape', 'mesh', f.t, params, g);\n      add(g + '-tag', 'label', { position: [0, -f.half - 20, 0] }, { text: f.tag, size: 12, color: '$textPrimary', background: '$windowBg', padding: 5 }, g);\n    }\n    anims.push({ op: 'animate', id: 'mat-10-shape', params: { preset: 'spin', axis: 'y', duration: 9000 } });\n    anims.push({ op: 'animate', id: 'mat-11-shape', params: { preset: 'spin', axis: 'y', duration: 14000 } });\n    this._heading(add, 'MATERIAL PRESETS', \"params.material: 'gold'   environment look: 'studio'\");\n    return { ops: ops, anims: anims };\n  },\n\n  _arcadeOps() {\n    const ops = [], anims = [];\n    const add = this._adder(ops);\n    add('env', 'environment', null, {\n      look: 'neon', bloom: { threshold: 0.42, intensity: 1.25, quality: 'high' },\n      fog: { color: '#12061f', near: 600, far: 3400 }, chromaticAberration: 1.2,\n      grading: { saturation: 1.2, contrast: 1.1, vignette: 0.45 }\n    });\n    add('sky', 'sky', null, { top: '#05030d', horizon: '#3b0d4f', bottom: '#030208', stars: 0.6 });\n    add('glowL', 'light', { position: [-420, -60, -250] }, { lightType: 'point', color: '#ff2bd6', intensity: 2.2 });\n    add('glowR', 'light', { position: [420, -60, -250] }, { lightType: 'point', color: '#27e7ff', intensity: 2.2 });\n    add('fill', 'light', null, { lightType: 'hemisphere', color: '#3a2a6a', groundColor: '#0a0612', intensity: 0.5 });\n    add('floor', 'mesh', { position: [0, 250, -600], scale: [2400, 10, 2000] }, { primitive: 'box', color: '#08060d', metalness: 0.5, roughness: 0.3 });\n    for (let i = -6; i <= 6; i++) {\n      add('gx' + (i + 6), 'line', null, { points: [[i * 160, 244, 400], [i * 160, 244, -1600]], width: 2, color: '#ff2bd6', blend: 'additive' });\n    }\n    for (let j = 0; j < 12; j++) {\n      const z = 400 - j * 170;\n      add('gz' + j, 'line', null, { points: [[-1100, 244, z], [1100, 244, z]], width: 2, color: '#ff2bd6', blend: 'additive' });\n    }\n    // A setting synthwave sun, banded by strips of the night sky.\n    add('sun', 'mesh', { position: [0, 120, -1850], scale: 820 }, { primitive: 'sphere', color: '#ff4d6d', shading: 'unlit', castShadow: false });\n    const D = 1680, zs = -1850, zb = -1440, R = 410, cy = 120;\n    const ss = D / (D - zs), sb = D / (D - zb);\n    for (let b = 0; b < 4; b++) {\n      const y = cy + 10 + b * 38;\n      const half = Math.sqrt(Math.max(0, R * R - (y - cy) * (y - cy))) * ss / sb;\n      add('band' + b, 'mesh', { position: [0, y * ss / sb, zb], scale: [half * 2, (5 + b * 4) * ss / sb, 2] }, { primitive: 'box', color: '#12061f', shading: 'unlit', castShadow: false });\n    }\n    const ring = function (r) {\n      const pts = [];\n      for (let k = 0; k < 72; k++) { const a = (k / 72) * Math.PI * 2; pts.push([Math.cos(a) * r, Math.sin(a) * r, 0]); }\n      return pts;\n    };\n    add('portal', 'group', { position: [0, 10, -700] }, {});\n    add('portalOuter', 'line', null, { points: ring(260), closed: true, width: 8, color: '#ff2bd6', blend: 'additive' }, 'portal');\n    add('portalInner', 'line', null, { points: ring(226), closed: true, width: 4, color: '#27e7ff', blend: 'additive' }, 'portal');\n    add('sign', 'text', { position: [0, -310, -560] }, { text: 'ARCADE', size: 120, depth: 18, bevel: 2, material: 'neon', color: '#27e7ff', emissive: '#27e7ff' });\n    add('orb', 'mesh', { position: [-330, 70, -300], scale: 150 }, { primitive: 'icosphere', material: 'hologram', color: '#27e7ff', rimColor: '#27e7ff' });\n    add('mirror', 'mesh', { position: [330, 110, -260], scale: 130 }, { primitive: 'sphere', material: 'chrome' });\n    add('sparks', 'particles', { position: [0, 244, -700] }, {\n      rate: 90, lifetime: 1400, speed: [140, 280], direction: [0, -1, 0], spread: 0.5, gravity: 420, drag: 0.15,\n      size: [2, 4], sizeEnd: 0, color: '#ffd166', colorEnd: '#ff2bd6', maxParticles: 400\n    });\n    add('embers', 'particles', { position: [0, 120, -600] }, {\n      rate: 50, lifetime: 5000, speed: [10, 40], direction: [0, -1, 0], spread: 0.7, turbulence: 60,\n      emitterSize: [1600, 60, 900], size: [2, 5], color: '#27e7ff', colorEnd: '#ff2bd6', opacityEnd: 0, maxParticles: 400\n    });\n    anims.push({ op: 'animate', id: 'orb', params: { preset: 'float', duration: 5000 } });\n    anims.push({ op: 'animate', id: 'mirror', params: { preset: 'bob', amplitude: 16, duration: 3200 } });\n    anims.push({ op: 'animate', id: 'portal', params: { channel: 'rotation', keyframes: [{ t: 0, value: [0, -0.25, 0], easing: 'easeInOut' }, { t: 4000, value: [0, 0.25, 0], easing: 'easeInOut' }, { t: 8000, value: [0, -0.25, 0] }], loop: true } });\n    this._heading(add, 'NEON ARCADE', \"look: 'neon'   bloom   blend: 'additive'   particles\");\n    return { ops: ops, anims: anims };\n  },\n\n  _titleOps() {\n    const ops = [], anims = [];\n    const add = this._adder(ops);\n    add('cam', 'camera', { position: [0, -200, 950] }, { target: [0, 0, 0], fov: 34, orbit: { minDistance: 450, maxDistance: 1800, minPitch: -0.1, maxPitch: 1.0, damping: 0.9 }, zoom: true });\n    add('env', 'environment', null, {\n      look: 'sunset', fog: { color: '#d9826a', near: 1600, far: 6000 }, ao: true, dof: { focus: 0, range: 520, aperture: 5 },\n      grading: { temperature: 0.2, saturation: 1.15, contrast: 1.12, vignette: 0.35 }\n    });\n    add('sky', 'sky', null, { top: '#1d2257', horizon: '#ff7b47', bottom: '#1a0f1c', sun: { direction: [-0.78, -0.16, -0.6], color: '#ffb26a', size: 4 } });\n    // The key travels away from the viewer (-z), so it lights the letters' faces.\n    add('key', 'light', null, { lightType: 'directional', direction: [-0.35, 0.5, -0.8], color: '#ffe2bf', intensity: 1.7, castShadow: true, shadow: { size: 2048, softness: 2.5 } });\n    add('fill', 'light', null, { lightType: 'hemisphere', color: '#9fb0ff', groundColor: '#3a1d2a', intensity: 0.45 });\n    add('disc', 'mesh', { position: [0, 190, 0], scale: [1100, 20, 1100] }, { primitive: 'cylinder', material: 'obsidian', color: '#140d18', clearcoat: 0.6, envIntensity: 0.5 });\n    add('titleGroup', 'group', {}, {});\n    add('title', 'text', { position: [0, -40, 0] }, { text: 'ABJECTS', size: 130, depth: 34, bevel: 4, material: 'gold' }, 'titleGroup');\n    add('subtitle', 'text', { position: [0, 80, 10] }, { text: 'EVERYTHING IS AN OBJECT', size: 34, depth: 6, bevel: 1, material: 'chrome' }, 'titleGroup');\n    const inst = [];\n    const palette = ['$accent', '$accentTertiary', '#e8e2d0'];\n    for (let i = 0; i < 48; i++) {\n      const a = (i / 48) * Math.PI * 2;\n      inst.push({ position: [Math.cos(a) * 520, 150 + Math.sin(a * 3) * 18, Math.sin(a) * 520], scale: 16 + (i % 4) * 4, rotation: [a, a * 2, 0], color: palette[i % 3] });\n    }\n    add('halo', 'mesh', null, { primitive: 'box', color: '#ffffff', metalness: 0.6, roughness: 0.3, instances: inst });\n    anims.push({ op: 'animate', id: 'halo', params: { preset: 'spin', axis: 'y', duration: 40000 } });\n    anims.push({ op: 'animate', id: 'titleGroup', params: { preset: 'float', duration: 6000 } });\n    return { ops: ops, anims: anims };\n  },\n\n  _companionOps(pos) {\n    const ops = [];\n    const add = function (id, kind, transform, params, parentId) {\n      const op = { op: 'add', id: id, kind: kind, transform: transform || {}, params: params || {} };\n      if (parentId) op.parentId = parentId;\n      ops.push(op);\n    };\n    add('buddy', 'group', { position: pos }, { layer: 'stack', draggable: { inertia: true }, cursor: 'grab' });\n    add('buddy-core', 'group', {}, {}, 'buddy');\n    add('buddy-body', 'mesh', { scale: 86 }, { primitive: 'sphere', material: 'plastic', trail: { color: '$accentTertiary', width: 12, lifetime: 1400 } }, 'buddy-core');\n    add('buddy-eye', 'group', { position: [0, -6, 36] }, {}, 'buddy-core');\n    add('buddy-white', 'mesh', { scale: [42, 42, 14] }, { primitive: 'sphere', color: '#f3ecd8', roughness: 0.3 }, 'buddy-eye');\n    add('buddy-ring', 'mesh', { position: [0, 0, 6], scale: 56 }, { primitive: 'ring', material: 'gold' }, 'buddy-eye');\n    add('buddy-pupil', 'mesh', { position: [0, 0, 8], scale: [7, 28, 6] }, { primitive: 'capsule', color: '#0e0b14', roughness: 0.2 }, 'buddy-eye');\n    add('buddy-tag', 'label', { position: [0, -74, 0] }, { text: 'DRAG ME', size: 12, color: '$textPrimary', background: '$windowBg', padding: 6 }, 'buddy');\n    add('buddy-sparks', 'particles', {}, {\n      burst: 36, burstKey: 0, rate: 0, lifetime: 900, speed: [90, 220], direction: [0, -1, 0], spread: 3.1,\n      gravity: 260, size: [2, 5], sizeEnd: 0, color: '$accentTertiary', colorEnd: '$accent', maxParticles: 200\n    }, 'buddy');\n    ops.push({ op: 'animate', id: 'buddy-body', params: { preset: 'breathe' } });\n    return ops;\n  },\n\n  _dockOps(hud) {\n    return [\n      { op: 'add', id: 'dock', kind: 'group', transform: { position: [hud.cx, hud.cy, 0] }, params: {} },\n      { op: 'animate', id: 'dock', params: { channel: 'rotation', keyframes: [\n        { t: 0, value: [0.04, -0.24, 0], easing: 'easeInOut' },\n        { t: 5000, value: [-0.04, 0.24, 0], easing: 'easeInOut' },\n        { t: 10000, value: [0.04, -0.24, 0] }\n      ], loop: true } }\n    ];\n  },\n\n  async _world(ops) {\n    return this.call(await this.dep('UIServer'), 'scene', { world: true, ops: ops });\n  },\n\n  // ==========================================================================\n  // USE CASES\n  // ==========================================================================\n\n  async show(msg) {\n    const d = this._initData();\n    const wm = await this.dep('WidgetManager');\n    if (this._mainId) {\n      try { await this.call(wm, 'raiseWindow', { windowId: this._mainId }); } catch (e) { /* already gone */ }\n      return { windowId: this._mainId, hudId: this._hudId, station: d.station, reopened: true };\n    }\n    const L = await this._layout();\n    this._L = L;\n    // A preset of our own, usable by name from any abject while we live.\n    this._enamel = false;\n    try {\n      await this.call(await this.dep('SceneLibrary'), 'registerMaterial', {\n        name: 'showcaseEnamel',\n        spec: { color: '$accentTertiary', metalness: 0, roughness: 0.22, clearcoat: 1, clearcoatRoughness: 0.04 },\n        description: 'Glossy enamel in the theme\\'s tertiary accent (registered by the scene showcase)'\n      });\n      this._enamel = true;\n    } catch (e) { /* the built-in plastic stands in */ }\n\n    this._mainId = await this.call(wm, 'createWindowAbject', {\n      title: 'Scene Showcase', rect: { x: L.main.x, y: L.main.y, w: L.main.w, h: L.main.h }, resizable: false, closable: true\n    });\n    this.ensure(!!this._mainId, 'the stage window must exist before a station can be shown');\n    try {\n      const r = await this.call(this._mainId, 'getRect', {});\n      if (r && r.width > 0) L.hud = this._hudPlace(L.W, L.H, { x: r.x, y: r.y, w: r.width, h: r.height }, L.hud.w, L.hud.h, 20);\n    } catch (e) { /* keep the planned spot */ }\n    this._stageW = L.main.w;\n    this._stageH = L.main.h;\n    await this._openHud();\n\n    const home = d.companion || L.hud.home;\n    await this._world(this._companionOps(home));\n    this._burst = 0;\n    await this._showStation(d.station);\n    this._checkInvariants();\n    await this.changed('opened', { windowId: this._mainId, hudId: this._hudId });\n    return { windowId: this._mainId, hudId: this._hudId, station: d.station };\n  },\n\n  async _openHud() {\n    const L = this._L;\n    const d = this._initData();\n    const wm = await this.dep('WidgetManager');\n    const h = L.hud;\n    const hudId = await this.call(wm, 'createWindowAbject', {\n      title: 'Showcase Guide', rect: { x: Math.round(h.cx - h.w / 2), y: Math.round(h.cy - h.h / 2), w: h.w, h: h.h }, resizable: false, closable: true\n    });\n    this._hudId = hudId;\n    const root = await this.call(wm, 'createVBox', { windowId: hudId, margins: { top: 14, right: 14, bottom: 14, left: 14 }, spacing: 8 });\n    const row = await this.call(wm, 'createHBox', { windowId: hudId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 6 });\n    const st = this._stations();\n    const made = await this.call(wm, 'create', { specs: [\n      { type: 'label', windowId: hudId, text: 'SCENE SHOWCASE', style: { fontSize: 20, fontWeight: 'bold' } },\n      { type: 'label', windowId: hudId, text: st[d.station].title, style: { fontSize: 14, fontWeight: 'bold' } },\n      { type: 'label', windowId: hudId, text: st[d.station].text, style: { wordWrap: true, fontSize: 13 } },\n      { type: 'button', windowId: hudId, text: st.materials.label },\n      { type: 'button', windowId: hudId, text: st.arcade.label },\n      { type: 'button', windowId: hudId, text: st.title.label },\n      { type: 'button', windowId: hudId, text: 'SUMMON COMPANION' },\n      { type: 'button', windowId: hudId, text: d.ride ? 'RIDE THE DOCK: ON' : 'RIDE THE DOCK: OFF' },\n      { type: 'button', windowId: hudId, text: 'SCENE INFO' },\n      { type: 'label', windowId: hudId, text: 'The companion is a world object: drag it anywhere on the desktop. This panel is a window riding a turning world node.', style: { wordWrap: true, fontSize: 12 } }\n    ] });\n    const ids = made.widgetIds;\n    this._w = {\n      title: ids[0], stationTitle: ids[1], text: ids[2],\n      materials: ids[3], arcade: ids[4], titleBtn: ids[5],\n      summon: ids[6], ride: ids[7], info: ids[8], infoText: ids[9]\n    };\n    for (let i = 3; i <= 8; i++) await this.call(ids[i], 'addDependent', {});\n    await this.call(row, 'addLayoutChildren', { children: [\n      { widgetId: ids[3], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[4], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[5], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } }\n    ] });\n    await this.call(root, 'addLayoutChildren', { children: [\n      { widgetId: ids[0], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 28 } },\n      { widgetId: ids[1], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 20 } },\n      { widgetId: ids[2], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 104 } },\n      { widgetId: row, sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[6], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[7], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[8], sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 32 } },\n      { widgetId: ids[9], sizePolicy: { horizontal: 'expanding', vertical: 'expanding' } }\n    ] });\n    // A gold ring pops out past the panel's corner (clip: 'none').\n    await this.call(hudId, 'scene', { ops: [\n      { op: 'add', id: 'hud-ring', kind: 'mesh', transform: { position: [h.w / 2 - 8, -h.h / 2 + 8, 50], scale: 64 }, params: { primitive: 'ring', material: 'gold', clip: 'none' } },\n      { op: 'animate', id: 'hud-ring', params: { preset: 'spin', axis: 'y', duration: 7000 } }\n    ] });\n    await this._world(this._dockOps(h));\n    this._attached = false;\n    if (d.ride) await this._attach(true);\n    return hudId;\n  },\n\n  async _attach(on) {\n    if (!this._hudId) return false;\n    if (on) {\n      await this.call(this._hudId, 'attachTo', { scope: 'world', nodeId: 'dock', offset: [0, 0, 0] });\n    } else {\n      await this.call(this._hudId, 'attachTo', { detach: true });\n    }\n    this._attached = !!on;\n    return this._attached;\n  },\n\n  async _showStation(key) {\n    const st = this._stations()[key];\n    this.ensure(!!st, 'unknown station: ' + key);\n    if (!this._mainId) return false;\n    const built = key === 'materials' ? this._materialsOps() : key === 'arcade' ? this._arcadeOps() : this._titleOps();\n    const ops = [\n      { op: 'remove', id: 'stage' },\n      { op: 'add', id: 'stage', kind: 'group', transform: {}, params: {} }\n    ].concat(built.ops, built.anims);\n    await this.call(this._mainId, 'scene', { ops: ops });\n    this._station = key;\n    if (this._w) {\n      try {\n        await this.call(this._w.stationTitle, 'update', { text: st.title });\n        await this.call(this._w.text, 'update', { text: st.text });\n      } catch (e) { /* the panel closed */ }\n    }\n    return true;\n  },\n\n  async hide(msg) {\n    const wm = await this.dep('WidgetManager');\n    // World nodes first: the panel lets go of its dock, then nothing of ours\n    // is left on the desktop.\n    if (this._hudId && this._attached) { try { await this._attach(false); } catch (e) { /* gone */ } }\n    try { await this._world([{ op: 'remove', id: 'buddy' }, { op: 'remove', id: 'dock' }]); } catch (e) { /* gone */ }\n    const ids = [this._hudId, this._mainId];\n    this._hudId = null;\n    this._mainId = null;\n    this._w = null;\n    this._attached = false;\n    for (let i = 0; i < ids.length; i++) {\n      if (ids[i]) { try { await this.call(wm, 'destroyWindowAbject', { windowId: ids[i] }); } catch (e) { /* gone */ } }\n    }\n    if (this._enamel) {\n      try { await this.call(await this.dep('SceneLibrary'), 'unregisterMaterial', { name: 'showcaseEnamel' }); } catch (e) { /* gone */ }\n      this._enamel = false;\n    }\n    await this.changed('closed', {});\n    this.ensure(!this._mainId && !this._hudId, 'hide leaves no showcase window open');\n    return true;\n  },\n\n  async windowCloseRequested(msg) {\n    const wid = msg && msg.payload ? msg.payload.windowId : null;\n    if (wid && wid === this._hudId) {\n      // Closing just the panel: let go of the dock and keep the stage.\n      if (this._attached) { try { await this._attach(false); } catch (e) { /* gone */ } }\n      const hudId = this._hudId;\n      this._hudId = null;\n      this._w = null;\n      try { await this._world([{ op: 'remove', id: 'dock' }]); } catch (e) { /* gone */ }\n      try { await this.call(await this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: hudId }); } catch (e) { /* gone */ }\n      return true;\n    }\n    await this.hide({});\n    return true;\n  },\n\n  async setStation(msg) {\n    const key = msg && msg.payload ? msg.payload.station : null;\n    this.ensure(!!this._stations()[key], \"setStation needs station: 'materials' | 'arcade' | 'title'\");\n    const d = this._initData();\n    d.station = key;\n    await this._showStation(key);\n    await this.saveData();\n    this._checkInvariants();\n    return { station: key };\n  },\n\n  async summonCompanion(msg) {\n    const L = this._L || await this._layout();\n    const to = L.hud.home;\n    await this._world([\n      { op: 'animate', id: 'buddy', params: { channel: 'position', to: to, spring: { stiffness: 90, damping: 11 } } }\n    ]);\n    const d = this._initData();\n    d.companion = to;\n    await this.saveData();\n    // The spring runs in the browser; once it settles, the retained copy\n    // (what a reconnecting screen sees) moves there too.\n    const self = this;\n    setTimeout(function () {\n      if (!self._mainId) return;\n      self._world([{ op: 'update', id: 'buddy', transform: { position: to } }]).catch(function () {});\n    }, 2200);\n    return { position: to };\n  },\n\n  async toggleRide(msg) {\n    const d = this._initData();\n    const want = msg && msg.payload && typeof msg.payload.ride === 'boolean' ? msg.payload.ride : !this._attached;\n    if (!this._hudId) return { ride: false };\n    await this._attach(want);\n    d.ride = want;\n    await this.saveData();\n    if (this._w) await this.call(this._w.ride, 'update', { text: want ? 'RIDE THE DOCK: ON' : 'RIDE THE DOCK: OFF' });\n    this._checkInvariants();\n    return { ride: want };\n  },\n\n  async sceneInfo(msg) {\n    const p = await this.call(await this.dep('WidgetManager'), 'getSceneParams', {}, { timeout: 10000 });\n    const c = p.capabilities || null, s = p.stats || null;\n    let text = 'No screen answered, so GPU details are unknown.';\n    if (c && s) {\n      const fm = s.frameMs || {};\n      const q = c.postQuality ? c.postQuality.name : 'n/a';\n      text = (c.gpu ? c.gpu + '\\n' : '') +\n        (s.fps ? s.fps + ' fps, ' + fm.avg + ' ms avg, ' + fm.p95 + ' ms p95\\n' : 'idle (nothing animating)\\n') +\n        s.drawCalls + ' draw calls, ' + s.triangles + ' triangles, ' + s.particles + ' particles\\n' +\n        'post quality: ' + q + ', textures ~' + s.textureMB + ' MB';\n    }\n    if (this._w) { try { await this.call(this._w.infoText, 'update', { text: text }); } catch (e) { /* closed */ } }\n    return { capabilities: c, stats: s, text: text };\n  },\n\n  async getState(msg) {\n    const d = this._initData();\n    return {\n      station: d.station, ride: this._attached === true, companion: d.companion,\n      windowId: this._mainId || null, hudId: this._hudId || null,\n      enamelRegistered: this._enamel === true\n    };\n  },\n\n  // Widget clicks from the guide panel.\n  async changed(msg) {\n    const p = (msg && msg.payload) || {};\n    if (p.aspect !== 'click' || !this._w) return false;\n    const from = msg.routing ? msg.routing.from : null;\n    const w = this._w;\n    if (from === w.materials) return this.setStation({ payload: { station: 'materials' } });\n    if (from === w.arcade) return this.setStation({ payload: { station: 'arcade' } });\n    if (from === w.titleBtn) return this.setStation({ payload: { station: 'title' } });\n    if (from === w.summon) return this.summonCompanion({});\n    if (from === w.ride) return this.toggleRide({ payload: {} });\n    if (from === w.info) return this.sceneInfo({});\n    return false;\n  },\n\n  // Scene input: shapes on the stage, and the desktop companion.\n  async nodeInput(msg) {\n    const p = (msg && msg.payload) || {};\n    const id = String(p.nodeId || '');\n    if (id === 'buddy' || id.indexOf('buddy-') === 0) return this._companionInput(p);\n    if (!this._mainId) return false;\n    if (p.type === 'mousedown' && /^mat-\\d+-shape$/.test(id)) {\n      await this.call(this._mainId, 'scene', { ops: [{ op: 'animate', id: id, params: { preset: 'wobble' } }] });\n      return true;\n    }\n    if (p.type === 'cameraChange') this._view = { position: p.position, target: p.target };\n    return true;\n  },\n\n  async _companionInput(p) {\n    if (p.type === 'dragStart') {\n      this._dragging = true;\n      await this._world([{ op: 'update', id: 'buddy-tag', params: { text: 'WHEE' } }]);\n      return true;\n    }\n    if (p.type === 'dragEnd') {\n      this._dragging = false;\n      const d = this._initData();\n      if (Array.isArray(p.position)) d.companion = p.position;\n      await this._world([\n        { op: 'update', id: 'buddy-tag', params: { text: 'DRAG ME' } },\n        { op: 'animate', id: 'buddy-core', params: { preset: 'wobble' } }\n      ]);\n      await this.saveData();\n      return true;\n    }\n    if (p.type === 'mouseup' && !this._dragging) {\n      this._burst = (this._burst || 0) + 1;\n      await this._world([\n        { op: 'update', id: 'buddy-sparks', params: { burstKey: this._burst } },\n        { op: 'animate', id: 'buddy-core', params: { preset: 'wobble' } }\n      ]);\n      return true;\n    }\n    return true;\n  }\n})"
+}
