@@ -140,10 +140,28 @@ When asked about a task, describe which objects you would message and what you w
 - If a diagnosis finishes with "the fix is to change the code of object X", report the finding and stop; let the dispatcher route the follow-up fix task to a code-generation agent. Do not claim partial success by proposing a manual edit.`;
   }
 
+  /**
+   * The need to look up in the Registry, bounded. An ask carries either a
+   * `Task:` line, a planning context whose leading goal JSON holds the title
+   * and description, or plain prose; pasting the whole question (a poll
+   * carries up to 12K of goal context) buries the need.
+   */
+  private static taskFromQuestion(question: string): string {
+    const taskLine = question.match(/^Task:\s*"?(.+?)"?\s*$/m)?.[1];
+    const jsonField = (name: string): string | undefined => {
+      const raw = question.match(new RegExp(`"${name}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`))?.[1];
+      if (raw === undefined) return undefined;
+      try { return JSON.parse(`"${raw}"`) as string; } catch { return raw; }
+    };
+    const fromGoal = [jsonField('title'), jsonField('description')].filter(Boolean).join(': ');
+    const task = taskLine ?? (fromGoal || question);
+    return task.length > ObjectAgent.MAX_LOOKUP_CHARS ? `${task.slice(0, ObjectAgent.MAX_LOOKUP_CHARS)}…` : task;
+  }
+
+  private static readonly MAX_LOOKUP_CHARS = 1500;
+
   protected override async handleAsk(question: string): Promise<string> {
-    // Extract task description from the confidence question
-    const taskMatch = question.match(/Task:\s*"?(.+?)"?\s*$/m);
-    const taskDesc = taskMatch?.[1] ?? question;
+    const taskDesc = ObjectAgent.taskFromQuestion(question);
 
     // Ask Registry which objects can help with this task
     let registryContext = '';
@@ -398,9 +416,7 @@ When asked about a task, describe which objects you would message and what you w
 
     // Include task data hints if this is the first observation
     if (!extra?.lastResult && extra?.taskData) {
-      const { object, method, payload } = extra.taskData as {
-        object?: string; method?: string; payload?: unknown;
-      };
+      const { object, method, payload } = ObjectAgent.taskHints(extra.taskData);
       if (object) lines.push(`Hint: target object is "${object}"`);
       if (method) lines.push(`Hint: method to call is "${method}"`);
       if (payload !== undefined) lines.push(`Hint: payload is ${JSON.stringify(payload).slice(0, 500)}`);
@@ -426,6 +442,12 @@ When asked about a task, describe which objects you would message and what you w
     this.taskExtras.set(taskId, extra);
     // Per-task goal context; the shared field is only a legacy fallback
     const goalId = extra.goalId;
+    // A failure is what the next observation must show; leaving lastResult
+    // alone would echo the previous success and keep the tier on balanced.
+    const fail = (error: string, data?: unknown): { success: false; data?: unknown; error: string } => {
+      extra.lastResult = `Error: ${error}`;
+      return data === undefined ? { success: false, error } : { success: false, data, error };
+    };
 
     try {
       let result: string;
@@ -433,12 +455,12 @@ When asked about a task, describe which objects you would message and what you w
       switch (action.action) {
         case 'ask': {
           const objectName = action.object as string;
-          if (!objectName) return { success: false, error: 'ask action requires "object" field' };
+          if (!objectName) return fail('ask action requires "object" field');
           const question = action.question as string;
-          if (!question) return { success: false, error: 'ask action requires "question" field' };
+          if (!question) return fail('ask action requires "question" field');
 
           const objectId = await this.resolveObject(objectName);
-          if (!objectId) return { success: false, error: `Object "${objectName}" not found` };
+          if (!objectId) return fail(`Object "${objectName}" not found`);
 
           const answer = await this.request<string>(
             request(this.id, objectId, 'ask', { question }),
@@ -450,10 +472,10 @@ When asked about a task, describe which objects you would message and what you w
 
         case 'introspect': {
           const objectName = action.object as string;
-          if (!objectName) return { success: false, error: 'introspect action requires "object" field' };
+          if (!objectName) return fail('introspect action requires "object" field');
 
           const objectId = await this.resolveObject(objectName);
-          if (!objectId) return { success: false, error: `Object "${objectName}" not found` };
+          if (!objectId) return fail(`Object "${objectName}" not found`);
 
           const desc = await this.request<{ manifest: unknown; description: string }>(
             request(this.id, objectId, 'describe', {}),
@@ -464,12 +486,12 @@ When asked about a task, describe which objects you would message and what you w
 
         case 'call': {
           const objectName = action.object as string;
-          if (!objectName) return { success: false, error: 'call action requires "object" field' };
+          if (!objectName) return fail('call action requires "object" field');
           const method = action.method as string;
-          if (!method) return { success: false, error: 'call action requires "method" field' };
+          if (!method) return fail('call action requires "method" field');
 
           const objectId = await this.resolveObject(objectName);
-          if (!objectId) return { success: false, error: `Object "${objectName}" not found` };
+          if (!objectId) return fail(`Object "${objectName}" not found`);
 
           const timeout = (action.timeout as number) || 120000;
           const callResult = await this.request(
@@ -479,7 +501,7 @@ When asked about a task, describe which objects you would message and what you w
 
           const contract = await this.request<ResultContract|null>(request(this.id,objectId,'getResultContract',{method})).catch(()=>null);
           const rejected=domainFailure(callResult,contract);
-          if(rejected)return {success:false,data:callResult,error:rejected};
+          if(rejected)return fail(rejected, callResult);
 
           // Detect screenshot results and store image data for LLM vision
           if (callResult && typeof callResult === 'object' && 'imageBase64' in (callResult as Record<string, unknown>)) {
@@ -511,10 +533,10 @@ When asked about a task, describe which objects you would message and what you w
         }
 
         case 'write_scratchpad': {
-          if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
-          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          if (!goalId) return fail('write_scratchpad requires an active goal context');
+          if (!this.goalManagerId) return fail('GoalManager not available');
           const key = action.key as string;
-          if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
+          if (!key) return fail('write_scratchpad requires "key"');
           await this.request(
             request(this.id, this.goalManagerId, 'writeGoalData', {
               goalId, key, value: action.value,
@@ -525,8 +547,8 @@ When asked about a task, describe which objects you would message and what you w
         }
 
         case 'read_scratchpad': {
-          if (!goalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
-          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          if (!goalId) return fail('read_scratchpad requires an active goal context');
+          if (!this.goalManagerId) return fail('GoalManager not available');
           const key = action.key as string | undefined;
           const value = await this.request(
             request(this.id, this.goalManagerId, 'readGoalData', {
@@ -538,7 +560,7 @@ When asked about a task, describe which objects you would message and what you w
         }
 
         default:
-          return { success: false, error: `Unknown action: ${action.action}` };
+          return fail(`Unknown action: ${action.action}`);
       }
 
       // Point the next observation at a large result rather than quoting it
@@ -547,9 +569,7 @@ When asked about a task, describe which objects you would message and what you w
       extra.lastResult = resultEcho(result);
       return bulkAwareResult(result);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      extra.lastResult = `Error: ${errMsg}`;
-      return { success: false, error: errMsg };
+      return fail(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -611,11 +631,17 @@ When asked about a task, describe which objects you would message and what you w
    * above stay byte-identical across tasks and can be served from the
    * provider's prompt cache. Returns undefined when there is nothing to say.
    */
+  /** Task data hints; dispatchers name the target object as `target`. */
+  private static taskHints(taskData: Record<string, unknown>): { object?: string; method?: string; payload?: unknown } {
+    const { object, target, method, payload } = taskData as {
+      object?: string; target?: string; method?: string; payload?: unknown;
+    };
+    return { object: object ?? target, method, payload };
+  }
+
   private buildTaskPrompt(taskData?: Record<string, unknown>): string | undefined {
     if (!taskData) return undefined;
-    const { object, method, payload } = taskData as {
-      object?: string; method?: string; payload?: unknown;
-    };
+    const { object, method, payload } = ObjectAgent.taskHints(taskData);
     if (!object && !method) return undefined;
 
     let hints = '\n\n## Task Hints\n\n';

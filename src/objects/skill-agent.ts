@@ -11,8 +11,8 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import type { AgentAction } from './agent-abject.js';
-import { bulkAwareResult, resultEcho } from './agent-abject.js';
+import type { AgentAction, AgentActionResult } from './agent-abject.js';
+import { bulkAwareResult, resultEcho, LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
 import type { MCPServerSummary, MCPServerDetail } from './mcp-registry-client.js';
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
@@ -589,6 +589,20 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     this.taskExtras.set(taskId, extra);
     // Per-task goal context; the shared field is only a legacy fallback
     const goalId = extra.goalId;
+    // A failure is what the next observation must show; leaving lastResult
+    // alone would echo the previous success and keep the tier on balanced.
+    const fail = (error: string): { success: false; error: string } => {
+      extra.lastResult = `Error: ${error}`;
+      return { success: false, error };
+    };
+    // A command or request that ran but failed (non-zero exit, HTTP error)
+    // reports as a failure with its output intact: small output reads inline
+    // as the error, large output rides the payload channel behind a handle.
+    const failedOutput = (summary: string, text: string): AgentActionResult => {
+      extra.lastResult = `Error: ${resultEcho(text)}`;
+      if (text.length <= LARGE_PAYLOAD_CHARS) return fail(text);
+      return { ...bulkAwareResult(text), success: false, error: `${summary} (full output held below; read it with read_chunk)` };
+    };
 
     try {
       let result: string;
@@ -596,8 +610,8 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       switch (action.action) {
         case 'shell': {
           const command = action.command as string;
-          if (!command) return { success: false, error: 'shell action requires "command" field' };
-          if (!this.shellExecutorId) return { success: false, error: 'ShellExecutor not available' };
+          if (!command) return fail('shell action requires "command" field');
+          if (!this.shellExecutorId) return fail('ShellExecutor not available');
 
           // ShellExecutor may pause to ask the user for permission, and it
           // gives them two minutes to answer. The request deadline has to
@@ -614,17 +628,19 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             }),
             PERMISSION_AWARE_TIMEOUT,
           );
-          result = execResult.exitCode === 0
-            ? (execResult.stdout || '(no output)')
-            : `Exit code ${execResult.exitCode}\nstdout: ${execResult.stdout}\nstderr: ${execResult.stderr}`;
+          if (execResult.exitCode !== 0) {
+            return failedOutput(`Exit code ${execResult.exitCode}`,
+              `Exit code ${execResult.exitCode}\nstdout: ${execResult.stdout}\nstderr: ${execResult.stderr}`);
+          }
+          result = execResult.stdout || '(no output)';
           break;
         }
 
         case 'http': {
-          if (!this.httpClientId) return { success: false, error: 'HttpClient not available' };
+          if (!this.httpClientId) return fail('HttpClient not available');
           const method = (action.method as string || 'GET').toUpperCase();
           const url = action.url as string;
-          if (!url) return { success: false, error: 'http action requires "url" field' };
+          if (!url) return fail('http action requires "url" field');
 
           const httpResult = await this.request<{ status: number; body: string; ok: boolean }>(
             request(this.id, this.httpClientId, 'request', {
@@ -634,13 +650,14 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             }),
           );
           result = `HTTP ${httpResult.status}\n${httpResult.body ?? ''}`;
+          if (!httpResult.ok) return failedOutput(`HTTP ${httpResult.status}`, result);
           break;
         }
 
         case 'read_file': {
-          if (!this.hostFileSystemId) return { success: false, error: 'HostFileSystem not available' };
+          if (!this.hostFileSystemId) return fail('HostFileSystem not available');
           const path = action.path as string;
-          if (!path) return { success: false, error: 'read_file action requires "path" field' };
+          if (!path) return fail('read_file action requires "path" field');
 
           const fileResult = await this.request<{ content: string; lines: number }>(
             request(this.id, this.hostFileSystemId, 'readFile', { path }),
@@ -651,10 +668,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'write_file': {
-          if (!this.hostFileSystemId) return { success: false, error: 'HostFileSystem not available' };
+          if (!this.hostFileSystemId) return fail('HostFileSystem not available');
           const path = action.path as string;
           const content = action.content as string;
-          if (!path || content === undefined) return { success: false, error: 'write_file requires "path" and "content"' };
+          if (!path || content === undefined) return fail('write_file requires "path" and "content"');
 
           await this.request(
             request(this.id, this.hostFileSystemId, 'writeFile', { path, content }),
@@ -665,9 +682,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'search': {
-          if (!this.webSearchId) return { success: false, error: 'WebSearch not available' };
+          if (!this.webSearchId) return fail('WebSearch not available');
           const query = action.query as string;
-          if (!query) return { success: false, error: 'search action requires "query" field' };
+          if (!query) return fail('search action requires "query" field');
 
           const searchResult = await this.request<{ results: Array<{ title: string; url: string; snippet: string }> }>(
             request(this.id, this.webSearchId, 'search', { query, maxResults: 5 }),
@@ -677,9 +694,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'fetch': {
-          if (!this.webFetchId) return { success: false, error: 'WebFetch not available' };
+          if (!this.webFetchId) return fail('WebFetch not available');
           const url = action.url as string;
-          if (!url) return { success: false, error: 'fetch action requires "url" field' };
+          if (!url) return fail('fetch action requires "url" field');
 
           const fetchResult = await this.request<{ content: string; title: string }>(
             request(this.id, this.webFetchId, 'fetch', { url, maxLength: 30000 }),
@@ -689,10 +706,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'install_skill': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
           const content = action.content as string;
-          if (!name || !content) return { success: false, error: 'install_skill requires "name" and "content" fields' };
+          if (!name || !content) return fail('install_skill requires "name" and "content" fields');
 
           await this.request(
             request(this.id, this.skillRegistryId, 'installSkill', { name, content }),
@@ -704,7 +721,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         case 'search_catalog': {
           const query = (action.query as string)?.trim() ?? '';
           const limit = typeof action.limit === 'number' && action.limit > 0 ? action.limit : 10;
-          if (!query) return { success: false, error: 'search_catalog requires "query" field' };
+          if (!query) return fail('search_catalog requires "query" field');
           const hits = await this.searchCatalog(query, limit);
           if (hits.length === 0) {
             result = `No matches for "${query}" in the MCP registry or ClawHub.`;
@@ -719,27 +736,27 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'install_mcp_server': {
-          if (!this.mcpRegistryClientId) return { success: false, error: 'MCPRegistryClient not available' };
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.mcpRegistryClientId) return fail('MCPRegistryClient not available');
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
-          if (!name) return { success: false, error: 'install_mcp_server requires "name" field' };
+          if (!name) return fail('install_mcp_server requires "name" field');
           result = await this.installMcpServer(name);
           break;
         }
 
         case 'install_clawhub_skill': {
-          if (!this.clawHubClientId) return { success: false, error: 'ClawHubClient not available' };
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.clawHubClientId) return fail('ClawHubClient not available');
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const slug = action.slug as string;
-          if (!slug) return { success: false, error: 'install_clawhub_skill requires "slug" field' };
+          if (!slug) return fail('install_clawhub_skill requires "slug" field');
           result = await this.installClawHubSkill(slug);
           break;
         }
 
         case 'enable_skill': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
-          if (!name) return { success: false, error: 'enable_skill requires "name" field' };
+          if (!name) return fail('enable_skill requires "name" field');
 
           const enabled = await this.request<{
             success: boolean; warning?: string; mcpStatus?: string; toolCount?: number;
@@ -759,7 +776,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
               enabled.missingEnv?.length ? `Missing env: ${enabled.missingEnv.join(', ')}` : '',
               enabled.hint ?? '',
             ].filter(Boolean);
-            return { success: false, error: parts.join('\n') };
+            return fail(parts.join('\n'));
           }
 
           result = enabled.mcpStatus
@@ -770,11 +787,11 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'set_skill_config': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
           const env = action.env as Record<string, string> | undefined;
           if (!name || !env || typeof env !== 'object') {
-            return { success: false, error: 'set_skill_config requires "name" and an "env" object' };
+            return fail('set_skill_config requires "name" and an "env" object');
           }
 
           const saved = await this.request<{
@@ -793,10 +810,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
             .map(([k, v]) => `${k}: ${maskSecret(String(v ?? ''))}`)
             .join(', ');
           if (saved.restarted && saved.mcpStatus === 'error') {
-            return {
-              success: false,
-              error: `Saved config for "${name}" (${summary}) but the MCP server still fails to start.\n${saved.error ?? ''}`,
-            };
+            return fail(`Saved config for "${name}" (${summary}) but the MCP server still fails to start.\n${saved.error ?? ''}`);
           }
           result = `Saved config for "${name}" — ${summary}.`
             + (saved.restarted ? ` MCP bridge restarted: ${saved.toolCount ?? 0} tools available.` : '');
@@ -804,9 +818,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'get_skill_config': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
-          if (!name) return { success: false, error: 'get_skill_config requires "name" field' };
+          if (!name) return fail('get_skill_config requires "name" field');
 
           const config = await this.request<{ env?: Record<string, string> }>(
             request(this.id, this.skillRegistryId, 'getSkillConfig', { name }),
@@ -819,9 +833,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'disable_skill': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
           const name = action.name as string;
-          if (!name) return { success: false, error: 'disable_skill requires "name" field' };
+          if (!name) return fail('disable_skill requires "name" field');
 
           await this.request(
             request(this.id, this.skillRegistryId, 'disableSkill', { name }),
@@ -831,10 +845,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'load_skill': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry unavailable' };
+          if (!this.skillRegistryId) return fail('SkillRegistry unavailable');
           const enabled = await this.request<EnabledSkillSummary[]>(request(this.id, this.skillRegistryId, 'getEnabledSkills', {}));
           const skill = enabled.find(s => s.name === action.name);
-          if (!skill) return { success: false, error: 'Skill is not enabled; Ask SkillRegistry about availability' };
+          if (!skill) return fail('Skill is not enabled; Ask SkillRegistry about availability');
           // Remember it: a later shell command in this task runs on behalf of
           // this skill, and the permission layer needs its name to find the
           // grant the user made by enabling it.
@@ -847,7 +861,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'list_skills': {
-          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          if (!this.skillRegistryId) return fail('SkillRegistry not available');
 
           const skills = await this.request<Array<{ name: string; description: string; enabled: boolean; error?: string }>>(
             request(this.id, this.skillRegistryId, 'listSkills', {}),
@@ -862,10 +876,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           const server = action.server as string;
           const tool = action.tool as string;
           const input = (action.input as Record<string, unknown>) ?? {};
-          if (!server || !tool) return { success: false, error: 'mcp_tool_call requires "server" and "tool" fields' };
+          if (!server || !tool) return fail('mcp_tool_call requires "server" and "tool" fields');
 
           const resolved = await this.resolveBridge(server);
-          if (!resolved.bridgeId) return { success: false, error: resolved.error };
+          if (!resolved.bridgeId) return fail(resolved.error ?? `MCP server "${server}" is not available`);
 
           const toolResult = await this.request<{ content: string; isError: boolean }>(
             request(this.id, resolved.bridgeId, 'callTool', { toolName: tool, input }),
@@ -873,7 +887,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
           );
 
           if (toolResult.isError) {
-            return { success: false, error: `MCP tool error: ${toolResult.content}` };
+            return fail(`MCP tool error: ${toolResult.content}`);
           } else {
             result = toolResult.content;
           }
@@ -882,10 +896,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
 
         case 'list_mcp_tools': {
           const server = action.server as string;
-          if (!server) return { success: false, error: 'list_mcp_tools requires "server" field' };
+          if (!server) return fail('list_mcp_tools requires "server" field');
 
           const resolved = await this.resolveBridge(server);
-          if (!resolved.bridgeId) return { success: false, error: resolved.error };
+          if (!resolved.bridgeId) return fail(resolved.error ?? `MCP server "${server}" is not available`);
 
           const tools = await this.request<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>>(
             request(this.id, resolved.bridgeId, 'listTools', {}),
@@ -897,10 +911,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'write_scratchpad': {
-          if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
-          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          if (!goalId) return fail('write_scratchpad requires an active goal context');
+          if (!this.goalManagerId) return fail('GoalManager not available');
           const key = action.key as string;
-          if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
+          if (!key) return fail('write_scratchpad requires "key"');
           await this.request(
             request(this.id, this.goalManagerId, 'writeGoalData', {
               goalId, key, value: action.value,
@@ -911,8 +925,8 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'read_scratchpad': {
-          if (!goalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
-          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          if (!goalId) return fail('read_scratchpad requires an active goal context');
+          if (!this.goalManagerId) return fail('GoalManager not available');
           const key = action.key as string | undefined;
           const value = await this.request(
             request(this.id, this.goalManagerId, 'readGoalData', {
@@ -924,7 +938,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         default:
-          return { success: false, error: `Unknown action: ${action.action}` };
+          return fail(`Unknown action: ${action.action}`);
       }
 
       // Bulk (an MCP tool's rows, a fetched body, a file) goes back through
@@ -934,9 +948,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       extra.lastResult = resultEcho(result);
       return bulkAwareResult(result);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      extra.lastResult = `Error: ${errMsg}`;
-      return { success: false, error: errMsg };
+      return fail(err instanceof Error ? err.message : String(err));
     }
   }
 
