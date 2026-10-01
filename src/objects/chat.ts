@@ -10,9 +10,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { v4 as uuidv4 } from 'uuid';
 import { captureConversation, identifyMessages, type ConversationContext } from '../core/conversation-context.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
-import { looksLikeAbsenceClaim, looksLikeClaim, readReportVerdict } from '../core/claims.js';
-import { reportQuestions } from '../core/decision-questions.js';
-import { choiceOf, noulOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
+import { looksLikeAbsenceClaim, looksLikeClaim } from '../core/claims.js';
+import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from '../core/decision-questions.js';
+import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
@@ -36,26 +36,39 @@ const CHAT_THINK_TIER = 'balanced';
 /**
  * How a user message should be handled (site chat.route). Chat itself can
  * only converse; anything that acts or looks at live state becomes a goal.
+ * One choice decides: a goal is created directly only for
+ * `goal_self_contained`, so "needs a goal" and "can be acted on alone" are a
+ * single answer rather than two combined in code.
  */
 const CHAT_ROUTE_QUESTIONS: Record<string, DecisionQuestion> = {
   route: {
     type: 'choice',
-    instructions: 'The assistant can only converse; it acts and observes by creating goals that agents carry out. Any request to do, fetch, show, change, check, or investigate something (including questions about this system\'s objects, agents, skills, or state, and approvals of an earlier proposal) becomes a goal. Pick the handling for `message`, using `recent` for context.',
+    instructions: instruction('Pick the handling for `message`, using `recent` for context. The assistant can only converse; it acts and observes by creating goals that agents carry out.', {
+      focus: 'Whether the message asks for something done, fetched, shown, changed, checked, or investigated (a goal), and whether it can be acted on without the earlier conversation.',
+    }),
     criteria: {
-      goal: 'Asks for an action, data, or an investigation of live or system state, even if it looks like a repeat.',
-      converse: 'A greeting, thanks, small talk, or a question answerable from facts already in the conversation or recent goal results.',
-      remember: 'Shares a standing personal fact or preference worth saving.',
-      clarify: 'Ambiguous in a way only the user can settle (which of their things, the desired outcome, an irreversible choice).',
+      goal_self_contained: criterion('Asks for an action, data, or an investigation, and says everything needed to act on it.', {
+        notFor: 'A request that leans on earlier messages to say what it means.',
+        examples: ["What's the weather in Seattle?", 'Find the oldest note in my wiki.'],
+      }),
+      goal_needs_context: criterion('Asks for an action or data, but refers back to the conversation to say what (it, that, those, the second one, yes do it).', {
+        examples: ['ok, delete the safe ones', 'do the second one'],
+      }),
+      converse: criterion('A greeting, thanks, small talk, or a question answerable from facts already in the conversation or recent goal results.', {
+        notFor: 'Questions about live state or this system\'s objects, which need a goal.',
+        examples: ['thanks!', 'is my understanding of the summary right?'],
+      }),
+      remember: criterion('Shares a standing personal fact or preference worth saving.', {
+        examples: ['I live in Portland.'],
+      }),
+      clarify: criterion('Ambiguous in a way only the user can settle: which of their things, the desired outcome, or an irreversible choice.'),
     },
-  },
-  self_contained: {
-    type: 'noul',
-    instructions: 'Can an agent act on `message` without the earlier conversation to resolve its references (it, that, yes do it, the second one)?',
   },
 };
 
 const ROUTE_HINTS: Record<string, string> = {
-  goal: 'a request that needs a goal',
+  goal_self_contained: 'a request that needs a goal',
+  goal_needs_context: 'a request that needs a goal, using the earlier conversation to resolve its references',
   converse: 'conversation you can answer directly',
   remember: 'a personal fact worth remembering',
   clarify: 'ambiguous in a way only the user can settle',
@@ -2367,15 +2380,19 @@ A single successful creation goal is a complete turn. End it with **done**.
     const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
       .map(e => ({ role: e.role, content: e.content.slice(0, 300) }));
     const outcome = await this.askDecision('chat.audit', {
-      request: userText.slice(0, 1500), text: draft.slice(0, 4000), goal_created_this_turn: false, recent,
-    }, reportQuestions(), { onBehalfOf: 'Chat', nativeOnly });
-    const verdict = outcome ? readReportVerdict(outcome.answers as Parameters<typeof readReportVerdict>[0]) : undefined;
-    if (!outcome || !verdict) return shaped;
-    const flagged = verdict.ungrounded || verdict.absence || verdict.promise;
-    log.info(`[decision:${outcome.mode}] chat.audit: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} flagged=${flagged} clean=${verdict.clean} shapes=${shaped}`);
+      request: userText.slice(0, 1500), text: draft.slice(0, 4000), recent,
+    }, replyKindQuestions(), { onBehalfOf: 'Chat', nativeOnly });
+    const kind = choiceOf(outcome, 'reply_kind');
+    if (!outcome || !kind) return shaped;
+    const p = kind.probabilities[kind.choice] ?? 0;
+    // One reading decides: audit what claims an unrun action, an absence, or
+    // a promise; trust what reads as an answer, a question, or conversation.
+    const flagged = (REPLY_KINDS_TO_AUDIT as readonly string[]).includes(kind.choice) && p >= 0.6;
+    const clean = !flagged && p >= 0.8;
+    log.info(`[decision:${outcome.mode}] chat.audit: ${kind.choice}@${p.toFixed(2)} → ${flagged ? 'audit' : clean ? 'deliver' : 'shapes decide'} (shapes=${shaped})`);
     if (outcome.mode === 'advise') return shaped || flagged;
     if (flagged) return true;
-    return verdict.clean ? false : shaped;
+    return clean ? false : shaped;
   }
 
   /**
@@ -2389,8 +2406,8 @@ A single successful creation goal is a complete turn. End it with **done**.
     const mode = userText.trim() ? await this.decisionSiteMode('chat.route') : 'off';
     if (mode === 'off') return this.runTaskTurn(userText, initialMessages);
     const r = await this.decideRoute(userText, newAttachment);
-    if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)} self_contained=${r.selfContained.toFixed(2)}`);
-    if (r && r.outcome.mode === 'act' && r.route === 'goal' && r.routeP >= 0.9 && r.selfContained >= 0.85 && !newAttachment) {
+    if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)}`);
+    if (r && r.outcome.mode === 'act' && r.route === 'goal_self_contained' && r.routeP >= 0.9 && !newAttachment) {
       log.info('[decision:act] chat.route: creating the goal directly');
       return this.createRoutedGoal(userText);
     }
@@ -2400,7 +2417,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     return this.runTaskTurn(userText, hinted);
   }
 
-  private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number; selfContained: number } | null> {
+  private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number } | null> {
     const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
       .map(e => ({ role: e.role, content: e.content.slice(0, 500) }));
     const recentGoals = [...this.liveGoals.values()].slice(-3).map(g => ({ title: g.title, status: g.status }));
@@ -2409,7 +2426,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     }, CHAT_ROUTE_QUESTIONS, { onBehalfOf: 'Chat' });
     const route = choiceOf(outcome, 'route');
     if (!outcome || !route) return null;
-    return { outcome, route: route.choice, routeP: route.probabilities[route.choice] ?? 0, selfContained: noulOf(outcome, 'self_contained') ?? 0 };
+    return { outcome, route: route.choice, routeP: route.probabilities[route.choice] ?? 0 };
   }
 
   /**

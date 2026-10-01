@@ -35,6 +35,7 @@ import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
+import { criterion, instruction } from '../core/decision-questions.js';
 import * as acorn from 'acorn';
 
 const log = new Log('OBJECT-CREATOR');
@@ -2019,7 +2020,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private static readonly REVIEW_QUESTIONS: Record<string, DecisionQuestion> = {
     review_worthwhile: {
       type: 'noul',
-      instructions: 'A change was just deployed; `hunks` shows the lines it added (+) and removed (-). Could it misbehave at runtime in a way a method-name check cannot catch: a new or changed payload shape sent to a dependency (`newCallSites`), a new enum-like value, a consumed result without await, an event name or payload change, or logic that could defeat a stated requirement in `goal`?',
+      instructions: instruction('Could this just-deployed change misbehave at runtime in a way a method-name check cannot catch?', {
+        focus: 'The added (+) and removed (-) lines in `hunks`, and `newCallSites`: a new or changed payload shape sent to a dependency, a new enum-like value, a consumed result without await, an event name or payload change, or logic that could defeat a requirement in `goal`.',
+        notFor: 'Calls to methods that do not exist (the call check already catches those), and style or naming.',
+        examples: ['a payload key renamed on the sending side only', 'a new status value the receiving handler never checks'],
+      }),
     },
   };
 
@@ -3168,12 +3173,27 @@ ${source}
   private static readonly EVIDENCE_QUESTIONS: Record<string, DecisionQuestion> = {
     call_evidence: {
       type: 'choice',
-      instructions: 'After deploying the object `target`, the agent called `method` on it with a payload carrying `payloadKeys`, and got `responseSummary`. What does this call show about the behavior `goal` asks for?',
+      instructions: instruction('After deploying the object `target`, the agent called `method` on it. What does this one call show about the behavior `goal` asks for?', {
+        focus: '`method`, the payload fields in `payloadKeys`, and `responseSummary`.',
+        notFor: 'Whether the object is well built overall; judge only what this call drove and returned.',
+      }),
       criteria: {
-        exercises_requested: 'It drove a behavior the goal asks for and the response shows its effect.',
-        exercises_other: 'It drove a real behavior, but not one the goal asks for.',
-        read_only: 'It only read state, configuration, or data; no behavior was driven.',
-        failed_or_noop: 'It failed, was refused, or changed nothing.',
+        exercises_requested: criterion('It drove a behavior the goal asks for, and the response shows the effect.', {
+          notFor: 'A call that only returns stored data or configuration, even data the goal mentions (read_only).',
+          examples: ['adding an item to a list the goal asks to support adding', 'an input event on the requested button, returning the new state'],
+        }),
+        exercises_other: criterion('It drove a real behavior, but not one the goal asks for.', {
+          notFor: 'The requested behavior reached through a differently named method (exercises_requested).',
+          examples: ['resetting a counter when the goal asked for sorting'],
+        }),
+        read_only: criterion('It only read state, configuration, or data; no behavior was driven.', {
+          notFor: 'A call that changed state and also returned data (exercises_requested or exercises_other).',
+          examples: ['listing the items', 'a status or settings query'],
+        }),
+        failed_or_noop: criterion('It failed, was refused, or changed nothing.', {
+          notFor: 'A read that returned data as expected (read_only).',
+          examples: ['an error message in the response', 'a success reply with the state unchanged'],
+        }),
       },
     },
   };
@@ -3892,48 +3912,142 @@ ${source}
   private static readonly TIER_QUESTIONS: Record<string, DecisionQuestion> = {
     next_step: {
       type: 'choice',
-      instructions: 'From the object author\'s state (`lastAction`, `recent`, and the draft and deploy flags), predict what its NEXT response must do.',
+      instructions: instruction('What must the object author\'s NEXT response do?', {
+        focus: '`lastAction`, `recent`, and the draft and deploy flags (`draftStaged`, `undeployed`, `deployed`, `exercisedSinceDeploy`).',
+        notFor: 'Whether the work so far is good; predict only the kind of the next step.',
+      }),
       criteria: {
-        author_code: 'Write or rewrite source or manifest text.',
-        fix_failure: 'The last action failed or surfaced a problem that needs diagnosis and a code change.',
-        read_source: 'Navigate existing source: read a member, search it, or read a line range.',
-        discover: 'Ask or describe a dependency to learn how to use it.',
-        deploy_or_check: 'A mechanical deploy or check with nothing to write.',
-        exercise_live: 'Drive the deployed object and read the result.',
-        report: 'Write the final done or fail report.',
+        author_code: criterion('Write or rewrite source or manifest text: new members, edited handlers, a drafted manifest.', {
+          notFor: 'Fixing a failure the last action surfaced (fix_failure), or reading source to plan an edit (read_source).',
+          examples: ['edit the handlers a change touches, after reading them', 'draft the manifest and source of a new object'],
+        }),
+        fix_failure: criterion('Diagnose a failure or problem the last action surfaced and change code to fix it.', {
+          notFor: 'A failed step that a plain retry or a different read resolves without writing code.',
+          examples: ['a deploy refused because a call names a missing method', 'an exercised method threw an error'],
+        }),
+        read_source: criterion('Navigate existing source: read a member, search it, or read a line range.', {
+          notFor: 'Asking a dependency how to use it (discover).',
+          examples: ['read one handler of the staged draft', 'search the source for a field name'],
+        }),
+        discover: criterion('Ask or describe a dependency to learn how to use it.', {
+          notFor: 'Reading this object\'s own source (read_source).',
+          examples: ['ask a layout service how to build a form', 'describe a dependency to list its methods'],
+        }),
+        deploy_or_check: criterion('A mechanical deploy or check with nothing to write.', {
+          notFor: 'A deploy that first needs a code fix (fix_failure).',
+          examples: ['deploy a clean, compiled draft', 'compile after the edit set closed'],
+        }),
+        exercise_live: criterion('Drive the deployed object and read the result.', {
+          notFor: 'Deploying it (deploy_or_check).',
+          examples: ['call the method the goal asked for', 'capture the deployed window'],
+        }),
+        report: criterion('Write the final done or fail report.', {
+          notFor: 'A progress note while work remains.',
+          examples: ['done after a verified deploy', 'fail with findings after a blocker'],
+        }),
       },
     },
   };
 
   private static readonly ADVISOR_QUESTIONS: Record<string, DecisionQuestion> = {
-    ready_to_edit: {
-      type: 'noul',
-      instructions: 'Has the agent already seen enough of the existing source to make the change `goal` asks for? `membersRead` lists the members it has read; `relevantMembers`, when present, lists the members the goal most likely touches.',
-    },
-    rereading: {
-      type: 'noul',
-      instructions: 'Is the agent re-reading source it has already seen (`recent`, `membersRead`) without a new question the read would answer?',
+    reading: {
+      type: 'choice',
+      instructions: instruction('After several read-only turns, where does the agent stand with the source it needs for `goal`?', {
+        focus: '`recent`, `membersRead`, and `relevantMembers` (the members the goal most likely touches, when known).',
+        notFor: 'Whether the eventual change will be correct; judge only whether more reading is needed.',
+      }),
+      criteria: {
+        ready: criterion('It has already seen the source the goal needs; the next step can be the change itself (or, for a question, the answer).', {
+          notFor: 'Having read only an outline, with the members the change touches still unread (still_learning).',
+          examples: ['every member the change touches has been read', 'the line a fix changes has been found'],
+        }),
+        rereading: criterion('It is re-reading source it has already seen, without a new question the read would answer.', {
+          notFor: 'Reading a member for the first time, or re-reading one an edit just changed.',
+          examples: ['the same handler read three times', 'overlapping line ranges of one member'],
+        }),
+        still_learning: criterion('It is still reading source it has not seen that the goal needs.', {
+          notFor: 'Going back over members already read (rereading).',
+          examples: ['following a call chain into a member not yet read'],
+        }),
+      },
     },
     endgame: {
       type: 'choice',
-      instructions: 'The agent has `stepsRemaining` steps left; up to `extensionsLeft` extensions of 10 steps may follow, granted only while the run shows progress. What should the remaining budget go to?',
+      instructions: instruction('With `stepsRemaining` steps left, what should the remaining budget go to?', {
+        focus: '`deployed`, `undeployed`, `exercisedSinceDeploy`, `visualSinceDeploy`, and `authorsUI`. Up to `extensionsLeft` extensions of 10 steps may follow, granted only while the run shows progress.',
+        notFor: 'How good the work is; judge only what the remaining steps should be spent on.',
+      }),
       criteria: {
-        keep_building: 'The change is still being written; continue authoring.',
-        deploy_now: 'Deploy the staged change now, leaving room to verify it.',
-        exercise_now: 'Drive the deployed object now: call a requested behavior and read the result.',
-        screenshot_now: 'Capture and inspect the deployed UI now.',
-        finish_now: 'The work is deployed and verified; write the final report now.',
+        keep_building: criterion('The change is still being written; continue authoring.', {
+          notFor: 'A finished change that only waits for a deploy (deploy_now).',
+          examples: ['members the goal needs are still missing'],
+        }),
+        deploy_now: criterion('Deploy the staged change now, leaving room to verify it.', {
+          notFor: 'A change already live with nothing new staged.',
+          examples: ['the edit is complete and compiles but is not live'],
+        }),
+        exercise_now: criterion('Drive the deployed object now: call a requested behavior and read the result.', {
+          notFor: 'An object that is not deployed yet (deploy_now).',
+          examples: ['deployed, and not exercised since'],
+        }),
+        screenshot_now: criterion('Capture and inspect the deployed UI now.', {
+          notFor: 'An object without a window.',
+          examples: ['a deployed, exercised window that was never captured'],
+        }),
+        finish_now: criterion('The work is deployed and verified; write the final report now.', {
+          notFor: 'Deployed but never exercised (exercise_now).',
+          examples: ['deployed, exercised, and its window inspected'],
+        }),
       },
     },
   };
 
-  private static readonly KIND_CRITERIA: Record<string, string> = {
-    create_new: 'Build a new object that does not exist yet.',
-    modify_existing: 'Change, fix, or extend an object that already exists.',
-    clone_variant: 'Make a copy or variant of an existing object under a new name, leaving the original as it is.',
-    investigate_only: 'Answer a question about an object (how it works, why it fails) with a written report; nothing is changed.',
-    compose: 'Combine several existing objects behind one interface.',
-  };
+  /**
+   * The one choice that decides a dispatched task's kind and, for a modify,
+   * its target: each listed object is its own modify option, so a single
+   * answer names both (rule: one choice decides each action).
+   */
+  private static taskQuestion(candidates: Array<{ name: string; description: string }>, givenTarget: string | undefined): DecisionQuestion {
+    const criteria: Record<string, Record<string, unknown>> = {
+      create_new: criterion('Build a new object that does not exist yet.', {
+        notFor: 'Changing or copying an object that already exists.',
+        examples: ['build a pomodoro timer', 'make a dashboard for a weather feed'],
+      }),
+    };
+    candidates.forEach((c, i) => { criteria[`modify_${i}`] = criterion(`Change, fix, or extend the existing object "${c.name}": ${c.description}`); });
+    criteria[givenTarget || candidates.length === 0 ? 'modify_existing' : 'modify_unlisted'] = givenTarget
+      ? criterion('Change, fix, or extend the given target object (`givenTarget`).', {
+        notFor: 'A copy of it under a new name (clone_variant), or a question about it (investigate_only).',
+        examples: ['fix the bug the task describes in it', 'add the requested feature to it'],
+      })
+      : criterion(candidates.length ? 'Change, fix, or extend an existing object that is not in this list.' : 'Change, fix, or extend an existing object.', {
+        notFor: candidates.length ? 'A listed object (choose its own option).' : 'Building a new object (create_new).',
+        examples: ['change how an existing service formats its replies'],
+      });
+    Object.assign(criteria, {
+      clone_variant: criterion('Make a copy or variant of an existing object under a new name, leaving the original as it is.', {
+        notFor: 'Changing the original itself.',
+        examples: ['a second clock with a dark theme', 'fork the notes app as a journal'],
+      }),
+      investigate_only: criterion('Answer a question about an object with a written report; nothing is changed.', {
+        notFor: 'A request to fix the thing the question is about.',
+        examples: ['why does the editor lag on large files?', 'how does the timer keep its state?'],
+      }),
+      compose: criterion('Combine several existing objects behind one interface.', {
+        notFor: 'One object that merely calls others as dependencies.',
+        examples: ['join a list view and a detail view into one app'],
+      }),
+    });
+    return {
+      type: 'choice',
+      instructions: instruction('What authoring work does `task` ask for, and on which object?', {
+        focus: 'The object `task` names or clearly describes, matched against the listed objects, and `givenTarget` when the dispatcher named one.',
+        notFor: 'A similar name alone: choose a listed object only when the task is about that object.',
+        examples: ['"make the fish in the aquarium swim faster" changes the listed aquarium', '"why does the clock lag?" asks a question'],
+      }),
+      criteria,
+    };
+  }
 
   /** Words too common to say what a goal is about, for the member prefilter. */
   private static readonly STOP_WORDS = new Set([
@@ -4129,7 +4243,13 @@ ${source}
     }
     const questions: Record<string, DecisionQuestion> = {};
     members.forEach((m, i) => {
-      questions[`m_${i}`] = { type: 'noul', instructions: `Will fulfilling \`goal\` most likely require editing or closely understanding \`members[${i}]\` (${m.name})?` };
+      questions[`m_${i}`] = {
+        type: 'noul',
+        instructions: instruction(`Will fulfilling \`goal\` most likely require editing or closely understanding \`members[${i}]\` (${m.name})?`, {
+          focus: 'Its signature, first lines, and `callsTo`, against what the goal changes.',
+          notFor: 'Members that are merely nearby or generally important, such as setup or lifecycle code the change leaves alone.',
+        }),
+      };
     });
     const outcome = await this.askDecision(site, {
       goal: state.goal.slice(0, 1500),
@@ -4175,9 +4295,11 @@ ${source}
 
   /**
    * The advisor (site object-creator.advisor, advise): after three read-only
-   * turns, has the agent read enough to edit, or is it re-reading? Under 30%
-   * of the step budget, what should the rest go to? Asked at most every third
-   * turn per trigger; its lines land in `memo.advice` for the renderer.
+   * turns, one choice says whether the agent is ready to act, re-reading, or
+   * still learning; under 30% of the step budget, one choice says what the
+   * rest should go to. Each answer drives at most one line on its own. Asked
+   * at most every third turn per trigger; its lines land in `memo.advice` for
+   * the renderer.
    */
   private async judgeAdvisor(extra: TaskExtra): Promise<void> {
     const site = 'object-creator.advisor';
@@ -4199,8 +4321,7 @@ ${source}
 
     const Q = ObjectCreator.ADVISOR_QUESTIONS;
     const questions: Record<string, DecisionQuestion> = {
-      ...(reading && state.kind !== 'investigate' ? { ready_to_edit: Q.ready_to_edit } : {}),
-      ...(reading ? { rereading: Q.rereading } : {}),
+      ...(reading ? { reading: Q.reading } : {}),
       ...(lowBudget ? { endgame: Q.endgame } : {}),
     };
     const relevantMembers = state.memberRelevance?.key === this.relevanceKey(state)
@@ -4230,17 +4351,20 @@ ${source}
     if (!outcome) return;
 
     const lines: string[] = [];
-    const ready = noulOf(outcome, 'ready_to_edit');
-    const rereading = noulOf(outcome, 'rereading');
+    const readingPick = choiceOf(outcome, 'reading');
     const endgame = choiceOf(outcome, 'endgame');
-    if (ready !== undefined && ready >= 0.75) {
-      const readRelevant = relevantMembers.length > 0 && relevantMembers.every(m => membersRead.includes(m));
-      lines.push(readRelevant
-        ? 'ADVISOR: you have read the members the goal most likely touches; the next step can be edit_source.'
-        : 'ADVISOR: you have likely seen enough of the source to make the change; the next step can be edit_source.');
-    }
-    if (rereading !== undefined && rereading >= 0.75) {
-      lines.push('ADVISOR: recent reads revisit source you have already seen. Act on what you have, or name the new question the next read answers.');
+    const readP = readingPick ? readingPick.probabilities[readingPick.choice] ?? 0 : 0;
+    if (readingPick && readP >= 0.75) {
+      if (readingPick.choice === 'ready') {
+        const readRelevant = relevantMembers.length > 0 && relevantMembers.every(m => membersRead.includes(m));
+        lines.push(state.kind === 'investigate'
+          ? 'ADVISOR: you have likely seen enough of the source to answer; the next step can be the report.'
+          : readRelevant
+            ? 'ADVISOR: you have read the members the goal most likely touches; the next step can be edit_source.'
+            : 'ADVISOR: you have likely seen enough of the source to make the change; the next step can be edit_source.');
+      } else if (readingPick.choice === 'rereading') {
+        lines.push('ADVISOR: recent reads revisit source you have already seen. Act on what you have, or name the new question the next read answers.');
+      }
     }
     const endP = endgame ? endgame.probabilities[endgame.choice] ?? 0 : 0;
     if (endgame && endP >= 0.75 && endgame.choice !== 'keep_building') {
@@ -4254,7 +4378,7 @@ ${source}
       };
       if (text[endgame.choice]) lines.push(`ADVISOR: about ${n} step${n === 1 ? '' : 's'} left; ${text[endgame.choice]}`);
     }
-    log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${turn} (${trigger}): ready_to_edit=${ready?.toFixed(2) ?? '-'} rereading=${rereading?.toFixed(2) ?? '-'} endgame=${endgame ? `${endgame.choice}@${endP.toFixed(2)}` : '-'} → ${lines.length} line(s)`);
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site} turn ${turn} (${trigger}): reading=${readingPick ? `${readingPick.choice}@${readP.toFixed(2)}` : '-'} endgame=${endgame ? `${endgame.choice}@${endP.toFixed(2)}` : '-'} → ${lines.length} line(s)`);
     if (lines.length) memo.advice = { turn, lines };
   }
 
@@ -4271,7 +4395,7 @@ ${source}
         if (typeof s.typeId !== 'string' || !s.typeId.includes('/user/') || seen.has(s.name)) continue;
         seen.add(s.name);
         out.push({ name: s.name, description: (s.description ?? '').slice(0, 120) });
-        if (out.length >= 254) break;
+        if (out.length >= 250) break; // with the five kind options, the choice stays within 255
       }
       return out;
     } catch {
@@ -4281,11 +4405,13 @@ ${source}
 
   /**
    * Judge an undeclared task's kind, and its target when none was given (site
-   * object-creator.kind), in one request at task start. Acting needs p ≥ 0.85
-   * and only ever moves toward what the task text says: to investigate, or to
-   * modify with a confidently named target. An explicit kind never reaches
-   * here, and an explicit target is never replaced. Other confident verdicts
-   * (p ≥ 0.6) become soft hints in the first observation.
+   * object-creator.kind), with one choice at task start whose options fold
+   * the target into the kind: create, modify each listed object, modify one
+   * not listed, clone, investigate, compose. Acting needs p ≥ 0.85 on the
+   * chosen option and only ever moves toward what the task text says: to
+   * investigate, or to modify the one listed object it names. An explicit
+   * kind never reaches here, and an explicit target is never replaced. Other
+   * confident answers (p ≥ 0.6) become one soft hint in the first observation.
    */
   private async judgeTaskKind(
     prompt: string,
@@ -4296,47 +4422,34 @@ ${source}
     const site = 'object-creator.kind';
     const out: { kind?: LoopState['kind']; target?: string; hints: string[] } = { hints: [] };
     if (await this.decisionSiteMode(site) === 'off') return out;
-    const questions: Record<string, DecisionQuestion> = {
-      task_kind: { type: 'choice', instructions: 'What kind of authoring work does `task` ask for?', criteria: ObjectCreator.KIND_CRITERIA },
-    };
     const candidates = givenTarget ? [] : await this.userObjectCandidates();
-    if (candidates.length > 0) {
-      const criteria: Record<string, string> = {};
-      candidates.forEach((c, i) => { criteria[`obj_${i}`] = `"${c.name}": ${c.description}`; });
-      criteria.none = 'None of these: the task builds something new, or concerns an object not listed.';
-      questions.target_object = { type: 'choice', instructions: 'Which existing object does `task` concern, if any?', criteria };
-    }
-    const outcome = await this.askDecision(site, { task: prompt.slice(0, 1500), givenTarget: givenTarget ?? null }, questions, { ...scope, timeoutMs: 15000 });
-    const kindPick = choiceOf(outcome, 'task_kind');
-    if (!outcome || !kindPick) return out;
-    const kp = kindPick.probabilities[kindPick.choice] ?? 0;
-    const targetPick = choiceOf(outcome, 'target_object');
-    const target = targetPick && targetPick.choice !== 'none' ? candidates[Number(targetPick.choice.slice(4))]?.name : undefined;
-    const tp = target ? targetPick!.probabilities[targetPick!.choice] ?? 0 : 0;
-    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: task_kind=${kindPick.choice}@${kp.toFixed(2)}${targetPick ? ` target=${target ?? 'none'}@${(targetPick.probabilities[targetPick.choice] ?? 0).toFixed(2)}` : ''} (dispatch inferred ${heuristic}${givenTarget ? ` with target ${givenTarget}` : ''})`);
-    const act = outcome.mode === 'act';
-    const confidentTarget = act && target && tp >= 0.85 ? target : undefined;
-    if (act && kp >= 0.85) {
-      if (kindPick.choice === 'investigate_only' && heuristic !== 'investigate') out.kind = 'investigate';
-      else if (kindPick.choice === 'modify_existing' && heuristic === 'create' && confidentTarget) out.kind = 'modify';
-    }
-    if (confidentTarget && (out.kind ?? heuristic) !== 'create') out.target = confidentTarget;
-    if (out.kind || out.target) log.info(`[${this.manifest.name}] Task judged ${out.kind ?? heuristic}${out.target ? ` of ${out.target}` : ''} (${site})`);
+    const outcome = await this.askDecision(site, { task: prompt.slice(0, 1500), givenTarget: givenTarget ?? null }, {
+      task: ObjectCreator.taskQuestion(candidates, givenTarget),
+    }, { ...scope, timeoutMs: 15000 });
+    const pick = choiceOf(outcome, 'task');
+    if (!outcome || !pick) return out;
+    const p = pick.probabilities[pick.choice] ?? 0;
+    const listed = /^modify_\d+$/.test(pick.choice) ? candidates[Number(pick.choice.slice(7))]?.name : undefined;
+    const fmt = (n: number): string => n.toFixed(2);
 
-    const effective = out.kind ?? heuristic;
-    const fmt = (p: number): string => p.toFixed(2);
-    if (target && !out.target && tp >= 0.6) out.hints.push(`Possible existing target: ${target} (p=${fmt(tp)}); load_target if right.`);
-    if (!out.kind && kp >= 0.6) {
-      if (kindPick.choice === 'investigate_only' && effective !== 'investigate') {
-        out.hints.push(`This task reads as a question to answer with a written report (p=${fmt(kp)}); if so, finish with done and the report, and leave the source as it is.`);
-      } else if (kindPick.choice === 'modify_existing' && effective === 'create' && !(target && tp >= 0.6)) {
-        out.hints.push(`This task reads as a change to an existing object (p=${fmt(kp)}); find it and load_target it before editing.`);
-      } else if (kindPick.choice === 'clone_variant') {
-        out.hints.push(`This task reads as a variant of an existing object (p=${fmt(kp)}); clone_object copies one server-side under a new name.`);
-      } else if (kindPick.choice === 'compose') {
-        out.hints.push(`This task reads as combining existing objects (p=${fmt(kp)}); compose_organism joins them behind one interface.`);
+    if (outcome.mode === 'act' && p >= 0.85) {
+      if (pick.choice === 'investigate_only' && heuristic !== 'investigate') out.kind = 'investigate';
+      else if (listed && heuristic === 'create') { out.kind = 'modify'; out.target = listed; }
+    }
+    if (!out.kind && p >= 0.6) {
+      if (listed && heuristic === 'create') {
+        out.hints.push(`Possible existing target: ${listed} (p=${fmt(p)}); load_target if right.`);
+      } else if (pick.choice === 'modify_unlisted' || (pick.choice === 'modify_existing' && !givenTarget && heuristic === 'create')) {
+        out.hints.push(`This task reads as a change to an existing object (p=${fmt(p)}); find it and load_target it before editing.`);
+      } else if (pick.choice === 'investigate_only' && heuristic !== 'investigate') {
+        out.hints.push(`This task reads as a question to answer with a written report (p=${fmt(p)}); if so, finish with done and the report, and leave the source as it is.`);
+      } else if (pick.choice === 'clone_variant') {
+        out.hints.push(`This task reads as a variant of an existing object (p=${fmt(p)}); clone_object copies one server-side under a new name.`);
+      } else if (pick.choice === 'compose') {
+        out.hints.push(`This task reads as combining existing objects (p=${fmt(p)}); compose_organism joins them behind one interface.`);
       }
     }
+    log.info(`[decision:${outcome.mode}] ObjectCreator ${site}: task=${listed ? `modify ${listed}` : pick.choice}@${fmt(p)} (dispatch inferred ${heuristic}${givenTarget ? ` with target ${givenTarget}` : ''}) → ${out.kind ? `${out.kind}${out.target ? ` of ${out.target}` : ''}` : out.hints.length ? 'hint' : 'unchanged'}`);
     return out;
   }
 
@@ -4377,11 +4490,22 @@ ${source}
     }
     if (drafts.length === 0) return;
     const shown = drafts.sort((a, b) => b.at - a.at).slice(0, 254).map(({ at: _at, ...d }) => d);
-    const criteria: Record<string, string> = {};
-    shown.forEach((d, i) => { criteria[`d_${i}`] = `\`drafts[${i}]\`: the draft saved for "${d.targetName ?? d.manifestName ?? 'an unnamed object'}" (${d.lines} lines)`; });
-    criteria.none = 'None: this task starts its own work rather than continuing a saved draft.';
+    const criteria: Record<string, Record<string, unknown>> = {};
+    shown.forEach((d, i) => { criteria[`d_${i}`] = criterion(`Continue \`drafts[${i}]\`, the draft saved for "${d.targetName ?? d.manifestName ?? 'an unnamed object'}" (${d.lines} lines).`); });
+    criteria.none = criterion('This task starts its own work rather than continuing a saved draft.', {
+      notFor: 'A task that finishes, fixes, or deploys earlier work on the same object.',
+      examples: ['build a second, unrelated object', 'answer a question about a live object'],
+    });
     const outcome = await this.askDecision(site, { task: state.goal.slice(0, 1500), drafts: shown }, {
-      draft: { type: 'choice', instructions: 'Earlier tasks in this goal saved the staged drafts in `drafts` when they ended before deploying. Which one does `task` continue?', criteria },
+      draft: {
+        type: 'choice',
+        instructions: instruction('Earlier tasks in this goal saved the staged drafts in `drafts` when they ended before deploying. Which one does `task` continue?', {
+          focus: 'The object `task` is about, against each draft\'s targetName and manifestName, and whether the task says to finish, fix, or deploy earlier work.',
+          notFor: 'A task about a different object, even one in the same goal.',
+          examples: ['"finish and deploy the aquarium" continues the aquarium draft', '"add a settings page to the clock" with only an aquarium draft saved continues none'],
+        }),
+        criteria,
+      },
     }, { ...scope, timeoutMs: 15000 });
     const pick = choiceOf(outcome, 'draft');
     if (!outcome || !pick) return;

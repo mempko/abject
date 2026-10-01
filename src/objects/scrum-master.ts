@@ -49,8 +49,8 @@ import { safeStringify } from '../core/format.js';
 import {
   deriveContractEdges, validateDataFlow, transitiveDependentCounts,
 } from '../core/task-graph.js';
-import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement, readReportVerdict } from '../core/claims.js';
-import { reportQuestions, interjectionQuestions, roundOutcomeQuestions } from '../core/decision-questions.js';
+import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement } from '../core/claims.js';
+import { resultKindQuestions, interjectionQuestions, roundOutcomeQuestions, DEFERRABLE_NOTES, criterion, instruction } from '../core/decision-questions.js';
 import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
 
 const log = new Log('ScrumMaster');
@@ -2169,56 +2169,60 @@ Rules:
     const goal = snap.data.goal as { title: string; description: string };
     const roster = (snap.data.team as Array<{ name: string; description: string }>).slice(0, 254);
     if (roster.length === 0) return undefined;
-    const owners: Record<string, string> = {};
-    for (const a of roster) owners[a.name] = a.description.slice(0, 600) || a.name;
-    owners.unclear = 'No roster description clearly covers the whole request.';
+    // One choice decides: each roster agent is an option meaning "this agent
+    // finishes the whole goal by itself in one task", described by its own
+    // live registration text; the rest are the reasons not to dispatch
+    // directly. Several agents can often each do it (an HTTP fetch, say), so
+    // the answer is read as "some agent, and which one leads": the agents'
+    // combined probability says one task is enough, the leader gets it. There
+    // is no "unclear" option: a vote spread across agents already says that,
+    // and such an option drew probability whenever descriptions overlapped.
+    const reserved = new Set(['several_tasks', 'already_satisfied', 'needs_user']);
+    const options: Record<string, Record<string, unknown>> = {};
+    // One choice takes at most 255 options; four are reserved below.
+    for (const a of roster.slice(0, 250)) {
+      if (reserved.has(a.name)) continue;
+      // Whole: what an agent refuses tends to come last in its description.
+      options[a.name] = criterion(`${a.name} can finish the whole goal by itself in one task. ${a.description.slice(0, 1500) || a.name}`, {
+        notFor: 'Work this description says the agent does not do, or work that also needs another agent.',
+      });
+    }
+    options.several_tasks = criterion('The goal needs several tasks: independent parts to combine, research that has to come first, handoffs between agents, or a separate verification.', {
+      notFor: 'One agent taking several steps inside a single task.',
+      examples: ['Research three competitors, then build a dashboard from the findings.'],
+    });
+    options.already_satisfied = criterion('The conversation or scratchpad already holds the answer.');
+    options.needs_user = criterion('Ambiguous in a way only the user can settle.');
     const questions: Record<string, DecisionQuestion> = {
-      shape: {
+      dispatch: {
         type: 'choice',
-        instructions: 'Classify how the work in `goal` splits into tasks. A task is one agent working until it is done: the steps it takes inside that task (reading, deciding, acting, checking) do not make separate tasks.',
-        criteria: {
-          one_task: 'One agent can carry the whole request to completion in a single task, however many steps that task takes inside.',
-          independent_parts: 'Two or more parts that separate tasks or agents can do without each other, then combine.',
-          research_then_build: 'A first task must discover facts before the real work can even be planned.',
-          coordinated_chain: 'Several tasks in sequence, handoffs between different agents, or a separate verification task by someone else.',
-          already_satisfied: 'The conversation or scratchpad already holds the answer.',
-          needs_user: 'Ambiguous in a way only the user can settle.',
-        },
-      },
-      owner: {
-        type: 'choice',
-        instructions: 'Pick the agent whose own description clearly covers the whole of `goal` right now. Judge only from these descriptions, and honour what a description says the agent does not do.',
-        criteria: owners,
-      },
-      needs_profile_or_target: {
-        type: 'noul',
-        instructions: 'Does `goal` depend on a specific named browser profile, login state, or existing object that has to be passed along explicitly?',
+        instructions: instruction('Which agent should finish `goal` in a single task? A task is one agent working until it is done; the steps it takes inside (reading, fetching, deciding, acting, checking) do not make separate tasks.', {
+          focus: 'Each agent\'s own description, including what it says it does not do. When several agents could each finish it, pick the one whose description fits best.',
+        }),
+        criteria: options,
       },
     };
     const outcome = await this.askDecision('scrum.quick-dispatch', {
       goal: { title: goal.title, description: goal.description.slice(0, 3000) },
       ...(snap.data.conversationContext ? { conversation: safeStringify(snap.data.conversationContext, 2000) } : {}),
     }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
-    const shape = choiceOf(outcome, 'shape');
-    const owner = choiceOf(outcome, 'owner');
-    if (!outcome || !shape || !owner) return undefined;
-    const shapeP = shape.probabilities.one_task ?? 0;
-    const ownerP = owner.probabilities[owner.choice] ?? 0;
-    const needsHint = noulOf(outcome, 'needs_profile_or_target') ?? 1;
-    const clear = shape.choice === 'one_task' && shapeP >= 0.85 && owner.choice !== 'unclear'
-      && ownerP >= 0.75 && owner.confidence >= 0.4 && needsHint < 0.3;
-    log.info(`[decision:${outcome.mode}] scrum.quick-dispatch ${goalId.slice(0, 8)}: shape=${shape.choice}@${(shape.probabilities[shape.choice] ?? 0).toFixed(2)} owner=${owner.choice}@${ownerP.toFixed(2)} needs_hint=${needsHint.toFixed(2)} clear=${clear}`);
+    const pick = choiceOf(outcome, 'dispatch');
+    if (!outcome || !pick) return undefined;
+    const agents = Object.entries(pick.probabilities).filter(([k]) => !reserved.has(k)).sort((a, b) => b[1] - a[1]);
+    const agentMass = agents.reduce((sum, [, q]) => sum + q, 0);
+    const [leader, leaderP] = agents[0] ?? ['', 0];
+    const clear = agentMass >= 0.8 && leaderP >= 0.45;
+    log.info(`[decision:${outcome.mode}] scrum.quick-dispatch ${goalId.slice(0, 8)}: ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)} one-agent=${agentMass.toFixed(2)} leader=${leader}@${leaderP.toFixed(2)} clear=${clear}`);
     if (outcome.mode === 'act' && clear) {
       // Claim the round-0 scrum so nothing else plans this goal; a failed
       // commit falls back to a full scrum (fallBackToFullScrum clears it).
       this.scrummedRounds.add(`${goalId}#0`);
-      await this.commitQuickDispatch(goalId, { agentName: owner.choice, task: goal.description }, `decided-quick-dispatch:${goalId}`);
+      await this.commitQuickDispatch(goalId, { agentName: leader, task: goal.description }, `decided-quick-dispatch:${goalId}`);
       return { dispatched: true };
     }
-    if (clear) return { dispatched: false, note: `Runtime check: this goal reads as one step that ${owner.choice} owns (p=${ownerP.toFixed(2)}); quick_dispatch fits unless the snapshot says otherwise.` };
-    if (owner.choice === 'unclear' || ownerP < 0.5) {
-      const top = Object.entries(owner.probabilities).filter(([k]) => k !== 'unclear').sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k);
-      return { dispatched: false, note: `Runtime check: no single roster description clearly owns this goal; if you poll, ${top.join(', ')} look most relevant.` };
+    if (agentMass >= 0.6 && leaderP >= 0.3) return { dispatched: false, note: `Runtime check: this goal reads as one task (p=${agentMass.toFixed(2)}) that ${agents.filter(([, q]) => q >= 0.2).map(([k]) => k).join(' or ')} can finish; quick_dispatch fits unless the snapshot says otherwise.` };
+    if (agentMass >= 0.6) {
+      return { dispatched: false, note: `Runtime check: no single roster description clearly owns this goal; if you poll, ${agents.slice(0, 3).map(([k]) => k).join(', ')} look most relevant.` };
     }
     return undefined;
   }
@@ -2253,17 +2257,17 @@ Rules:
       expected: safeStringify((data.recentPlans as Array<{ expectedObservations?: unknown }> | undefined)?.at(-1)?.expectedObservations ?? null, 1000),
     }, roundOutcomeQuestions(), { goalId, onBehalfOf: 'ScrumMaster' });
     const round = choiceOf(outcome, 'round_outcome');
-    const grounded = noulOf(outcome, 'results_grounded') ?? 0;
     if (!outcome || !round) return undefined;
     const p = round.probabilities[round.choice] ?? 0;
-    log.info(`[decision:${outcome.mode}] scrum.review ${goalId.slice(0, 8)} round ${scrumNumber}: ${round.choice}@${p.toFixed(2)} grounded=${grounded.toFixed(2)}`);
-    if (outcome.mode === 'act' && round.choice === 'satisfied' && p >= 0.9 && grounded >= 0.8) {
+    log.info(`[decision:${outcome.mode}] scrum.review ${goalId.slice(0, 8)} round ${scrumNumber}: ${round.choice}@${p.toFixed(2)}`);
+    // One reading decides: only "satisfied, with evidence" completes the goal.
+    if (outcome.mode === 'act' && round.choice === 'satisfied_with_evidence' && p >= 0.9) {
       this.scrummedRounds.add(`${goalId}#${scrumNumber}`);
       await this.commitCompleteGoal(goalId, {});
       return { completed: true };
     }
     if (p < 0.7) return undefined;
-    return { completed: false, note: `Runtime check: this round's results read as "${round.choice.replace(/_/g, ' ')}" (p=${p.toFixed(2)}; evidence cited: ${grounded >= 0.5 ? 'yes' : 'thin'}). Weigh that as you review.` };
+    return { completed: false, note: `Runtime check: this round's results read as "${round.choice.replace(/_/g, ' ')}" (p=${p.toFixed(2)}). Weigh that as you review.` };
   }
 
   /**
@@ -2272,30 +2276,33 @@ Rules:
    * unsupported claim or a partial result the shapes missed goes to review);
    * acting, it can also pass a plain answer the shapes misjudged.
    */
-  private async judgeOneShotResult(goalId: string, taskId: string, text: string, scratchpad: Record<string, unknown>): Promise<{ claim: boolean; bareAck: boolean }> {
+  private async judgeOneShotResult(goalId: string, taskId: string, text: string, scratchpad: Record<string, unknown>): Promise<{ claim: boolean; bareAck: boolean; report?: boolean }> {
     const shaped = { claim: looksLikeUngroundedClaim(text), bareAck: looksLikeBareAcknowledgement(text) };
     if (await this.decisionSiteMode('scrum.one-shot') === 'off') return shaped;
     const goal = await this.fetchGoalForSynthesis(goalId);
-    const questions: Record<string, DecisionQuestion> = {
-      ...reportQuestions(),
-      answers_goal: { type: 'noul', instructions: 'Would the person who asked `request` be satisfied reading only `text`?' },
-    };
     const outcome = await this.askDecision('scrum.one-shot', {
       request: goal ? `${goal.title}\n${(goal.description ?? '').slice(0, 1500)}` : '',
       text: text.slice(0, 4000),
       receipts: safeStringify(scratchpad[`verification/${taskId}`] ?? null, 1500),
-    }, questions, { goalId, onBehalfOf: 'ScrumMaster' });
-    const verdict = outcome ? readReportVerdict(outcome.answers as Parameters<typeof readReportVerdict>[0]) : undefined;
-    if (!outcome || !verdict) return shaped;
-    const answers = noulOf(outcome, 'answers_goal') ?? 0;
-    const partial = verdict.kind === 'partial_or_failure' && verdict.kindP >= 0.6;
-    const flaggedClaim = verdict.ungrounded || partial;
-    log.info(`[decision:${outcome.mode}] scrum.one-shot ${goalId.slice(0, 8)}: kind=${verdict.kind}@${verdict.kindP.toFixed(2)} answers_goal=${answers.toFixed(2)} shapes=${JSON.stringify(shaped)}`);
-    if (outcome.mode === 'advise') return { claim: shaped.claim || flaggedClaim, bareAck: shaped.bareAck || verdict.bareAck };
-    const solid = ['answer', 'grounded_action'].includes(verdict.kind) && verdict.kindP >= 0.75 && answers >= 0.7;
+    }, resultKindQuestions(), { goalId, onBehalfOf: 'ScrumMaster' });
+    const kind = choiceOf(outcome, 'result_kind');
+    if (!outcome || !kind) return shaped;
+    const p = kind.probabilities[kind.choice] ?? 0;
+    // One reading decides: a claim or a partial result goes to review, a
+    // solid answer passes as written, and anything else (a bare "done", a
+    // worker's report, a reading too unsure to call an answer) is composed
+    // into a reply. Composing costs one fast call and keeps the content, so
+    // doubt goes that way.
+    const flaggedClaim = ['unsupported_claim', 'partial_or_failure'].includes(kind.choice) && p >= 0.6;
+    const bareAck = kind.choice === 'bare_ack' && p >= 0.6;
+    const solid = ['answer', 'grounded_action'].includes(kind.choice) && p >= 0.75;
+    const report = !flaggedClaim && !bareAck && !solid;
+    log.info(`[decision:${outcome.mode}] scrum.one-shot ${goalId.slice(0, 8)}: ${kind.choice}@${p.toFixed(2)} shapes=${JSON.stringify(shaped)}`);
+    if (outcome.mode === 'advise') return { claim: shaped.claim || flaggedClaim, bareAck: shaped.bareAck || bareAck };
     return {
       claim: flaggedClaim || (shaped.claim && !solid),
-      bareAck: verdict.bareAck || (shaped.bareAck && !solid),
+      bareAck: bareAck || (shaped.bareAck && !solid),
+      report,
     };
   }
 
@@ -2326,20 +2333,21 @@ Rules:
       latest_plan: safeStringify(((goal.scratchpad?.['learning/plans'] as unknown[]) ?? []).at(-1) ?? null, 1000),
     }, interjectionQuestions(!!goal.pendingQuestion), { goalId, onBehalfOf: 'ScrumMaster' });
     const intent = choiceOf(outcome, 'intent');
-    const conflicts = noulOf(outcome, 'conflicts') ?? 1;
     if (!outcome || !intent) return undefined;
     const p = intent.probabilities[intent.choice] ?? 0;
-    log.info(`[decision:${outcome.mode}] scrum.interjection ${goalId.slice(0, 8)}: ${intent.choice}@${p.toFixed(2)} conflicts=${conflicts.toFixed(2)}`);
-    const benign = ['acknowledge', 'status', 'constraint'].includes(intent.choice) && p >= 0.85 && conflicts < 0.2;
+    log.info(`[decision:${outcome.mode}] scrum.interjection ${goalId.slice(0, 8)}: ${intent.choice}@${p.toFixed(2)}`);
+    // One reading decides: the deferrable kinds already mean "nothing in
+    // flight is wasted", so no separate conflict answer is combined in.
+    const benign = (DEFERRABLE_NOTES as readonly string[]).includes(intent.choice) && p >= 0.85;
     if (outcome.mode === 'act' && benign && inFlight.length > 0) {
-      const status = intent.choice === 'status'
+      const status = intent.choice === 'status_question'
         ? `Working on it: ${inFlight.slice(0, 3).map(t => t.description.slice(0, 80)).join('; ')}.`
         : 'Noted. The current work continues, and your note will be weighed at the next planning step.';
       await this.request(request(this.id, this.goalManagerId, 'reportGoalProgress', { goalId, message: status }), 10000).catch(() => { /* best effort */ });
       return { defer: true };
     }
     if (p < 0.7) return undefined;
-    return { defer: false, hint: `Runtime check: the pending note reads as "${intent.choice}" (p=${p.toFixed(2)}; conflicts with in-flight work: ${conflicts >= 0.5 ? 'likely' : 'unlikely'}).` };
+    return { defer: false, hint: `Runtime check: the pending note reads as "${intent.choice.replace(/_/g, ' ')}" (p=${p.toFixed(2)}).` };
   }
 
   /**
@@ -2356,7 +2364,10 @@ Rules:
       failed: failed.slice(-8).map(t => ({ description: String(t.fields.description ?? '').slice(0, 200), error: String(t.fields.error ?? '').slice(0, 300) })),
       recent_plans: safeStringify(((scratchpad['learning/plans'] as unknown[]) ?? []).slice(-3), 1500),
     }, {
-      repeating_failure: { type: 'noul', instructions: 'Do the rounds keep dispatching the same kind of task against the same target and failing the same way?' },
+      repeating_failure: { type: 'noul', instructions: instruction('Do the rounds keep dispatching the same kind of task against the same target and failing the same way?', {
+        notFor: 'Rounds that fail differently each time, or that each get further before failing; that is progress.',
+        examples: ['Yes: three rounds each "fix the import" and each fail with the same missing-module error.'],
+      }) },
     }, { goalId, onBehalfOf: 'ScrumMaster' });
     const p = noulOf(outcome, 'repeating_failure');
     if (!outcome || p === undefined) return undefined;
@@ -2384,7 +2395,9 @@ Rules:
     }, {
       difficulty: {
         type: 'score',
-        instructions: 'How hard is the planning decision this goal state presents?',
+        instructions: instruction('How hard is the planning decision this goal state presents?', {
+          notFor: 'How hard the goal\'s work is; a hard goal can still have an obvious next planning step.',
+        }),
         criteria: [
           'Obvious: complete, or retry a transient failure',
           'Routine planning',
@@ -2425,20 +2438,26 @@ Rules:
     // completeTask mirrors the agent's result to this scratchpad key.
     const mirrored = goal?.scratchpad?.[`tasks/${taskId}/result`];
     const text = mirrored === undefined ? '' : typeof mirrored === 'string' ? mirrored : safeStringify(mirrored, 4000);
-    const { claim, bareAck } = await this.judgeOneShotResult(goalId, taskId, text, goal?.scratchpad ?? {});
+    const { claim, bareAck, report } = await this.judgeOneShotResult(goalId, taskId, text, goal?.scratchpad ?? {});
     if (claim) return false;
 
     let result: unknown = mirrored;
     let resultText = text;
-    if (bareAck) {
-      const synthesis = await this.synthesizeCompletionText(goalId);
-      if (synthesis === ScrumMaster.SYNTHESIS_FALLBACK) {
+    if (bareAck || report) {
+      // A worker's report holds the answer but speaks to a coordinator; the
+      // same synthesis complete_goal uses turns it into the reply.
+      const synthesis = await this.synthesizeCompletionText(goalId, report
+        ? 'The task\'s result holds the answer but may be written for a coordinator. Reply to the user directly: lead with the answer to their question, keep the data that supports it, and leave out how it was fetched.'
+        : undefined);
+      if (synthesis !== ScrumMaster.SYNTHESIS_FALLBACK) {
+        log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was ${report ? 'not a direct reply' : `"${text.slice(0, 40)}"`}; synthesized the reply from the goal's data (${synthesis.length} chars)`);
+        result = synthesis;
+        resultText = synthesis;
+      } else if (bareAck) {
         log.warn(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" and synthesis was unavailable`);
         return false;
       }
-      log.info(`quick_dispatch goal ${goalId.slice(0, 8)}: task result was "${text.slice(0, 40)}" — synthesized the answer from the goal's data (${synthesis.length} chars)`);
-      result = synthesis;
-      resultText = synthesis;
+      // A report still answers the question: without a synthesis it ships as written.
     }
 
     await this.recordCompletionPlan(goalId, resultText);

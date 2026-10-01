@@ -41,7 +41,8 @@ import { makePattern, readPattern, serializePattern, PATTERN_FIELDS } from '../c
 import type { AgentAction, PredictionRecord } from './agent-abject.js';
 import { verificationRecordOf, renderVerificationRecord, type VerificationRecordEntry } from './scrum-master.js';
 import { learningFingerprint, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
-import { boundDecisionState, choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
+import { boundDecisionState, choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
+import { criterion, instruction } from '../core/decision-questions.js';
 import type { DecisionMode } from '../core/decision-sites.js';
 import { Log } from '../core/timed-log.js';
 
@@ -70,10 +71,8 @@ const GOAL_TRANSCRIPT_BUDGET = 40000;
 const MAX_PENDING_GOAL_REVIEWS = 5;
 
 // Decision-model thresholds (sites reviewer.*; see src/core/decision-sites.ts).
-/** reviewer.worth (act): a routine verdict this sure settles a review without the model pass... */
+/** reviewer.worth (act): a `routine` verdict this sure settles a review without the model pass. */
 const ROUTINE_MIN_P = 0.85;
-/** ...provided owner evidence is this unlikely to contradict injected knowledge. */
-const ROUTINE_MAX_CONFLICT = 0.2;
 /** reviewer.worth (act): the day's last review slots wait for reviews judged valuable. */
 const RESERVED_REVIEW_SLOTS = 6;
 /** Worth verdicts kept per goal, so a deferred review is not judged again on every drain. */
@@ -89,8 +88,8 @@ const AUTO_PATTERN_MIN_P = 0.85;
 /** Pattern applications judged in one reviewer.patterns request; filled per completion. */
 const MAX_JUDGED_APPLICATIONS = 24;
 const MAX_FILLED_APPLICATIONS = 12;
-/** reviewer.privacy (advise): a leak costs more than a false alarm, so warn early. */
-const PRIVACY_WARN_P = 0.5;
+/** reviewer.privacy (advise): warn unless `generic` is more likely than this; a leak costs more than a false alarm. */
+const PRIVACY_GENERIC_MIN_P = 0.5;
 /** reviewer.dedupe (act): a relation this sure turns a new entry away. */
 const DEDUPE_ACT_P = 0.85;
 
@@ -143,7 +142,8 @@ interface Judgment {
 interface ReviewJudgments {
   /** Keyed `<taskId>:<step>`. */
   predictions?: { mode: DecisionMode; byEpisode: Record<string, Judgment> };
-  fidelity?: { mode: DecisionMode; verdict: 'consistent' | 'misreported' | 'unverifiable'; p: number; staleFigure?: number; caveatDropped?: number; emulated: boolean; deterministic?: boolean };
+  /** `finding` is the chosen option (consistent, stale_figure, dropped_caveat, unsupported_claim); `verdict` is what GoalManager records. */
+  fidelity?: { mode: DecisionMode; verdict: 'consistent' | 'misreported' | 'unverifiable'; finding?: string; p: number; probabilities?: Record<string, number>; emulated: boolean; deterministic?: boolean };
   /** Keyed `<taskId>:<step>:<patternId>`. */
   patterns?: { mode: DecisionMode; byApplication: Record<string, Judgment> };
 }
@@ -151,15 +151,14 @@ interface ReviewJudgments {
 /** How much a finished goal or task could teach (site reviewer.worth). */
 interface WorthVerdict {
   mode: DecisionMode;
-  level: number;
-  /** Probability of `level`. */
-  levelP: number;
-  /** Probability of level 0 (routine success). */
+  /** The chosen option: routine, minor, or valuable. */
+  choice: string;
+  /** Probability of `choice`. */
+  p: number;
+  /** Probability of `routine`: alone it decides the routine settle. */
   routineP: number;
-  /** Probability of level 2 or above. */
-  highP: number;
-  /** Probability that owner evidence contradicts injected knowledge. */
-  conflict: number;
+  /** Probability of `valuable`: alone it decides priority and the reserved slots. */
+  valuableP: number;
   emulated: boolean;
   /** Deferred while the day's reserved slots wait for valuable reviews. */
   deferred?: boolean;
@@ -199,82 +198,145 @@ interface PendingGoalReview {
 }
 
 // ── Decision questions (file-local; shared ones live in src/core/decision-questions.ts) ──
+//
+// Written to the shared rules: every option says what it covers, what it
+// does not, and gives an example; and one choice decides each action, so a
+// threshold always reads a single option's probability.
 
-const WORTH_LEVELS = [
-  'Routine success: predictions evidently supported, no errors, no knowledge conflict',
-  'Minor errors, recovered easily',
-  'Contradicted predictions, retries, a failed goal, or claims about permissions or access',
-  'A misreported summary, or owner evidence contradicting injected knowledge',
-];
+/** reviewer.worth: one option per disposition of the review (settle as routine, review, review first). */
+const WORTH_OPTIONS: Record<string, string> = {
+  routine: 'routine success',
+  minor: 'minor errors, recovered',
+  valuable: 'something to learn',
+};
 
 function worthQuestions(): Record<string, DecisionQuestion> {
   return {
     learning_value: {
-      type: 'score',
-      instructions: 'How much could a learning review of this finished work teach the workspace? Judge from `goal`, `user_result`, `tasks`, `injected_knowledge` and `verification`.',
-      criteria: WORTH_LEVELS,
-    },
-    knowledge_conflict: {
-      type: 'noul',
-      instructions: 'Does owner evidence (task outcomes, errors, verification receipts) contradict any claim named in `injected_knowledge`?',
+      type: 'choice',
+      instructions: instruction('How much could a learning review of this finished work teach the workspace?', {
+        focus: 'Judge from `goal`, `user_result`, `tasks` (their contradicted predictions, failed actions and retries), `injected_knowledge` and `verification`. Owner evidence such as task outcomes, errors and verification receipts outranks what a task says about itself.',
+        notFor: 'How long or hard the work was: a long goal that went exactly as predicted is still routine.',
+      }),
+      criteria: {
+        routine: criterion('A routine success: the recorded predictions evidently held, no action failed, the user-facing result matches the verification record, and the owner evidence agrees with the injected knowledge.', {
+          notFor: 'Work that needed retries or recovered from errors (minor or valuable), or a success whose evidence disputes an injected knowledge claim (valuable).',
+          examples: ['Three tasks, every prediction held, the tests ran once and passed, and the summary quotes that run.'],
+        }),
+        minor: criterion('Small errors the work recovered from easily, with the predictions otherwise holding and the injected knowledge undisputed.', {
+          notFor: 'The same step failing repeatedly, a failed goal, or claims about permissions or access (valuable).',
+          examples: ['A typo in a command, fixed on the next step.', 'One timeout, retried once and then fine.'],
+        }),
+        valuable: criterion('Something worth learning: a contradicted prediction, repeated retries, a failed goal, a claim about permissions or access, owner evidence that contradicts an injected knowledge claim, or a user-facing result that misreports the record.', {
+          notFor: 'A single slip recovered on the next step (minor).',
+          examples: ['The knowledge said the project has no test suite, and the verification ran 198 tests.', 'The summary quotes 285 passing while the newest run counted 290.'],
+        }),
+      },
     },
   };
 }
 
-/** One choice per episode, in GoalManager's assessment vocabulary. */
+/** reviewer.predictions: GoalManager's assessment vocabulary, shared by every episode's question. */
+const PREDICTION_CRITERIA = {
+  supported: criterion('Every material claim in the prediction is borne out by the observed result.', {
+    notFor: 'An operation that succeeded while a material claim went unchecked (unresolved).',
+    examples: ['Expected "the tests pass"; the output shows exit 0 and "12 passed".', 'Expected "no matches"; the search over the intended path exited 1 with empty output.'],
+  }),
+  contradicted: criterion('The observed result disproves at least one material claim in the prediction.', {
+    notFor: 'A non-zero exit that is the command\'s ordinary way of reporting the predicted finding (that can be supported).',
+    examples: ['Expected "the files are identical"; the diff prints differences.', 'Expected "all tests pass"; the output shows 2 failed.'],
+  }),
+  unresolved: criterion('The observation is missing, cut off where it matters, or silent on a material claim, and nothing in it disproves the prediction.', {
+    notFor: 'A prediction the visible output already disproves (contradicted).',
+    examples: ['The output stops before the summary line the prediction is about.'],
+  }),
+};
+
 function reviewPredictionQuestions(count: number): Record<string, DecisionQuestion> {
   const out: Record<string, DecisionQuestion> = {};
   for (let i = 0; i < count; i++) {
     out[`q_${i}`] = {
       type: 'choice',
-      instructions: `Before acting, an agent stated \`episodes[${i}].expect\`. Judge its material claims against the observed \`episodes[${i}].actual\`, reading the result by the operation's own semantics: a diff that finds differences or a search with no matches can exit non-zero as an ordinary finding, and exit 0 can still hide skipped or partial work. Judge the prediction, not whether the operation succeeded. \`prior\`, when present, is an earlier automated judgment of the same step; weigh it, and let the evidence decide.`,
-      criteria: {
-        supported: 'Every material claim in the prediction is borne out by the observed result.',
-        contradicted: 'The observed result disproves a material claim in the prediction.',
-        unresolved: 'The observation is missing, truncated where it matters, or silent on a material claim, and nothing in it disproves the prediction.',
-      },
+      instructions: instruction(`Do the observed results in \`episodes[${i}].actual\` bear out the material claims in \`episodes[${i}].expect\`?`, {
+        focus: 'Read the result by the operation\'s own semantics: a diff that finds differences or a search with no matches can exit non-zero as an ordinary finding, and exit 0 can still hide skipped or partial work. `prior`, when present, is an earlier automated judgment of the same step; weigh it against the evidence.',
+        notFor: 'Whether the operation succeeded: an expected rejection can support a prediction, and a successful call can contradict one.',
+      }),
+      criteria: PREDICTION_CRITERIA,
     };
   }
   return out;
 }
 
+/** reviewer.fidelity: every way a summary can misreport is its own option, so one answer names the finding. */
+const FIDELITY_FINDINGS: Record<string, string> = {
+  consistent: 'its figures and caveats match the newest verification record',
+  stale_figure: 'it quotes a figure from an older run rather than the newest',
+  dropped_caveat: 'it drops a caveat a task reported',
+  unsupported_claim: 'it states a figure or claim the record contradicts or does not support',
+};
+
 function fidelityQuestions(): Record<string, DecisionQuestion> {
   return {
     fidelity: {
       type: 'choice',
-      instructions: '`user_result` is what the user was told. `receipts` are the recorded verification runs, newest first; `task_reports` are what each task reported. Judge whether the user-facing result is faithful to that record.',
+      instructions: instruction('Is the user-facing result (`user_result`) faithful to the verification record?', {
+        focus: '`receipts` are the recorded verification runs, newest first; `task_reports` are what each task reported, including what it did not cover, run, or verify. Compare every test or check figure and every caveat.',
+        notFor: 'Whether the work itself succeeded: a faithful summary of a failing run is consistent.',
+      }),
       criteria: {
-        consistent: 'Every test or check figure in `user_result` matches the NEWEST receipt, and the caveats the tasks reported (what they did not cover, run, or verify) survive into it.',
-        misreported: 'A figure or claim in `user_result` is contradicted or unsupported by the receipts, or a caveat a task reported was dropped.',
+        consistent: criterion('Every test or check figure in the result matches the newest receipt, every claim is supported by the record, and the caveats the tasks reported survive into it.', {
+          notFor: 'A result that leaves out a reported caveat (dropped_caveat) or quotes an older run (stale_figure).',
+          examples: ['The newest run passed 12 of 12 and the result says "all 12 tests pass".'],
+        }),
+        stale_figure: criterion('The result quotes a test or check figure that matches an older receipt rather than the newest one.', {
+          notFor: 'A count a task report gives for a partial run of its own, such as a single test file (consistent).',
+          examples: ['The result says 285 passing; an earlier run counted 285 and the newest counted 290.'],
+        }),
+        dropped_caveat: criterion('A caveat a task reported, something it did not cover, run, or verify, is missing from the result.', {
+          notFor: 'A caveat the result restates in other words (consistent).',
+          examples: ['A task said lint was not run; the result says "everything checks out".'],
+        }),
+        unsupported_claim: criterion('The result states a figure, effect, or check that the receipts and task reports contradict or do not support.', {
+          notFor: 'An older figure that an earlier receipt does show (stale_figure).',
+          examples: ['The result says the deploy was verified; no receipt or task report shows a deploy check.'],
+        }),
       },
-    },
-    stale_figure: {
-      type: 'noul',
-      instructions: 'Does `user_result` quote a test or check figure that matches an older receipt rather than the newest one?',
-    },
-    caveat_dropped: {
-      type: 'noul',
-      instructions: 'Did a caveat from `task_reports` (something a task did not cover, run, or verify) disappear from `user_result`?',
     },
   };
 }
+
+/** reviewer.patterns: one choice per declared application. */
+const PATTERN_CRITERIA = {
+  helpful: criterion('Following the pattern\'s Therefore is what made this step or the goal go better.', {
+    notFor: 'A step that went well for reasons unrelated to the pattern, or where the pattern was only mentioned (inconclusive).',
+    examples: ['The pattern said to gather data before judging; the gathered data exposed the real cause and the fix held.'],
+  }),
+  harmful: criterion('Following the Therefore contributed to a failure or a wasted detour.', {
+    notFor: 'A failure with an unrelated cause, such as an outage (inconclusive).',
+    examples: ['The pattern said to retry with backoff; the retries hid a permanent permission error until the budget ran out.'],
+  }),
+  inconclusive: criterion('The pattern was followed, but its benefit or harm cannot be separated from other causes.', {
+    notFor: 'A clear causal link in either direction (helpful or harmful).',
+    examples: ['The step succeeded, and would likely have succeeded without the pattern too.'],
+  }),
+};
 
 function patternQuestions(count: number): Record<string, DecisionQuestion> {
   const out: Record<string, DecisionQuestion> = {};
   for (let i = 0; i < count; i++) {
     out[`a_${i}`] = {
       type: 'choice',
-      instructions: `\`applications[${i}]\` records that an agent followed \`applications[${i}].pattern\` at one step, for the reason in \`why\`. From its \`episode\`, its task outcome and \`goal_outcome\`, what did following the pattern's \`therefore\` do?`,
-      criteria: {
-        helpful: 'The outcome benefited because the Therefore was followed.',
-        harmful: 'Following the Therefore contributed to a failure.',
-        inconclusive: 'It was followed, but its benefit or harm cannot be separated from other causes.',
-      },
+      instructions: instruction(`What did following \`applications[${i}].pattern\` (its \`therefore\`) do at this step?`, {
+        focus: 'Use the agent\'s stated reason in `why`, the step\'s `episode`, its task outcome and `goal_outcome`.',
+        notFor: 'Whether the pattern is good advice in general: judge this one application.',
+      }),
+      criteria: PATTERN_CRITERIA,
     };
   }
   return out;
 }
 
+/** reviewer.privacy: `generic` or the most prominent kind of workspace detail, in one answer. */
 const DETAIL_KINDS: Record<string, string> = {
   personal_name: 'a person\'s name',
   email_address: 'an email address',
@@ -287,22 +349,38 @@ const DETAIL_KINDS: Record<string, string> = {
 
 function privacyQuestions(): Record<string, DecisionQuestion> {
   return {
-    workspace_specific_detail: {
-      type: 'noul',
-      instructions: 'Does `skill` (its name, description, or instructions) carry details specific to one workspace or person: names, email addresses, account ids, absolute file paths, hostnames, or tokens? Generic placeholders such as <user> or ~/project do not count.',
+    skill_content: {
+      type: 'choice',
+      instructions: instruction('Does `skill` (its name, description, or instructions) carry a detail specific to one workspace or person, and if so, which kind is most prominent?', {
+        focus: 'Skills travel beyond the workspace they were written in, so any concrete personal or workspace value counts.',
+        notFor: 'Generic placeholders such as <user>, <host> or ~/project, and well-known public tools or sites.',
+      }),
+      criteria: {
+        generic: criterion('Generic throughout: no names, addresses, accounts, paths, hosts, or secrets of a particular person or workspace.', {
+          notFor: 'A placeholder that still carries one concrete value (choose that value\'s kind).',
+          examples: ['"Run the project\'s test command, then read the summary line."'],
+        }),
+        personal_name: criterion('A real person\'s name.', { notFor: 'A tool, product, or role name.', examples: ['"Ask Dana before deploying."'] }),
+        email_address: criterion('An email address.', { notFor: 'A description of where mail goes, such as "the team inbox".', examples: ['"Send the report to ops@example.org."'] }),
+        account_or_id: criterion('An account name, user id, customer id, or similar identifier.', { notFor: 'A generic role such as "the admin account".', examples: ['"Log in as acct-48213."'] }),
+        absolute_path: criterion('An absolute or home-directory file path on one machine.', { notFor: 'A relative path inside a project, such as src/index.ts.', examples: ['"/home/sam/projects/site/build.sh"'] }),
+        host_or_url: criterion('A specific hostname, IP address, or private URL.', { notFor: 'A public, well-known site such as a package registry.', examples: ['"ssh deploy@10.0.0.5"', '"https://intranet.corp.local/wiki"'] }),
+        secret_or_token: criterion('A password, API key, token, or other secret.', { notFor: 'The name of an environment variable without its value.', examples: ['"export API_KEY=sk-live-..."'] }),
+        other_detail: criterion('Some other value specific to this workspace or person.', { notFor: 'Any of the kinds above (choose that kind).', examples: ['A private project codename.'] }),
+      },
     },
+    // Decides only its own advice line, never the warning.
     generic_multistep_procedure: {
       type: 'noul',
-      instructions: 'Is `skill` a reusable, generic procedure of several steps that other tasks could follow as written?',
-    },
-    detail_kind: {
-      type: 'choice',
-      instructions: 'If `skill` carries a workspace-specific detail, which kind is the most prominent?',
-      criteria: Object.fromEntries(Object.keys(DETAIL_KINDS).map(k => [k, `It includes ${DETAIL_KINDS[k]}.`])),
+      instructions: instruction('Is `skill` a reusable procedure of several steps that other tasks could follow as written?', {
+        notFor: 'A record of what one task did, or a single fact.',
+        examples: ['Reusable: "1. Find the config. 2. Validate it. 3. Apply it and read back the result."'],
+      }),
     },
   };
 }
 
+/** reviewer.dedupe: `relation` alone decides whether a save is turned away; `entry_kind` only adds advice. */
 const ENTRY_KIND_ADVICE: Record<string, string> = {
   route_procedure: 'save what holds true (what a thing is, what it exposes, what its output means) and leave the route to the task',
   goal_specific_scratchpad: 'the goal scratchpad already keeps goal-specific findings; the knowledge base keeps lessons that outlive the goal',
@@ -310,26 +388,52 @@ const ENTRY_KIND_ADVICE: Record<string, string> = {
 };
 
 function dedupeQuestions(count: number): Record<string, DecisionQuestion> {
-  const relation: Record<string, string> = {};
+  const relation: Record<string, ReturnType<typeof criterion>> = {};
   for (let i = 0; i < count; i++) {
-    relation[`duplicate_of_${i}`] = `Says what \`existing[${i}]\` already says: saving it would add a second copy.`;
-    relation[`refines_${i}`] = `Corrects, narrows, or extends \`existing[${i}]\`: that entry could absorb it.`;
+    relation[`duplicate_of_${i}`] = criterion(`\`new_entry\` says what \`existing[${i}]\` already says, so saving it adds a second copy.`, {
+      notFor: `An entry that corrects, narrows, or adds to \`existing[${i}]\` (refines_${i}).`,
+      examples: ['Both say the project\'s tests run with one command and report a pass count.'],
+    });
+    relation[`refines_${i}`] = criterion(`\`new_entry\` corrects, narrows, or extends \`existing[${i}]\`, so that entry could absorb it.`, {
+      notFor: `A restatement with nothing new (duplicate_of_${i}), or a different subject that only shares words (new).`,
+      examples: ['The existing entry says a check is slow; the new one says it is slow only on its first run.'],
+    });
   }
-  relation.new = 'Covers something none of `existing` holds.';
+  relation.new = criterion('`new_entry` covers something none of `existing` holds.', {
+    notFor: 'A subject an existing entry already covers, even in other words.',
+    examples: ['The existing entries describe the test command; the new one describes the deploy step.'],
+  });
   return {
     relation: {
       type: 'choice',
-      instructions: 'How does `new_entry` relate to the entries already in the knowledge base (`existing`)?',
+      instructions: instruction('How does `new_entry` relate to the entries already in the knowledge base (`existing`)?', {
+        focus: 'Compare the claims, not the wording.',
+        notFor: 'Which entry is better written.',
+      }),
       criteria: relation,
     },
     entry_kind: {
       type: 'choice',
-      instructions: 'What kind of knowledge is `new_entry`?',
+      instructions: instruction('What kind of knowledge is `new_entry`?', {
+        focus: 'Judge by whether it will still be true and useful after this goal ends.',
+      }),
       criteria: {
-        durable_fact_or_constraint: 'A durable fact about the system, a tool, or a constraint that holds beyond this goal.',
-        route_procedure: 'The route one task took (which steps to run for a kind of question) rather than what is true.',
-        goal_specific_scratchpad: 'Findings or intermediate data specific to one goal.',
-        user_profile_fact: 'A fact about the user: a preference, a detail, or a habit.',
+        durable_fact_or_constraint: criterion('A durable fact about the system, a tool, or a constraint that holds beyond this goal.', {
+          notFor: 'The steps one task took to answer a question (route_procedure).',
+          examples: ['"The test command exits 1 when any test fails and prints a summary line."'],
+        }),
+        route_procedure: criterion('The route one task took, which steps to run for a kind of question, rather than what is true.', {
+          notFor: 'A description of what a tool exposes or what its output means (durable_fact_or_constraint).',
+          examples: ['"For failure questions, open the log, search for ERROR, then check the config."'],
+        }),
+        goal_specific_scratchpad: criterion('Findings or intermediate data that matter only to one goal.', {
+          notFor: 'A lesson that will help later goals (durable_fact_or_constraint).',
+          examples: ['"The three files changed in this fix were a, b and c."'],
+        }),
+        user_profile_fact: criterion('A fact about the user: a preference, a detail, or a habit.', {
+          notFor: 'A fact about the system or a tool.',
+          examples: ['"The user prefers short summaries."'],
+        }),
       },
     },
   };
@@ -1256,7 +1360,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const worthState = () => this.worthState(all, { title: goal?.title, outcome: review.outcome, detail: review.detail, userResult }, verification);
     const subject = `goal ${review.goalId.slice(0, 8)}`;
     let worth = this.inReserveZone() ? await this.judgeWorth(review.goalId, worthState) : undefined;
-    if (worth?.mode === 'act' && worth.highP < 0.5 && !this.routineVerdict(worth, failed)) {
+    if (worth?.mode === 'act' && worth.valuableP < 0.5 && !this.routineVerdict(worth, failed)) {
       this.markDeferred(review.goalId);
       this.logWorth(subject, worth, 'defer');
       return;
@@ -1349,7 +1453,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private sortByWorth<T extends { goalId: string }>(reviews: T[]): T[] {
     const rank = (goalId: string): number => {
       const w = this.worthByGoal.get(goalId);
-      return !w ? 1 : w.highP >= 0.5 ? 2 : w.deferred ? 0 : 1;
+      return !w ? 1 : w.valuableP >= 0.5 ? 2 : w.deferred ? 0 : 1;
     };
     return reviews.sort((a, b) => rank(b.goalId) - rank(a.goalId));
   }
@@ -1387,16 +1491,12 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const cached = goalId ? this.worthByGoal.get(goalId) : undefined;
     if (cached) return { ...cached, mode };
     const outcome = await this.askDecision('reviewer.worth', boundDecisionState(state()), worthQuestions(), this.decisionScope(goalId));
-    const score = scoreOf(outcome, 'learning_value');
-    if (!outcome || !score) return undefined;
-    const pr = score.probabilities;
-    const level = topLevel(score);
+    const answer = choiceOf(outcome, 'learning_value');
+    if (!outcome || !answer) return undefined;
+    const pr = answer.probabilities;
     const verdict: WorthVerdict = {
-      mode: outcome.mode, level, levelP: pr[String(level)] ?? 0, routineP: pr['0'] ?? 0,
-      highP: (pr['2'] ?? 0) + (pr['3'] ?? 0),
-      // Unanswered, a conflict is assumed: the routine shortcut needs a clear no.
-      conflict: noulOf(outcome, 'knowledge_conflict') ?? 1,
-      emulated: outcome.emulated,
+      mode: outcome.mode, choice: answer.choice, p: pr[answer.choice] ?? 0,
+      routineP: pr.routine ?? 0, valuableP: pr.valuable ?? 0, emulated: outcome.emulated,
     };
     if (goalId) {
       this.worthByGoal.set(goalId, verdict);
@@ -1405,18 +1505,24 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return verdict;
   }
 
-  /** A routine verdict sure enough to settle a review without the model pass. */
+  /**
+   * A `routine` verdict sure enough to settle a review without the model
+   * pass. The one option already excludes conflicts with injected knowledge
+   * and misreported summaries. A sibling site that found trouble on its own
+   * evidence (a contradicted prediction, a misreported summary) still keeps
+   * the full review: those are separate decisions, each by its own answer,
+   * and they can only add a review, never skip one.
+   */
   private routineVerdict(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): boolean {
-    if (failed || worth.routineP < ROUTINE_MIN_P || worth.conflict >= ROUTINE_MAX_CONFLICT) return false;
-    // Sibling judgments that already see trouble keep the full review.
+    if (failed || worth.routineP < ROUTINE_MIN_P) return false;
     const f = judgments?.fidelity;
-    if (f && !f.deterministic && f.verdict === 'misreported' && f.p >= 0.5) return false;
-    return !Object.values(judgments?.predictions?.byEpisode ?? {}).some(j => (j.probabilities.contradicted ?? 0) >= 0.5);
+    if (f && !f.deterministic && f.verdict === 'misreported') return false;
+    return !Object.values(judgments?.predictions?.byEpisode ?? {}).some(j => j.choice === 'contradicted' && j.p >= 0.5);
   }
 
   private worthPlan(worth: WorthVerdict, failed: boolean, judgments?: ReviewJudgments): 'routine' | 'defer' | 'priority' | 'review' {
     if (this.routineVerdict(worth, failed, judgments)) return 'routine';
-    if (worth.highP >= 0.5) return 'priority';
+    if (worth.valuableP >= 0.5) return 'priority';
     return this.inReserveZone() ? 'defer' : 'review';
   }
 
@@ -1427,7 +1533,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       priority: 'review ahead of routine work',
       review: 'review',
     }[plan];
-    log.info(`[decision:${worth.mode}] reviewer.worth ${subject}: level ${worth.level}@${fmtP(worth.levelP)} routine=${fmtP(worth.routineP)} conflict=${fmtP(worth.conflict)}; ${worth.mode === 'act' ? what : `would ${what}`}`);
+    log.info(`[decision:${worth.mode}] reviewer.worth ${subject}: ${worth.choice}@${fmtP(worth.p)} routine=${fmtP(worth.routineP)} valuable=${fmtP(worth.valuableP)}; ${worth.mode === 'act' ? what : `would ${what}`}`);
   }
 
   /**
@@ -1447,8 +1553,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const report = this.learningReport(extra);
       await this.request(request(this.id, this.goalManagerId!, 'ackReview', { goalId: review.goalId, report: {
         ...report,
-        routine: { level: worth.level, p: worth.routineP, knowledgeConflict: worth.conflict, emulated: worth.emulated },
-        summary: `Routine: settled without the full learning review (${provenance({ p: worth.routineP, emulated: worth.emulated })}; knowledge conflict p=${fmtP(worth.conflict)}). ${report.summary}`,
+        routine: { p: worth.routineP, emulated: worth.emulated },
+        summary: `Routine: settled without the full learning review (${provenance({ p: worth.routineP, emulated: worth.emulated })}). ${report.summary}`,
       } }), 10000);
       for (const taskId of reviewedTaskIds) this.send(request(this.id, this.agentAbjectId!, 'releaseTask', { taskId }));
       this.changed('reviewCompleted', { kind: 'review', routine: true });
@@ -1525,11 +1631,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     };
     const outcome = await this.askDecision('reviewer.fidelity', boundDecisionState(state), fidelityQuestions(), this.decisionScope(goalId));
     const answer = choiceOf(outcome, 'fidelity');
-    if (!outcome || !answer || (answer.choice !== 'consistent' && answer.choice !== 'misreported')) return undefined;
-    const judged = { mode: outcome.mode, verdict: answer.choice, p: answer.probabilities[answer.choice] ?? 0,
-      staleFigure: noulOf(outcome, 'stale_figure'), caveatDropped: noulOf(outcome, 'caveat_dropped'), emulated: outcome.emulated } as const;
-    const line = `reviewer.fidelity goal ${goalId.slice(0, 8)}: ${judged.verdict}@${fmtP(judged.p)} stale_figure=${fmtP(judged.staleFigure)} caveat_dropped=${fmtP(judged.caveatDropped)}`;
-    if (outcome.mode === 'act' && judged.verdict === 'misreported' && judged.p >= AUTO_FIDELITY_MIN_P) log.warn(`[decision:act] ${line}: the user-facing summary looks misreported`);
+    if (!outcome || !answer || !(answer.choice in FIDELITY_FINDINGS)) return undefined;
+    const judged: NonNullable<ReviewJudgments['fidelity']> = { mode: outcome.mode, verdict: answer.choice === 'consistent' ? 'consistent' : 'misreported',
+      finding: answer.choice, p: answer.probabilities[answer.choice] ?? 0, probabilities: answer.probabilities, emulated: outcome.emulated };
+    const line = `reviewer.fidelity goal ${goalId.slice(0, 8)}: ${answer.choice}@${fmtP(judged.p)}`;
+    if (outcome.mode === 'act' && judged.verdict === 'misreported' && judged.p >= AUTO_FIDELITY_MIN_P) log.warn(`[decision:act] ${line}: the user-facing summary looks misreported (${FIDELITY_FINDINGS[answer.choice]})`);
     else log.info(`[decision:${outcome.mode}] ${line}`);
     return judged;
   }
@@ -1614,7 +1720,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!f || f.mode !== 'act' || extra.summaryFidelityRecorded || (!f.deterministic && f.p < AUTO_FIDELITY_MIN_P)) return;
     const explanation = f.deterministic
       ? 'Automated assessment (rule): no verification record or user-facing result to compare.'
-      : `Automated assessment (${provenance(f)}; stale figure p=${fmtP(f.staleFigure)}, dropped caveat p=${fmtP(f.caveatDropped)}).`;
+      : `Automated assessment (${provenance(f)}): ${FIDELITY_FINDINGS[f.finding ?? f.verdict] ?? f.verdict}.`;
     await this.recordSummaryFidelity(extra, { verdict: f.verdict, explanation });
   }
 
@@ -1658,14 +1764,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     let emulated = false;
     if (worth) {
       emulated ||= worth.emulated;
-      lines.push(`- Learning value: level ${worth.level} of ${WORTH_LEVELS.length - 1} (${WORTH_LEVELS[worth.level] ?? '?'}), p=${fmtP(worth.levelP)}; owner evidence contradicting injected knowledge p=${fmtP(worth.conflict)}.`);
+      lines.push(`- Learning value: ${WORTH_OPTIONS[worth.choice] ?? worth.choice} p=${fmtP(worth.p)} (routine ${fmtP(worth.routineP)}, valuable ${fmtP(worth.valuableP)}).`);
     }
     const f = judgments?.fidelity;
     if (f) {
       emulated ||= f.emulated;
       lines.push(f.deterministic
         ? '- Summary fidelity: unverifiable (no verification record or user-facing result to compare).'
-        : `- Summary fidelity: ${f.verdict} p=${fmtP(f.p)} (a stale figure p=${fmtP(f.staleFigure)}, a dropped caveat p=${fmtP(f.caveatDropped)}).`);
+        : `- Summary fidelity: ${f.finding ?? f.verdict} p=${fmtP(f.p)}, ${FIDELITY_FINDINGS[f.finding ?? ''] ?? f.verdict} (${Object.entries(f.probabilities ?? {}).map(([k, v]) => `${k} ${fmtP(v)}`).join(', ')}).`);
     }
     const preds = judgments?.predictions;
     if (preds) {
@@ -1765,17 +1871,20 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const outcome = await this.askDecision('reviewer.privacy', boundDecisionState({
       skill: { name: skill.name, description: clipText(skill.description, 600), instructions: clipText(skill.instructions, 12000) },
     }), privacyQuestions(), this.decisionScope(scope.goalId, scope.taskId));
-    const detail = noulOf(outcome, 'workspace_specific_detail');
-    if (!outcome || detail === undefined) return undefined;
-    const generic = noulOf(outcome, 'generic_multistep_procedure');
-    const kind = choiceOf(outcome, 'detail_kind');
-    log.info(`[decision:${outcome.mode}] reviewer.privacy skill "${skill.name}": workspace_specific_detail=${fmtP(detail)} kind=${kind?.choice ?? '?'} generic=${fmtP(generic)}`);
+    const content = choiceOf(outcome, 'skill_content');
+    if (!outcome || !content) return undefined;
+    const procedure = noulOf(outcome, 'generic_multistep_procedure');
+    // The warning reads one option: `generic`. The kind it names is the most
+    // likely of the other options in the same answer.
+    const genericP = content.probabilities.generic ?? 0;
+    const kind = Object.entries(content.probabilities).filter(([k]) => k !== 'generic').sort((a, b) => b[1] - a[1])[0]?.[0];
+    log.info(`[decision:${outcome.mode}] reviewer.privacy skill "${skill.name}": ${content.choice}@${fmtP(content.probabilities[content.choice])} generic=${fmtP(genericP)} procedure=${fmtP(procedure)}`);
     const tag = `decision model${outcome.emulated ? ', emulated' : ''}`;
-    const warning = detail >= PRIVACY_WARN_P
-      ? `Review before enabling: this skill may carry workspace-specific detail (${DETAIL_KINDS[kind?.choice ?? ''] ?? DETAIL_KINDS.other_detail}; ${tag}, p=${fmtP(detail)}).`
+    const warning = genericP <= PRIVACY_GENERIC_MIN_P
+      ? `Review before enabling: this skill may carry workspace-specific detail (${DETAIL_KINDS[kind ?? ''] ?? DETAIL_KINDS.other_detail}; ${tag}, p=${fmtP(1 - genericP)}).`
       : undefined;
-    const advice = generic !== undefined && generic < 0.3
-      ? `It reads less like a reusable multi-step procedure (${tag}, p=${fmtP(generic)}); a knowledge entry may suit it better.`
+    const advice = procedure !== undefined && procedure < 0.3
+      ? `It reads less like a reusable multi-step procedure (${tag}, p=${fmtP(procedure)}); a knowledge entry may suit it better.`
       : undefined;
     return warning || advice ? { warning, advice } : undefined;
   }

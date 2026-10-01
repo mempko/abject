@@ -65,9 +65,23 @@ const UNSCORED_NOUL_YES = 0.7;
 /** Confidence a bare pick carries: below every act threshold, still an answer. */
 const UNSCORED_CONFIDENCE = 0.5;
 
+/**
+ * Prose for an instruction or criterion. The shared structured shape
+ * (question / what, focus, not_for, examples) reads as sentences, so a chat
+ * model sees the same distinctions a decision model does; anything else is
+ * shown as JSON.
+ */
 function textOf(t: DecisionText | undefined): string {
   if (t === undefined) return '';
-  return typeof t === 'string' ? t : JSON.stringify(t);
+  if (typeof t === 'string') return t;
+  if (!Array.isArray(t) && (typeof t.what === 'string' || typeof t.question === 'string')) {
+    const parts = [String(t.question ?? t.what)];
+    if (typeof t.focus === 'string') parts.push(`Focus: ${t.focus}`);
+    if (typeof t.not_for === 'string') parts.push(`Not for: ${t.not_for}`);
+    if (Array.isArray(t.examples) && t.examples.length) parts.push(`Examples: ${t.examples.map(e => `"${String(e)}"`).join('; ')}`);
+    return parts.join(' ');
+  }
+  return JSON.stringify(t);
 }
 
 export function buildPlans(request: DecisionRequest): QuestionPlan[] {

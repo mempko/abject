@@ -17,7 +17,7 @@ import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
-import { askScopeQuestions } from '../core/decision-questions.js';
+import { askScopeQuestions, criterion, instruction } from '../core/decision-questions.js';
 
 const log = new Log('ObjectAgent');
 
@@ -480,12 +480,27 @@ When asked about a task, describe which objects you would message and what you w
   private static readonly TIER_QUESTIONS: Record<string, DecisionQuestion> = {
     next_step: {
       type: 'choice',
-      instructions: 'An agent is accomplishing `task` by sending messages to existing objects. From `lastAction` and `lastResult`, predict what its NEXT step must do.',
+      instructions: instruction('An agent is accomplishing `task` by sending messages to existing objects. What must its NEXT step do?', {
+        focus: '`lastAction` and `lastResult` against `task`; `imageAttached` when the last result carried an image.',
+        notFor: 'Whether the task is going well overall; predict only the kind of the next step.',
+      }),
       criteria: {
-        mechanical_call: 'Make the obvious next call, read, or check.',
-        recover: 'Work around a failure: a broken method, a wrong target, a refused or malformed call.',
-        judge_evidence: 'Weigh ambiguous or conflicting results, or inspect an attached image, to decide what is true.',
-        synthesize_answer: 'Compose the final answer from results already gathered.',
+        mechanical_call: criterion('Make the obvious next call, read, or check.', {
+          notFor: 'A next call that first needs a failure understood (recover).',
+          examples: ['call the method the last answer pointed to', 'read the state back after a successful write'],
+        }),
+        recover: criterion('Work around a failure: a broken method, a wrong target, a refused or malformed call.', {
+          notFor: 'A successful call whose result is merely surprising (judge_evidence).',
+          examples: ['the named object was not found, so find the right one', 'a method rejected its payload'],
+        }),
+        judge_evidence: criterion('Weigh ambiguous or conflicting results, or inspect an attached image, to decide what is true.', {
+          notFor: 'A clear result that only needs passing on (mechanical_call or synthesize_answer).',
+          examples: ['two sources disagree on a value', 'a screenshot must be checked against the task'],
+        }),
+        synthesize_answer: criterion('Compose the final answer from results already gathered.', {
+          notFor: 'Results that still conflict (judge_evidence).',
+          examples: ['the requested data is in hand'],
+        }),
       },
     },
   };

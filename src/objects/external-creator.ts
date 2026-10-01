@@ -44,7 +44,7 @@ import { ALWAYS_PROTECTED } from './external-project-registry.js';
 import type { FileEdit } from '../core/file-edit.js';
 import { Log } from '../core/timed-log.js';
 import { choiceOf, noulOf, type DecisionQuestion } from '../llm/decision.js';
-import { askScopeQuestions } from '../core/decision-questions.js';
+import { askScopeQuestions, criterion, instruction } from '../core/decision-questions.js';
 
 const log = new Log('ExternalCreator');
 
@@ -599,12 +599,21 @@ clean result I did not observe.`;
     if (all.length < 2) return undefined;
     if (await this.decisionSiteMode('external.project') === 'off') return undefined;
     const candidates = all.slice(0, 60);
-    const criteria: Record<string, string> = {};
+    const criteria: Record<string, Record<string, unknown>> = {};
     for (const p of candidates) {
-      criteria[p.name] = `The registered project "${p.name}" at ${p.root}${p.description ? `: ${p.description.slice(0, 150)}` : ''}.`;
+      criteria[p.name] = criterion(
+        `Work in the registered project "${p.name}" at ${p.root}${p.description ? `: ${p.description.slice(0, 150)}` : ''}.`,
+        { notFor: 'A task that only mentions this project while the files it changes live somewhere else.', examples: [`edit or inspect files under ${p.root}`] },
+      );
     }
-    criteria[ExternalCreator.OUTSIDE_PROJECTS] = 'Files or directories outside every registered project: a download, a loose file, another directory.';
-    criteria[ExternalCreator.NOT_PROJECT_WORK] = 'Not work on project files at all: a question or request that needs no project.';
+    criteria[ExternalCreator.OUTSIDE_PROJECTS] = criterion('Work on files or directories outside every registered project.', {
+      notFor: 'A registered project named by a nickname or by one of its subdirectories.',
+      examples: ['summarize a spreadsheet in the downloads folder', 'read a config file in the home directory'],
+    });
+    criteria[ExternalCreator.NOT_PROJECT_WORK] = criterion('Not work on files at all: a question or request that needs no project.', {
+      notFor: 'A question about what a registered project contains.',
+      examples: ['explain what a regular expression matches', 'draft a short announcement'],
+    });
     const hints: Record<string, string> = {};
     for (const key of ['project', 'projectPath', 'target']) {
       if (typeof data?.[key] === 'string') hints[key] = clip(data[key] as string, 300);
@@ -619,7 +628,10 @@ clean result I did not observe.`;
     }, {
       project: {
         type: 'choice',
-        instructions: 'Which registered project in `projects` does `task` concern? `hints`, `goal_title`, and the project the previous task in the same goal worked in are supporting context.',
+        instructions: instruction('Which registered project in `projects` does `task` concern?', {
+          focus: 'The files and work `task` names; `hints`, `goal_title`, and `previous_task_project` are supporting context.',
+          notFor: 'Which project would be easiest or most familiar to work in.',
+        }),
         criteria,
       },
     }, { goalId: extra?.goalId, taskId: extra?.taskId, onBehalfOf: this.manifest.name, timeoutMs: 30_000 });
@@ -1030,13 +1042,31 @@ clean result I did not observe.`;
   private static readonly ATTRIBUTION_QUESTIONS: Record<string, DecisionQuestion> = {
     attribution: {
       type: 'choice',
-      instructions: 'A project command (`cmd`) failed after this task changed `touchedFiles`. Compare `currentTail` with `baselineTail` (the same command before the task started) and `newSignatures`. What most likely caused the new failures?',
+      instructions: instruction('What most likely caused the new failures of `cmd` after this task changed `touchedFiles`?', {
+        focus: 'Compare `currentTail` with `baselineTail` (the same command before the task started), and read `newSignatures`.',
+        notFor: 'Whether the task is finished or the change is a good idea.',
+      }),
       criteria: {
-        introduced_by_this_change: 'This task\'s change caused them, including knock-on failures in callers or dependents of the files it touched.',
-        pre_existing_or_flaky: 'They were already there or are flaky: the baseline shows the same failures or the test is nondeterministic.',
-        concurrent_task: 'Another task working in the same project at the same time caused them, in files this task did not touch.',
-        environment: 'The environment caused them: toolchain, services, network, resources, or timing.',
-        unknown: 'The output does not show enough to tell.',
+        introduced_by_this_change: criterion('This task\'s change caused them, including knock-on failures in callers or dependents of the files it touched.', {
+          notFor: 'Failures the baseline already shows.',
+          examples: ['a caller of a renamed function no longer compiles', 'the test of a changed module now fails'],
+        }),
+        pre_existing_or_flaky: criterion('They were already there, or the failing test is nondeterministic.', {
+          notFor: 'Failures that appear only after the change, in code it affects.',
+          examples: ['the baseline tail shows the same failing test', 'a timing-dependent test that fails now and then'],
+        }),
+        concurrent_task: criterion('Another task working in the same project at the same time caused them.', {
+          notFor: 'Knock-on effects of this task\'s own change in files it did not touch.',
+          examples: ['failures in a file another task is editing, unrelated to `touchedFiles`'],
+        }),
+        environment: criterion('The environment caused them: toolchain, services, network, resources, or timing.', {
+          notFor: 'Errors in the code or content itself.',
+          examples: ['connection refused to a local database', 'out of memory during the build'],
+        }),
+        unknown: criterion('The output does not show enough to tell.', {
+          notFor: 'A cause the tails make plain.',
+          examples: ['a tail that ends before any failure line'],
+        }),
       },
     },
   };
@@ -1558,9 +1588,9 @@ clean result I did not observe.`;
   /**
    * Whether a syntax-looking failure really means the edited file no longer
    * parses (site external.syntax). Asked only after the deterministic check
-   * said syntax, one yes/no per diagnostic in that file. Acting, the rollback
-   * happens only when at least one diagnostic reads as a parse failure
-   * (p >= 0.5); otherwise the edit stays and the agent fixes forward, with the
+   * said syntax, one choice over the diagnostics in that file. Acting, the
+   * rollback happens unless they read as findings in parseable code
+   * (unparseable p < 0.5); then the edit stays and the agent fixes forward, with the
    * pre-image still held. Advising, the rollback stands and a disagreeing
    * judgment rides along as a note. No answer keeps today's rollback.
    */
@@ -1570,38 +1600,51 @@ clean result I did not observe.`;
     const { flagged, inFile } = this.parseFailureCandidates(verdict, editedPath, extra);
     const diagnostics = [...flagged, ...inFile.filter(s => !flagged.includes(s))].slice(0, 10).map(s => clip(s, 400));
     if (diagnostics.length === 0) return { rollback: true };
-    const questions: Record<string, DecisionQuestion> = {};
-    diagnostics.forEach((_, i) => {
-      questions[`is_syntax_error_${i}`] = {
-        type: 'noul',
-        instructions: `Does \`diagnostics[${i}]\` mean \`file\` cannot be parsed, as opposed to a type, lint, or test failure in parseable code?`,
-      };
-    });
     const outcome = await this.askDecision('external.syntax', {
       file: rel, diagnostics, checkCommand: verdict.outcome.command,
-    }, questions, { ...this.decisionScope(extra), timeoutMs: 30_000 });
-    if (!outcome) return { rollback: true };
-    const ps = diagnostics.map((_, i) => noulOf(outcome, `is_syntax_error_${i}`)).filter((p): p is number => p !== undefined);
-    if (ps.length === 0) return { rollback: true };
-    const max = Math.max(...ps);
-    const parses = max < 0.5;
-    log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} max is_syntax_error=${max.toFixed(2)}${parses ? (outcome.mode === 'act' ? ' -> edit kept' : ' -> rollback stands, noted') : ' -> rollback'}`);
+    }, ExternalCreator.SYNTAX_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 30_000 });
+    const pick = choiceOf(outcome, 'parse_state');
+    if (!outcome || !pick) return { rollback: true };
+    const unparseable = pick.probabilities.unparseable ?? 1;
+    const parses = unparseable < 0.5;
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.syntax: ${rel} ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)}${parses ? (outcome.mode === 'act' ? ' -> edit kept' : ' -> rollback stands, noted') : ' -> rollback'}`);
     if (!parses) return { rollback: true };
     if (outcome.mode === 'act') {
-      this.audit(extra, `syntax-looking failure in ${rel} judged parseable (max is_syntax_error=${max.toFixed(2)}); edit kept`);
+      this.audit(extra, `syntax-looking failure in ${rel} judged parseable (unparseable p=${unparseable.toFixed(2)}); edit kept`);
       return {
         rollback: false,
-        note: `A diagnostic in ${rel} looked like a parse failure, but a runtime judgment reads every diagnostic there as a ` +
-          `type, lint, or test finding in parseable code (is_syntax_error at most ${max.toFixed(2)}), so the edit was kept. ` +
+        note: `A diagnostic in ${rel} looked like a parse failure, but a runtime judgment reads the diagnostics there as ` +
+          `type, lint, or test findings in parseable code (unparseable p=${unparseable.toFixed(2)}), so the edit was kept. ` +
           `Fix it forward from the diagnostics above.`,
       };
     }
     return {
       rollback: true,
       note: `Runtime judgment: these diagnostics read as findings in parseable code rather than a parse failure ` +
-        `(is_syntax_error at most ${max.toFixed(2)}). If that holds, reapply the edit and fix the findings forward.`,
+        `(unparseable p=${unparseable.toFixed(2)}). If that holds, reapply the edit and fix the findings forward.`,
     };
   }
+
+  /** One choice decides the rollback: can the edited file still be parsed? */
+  private static readonly SYNTAX_QUESTIONS: Record<string, DecisionQuestion> = {
+    parse_state: {
+      type: 'choice',
+      instructions: instruction('After an edit, a check reported `diagnostics` in `file`. Can `file` still be parsed?', {
+        focus: 'Whether any single diagnostic is a syntax or parse error in `file`.',
+        notFor: 'How serious the remaining findings are, or how to fix them.',
+      }),
+      criteria: {
+        unparseable: criterion('At least one diagnostic means the file cannot be parsed.', {
+          notFor: 'Type, lint, or test findings in code that parses.',
+          examples: ["`error TS1005: ';' expected`", '`Parsing error: Unexpected token }`'],
+        }),
+        parseable_findings: criterion('Every diagnostic is a finding in code that parses: types, lint, or tests.', {
+          notFor: 'Any diagnostic about an unexpected token, an unterminated string, or unbalanced brackets.',
+          examples: ['`error TS2322: Type string is not assignable to type number`', "`Expected '===' and instead saw '=='`"],
+        }),
+      },
+    },
+  };
 
   /** Files this task has written, as project-relative paths (for attribution). */
   private touchedFiles(extra: TaskExtra): string[] {
@@ -2142,10 +2185,24 @@ clean result I did not observe.`;
     return { current, ...(!current.complete ? { warning: `Current snapshot coverage is incomplete. ${current.issues?.slice(0, 3).join('; ') ?? ''}` } : {}) };
   }
 
+  /** One choice decides the auto-run; the refusal kind is checked in code first. */
   private static readonly AUTO_VERIFY_QUESTIONS: Record<string, DecisionQuestion> = {
-    verification_unwanted: {
-      type: 'noul',
-      instructions: 'Do `task` or `projectInstructions` say not to run tests or verification here (too slow, needs services, told to skip)?',
+    verification: {
+      type: 'choice',
+      instructions: instruction('Done was claimed with unverified changes. Should the runtime run `verifyCommand` now?', {
+        focus: 'What `task` and `projectInstructions` say about running tests or verification.',
+        notFor: 'Whether the change itself is correct; the run will show that.',
+      }),
+      criteria: {
+        run_now: criterion('Nothing in the task or the project instructions asks to skip verification here.', {
+          notFor: 'Instructions that say verification must not run locally or belongs somewhere else.',
+          examples: ['a bug fix in a project whose instructions say to run the tests before committing', 'a task and instructions that never mention tests'],
+        }),
+        skip_requested: criterion('The task or project instructions ask not to run tests or verification here: too slow, needs services, or told to skip.', {
+          notFor: 'Instructions that only explain how to run the tests.',
+          examples: ['"do not run the test suite locally, it needs a database"', 'a task that says to skip the tests and only update the docs'],
+        }),
+      },
     },
   };
 
@@ -2169,16 +2226,17 @@ clean result I did not observe.`;
       ...(instructions ? { projectInstructions: instructions } : {}),
       verifyCommand: command,
     }, ExternalCreator.AUTO_VERIFY_QUESTIONS, { ...this.decisionScope(extra), timeoutMs: 20_000 });
-    const unwanted = noulOf(outcome, 'verification_unwanted');
-    if (!outcome || unwanted === undefined) return undefined;
+    const pick = choiceOf(outcome, 'verification');
+    if (!outcome || !pick) return undefined;
+    const runP = pick.probabilities.run_now ?? 0;
     // Held at advise, the site has nothing to add: the refusal already tells
     // the agent to run the command.
-    const run = outcome.mode === 'act' && unwanted < 0.5;
-    log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: verification_unwanted=${unwanted.toFixed(2)} -> ${run ? `running \`${command}\`` : 'left to the agent'}`);
+    const run = outcome.mode === 'act' && runP > 0.5;
+    log.info(`[decision:${outcome.mode}] ExternalCreator external.auto-verify: ${pick.choice}@${(pick.probabilities[pick.choice] ?? 0).toFixed(2)} -> ${run ? `running \`${command}\`` : 'left to the agent'}`);
     if (!run) return undefined;
 
     extra.autoVerified = true;
-    this.audit(extra, `auto-verify: done was claimed with unverified changes, so the runtime is running \`${command}\` itself (verification_unwanted=${unwanted.toFixed(2)})`);
+    this.audit(extra, `auto-verify: done was claimed with unverified changes, so the runtime is running \`${command}\` itself (run_now p=${runP.toFixed(2)})`);
     this.reportProgress(extra, 'acting', `runtime verify: ${command.slice(0, 80)}`);
     // The completion request waits on a stall timer and a verify can run for
     // minutes: progress beats keep it, and this task's ticket, alive.
@@ -2780,14 +2838,35 @@ clean result I did not observe.`;
   private static readonly COMMAND_OUTCOME_QUESTIONS: Record<string, DecisionQuestion> = {
     command_outcome: {
       type: 'choice',
-      instructions: 'A shell command ran in a project and exited with `exitCode` (null when it could not run); `stdoutTail` and `stderrTail` are the ends of its output. What does the outcome mean for the next step?',
+      instructions: instruction('What does this shell command\'s outcome mean for the next step?', {
+        focus: '`exitCode` (null when the command could not run) read together with the ends of its output in `stdoutTail` and `stderrTail`.',
+        notFor: 'Whether the task as a whole is finished; judge only this one command.',
+      }),
       criteria: {
-        succeeded: 'The command did what it was asked; nothing in the exit status or output is a problem.',
-        expected_nonzero: 'A non-zero exit that reports a finding rather than a fault: a search with no match, a diff or comparison that found differences, a test expression that was false.',
-        tests_or_checks_failed: 'Tests, a typecheck, a linter, or a build ran and reported failures in the files.',
-        command_error: 'The command itself was wrong or could not run: bad flags or syntax, command or file not found, permission denied, a missing dependency.',
-        environment_or_infra: 'The environment got in the way: network, out of memory, a timeout, the process was killed, a service is unavailable.',
-        partial_or_truncated: 'The output is cut off or incomplete, so the outcome cannot be read from it.',
+        succeeded: criterion('The command did what it was asked; nothing in the exit status or output is a problem.', {
+          notFor: 'An exit status of 0 whose output reports errors or failures.',
+          examples: ['`ls src` listing the files', '`git add -A` exiting 0'],
+        }),
+        expected_nonzero: criterion('A non-zero exit that reports a finding rather than a fault.', {
+          notFor: 'A test runner, compiler, or linter reporting failures.',
+          examples: ['`grep` with no match exits 1', '`git diff --exit-code` exits 1 because files differ'],
+        }),
+        tests_or_checks_failed: criterion('Tests, a typecheck, a linter, or a build ran to completion and reported failures in the files.', {
+          notFor: 'A runner that could not start, or a missing tool.',
+          examples: ['the test runner reports 2 failing tests', 'the compiler reports a type error'],
+        }),
+        command_error: criterion('The command itself was wrong or could not run.', {
+          notFor: 'Failures reported by a runner that did run.',
+          examples: ['an unknown flag, or `command not found`', '`permission denied`, or a missing dependency'],
+        }),
+        environment_or_infra: criterion('The environment got in the way of an otherwise sound command.', {
+          notFor: 'A mistake in the command or its arguments.',
+          examples: ['network unreachable, or a service is down', 'the process was killed for memory or by a timeout'],
+        }),
+        partial_or_truncated: criterion('The output is cut off or incomplete, so the outcome cannot be read from it.', {
+          notFor: 'Long output whose ending still shows the result.',
+          examples: ['output that stops mid-line with `truncated` true', 'only progress lines and no summary'],
+        }),
       },
     },
   };
@@ -2795,10 +2874,19 @@ clean result I did not observe.`;
   private static readonly ERROR_KIND_QUESTIONS: Record<string, DecisionQuestion> = {
     error_kind: {
       type: 'choice',
-      instructions: 'An `action` taken in a project failed with `error`. Is the fix plain from the message itself, or does it need diagnosis?',
+      instructions: instruction('Is the fix for this failed action plain from its error message, or does it need diagnosis?', {
+        focus: '`error`, read with `action` and `path`.',
+        notFor: 'Whether the overall approach of the task is right.',
+      }),
       criteria: {
-        trivial_retry: 'A mechanical slip with a plain fix: edit text that was not found or not unique, a path typo, a missing required argument.',
-        needs_diagnosis: 'The cause is unclear, or fixing it needs reasoning about the project.',
+        trivial_retry: criterion('A mechanical slip whose fix the message itself spells out.', {
+          notFor: 'An error whose cause has to be found by reading the project.',
+          examples: ['edit text that was not found or not unique in the file', 'a path typo, or a missing required argument'],
+        }),
+        needs_diagnosis: criterion('The cause is unclear, or fixing it needs reasoning about the project.', {
+          notFor: 'A slip the message already explains.',
+          examples: ['a write refused for a reason the message does not give', 'a message to another object failing with an internal error'],
+        }),
       },
     },
   };

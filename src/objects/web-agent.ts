@@ -15,8 +15,8 @@ import type { AgentAction, AgentActionResult, ObserveReply } from './agent-abjec
 import { LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { choiceOf, noulOf, scoreOf, topLevel } from '../llm/decision.js';
-import type { DecisionQuestion } from '../llm/decision.js';
-import { askScopeQuestions } from '../core/decision-questions.js';
+import type { DecisionQuestion, DecisionText } from '../llm/decision.js';
+import { askScopeQuestions, criterion, instruction } from '../core/decision-questions.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WebAgent');
@@ -1338,18 +1338,33 @@ Set keepPageOpen: false to explicitly close the page when done.
   /** Actions that leave the page as it was; the page judgments look past them. */
   private static readonly OFF_PAGE_ACTIONS = new Set(['http', 'write_scratchpad', 'read_scratchpad', 'attach_screenshot']);
   /** Profile choices that are not profile names. */
-  private static readonly PROFILE_OPTIONS: Record<string, string> = {
-    none_ephemeral: 'No profile: a clean, signed-out browser suits the task (public pages, no account needed, or a fresh session requested).',
-    named_new_profile: 'The task names a new profile to create, one that is not in this list.',
+  private static readonly PROFILE_OPTIONS: Record<string, DecisionText> = {
+    none_ephemeral: criterion('No profile: a clean, signed-out browser suits the task.', {
+      notFor: 'A task about the user\'s own account, cart, inbox, or settings on a site one of the listed profiles is kept for.',
+      examples: ['read a public news article', 'look up a product price on a store'],
+    }),
+    named_new_profile: criterion('The task names a new profile to create, one that is not in this list.', {
+      notFor: 'A task that names a profile already in this list, or names no profile at all.',
+      examples: ['set up a new browser profile called work-mail'],
+    }),
   };
 
   private static readonly SCREENSHOT_QUESTIONS: Record<string, DecisionQuestion> = {
     needs_screenshot: {
       type: 'noul',
-      instructions: 'A browsing agent picks its next action for `task` from `snapshotHead`, the page\'s accessibility tree (`roleHistogram` and `unnamedInteractive` summarize the whole tree). Would that next action be chosen incorrectly without the rendered screenshot of the page?',
+      instructions: instruction('Would the browsing agent choose its next action for `task` incorrectly without the rendered screenshot of the page?', {
+        focus: '`snapshotHead` is the start of the page\'s accessibility tree; `roleHistogram` and `unnamedInteractive` summarize the whole tree; `lastAction` and `lastSuccess` say what the previous step did.',
+        notFor: 'Whether a screenshot would merely confirm what the tree already names.',
+      }),
       criteria: {
-        true: 'Canvas, image, or SVG content carries meaning the tree leaves unnamed; many buttons or links have no name; a visual CAPTCHA or puzzle is showing; the task depends on layout, color, or position; the tree is nearly empty while the title promises content; or `lastAction` left no visible trace in the tree.',
-        false: 'The tree names what the next action needs: forms with labelled fields, search results, articles, listings, or a raw JSON or text body.',
+        true: criterion('The tree leaves out something the next action depends on: unnamed canvas, image, or SVG content, unlabelled controls, a visual puzzle, layout or color the task asks about, a near-empty tree under a title that promises content, or a last action that left no trace in the tree.', {
+          notFor: 'A long tree whose controls and content are all named.',
+          examples: ['a row of unnamed icon buttons', 'a slider puzzle to verify a human'],
+        }),
+        false: criterion('The tree names everything the next action needs.', {
+          notFor: 'A task about layout, color, position, or picture content the tree only names generically.',
+          examples: ['a sign-in form with labelled fields', 'search results with link titles'],
+        }),
       },
     },
   };
@@ -1357,17 +1372,47 @@ Set keepPageOpen: false to explicitly close the page when done.
   private static readonly PAGE_STATE_QUESTIONS: Record<string, DecisionQuestion> = {
     page_state: {
       type: 'choice',
-      instructions: 'What state is this page in, judged from its `url`, `title`, and accessibility tree (`snapshotHead`), for a browsing agent working on `task`?',
+      instructions: instruction('What state is this page in for a browsing agent working on `task`?', {
+        focus: 'Judge from `url`, `title`, and the start of the accessibility tree in `snapshotHead`.',
+        notFor: 'Whether the page holds the specific answer the task wants; judge only whether the page is usable.',
+      }),
       criteria: {
-        content_ready: 'The page shows usable content or controls for the task.',
-        human_verification: 'A human-verification check blocks the page: a "verify you are human" box, an image or slider puzzle, or a browser-check interstitial.',
-        login_required: 'The page asks the visitor to sign in, or shows a signed-out view of content that needs an account.',
-        otp_or_2fa: 'The page asks for a one-time code, a second factor, or approval on another device.',
-        consent_banner: 'A cookie or consent overlay covers the content and waits for a choice.',
-        error_page: 'The page shows an error: not found, server error, access denied, or a browser network error.',
-        loading_or_blank: 'The page is blank, a bare shell, or still showing loading indicators.',
-        paywall_or_rate_limited: 'A paywall, subscription wall, or rate-limit notice blocks the content.',
-        data_document: 'The page is a raw data document (JSON, XML, an RSS or Atom feed, CSV, plain text) rather than a rendered site.',
+        content_ready: criterion('The page shows usable content or controls for the task.', {
+          notFor: 'A page whose content sits behind an overlay, wall, or sign-in prompt.',
+          examples: ['a product page showing its price', 'a search form ready for input'],
+        }),
+        human_verification: criterion('A human-verification check blocks the page.', {
+          notFor: 'An ordinary sign-in form, or a cookie consent banner.',
+          examples: ['a "verify you are human" checkbox', 'a "checking your browser" interstitial'],
+        }),
+        login_required: criterion('The page asks the visitor to sign in, or shows a signed-out view of content that needs an account.', {
+          notFor: 'A visible page that merely offers an optional sign-in link; a prompt for a one-time code.',
+          examples: ['a sign-in form where the inbox should be', 'a "log in to continue" page'],
+        }),
+        otp_or_2fa: criterion('The page asks for a one-time code, a second factor, or approval on another device.', {
+          notFor: 'A username and password form.',
+          examples: ['"enter the 6-digit code we sent you"', '"approve this sign-in on your phone"'],
+        }),
+        consent_banner: criterion('A cookie or consent overlay covers the content and waits for a choice.', {
+          notFor: 'A small notice that leaves the content usable behind it.',
+          examples: ['an "accept all cookies" dialog over the page', 'a privacy choices modal'],
+        }),
+        error_page: criterion('The page shows an error instead of the requested content.', {
+          notFor: 'A page that loaded fine but lacks the specific item the task wants.',
+          examples: ['"404 not found"', 'a browser "site can\'t be reached" page'],
+        }),
+        loading_or_blank: criterion('The page is still loading, or rendered blank where its content should be.', {
+          notFor: 'A fresh tab that has not navigated anywhere yet; a data or text page that is simply short.',
+          examples: ['a spinner with no content around it', 'an app shell with an empty main area'],
+        }),
+        paywall_or_rate_limited: criterion('A paywall, subscription wall, or rate-limit notice blocks the content.', {
+          notFor: 'A sign-in page for the user\'s own account.',
+          examples: ['"subscribe to keep reading"', '"too many requests, try again later"'],
+        }),
+        data_document: criterion('The page is a raw data document rather than a rendered site.', {
+          notFor: 'A rendered page that shows data in tables or lists.',
+          examples: ['a JSON API response', 'an RSS feed'],
+        }),
       },
     },
   };
@@ -1387,7 +1432,10 @@ Set keepPageOpen: false to explicitly close the page when done.
   private static readonly DIFFICULTY_QUESTIONS: Record<string, DecisionQuestion> = {
     decision_difficulty: {
       type: 'score',
-      instructions: 'How hard is the browsing agent\'s NEXT decision toward `task`, given the page (`snapshotHead`, `refCount`) and how `lastAction` went (`lastSuccess`)?',
+      instructions: instruction('How hard is the browsing agent\'s next decision toward `task`?', {
+        focus: 'The page (`snapshotHead`, `refCount`, `unnamedInteractive`) and how `lastAction` went (`lastSuccess`).',
+        notFor: 'How hard the whole task is; judge only the next single action.',
+      }),
       criteria: [
         'Obvious: the next step is plain from the page (one clear control, the content already in view, or the task already answered).',
         'Routine: fill a form with known values, follow a named link, or read visible content.',
@@ -1460,6 +1508,10 @@ Set keepPageOpen: false to explicitly close the page when done.
    * ≥ 0.85; nothing here ever fails the task.
    */
   private async judgePageState(extra: WebTaskExtra, page: ObservedPage, scope: { goalId?: string; taskId: string; onBehalfOf: string }): Promise<{ act?: 'request_human' | 'wait'; hint?: string; detail?: string }> {
+    // A tab that has not navigated anywhere is blank by construction, not
+    // loading: there is no page to judge, and waiting would only stall the
+    // step before the agent's first navigate (or its http-only work).
+    if (!page.url || page.url === 'about:blank') return {};
     if (await this.decisionSiteMode('web.page-state') === 'off') return {};
     const outcome = await this.askDecision('web.page-state', {
       url: page.url, title: page.title, refCount: page.features.refCount,
@@ -1583,9 +1635,11 @@ Set keepPageOpen: false to explicitly close the page when done.
     const reserved = new Set(Object.keys(WebAgent.PROFILE_OPTIONS));
     const existing = (await listExisting()).filter(p => !reserved.has(p.name)).slice(0, 250);
     if (existing.length === 0) return { apply: false };
-    const criteria: Record<string, string> = {};
+    const criteria: Record<string, DecisionText> = {};
     for (const p of existing) {
-      criteria[p.name] = `The persistent browser profile "${p.name}", with the logins and cookies saved in it${p.lastUsed ? ` (last used ${new Date(p.lastUsed).toISOString().slice(0, 10)})` : ''}.`;
+      criteria[p.name] = criterion(`The persistent browser profile "${p.name}", with the logins and cookies saved in it${p.lastUsed ? ` (last used ${new Date(p.lastUsed).toISOString().slice(0, 10)})` : ''}.`, {
+        notFor: 'Tasks about public pages that need no account, or about a site this profile was not kept for.',
+      });
     }
     Object.assign(criteria, WebAgent.PROFILE_OPTIONS);
     const outcome = await this.askDecision('web.profile', {
@@ -1595,7 +1649,10 @@ Set keepPageOpen: false to explicitly close the page when done.
     }, {
       profile: {
         type: 'choice',
-        instructions: 'Which browser profile does `task` intend to run in? A profile holds a site\'s signed-in session, so a task about the user\'s own account on a site usually intends the profile kept for that site.',
+        instructions: instruction('Which browser profile does `task` intend to run in?', {
+          focus: 'A profile holds a site\'s signed-in session, so a task about the user\'s own account on a site usually intends the profile kept for that site. `profile_mentioned` is a profile name the task text seemed to mention, when any.',
+          notFor: 'Which profile would merely be convenient; pick the one the task intends.',
+        }),
         criteria,
       },
     }, { ...scope, onBehalfOf: this.manifest.name, timeoutMs: 15000 });

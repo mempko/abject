@@ -21,6 +21,7 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { type DecisionQuestion } from '../llm/decision.js';
+import { criterion, instruction } from '../core/decision-questions.js';
 import {
   type ExposureSelectors,
   type ExposureSelectorsInput,
@@ -417,20 +418,25 @@ Each line shows one registered object: id, name, description, and non-meta metho
       catalog = [...catalog].sort((a, b) => score(b) - score(a)).slice(0, 254);
     }
     const byKey = new Map<string, ObjectRegistration>();
-    const criteria: Record<string, string> = {};
+    const criteria: Record<string, Record<string, unknown>> = {};
     for (const reg of catalog) {
       const base = (reg.name ?? reg.manifest.name ?? 'object').replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 36) || 'object';
       let key = base;
       for (let n = 2; byKey.has(key) || key === 'none'; n++) key = `${base}_${n}`;
       byKey.set(key, reg);
       const methods = reg.manifest.interface.methods.filter(m => !Registry.META_METHODS.has(m.name)).map(m => m.name);
-      criteria[key] = `${reg.manifest.description.slice(0, 300)} Methods: ${methods.slice(0, 20).join(', ')}`;
+      criteria[key] = criterion(`${reg.manifest.description.slice(0, 300)} Methods: ${methods.slice(0, 20).join(', ')}`);
     }
-    criteria.none = 'No listed object performs this capability directly.';
+    criteria.none = criterion('No listed object performs this capability directly.', {
+      notFor: 'An object that does it as part of a broader role; pick that object.',
+    });
     const questions: Record<string, DecisionQuestion> = {
       best: {
         type: 'choice',
-        instructions: 'Pick the registered object that performs `need` directly through its methods. Prefer the object that owns the capability over a general-purpose agent.',
+        instructions: instruction('Pick the registered object that performs `need` directly through its methods.', {
+          focus: 'The object that owns the capability, judged by its description and method names.',
+          notFor: 'A general-purpose agent that could arrange it through other objects, when an object here does it itself.',
+        }),
         criteria,
       },
     };

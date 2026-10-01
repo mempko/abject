@@ -285,10 +285,23 @@ decisions belong to ScrumMaster.
     if (await this.decisionSiteMode('goal.health') === 'off') return undefined;
     this.healthCheckedAt.set(goal.id, { at: Date.now() });
     const now = Date.now();
+    // What is still in flight: progress messages go quiet while a task sits on
+    // one long action (an approval prompt, a long command), which is waiting,
+    // not looping, and only the runtime can show it.
+    const runtime = await this.discoverDep('AgentAbject');
+    const execution = runtime
+      ? await this.request<{ tasks?: Array<{ phase?: string; step?: number; operation?: { action?: Record<string, unknown> } }> }>(
+        request(this.id, runtime, 'getGoalExecutionHealth', { goalId: goal.id }), 5000).catch(() => null)
+      : null;
+    const running = (execution?.tasks ?? []).slice(0, 6).map(t => {
+      const action = t.operation?.action;
+      return { phase: t.phase, step: t.step, ...(action ? { action: JSON.stringify(action).slice(0, 300) } : {}) };
+    });
     const outcome = await this.askDecision('goal.health', {
       title: goal.title ?? '',
       quiet_minutes: Math.round(age / 60000),
       progress: (goal.progress ?? []).slice(-10).map(p => ({ agent: p.agentName, phase: p.phase, message: p.message.slice(0, 200), minutes_ago: Math.round((now - p.timestamp) / 60000) })),
+      running,
     }, goalHealthQuestions(), { goalId: goal.id, onBehalfOf: 'GoalObserver', timeoutMs: 20000 });
     const health = choiceOf(outcome, 'health');
     if (!outcome || !health) return undefined;

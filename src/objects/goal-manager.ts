@@ -339,10 +339,7 @@ export class GoalManager extends Abject {
         error: error.slice(0, 2000),
         history,
         produces: ((fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
-      }, {
-        ...failureQuestions(GoalManager.TASK_FAILURE_KINDS),
-        partial_work_usable: { type: 'noul', instructions: 'Did the failed attempt produce outputs later work can reuse?' },
-      }, { goalId, taskId, onBehalfOf: 'GoalManager', timeoutMs: GoalManager.FAILURE_CLASSIFY_WAIT_MS });
+      }, failureQuestions(GoalManager.TASK_FAILURE_KINDS), { goalId, taskId, onBehalfOf: 'GoalManager', timeoutMs: GoalManager.FAILURE_CLASSIFY_WAIT_MS });
       const kind = choiceOf(outcome, 'failure_kind');
       if (!outcome || !kind) return;
       const p = kind.probabilities[kind.choice] ?? 0;
@@ -350,7 +347,6 @@ export class GoalManager extends Abject {
       if (p < 0.5) return;
       record = {
         kind: kind.choice, p: Math.round(p * 100) / 100,
-        retrySame: noulOf(outcome, 'retry_same'), partialWorkUsable: noulOf(outcome, 'partial_work_usable'),
         source: outcome.emulated ? 'emulated decision' : 'decision model', at: Date.now(),
       };
     }

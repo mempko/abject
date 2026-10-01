@@ -19,8 +19,8 @@ import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
 import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
 import { formatMCPToolList } from '../core/mcp-format.js';
 import { choiceOf, noulOf } from '../llm/decision.js';
-import type { DecisionQuestion } from '../llm/decision.js';
-import { askScopeQuestions } from '../core/decision-questions.js';
+import type { DecisionQuestion, DecisionText } from '../llm/decision.js';
+import { askScopeQuestions, criterion, instruction } from '../core/decision-questions.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('SkillAgent');
@@ -1105,10 +1105,19 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   // decision state.
 
   /** Preselect choices that are not skill names. */
-  private static readonly PRESELECT_OPTIONS: Record<string, string> = {
-    skill_management: 'The task installs, enables, disables, configures, lists, or searches for skills or MCP servers, rather than using one.',
-    authoring_out_of_scope: 'The task asks to create, build, design, wrap, or modify an object, widget, app, agent, bridge, proxy, or integration: authoring work, even when the result would wrap a skill.',
-    none: 'No installed skill covers the task; it needs general shell, HTTP, file, or web work.',
+  private static readonly PRESELECT_OPTIONS: Record<string, DecisionText> = {
+    skill_management: criterion('The task installs, enables, disables, configures, lists, or searches for skills or MCP servers.', {
+      notFor: 'A task that uses an installed skill to get something done.',
+      examples: ['install a PDF reader', 'set the API token for an installed skill'],
+    }),
+    authoring_out_of_scope: criterion('The task asks to create, build, design, wrap, or modify an object, widget, app, agent, bridge, proxy, or integration, even one that would wrap a skill.', {
+      notFor: 'A task that runs an installed skill, even when its result feeds something another agent will build.',
+      examples: ['build a window that shows my calendar', 'wrap the issue tracker in a new object'],
+    }),
+    none: criterion('No installed skill covers the task; it needs general shell, HTTP, file, or web work.', {
+      notFor: 'A task an installed skill covers, even when a shell command or HTTP call could also do it.',
+      examples: ['count the lines in a log file', 'fetch a URL and summarize it'],
+    }),
   };
 
   /** Characters of preloaded skill instructions; load_skill returns the whole text. */
@@ -1117,15 +1126,39 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   private static readonly RESULT_QUESTIONS: Record<string, DecisionQuestion> = {
     last_result: {
       type: 'choice',
-      instructions: 'A skill-execution agent ran `action` and got the output in `head` (and `tail` when long); `ok` is whether the runtime reported success. What does the result mean for its next step?',
+      instructions: instruction('What does the result of `action` mean for the agent\'s next step?', {
+        focus: '`head` (and `tail` when long) hold the output; `exitCode` and `httpStatus` when present; `ok` is whether the runtime reported success.',
+        notFor: 'Whether the task as a whole is finished; judge only this one result.',
+      }),
       criteria: {
-        success: 'It worked and returned what was asked for.',
-        expected_nonzero: 'A non-zero exit or empty result that is itself a normal answer, such as a search with no matches or a check that reports a difference.',
-        auth_or_credential: 'A credential is missing, expired, or rejected: unauthorized, forbidden, an invalid token, or a sign-in required.',
-        not_found: 'The command, file, tool, resource, or endpoint does not exist.',
-        server_or_network: 'A server error, timeout, outage, rate limit, or network failure.',
-        usage_error: 'Wrong arguments, flags, parameters, or input shape for the command or tool.',
-        other_failure: 'Some other failure.',
+        success: criterion('It worked and returned what was asked for.', {
+          notFor: 'Exit 0 or HTTP 200 whose output reports an error.',
+          examples: ['a JSON list of issues', '"message sent"'],
+        }),
+        expected_nonzero: criterion('A non-zero exit or empty result that is itself a normal answer.', {
+          notFor: 'A non-zero exit whose output reports an actual error.',
+          examples: ['grep exiting 1 with no matches', 'a diff command reporting differences'],
+        }),
+        auth_or_credential: criterion('A credential is missing, expired, or rejected.', {
+          notFor: 'A local file permission error, or bad arguments.',
+          examples: ['HTTP 401 "invalid token"', '"API key not set"'],
+        }),
+        not_found: criterion('The command, file, tool, resource, or endpoint does not exist.', {
+          notFor: 'A search that ran and found no matches.',
+          examples: ['"command not found"', 'HTTP 404 for an endpoint'],
+        }),
+        server_or_network: criterion('A server error, timeout, outage, rate limit, or network failure.', {
+          notFor: 'A rejected credential, or bad arguments.',
+          examples: ['HTTP 503', '"connection timed out"'],
+        }),
+        usage_error: criterion('Wrong arguments, flags, parameters, or input shape for the command or tool.', {
+          notFor: 'A missing command, or a rejected credential.',
+          examples: ['"unknown flag --foo"', '"missing required parameter: id"'],
+        }),
+        other_failure: criterion('Some other failure.', {
+          notFor: 'Any of the kinds above.',
+          examples: ['the tool crashed with a stack trace'],
+        }),
       },
     },
   };
@@ -1190,9 +1223,11 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         .catch(() => [] as Array<{ name: string; tools: Array<{ name: string }> }>),
     ]);
     const candidates = skills.filter(s => !Object.hasOwn(SkillAgent.PRESELECT_OPTIONS, s.name)).slice(0, 250);
-    const criteria: Record<string, string> = {};
+    const criteria: Record<string, DecisionText> = {};
     for (const s of candidates) {
-      criteria[s.name] = `The installed skill "${s.name}": ${s.description.replace(/\s+/g, ' ').trim()}`.slice(0, 255);
+      criteria[s.name] = criterion(`The installed skill "${s.name}": ${s.description.replace(/\s+/g, ' ').trim()}`.slice(0, 255), {
+        notFor: 'A task that installs, enables, or configures this skill rather than using it, or one that only shares a topic word with it.',
+      });
     }
     Object.assign(criteria, SkillAgent.PRESELECT_OPTIONS);
     const outcome = await this.askDecision('skill.preselect', {
@@ -1204,7 +1239,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     }, {
       skill: {
         type: 'choice',
-        instructions: 'Which installed skill covers `task`? A skill covers it when the task names the skill or asks for something its description does. `approach` is the planned route and `failureHistory` lists earlier failed attempts, when present.',
+        instructions: instruction('Which installed skill covers `task`?', {
+          focus: 'A skill covers the task when the task names it or asks for something its description says it does. `approach` is the planned route and `failureHistory` lists earlier failed attempts, when present.',
+          notFor: 'Skills that only share a topic word with the task.',
+        }),
         criteria,
       },
     }, { ...scope, onBehalfOf: this.manifest.name, timeoutMs: 20000 });
@@ -1304,13 +1342,18 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     if (await this.decisionSiteMode('skill.catalog') === 'off') return undefined;
     const shown = hits.slice(0, 20);
     const labels: Record<string, string> = { none_match: 'none of these' };
-    const criteria: Record<string, string> = {};
+    const criteria: Record<string, DecisionText> = {};
     shown.forEach((h, i) => {
       const label = h.kind === 'mcp' ? `[mcp] ${h.name}` : `[skill] ${h.slug}`;
       labels[`entry_${i}`] = label;
-      criteria[`entry_${i}`] = `${label}: ${(h.description ?? '').replace(/\s+/g, ' ').trim()}`.slice(0, 255);
+      criteria[`entry_${i}`] = criterion(`${label}: ${(h.description ?? '').replace(/\s+/g, ' ').trim()}`.slice(0, 255), {
+        notFor: 'A request that only shares a keyword with this entry.',
+      });
     });
-    criteria.none_match = 'None of these entries provides what the request asks for.';
+    criteria.none_match = criterion('None of these entries provides what the request asks for.', {
+      notFor: 'An entry that covers the request under a different name.',
+      examples: ['a request for a PDF reader when every entry is a calendar tool'],
+    });
     const extra = this.taskExtras.get(taskId);
     const outcome = await this.askDecision('skill.catalog', {
       request: (extra?.task ?? query).slice(0, 1500),
@@ -1318,7 +1361,10 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     }, {
       catalog_match: {
         type: 'choice',
-        instructions: 'Which catalog entry best provides what `request` asks for? `query` is the search that found these entries.',
+        instructions: instruction('Which catalog entry best provides what `request` asks for?', {
+          focus: '`query` is the search that found these entries.',
+          notFor: 'Entries that only share a keyword with the request.',
+        }),
         criteria,
       },
     }, { goalId: extra?.goalId, taskId, onBehalfOf: this.manifest.name, timeoutMs: 20000 });

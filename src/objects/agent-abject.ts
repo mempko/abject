@@ -33,6 +33,7 @@ import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../l
 import {
   predictionQuestions, progressQuestions, stopQuestions, failureQuestions, completionQuestions,
   finalDispositionQuestions, relevanceQuestions, delegationQuestions, FAILURE_GUIDANCE, type FailureKind,
+  criterion, instruction,
 } from '../core/decision-questions.js';
 
 const log = new Log('AgentAbject');
@@ -3927,11 +3928,16 @@ The registered object must implement these handlers to participate in the agent 
   private static readonly THINK_TIER_QUESTIONS: Record<string, DecisionQuestion> = {
     next_step: {
       type: 'choice',
-      instructions: 'From the agent\'s state, predict what its NEXT response must do.',
+      instructions: instruction('From the agent\'s state, predict what its NEXT response must do.'),
       criteria: {
-        routine: 'A mechanical follow-up: verify, continue reading, take the obvious next call, or report a result already gathered.',
-        reasoning: 'Diagnose a failure, plan, weigh ambiguous or conflicting evidence, or compose a final answer.',
-        authoring: 'Write or modify source code or other long structured content.',
+        routine: criterion('A mechanical follow-up whose choice is obvious from the state.', {
+          notFor: 'A step right after a failure or a surprising result.',
+          examples: ['Read the next chunk of a file already being read.', 'Report a result already gathered.'],
+        }),
+        reasoning: criterion('Diagnose a failure, plan, weigh ambiguous or conflicting evidence, or compose a final answer.', {
+          examples: ['The last call failed in an unexpected way.'],
+        }),
+        authoring: criterion('Write or modify source code or other long structured content.'),
       },
     },
   };
@@ -4093,15 +4099,15 @@ The registered object must implement these handlers to participate in the agent 
   private async judgeFailure(entry: TaskEntry, action: AgentAction, state: Record<string, unknown>, scope: ReturnType<AgentAbject['decisionScope']>): Promise<string[]> {
     const outcome = await this.askDecision('agent.failure', state, failureQuestions(AgentAbject.ACTION_FAILURE_KINDS), scope);
     const kind = choiceOf(outcome, 'failure_kind');
-    const retry = noulOf(outcome, 'retry_same');
     if (!outcome || !kind) return [];
     const p = kind.probabilities[kind.choice] ?? 0;
     const key = `retry:${JSON.stringify(AgentAbject.briefAction(action))}`;
     const nudged = (entry.state.nudgedSignatures ??= []);
-    if (kind.choice === 'transient' && p >= 0.85 && (retry ?? 0) >= 0.8 && !nudged.includes(key)) {
+    // "transient" means an unchanged retry would likely succeed: one answer decides the retry.
+    if (kind.choice === 'transient' && p >= 0.85 && !nudged.includes(key)) {
       entry.retryCandidate = { action: structuredClone(action), key };
     }
-    log.info(`[decision:${outcome.mode}] ${scope.onBehalfOf} agent.failure: ${kind.choice}@${p.toFixed(2)} retry_same=${retry?.toFixed(2) ?? '?'}`);
+    log.info(`[decision:${outcome.mode}] ${scope.onBehalfOf} agent.failure: ${kind.choice}@${p.toFixed(2)}`);
     if (p < 0.6) return [];
     return [`The last failure looks like ${kind.choice.replace(/_/g, ' ')} (p=${p.toFixed(2)}): ${FAILURE_GUIDANCE[kind.choice as FailureKind]}.`];
   }
@@ -4204,7 +4210,10 @@ The registered object must implement these handlers to participate in the agent 
       observation: (task.observation ?? '').slice(0, 1000),
       images_in_conversation: withImages.length,
     }, {
-      needs_image: { type: 'noul', instructions: 'Does choosing the next action require looking at the earlier images in the conversation, rather than working from the text?' },
+      needs_image: { type: 'noul', instructions: instruction('Does choosing the next action require looking at the earlier images in the conversation, rather than working from the text?', {
+        notFor: 'The latest image, which is always kept.',
+        examples: ['Yes: judging whether an earlier screenshot\'s layout was fixed. No: the next step reads a file.'],
+      }) },
     }, this.decisionScope(entry));
     const p = noulOf(outcome, 'needs_image');
     if (!outcome || p === undefined || p >= 0.2) return;
@@ -4237,7 +4246,7 @@ The registered object must implement these handlers to participate in the agent 
     const status = choiceOf(outcome, 'completion_status');
     if (!outcome || !status) return undefined;
     const p = status.probabilities[status.choice] ?? 0;
-    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.completion: ${status.choice}@${p.toFixed(2)} claims_unsupported=${noulOf(outcome, 'claims_unsupported')?.toFixed(2) ?? '?'}`);
+    log.info(`[decision:${outcome.mode}] ${this.agentNameOf(entry)} agent.completion: ${status.choice}@${p.toFixed(2)}`);
     if (outcome.mode !== 'act' || p < 0.8) return undefined;
     if (status.choice === 'not_done') return `Runtime completion check: the result reads as intentions or plans rather than outcomes (p=${p.toFixed(2)}). Deliver the requested outcome, or fail with your findings`;
     if (status.choice === 'wrong_task') return `Runtime completion check: the result reads as an answer to a different request (p=${p.toFixed(2)}). Deliver what the task asked, or fail with your findings`;
@@ -4278,8 +4287,7 @@ The registered object must implement these handlers to participate in the agent 
     const disposition = choiceOf(outcome, 'final_disposition');
     if (!outcome || !disposition) return false;
     const p = disposition.probabilities[disposition.choice] ?? 0;
-    const deliverable = noulOf(outcome, 'last_result_is_deliverable') ?? 0;
-    log.info(`[decision:${outcome.mode}] ${agentName} agent.final: ${disposition.choice}@${p.toFixed(2)} deliverable=${deliverable.toFixed(2)}`);
+    log.info(`[decision:${outcome.mode}] ${agentName} agent.final: ${disposition.choice}@${p.toFixed(2)}`);
     if (outcome.mode !== 'act' || p < 0.8) return false;
     const last = task.lastResult;
     const salvageable = !!last?.success && last.data != null && last.data !== '';
@@ -4289,7 +4297,7 @@ The registered object must implement these handlers to participate in the agent 
       setPhase('error');
       return true;
     }
-    if (disposition.choice === 'done_complete' && deliverable >= 0.9 && salvageable) {
+    if (disposition.choice === 'done_last_result_is_deliverable' && salvageable) {
       task.result = last!.data;
       setPhase('done');
       log.info(`[${agentName}] Max steps reached; the last result was judged the deliverable`);
