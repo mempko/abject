@@ -2300,6 +2300,12 @@ The registered object must implement these handlers to participate in the agent 
       };
       const entry = this.streamingEntries.get(correlationId);
       if (!entry) return;
+      // A chunk is proof of life for the very request it belongs to (its
+      // correlation id is that request's message id). Progress events only
+      // reset requests addressed to their sender, so the self-directed one
+      // below never reaches this timer; without this reset a healthy stream
+      // longer than the stall timeout died at exactly that mark.
+      this.resetRequestTimeout(correlationId);
       // Forward to ticket caller via taskStream event
       this.send(event(this.id, entry.callerId, 'taskStream', {
         ticketId: entry.state.id,
@@ -2308,10 +2314,9 @@ The registered object must implement these handlers to participate in the agent 
       }));
 
       // Streaming chunks prove the LLM is alive. Emit a self-directed
-      // progress event so the base-class handler resets ALL pending request
-      // timers (including the 120s stream request timer) and bubbles the
-      // signal upstream through the call tree. Throttled to 1/sec so we
-      // don't flood the bus on fast streams.
+      // progress event so the base-class handler bubbles the signal upstream
+      // through the call tree (the stream's own timer was reset above).
+      // Throttled to 1/sec so we don't flood the bus on fast streams.
       // Throttled per task, not globally: a shared clock would let one busy
       // stream starve the keep-alives that other tasks depend on.
       const now = Date.now();

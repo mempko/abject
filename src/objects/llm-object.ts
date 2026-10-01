@@ -1250,26 +1250,19 @@ export class LLMObject extends Abject {
         onBehalfOf,
       );
 
-      // Keep-alive heartbeat sent every 30s for the entire stream lifetime.
-      // Caller-side request timers are "no progress for N ms" — they reset on
-      // any incoming event from this Abject. The chunk events already cover
-      // the steady-state token-flow case, but two failure modes need an
-      // explicit heartbeat: (1) pre-first-chunk model load / queue time, and
-      // (2) mid-stream subprocess stalls that haven't yet hit the provider's
-      // 180s idle-kill timer. Keeping the keepalive running through the whole
-      // stream fills both gaps for ~one event/30s of overhead.
+      // Keep-alive heartbeat for the entire stream lifetime. Caller-side
+      // request timers are "no progress for N ms", reset by progress events
+      // from the Abject the request was sent to. Chunk events are not
+      // progress events, so the heartbeat beats during token flow as well as
+      // through pre-first-chunk queue time and mid-stream stalls; skipping it
+      // while chunks flowed let a healthy stream longer than the caller's
+      // timeout die at exactly that mark.
       // Must beat the 30s default no-progress request timeout with margin:
       // a heartbeat cadence EQUAL to the timeout loses the race every time
       // (the timer fires at 30.000s; the first beat lands at 30.00x plus bus
       // hops), which killed every ask whose LLM synthesis ran past ~29s.
       const KEEPALIVE_MS = 10000;
-      let lastChunkAt = start;
       const keepaliveTimer: ReturnType<typeof setInterval> = this.setRecurringTimer(() => {
-        const sinceChunk = Date.now() - lastChunkAt;
-        // Skip keepalive if a chunk arrived within the last interval —
-        // chunks already reset upstream timers, so the keepalive is redundant
-        // during healthy token flow.
-        if (sinceChunk < KEEPALIVE_MS) return;
         this.send(
           event(this.id, callerId, 'progress', {
             phase: 'llm-waiting', taskId: options?.cacheKey,
@@ -1289,7 +1282,6 @@ export class LLMObject extends Abject {
             progress.killed = true;
             break;
           }
-          lastChunkAt = Date.now();
           fullContent += chunk.content;
           if (chunk.stopReason) stopReason = chunk.stopReason;
           if (chunk.usage) usage = chunk.usage;
