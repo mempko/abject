@@ -1093,7 +1093,7 @@ by re-matching title/owner.
   }
 
   private placeOriginAnchor(): void {
-    if (!this.surfaceId) return;
+    if (!this.surfaceId || this.destroying) return;
     this.request(request(this.id, this.uiServerId, 'scene', {
       surfaceId: this.surfaceId,
       ops: [{ op: 'update', id: WindowAbject.ORIGIN_ANCHOR, transform: { position: this.originAnchorPosition() } }],
@@ -1110,6 +1110,10 @@ by re-matching title/owner.
   private static readonly DECORATION_ROOT = 'focus-deco';
 
   private async syncFocusDecoration(): Promise<void> {
+    // A closing window loses focus while its surface is being destroyed; the
+    // decoration goes with the surface, so a remove sent now would only reach
+    // the UIServer after the surface is gone.
+    if (this.destroying) return;
     const want = this.windowFocused && !!this.focusDecoration && !this.chromeless && !this.transparent;
     if (want && !this.decorationShown) await this.addFocusDecoration();
     else if (!want && this.decorationShown) await this.removeFocusDecoration();
@@ -1142,7 +1146,7 @@ by re-matching title/owner.
   }
 
   private async placeFocusDecoration(): Promise<void> {
-    if (!this.surfaceId) return;
+    if (!this.surfaceId || this.destroying) return;
     await this.request(request(this.id, this.uiServerId, 'scene', {
       surfaceId: this.surfaceId,
       ops: [{
