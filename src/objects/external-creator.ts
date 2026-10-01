@@ -813,14 +813,18 @@ clean result I did not observe.`;
    *
    * Line and column numbers are deliberately removed: they move whenever a
    * line is inserted above, and a baseline that shifts under every edit would
-   * report every pre-existing error as newly introduced. What is left — the
-   * file, the code, and the message — identifies the same failure across runs.
+   * report every pre-existing error as newly introduced. Per-run identifiers
+   * go for the same reason: UUIDs, long hex ids, epoch-millisecond stamps
+   * (and the random suffix ids built from them carry), ISO timestamps, and
+   * temporary directories' random suffixes differ on every run, so a test that logs one would read as a new failure
+   * each time. What is left — the file, the code, and the message —
+   * identifies the same failure across runs.
    */
   private static signaturesOf(output: string, root?: string): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
     const looksLikeFailure =
-      /(^|\s)(error|Error|ERROR|FAIL|FAILED|Failed|failing|✕|✗|×|●|panic:|Exception|Traceback)\b|error\s+TS\d+|:\s*error\s*:/;
+      /(^|\s)(error|Error|ERROR|FAIL|FAILED|Failed|failing|✕|✗|×|●|panic:|Exception|Traceback)\b|(^|\s)✖|\b[A-Z][A-Za-z]*(Error|Exception)\b|error\s+TS\d+|:\s*error\s*:/;
 
     for (const raw of ExternalCreator.stripAnsi(output).split('\n')) {
       const line = raw.trimEnd();
@@ -834,6 +838,11 @@ clean result I did not observe.`;
         .replace(/:\d+:\d+/g, '')                 // eslint / rustc file:line:col
         .replace(/:\d+(?=[:\s]|$)/g, '')          // file:line
         .replace(/\b\d+(\.\d+)?\s*m?s\b/g, '')    // timings
+        .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<id>') // UUIDs
+        .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?/g, '<time>') // ISO timestamps
+        .replace(/\b\d{10,}(-[a-z0-9]{4,12})?\b/gi, '<n>') // epoch stamps and ids built on them
+        .replace(/\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{12,}\b/gi, '<hex>') // long hex ids and hashes
+        .replace(/((?:\/tmp|\/var\/folders\/[^\s]+?\/T|\\Temp)[\/\\][^\s\/\\'"]*?)[A-Za-z0-9]{6}(?=[\/\\\s'"]|$)/g, '$1<tmp>') // mkdtemp suffixes
         .replace(/\s+/g, ' ')
         .trim();
       if (sig.length < 4) continue;
