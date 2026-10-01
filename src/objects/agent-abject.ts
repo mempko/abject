@@ -3174,9 +3174,13 @@ The registered object must implement these handlers to participate in the agent 
             // A multi-action LLM response queued actions 2..N; execute them
             // in order without an LLM round-trip between them. A mid-batch
             // failure discards the rest so the model reassesses with the
-            // real results in front of it.
+            // real results in front of it. A verb the agent does not have is
+            // the exception: it was rejected before anything ran, so the
+            // actions after it do not depend on it and the batch continues.
             if (entry.pendingActions?.length) {
-              if (task.lastResult && !task.lastResult.success) {
+              const nothingRan = task.lastResult && !task.lastResult.success
+                && AgentAbject.isUnknownActionError(task.lastResult.error);
+              if (task.lastResult && !task.lastResult.success && !nothingRan) {
                 task.llmMessages.push({
                   role: 'user',
                   content: `[Batch] Discarded ${entry.pendingActions.length} remaining batched action(s) because the action before them failed (see the failure result below). Reassess before re-emitting them.`,
@@ -3187,15 +3191,23 @@ The registered object must implement these handlers to participate in the agent 
                 // Record the finished action's result now — the next drained
                 // action overwrites lastResult before any think() runs.
                 this.addActionResultToConversation(entry);
+                if (nothingRan) {
+                  log.info(`[${agentName}] Step ${task.step + 1} — batched "${task.action?.action}" is not an action here; nothing ran, continuing the batch`);
+                  task.llmMessages.push({
+                    role: 'user',
+                    content: `[Batch] "${task.action?.action}" is not one of your actions, so nothing ran for it; the remaining batched action(s) continue.`,
+                  });
+                }
                 task.lastResult = undefined;
                 task.action = entry.pendingActions.shift();
                 log.info(`[${agentName}] Step ${task.step + 1} — draining batched action: ${task.action?.action} (${entry.pendingActions.length} left)`);
 
                 // A terminal is allowed as the LAST batched action, so a plan
                 // can be staged and committed in one response. It only gets
-                // here when everything ahead of it succeeded — a mid-batch
-                // failure discards the rest above — so it never commits work
-                // built on a step that did not happen.
+                // here when everything ahead of it succeeded or was a verb
+                // that ran nothing (a real mid-batch failure discards the
+                // rest above), so it never commits work built on a step that
+                // did not happen.
                 const batchedTerminal = task.action ? this.isTerminalAction(entry, task.action) : null;
                 if (batchedTerminal === 'success') { setPhase('done'); break; }
                 if (batchedTerminal === 'error') { setPhase('error'); break; }
@@ -3953,6 +3965,15 @@ The registered object must implement these handlers to participate in the agent 
 
   private decisionScope(entry: TaskEntry): { goalId?: string; taskId: string; onBehalfOf: string } {
     return { goalId: entry.config.budgetGoalId ?? entry.goalId ?? entry.incomingGoalId, taskId: entry.state.id, onBehalfOf: this.agentNameOf(entry) };
+  }
+
+  /**
+   * Did an agent reject the action's verb itself? Every agent's act handler
+   * answers a verb it does not have with an error starting "Unknown action",
+   * before running anything.
+   */
+  private static isUnknownActionError(error: string | undefined): boolean {
+    return /^Unknown action\b/i.test((error ?? '').trim());
   }
 
   /** An action without its prose fields, long strings clipped: what a judge needs to see. */
