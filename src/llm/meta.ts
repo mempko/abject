@@ -9,7 +9,7 @@
  * model until Meta ships variants.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -29,6 +29,15 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   balanced: 'muse-spark-1.1',
   fast: 'muse-spark-1.1',
   code: 'muse-spark-1.1',
+};
+
+/** Newest model of each line in the live catalog; the defaults above are the offline fallback. */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ family: '^muse-spark-\\d+(\\.\\d+)?$' }],
+    balanced: [{ family: '^muse-spark-\\d+(\\.\\d+)?$' }],
+    fast: [{ family: '^muse-spark-\\d+(\\.\\d+)?$' }],
+  },
 };
 
 /** Muse Spark's documented output ceiling (context window is 1,048,576). */
@@ -96,6 +105,7 @@ export class MetaProvider extends OpenAIProvider {
         { id: 'muse-spark-1.1', name: 'Muse Spark 1.1', vision: true },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

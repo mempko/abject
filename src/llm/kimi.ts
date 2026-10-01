@@ -6,7 +6,7 @@
  * tier models. Kimi is known for very long context windows.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -26,6 +26,13 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   balanced: 'moonshot-v1-32k',
   fast: 'moonshot-v1-8k',
   code: 'kimi-k2.6',
+};
+
+/** Newest model of each line in the live catalog; the defaults above are the offline fallback. */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ family: '^kimi-k\\d+(\\.\\d+)?$' }],
+  },
 };
 
 /** k2.5+ / k2-thinking reason via a thinking param; moonshot-v1-* do not. */
@@ -117,6 +124,7 @@ export class KimiProvider extends OpenAIProvider {
         { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

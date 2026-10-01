@@ -22,6 +22,7 @@ import {
   CacheProfile,
   defaultIsRetryable,
   getTextContent,
+  TierRules,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -92,6 +93,19 @@ export class GeminiProvider extends BaseLLMProvider {
     balanced: 'gemini-3.5-flash',
     fast: 'gemini-3.1-flash-lite',
     code: 'gemini-3.1-pro-preview',
+  };
+
+  /**
+   * Google's moving `-latest` aliases first, else the newest of each line
+   * (a preview only when the line has no release); TIER_MODELS is the
+   * offline fallback.
+   */
+  private static readonly TIER_RULES: TierRules = {
+    tiers: {
+      smart: [{ aliases: ['gemini-pro-latest'] }, { family: '^gemini-\\d+(\\.\\d+)?-pro(-preview)?$' }],
+      balanced: [{ aliases: ['gemini-flash-latest'] }, { family: '^gemini-\\d+(\\.\\d+)?-flash(-preview)?$' }],
+      fast: [{ aliases: ['gemini-flash-lite-latest'] }, { family: '^gemini-\\d+(\\.\\d+)?-flash-lite(-preview)?$' }],
+    },
   };
 
   // Thinking counts against maxOutputTokens (default is only ~8192), so size it
@@ -233,6 +247,7 @@ export class GeminiProvider extends BaseLLMProvider {
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true },
       ],
       defaultTierModels: GeminiProvider.TIER_MODELS,
+      tierRules: GeminiProvider.TIER_RULES,
     };
   }
 

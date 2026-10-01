@@ -5,7 +5,7 @@
  * we subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -27,6 +27,15 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   balanced: 'grok-4.3',
   fast: 'grok-4.3',
   code: 'grok-4.3',
+};
+
+/** Newest model of each line in the live catalog; the defaults above are the offline fallback. */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ family: '^grok-\\d+(\\.\\d+)?$' }],
+    balanced: [{ family: '^grok-\\d+(\\.\\d+)?$' }],
+    fast: [{ family: '^grok-\\d+(\\.\\d+)?$' }],
+  },
 };
 
 /** grok-4.1 and newer accept reasoning_effort; grok-4 / grok-4-0709 / grok-4-fast reject it. */
@@ -109,6 +118,7 @@ export class GrokProvider extends OpenAIProvider {
         { id: 'grok-4-fast', name: 'Grok 4 Fast', vision: true },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

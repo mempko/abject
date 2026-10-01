@@ -5,7 +5,7 @@
  * subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -26,6 +26,15 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   balanced: 'deepseek-v4-flash',
   fast: 'deepseek-v4-flash',
   code: 'deepseek-v4-pro',
+};
+
+/** Newest model of each line in the live catalog; the defaults above are the offline fallback. */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ family: '^deepseek-v\\d+(\\.\\d+)?-pro$' }],
+    balanced: [{ family: '^deepseek-v\\d+(\\.\\d+)?-flash$' }],
+    fast: [{ family: '^deepseek-v\\d+(\\.\\d+)?-flash$' }],
+  },
 };
 
 /** Reasoning models: the explicit pro id or the legacy reasoner alias. */
@@ -113,6 +122,7 @@ export class DeepSeekProvider extends OpenAIProvider {
         { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

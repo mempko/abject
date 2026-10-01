@@ -34,6 +34,7 @@ import {
   userMessage,
 } from '../llm/provider.js';
 import { isContextOverflowError } from '../llm/provider.js';
+import { LATEST_MODEL, MODEL_TIERS, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import {
   validateDecisionRequest, boundDecisionState, isDecisionProvider, summarizeAnswers, stateChars,
   type DecisionProvider, type DecisionRequest, type DecisionResult, type DecisionQuestion, type DecisionState,
@@ -127,6 +128,12 @@ interface ResolvedRoute {
   provider: LLMProvider;
   modelOverride?: string;
   effortOverride?: EffortLevel;
+  /**
+   * Set when the model was recommended from the live catalog rather than
+   * chosen: the provider's pinned default, tried next if the recommendation
+   * fails (a just-released model the account cannot call yet, say).
+   */
+  pinnedFallback?: string;
 }
 
 /** Whether a failed attempt may still be retried elsewhere; both flip once the caller has seen anything. */
@@ -1625,6 +1632,10 @@ export class LLMObject extends Abject {
    */
   registerProvider(provider: LLMProvider): void {
     this.providers.set(provider.name, provider);
+    // Recommended tier models come from the live catalog; fetch it now so
+    // the first call already routes to the recommendation, not the pin.
+    // Re-registration (a Settings save, a new key) refreshes it.
+    if (provider.describe().tierRules) void this.getProviderModels(provider.name, { refresh: true });
     if (!this.defaultProvider) {
       this.defaultProvider = provider.name;
     }
@@ -1641,6 +1652,30 @@ export class LLMObject extends Abject {
       await this.loadLedger();
     } else {
       log.warn('Storage unavailable; the call ledger will reset when the process restarts');
+    }
+    // Recommendations follow new releases: re-read the catalogs daily.
+    this.setRecurringTimer(() => { void this.refreshRecommendations(); }, LLMObject.RECOMMENDATION_REFRESH_MS);
+  }
+
+  private static readonly RECOMMENDATION_REFRESH_MS = 24 * 60 * 60 * 1000;
+
+  /**
+   * Re-read every rule-bearing provider's catalog and log each tier whose
+   * recommended model moved (a new release, a retired line), so a change in
+   * what "Latest" routes to is never silent.
+   */
+  private async refreshRecommendations(): Promise<void> {
+    for (const provider of this.providers.values()) {
+      const desc = provider.describe();
+      if (!desc.tierRules) continue;
+      const before = this.modelListCache.get(provider.name);
+      const after = await this.getProviderModels(provider.name, { refresh: true });
+      if (!before || after.length === 0) continue;
+      for (const tier of MODEL_TIERS) {
+        const was = resolveTier(desc, before, tier).model;
+        const now = resolveTier(desc, after, tier).model;
+        if (was !== now) log.info(`Recommended ${tier} model on ${provider.name} moved: ${was} → ${now}`);
+      }
     }
   }
 
@@ -2143,6 +2178,9 @@ export class LLMObject extends Abject {
       if (seen.has(key)) continue;
       seen.add(key);
       routes.push({ provider, modelOverride: candidate.model, effortOverride: candidate.effort });
+    }
+    if (primary.pinnedFallback && !seen.has(`${primary.provider.name}/${primary.pinnedFallback}`)) {
+      routes.push({ provider: primary.provider, modelOverride: primary.pinnedFallback, effortOverride: primary.effortOverride });
     }
     return routes;
   }
@@ -3447,15 +3485,16 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
       // Mirror resolveProviderAndModel: an unrouted code tier rides smart.
       const config = this.tierRouting[tier] ?? (tier === 'code' ? this.tierRouting.smart : undefined);
-      if (config && this.providers.get(config.provider)) {
+      const configured = config ? this.providers.get(config.provider) : undefined;
+      if (config && configured) {
         providerName = config.provider;
-        model = config.model;
+        model = config.model === LATEST_MODEL ? this.latestModel(configured, tier).model : config.model;
         effort = config.effort;
       } else {
         const provider = this.getProvider();
         if (provider) {
           providerName = provider.name;
-          model = provider.describe().defaultTierModels[tier] || undefined;
+          model = this.latestModel(provider, tier).model;
         }
       }
 
@@ -3500,7 +3539,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   private resolveProviderAndModel(
     providerName?: string,
     tier?: ModelTier,
-  ): { provider: LLMProvider; modelOverride?: string; effortOverride?: EffortLevel } {
+  ): ResolvedRoute {
     // Explicit provider name takes priority (backward compat)
     if (providerName) {
       const provider = this.providers.get(providerName);
@@ -3516,15 +3555,36 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       const config = this.tierRouting[effectiveTier]!;
       const provider = this.providers.get(config.provider);
       if (provider) {
-        return { provider, modelOverride: config.model, effortOverride: config.effort };
+        if (config.model !== LATEST_MODEL) return { provider, modelOverride: config.model, effortOverride: config.effort };
+        const latest = this.latestModel(provider, effectiveTier);
+        return { provider, modelOverride: latest.model, effortOverride: config.effort, ...(latest.pinned ? { pinnedFallback: latest.pinned } : {}) };
       }
       log.warn(`Tier '${effectiveTier}' routes to provider '${config.provider}' which is not registered, falling back to default`);
     }
 
-    // Fall back to default provider
+    // Fall back to the default provider, on its recommended model for the
+    // tier (out of the box, before anything is configured).
     const provider = this.getProvider();
     require(provider !== undefined, 'No LLM provider available');
-    return { provider: provider! };
+    if (!tier || !hasTierRules(provider!.describe(), tier)) return { provider: provider! };
+    const latest = this.latestModel(provider!, tier);
+    return { provider: provider!, modelOverride: latest.model, ...(latest.pinned ? { pinnedFallback: latest.pinned } : {}) };
+  }
+
+  /**
+   * The recommended model for a tier on a provider, from its cached live
+   * catalog (tier-resolver.ts). Until the catalog arrives it is the pinned
+   * default; asking starts the fetch, so the next call sees the live answer.
+   * `pinned` is the provider's own default when the recommendation differs
+   * from it, to try next if the recommended model fails.
+   */
+  private latestModel(provider: LLMProvider, tier: ModelTier): { model: string | undefined; pinned?: string } {
+    const desc = provider.describe();
+    const catalog = this.modelListCache.get(provider.name);
+    if (!catalog && hasTierRules(desc, tier)) void this.getProviderModels(provider.name);
+    const resolved = resolveTier(desc, catalog ?? desc.models, tier);
+    const pinned = desc.defaultTierModels[tier] || desc.defaultTierModels.smart;
+    return { model: resolved.model || undefined, ...(resolved.source !== 'pinned' && pinned && pinned !== resolved.model ? { pinned } : {}) };
   }
 
   /**

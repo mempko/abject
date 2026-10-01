@@ -19,6 +19,7 @@ import {
   EmptyCompletionError,
   defaultIsRetryable,
   isContextOverflowMessage,
+  TierRules,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -189,6 +190,15 @@ export class OpenAIProvider extends BaseLLMProvider {
     code: 'gpt-5.4',
   };
 
+  /** Newest of each line in the live catalog; the tier models are the offline fallback. */
+  private static readonly TIER_RULES: TierRules = {
+    tiers: {
+      smart: [{ family: '^gpt-\\d+(\\.\\d+)?$' }],
+      balanced: [{ family: '^gpt-\\d+(\\.\\d+)?-mini$' }],
+      fast: [{ family: '^gpt-\\d+(\\.\\d+)?-nano$' }],
+    },
+  };
+
   override resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     return options?.tier ? this.tierModels[options.tier] : this.model;
@@ -338,10 +348,11 @@ export class OpenAIProvider extends BaseLLMProvider {
         headers: this.buildHeaders(),
       });
       const parsed = JSON.parse(response.body) as {
-        data?: Array<{ id: string; owned_by?: string }>;
+        data?: Array<{ id: string; owned_by?: string; created?: number }>;
       };
       const rows = parsed.data ?? [];
       if (rows.length === 0) return this.fallbackModels();
+      const createdById = new Map(rows.map(r => [r.id, r.created]));
       // Keep chat-capable text models; drop embeddings/audio/image/moderation/realtime.
       const excluded = /(embedding|whisper|tts|dall-e|moderation|audio|realtime|transcribe|davinci|babbage|ada|curie)/i;
       const filtered = rows
@@ -349,7 +360,10 @@ export class OpenAIProvider extends BaseLLMProvider {
         .filter(id => !excluded.test(id))
         .sort();
       const models = (filtered.length > 0 ? filtered : rows.map(r => r.id))
-        .map(id => ({ id, name: id, vision: this.modelVision(id), efforts: this.supportedEfforts(id) }));
+        .map(id => {
+          const created = createdById.get(id);
+          return { id, name: id, vision: this.modelVision(id), efforts: this.supportedEfforts(id), ...(created !== undefined ? { created } : {}) };
+        });
       return models;
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
@@ -380,6 +394,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       credentialPlaceholder: 'sk-...',
       models: this.fallbackModels(),
       defaultTierModels: this.tierModels,
+      tierRules: OpenAIProvider.TIER_RULES,
     };
   }
 

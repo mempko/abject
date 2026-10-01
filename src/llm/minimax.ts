@@ -6,7 +6,7 @@
  * tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -26,6 +26,14 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   balanced: 'MiniMax-M2.7',
   fast: 'MiniMax-M2.7-highspeed',
   code: 'MiniMax-M3',
+};
+
+/** Newest model of each line in the live catalog; the defaults above are the offline fallback. */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ family: '^MiniMax-M\\d+(\\.\\d+)?$' }],
+    fast: [{ family: '^MiniMax-M\\d+(\\.\\d+)?-highspeed$' }],
+  },
 };
 
 /** M2.x / M3 reason (always-on, not effort-tunable); abab models do not. */
@@ -96,6 +104,7 @@ export class MiniMaxProvider extends OpenAIProvider {
         { id: 'MiniMax-M2', name: 'MiniMax M2', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

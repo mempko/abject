@@ -142,6 +142,45 @@ export interface ModelInfo {
    * window is documented elsewhere.
    */
   contextWindow?: number;
+  /**
+   * When the provider published the model, in epoch seconds, if its catalog
+   * says. Among a model line the newest wins (see tier-resolver.ts).
+   */
+  created?: number;
+  /**
+   * List price in USD per million tokens, if the catalog publishes it. Ranks
+   * a vendor's model lines into tiers where names say nothing about size.
+   */
+  pricing?: { inputPerMTok: number; outputPerMTok: number };
+}
+
+/**
+ * One way to pick a tier's model from a provider's live catalog, so presets
+ * and first-run routing follow new releases without a code change. Rules are
+ * tried in order; the first that finds a model wins.
+ */
+export interface TierRule {
+  /** Moving ids the provider maintains (a "-latest" alias): the first one present in the catalog wins. */
+  aliases?: string[];
+  /** RegExp source over model ids: the newest match wins (catalog date, else the version in the id). */
+  family?: string;
+  /** RegExp source: matching ids are never picked. */
+  exclude?: string;
+}
+
+/**
+ * A provider's catalog rules for every tier. Data, not functions:
+ * descriptions cross worker boundaries by structured clone.
+ */
+export interface TierRules {
+  tiers: Partial<Record<ModelTier, TierRule[]>>;
+  /**
+   * For catalogs that publish one moving alias per model line (OpenRouter's
+   * `~vendor/line-latest`): a RegExp source matching those ids, capture
+   * group 1 naming the vendor. Each vendor's lines are ranked by price into a
+   * tier ladder, and each ladder becomes a preset.
+   */
+  aliasLadders?: string;
 }
 
 /**
@@ -234,6 +273,11 @@ export interface LLMProviderDescription {
   capabilities?: { chat?: boolean; decide?: boolean };
   /** Decision models this provider serves, when `capabilities.decide`. */
   decisionModels?: ModelInfo[];
+  /**
+   * How to pick each tier's model from the live catalog (tier-resolver.ts).
+   * Absent means the provider's `defaultTierModels` are the recommendation.
+   */
+  tierRules?: TierRules;
 }
 
 /** Whether a provider description offers chat completions (the default). */

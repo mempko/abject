@@ -19,6 +19,7 @@ import {
   defaultIsRetryable,
   getTextContent,
   isContextOverflowMessage,
+  TierRules,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -132,6 +133,15 @@ export class AnthropicProvider extends BaseLLMProvider {
     balanced: 'claude-sonnet-4-6',
     fast: 'claude-haiku-4-5-20251001',
     code: 'claude-opus-4-8',
+  };
+
+  /** Newest of each line in the live catalog; TIER_MODELS is the offline fallback. */
+  private static readonly TIER_RULES: TierRules = {
+    tiers: {
+      smart: [{ family: '^claude-opus-' }],
+      balanced: [{ family: '^claude-sonnet-' }],
+      fast: [{ family: '^claude-haiku-' }],
+    },
   };
 
   override resolveModel(options?: LLMCompletionOptions): string {
@@ -330,7 +340,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         return this.fallbackModels();
       }
       const parsed = JSON.parse(response.body) as {
-        data?: Array<{ id: string; display_name?: string }>;
+        data?: Array<{ id: string; display_name?: string; created_at?: string }>;
       };
       const rows = parsed.data ?? [];
       if (rows.length === 0) {
@@ -339,7 +349,13 @@ export class AnthropicProvider extends BaseLLMProvider {
       }
       log.info(`listModels: fetched ${rows.length} live Anthropic models`);
       // Every current Claude chat model accepts image input
-      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id, vision: true, efforts: this.supportedEfforts(r.id) }));
+      return rows.map(r => {
+        const created = r.created_at ? Math.floor(Date.parse(r.created_at) / 1000) : NaN;
+        return {
+          id: r.id, name: r.display_name ?? r.id, vision: true, efforts: this.supportedEfforts(r.id),
+          ...(Number.isFinite(created) ? { created } : {}),
+        };
+      });
     } catch (err) {
       log.warn(`listModels: fetch failed (${err instanceof Error ? err.message : String(err)}); falling back to the hardcoded catalog`);
       return this.fallbackModels();
@@ -365,6 +381,7 @@ export class AnthropicProvider extends BaseLLMProvider {
       credentialPlaceholder: 'sk-ant-...',
       models: this.fallbackModels(),
       defaultTierModels: AnthropicProvider.TIER_MODELS,
+      tierRules: AnthropicProvider.TIER_RULES,
     };
   }
 

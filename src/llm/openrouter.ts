@@ -8,7 +8,7 @@
  * headers.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 import type { DecisionOptions, DecisionProvider, DecisionRequest, DecisionResult } from './decision.js';
@@ -64,7 +64,34 @@ const DECISION_MODELS: ModelInfo[] = [
 ];
 
 interface OpenRouterModelsResponse {
-  data: Array<{ id: string; name?: string; architecture?: { input_modalities?: string[] } }>;
+  data: Array<{
+    id: string; name?: string; created?: number;
+    architecture?: { input_modalities?: string[] };
+    /** USD per token, as decimal strings; '-1' means variable (a router). */
+    pricing?: { prompt?: string; completion?: string };
+  }>;
+}
+
+/**
+ * Tier rules over OpenRouter's catalog. Its `~vendor/line-latest` aliases
+ * are moved by OpenRouter to each line's newest release, so routing to one
+ * follows new models with no change here; each vendor's aliases also form a
+ * price-ranked ladder (one preset per vendor). The pinned defaults above
+ * stay as the offline fallback.
+ */
+const TIER_RULES: TierRules = {
+  tiers: {
+    smart: [{ aliases: ['~anthropic/claude-opus-latest'] }],
+    balanced: [{ aliases: ['~openai/gpt-mini-latest'] }],
+    fast: [{ aliases: ['~google/gemini-flash-latest'] }],
+  },
+  aliasLadders: '^~([^/]+)/',
+};
+
+/** A catalog price string (USD per token) as USD per million tokens. */
+function perMTok(perToken: string | undefined): number | undefined {
+  const n = perToken === undefined ? NaN : Number(perToken);
+  return Number.isFinite(n) ? n * 1_000_000 : undefined;
 }
 
 export class OpenRouterProvider extends OpenAIProvider implements DecisionProvider {
@@ -136,7 +163,9 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
    * ignored where it is not, whereas omitting it on a route that needs it
    * silently costs full price.
    */
-  private static readonly EXPLICIT_CACHE_FAMILIES = /^(anthropic|qwen|google)\//i;
+  // A leading `~` is a moving alias (`~anthropic/claude-opus-latest`), which
+  // routes to the same family and needs the same breakpoints.
+  private static readonly EXPLICIT_CACHE_FAMILIES = /^~?(anthropic|qwen|google)\//i;
 
   protected override supportsExplicitCacheBreakpoints(model: string): boolean {
     return OpenRouterProvider.EXPLICIT_CACHE_FAMILIES.test(model);
@@ -178,15 +207,21 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as OpenRouterModelsResponse;
-      return data.data.map(m => ({
-        id: m.id,
-        name: m.name ?? m.id,
-        // OpenRouter publishes real modality data per model; missing means unknown
-        vision: m.architecture?.input_modalities
-          ? m.architecture.input_modalities.includes('image')
-          : undefined,
-        efforts: this.supportedEfforts(m.id),
-      }));
+      return data.data.map(m => {
+        const input = perMTok(m.pricing?.prompt);
+        const output = perMTok(m.pricing?.completion);
+        return {
+          id: m.id,
+          name: m.name ?? m.id,
+          // OpenRouter publishes real modality data per model; missing means unknown
+          vision: m.architecture?.input_modalities
+            ? m.architecture.input_modalities.includes('image')
+            : undefined,
+          efforts: this.supportedEfforts(m.id),
+          ...(m.created !== undefined ? { created: m.created } : {}),
+          ...(input !== undefined && output !== undefined ? { pricing: { inputPerMTok: input, outputPerMTok: output } } : {}),
+        };
+      });
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id }));
@@ -218,6 +253,7 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
       defaultTierModels: DEFAULT_TIER_MODELS,
       capabilities: { chat: true, decide: true },
       decisionModels: DECISION_MODELS,
+      tierRules: TIER_RULES,
     };
   }
 }

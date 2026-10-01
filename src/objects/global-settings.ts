@@ -14,6 +14,7 @@ import { Log } from '../core/timed-log.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
+import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 
@@ -156,6 +157,11 @@ interface TierPreset {
   vision: { provider: string; model: string } | null;
   /** Optional so presets saved before the row existed still load. */
   fallback?: { provider: string; model: string } | null;
+  /**
+   * The Decision row: a provider and model, or null for Auto. Undefined (a
+   * preset saved before presets carried it) leaves the row as it is.
+   */
+  decision?: { provider: string; model: string } | null;
 }
 
 /**
@@ -206,7 +212,7 @@ const LEGACY_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
 const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
 const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 
-interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: string[]; }
+interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: string[]; created?: number; pricing?: { inputPerMTok: number; outputPerMTok: number }; }
 
 /**
  * GlobalSettings object that provides a configuration UI for LLM API keys.
@@ -481,7 +487,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.dep('GlobalSettings'), 'hide', {});
 
 ### What It Manages
-- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, an optional tier fallback model (stands in when a tier\'s own model fails), and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
+- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, an optional tier fallback model (stands in when a tier\'s own model fails), and tier PRESETS (apply/save/delete a named tier configuration including the Decision row; built-in presets are each provider's recommended models from its live catalog, with tiers on "Latest" that follow new releases, plus one ladder per vendor for catalogs with moving aliases such as OpenRouter; a saved preset freezes the concrete models it had when saved)
 - Auth tab: optional HTTP basic auth for the UI server
 - Permissions tab: category sub-tabs — Filesystem (allowed paths, read-only mode), Shell (enable + command allow/deny), Web (enable + domain allow/deny), Objects (capability enforcement mode)
 - Skills & MCP tab: installed skills (SKILL.md files) and the skills/MCP catalog browser
@@ -1611,10 +1617,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // ── 2 · Preset (card) ──
     // [Preset] [dropdown: saved + built-in] [Apply] [Delete], then
     // [Name] [text input] [Save Preset]. Built-ins are derived from each
-    // provider's defaultTierModels, so every provider ships a starter preset.
+    // provider's live catalog (builtinPresets), so every provider ships a
+    // starter preset that follows new releases.
     {
       const presetCard = await this.sectionCard(cId, '2 · Preset',
-        'Start from a preset — a built-in provider default or one you saved — then fine-tune the tiers below. You can also save the current tier setup under a name.', 34);
+        'Start from a preset (a provider\'s recommended models, which follow new releases, or one you saved), then fine-tune the tiers below. Saving records the current models under a name.', 34);
 
       const presetRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -1781,7 +1788,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
       // Model dropdown (populated from provider's model list)
       const activeProvider = savedProvider && providerIds.includes(savedProvider) ? savedProvider : providerIds[0];
-      const modelList = this.providerModelCache.get(activeProvider) ?? [];
+      const modelList = this.tierModelList(activeProvider, tier);
       const modelOptions = modelList.length > 0
         ? modelList.map(m => m.name)
         : ['(no models)'];
@@ -1810,7 +1817,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // levels. Disabled (single '—') when the model has no effort knob.
       const savedEffort = savedTierRouting[tier].effort ?? null;
       this.tierDesiredEfforts[tier] = savedEffort;
-      const effortOptions = this.effortOptionsFor(activeProvider, modelList[modelIdx]?.id ?? null);
+      const effortOptions = this.effortOptionsFor(activeProvider, modelList[modelIdx]?.id ?? null, tier);
       const effortIdx = savedEffort ? Math.max(0, effortOptions.indexOf(savedEffort)) : 0;
       const { widgetIds: [effortSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -1829,7 +1836,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
 
       // Capability label for the selected model (vision / text-only)
-      const initialCap = this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '');
+      const initialCap = this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '', tier);
       const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
           { type: 'label', windowId: this.windowId, text: initialCap.text,
@@ -2298,24 +2305,43 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   // ========== TIER PRESETS ==========
 
   /**
-   * Built-in starter presets, one per provider, derived from each
-   * description's defaultTierModels — no per-provider knowledge here. The
-   * vision fallback is the provider's first vision-capable catalog model.
+   * Built-in starter presets, derived from each provider's description and
+   * live catalog, with no per-provider knowledge here:
+   * - "<Provider> recommended": every tier on Latest where the provider can
+   *   recommend it from its catalog (so it follows new releases), else the
+   *   provider's default model.
+   * - one "<Provider> · <Vendor>" ladder per vendor, for catalogs that
+   *   publish moving aliases (OpenRouter), in alphabetical order.
+   * Each sets the Decision row to Auto: a keyed decision provider when
+   * there is one, else decisions emulated on the Fast tier.
    */
   private builtinPresets(): Array<{ name: string; preset: TierPreset }> {
     const out: Array<{ name: string; preset: TierPreset }> = [];
     for (const desc of this.providerDescriptions) {
       const d = desc.defaultTierModels;
       if (!d || !d.smart) continue;
+      const catalog = this.providerModelCache.get(desc.id) ?? desc.models;
       const routing: TierPreset['routing'] = {};
       for (const tier of TIER_NAMES) {
-        routing[tier] = { provider: desc.id, model: d[tier] || d.smart };
+        routing[tier] = { provider: desc.id, model: hasTierRules(desc, tier) ? LATEST_MODEL : (d[tier] || d.smart) };
       }
-      const visionModel = desc.models.find(m => m.vision === true);
+      // Vision: the first recommended tier model that takes images, else the
+      // first vision model in the catalog.
+      const recommended = TIER_NAMES.map(t => resolveTier(desc, catalog, t).model);
+      const visionModel = recommended.map(id => catalog.find(m => m.id === id)).find(m => m?.vision === true)
+        ?? catalog.find(m => m.vision === true);
       out.push({
-        name: `${desc.label} defaults`,
-        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null, fallback: null },
+        name: `${desc.label} recommended`,
+        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null, fallback: null, decision: null },
       });
+      for (const ladder of aliasLadders(desc, catalog)) {
+        const ladderRouting: TierPreset['routing'] = {};
+        for (const tier of TIER_NAMES) ladderRouting[tier] = { provider: desc.id, model: ladder.tiers[tier] };
+        out.push({
+          name: `${desc.label} · ${ladder.label}`,
+          preset: { routing: ladderRouting, vision: ladder.vision ? { provider: desc.id, model: ladder.vision } : null, fallback: null, decision: null },
+        });
+      }
     }
     return out;
   }
@@ -2376,18 +2402,25 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, modelSelectId, 'getValue', {})
       );
       if (providerName && modelName && modelName !== '(no models)') {
-        const modelList = this.providerModelCache.get(providerName) ?? [];
-        const info = modelList.find(m => m.name === modelName);
+        const info = this.tierModelList(providerName, tier).find(m => m.name === modelName);
         const effort = this.tierDesiredEfforts[tier];
-        routing[tier] = { provider: providerName, model: info ? info.id : modelName, ...(effort ? { effort } : {}) };
+        // A saved preset is frozen: "Latest" and moving aliases become the
+        // concrete model they point at today, so the preset never drifts.
+        const desc = this.descById(providerName);
+        const catalog = this.providerModelCache.get(providerName) ?? [];
+        const chosen = info ? info.id : modelName;
+        const model = desc ? freezeModel(desc, catalog, tier, chosen) : chosen;
+        routing[tier] = { provider: providerName, model, ...(effort ? { effort } : {}) };
       }
     }
     const vision = await this.readAuxRow('vision');
     const fallback = await this.readAuxRow('fallback');
+    const decision = await this.readAuxRow('decision');
     return {
       routing,
       vision: vision.provider && vision.model ? { provider: vision.provider, model: vision.model } : null,
       fallback: fallback.provider && fallback.model ? { provider: fallback.provider, model: fallback.model } : null,
+      decision: decision.provider && decision.model ? { provider: decision.provider, model: decision.model } : null,
     };
   }
 
@@ -2415,11 +2448,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     for (const key of AUX_ROW_KEYS) {
       const row = this.auxRows[key];
-      // Presets carry chat routing; the Decision row keeps its own choice.
-      if (!row.providerSelectId || key === 'decision') continue;
+      // A preset saved before presets carried the Decision row leaves it be.
+      if (!row.providerSelectId || (key === 'decision' && preset.decision === undefined)) continue;
       const wanted = preset[key] ?? null;
-      const providerOptions = [GlobalSettings.AUX_NONE_LABEL, ...providerLabels];
-      const vIdx = wanted ? providerIds.indexOf(wanted.provider) : -1;
+      const rowIds = this.auxProviderIds(key);
+      const emptyLabel = AUX_ROWS[key].decision ? GlobalSettings.AUX_AUTO_LABEL : GlobalSettings.AUX_NONE_LABEL;
+      const providerOptions = [emptyLabel, ...rowIds.map(id => this.labelForId(id) ?? id)];
+      const vIdx = wanted ? rowIds.indexOf(wanted.provider) : -1;
       await this.request(request(this.id, row.providerSelectId, 'update', {
         options: providerOptions, selectedIndex: vIdx >= 0 ? vIdx + 1 : 0,
       }));
@@ -2682,6 +2717,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         }
       } catch { /* widget gone */ }
     }
+
+    // Built-in presets derive from the live catalog (recommendations, vendor
+    // ladders), so a fresh catalog can change them.
+    if (this.descById(name)?.tierRules) await this.refreshPresetOptions();
   }
 
   /** Format the models-list label for a provider ("3 models: Claude Opus 4.7, …"). */
@@ -2770,7 +2809,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Deliberately NOT auto-applied: applyTierPreset ends in saveSettings(),
     // so applying here would silently overwrite and persist the user's custom
     // tier routing every time they browse the provider dropdown.
-    const presetName = `${desc.label} defaults`;
+    const presetName = `${desc.label} recommended`;
     if (this.resolvePreset(presetName) && this.presetSelectId) {
       const options = this.presetOptionNames();
       const pIdx = options.indexOf(presetName);
@@ -2871,6 +2910,22 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * or the model cache was updated. Preserves the current selection when
    * still present in the new list.
    */
+  /**
+   * A tier's model choices on one provider: "Latest (…)" first when the
+   * provider can recommend the tier from its live catalog (stored as
+   * `latest`, re-resolved on every call so it follows new releases), then
+   * the catalog. The Latest entry carries the recommended model's vision
+   * and effort information.
+   */
+  private tierModelList(provider: LLMProviderName, tier: ModelTierName): ModelInfo[] {
+    const list = this.providerModelCache.get(provider) ?? [];
+    const desc = this.descById(provider);
+    if (!desc || list.length === 0 || !hasTierRules(desc, tier)) return list;
+    const recommended = resolveTier(desc, list, tier).model;
+    const info = list.find(m => m.id === recommended);
+    return [{ ...(info ?? { id: recommended, name: recommended }), id: LATEST_MODEL, name: `Latest (${info?.name ?? recommended})` }, ...list];
+  }
+
   private async refreshTierModelOptions(tier: ModelTierName): Promise<void> {
     const providerSelectId = this.tierProviderSelectIds[tier];
     const modelSelectId = this.tierModelSelectIds[tier];
@@ -2885,7 +2940,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, modelSelectId, 'getValue', {})
     );
 
-    const modelList = this.providerModelCache.get(providerName) ?? [];
+    const modelList = this.tierModelList(providerName, tier);
     const options = modelList.length > 0
       ? modelList.map(m => m.name)
       : ['(no models)'];
@@ -2912,8 +2967,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * list's vision flag. Unknown capability renders as empty rather than
    * guessing.
    */
-  private capabilityLabelFor(provider: LLMProviderName, modelName: string): { text: string; color: string } {
-    const models = this.providerModelCache.get(provider) ?? [];
+  private capabilityLabelFor(provider: LLMProviderName, modelName: string, tier?: ModelTierName): { text: string; color: string } {
+    const models = tier ? this.tierModelList(provider, tier) : this.providerModelCache.get(provider) ?? [];
     const info = models.find(m => m.name === modelName);
     if (info?.vision === true) return { text: '◉ vision', color: this.theme.statusSuccess };
     if (info?.vision === false) return { text: 'text-only', color: this.theme.textTertiary };
@@ -2924,7 +2979,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async updateTierCapabilityLabel(tier: ModelTierName, provider: LLMProviderName, modelName: string): Promise<void> {
     const capLabelId = this.tierCapLabelIds[tier];
     if (!capLabelId) return;
-    const cap = this.capabilityLabelFor(provider, modelName);
+    const cap = this.capabilityLabelFor(provider, modelName, tier);
     try {
       await this.request(request(this.id, capLabelId, 'update', {
         text: cap.text,
@@ -3190,7 +3245,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const modelName = await this.request<string>(
         request(this.id, modelSelectId, 'getValue', {})
       );
-      const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
+      const info = this.tierModelList(provider, tier).find(m => m.name === modelName);
       this.tierDesiredModelIds[tier] = info?.id ?? null;
       await this.updateTierCapabilityLabel(tier, provider, modelName);
       await this.refreshTierEffortOptions(tier, provider, info?.id ?? null);
@@ -3202,9 +3257,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * model's supported levels (from ModelInfo.efforts). A model with no
    * selectable effort gets the single placeholder '—'.
    */
-  private effortOptionsFor(provider: LLMProviderName, modelId: string | null): string[] {
+  private effortOptionsFor(provider: LLMProviderName, modelId: string | null, tier?: ModelTierName): string[] {
     if (!modelId) return ['—'];
-    const info = (this.providerModelCache.get(provider) ?? []).find(m => m.id === modelId);
+    const models = tier ? this.tierModelList(provider, tier) : this.providerModelCache.get(provider) ?? [];
+    const info = models.find(m => m.id === modelId);
     const efforts = info?.efforts ?? [];
     if (efforts.length === 0) return ['—'];
     return [EFFORT_DEFAULT_LABEL, ...efforts];
@@ -3219,7 +3275,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async refreshTierEffortOptions(tier: ModelTierName, provider: LLMProviderName, modelId: string | null): Promise<void> {
     const effortSelectId = this.tierEffortSelectIds[tier];
     if (!effortSelectId) return;
-    const options = this.effortOptionsFor(provider, modelId);
+    const options = this.effortOptionsFor(provider, modelId, tier);
     const desired = this.tierDesiredEfforts[tier];
     let selectedIndex = 0;
     if (desired) {
@@ -4727,7 +4783,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
 
       if (providerName && modelName && modelName !== '(no models)') {
-        const modelList = this.providerModelCache.get(providerName) ?? [];
+        const modelList = this.tierModelList(providerName, tier);
         const modelInfo = modelList.find(m => m.name === modelName);
         tierRouting[tier] = {
           provider: providerName,
