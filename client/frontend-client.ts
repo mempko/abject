@@ -346,6 +346,7 @@ export class FrontendClient {
     this.setupKeyboardCamera();
     this.setupFileUpload();
     this.setupMobilePaletteButton();
+    this.setupMobileExposeButton();
   }
 
   /**
@@ -361,18 +362,35 @@ export class FrontendClient {
       if (!this.authenticated) return;
       this.sendToBackend({ type: 'globalShortcut', combo: 'commandPalette' });
     });
-    this.updateMobilePaletteButton();
+    this.updateMobileButtons();
   }
 
-  /** Show the floating palette button only on mobile once authenticated. */
-  private updateMobilePaletteButton(): void {
-    const btn = document.getElementById('mobile-palette-btn');
+  /**
+   * Wire the floating mobile Exposé button: opens the same window overview
+   * the swipe-up-and-hold gesture on the bottom handle opens, as a tap.
+   */
+  private setupMobileExposeButton(): void {
+    const btn = document.getElementById('mobile-expose-btn');
     if (!btn) return;
+    btn.addEventListener('click', () => {
+      if (!this.authenticated) return;
+      this.compositor.enterExpose();
+    });
+    this.updateMobileButtons();
+  }
+
+  /** Show the floating mobile buttons only on mobile once authenticated. */
+  private updateMobileButtons(): void {
     // Out of the way while the virtual keyboard is up (it would cover the field).
-    if (this.authenticated && this.mobileMode && !this.keyboardVisible) {
-      btn.removeAttribute('hidden');
-    } else {
-      btn.setAttribute('hidden', '');
+    const show = this.authenticated && this.mobileMode && !this.keyboardVisible;
+    for (const id of ['mobile-palette-btn', 'mobile-expose-btn']) {
+      const btn = document.getElementById(id);
+      if (!btn) continue;
+      if (show) {
+        btn.removeAttribute('hidden');
+      } else {
+        btn.setAttribute('hidden', '');
+      }
     }
   }
 
@@ -399,7 +417,7 @@ export class FrontendClient {
       this.mobileMode = (coarse || touch) && nowNarrow;
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
-        this.updateMobilePaletteButton();
+        this.updateMobileButtons();
       }
     });
 
@@ -808,7 +826,7 @@ export class FrontendClient {
       }
       if (this.keyboardVisible !== visible) {
         this.keyboardVisible = visible;
-        this.updateMobilePaletteButton();
+        this.updateMobileButtons();
       }
       this.scheduleKeyboardReveal();
     };
@@ -965,7 +983,7 @@ export class FrontendClient {
         this.hideConnecting();
         this.hideLoginForm();
         this.sendFontMetricsWhenReady();
-        this.updateMobilePaletteButton();
+        this.updateMobileButtons();
         break;
 
       case 'authRequired': {
@@ -987,7 +1005,7 @@ export class FrontendClient {
           this.hideConnecting();
           this.hideLoginForm();
           this.sendFontMetricsWhenReady();
-          this.updateMobilePaletteButton();
+          this.updateMobileButtons();
         } else {
           // Token was rejected — clear it and show form
           localStorage.removeItem('abjects_auth_token');

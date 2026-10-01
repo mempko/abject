@@ -514,6 +514,43 @@
       #mobile-palette-btn[hidden] {
         display: none;
       }
+
+      /* Floating mobile Exposé button: opens the window overview, the same
+         view the swipe-up-and-hold gesture on the bottom handle opens.
+         Sits to the left of the palette button. */
+      #mobile-expose-btn {
+        position: fixed;
+        right: 84px;
+        bottom: 20px;
+        width: 52px;
+        height: 52px;
+        border-radius: 0;
+        border: 2px solid var(--rule);
+        background: var(--red);
+        color: var(--cream);
+        font-size: 1.45rem;
+        font-weight: 700;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 500;
+        box-shadow: 4px 4px 0 var(--shade);
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        cursor: pointer;
+      }
+      #mobile-expose-btn:active {
+        transform: translate(4px, 4px);
+        box-shadow: 0 0 0 var(--shade);
+      }
+      #mobile-expose-btn:focus-visible {
+        outline: 2px solid var(--red);
+        outline-offset: 3px;
+      }
+      #mobile-expose-btn[hidden] {
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -570,6 +607,7 @@
     <input id="file-upload-proxy" type="file"
       style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;" />
     <button id="mobile-palette-btn" type="button" aria-label="Search abjects" hidden>⌘</button>
+    <button id="mobile-expose-btn" type="button" aria-label="Window overview" hidden>▦</button>
     <script type="module" src="./index.ts"></script>
   </body>
 </html>
