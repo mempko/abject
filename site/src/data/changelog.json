@@ -1,5 +1,28 @@
 [
   {
+    "version": "0.13.0",
+    "date": "2026-10-02",
+    "title": "Faster Boots and Self-Updating Model Tiers",
+    "summary": "Abject now starts faster on long-lived workspaces and keeps each model tier pointed at your provider's newest models without manual upkeep. Agents also recover more gracefully when a plan step is rejected or a website puts up a human-verification wall.",
+    "highlights": [
+      "Model tiers now follow each provider's latest models, so new releases are picked up without editing your settings.",
+      "Faster startup on large workspaces: shared state is restored in batches at boot, and sync is scoped to the workspace it belongs to.",
+      "Finished goals are moved to a cold archive, and goal updates no longer rewrite whole records, which keeps the active store small.",
+      "Mobile: a new Exposé button sits next to the quick command button for jumping between windows.",
+      "Mobile touch gestures are simpler: pan mode and horizontal scroll are gone, leaving fewer ways to trigger the wrong gesture.",
+      "Agents try to route around human-verification walls on their own before asking you to step in.",
+      "Decision questions now share one structured shape, and the unused shadow mode has been removed from the decision framework."
+    ],
+    "fixes": [
+      "Long streaming responses no longer time out while tokens are still arriving.",
+      "Agents continue a batched plan when a single action in it is rejected, instead of abandoning the rest.",
+      "Settings now shows model ids you asked for even when the provider does not currently offer them.",
+      "The object creator no longer treats repeated failures as new ones because of per-run identifiers in the failure signature.",
+      "Closing a window no longer sends scene updates for its origin anchor and focus decoration mid-teardown.",
+      "The window manager logs only genuinely unknown mousedown targets, cutting log noise."
+    ]
+  },
+  {
     "version": "0.12.1",
     "date": "2026-09-30",
     "title": "System One: typed decisions for agent judgment calls",
