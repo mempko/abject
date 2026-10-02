@@ -2292,6 +2292,9 @@ export class WorkspaceManager extends Abject {
         accessMode: access.accessMode,
         whitelist: access.whitelist,
         sharedNamespaces: [...WorkspaceManager.SHARED_NAMESPACES],
+        // Its identity: which workspaces SharedState may sync with depends on
+        // it (a joined copy carries its host's id).
+        workspaceId: ws.id,
       }));
       return;
     }

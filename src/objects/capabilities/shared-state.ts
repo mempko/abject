@@ -11,6 +11,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as precondition } from '../../core/contracts.js';
+import { runBounded } from '../../core/bounded.js';
 import { request as createRequest, event as createEvent } from '../../core/message.js';
 import { Log } from '../../core/timed-log.js';
 
@@ -117,6 +118,24 @@ export class SharedState extends Abject {
    */
   private _whitelist: string[] = [];
 
+  /**
+   * The workspace this SharedState belongs to. A joined copy of a workspace
+   * carries its host's id, so the same id names one workspace on every peer.
+   * Unknown until WorkspaceManager says, and nothing syncs until then.
+   *
+   * Who may sync with whom (acceptsSyncFrom, discovery):
+   * - local: nobody.
+   * - shared: only SharedStates of this same workspace (its host and joined
+   *   copies), so its state stays among the workspace's members. Before this,
+   *   discovery reached every workspace a whitelisted peer exposed and every
+   *   shared workspace on this host, and state crossed between workspaces.
+   * - public: this same workspace, or any other public workspace. Public
+   *   workspaces form a commons keyed by namespace name (a chat channel
+   *   namespace is the meeting point), but never take in a non-public
+   *   workspace's state.
+   */
+  private _workspaceId: string | undefined;
+
   // Named state maps — each subscriber group gets its own CRDT map
   private stateMaps: Map<string, LWWMap> = new Map();
   // Track subscribers per state name
@@ -179,6 +198,20 @@ export class SharedState extends Abject {
                 { name: 'key', type: { kind: 'primitive', primitive: 'string' }, description: 'Key to get' },
               ],
               returns: { kind: 'reference', reference: 'any' },
+            },
+            {
+              name: 'getSyncScope',
+              description: 'This state object\'s workspace id and access mode (local, shared, public). Local callers only; refused for messages from peers.',
+              parameters: [],
+              returns: { kind: 'reference', reference: '{ accessMode: string; workspaceId?: string }' },
+            },
+            {
+              name: 'listNamespaces',
+              description: 'Names of the state instances this object holds, optionally only those starting with `prefix`. Local callers only; refused for messages from peers.',
+              parameters: [
+                { name: 'prefix', type: { kind: 'primitive', primitive: 'string' }, description: 'Name prefix to filter by (optional)' },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
             },
             {
               name: 'getAll',
@@ -324,7 +357,7 @@ export class SharedState extends Abject {
         const targets = this.syncTargets();
         log.info(`[${this.id.slice(0, 8)}] new name '${name}' after discovery — requesting sync from ${targets.length} allowed peers`);
         for (const remoteSSId of targets) {
-          this.send(createEvent(this.id, remoteSSId, '_requestSync', {
+          this.send(createEvent(this.id, remoteSSId, '_requestSync', { workspaceId: this._workspaceId, accessMode: this._accessMode,
             names: [name],
           }));
         }
@@ -338,6 +371,20 @@ export class SharedState extends Abject {
       if (!subs) return false;
       subs.delete(msg.routing.from);
       return true;
+    });
+
+    this.on('getSyncScope', async (msg: AbjectMessage) => {
+      precondition(!msg.routing.authenticatedPeerId, 'getSyncScope answers local callers only');
+      return { accessMode: this._accessMode, workspaceId: this._workspaceId };
+    });
+
+    this.on('listNamespaces', async (msg: AbjectMessage) => {
+      // Local maintenance only (GoalManager's orphan cleanup). A peer, even a
+      // whitelisted one, gets nothing from it: replication never needs the
+      // list, and enumerating names would only help a peer go looking.
+      precondition(!msg.routing.authenticatedPeerId, 'listNamespaces answers local callers only');
+      const { prefix } = (msg.payload ?? {}) as { prefix?: string };
+      return [...this.stateMaps.keys()].filter(name => !prefix || name.startsWith(prefix));
     });
 
     this.on('removeNamespace', async (msg: AbjectMessage) => {
@@ -366,6 +413,7 @@ export class SharedState extends Abject {
         propagationId?: string; hopsRemaining?: number;
       };
       const fromId = msg.routing.from;
+      if (!this.acceptsSyncFrom(msg, '_syncEntry')) return;
       log.info(`[${this.id.slice(0, 8)}] _syncEntry from=${fromId.slice(0, 8)} name='${name}' key='${key}'`);
 
       // Add the sender as a known remote peer (bidirectional link)
@@ -394,7 +442,7 @@ export class SharedState extends Abject {
         );
         const selected = this.selectRandom(allPeers, fanout);
         for (const remoteSSId of selected) {
-          this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
+          this.send(createEvent(this.id, remoteSSId, '_syncEntry', { workspaceId: this._workspaceId, accessMode: this._accessMode,
             name, key, entry, propagationId, hopsRemaining: (hopsRemaining ?? 0) - 1,
           }));
         }
@@ -406,6 +454,7 @@ export class SharedState extends Abject {
         name: string; entries: Array<{ key: string; entry: LWWEntry }>;
       };
       const fromId = msg.routing.from;
+      if (!this.acceptsSyncFrom(msg, '_syncFull')) return;
       log.info(`[${this.id.slice(0, 8)}] _syncFull from=${fromId.slice(0, 8)} name='${name}' entries=${entries.length}`);
 
       // Add the sender as a known remote peer (bidirectional link)
@@ -420,6 +469,7 @@ export class SharedState extends Abject {
     this.on('_requestSync', async (msg: AbjectMessage) => {
       // Local workspaces never respond to sync requests
       if (this._accessMode === 'local') return;
+      if (!this.acceptsSyncFrom(msg, '_requestSync')) return;
 
       const { names } = msg.payload as { names: string[] };
       const fromId = msg.routing.from;
@@ -443,7 +493,7 @@ export class SharedState extends Abject {
         const entries = map.exportEntries();
         log.info(`[${this.id.slice(0, 8)}] _requestSync: sending _syncFull for '${name}' with ${entries.length} entries to ${fromId.slice(0, 8)}`);
         if (entries.length === 0) continue;
-        this.send(createEvent(this.id, fromId, '_syncFull', {
+        this.send(createEvent(this.id, fromId, '_syncFull', { workspaceId: this._workspaceId, accessMode: this._accessMode,
           name, entries,
         }));
       }
@@ -475,11 +525,13 @@ export class SharedState extends Abject {
     });
 
     this.on('setAccessMode', async (msg: AbjectMessage) => {
-      const { accessMode, whitelist, sharedNamespaces } = msg.payload as {
+      const { accessMode, whitelist, sharedNamespaces, workspaceId } = msg.payload as {
         accessMode: 'local' | 'shared' | 'public';
         whitelist?: string[];
         sharedNamespaces?: string[];
+        workspaceId?: string;
       };
+      if (typeof workspaceId === 'string' && workspaceId.length > 0) this._workspaceId = workspaceId;
       const prev = this._accessMode;
       this._accessMode = accessMode;
       if (whitelist !== undefined) this._whitelist = whitelist;
@@ -520,6 +572,25 @@ export class SharedState extends Abject {
   private _sharedNamespaces: string[] = [];
 
   /** True when `name` may cross the wire under the current namespace policy. */
+  /**
+   * Whether to take a sync message, by the rule on `_workspaceId`. Every
+   * sync message states its sender's workspace id and access mode; one that
+   * states neither (a peer that predates the rule) is dropped, so a stale
+   * peer cannot carry one workspace's state into another.
+   */
+  private acceptsSyncFrom(msg: AbjectMessage, kind: string): boolean {
+    const payload = (msg.payload ?? {}) as { workspaceId?: unknown; accessMode?: unknown };
+    const sameWorkspace = !!this._workspaceId && payload.workspaceId === this._workspaceId;
+    const accepted = this._accessMode === 'shared' ? sameWorkspace
+      : this._accessMode === 'public' ? sameWorkspace || payload.accessMode === 'public'
+      : false;
+    if (!accepted) {
+      const theirs = typeof payload.workspaceId === 'string' ? `${payload.workspaceId.slice(0, 8)} (${String(payload.accessMode ?? 'mode unstated')})` : 'unstated';
+      log.info(`[${this.id.slice(0, 8)}] dropped ${kind} from ${msg.routing.from.slice(0, 8)}: workspace ${theirs} may not sync with ${this._accessMode} workspace ${this._workspaceId?.slice(0, 8) ?? '(unknown)'}`);
+    }
+    return accepted;
+  }
+
   private namespaceAllowedForSync(name: string): boolean {
     if (this._sharedNamespaces.length === 0) return true;
     for (const pattern of this._sharedNamespaces) {
@@ -668,6 +739,18 @@ export class SharedState extends Abject {
 
     const newRemotePeers = new Map<string, AbjectId>();
 
+    // Sync partners by mode (see _workspaceId): a shared workspace only its
+    // own copies; a public one its own copies and other public workspaces.
+    if (!this._workspaceId) {
+      log.info(`[${this.id.slice(0, 8)}] skipping discovery — workspace identity not yet known`);
+      this.discoveryDone = false;
+      return;
+    }
+    const partner = (ws: { workspaceId?: string; accessMode?: string }): boolean =>
+      ws.workspaceId === this._workspaceId || (this._accessMode === 'public' && ws.accessMode === 'public');
+    discovered = discovered.filter(partner);
+    localShared = localShared.filter(ws => partner(ws as { workspaceId?: string; accessMode?: string }));
+
     // Discover SharedState in each remote workspace via its registry
     for (const ws of discovered) {
       const registryId = ws.registryId as AbjectId;
@@ -749,7 +832,7 @@ export class SharedState extends Abject {
     // Request full sync from newly discovered remote SharedState instances
     for (const remoteSSId of newlyDiscovered) {
       log.info(`[${this.id.slice(0, 8)}] sending _requestSync to ${remoteSSId.slice(0, 8)} for names=${JSON.stringify(subscribedNames)}`);
-      this.send(createEvent(this.id, remoteSSId, '_requestSync', {
+      this.send(createEvent(this.id, remoteSSId, '_requestSync', { workspaceId: this._workspaceId, accessMode: this._accessMode,
         names: subscribedNames,
       }));
     }
@@ -929,7 +1012,7 @@ export class SharedState extends Abject {
 
     log.info(`[${this.id.slice(0, 8)}] gossipBroadcast name='${name}' key='${key}' to ${selected.length}/${allPeers.length} peers`);
     for (const remoteSSId of selected) {
-      this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
+      this.send(createEvent(this.id, remoteSSId, '_syncEntry', { workspaceId: this._workspaceId, accessMode: this._accessMode,
         name, key, entry, propagationId, hopsRemaining: 3,
       }));
     }
@@ -966,6 +1049,15 @@ export class SharedState extends Abject {
     } catch { /* best-effort */ }
   }
 
+  /** Namespaces restored concurrently at boot. */
+  private static readonly RESTORE_CONCURRENCY = 8;
+
+  /**
+   * Restore every persisted entry named in the manifest. Each namespace is
+   * one prefix read from Storage, a few at a time; one `get` per key cost a
+   * cross-thread round trip each and stretched a large workspace's boot to
+   * seconds. Logs one summary line, not the manifest or each key.
+   */
   private async loadPersistedEntries(): Promise<void> {
     if (!this.storageId) return;
     try {
@@ -973,9 +1065,11 @@ export class SharedState extends Abject {
         createRequest(this.id, this.storageId, 'get', { key: 'shared-state:_manifest' }),
       );
       if (!manifest) return;
-      log.info(`[${this.id.slice(0, 8)}] loading persisted manifest:`, manifest);
-
-      for (const [name, keys] of Object.entries(manifest)) {
+      const names = Object.keys(manifest);
+      let restored = 0;
+      let batched = true;
+      const restoreOne = async (name: string): Promise<void> => {
+        const keys = manifest[name] ?? [];
         this.persistedKeys.set(name, new Set(keys));
         let map = this.stateMaps.get(name);
         if (!map) {
@@ -983,20 +1077,30 @@ export class SharedState extends Abject {
           this.stateMaps.set(name, map);
           this.subscribers.set(name, new Set());
         }
-
-        for (const key of keys) {
-          const storageKey = `shared-state:${name}:${key}`;
+        const prefix = `shared-state:${name}:`;
+        let values: Record<string, unknown> | null = null;
+        if (batched) {
           try {
-            const entry = await this.request<LWWEntry | null>(
-              createRequest(this.id, this.storageId!, 'get', { key: storageKey }),
-            );
-            if (entry && entry.value !== undefined) {
-              map.merge(key, entry);
-              log.info(`[${this.id.slice(0, 8)}] restored '${name}':'${key}'`);
-            }
-          } catch { /* best-effort */ }
+            values = await this.request<Record<string, unknown>>(createRequest(this.id, this.storageId!, 'getByPrefix', { prefix }));
+          } catch {
+            batched = false; // a Storage without prefix reads: one get per key
+          }
         }
-      }
+        for (const key of keys) {
+          let entry: LWWEntry | null = null;
+          try {
+            entry = values
+              ? (values[`${prefix}${key}`] as LWWEntry | undefined) ?? null
+              : await this.request<LWWEntry | null>(createRequest(this.id, this.storageId!, 'get', { key: `${prefix}${key}` }));
+          } catch { /* best-effort */ }
+          if (entry && entry.value !== undefined) {
+            map.merge(key, entry);
+            restored++;
+          }
+        }
+      };
+      await runBounded(names.length, SharedState.RESTORE_CONCURRENCY, i => restoreOne(names[i]));
+      log.info(`[${this.id.slice(0, 8)}] restored ${restored} persisted entries across ${names.length} namespaces${batched ? '' : ' (one read per key)'}`);
     } catch (err) {
       log.warn(`[${this.id.slice(0, 8)}] failed to load persisted entries:`, err);
     }
@@ -1038,7 +1142,7 @@ export class SharedState extends Abject {
     }
 
     // Request sync for names where we may have gaps
-    this.send(createEvent(this.id, targetPeer, '_requestSync', {
+    this.send(createEvent(this.id, targetPeer, '_requestSync', { workspaceId: this._workspaceId, accessMode: this._accessMode,
       names: subscribedNames,
     }));
   }

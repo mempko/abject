@@ -6,6 +6,7 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
+import { require } from '../../core/contracts.js';
 
 const log = new Log('Storage');
 
@@ -120,6 +121,18 @@ export class Storage extends Abject {
                 },
               },
               {
+                name: 'getByPrefix',
+                description: 'Every key that starts with `prefix` and its value, in one read. Use it to restore many entries at once; one `get` per key costs a round trip each.',
+                parameters: [
+                  {
+                    name: 'prefix',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Key prefix',
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'any' },
+              },
+              {
                 name: 'keys',
                 description: 'List all keys',
                 parameters: [],
@@ -177,6 +190,12 @@ export class Storage extends Abject {
     this.on('getPrevious', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key: string };
       return this.getPreviousValue(key);
+    });
+
+    this.on('getByPrefix', async (msg: AbjectMessage) => {
+      const { prefix } = msg.payload as { prefix: string };
+      require(typeof prefix === 'string' && prefix.length > 0, 'getByPrefix: prefix must be a non-empty string');
+      return this.getValuesByPrefix(prefix);
     });
 
     this.on('keys', async () => {
@@ -313,6 +332,29 @@ export class Storage extends Abject {
       const request = store.getKey(key);
 
       request.onsuccess = () => resolve(request.result !== undefined);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Every key starting with `prefix` and its value, as one object.
+   */
+  async getValuesByPrefix(prefix: string): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {};
+    if (this.useMemory) {
+      for (const [key, entry] of this.memoryFallback) if (key.startsWith(prefix)) out[key] = entry.value;
+      return out;
+    }
+
+    return new Promise((resolve, reject) => {
+      const tx = this.db!.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+
+      request.onsuccess = () => {
+        for (const entry of request.result as StorageEntry[]) out[entry.key] = entry.value;
+        resolve(out);
+      };
       request.onerror = () => reject(request.error);
     });
   }

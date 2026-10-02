@@ -35,6 +35,7 @@ export class NodeStorage extends Storage {
   private delStmt?: StatementSync;
   private hasStmt?: StatementSync;
   private keysStmt?: StatementSync;
+  private prefixStmt?: StatementSync;
   private clearStmt?: StatementSync;
 
   constructor(storagePath?: string) {
@@ -98,6 +99,17 @@ export class NodeStorage extends Storage {
     return this.hasStmt!.get(key) !== undefined;
   }
 
+  override async getValuesByPrefix(prefix: string): Promise<Record<string, unknown>> {
+    if (!this.sqlite) return super.getValuesByPrefix(prefix);
+    // A range over the primary key, so the read is one index scan. Keys are
+    // ASCII, so every key with the prefix sorts below prefix + U+FFFF.
+    const out: Record<string, unknown> = {};
+    for (const row of this.prefixStmt!.all(prefix, `${prefix}\uffff`) as Array<{ key: string; value: string }>) {
+      try { out[row.key] = JSON.parse(row.value); } catch { /* an unreadable row reads as absent, as in getValue */ }
+    }
+    return out;
+  }
+
   override async getKeys(): Promise<string[]> {
     if (!this.sqlite) return super.getKeys();
     return (this.keysStmt!.all() as Array<{ key: string }>).map(r => r.key);
@@ -133,6 +145,7 @@ export class NodeStorage extends Storage {
     this.delStmt = db.prepare('DELETE FROM kv WHERE key = ?');
     this.hasStmt = db.prepare('SELECT 1 FROM kv WHERE key = ?');
     this.keysStmt = db.prepare('SELECT key FROM kv');
+    this.prefixStmt = db.prepare('SELECT key, value FROM kv WHERE key >= ? AND key < ?');
     this.clearStmt = db.prepare('DELETE FROM kv');
     this.sqlite = db;
     log.info(`Storage opened at ${this.dbPath} (SQLite/WAL)`);
