@@ -355,8 +355,9 @@ export class ChatBrowser extends Abject {
     }, 80);
   }
 
-  /** Run refreshes single-file until none is pending. Fetches BEFORE clearing,
-   *  so a timed-out/failed fetch keeps the current list instead of blanking it. */
+  /** Run refreshes single-file until none is pending. Fetches BEFORE touching
+   *  the window, so a timed-out/failed fetch keeps the current list instead of
+   *  blanking it. */
   private async drainRefresh(): Promise<void> {
     if (this.refreshInFlight) return;
     this.refreshInFlight = true;
@@ -366,13 +367,30 @@ export class ChatBrowser extends Abject {
         if (!this.windowId || !this.rootLayoutId) return;
         const rows = await this.fetchRoster();
         if (rows === null) continue; // keep current; re-loop if more arrived
+        const items = await this.listItems(rows);
+
+        // A list already on screen that stays a list is updated in place.
+        // Rebuilding it put an empty list in the window while every
+        // conversation's history loaded, a visible blink on each roster change,
+        // and it threw away the search text and scroll position.
+        if (this.listWidgetId && rows.length > 0) {
+          this.chatCount = rows.length;
+          this.refreshHeader();
+          try {
+            await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+            continue;
+          } catch { /* list gone; rebuild below */ }
+        }
+
+        // Switching between the empty state and the list changes what the
+        // window holds, so that is rebuilt.
         try {
           await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
         } catch { /* best effort */ }
         this.listWidgetId = undefined;
         this.newChatBtnId = undefined;
         this.headerLabelId = undefined;
-        await this.populate(rows);
+        await this.populate(rows, items);
       }
     } finally {
       this.refreshInFlight = false;
@@ -381,8 +399,10 @@ export class ChatBrowser extends Abject {
 
   // ─── Rendering ─────────────────────────────────────────────────────
 
-  private async populate(rows: PersistedConversation[]): Promise<void> {
+  private async populate(rows: PersistedConversation[], prepared?: ListItem[]): Promise<void> {
     if (!this.rootLayoutId || !this.windowId) return;
+    // Rows first, so the list goes on screen already filled.
+    const items = prepared ?? await this.listItems(rows);
 
     // Header row: section header with the count, and "+ New chat"
     const headerRowId = await this.request<AbjectId>(
@@ -440,7 +460,7 @@ export class ChatBrowser extends Abject {
     // Clicking a row opens the conversation; the action button deletes it.
     const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'list', windowId: this.windowId, items: [], searchable: true }],
+        specs: [{ type: 'list', windowId: this.windowId, items, searchable: true }],
       })
     );
     this.listWidgetId = listId;
@@ -450,14 +470,16 @@ export class ChatBrowser extends Abject {
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
     this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
+  }
 
-    const items: ListItem[] = await Promise.all(
+  /** One list row per conversation, with its history as searchable text. */
+  private async listItems(rows: PersistedConversation[]): Promise<ListItem[]> {
+    return Promise.all(
       rows.map(async (c) => {
         const historyText = await this.fetchConversationHistory(c.conversationId);
         return this.toListItem(c, historyText);
       })
     );
-    await this.request(request(this.id, this.listWidgetId, 'update', { items }));
   }
 
   private async fetchConversationHistory(conversationId: string): Promise<string> {
