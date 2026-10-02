@@ -29,7 +29,7 @@ const SAME_AS_RESULT = '$sameAsOutcomeResult';
 const DEDUPE_MIN_CHARS = 1024;
 /** A settled session: nothing more will happen to it, and nothing waits on it. */
 const TERMINAL = new Set<SessionRecord['status']>(['accepted', 'cancelled']);
-/** Settled sessions older than this leave the store. */
+/** Settled sessions, and sessions interrupted by a restart, older than this leave the store. */
 const RETENTION_MS = 48 * 60 * 60 * 1000;
 /** And no more than this many settled sessions stay, newest first. */
 const MAX_SETTLED_SESSIONS = 150;
@@ -40,22 +40,33 @@ function isRecordObject(v: unknown): v is Record<string, unknown> {
 
 /** The record as stored and held: duplicates of the result replaced by the marker. */
 function compact(rec: SessionRecord): SessionRecord {
+  return compactWithChange(rec).rec;
+}
+
+/**
+ * compact(), also saying whether it replaced anything, so a loader can tell
+ * a record that needs rewriting without serializing the whole record twice
+ * to compare.
+ */
+function compactWithChange(rec: SessionRecord): { rec: SessionRecord; changed: boolean } {
   const outcome = isRecordObject(rec.outcome) ? rec.outcome : undefined;
-  if (!outcome || outcome.result === undefined) return rec;
+  if (!outcome || outcome.result === undefined) return { rec, changed: false };
   const canonical = JSON.stringify(outcome.result);
-  if (canonical.length < DEDUPE_MIN_CHARS) return rec;
+  if (canonical.length < DEDUPE_MIN_CHARS) return { rec, changed: false };
   const same = (v: unknown) => v !== undefined && JSON.stringify(v) === canonical;
   const marker = { [SAME_AS_RESULT]: true };
+  let changed = false;
   const next: SessionRecord = { ...rec, outbox: rec.outbox.map(o => {
     if (!isRecordObject(o.payload)) return o;
     const payload = { ...o.payload };
-    for (const field of ['result', 'evidence']) if (same(payload[field])) payload[field] = marker;
+    for (const field of ['result', 'evidence']) if (same(payload[field])) { payload[field] = marker; changed = true; }
     return { ...o, payload };
   }) };
   if (isRecordObject(rec.snapshot) && isRecordObject(rec.snapshot.state) && same(rec.snapshot.state.result)) {
     next.snapshot = { ...rec.snapshot, state: { ...rec.snapshot.state, result: marker } };
+    changed = true;
   }
-  return next;
+  return { rec: next, changed };
 }
 
 /** The record as callers see it: every marker replaced by a copy of the result. */
@@ -241,7 +252,10 @@ export class TaskSession extends Abject {
     if (!this.storageId) return;
     const now = Date.now();
     const settledIds = [...this.sessions.values()].filter(settled).sort((a, b) => b.updatedAt - a.updatedAt);
-    const evict = settledIds.filter((s, i) => i >= MAX_SETTLED_SESSIONS || now - s.updatedAt > RETENTION_MS);
+    // A session cut off by a restart ('partial') is never resumed after this
+    // long, and nothing would otherwise ever remove it: it is not settled.
+    const staleInterrupted = [...this.sessions.values()].filter(s => s.status === 'partial' && now - s.updatedAt > RETENTION_MS);
+    const evict = [...settledIds.filter((s, i) => i >= MAX_SETTLED_SESSIONS || now - s.updatedAt > RETENTION_MS), ...staleInterrupted];
     if (evict.length === 0) return;
     let payloadKeys: string[] = [];
     try { payloadKeys = (await this.request<string[]>(request(this.id, this.storageId, 'keys', {}))) ?? []; } catch { /* payload sweep is best effort */ }
@@ -256,7 +270,7 @@ export class TaskSession extends Abject {
       });
     }
     await this.request(request(this.id, this.storageId, 'set', { key: 'agent:session-index', value: [...this.sessions.keys()] }));
-    log.info(`retention: removed ${evict.length} settled session(s); ${this.sessions.size} remain`);
+    log.info(`retention: removed ${evict.length} settled or interrupted session(s); ${this.sessions.size} remain`);
   }
   protected override async onInit(): Promise<void> {
     this.storageId = await this.discoverDep('Storage') ?? undefined;
@@ -265,16 +279,15 @@ export class TaskSession extends Abject {
     const stored = index ? (await Promise.all(index.map(id => this.request<SessionRecord | null>(request(this.id, this.storageId!, 'get', { key: `agent:session:${id}` }))))).filter((s): s is SessionRecord => !!s) : await this.request<SessionRecord[] | null>(request(this.id, this.storageId, 'get', { key: 'agent:sessions' }));
     let compacted = 0;
     for (const s of stored ?? []) {
-      const before = JSON.stringify(s);
-      if (s.status === 'running') s.status = 'partial'; // No claim that interrupted effects did or did not happen.
-      const rec = compact(s);
+      const interrupted = s.status === 'running';
+      if (interrupted) s.status = 'partial'; // No claim that interrupted effects did or did not happen.
+      const { rec, changed } = compactWithChange(s);
       // Records written before results were stored once are rewritten in
       // the compact form the first time they are seen; a status change is
       // written back as before.
-      const after = JSON.stringify(rec);
-      if (after !== before) {
+      if (changed || interrupted) {
         await this.request(request(this.id, this.storageId, 'set', { key: `agent:session:${s.id}`, value: rec }));
-        if (after.length < before.length) compacted++;
+        if (changed) compacted++;
       }
       this.hold(rec);
     }

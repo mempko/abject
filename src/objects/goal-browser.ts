@@ -62,6 +62,12 @@ export class GoalBrowser extends Abject {
   private goalWidgetId?: AbjectId;
   private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
+  /**
+   * A destructive confirm is open. A button click can arrive twice (directly
+   * and via WidgetManager's forward), which stacked two dialogs; the second
+   * delivery is dropped while one is up.
+   */
+  private confirmOpen = false;
   private statusLabelId?: AbjectId;
   private emptyLabelId?: AbjectId;
   /** Last empty/non-empty state pushed to the layout (avoids redundant updates). */
@@ -394,8 +400,10 @@ Click the arrow to expand/collapse a goal.
     if (!this.goalManagerId) return;
 
     try {
+      // Archived goals included: finished goals moved to cold storage list
+      // as summaries, and opening one reads it whole.
       this.goals = await this.request<Goal[]>(
-        request(this.id, this.goalManagerId, 'listGoals', {})
+        request(this.id, this.goalManagerId, 'listGoals', { includeArchived: true })
       );
 
       // Auto-expand active goals
@@ -672,13 +680,19 @@ Click the arrow to expand/collapse a goal.
 
     // Stop All button
     if (fromId === this.stopAllBtnId && aspect === 'click') {
-      if (!this.goalObserverId) return;
-      const confirmed = await this.confirm({
-        title: 'Stop All Goals',
-        message: 'Stop all active goals and cancel their tasks?',
-        confirmLabel: 'Stop All',
-        destructive: true,
-      });
+      if (!this.goalObserverId || this.confirmOpen) return;
+      this.confirmOpen = true;
+      let confirmed: boolean;
+      try {
+        confirmed = await this.confirm({
+          title: 'Stop All Goals',
+          message: 'Stop all active goals and cancel their tasks?',
+          confirmLabel: 'Stop All',
+          destructive: true,
+        });
+      } finally {
+        this.confirmOpen = false;
+      }
       if (!confirmed) return;
       this.stopAllQuietUntil = Date.now() + STOP_ALL_QUIET_MS;
       this.send(event(this.id, this.stopAllBtnId, 'update', { busy: true }));
@@ -698,23 +712,39 @@ Click the arrow to expand/collapse a goal.
 
     // Clear button
     if (fromId === this.clearBtnId && aspect === 'click') {
-      const confirmed = await this.confirm({
-        title: 'Clear Goal History',
-        message: 'Clear all completed and failed goals from history?',
-        confirmLabel: 'Clear',
-        destructive: true,
-      });
-      if (!confirmed) return;
-      if (this.goalManagerId) {
-        this.send(request(this.id, this.goalManagerId, 'clearCompleted', {}));
+      if (this.confirmOpen) return;
+      this.confirmOpen = true;
+      let confirmed: boolean;
+      try {
+        confirmed = await this.confirm({
+          title: 'Clear Goal History',
+          message: 'Clear all completed and failed goals from history?',
+          confirmLabel: 'Clear',
+          destructive: true,
+        });
+      } finally {
+        this.confirmOpen = false;
       }
-      // Clear takes the finished goals only; live ones stay in view.
-      this.goals = this.goals.filter(g => g.status === 'active' || g.status === 'paused');
-      const kept = new Set(this.goals.map(g => g.id));
-      for (const id of [...this.tasksByGoal.keys()]) if (!kept.has(id)) this.tasksByGoal.delete(id);
-      for (const id of [...this.expandedGoals]) if (!kept.has(id)) this.expandedGoals.delete(id);
-      await this.rebuildTree();
+      if (!confirmed || !this.goalManagerId) return;
+      // Wait for the result and reload, so the view shows what was actually
+      // cleared (a goal whose learning is still running stays).
+      const result = await this.request<{ cleared?: number; archived?: number; kept?: number } | undefined>(
+        request(this.id, this.goalManagerId, 'clearCompleted', {}), 60000,
+      ).catch(() => undefined);
+      this.tasksByGoal.clear();
+      this.expandedGoals.clear();
+      await this.loadGoals();
       this.playEffect('flash', '$accent');
+      if (result) {
+        const cleared = (result.cleared ?? 0) + (result.archived ?? 0);
+        const kept = result.kept ?? 0;
+        await this.notify(
+          `Cleared ${cleared} goal${cleared === 1 ? '' : 's'}${kept > 0 ? `; ${kept} kept until ${kept === 1 ? 'its' : 'their'} learning review finishes` : ''}`,
+          'success',
+        );
+      } else {
+        await this.notify('Clearing goal history failed', 'error');
+      }
       return;
     }
 

@@ -14,6 +14,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
+import { runBounded } from '../core/bounded.js';
 import { canonical, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
 import { Log } from '../core/timed-log.js';
 import { failureQuestions, producesQuestions, FAILURE_KINDS, type FailureKind } from '../core/decision-questions.js';
@@ -30,6 +31,29 @@ const FAILED_TTL_MS    = 30 * 60 * 1000;   // 30 min failed → archived
 const STALE_TTL_MS     = 15 * 60 * 1000;   // 15 min no progress → abandoned
 const ARCHIVE_TTL_MS   = 60 * 60 * 1000;   // 1 hr archived → deleted
 const MAX_ARCHIVED     = 200;
+/**
+ * A finished goal untouched this long moves to cold storage: kept whole in
+ * Storage, listed and readable on request, but no longer loaded at boot or
+ * held in SharedState.
+ */
+const COLD_ARCHIVE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+/** A goal namespace no goal owns is removed once it is this old (or has no meta). */
+const ORPHAN_NAMESPACE_AFTER_MS = 24 * 60 * 60 * 1000;
+const COLD_INDEX_KEY = 'goals:cold-index';
+const coldGoalKey = (goalId: string): string => `goals:cold:${goalId}`;
+
+/** What the cold index keeps per archived goal, enough to list it. */
+interface ColdGoalSummary {
+  id: GoalId;
+  parentId?: GoalId;
+  title: string;
+  description: string;
+  status: Goal['status'];
+  creatorName?: string;
+  createdAt: number;
+  updatedAt: number;
+  archivedAt: number;
+}
 
 // ─── Data Model ──────────────────────────────────────────────────────
 
@@ -142,6 +166,23 @@ export interface Goal {
 }
 
 // ─── GoalManager ─────────────────────────────────────────────────────
+
+/**
+ * A short, stable fingerprint of a JSON-able value: its serialized length and
+ * a 32-bit FNV-1a hash. Used to tell whether a scratchpad key changed since
+ * it was last published; a collision only costs one skipped republish of a
+ * value that was rewritten to something of the same length and hash.
+ */
+function fingerprint(value: unknown): string {
+  let text: string;
+  try { text = JSON.stringify(value) ?? 'undefined'; } catch { text = String(value); }
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${text.length}:${(h >>> 0).toString(36)}`;
+}
 
 export class GoalManager extends Abject {
   private goals: Map<GoalId, Goal> = new Map();
@@ -383,6 +424,40 @@ export class GoalManager extends Abject {
     this.scratchStamps.set(`${goal.id}::${key}`, stamp);
     const reg: ScratchRegister = { value, updatedAt: stamp.updatedAt, peerId: stamp.peerId };
     this.setRegister(goal.id, `scratch:${key}`, reg);
+    this.publishedFor(goal.id).set(key, fingerprint(value));
+  }
+
+  /**
+   * What each scratchpad key last published as, by fingerprint, per goal. A
+   * fingerprint rather than the text: the scratchpads are large, and holding
+   * a second copy of every one would double their memory.
+   */
+  private publishedScratch: Map<GoalId, Map<string, string>> = new Map();
+
+  private publishedFor(goalId: GoalId): Map<string, string> {
+    let published = this.publishedScratch.get(goalId);
+    if (!published) { published = new Map(); this.publishedScratch.set(goalId, published); }
+    return published;
+  }
+
+  /**
+   * Publish the scratchpad keys that changed since this goal last synced,
+   * each as its own register (a removed key as a register with no value).
+   * The goal's `meta` no longer carries the scratchpad: rewriting all of it
+   * on every progress tick, and storing it twice, was the bulk of a long
+   * history's storage and boot time.
+   */
+  private publishChangedScratch(goal: Goal): void {
+    const published = this.publishedFor(goal.id);
+    for (const [key, value] of Object.entries(goal.scratchpad)) {
+      if (published.get(key) === fingerprint(value)) continue;
+      this.syncScratchKeyToSharedState(goal, key, value);
+    }
+    for (const key of [...published.keys()]) {
+      if (key in goal.scratchpad) continue;
+      this.syncScratchKeyToSharedState(goal, key, undefined);
+      published.delete(key);
+    }
   }
 
   /**
@@ -449,7 +524,8 @@ export class GoalManager extends Abject {
       const stampKey = `${goalId}::${name}`;
       if (!this.registerWins(reg, this.scratchStamps.get(stampKey))) return;
       this.scratchStamps.set(stampKey, { updatedAt: reg.updatedAt, peerId: reg.peerId });
-      goal.scratchpad[name] = reg.value;
+      if (reg.value === undefined) delete goal.scratchpad[name];
+      else goal.scratchpad[name] = reg.value;
       goal.updatedAt = Date.now();
       this.changed('goalUpdated', { goalId, message: `scratchpad.${name} updated by ${String(reg.peerId).slice(0, 8)}` });
       return;
@@ -816,9 +892,9 @@ export class GoalManager extends Abject {
             },
             {
               name: 'clearCompleted',
-              description: 'Archive all completed and failed goals (they are deleted after 1 hour)',
+              description: 'Clear history: remove every finished goal this peer created, and the cold archive, except goals whose learning is unfinished (a review pending or a correction not yet applied). Returns how many were cleared, archived ones removed, and kept.',
               parameters: [],
-              returns: { kind: 'primitive', primitive: 'undefined' },
+              returns: { kind: 'reference', reference: '{ cleared: number; archived: number; kept: number }' },
             },
             {
               name: 'getStats',
@@ -1040,6 +1116,9 @@ export class GoalManager extends Abject {
     // Load goal index from local Storage and subscribe to each goal's SharedState
     await this.loadGoalIndex();
     await this.initGoalCatalog();
+    await this.loadColdIndex();
+    // Housekeeping runs after boot, off the startup path.
+    void this.maintainGoalStore();
   }
 
   /** Load the local goal index from Storage and subscribe to each goal's per-goal SharedState. */
@@ -1055,66 +1134,35 @@ export class GoalManager extends Abject {
     } catch { /* No index yet */ }
 
 
-    // Subscribe to each goal's SharedState and load metadata
-    for (const goalId of goalIds) {
-      const ns = `goal-${goalId}`;
-      try {
-        if (this.sharedStateId) {
-          await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
-          await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
-
-          const all = await this.request<Record<string, unknown>>(
-            request(this.id, this.sharedStateId, 'getAll', { name: ns })
-          );
-          const meta = all?.meta;
-          if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
-            const goalData = meta as Goal;
-            const goal: Goal = {
-              ...goalData,
-              progress: goalData.progress ?? [],
-              scratchpad: goalData.scratchpad ?? {},
-              currentScrumNumber: goalData.currentScrumNumber ?? 0,
-              interjections: goalData.interjections ?? [],
-              // Legacy goals from before description was required: backfill
-              // from title so the field invariant holds.
-              description: goalData.description ?? goalData.title,
-            };
-            if (this.storageId) {
-              const local = await this.request<Record<string, unknown> | null>(request(this.id, this.storageId, 'get', { key: `goals:learning:${goal.id}` })).catch(() => null);
-              if (local?.version === 2) {
-                const state = local.goalState as Partial<Goal> | undefined;
-                // Legacy checkpoints have no ordering information. They must
-                // not undo a newer pause, stop or completion from SharedState.
-                const useLocal = typeof state?.updatedAt === 'number' && state.updatedAt >= goal.updatedAt;
-                if (useLocal) Object.assign(goal, state);
-                const scratchpad = (local.scratchpad ?? {}) as Record<string, unknown>;
-                goal.scratchpad = useLocal
-                  ? { ...goal.scratchpad, ...scratchpad }
-                  : { ...scratchpad, ...goal.scratchpad };
-                goal.lastMeaningfulProgressAt = Math.max(goal.lastMeaningfulProgressAt ?? 0, state?.lastMeaningfulProgressAt ?? 0) || undefined;
-              }
-              else if (local) goal.scratchpad = { ...goal.scratchpad, ...local };
-            }
-            this.goals.set(goal.id, goal);
-            if (!this.goalOrder.includes(goal.id)) {
-              this.goalOrder.push(goal.id);
-            }
-          }
-        }
-      } catch { /* Goal may have been deleted by another peer */ }
+    // Subscribe to each goal's SharedState and load it, a few goals at a
+    // time: one at a time cost three round trips per goal and stretched a
+    // long history's boot to seconds. Order is kept as in the index.
+    const loaded: Array<Goal | undefined> = new Array(goalIds.length);
+    await runBounded(goalIds.length, GoalManager.LOAD_CONCURRENCY, async (i) => {
+      loaded[i] = await this.loadIndexedGoal(goalIds[i]).catch(() => undefined); // deleted by another peer
+    });
+    for (const goal of loaded) {
+      if (!goal) continue;
+      this.goals.set(goal.id, goal);
+      if (!this.goalOrder.includes(goal.id)) this.goalOrder.push(goal.id);
     }
 
     // Unfinished learning outlives the task/goal index and SharedState. Scan
-    // only the owner's journal keys; never require a live task to recover it.
+    // only the owner's journal keys for goals not already loaded (a loaded
+    // goal merged its checkpoint above); never require a live task to
+    // recover it.
     const keys = await this.request<string[]>(request(this.id, this.storageId, 'keys', {})).catch(() => []);
-    for (const key of keys.filter(k => k.startsWith('goals:learning:'))) {
-      const checkpoint = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.storageId, 'get', { key }));
+    const unloaded = keys.filter(k => k.startsWith('goals:learning:') && !this.goals.has(k.slice('goals:learning:'.length)));
+    const checkpoints: Array<{ key: string; checkpoint: { version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null }> = [];
+    await runBounded(unloaded.length, GoalManager.LOAD_CONCURRENCY, async (i) => {
+      const key = unloaded[i];
+      const checkpoint = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(request(this.id, this.storageId!, 'get', { key })).catch(() => null);
+      checkpoints.push({ key, checkpoint });
+    });
+    for (const { key, checkpoint } of checkpoints) {
       if (checkpoint?.version !== 2 || !checkpoint.scratchpad) continue;
-      const id = key.slice('goals:learning:'.length), state = checkpoint.goalState ?? {}, existing = this.goals.get(id);
-      if (existing) {
-        for (const [k,v] of Object.entries(checkpoint.scratchpad)) if (/^learning\/(decision|assessment)\//.test(k)) existing.scratchpad[k] = v;
-        continue;
-      }
+      const id = key.slice('goals:learning:'.length), state = checkpoint.goalState ?? {};
+      if (this.goals.has(id)) continue;
       const recovered: Goal = { id, title: state.title ?? 'Recovered learning episode', description: state.description ?? 'Durable evidence retained for unfinished retrospective learning',
         status: 'archived', createdBy: state.createdBy ?? this.id, creatorName: state.creatorName ?? 'Recovered episode', createdAt: state.createdAt ?? 0,
         updatedAt: state.updatedAt ?? 0, result:state.result,error:state.error, progress:[],childIds:state.childIds ?? [],interjections:[],currentScrumNumber:0,scratchpad:checkpoint.scratchpad };
@@ -1124,6 +1172,262 @@ export class GoalManager extends Abject {
     if (this.goals.size > 0) {
       log.info(`Loaded ${this.goals.size} persisted goals from index`);
     }
+  }
+
+  private static readonly LOAD_CONCURRENCY = 8;
+
+  /**
+   * Load one indexed goal: its SharedState namespace (subscribed for live
+   * updates) and its local learning checkpoint. The scratchpad is rebuilt
+   * from the per-key registers, falling back to the copy older goal records
+   * carried inside `meta`, whichever was written later for each key; the
+   * checkpoint merges on top as before, and its decisions and assessments
+   * always win.
+   */
+  private async loadIndexedGoal(goalId: string): Promise<Goal | undefined> {
+    if (!this.sharedStateId) return undefined;
+    const ns = `goal-${goalId}`;
+    await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+    await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+    const all = await this.request<Record<string, unknown>>(
+      request(this.id, this.sharedStateId, 'getAll', { name: ns })
+    );
+    const meta = all?.meta;
+    if (!meta || typeof meta !== 'object' || !('id' in (meta as object))) return undefined;
+    const goalData = meta as Goal;
+    const scratchpad: Record<string, unknown> = { ...(goalData.scratchpad ?? {}) };
+    for (const [key, value] of Object.entries(all ?? {})) {
+      if (!key.startsWith('scratch:')) continue;
+      const reg = value as ScratchRegister | undefined;
+      if (!reg || typeof reg !== 'object' || typeof reg.updatedAt !== 'number') continue;
+      const name = key.slice('scratch:'.length);
+      // A legacy meta copy written after the register holds the newer value.
+      if (name in scratchpad && typeof goalData.updatedAt === 'number' && goalData.updatedAt > reg.updatedAt) continue;
+      this.scratchStamps.set(`${goalId}::${name}`, { updatedAt: reg.updatedAt, peerId: reg.peerId });
+      if (reg.value === undefined) delete scratchpad[name];
+      else scratchpad[name] = reg.value;
+    }
+    const goal: Goal = {
+      ...goalData,
+      progress: goalData.progress ?? [],
+      scratchpad,
+      currentScrumNumber: goalData.currentScrumNumber ?? 0,
+      interjections: goalData.interjections ?? [],
+      // Legacy goals from before description was required: backfill
+      // from title so the field invariant holds.
+      description: goalData.description ?? goalData.title,
+    };
+    if (this.storageId) {
+      const local = await this.request<Record<string, unknown> | null>(request(this.id, this.storageId, 'get', { key: `goals:learning:${goal.id}` })).catch(() => null);
+      if (local?.version === 2) {
+        const state = local.goalState as Partial<Goal> | undefined;
+        // Legacy checkpoints have no ordering information. They must
+        // not undo a newer pause, stop or completion from SharedState.
+        const useLocal = typeof state?.updatedAt === 'number' && state.updatedAt >= goal.updatedAt;
+        if (useLocal) Object.assign(goal, state);
+        const checkpoint = (local.scratchpad ?? {}) as Record<string, unknown>;
+        goal.scratchpad = useLocal
+          ? { ...goal.scratchpad, ...checkpoint }
+          : { ...checkpoint, ...goal.scratchpad };
+        for (const [k, v] of Object.entries(checkpoint)) if (/^learning\/(decision|assessment)\//.test(k)) goal.scratchpad[k] = v;
+        goal.lastMeaningfulProgressAt = Math.max(goal.lastMeaningfulProgressAt ?? 0, state?.lastMeaningfulProgressAt ?? 0) || undefined;
+      }
+      else if (local) goal.scratchpad = { ...goal.scratchpad, ...local };
+    }
+    return goal;
+  }
+
+  // ── Cold archive ───────────────────────────────────────────────────
+
+  /** Archived goals by id, from Storage: listed and readable, never loaded at boot. */
+  private coldIndex: Map<GoalId, ColdGoalSummary> = new Map();
+  private lastColdSweepAt = 0;
+
+  private async loadColdIndex(): Promise<void> {
+    if (!this.storageId) return;
+    const stored = await this.request<ColdGoalSummary[] | null>(
+      request(this.id, this.storageId, 'get', { key: COLD_INDEX_KEY })).catch(() => null);
+    for (const entry of Array.isArray(stored) ? stored : []) if (entry?.id) this.coldIndex.set(entry.id, entry);
+  }
+
+  private maintaining = false;
+
+  /** Archive due goals, then drop namespaces no goal owns. One run at a time. */
+  private async maintainGoalStore(): Promise<void> {
+    if (this.maintaining) return;
+    this.maintaining = true;
+    try {
+      await this.archiveColdGoals();
+      await this.removeOrphanNamespaces();
+    } catch (err) {
+      log.warn(`goal store maintenance failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.maintaining = false;
+    }
+  }
+
+  /** Created by this peer (or before goals recorded their creator). */
+  private ownGoal(goal: Goal): boolean {
+    return !goal.creatorPeerId || goal.creatorPeerId === this.selfPeerId;
+  }
+
+  /**
+   * Learning work that is genuinely unfinished: a review still pending, or a
+   * correction whose effects are not all applied or abandoned. Narrower than
+   * hasPendingLearning, which also holds a review that ended `partial` with
+   * nothing to apply (it keeps the lifecycle sweep from deleting history).
+   */
+  private hasUnfinishedLearning(goal: Goal): boolean {
+    if (goal.scratchpad['learning/review'] === 'pending') return true;
+    return Object.entries(goal.scratchpad).some(([key, value]) => key.startsWith('learning/decision/')
+      && (value as LearningDecision | undefined)?.effects?.some(e => !['applied', 'abandoned'].includes(e.state)));
+  }
+
+  /**
+   * Created by this peer, finished, quiet for COLD_ARCHIVE_AFTER_MS, and
+   * with no learning work left to do: no review pending and no correction whose effects are not
+   * yet applied or abandoned. A goal whose parent or child is still active
+   * stays, so the tree stays whole while it runs.
+   */
+  private coldArchivable(goal: Goal, now: number): boolean {
+    if (!['completed', 'failed', 'archived'].includes(goal.status)) return false;
+    // Only goals this peer created. A collaborator's goal in a shared
+    // workspace is theirs to archive: archiving it here would either come
+    // back through the catalog or, with a tombstone, vanish for everyone.
+    if (!this.ownGoal(goal)) return false;
+    if (now - goal.updatedAt < COLD_ARCHIVE_AFTER_MS) return false;
+    if (this.hasUnfinishedLearning(goal)) return false;
+    if (goal.parentId && this.goals.get(goal.parentId)?.status === 'active') return false;
+    if ((goal.childIds ?? []).some(id => this.goals.get(id)?.status === 'active')) return false;
+    return true;
+  }
+
+  /**
+   * Move each due goal to cold storage: the whole goal under its own key
+   * first, then the index entry, and only then remove the live copies (its
+   * SharedState namespace, its learning checkpoint, and memory). A crash in
+   * between leaves the goal in both places, and the next sweep finishes it.
+   */
+  private async archiveColdGoals(): Promise<number> {
+    if (!this.storageId) return 0;
+    const now = Date.now();
+    this.lastColdSweepAt = now;
+    const due = [...this.goals.values()].filter(goal => this.coldArchivable(goal, now));
+    if (due.length === 0) return 0;
+    let archived = 0;
+    for (const goal of due) {
+      try {
+        // Its tasks go with it, so an archived goal still shows what ran.
+        const tupleNs = this.getTupleNamespace(goal.id);
+        const coldTasks = this.tupleSpaceId
+          ? await this.request<unknown[]>(request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId: goal.id }, namespace: tupleNs })).catch(() => [])
+          : [];
+        const saved = await this.request<unknown>(request(this.id, this.storageId, 'set', { key: coldGoalKey(goal.id), value: { ...goal, coldTasks } }));
+        if (saved === false) continue;
+        this.coldIndex.set(goal.id, {
+          id: goal.id, ...(goal.parentId ? { parentId: goal.parentId } : {}), title: goal.title,
+          description: (goal.description ?? goal.title).slice(0, 500), status: goal.status,
+          ...(goal.creatorName ? { creatorName: goal.creatorName } : {}),
+          createdAt: goal.createdAt, updatedAt: goal.updatedAt, archivedAt: now,
+        });
+        await this.request(request(this.id, this.storageId, 'set', { key: COLD_INDEX_KEY, value: [...this.coldIndex.values()] }));
+        if (this.sharedStateId) {
+          this.publishCatalogTombstone(goal.id);
+          await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` })).catch(() => { /* best effort */ });
+        }
+        await this.request(request(this.id, this.storageId, 'delete', { key: `goals:learning:${goal.id}` })).catch(() => { /* best effort */ });
+        if (tupleNs === goal.id) await this.removeTupleNamespace(goal.id);
+        this.goals.delete(goal.id);
+        this.publishedScratch.delete(goal.id);
+        for (const key of [...this.scratchStamps.keys()]) if (key.startsWith(`${goal.id}::`)) this.scratchStamps.delete(key);
+        const idx = this.goalOrder.indexOf(goal.id);
+        if (idx !== -1) this.goalOrder.splice(idx, 1);
+        archived++;
+      } catch (err) {
+        log.warn(`cold archive of goal ${goal.id.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (archived > 0) {
+      await this.saveGoalIndex();
+      log.info(`moved ${archived} finished goal(s) older than ${Math.round(COLD_ARCHIVE_AFTER_MS / 86_400_000)} days to cold storage (${this.coldIndex.size} archived in all)`);
+      this.changed('goalsSwept', {});
+    }
+    return archived;
+  }
+
+  /**
+   * In a local workspace, remove `goal-*` namespaces that no live or
+   * archived goal owns (left behind when a goal was deleted but its
+   * namespace removal failed), and task queues whose goal is gone. Only
+   * goal namespaces with no meta or quiet for ORPHAN_NAMESPACE_AFTER_MS.
+   */
+  private async removeOrphanNamespaces(): Promise<void> {
+    if (!this.sharedStateId) return;
+    // Local workspaces only. In a shared or public one, a namespace with no
+    // goal here can be a collaborator's goal not adopted yet, or commons
+    // data held for others: not ours to delete.
+    const scope = await this.request<{ accessMode?: string } | null>(
+      request(this.id, this.sharedStateId, 'getSyncScope', {})).catch(() => null);
+    if (scope?.accessMode !== 'local') return;
+    const names = await this.request<string[]>(
+      request(this.id, this.sharedStateId, 'listNamespaces', { prefix: 'goal-' })).catch(() => [] as string[]);
+    const now = Date.now();
+    let removed = 0;
+    for (const name of names) {
+      const goalId = name.slice('goal-'.length);
+      if (this.goals.has(goalId) || this.coldIndex.has(goalId)) continue;
+      const meta = await this.request<{ updatedAt?: number } | null>(
+        request(this.id, this.sharedStateId, 'get', { name, key: 'meta' })).catch(() => null);
+      if (meta && typeof meta.updatedAt === 'number' && now - meta.updatedAt < ORPHAN_NAMESPACE_AFTER_MS) continue;
+      await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name })).catch(() => { /* best effort */ });
+      removed++;
+    }
+    if (removed > 0) log.info(`removed ${removed} goal namespace(s) no goal owns`);
+
+    // Task queues: one per root goal, named after it. A queue whose goal is
+    // neither live nor archived belonged to a deleted goal.
+    const queues = await this.request<string[]>(
+      request(this.id, this.sharedStateId, 'listNamespaces', { prefix: 'ts-' })).catch(() => [] as string[]);
+    let queuesRemoved = 0;
+    for (const name of queues) {
+      const goalId = name.slice('ts-'.length);
+      if (this.goals.has(goalId) || this.coldIndex.has(goalId)) continue;
+      await this.removeTupleNamespace(goalId);
+      queuesRemoved++;
+    }
+    if (queuesRemoved > 0) log.info(`removed ${queuesRemoved} task queue namespace(s) no goal owns`);
+  }
+
+  /**
+   * Remove a root goal's task queue: from TupleSpace's index, then its data
+   * in SharedState. TupleSpace's own removeNamespace only forgets the name,
+   * which is how thousands of queues outlived their goals.
+   */
+  private async removeTupleNamespace(goalId: GoalId): Promise<void> {
+    if (this.tupleSpaceId) {
+      await this.request(request(this.id, this.tupleSpaceId, 'removeNamespace', { namespace: goalId })).catch(() => { /* best effort */ });
+    }
+    if (this.sharedStateId) {
+      await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `ts-${goalId}` })).catch(() => { /* best effort */ });
+    }
+  }
+
+  /** An archived goal, read whole from cold storage. */
+  private async readColdGoal(goalId: GoalId): Promise<Goal | null> {
+    if (!this.storageId || !this.coldIndex.has(goalId)) return null;
+    const goal = await this.request<Goal | null>(request(this.id, this.storageId, 'get', { key: coldGoalKey(goalId) })).catch(() => null);
+    return goal && goal.id === goalId ? goal : null;
+  }
+
+  /** A cold goal as a list entry: archived, with an empty scratchpad until read. */
+  private coldListEntry(summary: ColdGoalSummary): Goal & { cold: true } {
+    return {
+      id: summary.id, ...(summary.parentId ? { parentId: summary.parentId } : {}),
+      title: summary.title, description: summary.description, status: 'archived',
+      createdBy: this.id, ...(summary.creatorName ? { creatorName: summary.creatorName } : {}),
+      createdAt: summary.createdAt, updatedAt: summary.updatedAt,
+      progress: [], childIds: [], interjections: [], currentScrumNumber: 0, scratchpad: {}, cold: true,
+    } as Goal & { cold: true };
   }
 
   /** Persist the local goal index to Storage. */
@@ -1236,7 +1540,7 @@ reviews results and either plans another round or completes/fails the goal.
 - Goals are created by their originator (e.g. Chat creates one per user request); the planner owns the goal's lifecycle while a scrum is running it.
 - Sub-goals: pass parentId when creating a goal to link it under a parent.
 - clearCompleted archives (not deletes) completed/failed goals. Archived goals auto-delete after 1 hour.
-- listGoals excludes archived goals by default. Pass includeArchived: true to see them.
+- listGoals excludes archived goals by default. Pass includeArchived: true to see them, including goals moved to cold storage (finished goals untouched for 30 days), which list as summaries; getGoal reads one whole.
 - Tasks are backed by TupleSpace (CRDT-synced) — they persist across restarts and sync across peers.
 - Goals metadata syncs to SharedState for cross-peer visibility.
 - Tasks carry the agent the planner assigned them to after polling abilities; there is no task-type matching.`;
@@ -1354,6 +1658,8 @@ reviews results and either plans another round or completes/fails the goal.
     if (changed) {
       this.changed('goalsSwept', {});
     }
+    // Cold archiving moves whole goals out of the live store; once an hour is plenty.
+    if (now - this.lastColdSweepAt >= 60 * 60 * 1000) void this.maintainGoalStore();
   }
 
   /**
@@ -1432,6 +1738,7 @@ reviews results and either plans another round or completes/fails the goal.
     // shared catalog at this one point keeps the index complete without
     // touching each of the mutation call sites.
     this.publishCatalogEntry(goal);
+    this.publishChangedScratch(goal);
     try {
       await this.request(request(this.id, this.sharedStateId, 'set', {
         name: `goal-${goal.id}`,
@@ -1450,7 +1757,6 @@ reviews results and either plans another round or completes/fails the goal.
           error: goal.error,
           createdAt: goal.createdAt,
           updatedAt: goal.updatedAt,
-          scratchpad: goal.scratchpad,
           currentScrumNumber: goal.currentScrumNumber,
           interjections: goal.interjections,
           ...(goal.pendingQuestion ? { pendingQuestion: goal.pendingQuestion } : {}),
@@ -1621,6 +1927,8 @@ reviews results and either plans another round or completes/fails the goal.
   private async readRetainedGoal(goalId: string): Promise<Goal | null> {
     const live = this.goals.get(goalId);
     if (live) return structuredClone(live);
+    const cold = await this.readColdGoal(goalId);
+    if (cold) return cold;
     if (!this.storageId) return null;
     const saved = await this.request<{ version?: number; goalState?: Partial<Goal>; scratchpad?: Record<string, unknown> } | null>(
       request(this.id, this.storageId, 'get', { key: `goals:learning:${goalId}` }));
@@ -2325,7 +2633,7 @@ reviews results and either plans another round or completes/fails the goal.
       const { status, parentId, includeArchived } = (msg.payload ?? {}) as {
         status?: string; parentId?: GoalId; includeArchived?: boolean;
       };
-      return this.goalOrder
+      const live = this.goalOrder
         .map(id => this.goals.get(id))
         .filter((g): g is Goal => {
           if (!g) return false;
@@ -2334,16 +2642,28 @@ reviews results and either plans another round or completes/fails the goal.
           if (parentId !== undefined && g.parentId !== parentId) return false;
           return true;
         });
+      if (!includeArchived || (status && status !== 'archived')) return live;
+      // Cold-archived goals list as summaries; getGoal reads one whole.
+      const cold = [...this.coldIndex.values()]
+        .filter(c => parentId === undefined || c.parentId === parentId)
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .map(c => this.coldListEntry(c));
+      return [...live, ...cold];
     });
 
     this.on('clearCompleted', async () => {
+      // Clearing history takes every finished goal this peer owns, except
+      // ones whose learning is genuinely unfinished (a review still pending,
+      // or a correction not yet applied): those finish first. A review that
+      // ended `partial` with nothing left to apply is history like any other;
+      // counting it as pending made Clear skip nearly every goal.
+      const finished = (g: Goal) => g.status === 'completed' || g.status === 'failed' || g.status === 'archived';
       const goalsToClear: Goal[] = [];
-      const now = Date.now();
-
+      let kept = 0;
       for (const [, goal] of this.goals) {
-        if (goal.scratchpad['learning/review'] !== 'pending' && !this.hasPendingLearning(goal) && (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived')) {
-          goalsToClear.push(goal);
-        }
+        if (!finished(goal) || !this.ownGoal(goal)) continue;
+        if (this.hasUnfinishedLearning(goal)) { kept++; continue; }
+        goalsToClear.push(goal);
       }
 
       for (const goal of goalsToClear) {
@@ -2364,6 +2684,7 @@ reviews results and either plans another round or completes/fails the goal.
               } catch { /* best effort */ }
             }
           } catch { /* best effort */ }
+          if (ns === goal.id) await this.removeTupleNamespace(goal.id);
         }
 
         // Remove entire SharedState namespace (deletes persisted data + unsubscribes)
@@ -2373,15 +2694,34 @@ reviews results and either plans another round or completes/fails the goal.
             await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` }));
           } catch { /* best effort */ }
         }
+        // And its learning checkpoint, or the boot-time recovery of
+        // unfinished learning would bring a partial review back.
+        if (this.storageId) {
+          await this.request(request(this.id, this.storageId, 'delete', { key: `goals:learning:${goal.id}` })).catch(() => { /* best effort */ });
+        }
 
         // Remove from in-memory map entirely (not just archive)
         this.goals.delete(goal.id);
+        this.publishedScratch.delete(goal.id);
+        for (const key of [...this.scratchStamps.keys()]) if (key.startsWith(`${goal.id}::`)) this.scratchStamps.delete(key);
         const idx = this.goalOrder.indexOf(goal.id);
         if (idx !== -1) this.goalOrder.splice(idx, 1);
       }
 
-      this.saveGoalIndex();
+      // The cold archive is history too.
+      const archived = this.coldIndex.size;
+      if (archived > 0 && this.storageId) {
+        for (const id of [...this.coldIndex.keys()]) {
+          await this.request(request(this.id, this.storageId, 'delete', { key: coldGoalKey(id) })).catch(() => { /* best effort */ });
+        }
+        this.coldIndex.clear();
+        await this.request(request(this.id, this.storageId, 'set', { key: COLD_INDEX_KEY, value: [] })).catch(() => { /* best effort */ });
+      }
+
+      await this.saveGoalIndex();
+      log.info(`cleared ${goalsToClear.length} finished goal(s) and ${archived} archived; kept ${kept} whose learning is still in progress`);
       this.changed('goalsCleared', {});
+      return { cleared: goalsToClear.length, archived, kept };
     });
 
     this.on('getStats', async () => {
@@ -2396,7 +2736,8 @@ reviews results and either plans another round or completes/fails the goal.
           case 'archived': archived++; break;
         }
       }
-      return { active, paused, completed, failed, archived, total: this.goals.size };
+      archived += this.coldIndex.size;
+      return { active, paused, completed, failed, archived, total: this.goals.size + this.coldIndex.size };
     });
 
     // ── Task convenience methods (delegate to TupleSpace) ──
@@ -2643,6 +2984,11 @@ reviews results and either plans another round or completes/fails the goal.
     this.on('getTasksForGoal', async (msg: AbjectMessage) => {
       const { goalId, status } = msg.payload as { goalId: string; status?: string };
       requireNonEmpty(goalId, 'goalId');
+      // An archived goal's tasks were kept in its cold record.
+      if (!this.goals.has(goalId) && this.coldIndex.has(goalId)) {
+        const cold = await this.readColdGoal(goalId) as (Goal & { coldTasks?: Array<{ fields: Record<string, unknown> }> }) | null;
+        return (cold?.coldTasks ?? []).filter(t => !status || t.fields?.status === status);
+      }
       if (!this.tupleSpaceId) return [];
 
       const ns = this.getTupleNamespace(goalId as GoalId);
