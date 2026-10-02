@@ -1381,9 +1381,13 @@ Set keepPageOpen: false to explicitly close the page when done.
           notFor: 'A page whose content sits behind an overlay, wall, or sign-in prompt.',
           examples: ['a product page showing its price', 'a search form ready for input'],
         }),
-        human_verification: criterion('A human-verification check blocks the page.', {
-          notFor: 'An ordinary sign-in form, or a cookie consent banner.',
-          examples: ['a "verify you are human" checkbox', 'a "checking your browser" interstitial'],
+        verification_route_around: criterion('A human-verification check blocks this page, and `task` can be done another way: another search engine, the site itself instead of a search, or a public API.', {
+          notFor: 'A check guarding the user\'s own account or a site `task` names; an ordinary sign-in form; a cookie banner.',
+          examples: ['a search engine\'s "unusual traffic" page while researching a general question', 'a "checking your browser" wall on one of many review sites'],
+        }),
+        verification_needs_user: criterion('A human-verification check blocks the page, and `task` needs this site: the user\'s own account, or a site `task` names.', {
+          notFor: 'A check on a search engine or any page the task could replace with another source.',
+          examples: ['a "verify you are human" check on the user\'s bank sign-in', 'a captcha on the store `task` asks to order from'],
         }),
         login_required: criterion('The page asks the visitor to sign in, or shows a signed-out view of content that needs an account.', {
           notFor: 'A visible page that merely offers an optional sign-in link; a prompt for a one-time code.',
@@ -1419,7 +1423,8 @@ Set keepPageOpen: false to explicitly close the page when done.
 
   /** One line of guidance per page state, phrased as what to do next. */
   private static readonly PAGE_STATE_HINTS: Record<string, string> = {
-    human_verification: 'a human-verification check is showing; request_human hands it to the user, and the task continues when they hand back',
+    verification_route_around: 'a human-verification check blocks this route; reach the content another way (another search engine, the site directly, or an API) before asking the user',
+    verification_needs_user: 'a human-verification check guards a site this task needs; request_human hands it to the user, and the task continues when they hand back',
     login_required: 'the page asks for sign-in; sign in with credentials the task provides, or fail with auth_required so the user can sign in or name a signed-in profile',
     otp_or_2fa: 'the page asks for a one-time code; enter one the task provides, or fail with otp_required and keepPageOpen: true',
     consent_banner: 'a consent overlay covers the page; dismiss it first',
@@ -1528,7 +1533,9 @@ Set keepPageOpen: false to explicitly close the page when done.
     const hint = p >= 0.8 ? WebAgent.PAGE_STATE_HINTS[verdict.choice] : undefined;
     const judged = { detail, ...(hint ? { hint: `${hint} (p=${p.toFixed(2)})` } : {}) };
     if (outcome.mode === 'act') {
-      if (verdict.choice === 'human_verification' && p >= 0.9) return { ...judged, act: 'request_human' };
+      // Only a check the task cannot route around goes to the user; a wall
+      // on a replaceable route (a search engine) gets the route-around hint.
+      if (verdict.choice === 'verification_needs_user' && p >= 0.9) return { ...judged, act: 'request_human' };
       if (verdict.choice === 'loading_or_blank' && p >= 0.85) return { ...judged, act: 'wait' };
     }
     return judged;
