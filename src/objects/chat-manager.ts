@@ -314,10 +314,13 @@ export class ChatManager extends Abject {
       const { conversationId, rect } = msg.payload as { conversationId: string; rect: Rect };
       const c = this.conversations.get(conversationId);
       if (!c || !rect) return;
+      // Where a chat window sits is kept so it reopens there, and that is all.
+      // It is not roster news: no row in the overview shows it, and moving a
+      // window is not talking in it. Announcing it rebuilt the overview list
+      // four times a second while a chat window was dragged, and stamped an
+      // idle chat "just now" so it jumped to the top.
       c.rect = rect;
-      c.lastActiveAt = Date.now();
       this.schedulePersist();
-      this.changed('rosterChanged', {});
     });
 
     // Events from child Chat Abjects.
