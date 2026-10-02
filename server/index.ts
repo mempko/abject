@@ -25,6 +25,7 @@ import { Console } from '../src/objects/capabilities/console.js';
 import { FileSystem } from '../src/objects/capabilities/filesystem.js';
 import { WebParser } from '../src/objects/capabilities/web-parser.js';
 import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
+import { BrowserWindowHost } from '../src/objects/capabilities/browser-window-host.js';
 import { WebAgent } from '../src/objects/web-agent.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { Settings } from '../src/objects/settings.js';
@@ -633,6 +634,12 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('WorkspaceCollaboratorInspector', () => new WorkspaceCollaboratorInspector());
   runtime.objectFactory.registerConstructor('WebParser', () => new WebParser());
   runtime.objectFactory.registerConstructor('WebBrowser', () => new WebBrowser());
+  // Desktop app only: opens the Electron windows WebBrowser's pages run in.
+  // Main-thread only, and absent from workerEligible on purpose: Electron's
+  // window APIs exist only on the main process's main thread.
+  if (process.versions.electron) {
+    runtime.objectFactory.registerConstructor('BrowserWindowHost', () => new BrowserWindowHost());
+  }
   runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
   runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
@@ -712,6 +719,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'WebBrowser', 'WebParser', 'FileTransfer', 'MCPBridge',
       // Deliberately NOT worker-eligible:
       // - PeerRouter: synchronous MessageInterceptor installed on the bus.
+      // - BrowserWindowHost: Electron's window APIs live on the main thread.
       // - Supervisor: must not depend on the workers it restarts.
       // - MediaStream: holds live RTCPeerConnection/MediaStreamTrack handles;
       //   needs its track ops turned into P2P-worker RPCs before it can move.
@@ -771,6 +779,10 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   // FileSystem is now per-workspace (spawned by WorkspaceManager rooted at
   // ~/.abject/ws-<id>/files); no global instance.
   const webParserId = await supervisedSpawn('WebParser');
+  // Inside the desktop app WebBrowser's pages are Electron windows, which it
+  // asks BrowserWindowHost for; outside it there is no host and WebBrowser
+  // launches its own Chromium.
+  if (process.versions.electron) await supervisedSpawn('BrowserWindowHost');
   const webBrowserId = await supervisedSpawn('WebBrowser');
   // WebAgent is per-workspace (spawned by WorkspaceManager), not global
   const shellExecutorId = await supervisedSpawn('ShellExecutor');

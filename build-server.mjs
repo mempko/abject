@@ -30,6 +30,9 @@ const runtimeExternals = [
   'node-datachannel/polyfill',
   'ws',
   'playwright',
+  // Only the desktop app's main thread imports it (BrowserWindowHost);
+  // Electron resolves it at runtime.
+  'electron',
   'linkedom',
   'tsx/esm/api',
 ];

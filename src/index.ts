@@ -247,9 +247,10 @@ export type {
   MCPResourceDefinition, MCPInitResult, MCPServerCapabilities,
   JsonRpcRequest, JsonRpcResponse, JsonRpcError,
 } from './core/mcp-types.js';
-// WebParser, WebBrowser, and WebAgent are server-only — import directly from their files:
+// WebParser, WebBrowser, BrowserWindowHost, and WebAgent are server-only — import directly from their files:
 // import { WebParser } from './objects/capabilities/web-parser.js';
 // import { WebBrowser } from './objects/capabilities/web-browser.js';
+// import { BrowserWindowHost } from './objects/capabilities/browser-window-host.js';
 // import { WebAgent } from './objects/web-agent.js';
 
 // Export core types

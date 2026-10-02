@@ -53,6 +53,17 @@ if (!app.requestSingleInstanceLock()) {
       mainWindow.focus();
     }
   });
+
+  // WebBrowser drives this app's own Chromium rather than a bundled one.
+  // Playwright attaches over CDP, on a port Chromium picks and records in
+  // DevToolsActivePort in the user data directory (BrowserWindowHost reads it).
+  // Only the instance holding the lock opens it: a second launch writing that
+  // file on its way out would point WebBrowser at a port nobody listens on.
+  app.commandLine.appendSwitch('remote-debugging-port', '0');
+  // With a debugger port open, Chromium reports navigator.webdriver = true to
+  // every page, which sites read as automation. Playwright's own launches
+  // pass the same switch.
+  app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 }
 
 // Use OS-standard data directory unless explicitly overridden
@@ -66,12 +77,6 @@ if (!process.env.ABJECTS_DATA_DIR) {
     process.env.ABJECTS_DATA_DIR = path.join(home, '.config', 'abject');
   }
 }
-
-// Point Playwright at the bundled headless shell (unpacked from asar)
-const resourcesDir = path.dirname(app.getAppPath());
-process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(
-  resourcesDir, 'app.asar.unpacked', 'playwright-browsers'
-);
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
 const CLIENT_PORT = 0; // OS assigns a free port
@@ -136,6 +141,10 @@ function createWindow(port: number): void {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    // Closing the desktop is quitting, even while WebBrowser still has pages
+    // open: those are windows too (offscreen ones included), so waiting for
+    // 'window-all-closed' would leave the app running with nothing to show.
+    app.quit();
   });
 }
 
@@ -189,12 +198,38 @@ function killChildProcesses(): void {
   }
 }
 
+/**
+ * Write the sessions of every open window to disk.
+ *
+ * Pages WebBrowser still has open may hold a login that Chromium has not
+ * written yet, and it writes through the very network and storage services
+ * that killChildProcesses ends. So they are flushed first, briefly: a flush
+ * that hangs must not hold up quitting.
+ */
+async function flushOpenSessions(): Promise<void> {
+  const sessions = new Set(
+    BrowserWindow.getAllWindows()
+      .filter(w => !w.isDestroyed())
+      .map(w => w.webContents.session),
+  );
+  const flushed = Promise.all([...sessions].map(async (ses) => {
+    try {
+      ses.flushStorageData();
+      await ses.cookies.flushStore();
+    } catch { /* best effort */ }
+  }));
+  await Promise.race([flushed, new Promise<void>(resolve => setTimeout(resolve, 1000))]);
+}
+
 let quitting = false;
 app.on('before-quit', (event) => {
   if (quitting) return;
   quitting = true;
   event.preventDefault();
+  void flushOpenSessions().finally(releaseAndQuit);
+});
 
+function releaseAndQuit(): void {
   killChildProcesses();
 
   const backend = serverModule?.backendShutdown;
@@ -208,7 +243,7 @@ app.on('before-quit', (event) => {
   // does not strand the user with a window that will not close.
   const deadline = new Promise<void>(resolve => setTimeout(resolve, 5000));
   Promise.race([released, deadline]).finally(() => app.quit());
-});
+}
 
 app.on('will-quit', () => {
   // Anything spawned since, and a second chance if the metrics call failed
@@ -263,7 +298,8 @@ app.whenReady().then(async () => {
   setTimeout(() => createWindow(port), 2500);
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    // Not getAllWindows(): WebBrowser's page windows are not the desktop.
+    if (!mainWindow) {
       createWindow(port);
     }
   });

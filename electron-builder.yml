@@ -16,7 +16,6 @@ files:
   - node_modules/uuid/**/*
   - node_modules/ajv/**/*
   - node_modules/yaml/**/*
-  - playwright-browsers/**/*
   - package.json
 
 # Bundled native (WASM) system packages, ingested at boot from
@@ -36,7 +35,6 @@ asarUnpack:
   - dist-server/workers/**/*
   - node_modules/node-datachannel/**/*.node
   - node_modules/node-datachannel/**/prebuilds/**/*
-  - playwright-browsers/**/*
 
 linux:
   target:
@@ -51,8 +49,8 @@ win:
 mac:
   # Both architectures from the one arm64 runner. electron-builder fetches
   # the matching Electron and rebuilds native deps (node-datachannel ships
-  # napi prebuilds for darwin-x64); incarnate:mac already downloads the
-  # mac-x64 and mac-arm64 Playwright shells. Default artifact names keep
+  # napi prebuilds for darwin-x64). No separate browser ships for either:
+  # WebBrowser drives Electron's own Chromium. Default artifact names keep
   # the x64 build unsuffixed (Abject-<v>.dmg) and mark arm64 explicitly.
   target:
     - target: dmg

@@ -6,6 +6,13 @@
  * (openPage → navigateTo → click/fill/type → getContent → closePage).
  *
  * Server-only: requires playwright to be installed.
+ *
+ * Where the browser comes from depends on where the backend runs. As a plain
+ * Node server, Playwright launches its own Chromium. Inside the desktop app,
+ * Playwright attaches over CDP to the Chromium Electron already ships, and
+ * BrowserWindowHost opens the windows the pages live in, so the app carries
+ * no second browser. Either way every page is a Playwright Page, and all the
+ * page methods below work on it the same.
  */
 
 import { AbjectId, AbjectMessage, MethodDeclaration } from '../../core/types.js';
@@ -16,6 +23,7 @@ import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 
 const log = new Log('WebBrowser');
 
@@ -44,7 +52,8 @@ interface BrowseOptions {
    * Browser channel to launch, e.g. 'chrome' or 'msedge' to drive the user's
    * installed branded browser instead of bundled Chromium (stronger, real
    * fingerprint). Falls back to bundled Chromium if the channel isn't
-   * installed. When headful, defaults to 'chrome'.
+   * installed. When headful, defaults to 'chrome', except in the desktop app,
+   * where pages use the app's own Chromium unless a channel is named.
    */
   channel?: string;
 }
@@ -92,6 +101,7 @@ type PlaywrightPage = {
     wheel: (deltaX: number, deltaY: number) => Promise<void>;
   };
   setContent: (html: string) => Promise<void>;
+  setViewportSize: (size: { width: number; height: number }) => Promise<void>;
   on: (event: string, fn: () => void) => void;
   // ARIA snapshot for AI (private Playwright API, stable since ~1.49)
   _snapshotForAI: (opts: { track: string }) => Promise<{ full: string; incremental?: string }>;
@@ -120,6 +130,23 @@ interface TrackedPage {
   /** Profile key ({workspaceId}/{profileName}) the page was opened against, if any. */
   profileKey?: string;
 }
+
+/** Playwright's CDP connection to the desktop app's own Chromium. */
+type CdpBrowser = {
+  contexts: () => Array<{ pages: () => PlaywrightPage[] }>;
+  on: (event: 'disconnected', fn: () => void) => void;
+  close: () => Promise<void>;
+};
+
+/** Viewport a page gets when the caller names none (Playwright's own default). */
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+
+/**
+ * Subdirectory of a profile directory that holds the desktop app's Electron
+ * session. Kept apart from the Playwright user-data-dir that shares the
+ * profile directory, since the two lay their files out differently.
+ */
+const ELECTRON_SESSION_DIR = 'electron-session';
 
 /** A persistent BrowserContext kept alive across openPage calls for one profile. */
 interface ProfileContext {
@@ -897,6 +924,15 @@ export class WebBrowser extends Abject {
   /** Absolute base dir for all on-disk profile jars. */
   private profilesRoot: string;
 
+  /** BrowserWindowHost, found only when running inside the desktop app. */
+  private windowHostId?: AbjectId;
+  /** CDP connection to the desktop app's Chromium, opened on first use. */
+  private electronBrowser: Promise<CdpBrowser> | null = null;
+  /** Profiles whose Electron session has been opened during this run. */
+  private openedElectronProfiles: Set<string> = new Set();
+  /** Pages that live in app windows (desktop app), as opposed to launched browsers. */
+  private electronPages: WeakSet<object> = new WeakSet();
+
   /** Storage key for the profile metadata index ({name, createdAt, lastUsed}). */
   private static readonly PROFILES_INDEX_KEY = 'web-browser:profiles';
 
@@ -1670,6 +1706,26 @@ export class WebBrowser extends Abject {
    * survive across calls). Otherwise the existing ephemeral path is used.
    */
   private async createPage(callerId: AbjectId, options?: BrowseOptions): Promise<unknown> {
+    const hostId = await this.windowHost();
+    if (!hostId) return this.createLaunchedPage(callerId, options);
+
+    // Inside the desktop app every page is an app window, headless or headful,
+    // so one profile is one cookie jar. Only a browser channel the caller
+    // names explicitly is launched separately, and an app window stands in if
+    // that browser is not installed.
+    if (!(options?.channel ?? process.env.ABJECTS_BROWSER_CHANNEL)) {
+      return this.createElectronPage(hostId, callerId, options);
+    }
+    try {
+      return await this.createLaunchedPage(callerId, options);
+    } catch (err) {
+      log.info(`channel launch failed, opening an app window instead: ${err instanceof Error ? err.message : String(err)}`);
+      return this.createElectronPage(hostId, callerId, options);
+    }
+  }
+
+  /** A page in a browser Playwright launched itself (always, outside the desktop app). */
+  private async createLaunchedPage(callerId: AbjectId, options?: BrowseOptions): Promise<unknown> {
     const pageOpts: Record<string, unknown> = {
       acceptDownloads: true,  // Prevent "Download is starting" errors for non-HTML responses
     };
@@ -1685,6 +1741,134 @@ export class WebBrowser extends Abject {
       newPage: (opts?: unknown) => Promise<unknown>;
     };
     return browser.newPage(pageOpts);
+  }
+
+  // ===========================================================================
+  // Desktop app: pages in Electron's own Chromium
+  // ===========================================================================
+
+  /**
+   * BrowserWindowHost's id when running inside the desktop app, otherwise
+   * undefined. Outside Electron the registry is never asked.
+   */
+  private async windowHost(): Promise<AbjectId | undefined> {
+    if (!process.env.ELECTRON_PACKAGED) return undefined;
+    this.windowHostId = await this.resolveDep('BrowserWindowHost', this.windowHostId);
+    return this.windowHostId;
+  }
+
+  /** Connect Playwright to the app's Chromium once, and again after a disconnect. */
+  private ensureElectronBrowser(hostId: AbjectId): Promise<CdpBrowser> {
+    if (!this.electronBrowser) {
+      const connecting = (async () => {
+        const { endpoint } = await this.request<{ endpoint: string }>(
+          request(this.id, hostId, 'getCdpEndpoint', {}));
+        const pw = await import('playwright');
+        const browser = await pw.chromium.connectOverCDP(endpoint) as unknown as CdpBrowser;
+        browser.on('disconnected', () => {
+          if (this.electronBrowser === connecting) this.electronBrowser = null;
+        });
+        log.info(`attached to the app's Chromium at ${endpoint}`);
+        return browser;
+      })();
+      connecting.catch(() => {
+        if (this.electronBrowser === connecting) this.electronBrowser = null;
+      });
+      this.electronBrowser = connecting;
+    }
+    return this.electronBrowser;
+  }
+
+  /**
+   * Open a page as an app window: the host creates the window at
+   * about:blank#<token>, and the page is found over CDP by that token. The
+   * token is also what tells these pages apart from the app's own window,
+   * which the CDP connection sees too.
+   */
+  private async createElectronPage(
+    hostId: AbjectId,
+    callerId: AbjectId,
+    options?: BrowseOptions,
+  ): Promise<PlaywrightPage> {
+    const browser = await this.ensureElectronBrowser(hostId);
+    const sessionPath = options?.profile
+      ? await this.electronProfileSession(callerId, options.profile)
+      : undefined;
+    const viewport = options?.viewport ?? DEFAULT_VIEWPORT;
+    const token = `abjects-page-${randomUUID()}`;
+    try {
+      await this.request(request(this.id, hostId, 'createWindow', {
+        token,
+        sessionPath,
+        headful: !this.browserHeadless(options),
+        viewport,
+        userAgent: options?.userAgent,
+      }));
+    } catch (err) {
+      // A host the Supervisor restarted has a new id; look it up afresh next time.
+      if (this.windowHostId === hostId) this.windowHostId = undefined;
+      throw err;
+    }
+
+    let page: PlaywrightPage;
+    try {
+      page = await this.findElectronPage(browser, token);
+      // Fix the layout viewport as a launched browser does, so viewport
+      // reads, screenshots and viewer coordinates agree whatever the window.
+      await page.setViewportSize(viewport);
+    } catch (err) {
+      this.closeElectronWindow(hostId, token);
+      throw err;
+    }
+    // However the page ends (closed here, closed by the user, connection
+    // lost), its window goes with it.
+    page.on('close', () => this.closeElectronWindow(hostId, token));
+    this.electronPages.add(page);
+    return page;
+  }
+
+  /** The CDP page whose URL carries the token, once Playwright has attached to it. */
+  private async findElectronPage(browser: CdpBrowser, token: string): Promise<PlaywrightPage> {
+    const marker = `#${token}`;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      for (const context of browser.contexts()) {
+        for (const page of context.pages()) {
+          if (page.url().endsWith(marker)) return page;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`App window ${token} never appeared over CDP`);
+  }
+
+  private closeElectronWindow(hostId: AbjectId, token: string): void {
+    this.request(request(this.id, hostId, 'closeWindow', { token })).catch(() => {
+      /* host gone; its windows went with it */
+    });
+  }
+
+  /**
+   * On-disk session directory for a profile in the desktop app, recorded in
+   * the same profile index the launched path uses.
+   */
+  private async electronProfileSession(callerId: AbjectId, profileName: string): Promise<string> {
+    const wsId = await this.resolveCallerWorkspace(callerId);
+    const safeName = this.sanitizeProfileName(profileName);
+    requireContract(safeName.length > 0, `Invalid profile name: ${profileName}`);
+    const key = `${wsId}/${safeName}`;
+    const dir = path.join(this.profilesRoot, wsId, safeName);
+    const sessionPath = path.join(dir, ELECTRON_SESSION_DIR);
+    await fs.mkdir(sessionPath, { recursive: true });
+
+    const now = Date.now();
+    await this.writeProfileIndex(key, { workspaceId: wsId, name: safeName, dir, createdAt: now, lastUsed: now });
+    if (!this.openedElectronProfiles.has(key)) {
+      this.openedElectronProfiles.add(key);
+      this.changed('profileOpened', { profile: safeName, workspaceId: wsId });
+      log.info(`profile session ready: ${key} (${sessionPath})`);
+    }
+    return sessionPath;
   }
 
   /**
@@ -1750,18 +1934,25 @@ export class WebBrowser extends Abject {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('Download is starting')) {
+      const announced = msg.includes('Download is starting');
+      // An app window in the desktop app cancels downloads rather than raise a
+      // save dialog, and Playwright reports that only as an aborted
+      // navigation. Whether it was a download is read off the response.
+      const cancelled = !announced && msg.includes('net::ERR_ABORTED') && this.electronPages.has(page);
+      if (announced || cancelled) {
         // Non-HTML response (text/plain, application/octet-stream, etc.)
         // Fetch the content directly and inject it into the page as preformatted text
         log.info(`navigatePage: download triggered for ${url}, fetching content directly`);
         try {
           const resp = await fetch(url);
+          if (cancelled && !WebBrowser.isDownloadResponse(resp)) throw err;
           const text = await resp.text();
           const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           await page.setContent(
             `<html><head><title>${url}</title></head><body><pre>${escaped}</pre></body></html>`
           );
         } catch (fetchErr) {
+          if (fetchErr === err) throw err;
           throw new Error(`Download response from ${url} and fetch fallback failed: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
         }
         return;
@@ -1771,6 +1962,19 @@ export class WebBrowser extends Abject {
     if (options?.waitFor) {
       await page.waitForSelector(options.waitFor, { timeout });
     }
+  }
+
+  /**
+   * Whether Chromium would have downloaded this response rather than shown
+   * it: an attachment, or a type it does not render. Anything else that
+   * aborted a navigation (a 204, a navigation cut short by another) is a
+   * real failure, not a download.
+   */
+  private static isDownloadResponse(resp: Response): boolean {
+    if (!resp.ok || resp.status === 204 || resp.status === 205) return false;
+    if (/^\s*attachment/i.test(resp.headers.get('content-disposition') ?? '')) return true;
+    const type = (resp.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+    return !/^(text|image|video|audio)\/|^application\/(json|xml|xhtml\+xml|javascript)$|\+(xml|json)$/.test(type);
   }
 
   // ===========================================================================
@@ -1969,7 +2173,10 @@ export class WebBrowser extends Abject {
   }
 
   /** Persist the metadata for a single profile under the Storage index. */
-  private async writeProfileIndex(key: string, entry: ProfileContext): Promise<void> {
+  private async writeProfileIndex(
+    key: string,
+    entry: Pick<ProfileContext, 'workspaceId' | 'name' | 'dir' | 'createdAt' | 'lastUsed'>,
+  ): Promise<void> {
     if (!this.storageId) return;
     try {
       const index = await this.readProfileIndex();
@@ -2047,7 +2254,7 @@ export class WebBrowser extends Abject {
         name: meta.name,
         createdAt: meta.createdAt,
         lastUsed: live?.lastUsed ?? meta.lastUsed,
-        openPages: live?.openPages ?? 0,
+        openPages: this.liveProfilePages(key),
       });
     }
     return results;
@@ -2069,16 +2276,43 @@ export class WebBrowser extends Abject {
       try { await live.context.close(); } catch { /* ignore */ }
     }
 
-    // Remove the on-disk profile directory.
+    // In the desktop app the profile is also an Electron session. Wipe it
+    // through the host; if Electron has it open, its directory must survive
+    // (see BrowserWindowHost.clearSession), so the rest is removed around it.
     const dir = path.join(this.profilesRoot, wsId, safeName);
-    try {
-      await fs.rm(dir, { recursive: true, force: true });
-    } catch { /* best effort */ }
+    let keep: string | undefined;
+    const hostId = await this.windowHost();
+    if (hostId) {
+      try {
+        const { live } = await this.request<{ live: boolean }>(request(this.id, hostId, 'clearSession',
+          { sessionPath: path.join(dir, ELECTRON_SESSION_DIR) }));
+        if (live) keep = ELECTRON_SESSION_DIR;
+      } catch (err) {
+        log.info(`profile session clear failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    this.openedElectronProfiles.delete(key);
+
+    // Remove the on-disk profile directory.
+    await this.removeProfileDir(dir, keep);
 
     await this.deleteProfileIndex(key);
     this.changed('profileDeleted', { profile: safeName, workspaceId: wsId });
     log.info(`profile deleted: ${key}`);
     return { deleted: true };
+  }
+
+  /** Delete a profile directory, or everything in it but `keep`. Best effort. */
+  private async removeProfileDir(dir: string, keep?: string): Promise<void> {
+    try {
+      if (!keep) {
+        await fs.rm(dir, { recursive: true, force: true });
+        return;
+      }
+      for (const entry of await fs.readdir(dir)) {
+        if (entry !== keep) await fs.rm(path.join(dir, entry), { recursive: true, force: true });
+      }
+    } catch { /* best effort */ }
   }
 
   // ===========================================================================
@@ -2098,6 +2332,12 @@ export class WebBrowser extends Abject {
       try { await entry.context.close(); } catch { /* ignore */ }
     }
     this.profileContexts.clear();
+    // Over CDP, close() only disconnects; the app's Chromium is not ours to quit.
+    const electronBrowser = this.electronBrowser;
+    this.electronBrowser = null;
+    if (electronBrowser) {
+      try { await (await electronBrowser).close(); } catch { /* never connected */ }
+    }
   }
 
   protected override askPrompt(_question: string): string {
@@ -2219,8 +2459,10 @@ Pages launch HEADLESS by default. Headless Chromium fails Cloudflare Turnstile
 and similar fingerprint checks (navigator.webdriver, "HeadlessChrome" UA,
 SwiftShader software WebGL) even when a real human clicks the challenge through
 the WebBrowserViewer takeover. To let a human pass such a challenge, open the
-page with \`options.headful: true\` (defaults to the installed Chrome for a real
-branded fingerprint; override with \`options.channel\`). Headful needs a display
+page with \`options.headful: true\`. In the desktop app that opens a real window
+of the app's own browser, sharing the profile's cookies with its headless
+pages; elsewhere it defaults to the installed Chrome for a real branded
+fingerprint. Override with \`options.channel\`. Headful needs a display
 — present on the desktop app (mac/windows/linux) and any machine with a GUI;
 on a pure headless server it falls back to headless automatically. All other
 Playwright capabilities are unchanged in either mode. Global override:
