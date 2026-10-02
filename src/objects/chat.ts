@@ -83,6 +83,9 @@ const DEFAULT_WIN_H = 620;
 const BUBBLE_MAX_FRACTION = 0.75;
 const BUBBLE_MIN_WIDTH = 240;
 const SENDER_LABEL_HEIGHT = 18;
+// Static welcome-card body copy; shared by creation and resize reflow so the
+// height estimate never diverges between the two paths.
+const WELCOME_BODY_TEXT = 'Abjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents.\n\nAsk me to explore what objects exist, create new ones, fetch your email, or anything else \u2014 specialized agents pick up the work automatically.';
 const GROUP_WINDOW_MS = 3 * 60_000;
 
 // ── Composer ───────────────────────────────────────────────────────────
@@ -1809,13 +1812,9 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     const tokens = this.theme.tokens;
     const headingText = sectionHeaderText(this.theme, 'Welcome to Chat');
-    const bodyText = 'Abjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents.\n\nAsk me to explore what objects exist, create new ones, fetch your email, or anything else \u2014 specialized agents pick up the work automatically.';
+    const bodyText = WELCOME_BODY_TEXT;
 
-    const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const cardWidth = Math.min(bubbleMaxWidth, 460);
-    const innerWidth = cardWidth - tokens.space.lg * 2;
-    // Use the markdown estimator (paragraph-aware) + padding so the card never clips.
-    const bodyHeight = this.estimateBubbleHeight(bodyText, innerWidth, true) + tokens.space.xl;
+    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
 
     const specs: Array<Record<string, unknown>> = [
       // Spacer above the card for vertical breathing room.
@@ -1868,9 +1867,55 @@ A single successful creation goal is a complete turn. End it with **done**.
       this.messageLabelIds.push(id);
     };
 
-    await addCentered(spacerId, cardWidth, tokens.space.xl);
-    await addCentered(headingId, cardWidth, 30);
+    await addCentered(spacerId, cardWidth, spacerHeight);
+    await addCentered(headingId, cardWidth, headingHeight);
     await addCentered(bodyId, cardWidth, bodyHeight);
+  }
+
+  /**
+   * Shared sizing for the welcome card so creation (showWelcomeState) and
+   * resize reflow (updateWelcomeLayout) compute identical geometry.
+   */
+  private welcomeCardLayout(): {
+    cardWidth: number;
+    spacerHeight: number;
+    headingHeight: number;
+    bodyHeight: number;
+  } {
+    const tokens = this.theme.tokens;
+    const cardWidth = Math.min(this.computeBubbleMaxWidth(), 460);
+    const innerWidth = cardWidth - tokens.space.lg * 2;
+    // Use the markdown estimator (paragraph-aware) + padding so the card never clips.
+    const bodyHeight = this.estimateBubbleHeight(WELCOME_BODY_TEXT, innerWidth, true) + tokens.space.xl;
+    return { cardWidth, spacerHeight: tokens.space.xl, headingHeight: 30, bodyHeight };
+  }
+
+  /**
+   * Re-fit the welcome card widgets in place for the current window size.
+   * updateLayoutChild merges the new preferredSize into the existing layout
+   * entry, so the three labels keep their ids and content — no destroy/recreate
+   * cycle, hence no blank frame while replacements render (resize flash).
+   */
+  private async updateWelcomeLayout(): Promise<void> {
+    if (!this.messageLogId || !this.windowId) return;
+    if (this.welcomeWidgetIds.length === 0) return;
+
+    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
+    const heights = [spacerHeight, headingHeight, bodyHeight];
+    const updates: Promise<unknown>[] = [];
+    for (let i = 0; i < this.welcomeWidgetIds.length; i++) {
+      const id = this.welcomeWidgetIds[i];
+      const height = heights[i] ?? bodyHeight;
+      updates.push(
+        this.request(request(this.id, this.messageLogId!, 'updateLayoutChild', {
+          widgetId: id,
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: cardWidth, height },
+          alignment: 'center',
+        }))
+      );
+    }
+    await Promise.all(updates);
   }
 
   private async removeWelcomeState(): Promise<void> {
@@ -3249,12 +3294,11 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     await Promise.all(updates);
 
-    // The welcome state is rendered with hand-built widths outside the
-    // bubble path; re-render it from scratch so it fits the new window size.
-    if (this.welcomeWidgetIds.length > 0) {
-      await this.removeWelcomeState();
-      await this.showWelcomeState();
-    }
+    // The welcome card is sized by hand outside the bubble path, so it is
+    // re-fit here, in place. Destroying and recreating it made the card vanish
+    // from the frame until the replacements finished rendering, a visible
+    // flash on every resize.
+    await this.updateWelcomeLayout();
   }
 
 
