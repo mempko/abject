@@ -561,8 +561,12 @@ Restore (via 'restoreWindow' method or Taskbar click):
     localY: number,
   ): Promise<{ grab: boolean; dragType?: 'move' | 'resize'; edge?: string; minimize?: string }> {
     const info = this.windows.get(surfaceId);
-    log.info(`surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
-    if (!info) return { grab: false };
+    if (!info) {
+      // Every click lands here, so only the anomaly is logged: a press on a
+      // surface no window owns (a window torn down under the pointer).
+      log.warn(`mousedown on unknown surface ${surfaceId}`);
+      return { grab: false };
+    }
 
     // Always raise the window on mousedown
     await this.raiseWindow(surfaceId);
