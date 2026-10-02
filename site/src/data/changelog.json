@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.14.0",
+    "date": "2026-10-02",
+    "title": "One Browser Inside, Steadier Chat Windows",
+    "summary": "The desktop app's web browser now runs on the Chromium already built into the app, so there is no second browser to download and logins carry over more reliably. Chat windows also stop flickering and jumping around while you move or resize them.",
+    "highlights": [
+      "In the desktop app, web browsing now uses the Chromium the app already ships with, instead of downloading and bundling a separate headless browser; outside the desktop app, browsing works the same as before",
+      "Smaller desktop install, since the separate browser download and its packaging are gone",
+      "Quitting the desktop app now saves cookies from every open browser window first, so a login you just completed is kept for next time",
+      "If you open the desktop app a second time, the second copy no longer points the browser at a debugging connection that has already closed"
+    ],
+    "fixes": [
+      "Dragging a chat window no longer moves that conversation to the top of the list or rebuilds the conversation overview several times a second; the window still reopens where you left it",
+      "The conversation list now updates in place, so it no longer blinks empty while histories load and keeps your search text and scroll position",
+      "Resizing a chat no longer makes the welcome card flash; it re-fits in place"
+    ]
+  },
+  {
     "version": "0.13.0",
     "date": "2026-10-02",
     "title": "Faster Boots and Self-Updating Model Tiers",
