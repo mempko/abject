@@ -1788,7 +1788,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
       // Model dropdown (populated from provider's model list)
       const activeProvider = savedProvider && providerIds.includes(savedProvider) ? savedProvider : providerIds[0];
-      const modelList = this.tierModelList(activeProvider, tier);
+      const modelList = this.withWanted(this.tierModelList(activeProvider, tier), savedModel);
       const modelOptions = modelList.length > 0
         ? modelList.map(m => m.name)
         : ['(no models)'];
@@ -2926,6 +2926,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     return [{ ...(info ?? { id: recommended, name: recommended }), id: LATEST_MODEL, name: `Latest (${info?.name ?? recommended})` }, ...list];
   }
 
+  /**
+   * A model list that still holds the wanted model. Until a provider's live
+   * catalog arrives the cached list is a short fallback, and a dropdown that
+   * cannot find the wanted model would land on its first entry, which the
+   * next save then persists in place of what was chosen (an applied preset
+   * came out all "Latest" this way). The wanted id is shown as itself until
+   * the catalog names it.
+   */
+  private withWanted(list: ModelInfo[], wanted: string | null | undefined): ModelInfo[] {
+    if (!wanted || list.some(m => m.id === wanted)) return list;
+    return [{ id: wanted, name: wanted }, ...list];
+  }
+
   private async refreshTierModelOptions(tier: ModelTierName): Promise<void> {
     const providerSelectId = this.tierProviderSelectIds[tier];
     const modelSelectId = this.tierModelSelectIds[tier];
@@ -2940,7 +2953,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, modelSelectId, 'getValue', {})
     );
 
-    const modelList = this.tierModelList(providerName, tier);
+    const modelList = this.withWanted(this.tierModelList(providerName, tier), this.tierDesiredModelIds[tier]);
     const options = modelList.length > 0
       ? modelList.map(m => m.name)
       : ['(no models)'];
@@ -3082,7 +3095,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
 
     const activeProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
-    const modelList = activeProvider ? this.auxModelList(key, activeProvider) : [];
+    const modelList = activeProvider ? this.withWanted(this.auxModelList(key, activeProvider), saved.model) : [];
     const modelOptions = activeProvider
       ? (modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'])
       : [spec.decision ? '(decision model if keyed, else Fast tier)' : '(none)'];
@@ -3181,7 +3194,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const currentLabel = await this.request<string>(
       request(this.id, row.modelSelectId, 'getValue', {})
     );
-    const modelList = this.auxModelList(key, provider);
+    const modelList = this.withWanted(this.auxModelList(key, provider), row.desiredModelId);
     const options = modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'];
 
     // Same intended-id preservation as the tier rows. The vision row exists
@@ -3212,7 +3225,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, row.modelSelectId, 'getValue', {})
       );
       const info = this.auxModelList(key, provider).find(m => m.name === modelName);
-      row.desiredModelId = info?.id ?? null;
+      // A name not in the list is a wanted id shown as itself (withWanted).
+      row.desiredModelId = info?.id ?? (modelName && !modelName.startsWith('(') ? modelName : null);
       const cap = this.auxCapLabel(key, provider, modelName);
       await this.updateAuxCapLabel(key, cap.text, cap.color);
     } catch { /* widget gone */ }
@@ -3246,7 +3260,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, modelSelectId, 'getValue', {})
       );
       const info = this.tierModelList(provider, tier).find(m => m.name === modelName);
-      this.tierDesiredModelIds[tier] = info?.id ?? null;
+      // A name not in the list is a wanted id shown as itself (withWanted).
+      this.tierDesiredModelIds[tier] = info?.id ?? (modelName && modelName !== '(no models)' ? modelName : null);
       await this.updateTierCapabilityLabel(tier, provider, modelName);
       await this.refreshTierEffortOptions(tier, provider, info?.id ?? null);
     } catch { /* widget gone */ }
@@ -3275,8 +3290,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async refreshTierEffortOptions(tier: ModelTierName, provider: LLMProviderName, modelId: string | null): Promise<void> {
     const effortSelectId = this.tierEffortSelectIds[tier];
     if (!effortSelectId) return;
-    const options = this.effortOptionsFor(provider, modelId, tier);
     const desired = this.tierDesiredEfforts[tier];
+    // A model the catalog has not named yet (shown by id, see withWanted) has
+    // unknown efforts: keep the chosen one until the catalog says otherwise.
+    const known = !modelId || this.tierModelList(provider, tier).some(m => m.id === modelId);
+    const options = !known && desired ? [EFFORT_DEFAULT_LABEL, desired] : this.effortOptionsFor(provider, modelId, tier);
     let selectedIndex = 0;
     if (desired) {
       const idx = options.indexOf(desired);
