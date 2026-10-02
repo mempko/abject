@@ -244,9 +244,9 @@ export class FrontendClient {
     id: number;
     startX: number; startY: number; startTime: number;
     lastX: number; lastY: number; lastTime: number;
-    /** Finger velocity, px/ms (smoothed). */
-    vx: number; vy: number;
-    mode: 'undecided' | 'mouse' | 'pan' | 'scroll' | 'held' | 'orbit' | 'handle' | 'expose' | 'exposeLift' | 'exposeSwipe' | 'ignore';
+    /** Vertical finger velocity, px/ms (smoothed). */
+    vy: number;
+    mode: 'undecided' | 'mouse' | 'scroll' | 'held' | 'orbit' | 'handle' | 'expose' | 'exposeLift' | 'exposeSwipe' | 'ignore';
     /** Surface / interactive node under the press, and the press in surface-local px. */
     surfaceId?: string;
     node?: NodeHit;
@@ -260,7 +260,6 @@ export class FrontendClient {
     swipedUp?: boolean;
     exposeId?: string;
     scrollAcc: number;
-    scrollAxis?: 'x' | 'y';
     longPressTimer?: ReturnType<typeof setTimeout>;
     holdTimer?: ReturnType<typeof setTimeout>;
   };
@@ -2586,7 +2585,7 @@ export class FrontendClient {
   /** Touch times come from the events (performance.now() clock), so speeds measure the finger, not handler delays. */
   private newTouch(id: number, x: number, y: number, mode: NonNullable<FrontendClient['activeTouch']>['mode'], time?: number): NonNullable<FrontendClient['activeTouch']> {
     const now = time || performance.now();
-    return { id, startX: x, startY: y, startTime: now, lastX: x, lastY: y, lastTime: now, vx: 0, vy: 0, mode, scrollAcc: 0 };
+    return { id, startX: x, startY: y, startTime: now, lastX: x, lastY: y, lastTime: now, vy: 0, mode, scrollAcc: 0 };
   }
 
   private clearTouchTimers(at: NonNullable<FrontendClient['activeTouch']>): void {
@@ -2629,10 +2628,12 @@ export class FrontendClient {
    * - Exposé: tap picks a window, a flick up closes one, a swipe down leaves.
    * - the bottom handle: tap or swipe up flies out; swipe up and hold opens Exposé.
    * - a draggable 3D object: the finger drags it (the compositor drag engine).
-   * - anything else waits for the gesture: a tap clicks, a drag pans the
-   *   camera (desktop view) or scrolls the window under it (focus mode), a
-   *   drag from a title bar moves the window, and a long press turns into a
-   *   real mouse drag (move) or a right-click (release).
+   * - anything else waits for the gesture: a tap clicks, a drag scrolls the
+   *   window under it (the mouse wheel) or is a plain mouse drag on empty
+   *   desktop, a drag from a title bar moves the window, and a long press
+   *   turns into a real mouse drag (move) or a right-click (release).
+   * One finger never moves the phone camera: panning and zooming take two
+   * fingers. (A window's own 3D camera still orbits under it, like the mouse.)
    */
   private onTouchStart(id: number, x: number, y: number, time?: number): void {
     // A waiting tap clicks now, before this gesture can move the camera
@@ -2681,12 +2682,8 @@ export class FrontendClient {
     if (!at) return;
     const now = time || performance.now();
     const dt = now - at.lastTime;
-    const dxStep = x - at.lastX;
     const dyStep = y - at.lastY;
-    if (dt > 0) {
-      at.vx = at.vx * 0.3 + (dxStep / dt) * 0.7;
-      at.vy = at.vy * 0.3 + (dyStep / dt) * 0.7;
-    }
+    if (dt > 0) at.vy = at.vy * 0.3 + (dyStep / dt) * 0.7;
     at.lastX = x; at.lastY = y; at.lastTime = now;
     const dx = x - at.startX;
     const dy = y - at.startY;
@@ -2701,11 +2698,8 @@ export class FrontendClient {
       case 'mouse':
         this.touchMouse(x, y, 'mousemove');
         return;
-      case 'pan':
-        this.compositor.mobilePanBy(dxStep, dyStep);
-        return;
       case 'scroll':
-        this.touchScroll(at, dxStep, dyStep);
+        this.touchScroll(at, dyStep);
         return;
       case 'orbit':
         this.compositor.updateCameraOrbit(x, y, now);
@@ -2758,17 +2752,17 @@ export class FrontendClient {
           this.touchMouse(x, y, 'mousemove');
           return;
         }
-        if (this.compositor.getMobileView() === MobileViewState.FOCUS && at.surfaceId) {
-          // Focus mode: the finger scrolls what is under it. Mostly sideways
-          // drags pan the camera only when the window is wider than the screen.
+        if (at.surfaceId) {
+          // The finger scrolls the window under it, like the mouse wheel over
+          // the pointer. The camera moves only with two fingers (the pinch).
           at.mode = 'scroll';
-          const wide = this.surfaceWiderThanScreen(at.surfaceId);
-          at.scrollAxis = wide && Math.abs(dx) > Math.abs(dy) * 1.5 ? 'x' : 'y';
-          this.touchScroll(at, dx, dy);
+          this.touchScroll(at, dy);
           return;
         }
-        at.mode = 'pan';
-        this.compositor.mobilePanBy(dx, dy);
+        // Empty desktop: a plain mouse drag from the press point.
+        at.mode = 'mouse';
+        this.touchMouse(at.startX, at.startY, 'mousedown');
+        this.touchMouse(x, y, 'mousemove');
         return;
       }
     }
@@ -2792,16 +2786,12 @@ export class FrontendClient {
         this.touchMouse(x, y, 'mouseup');
         if (isTap) this.afterTap(x, y);
         break;
-      case 'pan':
-        if (flung) this.compositor.mobileGlideFrom(at.vx * 1000, at.vy * 1000);
-        break;
       case 'orbit':
         // Released while moving, the view coasts on (the compositor's orbit inertia).
         this.compositor.endCameraOrbit(now);
         break;
       case 'scroll':
-        if (flung && at.scrollAxis === 'y') this.startScrollGlide(at);
-        else if (flung) this.compositor.mobileGlideFrom(at.vx * 1000, 0);
+        if (flung) this.startScrollGlide(at);
         break;
       case 'held':
         // A long press released in place is a right-click.
@@ -2959,23 +2949,14 @@ export class FrontendClient {
     return p ?? { x, y };
   }
 
-  /** Whether a window shows wider than the screen through the phone camera. */
-  private surfaceWiderThanScreen(surfaceId: string): boolean {
-    const s = this.compositor.getSurface(surfaceId);
-    return !!s && s.rect.width * this.compositor.getViewZoom() > this.compositor.width + 1;
-  }
-
   /**
-   * Focus-mode scroll: finger travel becomes wheel input on the surface (and
-   * an interactive node) under the press. Scrolling widgets move a fixed step
-   * per wheel event, so travel is sent in whole steps as it accumulates,
-   * which keeps the content under the finger.
+   * One-finger scroll: vertical finger travel becomes wheel input on the
+   * surface (and an interactive node) under the press. Scrolling widgets move
+   * a fixed step per wheel event, so travel is sent in whole steps as it
+   * accumulates, which keeps the content under the finger. Sideways travel
+   * does nothing: the rest of a wide window is a two-finger pan away.
    */
-  private touchScroll(at: NonNullable<FrontendClient['activeTouch']>, dx: number, dy: number): void {
-    if (at.scrollAxis === 'x') {
-      this.compositor.mobilePanBy(dx, 0);
-      return;
-    }
+  private touchScroll(at: NonNullable<FrontendClient['activeTouch']>, dy: number): void {
     at.scrollAcc += -dy / this.compositor.getViewZoom();
     at.scrollAcc = this.emitScrollSteps(at.surfaceId, at.node, at.local ?? { x: 0, y: 0 }, at.scrollAcc, at.startX, at.startY);
   }
