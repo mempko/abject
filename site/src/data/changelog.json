@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.14.1",
+    "date": "2026-10-03",
+    "title": "Steadier hands in the web browser",
+    "summary": "This patch release makes agents more reliable when they work in web pages. Clicks and form entries on busy sites and single-page apps no longer get rejected as stale, and scripts run in a page now return the values they compute.",
+    "highlights": [
+      "Agents act on web pages more reliably: a page snapshot now stays valid until a genuinely new page loads. Route changes inside single-page apps and iframe loads no longer make every element reference look out of date.",
+      "When an element an agent wants to click or type into has disappeared from the page, the action now fails right away with a clear message asking for a fresh snapshot. It no longer waits out a long timeout and then lands on whatever happens to be there."
+    ],
+    "fixes": [
+      "Fixed agents having their browser actions rejected or retried over and over on busy sites, where nearly every element reference was treated as stale just after the snapshot was taken.",
+      "Fixed in-page scripts losing their result when they contained the word \"return\" (for example inside a callback or a self-invoking function). Scripts now run as written and are wrapped only when they truly need a top-level return or await.",
+      "Browser actions on elements that never become usable now give up after 15 seconds, while the caller is still waiting for the answer."
+    ]
+  },
+  {
     "version": "0.14.0",
     "date": "2026-10-02",
     "title": "One Browser Inside, Steadier Chat Windows",
