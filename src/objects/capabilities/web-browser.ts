@@ -110,19 +110,19 @@ type PlaywrightPage = {
 };
 
 type PlaywrightLocator = {
+  count: () => Promise<number>;
   click: (opts?: unknown) => Promise<void>;
-  fill: (value: string) => Promise<void>;
+  fill: (value: string, opts?: unknown) => Promise<void>;
   type: (text: string, opts?: unknown) => Promise<void>;
-  selectOption: (values: string | string[] | { label: string }) => Promise<string[]>;
-  hover: () => Promise<void>;
-  check: () => Promise<void>;
-  uncheck: () => Promise<void>;
+  selectOption: (values: string | string[] | { label: string }, opts?: unknown) => Promise<string[]>;
+  hover: (opts?: unknown) => Promise<void>;
+  check: (opts?: unknown) => Promise<void>;
+  uncheck: (opts?: unknown) => Promise<void>;
   textContent: () => Promise<string | null>;
-  press: (key: string) => Promise<void>;
+  press: (key: string, opts?: unknown) => Promise<void>;
 };
 
 interface TrackedPage {
-  generation: number;
   page: PlaywrightPage;
   owner: AbjectId;
   createdAt: number;
@@ -1271,51 +1271,64 @@ export class WebBrowser extends Abject {
     });
 
     // -- getAriaSnapshot --
+    // `generation` names the document the refs were taken from; refAction
+    // takes it back to check the refs still apply.
     this.deferredPageHandler('getAriaSnapshot', async (tracked) => {
       const t0 = Date.now();
-      const generation = tracked.generation;
+      const before = await this.documentId(tracked.page);
       const url = tracked.page.url();
       const title = await this.safeTitle(tracked.page, url);
       const result = await tracked.page._snapshotForAI({ track: 'response' });
-      if (generation !== tracked.generation) throw new Error('Page navigated while observing; request a fresh snapshot');
+      const generation = await this.documentId(tracked.page);
+      if (generation !== before) throw new Error('Page navigated while observing; request a fresh snapshot');
       log.info(`getAriaSnapshot (url=${url}) [${Date.now() - t0}ms]`);
-      return { snapshot: result.full, url, title, generation: tracked.generation };
+      return { snapshot: result.full, url, title, generation };
     });
 
     // -- refAction --
     this.deferredPageHandler('refAction', async (tracked, payload) => {
-      if (payload.expectedGeneration !== undefined && payload.expectedGeneration !== tracked.generation) throw new Error('Page navigated since observation; get a fresh snapshot before acting');
+      if (payload.expectedGeneration !== undefined
+        && payload.expectedGeneration !== await this.documentId(tracked.page)) {
+        throw new Error('Page navigated since observation; get a fresh snapshot before acting');
+      }
       const ref = payload.ref as string;
       const action = payload.action as string;
       const value = payload.value as string | undefined;
       const t0 = Date.now();
 
       const locator = tracked.page.locator(`aria-ref=${ref}`);
+      // A ref the page no longer has (re-rendered away, or inside a frame that
+      // navigated) would otherwise sit in Playwright's auto-wait past the
+      // caller's request timeout, and then fire late on whatever is there.
+      if (await locator.count() === 0) {
+        throw new Error(`Ref ${ref} is no longer on the page; get a fresh snapshot before acting`);
+      }
+      const opts = { timeout: WebBrowser.REF_ACTION_TIMEOUT_MS };
 
       switch (action) {
         case 'click':
-          await locator.click();
+          await locator.click(opts);
           break;
         case 'fill':
-          await locator.fill(value ?? '');
+          await locator.fill(value ?? '', opts);
           break;
         case 'type':
-          await locator.type(value ?? '');
+          await locator.type(value ?? '', opts);
           break;
         case 'hover':
-          await locator.hover();
+          await locator.hover(opts);
           break;
         case 'check':
-          await locator.check();
+          await locator.check(opts);
           break;
         case 'uncheck':
-          await locator.uncheck();
+          await locator.uncheck(opts);
           break;
         case 'selectOption':
-          await locator.selectOption(value ? { label: value } : '');
+          await locator.selectOption(value ? { label: value } : '', opts);
           break;
         case 'press':
-          await locator.press(value ?? '');
+          await locator.press(value ?? '', opts);
           break;
         default:
           throw new Error(`Unknown ref action: ${action}`);
@@ -1328,11 +1341,7 @@ export class WebBrowser extends Abject {
     // -- evaluate --
     this.deferredPageHandler('evaluate', async (tracked, payload) => {
       const t0 = Date.now();
-      const script = (payload.script as string).trim();
-      const safeScript = /\breturn\b/.test(script)
-        ? `(function(){ ${script} })()`
-        : script;
-      const result = await tracked.page.evaluate(safeScript);
+      const result = await this.evaluateScript(tracked.page, (payload.script as string).trim());
       log.info(`evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
     });
@@ -1455,6 +1464,50 @@ export class WebBrowser extends Abject {
   private static readonly MOUSE_BUTTONS = ['left', 'middle', 'right'] as const;
 
   /**
+   * How long a ref action may wait for its element to become actionable.
+   * Under the callers' 30s request timeout, so an action that cannot happen
+   * fails while the caller is still listening instead of landing after it
+   * has moved on.
+   */
+  private static readonly REF_ACTION_TIMEOUT_MS = 15_000;
+
+  /**
+   * Identity of the document a page is showing: its time origin. Every new
+   * document gets a fresh one; same-document navigation (history.pushState,
+   * a #hash) and anything happening in iframes keep it. Snapshot refs live
+   * in the document they were taken from, so this is exactly when they stop
+   * applying. (A navigation counter also counted single-page-app route
+   * changes and every iframe load, which on a busy site made almost every
+   * ref "stale".) A page with no document to ask, mid-navigation, reads as
+   * a different document (NaN equals nothing).
+   */
+  private async documentId(page: PlaywrightPage): Promise<number> {
+    try {
+      return await page.evaluate('performance.timeOrigin') as number;
+    } catch {
+      return NaN;
+    }
+  }
+
+  /**
+   * Run a caller's script and return its value, awaited. The script runs as
+   * written first, which covers expressions, IIFEs (an async one is awaited)
+   * and statement lists. Only a script that is not valid that way because it
+   * has a top-level `return` or `await` runs again as an async function body.
+   * Wrapping on the mere presence of the word `return` used to swallow the
+   * value of every IIFE or callback that contained one.
+   */
+  private async evaluateScript(page: PlaywrightPage, script: string): Promise<unknown> {
+    try {
+      return await page.evaluate(script);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!/SyntaxError: (Illegal return statement|await is only valid in async functions)/.test(message)) throw err;
+      return page.evaluate(`(async () => {\n${script}\n})()`);
+    }
+  }
+
+  /**
    * Replay raw human input events on a page, in order, through Playwright's
    * mouse/keyboard (CDP-level trusted input). Returns the count dispatched.
    */
@@ -1535,7 +1588,6 @@ export class WebBrowser extends Abject {
     const pageId = this.generatePageId();
 
     const tracked: TrackedPage = {
-      generation: 0,
       page,
       owner,
       createdAt: Date.now(),
@@ -1544,7 +1596,6 @@ export class WebBrowser extends Abject {
     };
 
     this.pages.set(pageId, tracked);
-    page.on('framenavigated', () => { tracked.generation++; });
     if (profileKey) {
       const ctx = this.profileContexts.get(profileKey);
       if (ctx) ctx.openPages++;
