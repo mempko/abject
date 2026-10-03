@@ -92,9 +92,11 @@ type PlaywrightPage = {
   $$eval: (selector: string, fn: (els: Element[]) => unknown) => Promise<unknown>;
   keyboard: {
     press: (key: string) => Promise<void>;
+    type: (text: string, opts?: { delay?: number }) => Promise<void>;
     insertText: (text: string) => Promise<void>;
   };
   mouse: {
+    click: (x: number, y: number, opts?: { button?: string; clickCount?: number }) => Promise<void>;
     move: (x: number, y: number, opts?: { steps?: number }) => Promise<void>;
     down: (opts?: { button?: string }) => Promise<void>;
     up: (opts?: { button?: string }) => Promise<void>;
@@ -111,6 +113,8 @@ type PlaywrightPage = {
 
 type PlaywrightLocator = {
   count: () => Promise<number>;
+  isVisible: () => Promise<boolean>;
+  evaluate: (fn: (el: Element) => unknown) => Promise<unknown>;
   click: (opts?: unknown) => Promise<void>;
   fill: (value: string, opts?: unknown) => Promise<void>;
   type: (text: string, opts?: unknown) => Promise<void>;
@@ -121,6 +125,14 @@ type PlaywrightLocator = {
   textContent: () => Promise<string | null>;
   press: (key: string, opts?: unknown) => Promise<void>;
 };
+
+/** What a pointer landed on (or what has keyboard focus). */
+interface PointTarget {
+  tag: string;
+  role?: string;
+  type?: string;
+  text?: string;
+}
 
 interface TrackedPage {
   page: PlaywrightPage;
@@ -592,7 +604,7 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
       {
         name: 'options',
         type: { kind: 'reference', reference: 'ScreenshotOptions' },
-        description: 'Screenshot options: { fullPage? }',
+        description: 'Screenshot options: { fullPage?, scale? } — scale "css" gives one image pixel per CSS pixel, the coordinate space of clickAt/hoverAt/drag/scroll; "device" (default) is the display\'s native resolution.',
         optional: true,
       },
     ],
@@ -864,6 +876,69 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
         result: { kind: 'reference', reference: 'any' },
       },
     },
+  },
+  // -- Pointer and keyboard: real input at viewport coordinates --
+  {
+    name: 'clickAt',
+    description: 'Click at a point of the visible viewport with real mouse input, as a person would. Coordinates are CSS pixels from the viewport\'s top-left, the same pixels as screenshotPage with scale "css". Returns the element that was under the pointer.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'x', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport x in CSS pixels' },
+      { name: 'y', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport y in CSS pixels' },
+      { name: 'button', type: { kind: 'primitive', primitive: 'string' }, description: "'left' (default), 'right' or 'middle'", optional: true },
+      { name: 'clickCount', type: { kind: 'primitive', primitive: 'number' }, description: '1 (default), 2 for a double click, 3 for a triple click', optional: true },
+    ],
+    returns: { kind: 'object', properties: { target: { kind: 'reference', reference: 'PointTarget' } } },
+  },
+  {
+    name: 'hoverAt',
+    description: 'Move the mouse to a point of the visible viewport (opens hover menus and tooltips). Returns the element under the pointer.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'x', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport x in CSS pixels' },
+      { name: 'y', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport y in CSS pixels' },
+    ],
+    returns: { kind: 'object', properties: { target: { kind: 'reference', reference: 'PointTarget' } } },
+  },
+  {
+    name: 'drag',
+    description: 'Press the mouse at one viewport point, move to another in steps, and release (sliders, drag-and-drop, slide-to-verify).',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'fromX', type: { kind: 'primitive', primitive: 'number' }, description: 'Start x in CSS pixels' },
+      { name: 'fromY', type: { kind: 'primitive', primitive: 'number' }, description: 'Start y in CSS pixels' },
+      { name: 'toX', type: { kind: 'primitive', primitive: 'number' }, description: 'End x in CSS pixels' },
+      { name: 'toY', type: { kind: 'primitive', primitive: 'number' }, description: 'End y in CSS pixels' },
+    ],
+    returns: { kind: 'object', properties: { from: { kind: 'reference', reference: 'PointTarget' }, to: { kind: 'reference', reference: 'PointTarget' } } },
+  },
+  {
+    name: 'scroll',
+    description: 'Turn the mouse wheel over a viewport point (default: the centre), scrolling whatever is under it: the page, or a scrollable panel. Returns the window scroll position afterwards.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'deltaY', type: { kind: 'primitive', primitive: 'number' }, description: 'Vertical wheel delta in pixels; positive scrolls down' },
+      { name: 'deltaX', type: { kind: 'primitive', primitive: 'number' }, description: 'Horizontal wheel delta in pixels; positive scrolls right', optional: true },
+      { name: 'x', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport x to scroll over', optional: true },
+      { name: 'y', type: { kind: 'primitive', primitive: 'number' }, description: 'Viewport y to scroll over', optional: true },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        scrollX: { kind: 'primitive', primitive: 'number' },
+        scrollY: { kind: 'primitive', primitive: 'number' },
+        maxScrollY: { kind: 'primitive', primitive: 'number' },
+      },
+    },
+  },
+  {
+    name: 'typeText',
+    description: 'Type text with real key events into whatever has keyboard focus (click the field first). Returns the focused element.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to type' },
+    ],
+    returns: { kind: 'object', properties: { focused: { kind: 'reference', reference: 'PointTarget' } } },
   },
 ];
 
@@ -1231,10 +1306,13 @@ export class WebBrowser extends Abject {
 
     // -- screenshotPage --
     this.deferredPageHandler('screenshotPage', async (tracked, payload) => {
-      const options = payload.options as { fullPage?: boolean } | undefined;
+      const options = payload.options as { fullPage?: boolean; scale?: 'css' | 'device' } | undefined;
+      requireContract(options?.scale === undefined || options.scale === 'css' || options.scale === 'device',
+        "screenshotPage scale must be 'css' or 'device'");
       const buffer = await tracked.page.screenshot({
         type: 'png',
         fullPage: options?.fullPage ?? false,
+        ...(options?.scale ? { scale: options.scale } : {}),
       });
       const b64 = Buffer.from(buffer).toString('base64');
       const viewport = this.safeViewportSize(tracked.page);
@@ -1303,6 +1381,22 @@ export class WebBrowser extends Abject {
       if (await locator.count() === 0) {
         throw new Error(`Ref ${ref} is no longer on the page; get a fresh snapshot before acting`);
       }
+      // The snapshot also names elements nobody can reach: a collapsed menu's
+      // items, a duplicate of a button parked off the page for keyboard
+      // shortcuts or screen readers. Acting on one waits out the timeout;
+      // say so at once instead.
+      if (WebBrowser.NEEDS_VISIBLE.has(action)) {
+        if (!(await locator.isVisible())) {
+          throw new Error(`Ref ${ref} is on the page but not visible (hidden, collapsed, or zero-size); open what contains it, pick a visible element with the same name, or use the pointer on the screenshot`);
+        }
+        const offPage = await locator.evaluate((el: Element) => {
+          const r = el.getBoundingClientRect();
+          return r.right + window.scrollX <= 0 || r.bottom + window.scrollY <= 0;
+        }).catch(() => false);
+        if (offPage) {
+          throw new Error(`Ref ${ref} is parked off the page where no one can reach it (often a hidden duplicate); pick a visible element with the same name, or use the pointer on the screenshot`);
+        }
+      }
       const opts = { timeout: WebBrowser.REF_ACTION_TIMEOUT_MS };
 
       switch (action) {
@@ -1344,6 +1438,85 @@ export class WebBrowser extends Abject {
       const result = await this.evaluateScript(tracked.page, (payload.script as string).trim());
       log.info(`evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
+    });
+
+    // -- Pointer and keyboard: real input at viewport CSS-pixel coordinates --
+    // The same trusted input path a person's mouse takes, for what the
+    // accessibility snapshot cannot name: unlabeled tiles, icon buttons,
+    // canvas, custom widgets. Each reports what it landed on, so a caller
+    // aiming from a screenshot can tell a hit from a near miss.
+    this.deferredPageHandler('clickAt', async (tracked, payload) => {
+      const { x, y } = WebBrowser.requirePoint(payload.x, payload.y);
+      const button = WebBrowser.requireButton(payload.button);
+      const clickCount = payload.clickCount === undefined ? 1 : Number(payload.clickCount);
+      requireContract([1, 2, 3].includes(clickCount), 'clickAt clickCount must be 1, 2 or 3');
+      const target = await this.elementAt(tracked.page, x, y);
+      await tracked.page.mouse.click(x, y, { button, clickCount });
+      tracked.lastActivity = Date.now();
+      log.info(`clickAt (${payload.pageId}) ${x},${y} ${button}x${clickCount} → ${target?.tag ?? 'nothing'}`);
+      return { target };
+    });
+
+    this.deferredPageHandler('hoverAt', async (tracked, payload) => {
+      const { x, y } = WebBrowser.requirePoint(payload.x, payload.y);
+      const target = await this.elementAt(tracked.page, x, y);
+      await tracked.page.mouse.move(x, y, { steps: 5 });
+      tracked.lastActivity = Date.now();
+      return { target };
+    });
+
+    this.deferredPageHandler('drag', async (tracked, payload) => {
+      const from = WebBrowser.requirePoint(payload.fromX, payload.fromY);
+      const to = WebBrowser.requirePoint(payload.toX, payload.toY);
+      const fromTarget = await this.elementAt(tracked.page, from.x, from.y);
+      const mouse = tracked.page.mouse;
+      await mouse.move(from.x, from.y, { steps: 5 });
+      await mouse.down({ button: 'left' });
+      // Many small moves: sliders and drop targets track the path, not the jump.
+      await mouse.move(to.x, to.y, { steps: 20 });
+      await mouse.up({ button: 'left' });
+      const toTarget = await this.elementAt(tracked.page, to.x, to.y);
+      tracked.lastActivity = Date.now();
+      log.info(`drag (${payload.pageId}) ${from.x},${from.y} → ${to.x},${to.y}`);
+      return { from: fromTarget, to: toTarget };
+    });
+
+    this.deferredPageHandler('scroll', async (tracked, payload) => {
+      const deltaY = Number(payload.deltaY ?? 0);
+      const deltaX = Number(payload.deltaX ?? 0);
+      requireContract(Number.isFinite(deltaY) && Number.isFinite(deltaX), 'scroll needs numeric deltaY/deltaX');
+      const viewport = this.safeViewportSize(tracked.page);
+      const at = payload.x === undefined && payload.y === undefined
+        ? { x: Math.round(viewport.width / 2), y: Math.round(viewport.height / 2) }
+        : WebBrowser.requirePoint(payload.x, payload.y);
+      await tracked.page.mouse.move(at.x, at.y);
+      await tracked.page.mouse.wheel(deltaX, deltaY);
+      // Smooth scrolling and lazy-loaded rows land a beat after the wheel.
+      await new Promise(resolve => setTimeout(resolve, 400));
+      tracked.lastActivity = Date.now();
+      const position = await tracked.page.evaluate(`(() => {
+        const s = document.scrollingElement || document.documentElement;
+        return { scrollX: Math.round(scrollX), scrollY: Math.round(scrollY), maxScrollY: Math.max(0, Math.round(s.scrollHeight - innerHeight)) };
+      })()`).catch(() => ({ scrollX: 0, scrollY: 0, maxScrollY: 0 }));
+      return position;
+    });
+
+    this.deferredPageHandler('typeText', async (tracked, payload) => {
+      const text = payload.text;
+      requireContract(typeof text === 'string' && text.length > 0, 'typeText needs non-empty text');
+      // Keystrokes with no field focused go to the page itself, where many
+      // sites bind single keys to actions (archive, delete, next). Typing is
+      // for a field; a deliberate shortcut is a press.
+      if (!(await tracked.page.evaluate(WebBrowser.EDITABLE_FOCUS_SCRIPT).catch(() => false))) {
+        throw new Error('Nothing editable has keyboard focus; click the field first (keys meant as shortcuts go through press)');
+      }
+      // Key-by-key fires every listener a person's typing would (autocomplete,
+      // validation); a long body goes in as one insertion so it is not slow.
+      if (text.length <= WebBrowser.KEY_BY_KEY_MAX_CHARS) await tracked.page.keyboard.type(text);
+      else await tracked.page.keyboard.insertText(text);
+      tracked.lastActivity = Date.now();
+      const focused = await this.describeElement(tracked.page, 'document.activeElement');
+      return { focused };
     });
 
     // -- listPages: no ownership check --
@@ -1470,6 +1643,68 @@ export class WebBrowser extends Abject {
    * has moved on.
    */
   private static readonly REF_ACTION_TIMEOUT_MS = 15_000;
+
+  /** Ref actions that need an element a person could see and reach. */
+  private static readonly NEEDS_VISIBLE = new Set(['click', 'hover', 'check', 'uncheck', 'fill', 'type']);
+
+  /** Whether keyboard focus is on something that takes text (open shadow roots and iframes included). */
+  private static readonly EDITABLE_FOCUS_SCRIPT = `(() => {
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    if (!el || el === document.body || el === document.documentElement) return false;
+    if (el.tagName === 'IFRAME' || el.isContentEditable || el.tagName === 'TEXTAREA') return true;
+    if (el.tagName === 'INPUT') return !['button', 'checkbox', 'radio', 'submit', 'reset', 'image', 'file', 'range', 'color', 'hidden'].includes((el.type || '').toLowerCase());
+    return ['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(el.getAttribute('role') || '');
+  })()`;
+
+  /** typeText sends text up to this long key by key, longer text as one insertion. */
+  private static readonly KEY_BY_KEY_MAX_CHARS = 300;
+
+  /** A viewport point in CSS pixels, required finite and non-negative. */
+  private static requirePoint(x: unknown, y: unknown): { x: number; y: number } {
+    const px = Number(x);
+    const py = Number(y);
+    requireContract(Number.isFinite(px) && Number.isFinite(py) && px >= 0 && py >= 0,
+      `A point needs non-negative numeric x and y (got ${String(x)}, ${String(y)})`);
+    return { x: px, y: py };
+  }
+
+  private static requireButton(button: unknown): 'left' | 'right' | 'middle' {
+    const b = button === undefined ? 'left' : button;
+    requireContract(b === 'left' || b === 'right' || b === 'middle', "button must be 'left', 'right' or 'middle'");
+    return b as 'left' | 'right' | 'middle';
+  }
+
+  /** What is at a viewport point: the actionable element containing the hit. */
+  private elementAt(page: PlaywrightPage, x: number, y: number): Promise<PointTarget | null> {
+    return this.describeElement(page, `document.elementFromPoint(${x}, ${y})`);
+  }
+
+  /**
+   * A short description of an element: the nearest actionable ancestor's tag,
+   * role, and the name a person would read on it. A field's typed value is
+   * left out (it may be a password).
+   */
+  private async describeElement(page: PlaywrightPage, elementExpr: string): Promise<PointTarget | null> {
+    try {
+      return await page.evaluate(`(() => {
+        const el = ${elementExpr};
+        if (!el || el === document.body || el === document.documentElement) return null;
+        const hit = el.closest('a,button,input,select,textarea,label,summary,option,[role],[onclick],[tabindex],[contenteditable="true"],[contenteditable=""]') || el;
+        const tag = hit.tagName.toLowerCase();
+        const field = tag === 'input' || tag === 'textarea' || tag === 'select';
+        const name = hit.getAttribute('aria-label') || hit.getAttribute('title') || hit.getAttribute('alt')
+          || hit.getAttribute('placeholder') || (field ? hit.getAttribute('name') : hit.innerText) || '';
+        const out = { tag };
+        const role = hit.getAttribute('role'); if (role) out.role = role;
+        const type = hit.getAttribute('type'); if (type) out.type = type;
+        const text = String(name).replace(/\s+/g, ' ').trim().slice(0, 80); if (text) out.text = text;
+        return out;
+      })()`) as PointTarget | null;
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * Identity of the document a page is showing: its time origin. Every new
@@ -2485,6 +2720,7 @@ Navigation:    navigateTo(pageId, url, options?)
 Interaction:   click, fill, type, select, hover, press, check, uncheck
 Waiting:       waitForSelector(pageId, selector, options?) — returns {found: false} on timeout
 Reading:       getContent, screenshotPage, getAttribute, getTextContent, getUrl, getTitle
+Pointer/keys:  clickAt(pageId, x, y, button?, clickCount?), hoverAt(pageId, x, y), drag(pageId, fromX, fromY, toX, toY), scroll(pageId, deltaY, deltaX?, x?, y?), typeText(pageId, text) — real mouse and keyboard input at viewport CSS-pixel coordinates (screenshotPage with options.scale "css" gives an image in the same pixels); each reports the element it landed on
 Escape hatch:  evaluate(pageId, script) — run arbitrary JS in page context
 Viewer:        viewerScreenshot(pageId), viewerInput(pageId, events), viewerNavigate(pageId, nav) — no ownership check; used by the visual browser monitor for live view, human takeover (raw mouse/keyboard replay), and back/forward/reload
 

@@ -58,6 +58,11 @@ interface WebTaskExtra {
   lastSuccess?: boolean;
   /** Set when the user handed the page back; the next observation always carries a screenshot. */
   handbackPending?: boolean;
+  /**
+   * Set by a pointer action or a look: the agent is working from the picture,
+   * so the next observation carries a screenshot whatever the tree suggests.
+   */
+  screenshotNext?: boolean;
   /** Human-verification handoffs the runtime started on its own for this task. */
   autoHandoffs?: number;
   /** Sticky think tier chosen by site web.tier, switched only after two agreeing verdicts. */
@@ -263,6 +268,7 @@ Examples of tasks I handle well:
 - Taking screenshots of web pages
 - Searching the web via a search engine
 - Any task that requires interactive browser navigation (clicks, scrolls, form fills)
+- Sites whose controls the accessibility tree cannot name (unlabeled tiles, custom widgets, canvas): I see the page through a vision model and drive it with real mouse and keyboard input
 - Opening a site and handing the user live control so they can click around themselves
 
 ### Interactive browsing with the user — YES, I support it
@@ -1108,7 +1114,16 @@ Set keepPageOpen: false to explicitly close the page when done.
   // Observe callback — page scraping + screenshot
   // ═══════════════════════════════════════════════════════════════════
 
-  private static readonly MAX_SNAPSHOT_CHARS = 25000;
+  /**
+   * Memory backstop only. An observation over a few thousand characters
+   * reaches the model as a head plus a searchable handle, so a long snapshot
+   * costs no prompt; clipping it is what costs. At 25k, a store page's size
+   * selector and Add to Cart sat past the cut, and no grep could find them.
+   */
+  private static readonly MAX_SNAPSHOT_CHARS = 1_500_000;
+
+  /** Default wheel distance for a scroll action: most of a screen, keeping some overlap. */
+  private static readonly SCROLL_STEP_PX = 600;
 
 
   /**
@@ -1197,7 +1212,10 @@ Set keepPageOpen: false to explicitly close the page when done.
         // judge the accessibility tree enough on its own (site web.screenshot).
         // The capture and every judgment run side by side, so a judgment adds
         // no latency beyond the capture it may make unnecessary.
-        const firstLook = step === 0 || !extra.lastAction || extra.handbackPending === true;
+        // So do the look after a failed action (the agent needs to see why)
+        // and any look the agent asked for or is pointing from.
+        const firstLook = step === 0 || !extra.lastAction || extra.handbackPending === true
+          || extra.screenshotNext === true || extra.lastSuccess === false;
         const scope = { goalId: extra.goalId, taskId, onBehalfOf: this.manifest.name };
         const [shot, skipShot, pageState, tierVerdict] = await Promise.all([
           visionAvailable ? this.captureScreenshot(extra.pageId!) : Promise.resolve(undefined),
@@ -1224,8 +1242,11 @@ Set keepPageOpen: false to explicitly close the page when done.
         }
 
         const shipped = shot && !skipShot ? shot : undefined;
-        extra.lastScreenshot = shipped;
-        if (shipped) extra.handbackPending = undefined;
+        extra.lastScreenshot = shipped?.data;
+        if (shipped) {
+          extra.handbackPending = undefined;
+          extra.screenshotNext = undefined;
+        }
 
         // Vision-aware routing: if the chosen tier is text-only but the other
         // think tier can see, use that one; a configured vision-fallback model
@@ -1243,10 +1264,10 @@ Set keepPageOpen: false to explicitly close the page when done.
         }
         log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier} vision=${visionAvailable}${visionAvailable && !shipped ? ' screenshot=none' : ''}`);
 
-        // Truncate very large snapshots to stay within token budget
         let truncatedSnapshot = snapshot;
         if (snapshot.length > WebAgent.MAX_SNAPSHOT_CHARS) {
-          truncatedSnapshot = snapshot.slice(0, WebAgent.MAX_SNAPSHOT_CHARS) + '\n... (snapshot truncated)';
+          truncatedSnapshot = snapshot.slice(0, WebAgent.MAX_SNAPSHOT_CHARS)
+            + `\n... (snapshot truncated at ${WebAgent.MAX_SNAPSHOT_CHARS.toLocaleString()} chars; scroll or use the screenshot for the rest)`;
         }
 
         const lines: string[] = [];
@@ -1264,16 +1285,19 @@ Set keepPageOpen: false to explicitly close the page when done.
         // long snapshot is held back behind a handle.
         lines.push(...notes);
         if (pageState.hint) lines.push(`Runtime page check: ${pageState.hint}`);
+        if (shipped) {
+          lines.push(`Screenshot: ${shipped.width}x${shipped.height} pixels showing the visible part of the page. Pointer actions take x,y in these pixels, origin top-left.`);
+        }
         lines.push('');
         lines.push('Page structure (ARIA snapshot):');
         lines.push(truncatedSnapshot);
 
         if (!visionAvailable) {
           lines.push('');
-          lines.push('Note: no screenshot this step; the configured models are text-only. Navigate using the ARIA snapshot refs.');
+          lines.push('Note: no screenshot this step; the configured models are text-only. Navigate using the ARIA snapshot refs (pointer actions need a screenshot).');
         } else if (skipShot && shot) {
           lines.push('');
-          lines.push('No screenshot this step: the accessibility snapshot above carries what the next action needs.');
+          lines.push('No screenshot this step: the accessibility snapshot above carries what the next action needs. To see the page anyway, use look.');
         }
         const observation = lines.join('\n');
 
@@ -1288,7 +1312,7 @@ Set keepPageOpen: false to explicitly close the page when done.
             chunkable: true,
             llmContent: [
               { type: 'text' as const, text: `[Observation - Step]\n${observation}` },
-              { type: 'image' as const, mediaType: 'image/png' as const, data: shipped },
+              { type: 'image' as const, mediaType: 'image/png' as const, data: shipped.data },
             ],
           };
         }
@@ -1305,13 +1329,17 @@ Set keepPageOpen: false to explicitly close the page when done.
     }
   }
 
-  /** Take a screenshot for vision-enabled observation; undefined when the capture fails. */
-  private async captureScreenshot(pageId: string): Promise<string | undefined> {
+  /**
+   * Take a screenshot for vision-enabled observation; undefined when the
+   * capture fails. In CSS pixels, so a point read off the image is the point
+   * the pointer actions click, whatever the display's scale.
+   */
+  private async captureScreenshot(pageId: string): Promise<{ data: string; width: number; height: number } | undefined> {
     try {
-      const shot = await this.request<{ dataUri: string }>(
-        request(this.id, this.webBrowserId!, 'screenshotPage', { pageId })
+      const shot = await this.request<{ dataUri: string; width: number; height: number }>(
+        request(this.id, this.webBrowserId!, 'screenshotPage', { pageId, options: { scale: 'css' } })
       );
-      return shot.dataUri.replace(/^data:image\/\w+;base64,/, '');
+      return { data: shot.dataUri.replace(/^data:image\/\w+;base64,/, ''), width: shot.width, height: shot.height };
     } catch {
       return undefined;
     }
@@ -1336,7 +1364,7 @@ Set keepPageOpen: false to explicitly close the page when done.
   /** Handoffs the runtime starts on its own per task; past this the agent gets the hint and decides. */
   private static readonly MAX_AUTO_HANDOFFS = 2;
   /** Actions that leave the page as it was; the page judgments look past them. */
-  private static readonly OFF_PAGE_ACTIONS = new Set(['http', 'write_scratchpad', 'read_scratchpad', 'attach_screenshot']);
+  private static readonly OFF_PAGE_ACTIONS = new Set(['http', 'write_scratchpad', 'read_scratchpad', 'attach_screenshot', 'look']);
   /** Profile choices that are not profile names. */
   private static readonly PROFILE_OPTIONS: Record<string, DecisionText> = {
     none_ephemeral: criterion('No profile: a clean, signed-out browser suits the task.', {
@@ -1697,7 +1725,8 @@ Set keepPageOpen: false to explicitly close the page when done.
     const goalId = extra.goalId;
 
     // Log the action with its key parameter
-    const actionParam = ref ?? action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
+    const point = action.x !== undefined ? `@${String(action.x)},${String(action.y)}` : undefined;
+    const actionParam = ref ?? action.selector ?? action.url ?? action.key ?? point ?? action.direction ?? action.script?.toString().slice(0, 40) ?? '';
     log.info(`Act: ${action.action}${actionParam ? ' ' + actionParam : ''}${action.value ? ' value="' + String(action.value).slice(0, 30) + '"' : ''}`);
 
     try {
@@ -1771,6 +1800,67 @@ Set keepPageOpen: false to explicitly close the page when done.
             await this.request(request(this.id, webId, 'uncheck', { pageId, selector: action.selector as string }));
           }
           return { success: true, data: { unchecked: ref ?? action.selector } };
+
+        // ── Pointer and keyboard: real input at screenshot coordinates ──
+        // Each one leaves the agent working from the picture, so the next
+        // observation carries a screenshot to aim (and check) by.
+        case 'click_at': {
+          const res = await this.request<{ target: unknown }>(request(this.id, webId, 'clickAt', {
+            pageId, x: action.x, y: action.y,
+            ...(action.button !== undefined ? { button: action.button } : {}),
+            ...(action.clicks !== undefined ? { clickCount: action.clicks } : {}),
+          }));
+          extra.screenshotNext = true;
+          return { success: true, data: { clickedAt: { x: action.x, y: action.y }, landedOn: res.target ?? 'empty space (no element there)' } };
+        }
+
+        case 'hover_at': {
+          const res = await this.request<{ target: unknown }>(request(this.id, webId, 'hoverAt', { pageId, x: action.x, y: action.y }));
+          extra.screenshotNext = true;
+          return { success: true, data: { hoveredAt: { x: action.x, y: action.y }, landedOn: res.target ?? 'empty space (no element there)' } };
+        }
+
+        case 'drag': {
+          const from = (action.from ?? {}) as { x?: number; y?: number };
+          const to = (action.to ?? {}) as { x?: number; y?: number };
+          const res = await this.request<{ from: unknown; to: unknown }>(request(this.id, webId, 'drag', {
+            pageId, fromX: from.x, fromY: from.y, toX: to.x, toY: to.y,
+          }));
+          extra.screenshotNext = true;
+          return { success: true, data: { dragged: { from, to }, grabbed: res.from ?? 'empty space', releasedOver: res.to ?? 'empty space' } };
+        }
+
+        case 'scroll': {
+          const direction = String(action.direction ?? 'down');
+          const amount = Number(action.amount ?? WebAgent.SCROLL_STEP_PX);
+          if (!['down', 'up', 'left', 'right'].includes(direction) || !Number.isFinite(amount) || amount <= 0) {
+            return { success: false, error: 'scroll needs "direction" (down, up, left or right) and an optional positive "amount" in pixels' };
+          }
+          const vertical = direction === 'down' || direction === 'up';
+          const sign = direction === 'down' || direction === 'right' ? 1 : -1;
+          const pos = await this.request<{ scrollX: number; scrollY: number; maxScrollY: number }>(request(this.id, webId, 'scroll', {
+            pageId,
+            deltaY: vertical ? sign * amount : 0,
+            deltaX: vertical ? 0 : sign * amount,
+            ...(action.x !== undefined || action.y !== undefined ? { x: action.x, y: action.y } : {}),
+          }));
+          extra.screenshotNext = true;
+          return {
+            success: true,
+            data: { scrolled: direction, pageScrollY: pos.scrollY, pageMaxScrollY: pos.maxScrollY, atPageBottom: pos.scrollY >= pos.maxScrollY - 2 },
+          };
+        }
+
+        case 'type_text': {
+          const res = await this.request<{ focused: unknown }>(request(this.id, webId, 'typeText', { pageId, text: action.text }));
+          extra.screenshotNext = true;
+          return { success: true, data: { typedChars: String(action.text ?? '').length, into: res.focused ?? 'the focused field' } };
+        }
+
+        case 'look':
+          // Nothing to do to the page: the point is the picture next step.
+          extra.screenshotNext = true;
+          return { success: true, data: { look: 'the next observation carries a screenshot' } };
 
         case 'wait':
           await this.request(request(this.id, webId, 'waitForSelector', {
@@ -1980,7 +2070,7 @@ ${taskText}`;
   }
 
   private buildSystemPrompt(): string {
-    return `You are WebAgent, an autonomous browser agent with vision. You receive an accessibility tree snapshot of the page alongside a screenshot. Each interactive element has a ref like [ref=e5]. Use refs to target elements in your actions.
+    return `You are WebAgent, an autonomous browser agent with vision. You see each page two ways: an accessibility tree (the ARIA snapshot), where each interactive element has a ref like [ref=e5], and, when a vision model is configured, a screenshot of the visible part of the page. You act through refs, or through a real mouse and keyboard aimed at the screenshot.
 
 ## ARIA Snapshot Format
 The observation contains an accessibility tree in YAML-like format. Example:
@@ -2004,6 +2094,18 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 \`\`\`json
 { "action": "click", "ref": "e8", "reasoning": "Click the Submit button" }
 \`\`\`
+
+## How to Work
+
+Take the cheapest path that works, and change approach as soon as the page shows it is not working.
+
+1. **Go straight there.** When the address is predictable (a search results URL, a product page you have the link to), navigate to it rather than clicking through menus. For JSON, feeds and other data, use http.
+2. **Act through refs.** A ref names one element exactly and survives layout changes, so click, fill, select, check and press by ref whenever the snapshot has the element. A native dropdown appears as a combobox with its options listed under it; one select on the combobox's ref picks the option.
+3. **Search big pages.** A long page arrives as a short head plus a handle holding the whole tree. Grep it for the control's label instead of paging through it, and the match shows its ref: { "action": "read_chunk", "id": "obs-4", "grep": "Add to Cart" }
+4. **Use the screenshot when the tree falls short.** Some controls have no usable ref: a tile with no label, an icon-only button, a custom dropdown, a canvas, a hidden duplicate that shares the visible one's name. When the snapshot lacks the control, or a ref action fails or changes nothing, act on what you see with click_at, hover_at, drag, scroll, type_text and press. They send real mouse and keyboard input, the same as a person's hand.
+5. **Check each step that should change something.** The next observation shows whether it worked: the selected option, the cart count, the field's value, a confirmation. When it did not, take a different approach rather than repeating the same one.
+6. **Read with extract; interact through refs or the pointer.** A site's own handlers run on real input. Changing the page from a script (setting a value, dispatching events, calling the site's functions) skips them and can leave the page half-updated, such as a size menu that shows one size while Add to Cart adds another.
+7. **Confirm before anything irreversible.** Before placing an order, sending a message, deleting, or accepting, check on the page that it matches the task: item, variant, quantity, price, recipient. Afterwards, confirm it went through (an order number, a sent notice).
 
 ## Available Actions
 
@@ -2035,12 +2137,25 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
 - check: Check a checkbox. { "action": "check", "ref": "e10" }
 - uncheck: Uncheck a checkbox. { "action": "uncheck", "ref": "e10" }
 
+### Pointer and keyboard (aimed at the screenshot)
+Coordinates are pixels in the screenshot, whose size the observation states, with the origin at the top-left. Aim at the middle of the element. Each result names what the pointer landed on, so check it is what you meant.
+- click_at: Click a point. { "action": "click_at", "x": 640, "y": 360 }
+  Optional: "button": "right" or "middle"; "clicks": 2 for a double click.
+- hover_at: Move the mouse over a point (hover menus, tooltips). { "action": "hover_at", "x": 300, "y": 120 }
+- drag: Press, move, release (sliders, drag-and-drop). { "action": "drag", "from": { "x": 100, "y": 400 }, "to": { "x": 420, "y": 400 } }
+- scroll: Turn the mouse wheel. { "action": "scroll", "direction": "down" }
+  "direction" is down, up, left or right. Optional: "amount" in pixels (default 600); "x" and "y" to scroll the panel under that point instead of the page. The result says when the page bottom is reached.
+- type_text: Type into the field that has keyboard focus, so click_at the field first. { "action": "type_text", "text": "large black t-shirt" }
+  To replace what a field holds, press "ControlOrMeta+a" first. Keys and shortcuts (Enter, Tab, Escape, ArrowDown) go through press.
+- look: Ask for a screenshot in the next observation when this one had none. { "action": "look" }
+Whatever sits below the visible area is outside the screenshot: scroll, and the next observation shows the new view. After any pointer action the next observation carries a screenshot.
+
 ### Showing the page to the user
 - attach_screenshot: Display the current page to the user as an image bubble in the chat. Use this whenever the task asks you to show, display, or render a page (or a portion of one) to the user. Do this BEFORE calling done. The image goes directly to the chat — you do not need to also describe what's in it.
   { "action": "attach_screenshot", "reasoning": "User asked to see the homepage" }
 
-### Extraction (escape hatch for complex JavaScript)
-- extract: Run JavaScript in the page context. The script is evaluated as an expression.
+### Extraction (reading data with JavaScript)
+- extract: Run JavaScript in the page context to read data. The script runs as written: an expression, an IIFE (an async one is awaited), or statements with a top-level return.
   A large result comes back whole as a searchable handle (see "Large results"), so
   return the text you need rather than pre-slicing it inside the script.
   Simple: { "action": "extract", "script": "document.title" }
@@ -2102,13 +2217,13 @@ If a human-verification challenge blocks you (a "verify you are human" checkbox,
 The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself. When the user should interact with the live page — because a step needs a human (verification challenge, on-screen approval) or because the task asks to let them browse it themselves — use \`request_human\`: it opens a live view where the user CAN click and type in your page, and returns when they finish. When the missing piece is information rather than interaction (credentials, OTP codes), end with a "fail" whose reason names exactly what to ask the user for.
 
 ## Rules
-1. Use "ref" from the ARIA snapshot to target elements. The ref (e.g. "e5") comes from [ref=eN] annotations.
+1. Target elements by "ref" when the snapshot has them (the ref, e.g. "e5", comes from [ref=eN] annotations); aim the pointer at the screenshot for what the snapshot cannot name.
 2. One action per response. Always include "reasoning" explaining why.
 3. After filling a form, submit it (click the submit button or press Enter).
 4. The ARIA snapshot shows the page's semantic structure and text content. Use it to understand the page before resorting to "extract".
 5. As soon as you have useful data, call "done" immediately. Good enough is good enough.
 6. If stuck after several attempts, use "fail" with a clear reason.
-7. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
+7. Give an action at most two tries. When it fails twice, change approach (another ref, the pointer, another route) or fail.
 8. Output ONLY the JSON block. Any one-sentence note belongs in the JSON's \`reasoning\` field.
 9. Pay attention to the step counter. When steps are running low, call "done" with whatever you have.`;
   }
