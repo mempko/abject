@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.14.2",
+    "date": "2026-10-03",
+    "title": "The browser agent gets hands and eyes",
+    "summary": "The web agent can now use a page the way a person does: it looks at a screenshot, then clicks, drags, scrolls and types with real mouse and keyboard input. Sites built from canvases, sliders and custom widgets, which the page outline can't name, are now within reach.",
+    "highlights": [
+      "The web agent can click, hover, drag, scroll and type at any point on the visible page using real mouse and keyboard events, so it can work with canvases, sliders, hover menus, drag-and-drop and slide-to-verify controls",
+      "A new look action lets the agent take a screenshot in the same pixel coordinates it clicks in, so what it sees and where it points match exactly",
+      "Every pointer action reports which element it landed on, so the agent can check that it hit the right control before going further",
+      "The agent's guidance now helps it choose between two ways of acting: by reference to a named element (precise, and safe when the layout shifts) or by pointing at what the screenshot shows (for controls nothing else can name); retry and confirmation rules are also tighter",
+      "The same pointer and keyboard operations (clickAt, hoverAt, drag, scroll, typeText) are available on the web-browser capability for any Abject to use, and screenshotPage has a new scale option to match their coordinates"
+    ],
+    "fixes": [
+      "Clicking a hidden, collapsed or zero-size element now fails right away with a clear message that suggests what to do next, instead of silently missing",
+      "Elements parked off the page (often hidden duplicates of a visible control) are now detected and reported, so the agent picks the visible one instead",
+      "When a long page outline gets cut off, the agent is told where the cut happened and that it can scroll or use the screenshot to see the rest"
+    ]
+  },
+  {
     "version": "0.14.1",
     "date": "2026-10-03",
     "title": "Steadier hands in the web browser",
