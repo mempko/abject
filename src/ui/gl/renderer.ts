@@ -521,7 +521,7 @@ export class GlRenderer {
   }
 
   /** Largest square buffer this GPU accepts as both a texture and a renderbuffer. */
-  private maxBufferSize(): number {
+  maxBufferSize(): number {
     if (this.cachedMaxBufferSize === 0) {
       const gl = this.gl;
       this.cachedMaxBufferSize = Math.max(1, Math.min(
