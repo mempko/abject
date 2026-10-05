@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.14.4",
+    "date": "2026-10-05",
+    "title": "Your Own Models, Your Own Peers",
+    "summary": "You can now add any model endpoint to Abjects as a package, without changing the server. You can also decide exactly which peers and signaling servers your instance talks to. Outgoing web requests no longer reach your local network unless you allow it.",
+    "highlights": [
+      "Abjects can now be LLM providers: any abject (usually an autostart script package) can register with the LLM object and answer model calls by message. It appears in Settings → AI and gets tier routing, fallbacks, goal budgets, streaming and the cost ledger, the same as a built-in provider. The protocol is described in docs/LLM_PROVIDERS.md.",
+      "New example package, openai-compatible-provider: point it at any endpoint that speaks the OpenAI API (a local model server or a gateway) by setting a base URL, an optional API key and a list of models. The script SDK now includes types for writing your own providers.",
+      "Who Can Connect: a new card in the Network window that lets only the peers you list connect. Admission is checked on every incoming offer and before every outgoing connection, then again on the peer's verified identity once the encrypted handshake finishes. Removing a peer disconnects it. Servers can start this way with ABJECTS_PEER_ADMISSION=allowlist and ABJECTS_ALLOWED_PEERS.",
+      "Fixed signaling: the new \"Use only these servers\" checkbox under Network → Servers & Peers (or ABJECTS_SIGNALING_URLS) keeps an instance on your own signaling servers. It skips the public default and ignores servers learned from peers and contacts, so a private Whisper server stays private.",
+      "Private-address protection for web requests: HttpClient and StreamClient now refuse localhost, your local network, link-local and cloud metadata addresses. The check runs on what the host resolves to and again on every redirect. To allow a local service, add it under Settings → Permissions → Private hosts as a name, an address or a range (for example localhost:11434 for a local model server)."
+    ],
+    "fixes": [
+      "Quitting the app no longer leaves MCP servers, coding CLI sessions or other child processes running. They are signalled first thing at shutdown, and anything that ignores the request is force-stopped. This also fixes the AppImage build failing to finish quitting because a leftover server still held its mount.",
+      "Shutdown now finishes within the desktop app's quit deadline: the worker pool stops alongside the rest of teardown, and each worker-hosted object gets at most 2.5 seconds.",
+      "Connected peers are limited to the route announcement protocol. A peer can no longer register or remove routes directly, report false hop counts, or claim an object that is already reachable through another peer.",
+      "HTTP redirects to a different origin no longer carry your credential headers."
+    ]
+  },
+  {
     "version": "0.14.3",
     "date": "2026-10-05",
     "title": "Bring your own abjects, in TypeScript",
