@@ -16,6 +16,7 @@ import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { isPackageOwner, packageDataKey } from '../core/packages.js';
 
 const log = new Log('ABJECT-STORE');
 
@@ -156,7 +157,7 @@ export class AbjectStore extends Abject {
               },
               {
                 name: 'list',
-                description: 'List all saved snapshots',
+                description: 'List the saved snapshots of user-created objects (abjects from installed packages are not listed)',
                 parameters: [],
                 returns: {
                   kind: 'array',
@@ -168,6 +169,14 @@ export class AbjectStore extends Abject {
                 description: 'Restore all saved abjects by spawning them via Factory',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'RestoreResult' },
+              },
+              {
+                name: 'getPackageData',
+                description: 'The saved data (this.data) of an abject from an installed script package in this workspace, or null. WorkspaceManager hands it back when it spawns the package; package abjects are never restored as user objects.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'The package type name' },
+                ],
+                returns: { kind: 'object', properties: {} },
               },
               {
                 name: 'restoreLost',
@@ -267,7 +276,13 @@ export class AbjectStore extends Abject {
     });
 
     this.on('list', async () => {
-      return Array.from(this.snapshots.values());
+      return Array.from(this.snapshots.values()).filter(s => !isPackageOwner(s.owner));
+    });
+
+    this.on('getPackageData', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      precondition(typeof name === 'string' && name !== '', 'name must not be empty');
+      return this.findPackageSnapshot(name)?.data ?? null;
     });
 
     this.on('restoreAll', async () => {
@@ -555,6 +570,10 @@ export class AbjectStore extends Abject {
       'manifest must be a structured AbjectManifest with a non-empty name and interface.methods (refusing to persist free-form text)',
     );
 
+    if (isPackageOwner(owner)) {
+      return this.savePackageSnapshot(objectId, manifest, source, owner, data);
+    }
+
     // Discover peerId lazily if not yet known
     if (!this.peerId) {
       try {
@@ -648,6 +667,70 @@ export class AbjectStore extends Abject {
     return true;
   }
 
+  /** The stored entry (map key and snapshot) for a package type, if any. */
+  private findPackageEntry(typeName: string): [string, AbjectSnapshot] | undefined {
+    const key = packageDataKey(typeName);
+    for (const entry of this.snapshots) {
+      if (entry[1].typeId === key && isPackageOwner(entry[1].owner)) return entry;
+    }
+    return undefined;
+  }
+
+  private findPackageSnapshot(typeName: string): AbjectSnapshot | undefined {
+    return this.findPackageEntry(typeName)?.[1];
+  }
+
+  /**
+   * Save the data of an abject from an installed package. One record per
+   * package type in this workspace, under `package/<TypeName>`. It is never
+   * restored as a user object (the package supplies the code, and
+   * WorkspaceManager hands this data back when it spawns the package), and it
+   * keeps no version history (the source is not edited here).
+   */
+  private async savePackageSnapshot(
+    objectId: string,
+    manifest: AbjectManifest,
+    source: string,
+    owner: string,
+    data?: Record<string, unknown>,
+  ): Promise<boolean> {
+    const key = packageDataKey(manifest.name);
+    const existing = this.findPackageEntry(manifest.name);
+    if (existing) this.snapshots.delete(existing[0]);
+    const finalData = data !== undefined ? data : existing?.[1].data;
+
+    this.snapshots.set(key, {
+      typeId: key,
+      objectId,
+      manifest,
+      source,
+      owner,
+      savedAt: Date.now(),
+      ...(finalData !== undefined ? { data: finalData } : {}),
+    });
+    this.schedulePersist();
+    await this.flushPersist();
+
+    // Keep the live registration's data current (a respawn after a worker
+    // crash reads it), under the typeId WorkspaceManager stamped at spawn.
+    if (this.registryId) {
+      try {
+        const reg = await this.request<{ manifest: AbjectManifest; source?: string; typeId?: TypeId } | null>(
+          request(this.id, this.registryId, 'lookup', { objectId }));
+        if (reg) {
+          await this.request(request(this.id, this.registryId, 'register', {
+            objectId, manifest: reg.manifest, owner, source: reg.source ?? source,
+            ...(reg.typeId ? { typeId: reg.typeId } : {}),
+            ...(finalData !== undefined ? { data: finalData } : {}),
+          }));
+        }
+      } catch { /* best effort — registry may not be ready */ }
+    }
+
+    log.info(`Saved package data for '${manifest.name}' (${objectId})`);
+    return true;
+  }
+
   /**
    * Remove a snapshot by objectId.
    */
@@ -679,7 +762,11 @@ export class AbjectStore extends Abject {
     // `only` names object ids whose live instances are gone (a worker
     // crashed under them); their snapshots are respawned and the rest of the
     // store is left alone. Without it, everything is restored, as at boot.
-    const snapshotList = Array.from(this.snapshots.values()).filter(s => !only || only.has(s.objectId));
+    // Abjects from installed packages are never restored here: WorkspaceManager
+    // spawns them from the package and hands their data back (getPackageData).
+    const snapshotList = Array.from(this.snapshots.values())
+      .filter(s => !isPackageOwner(s.owner))
+      .filter(s => !only || only.has(s.objectId));
 
     if (snapshotList.length === 0) {
       log.info('No snapshots to restore');
@@ -706,7 +793,11 @@ export class AbjectStore extends Abject {
 
     // Clear old snapshots — we'll rebuild keyed by typeId
     if (only) { for (const snap of snapshotList) this.snapshots.delete(snap.typeId); }
-    else this.snapshots.clear();
+    else {
+      for (const [key, snap] of [...this.snapshots]) {
+        if (!isPackageOwner(snap.owner)) this.snapshots.delete(key);
+      }
+    }
 
     for (const snap of snapshotList) {
       // Guard against corrupted snapshots whose manifest was persisted as

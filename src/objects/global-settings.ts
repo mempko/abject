@@ -17,8 +17,56 @@ import { LLMProviderDescription, servesChat } from '../llm/provider.js';
 import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
+import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+import type { PackageView, PackageDirView, PackageProblem } from './packages.js';
+import type { PackageSettingSpec } from '../sandbox/extensions.js';
 
 const log = new Log('GlobalSettings');
+
+/** The settings window's tabs, in tab-bar order. */
+const SETTINGS_TABS = ['ai', 'auth', 'permissions', 'skills', 'packages'] as const;
+type SettingsTab = typeof SETTINGS_TABS[number];
+const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
+  ai: 'AI', auth: 'Auth', permissions: 'Permissions', skills: 'Skills & MCP', packages: 'Packages',
+};
+
+/** Content width of a settings card, for sizing word-wrapped labels. */
+const SETTINGS_CARD_TEXT_WIDTH = 440;
+
+/** Where a package directory comes from, as the Packages tab says it. */
+const PACKAGE_DIR_ORIGINS: Record<PackageDirView['origin'], string> = {
+  bundled: 'bundled with Abject',
+  installed: 'installed with pnpm forge',
+  environment: 'from ABJECTS_PACKAGE_DIRS',
+  configured: 'added here',
+};
+
+/** A package's state in a few words, for its row in the package list. */
+function packageStatusWord(p: PackageView): string {
+  let word: string;
+  if (p.status === 'shadowed') word = `replaced by ${p.shadowedBy?.version ?? 'a newer copy'}`;
+  else if (p.status === 'disabled') word = p.loaded ? 'stops after restart' : 'disabled';
+  else word = p.loaded ? 'running' : 'starts after restart';
+  return p.missingRequired.length > 0 && p.status === 'enabled' ? `${word} · needs settings` : word;
+}
+
+/** A package's state as a sentence, for the selected-package card. */
+function packageStatusSentence(p: PackageView): string {
+  const parts: string[] = [];
+  if (p.status === 'shadowed') {
+    parts.push(`Not loaded: version ${p.shadowedBy?.version} in ${p.shadowedBy?.dir} takes its place.`);
+  } else if (p.status === 'disabled') {
+    parts.push(p.loaded ? 'Disabled. It keeps running until Abject restarts.' : 'Disabled. It does not load.');
+  } else {
+    parts.push(p.loaded ? 'Running.' : 'Enabled. It loads the next time Abject starts.');
+  }
+  if (p.restartRequired && p.status !== 'disabled' && p.loaded) parts.push('Restart Abject to load the version on disk.');
+  if (p.missingRequired.length > 0) {
+    const labels = p.settings.filter(s => p.missingRequired.includes(s.key)).map(s => s.label);
+    parts.push(`Required settings missing: ${labels.join(', ')}.`);
+  }
+  return parts.join(' ');
+}
 
 /** Convert a string array to ListItem array for list widgets. */
 function toListItems(
@@ -311,10 +359,30 @@ export class GlobalSettings extends Abject {
 
   // Tab state
   private tabBarId?: AbjectId;
-  private activeTab: 'ai' | 'auth' | 'permissions' | 'skills' = 'ai';
+  private activeTab: SettingsTab = 'ai';
   private aiContainerId?: AbjectId;
   private authContainerId?: AbjectId;
   private skillsContainerId?: AbjectId;
+
+  // Packages tab (a view over the Packages object)
+  private packagesContainerId?: AbjectId;
+  private packagesObjectId?: AbjectId;
+  private pkgListCardId?: AbjectId;
+  private pkgListId?: AbjectId;
+  private pkgNoticeId?: AbjectId;
+  private pkgDetailLayoutId?: AbjectId;
+  private pkgEnabledCheckboxId?: AbjectId;
+  private pkgSaveBtnId?: AbjectId;
+  /** Setting input widget -> the setting it edits (for the selected package). */
+  private pkgSettingInputs = new Map<AbjectId, PackageSettingSpec>();
+  private pkgDirInputId?: AbjectId;
+  private pkgDirAddBtnId?: AbjectId;
+  private pkgDirListId?: AbjectId;
+  private pkgDirRemoveBtnId?: AbjectId;
+  private pkgViews: PackageView[] = [];
+  private pkgProblems: PackageProblem[] = [];
+  private pkgDirs: PackageDirView[] = [];
+  private pkgSelected?: string;
 
   // Auth widgets
   private authCheckboxId?: AbjectId;
@@ -867,11 +935,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
       // Tab bar changed
       if (fromId === this.tabBarId && aspect === 'change') {
-        const idx = value as number;
-        this.activeTab = idx === 0 ? 'ai' : idx === 1 ? 'auth' : idx === 2 ? 'permissions' : 'skills';
+        this.activeTab = SETTINGS_TABS[value as number] ?? 'ai';
         await this.switchTab();
+        if (this.activeTab === 'packages') await this.refreshPackages();
         return;
       }
+
+      // Packages tab widgets
+      if (await this.handlePackagesEvent(fromId, aspect, value)) return;
 
       if (fromId === this.permSubTabBarId && aspect === 'change') {
         await this.switchPermCategory(value as number);
@@ -1239,9 +1310,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'tabBar', windowId: this.windowId,
-          tabs: ['AI', 'Auth', 'Permissions', 'Skills & MCP'],
+          tabs: SETTINGS_TABS.map(t => SETTINGS_TAB_LABELS[t]),
           closable: false,
-          selectedIndex: this.activeTab === 'ai' ? 0 : this.activeTab === 'auth' ? 1 : this.activeTab === 'permissions' ? 2 : 3 },
+          selectedIndex: SETTINGS_TABS.indexOf(this.activeTab) },
       ]})
     );
     this.tabBarId = tabBarId;
@@ -1306,6 +1377,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Packages container (scrollable VBox, initially hidden)
+    this.packagesContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.packagesContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Status label at bottom (always visible)
     const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -1328,6 +1412,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.buildPermissionsTab();
     // Build Skills & MCP tab content
     await this.buildSkillsTab();
+    // Build Packages tab content
+    await this.buildPackagesTab();
     // Show correct tab
     await this.switchTab();
 
@@ -1398,6 +1484,416 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       preferredSize: { width: 180, height: 36 },
     }));
     await this.request(request(this.id, skillRowId, 'addLayoutSpacer', {}));
+  }
+
+  // ========== PACKAGES TAB ==========
+
+  /**
+   * Build Packages tab content into packagesContainerId: the installed
+   * packages, the selected package's switch and settings, and the directories
+   * packages load from. Everything shown and changed here goes through the
+   * Packages object, which owns packages.json.
+   */
+  private async buildPackagesTab(): Promise<void> {
+    const cId = this.packagesContainerId!;
+
+    // ── Installed packages ──
+    const listCard = await this.sectionCard(cId, 'Packages',
+      'Abjects that load from installed packages. Enabling, disabling and package directories take effect the next time Abject starts; settings apply at once.', 34);
+    this.pkgListCardId = listCard;
+
+    const { widgetIds: [listId, noticeId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: [], searchable: false, style: { height: 140 } },
+        { type: 'label', windowId: this.windowId, text: '',
+          style: { color: this.theme.statusWarning, fontSize: 12, wordWrap: true, visible: false } },
+      ]})
+    );
+    this.pkgListId = listId;
+    this.pkgNoticeId = noticeId;
+    await this.request(request(this.id, listId, 'addDependent', {}));
+    await this.request(request(this.id, listCard, 'addLayoutChild', {
+      widgetId: listId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 140 },
+    }));
+    await this.request(request(this.id, listCard, 'addLayoutChild', {
+      widgetId: noticeId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 18 },
+    }));
+
+    // ── Selected package (rebuilt whenever the selection or its state changes) ──
+    const detailCard = await this.sectionCard(cId, 'Selected package',
+      'What the package is, whether it loads, and the settings it needs.', 18);
+    // autoSize: the card grows and shrinks with whatever the pane is rebuilt to hold.
+    this.pkgDetailLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: detailCard,
+        autoSize: true,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 6,
+      })
+    );
+    await this.request(request(this.id, detailCard, 'addLayoutChild', {
+      widgetId: this.pkgDetailLayoutId,
+      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
+      preferredSize: { height: 40 },
+    }));
+
+    // ── Package directories ──
+    const dirCard = await this.sectionCard(cId, 'Package directories',
+      'Where packages load from, in order: a later copy of a package replaces an earlier one. Add a package directory, or a directory of packages.', 34);
+    const ed = await this.stringListEditor(dirCard, 'Directories', '/absolute/path/to/packages', []);
+    this.pkgDirInputId = ed.inputId;
+    this.pkgDirAddBtnId = ed.addBtnId;
+    this.pkgDirListId = ed.listId;
+    this.pkgDirRemoveBtnId = ed.removeBtnId;
+
+    await this.refreshPackages();
+  }
+
+  /** Re-read packages and directories from the Packages object and repaint the tab. */
+  private async refreshPackages(): Promise<void> {
+    if (!this.pkgListId) return;
+    if (!this.packagesObjectId) this.packagesObjectId = await this.discoverDep('Packages') ?? undefined;
+    if (!this.packagesObjectId) {
+      await this.setPackagesNotice('The Packages service is not running, so packages cannot be managed here.');
+      return;
+    }
+    try {
+      const state = await this.request<{ packages: PackageView[]; problems: PackageProblem[] }>(
+        request(this.id, this.packagesObjectId, 'list', {}), 30_000);
+      this.pkgViews = state.packages;
+      this.pkgProblems = state.problems;
+      this.pkgDirs = await this.request<PackageDirView[]>(
+        request(this.id, this.packagesObjectId, 'listDirs', {}), 30_000);
+    } catch (err) {
+      await this.setPackagesNotice(`Could not read packages: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (this.pkgSelected && !this.pkgViews.some(p => p.dir === this.pkgSelected)) this.pkgSelected = undefined;
+    if (!this.pkgSelected && this.pkgViews.length > 0) this.pkgSelected = this.pkgViews[0].dir;
+    try {
+      await this.renderPackageList();
+      await this.renderPackageDirs();
+      await this.renderPackageDetail();
+    } catch { /* settings window closed */ }
+  }
+
+  private async renderPackageList(): Promise<void> {
+    if (!this.pkgListId) return;
+    const items = this.pkgViews.map(p => ({
+      label: `${p.icon ? `${p.icon} ` : ''}${p.name} ${p.version} · ${p.runtime} · ${packageStatusWord(p)}`,
+      value: p.dir,
+    }));
+    await this.request(request(this.id, this.pkgListId, 'update', {
+      items, selectedIndex: this.pkgViews.findIndex(p => p.dir === this.pkgSelected),
+    }));
+
+    const notes: string[] = [];
+    if (this.pkgViews.length === 0) {
+      notes.push('No packages found. Install one with pnpm forge, or add a directory below.');
+    }
+    const pending = this.pkgViews.filter(p => p.restartRequired).map(p => p.name);
+    if (pending.length > 0) notes.push(`Restart Abject to apply changes to: ${[...new Set(pending)].join(', ')}.`);
+    for (const problem of this.pkgProblems) notes.push(`Could not read ${problem.dir}: ${problem.error}`);
+    await this.setPackagesNotice(notes.join(' '));
+  }
+
+  /** Show a note under the package list, or hide it when there is nothing to say. */
+  private async setPackagesNotice(text: string): Promise<void> {
+    if (!this.pkgNoticeId || !this.pkgListCardId) return;
+    const lines = text ? estimateWrappedLineCount(text, SETTINGS_CARD_TEXT_WIDTH, 12) : 1;
+    await this.request(request(this.id, this.pkgNoticeId, 'update', { text, style: { visible: text !== '' } }));
+    await this.request(request(this.id, this.pkgListCardId, 'updateLayoutChild', {
+      widgetId: this.pkgNoticeId,
+      preferredSize: { height: text ? lines * 16 + 2 : 1 },
+    }));
+  }
+
+  private async renderPackageDirs(): Promise<void> {
+    if (!this.pkgDirListId) return;
+    const items = this.pkgDirs.map(d => ({
+      label: `${d.dir}  (${PACKAGE_DIR_ORIGINS[d.origin]}${d.exists ? '' : ', missing'})`,
+      value: d.dir,
+      actions: d.editable ? [{ id: 'remove', label: 'Remove' }] : [],
+    }));
+    await this.request(request(this.id, this.pkgDirListId, 'update', { items }));
+    await this.syncListEmptyState(this.pkgDirListId, items.length === 0);
+  }
+
+  /** A word-wrapped label sized to its text, added to a layout. */
+  private async addPackageLabel(
+    layoutId: AbjectId, text: string, color: string, fontSize = 12,
+  ): Promise<AbjectId> {
+    const lines = estimateWrappedLineCount(text, SETTINGS_CARD_TEXT_WIDTH, fontSize);
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text, style: { color, fontSize, wordWrap: true } },
+      ]})
+    );
+    await this.request(request(this.id, layoutId, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: lines * Math.round(fontSize * 1.35) + 2 },
+    }));
+    return labelId;
+  }
+
+  /** Rebuild the selected-package card: facts, the load switch, and a settings form. */
+  private async renderPackageDetail(): Promise<void> {
+    const layout = this.pkgDetailLayoutId;
+    if (!layout) return;
+    await this.request(request(this.id, layout, 'clearLayoutChildren', {}));
+    this.pkgEnabledCheckboxId = undefined;
+    this.pkgSaveBtnId = undefined;
+    this.pkgSettingInputs.clear();
+
+    const p = this.pkgViews.find(v => v.dir === this.pkgSelected);
+    if (!p) {
+      await this.addPackageLabel(layout, 'Pick a package above to see it here.', this.theme.textSecondary);
+      return;
+    }
+
+    await this.addPackageLabel(layout, `${p.icon ? `${p.icon} ` : ''}${p.name} ${p.version}`, this.theme.textHeading, 14);
+    if (p.description) await this.addPackageLabel(layout, p.description, this.theme.textDescription);
+    const facts = [
+      p.runtime === 'script' ? 'Script package' : 'WASM package',
+      p.scope === 'workspace' ? 'one in every workspace' : 'one per instance',
+      p.replaces ? `replaces the built-in ${p.replaces}` : `type ${p.typeName}`,
+    ].join(' · ');
+    await this.addPackageLabel(layout, facts, this.theme.textSecondary);
+    await this.addPackageLabel(layout, `${p.dir} (${PACKAGE_DIR_ORIGINS[p.origin]})`, this.theme.textTertiary, 11);
+    await this.addPackageLabel(layout, packageStatusSentence(p),
+      p.restartRequired || p.missingRequired.length > 0 ? this.theme.statusWarning : this.theme.textDescription);
+
+    const { widgetIds: [enabledId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId, checked: p.status !== 'disabled',
+          text: 'Load this package (applies at the next start)' },
+      ]})
+    );
+    this.pkgEnabledCheckboxId = enabledId;
+    await this.request(request(this.id, enabledId, 'addDependent', {}));
+    await this.request(request(this.id, layout, 'addLayoutChild', {
+      widgetId: enabledId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    if (p.settings.length === 0) {
+      await this.addPackageLabel(layout, 'This package declares no settings.', this.theme.textSecondary);
+      return;
+    }
+
+    for (const spec of p.settings) {
+      const value = p.values[spec.key];
+      const title = `${spec.label}${spec.required ? ' (required)' : ''}`;
+      let inputId: AbjectId;
+      if (spec.type === 'boolean') {
+        ({ widgetIds: [inputId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'checkbox', windowId: this.windowId, checked: value === true, text: title },
+          ]})
+        ));
+        await this.request(request(this.id, layout, 'addLayoutChild', {
+          widgetId: inputId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 28 },
+        }));
+      } else {
+        await this.addPackageLabel(layout, title, this.theme.textHeading, 13);
+        const secretSet = spec.type === 'secret' && typeof value === 'object' && value !== null && value.set;
+        const placeholder = spec.type === 'secret'
+          ? (secretSet ? 'Stored. Type a new value to replace it.' : 'Not set')
+          : spec.default !== undefined ? `Default: ${String(spec.default)}` : spec.label;
+        const text = spec.type !== 'secret' && value !== undefined && typeof value !== 'object' ? String(value) : undefined;
+        ({ widgetIds: [inputId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'textInput', windowId: this.windowId, placeholder,
+              ...(text !== undefined ? { text } : {}),
+              ...(spec.type === 'secret' ? { masked: true } : {}) },
+          ]})
+        ));
+        await this.request(request(this.id, layout, 'addLayoutChild', {
+          widgetId: inputId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 32 },
+        }));
+      }
+      await this.request(request(this.id, inputId, 'addDependent', {}));
+      this.pkgSettingInputs.set(inputId, spec);
+      if (spec.description) await this.addPackageLabel(layout, spec.description, this.theme.textSecondary, 11);
+    }
+
+    const saveRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: layout,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, layout, 'addLayoutChild', {
+      widgetId: saveRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 40 },
+    }));
+    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
+    const { widgetIds: [saveId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Save Settings',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+      ]})
+    );
+    this.pkgSaveBtnId = saveId;
+    await this.request(request(this.id, saveId, 'addDependent', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutChild', {
+      widgetId: saveId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 36 },
+    }));
+  }
+
+  /**
+   * Route a widget event from the Packages tab. Returns true when the event
+   * belonged to the tab (handled or deliberately ignored), so the generic
+   * handlers below never see it: a submit in a package setting must save the
+   * package's settings, not the AI settings.
+   */
+  private async handlePackagesEvent(fromId: AbjectId, aspect: string, value: unknown): Promise<boolean> {
+    if (!this.packagesContainerId) return false;
+
+    if (fromId === this.pkgListId) {
+      if (aspect === 'selectionChanged') {
+        try {
+          this.pkgSelected = (JSON.parse(value as string) as { value: string }).value;
+          await this.renderPackageDetail();
+        } catch { /* malformed selection */ }
+      }
+      return true;
+    }
+
+    if (fromId === this.pkgEnabledCheckboxId) {
+      if (aspect === 'change') await this.setSelectedPackageEnabled(value === true || value === 'true');
+      return true;
+    }
+
+    if (fromId === this.pkgSaveBtnId) {
+      if (aspect === 'click') await this.saveSelectedPackageSettings();
+      return true;
+    }
+
+    if (this.pkgSettingInputs.has(fromId)) {
+      if (aspect === 'submit') await this.saveSelectedPackageSettings();
+      return true;
+    }
+
+    if (fromId === this.pkgDirAddBtnId || fromId === this.pkgDirInputId) {
+      if ((fromId === this.pkgDirAddBtnId && aspect === 'click') || (fromId === this.pkgDirInputId && aspect === 'submit')) {
+        await this.addPackageDir();
+      }
+      return true;
+    }
+
+    if (fromId === this.pkgDirRemoveBtnId) {
+      if (aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.pkgDirListId!, 'getValue', {}));
+        if (sel) await this.removePackageDir(sel);
+        else await this.rejectWith('Select a directory you added here to remove it.');
+      }
+      return true;
+    }
+
+    if (fromId === this.pkgDirListId) {
+      if (aspect === 'action') {
+        try {
+          const data = JSON.parse(value as string) as { value: string; actionId: string };
+          if (data.actionId === 'remove') await this.removePackageDir(data.value);
+        } catch { /* malformed action */ }
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  private selectedPackage(): PackageView | undefined {
+    return this.pkgViews.find(v => v.dir === this.pkgSelected);
+  }
+
+  private async setSelectedPackageEnabled(enabled: boolean): Promise<void> {
+    const p = this.selectedPackage();
+    if (!p || !this.packagesObjectId) return;
+    const r = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.packagesObjectId, 'setEnabled', { name: p.name, enabled }));
+    if (!r.success) {
+      await this.rejectWith(r.error ?? `Could not change ${p.name}.`);
+      await this.refreshPackages();
+      return;
+    }
+    this.windowEffect('flash');
+    await this.setStatus(enabled
+      ? `${p.name} will load the next time Abject starts.`
+      : `${p.name} will not load the next time Abject starts.`);
+    await this.refreshPackages();
+  }
+
+  private async saveSelectedPackageSettings(): Promise<void> {
+    const p = this.selectedPackage();
+    if (!p || !this.packagesObjectId) return;
+    const values: Record<string, unknown> = {};
+    for (const [inputId, spec] of this.pkgSettingInputs) {
+      const raw = String(await this.request<string>(request(this.id, inputId, 'getValue', {})) ?? '');
+      if (spec.type === 'boolean') {
+        values[spec.key] = raw === 'true';
+      } else if (spec.type === 'number') {
+        if (raw.trim() === '') { values[spec.key] = null; continue; }
+        const n = Number(raw);
+        if (!Number.isFinite(n)) { await this.rejectWith(`${spec.label} must be a number.`); return; }
+        values[spec.key] = n;
+      } else if (spec.type === 'secret') {
+        values[spec.key] = raw; // empty keeps the stored secret
+      } else {
+        values[spec.key] = raw === '' ? null : raw; // empty falls back to the default
+      }
+    }
+    const r = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.packagesObjectId, 'setSettings', { name: p.name, values }));
+    if (!r.success) {
+      await this.rejectWith(r.error ?? `Could not save settings for ${p.name}.`);
+      return;
+    }
+    this.windowEffect('flash');
+    await this.setStatus(`Settings saved for ${p.name}.`);
+    await this.refreshPackages();
+  }
+
+  private async addPackageDir(): Promise<void> {
+    if (!this.packagesObjectId || !this.pkgDirInputId) return;
+    const dir = String(await this.request<string>(request(this.id, this.pkgDirInputId, 'getValue', {})) ?? '').trim();
+    const r = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.packagesObjectId, 'addDir', { dir }));
+    if (!r.success) {
+      await this.rejectWith(r.error ?? 'Could not add that directory.');
+      return;
+    }
+    await this.request(request(this.id, this.pkgDirInputId, 'update', { text: '' }));
+    await this.listAddFeedback(dir, true);
+    await this.setStatus('Directory added. Restart Abject to load packages from it.');
+    await this.refreshPackages();
+  }
+
+  private async removePackageDir(dir: string): Promise<void> {
+    if (!this.packagesObjectId) return;
+    const r = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.packagesObjectId, 'removeDir', { dir }));
+    if (!r.success) {
+      await this.rejectWith(r.error ?? 'Could not remove that directory.');
+      return;
+    }
+    await this.setStatus('Directory removed. Restart Abject to stop loading packages from it.');
+    await this.refreshPackages();
   }
 
   /** Build AI tab content into aiContainerId. */
@@ -2174,6 +2670,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.webDeniedRemoveBtnId = undefined;
     this.capEnforceSelectId = undefined;
     this.permsSaveBtnId = undefined;
+    this.packagesContainerId = undefined;
+    this.pkgListCardId = undefined;
+    this.pkgListId = undefined;
+    this.pkgNoticeId = undefined;
+    this.pkgDetailLayoutId = undefined;
+    this.pkgEnabledCheckboxId = undefined;
+    this.pkgSaveBtnId = undefined;
+    this.pkgSettingInputs.clear();
+    this.pkgDirInputId = undefined;
+    this.pkgDirAddBtnId = undefined;
+    this.pkgDirListId = undefined;
+    this.pkgDirRemoveBtnId = undefined;
     this.unmasked.clear();
 
     this.changed('visibility', false);
@@ -2182,11 +2690,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
   /** Show/hide tab containers based on activeTab. */
   private async switchTab(): Promise<void> {
-    if (!this.aiContainerId || !this.authContainerId || !this.permissionsContainerId || !this.skillsContainerId) return;
+    if (!this.aiContainerId || !this.authContainerId || !this.permissionsContainerId || !this.skillsContainerId
+        || !this.packagesContainerId) return;
     await this.request(request(this.id, this.aiContainerId, 'update', { style: { visible: this.activeTab === 'ai' } }));
     await this.request(request(this.id, this.authContainerId, 'update', { style: { visible: this.activeTab === 'auth' } }));
     await this.request(request(this.id, this.permissionsContainerId, 'update', { style: { visible: this.activeTab === 'permissions' } }));
     await this.request(request(this.id, this.skillsContainerId, 'update', { style: { visible: this.activeTab === 'skills' } }));
+    await this.request(request(this.id, this.packagesContainerId, 'update', { style: { visible: this.activeTab === 'packages' } }));
   }
 
   // ========== HELPERS ==========

@@ -30,6 +30,15 @@ unregisters the preset; closing only the panel keeps the stage open.
 
 ## Load it
 
+**As a package (no build step):** this directory is a script package
+(`abject.json` names `SceneShowcase.js` and the manifest in
+`SceneShowcase.json`). Either add the directory in Settings → Packages →
+Package directories, or start the backend with
+`ABJECTS_PACKAGE_DIRS=$PWD/examples/scene-showcase pnpm awaken`, or install a
+copy with `pnpm forge examples/scene-showcase`. After a restart
+**SceneShowcase** is in every workspace's sidebar. As a package abject it is
+read-only; clone it to get an editable copy. See `docs/PACKAGES.md`.
+
 **From the Explorer (no AI involved, exact copy):**
 
 1. In the sidebar under SYSTEM, open **Explorer**. Pick **AbjectStore** and the

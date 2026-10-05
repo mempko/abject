@@ -1,0 +1,42 @@
+{
+  "name": "Tally",
+  "description": "Keeps named counts that survive restarts. A small script package written in TypeScript: typed handlers, durable this.data, and settings read from the Packages service.",
+  "version": "1.0.0",
+  "icon": "🧮",
+  "interface": {
+    "id": "abjects:example:tally",
+    "name": "Tally",
+    "description": "Named counters",
+    "methods": [
+      {
+        "name": "add",
+        "description": "Count `by` occurrences of `name` (the Step setting when by is omitted). Returns { name, count, unit }.",
+        "parameters": [
+          { "name": "name", "type": { "kind": "primitive", "primitive": "string" }, "description": "What is being counted" },
+          { "name": "by", "type": { "kind": "primitive", "primitive": "number" }, "description": "How many to add", "optional": true }
+        ],
+        "returns": { "kind": "object", "properties": {} }
+      },
+      {
+        "name": "counts",
+        "description": "Every count so far. Returns { unit, counts }.",
+        "parameters": [],
+        "returns": { "kind": "object", "properties": {} }
+      },
+      {
+        "name": "reset",
+        "description": "Clear one count, or all of them when no name is given. Returns { counts }.",
+        "parameters": [
+          { "name": "name", "type": { "kind": "primitive", "primitive": "string" }, "description": "The count to clear", "optional": true }
+        ],
+        "returns": { "kind": "object", "properties": {} }
+      }
+    ],
+    "events": [
+      { "name": "counted", "description": "A count changed (only when the Announce setting is on); payload { name, count }", "payload": { "kind": "object", "properties": {} } }
+    ]
+  },
+  "requiredCapabilities": [],
+  "providedCapabilities": [],
+  "tags": ["example"]
+}

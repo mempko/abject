@@ -1,0 +1,13 @@
+{
+  "name": "Tally",
+  "version": "1.0.0",
+  "runtime": "script",
+  "scope": "workspace",
+  "entry": "tally.ts",
+  "manifest": "manifest.json",
+  "settings": [
+    { "key": "unit", "label": "Unit", "type": "string", "default": "visits", "description": "What the counts are counted in." },
+    { "key": "step", "label": "Step", "type": "number", "default": 1, "description": "How much add counts when it is not told." },
+    { "key": "announce", "label": "Announce changes", "type": "boolean", "default": false, "description": "Tell observers about every change with a counted event." }
+  ]
+}

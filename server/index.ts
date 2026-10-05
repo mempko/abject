@@ -112,6 +112,7 @@ import { MCPRegistryClient } from '../src/objects/mcp-registry-client.js';
 import { ClawHubClient } from '../src/objects/clawhub-client.js';
 import { CatalogBrowser } from '../src/objects/catalog-browser.js';
 import { SecretsVault } from '../src/objects/secrets-vault.js';
+import { Packages } from '../src/objects/packages.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
@@ -668,6 +669,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('ClawHubClient', () => new ClawHubClient());
   runtime.objectFactory.registerConstructor('CatalogBrowser', () => new CatalogBrowser());
   runtime.objectFactory.registerConstructor('SecretsVault', () => new SecretsVault());
+  runtime.objectFactory.registerConstructor('Packages', () => new Packages());
   runtime.objectFactory.registerConstructor('OAuthHelper', () => new OAuthHelper());
   runtime.objectFactory.registerConstructor('RemoteUIAccess', () => new RemoteUIAccess());
   runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
@@ -692,7 +694,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'ProxyGenerator', 'Negotiator', 'HealthMonitor', 'CassetteRecorder',
       'SkillRegistry', 'SkillBrowser',
       'MCPRegistryClient', 'ClawHubClient', 'CatalogBrowser',
-      'SecretsVault', 'OAuthHelper',
+      'SecretsVault', 'OAuthHelper', 'Packages',
       // Per-workspace objects
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace', 'SharedState',
@@ -733,14 +735,16 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
 
   log.timed('constructors registered');
 
-  // Ingest WASM packages before anything spawns: bundled native system
-  // packages (native/, shipped with the app) first, then user-installed
-  // extensions (.abjects/extensions/*, which win name collisions). A package
-  // with `replaces` must override its built-in constructor in the Factory
-  // before the first spawn of that name.
+  // Ingest abject packages (WASM and script) before anything spawns: bundled
+  // native system packages (native/, shipped with the app) first, then
+  // user-installed extensions (.abjects/extensions/*), then ABJECTS_PACKAGE_DIRS
+  // and the directories in packages.json; later ones win name collisions, and
+  // packages.json can disable any of them. A package with `replaces` must
+  // override its built-in constructor in the Factory before the first spawn of
+  // that name.
   const wasmExtensions = await ingestAllExtensions(runtime.objectFactory);
   if (wasmExtensions.length > 0) {
-    log.timed(`WASM extensions ingested (${wasmExtensions.map(e => e.typeName).join(', ')})`);
+    log.timed(`packages ingested (${wasmExtensions.map(e => `${e.typeName}:${e.runtime}`).join(', ')})`);
   }
 
   // Spawn Supervisor early so it can supervise other objects
@@ -1017,6 +1021,10 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     'PermissionBroker', 'permanent', systemTypeId('PermissionBroker'));
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
+  // Installed packages and their configuration (the Packages settings tab).
+  // Worker-eligible like the other global services: it only reads and writes
+  // packages.json and the package directories, and asks the Factory by message.
+  await supervisedSpawn('Packages', 'permanent', systemTypeId('Packages'));
 
   // Capability-enforcement mode: register the interceptor's mailbox as a
   // GlobalSettings dependent (mode-change events land there) and pull the

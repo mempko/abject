@@ -31,23 +31,30 @@ import {
   storeWasmModule,
   decodeBase64Module,
 } from '../sandbox/wasm-module-store.js';
+import { isPackageOwner } from '../core/packages.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
 export type ObjectFactory = (args?: unknown) => Abject;
 
 /**
- * A named WASM type: an installed extension module that spawns under a type
- * name. When the name matches a built-in constructor, the WASM implementation
- * takes precedence — that's how a compiled module transparently replaces a
+ * A named package type: an installed package (src/sandbox/extensions.ts) that
+ * spawns under a type name. When the name matches a built-in constructor, the
+ * package takes precedence — that's how a package transparently replaces a
  * TypeScript system object (`replaces` in abject.json).
  */
-export interface WasmTypeRegistration {
+export interface PackageTypeRegistration {
+  /** 'wasm' spawns a WasmAbject, 'script' a ScriptableAbject. */
+  runtime: 'wasm' | 'script';
   manifest: AbjectManifest;
-  /** wasm source ref: `wasm:sha256:<hex>` */
+  /** wasm source ref (`wasm:sha256:<hex>`) or JavaScript handler-map source. */
   source: string;
   /** 'system' types spawn once at boot; 'workspace' types spawn per workspace. */
   scope: 'system' | 'workspace';
+  /** Script packages: the `package:<name>` owner their abjects spawn with. */
+  owner?: AbjectId;
+  /** The package this type came from, for the Packages settings view. */
+  package?: { name: string; version: string };
 }
 
 /**
@@ -56,7 +63,7 @@ export interface WasmTypeRegistration {
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
-  private wasmTypes: Map<string, WasmTypeRegistration> = new Map();
+  private packageTypes: Map<string, PackageTypeRegistration> = new Map();
   private _factoryBus?: MessageBusLike;
   private _factoryRegistryId?: AbjectId;
 
@@ -267,7 +274,7 @@ export class Factory extends Abject {
       return this.respawn(objectId, constructorName, parentId, registryId);
     });
 
-    this.on('listWasmTypes', async () => this.listWasmTypes());
+    this.on('listPackageTypes', async () => this.listPackageTypes());
 
     this.on('getObjectInfo', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
@@ -276,7 +283,10 @@ export class Factory extends Abject {
       const workerIndex = isWorker && this._workerPool
         ? workerIndexForId(objectId, this._workerPool.workerCount)
         : undefined;
-      return { isWorkerHosted: isWorker, constructorName, workerIndex };
+      // Where this Factory registered the object: authoritative for looking up
+      // a caller's registration, unlike anything the caller could claim.
+      const registryId = this.workerRegistries.get(objectId) ?? this.spawned.get(objectId)?.getRegistryId();
+      return { isWorkerHosted: isWorker, constructorName, workerIndex, ...(registryId ? { registryId } : {}) };
     });
   }
 
@@ -358,24 +368,38 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
   }
 
   /**
-   * Register a WASM type under a name. Spawns of that name resolve to the
-   * module instead of any registered constructor, so an installed extension
+   * Register a package type under a name. Spawns of that name resolve to the
+   * package instead of any registered constructor, so an installed package
    * can replace a built-in implementation transparently.
    */
-  registerWasmType(name: string, registration: WasmTypeRegistration): void {
+  registerPackageType(name: string, registration: PackageTypeRegistration): void {
     require(name !== '', 'name must not be empty');
-    require(isWasmSourceRef(registration.source), 'registration.source must be a wasm ref');
     require(registration.manifest?.interface !== undefined, 'registration manifest must declare an interface');
-    this.wasmTypes.set(name, registration);
-    log.info(`WASM type '${name}' registered (${registration.scope}, ${registration.source.slice(0, 30)}...)`);
+    if (registration.runtime === 'wasm') {
+      require(isWasmSourceRef(registration.source), 'a wasm package type needs a wasm source ref');
+    } else {
+      require(registration.runtime === 'script', `unknown package runtime '${String(registration.runtime)}'`);
+      require(registration.source.trim() !== '' && !isWasmSourceRef(registration.source),
+        'a script package type needs JavaScript handler-map source');
+      require(registration.scope === 'workspace', 'script package types must be workspace-scoped');
+      require(isPackageOwner(registration.owner), 'a script package type needs a package owner');
+    }
+    this.packageTypes.set(name, registration);
+    log.info(`package type '${name}' registered (${registration.runtime}, ${registration.scope})`);
   }
 
-  /** Installed WASM types (name + scope), e.g. for WorkspaceManager to spawn
-   *  workspace-scoped extensions alongside the built-in per-workspace set. */
-  listWasmTypes(): Array<{ name: string; scope: 'system' | 'workspace' }> {
-    return Array.from(this.wasmTypes.entries()).map(([name, t]) => ({
+  /** Installed package types, e.g. for WorkspaceManager to spawn
+   *  workspace-scoped packages alongside the built-in per-workspace set. */
+  listPackageTypes(): Array<{
+    name: string; scope: 'system' | 'workspace'; runtime: 'wasm' | 'script'; tags: string[];
+    package?: { name: string; version: string };
+  }> {
+    return Array.from(this.packageTypes.entries()).map(([name, t]) => ({
       name,
       scope: t.scope,
+      runtime: t.runtime,
+      tags: [...(t.manifest.tags ?? [])],
+      ...(t.package ? { package: { ...t.package } } : {}),
     }));
   }
 
@@ -461,10 +485,12 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     // Fresh instance: source + manifest, caller's data (default empty), and
     // deliberately NO typeId so it has its own ephemeral identity rather than
     // colliding with the source object's durable snapshot key.
+    // A package's abjects are read-only and restored from the package; an
+    // instance of one is an ordinary object, so it does not keep that owner.
     const spawnReq: SpawnRequest = {
       manifest: reg!.manifest,
       source: reg!.source,
-      owner: reg!.owner,
+      ...(isPackageOwner(reg!.owner) ? {} : { owner: reg!.owner }),
       data: req.data ?? {},
     };
     if (req.registryHint) spawnReq.registryHint = req.registryHint;
@@ -490,8 +516,10 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     require(reg !== null, `Object '${objectId}' not found in any registry`);
 
     // Lineage: stamp where this copy came from and its clone generation.
+    const fromPackage = isPackageOwner(reg!.owner);
     const manifest: AbjectManifest = {
       ...reg!.manifest,
+      ...(fromPackage ? { tags: (reg!.manifest.tags ?? []).filter(t => t !== 'package') } : {}),
       lineage: {
         clonedFrom: (reg!.typeId as string | undefined) ?? (objectId as string),
         generation: (reg!.manifest.lineage?.generation ?? 0) + 1,
@@ -501,10 +529,13 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     // Delegate to spawn with the same manifest and source.
     // Internal data clones with the source — that is the point of having data
     // live inside the object.
+    // A clone of a package abject is an ordinary, editable user object: it
+    // does not inherit the package owner (which would make it read-only and
+    // keep it out of the AbjectStore restore).
     const spawnReq: SpawnRequest = { manifest };
     if (reg!.source) {
       spawnReq.source = reg!.source;
-      spawnReq.owner = reg!.owner;
+      if (!fromPackage) spawnReq.owner = reg!.owner;
     }
     if (withData && reg!.data !== undefined) {
       // Deep-copy via JSON so the clone's data is independent of the original's.
@@ -741,16 +772,29 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(req.manifest !== undefined, 'manifest is required');
 
-    // WASM resolution runs before every other dispatch so installed type
+    // Package resolution runs before every other dispatch so installed type
     // overrides win over built-in constructors (that's what `replaces` means).
-    // 1. A registered WASM type under this name supplies manifest + module ref.
-    const wasmType =
+    // 1. A registered package type under this name supplies the manifest and
+    //    its code: a module ref (wasm) or handler-map source (script). Script
+    //    packages also supply the package owner, which keeps their source
+    //    read-only and their data out of the user-object restore.
+    const packageType =
       !req.source && !req.code && !req.codeBase64
-        ? this.wasmTypes.get(req.manifest.name)
+        ? this.packageTypes.get(req.manifest.name)
         : undefined;
-    if (wasmType) {
-      req = { ...req, manifest: wasmType.manifest, source: wasmType.source };
+    if (packageType) {
+      req = {
+        ...req,
+        manifest: packageType.manifest,
+        source: packageType.source,
+        ...(packageType.runtime === 'script' ? { owner: packageType.owner } : {}),
+      };
     }
+    const scriptPackage = packageType?.runtime === 'script';
+    // The package owner is reserved for abjects spawned from an installed
+    // package; a request may not claim it for anything else.
+    require(scriptPackage || !isPackageOwner(req.owner),
+      `owner '${String(req.owner)}' is reserved for abjects from installed packages`);
     // 2. Raw module bytes are ingested into the content-addressed store and
     //    replaced by their canonical wasm source ref.
     if (!req.source && (req.code || req.codeBase64)) {
@@ -766,8 +810,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       return this.spawnWasmInWorker(req);
     }
 
-    // Check if we have a registered factory
-    const factory = this.constructors.get(req.manifest.name);
+    // Check if we have a registered factory. A request carrying source asks
+    // for a source-backed object, so a built-in constructor of the same name
+    // must not win: that covers a script package replacing a built-in, a
+    // clone of one, and a user object that happens to share a built-in's name.
+    const factory = scriptPackage || req.source ? undefined : this.constructors.get(req.manifest.name);
 
     // Worker path: if the constructor is worker-eligible, delegate to WorkerPool
     if (factory && this._workerPool && this.workerEligible.has(req.manifest.name)) {

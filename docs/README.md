@@ -7,6 +7,11 @@ the system (or between the system and external toolchains).
 
 ## Documents
 
+- **PACKAGES.md**: abject packages in both runtimes (WASM and script):
+  the `abject.json` format, building with `pnpm forge` (including TypeScript),
+  where packages load from, `packages.json`, declared settings and how a
+  package's abjects read them, and how package abjects persist and stay
+  read-only.
 - **WASM_ABI.md**: the host/guest contract for abjects written in other
   languages and compiled to WebAssembly. Defines the module exports, host
   imports, JSON envelope protocol, package format (`abject.json`), the

@@ -256,8 +256,9 @@ client/                 # Thin browser client: FrontendClient, input forwarding
 workers/                # Worker thread entry points (shared Abject pool, P2P, UI)
 native/                 # Bundled WASM system packages (e.g. the C++ KnowledgeBase)
 sdk/cpp/                # C++ SDK for writing abjects that compile to WebAssembly
-examples/               # User-loadable WASM abject packages (install with pnpm forge)
-docs/                   # Specifications (WASM_ABI.md)
+sdk/script/             # TypeScript types for script packages
+examples/               # User-loadable abject packages, WASM and script (install with pnpm forge)
+docs/                   # Specifications (PACKAGES.md, WASM_ABI.md)
 ```
 
 ## Design by Contract

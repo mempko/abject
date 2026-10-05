@@ -1,13 +1,36 @@
-# src/sandbox/ - WASM Abject Hosting
+# src/sandbox/ - Abject Packages and WASM Hosting
 
-Host-side support for abjects written in other languages and compiled to
-WebAssembly. The full host/guest contract is specified in `docs/WASM_ABI.md`;
-the object that ties it into the runtime is `src/objects/wasm-abject.ts`
-(an ordinary Abject subclass, like ScriptableAbject but backed by a module
-instead of a JS source string). A C++ SDK for writing modules lives in
-`sdk/cpp/`.
+Host-side support for abjects that ship as packages instead of being built
+into the server: WASM modules written in other languages, and script abjects
+(JavaScript handler maps, which may be authored in TypeScript). The package
+format, where packages load from, and how they are configured are described in
+`docs/PACKAGES.md`; the WASM host/guest contract is `docs/WASM_ABI.md`.
+
+The objects that tie packages into the runtime are `src/objects/wasm-abject.ts`
+(a module-backed Abject) and `src/objects/scriptable-abject.ts` (a
+source-backed one). SDKs live in `sdk/cpp/` and `sdk/script/`.
 
 ## Files
+
+### extensions.ts
+
+Package discovery and boot-time ingest.
+
+- `readPackage(dir)`: read and validate one package (`runtime` `wasm` or
+  `script`, scope, manifest, declared settings)
+- `packageRoots()` / `discoverPackages()`: the places packages load from, in
+  precedence order (bundled `native/`, installed extensions,
+  `ABJECTS_PACKAGE_DIRS`, directories added in `packages.json`)
+- `resolvePackages()`: which copy of each type name loads; later same-or-newer
+  copies win, older ones are shadowed, disabled ones never load
+- `ingestAllExtensions(factory)`: register every enabled package's type with
+  the Factory before anything spawns
+
+### package-config.ts
+
+`$ABJECTS_DATA_DIR/packages.json`: extra package directories, disabled
+packages, and settings values. Read at boot; written by the Packages object
+(`src/objects/packages.ts`), atomically and readable only by its owner.
 
 ### wasm-abi.ts
 
@@ -41,6 +64,12 @@ work unchanged. Main thread and worker threads both resolve refs straight from
 disk; module bytes never cross thread boundaries.
 
 ## Security Model
+
+A script package's abjects run in the same sandbox as any ScriptableAbject
+(no Node or browser globals; everything by message), on worker threads when
+workers are enabled. They are owned by `package:<name>`, which makes their
+source and manifest read-only (only reinstalling the package changes them);
+the Factory refuses that owner to anything not spawned from the package.
 
 A WASM abject can only:
 

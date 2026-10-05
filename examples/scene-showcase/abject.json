@@ -1,0 +1,8 @@
+{
+  "name": "SceneShowcase",
+  "version": "1.0.0",
+  "runtime": "script",
+  "scope": "workspace",
+  "entry": "SceneShowcase.js",
+  "manifest": "SceneShowcase.json"
+}

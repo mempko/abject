@@ -28,6 +28,7 @@ import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
 import { validateCode, compileSandboxed } from '../core/sandbox.js';
+import { packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ScriptableAbject');
@@ -441,6 +442,8 @@ export class ScriptableAbject extends Abject {
       if (!draft || typeof draft !== 'object' || !draft.interface || !Array.isArray(draft.interface.methods)) {
         return { success: false, error: 'updateManifest requires { manifest } with an interface that has a methods array' };
       }
+      const fromPackage = this.packageRefusal('manifest');
+      if (fromPackage) return fromPackage;
       if (!(await this.senderMayEdit(msg.routing.from))) {
         return { success: false, error: `Only the owner (${this._owner || 'none'}), ObjectCreator, AbjectEditor, or AbjectStore may update the manifest (sender: ${msg.routing.from})` };
       }
@@ -474,6 +477,11 @@ export class ScriptableAbject extends Abject {
 
     this.on('updateSource', async (msg: AbjectMessage) => {
       const { source, expectedSource } = msg.payload as { source: string; expectedSource?: string };
+      const fromPackage = this.packageRefusal('source');
+      if (fromPackage) {
+        log.warn(`updateSource rejected for package abject '${this.manifest.name}' (sender ${msg.routing.from})`);
+        return fromPackage;
+      }
       if (msg.routing.from !== this._owner) {
         // Ownership may be stale after restart (ObjectCreator gets new ID each session).
         // Resolve the current ObjectCreator, AbjectEditor, and AbjectStore via
@@ -549,11 +557,28 @@ export class ScriptableAbject extends Abject {
   }
 
   /**
+   * The refusal for an edit to an abject from an installed package, or
+   * undefined for any other abject. Its code comes from the package, so an
+   * edit here would be undone by the next upgrade; nobody may make one, the
+   * authoring objects included.
+   */
+  private packageRefusal(what: 'source' | 'manifest'): { success: false; error: string } | undefined {
+    const pkg = packageNameOf(this._owner);
+    if (!pkg) return undefined;
+    return {
+      success: false,
+      error: `'${this.manifest.name}' comes from the installed package '${pkg}', so its ${what} is read-only here. ` +
+        'Change the package and reinstall it (pnpm forge), or clone this object to get an editable copy.',
+    };
+  }
+
+  /**
    * Whether a sender may change this object's source or manifest: its owner,
    * or one of the authoring objects, whose ids change every session so the
    * recorded owner may be stale.
    */
   private async senderMayEdit(from: AbjectId): Promise<boolean> {
+    if (packageNameOf(this._owner)) return false;
     if (from === this._owner) return true;
     const [creatorId, editorId, storeId] = await Promise.all([
       this.discoverDep('ObjectCreator'), this.discoverDep('AbjectEditor'), this.discoverDep('AbjectStore'),

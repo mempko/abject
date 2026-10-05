@@ -224,6 +224,9 @@ export type { ClawHubSkillSummary, SkillBundle } from './objects/clawhub-client.
 export { CatalogBrowser, CATALOG_BROWSER_ID } from './objects/catalog-browser.js';
 export { SecretsVault, SECRETS_VAULT_ID } from './objects/secrets-vault.js';
 export type { SecretMeta } from './objects/secrets-vault.js';
+export { Packages, PACKAGES_ID } from './objects/packages.js';
+export type { PackageView, PackageDirView, PackageProblem } from './objects/packages.js';
+export { packageOwner, isPackageOwner, packageNameOf, packageDataKey } from './core/packages.js';
 export { OAuthHelper, OAUTH_HELPER_ID } from './objects/oauth-helper.js';
 export type { OAuthProviderConfig, ConnectedAccount } from './objects/oauth-helper.js';
 export { parseSkillMd } from './core/skill-parser.js';

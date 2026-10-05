@@ -1906,22 +1906,38 @@ export class WorkspaceManager extends Abject {
       ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
-    // Installed workspace-scoped WASM extensions spawn alongside the built-in
-    // per-workspace set. Extensions replacing a built-in are already in
+    // Installed workspace-scoped packages spawn alongside the built-in
+    // per-workspace set. Packages replacing a built-in are already in
     // objectsToSpawn under the built-in's name (the Factory resolves the
     // override), so only genuinely new type names are appended here.
     let extensionNames: string[] = [];
+    // Script package types: their saved data comes back from this
+    // workspace's AbjectStore (which never restores them itself), and the
+    // ones tagged 'autostart' get a `startup` call once spawned.
+    const scriptPackages = new Map<string, { autostart: boolean }>();
     try {
-      const wasmTypes = await this.request<Array<{ name: string; scope: string }>>(
-        request(this.id, this.factoryId!, 'listWasmTypes', {})
+      const packageTypes = await this.request<Array<{ name: string; scope: string; runtime: string; tags?: string[] }>>(
+        request(this.id, this.factoryId!, 'listPackageTypes', {})
       );
-      extensionNames = wasmTypes
+      extensionNames = packageTypes
         .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name))
         .map((t) => t.name);
-    } catch { /* Factory without WASM support */ }
+      for (const t of packageTypes) {
+        if (t.runtime === 'script') scriptPackages.set(t.name, { autostart: !!t.tags?.includes('autostart') });
+      }
+    } catch { /* Factory without package support */ }
 
     for (const objName of [...objectsToSpawn, ...extensionNames]) {
       const typeId = this.computeTypeId(workspaceId, objName);
+      const scriptPackage = scriptPackages.get(objName);
+      let data: Record<string, unknown> | undefined;
+      if (scriptPackage && abjectStoreId) {
+        try {
+          data = await this.request<Record<string, unknown> | null>(
+            request(this.id, abjectStoreId, 'getPackageData', { name: objName })
+          ) ?? undefined;
+        } catch { /* store unavailable: the package starts with empty data */ }
+      }
       let result: SpawnResult;
       try {
         result = await this.request<SpawnResult>(
@@ -1930,6 +1946,7 @@ export class WorkspaceManager extends Abject {
               requiredCapabilities: [], tags: ['system'] },
             registryHint: wsRegistryId,
             typeId,
+            ...(data ? { data } : {}),
           })
         );
       } catch {
@@ -1979,6 +1996,14 @@ export class WorkspaceManager extends Abject {
             objectId: objId, workspaceId,
           }));
         } catch { /* WidgetManager may not be ready */ }
+      }
+
+      // A script package tagged 'autostart' is started the way AbjectStore
+      // starts restored user objects with that tag. Fire and forget: a slow
+      // or failing startup must not hold up the rest of the workspace.
+      if (scriptPackage?.autostart) {
+        this.request(request(this.id, objId, 'startup', {}), 10000)
+          .catch((err) => wsLog.warn(`startup of package '${objName}' failed: ${err instanceof Error ? err.message : String(err)}`));
       }
     }
 

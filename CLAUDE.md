@@ -27,14 +27,15 @@ src/
   protocol/             # Negotiator, Agreement management, HealthMonitor
   llm/                  # LLM provider interface and implementations (Anthropic, OpenAI, Ollama)
   network/              # Transport abstraction, WebSocket, MockTransport
-  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
+  sandbox/              # Packages (WASM + script): discovery, packages.json, ingest; WASM ABI, instance, module store
   ui/                   # App shell, Canvas Compositor
 workers/
   abject-worker-node.ts # worker_threads entry point for the shared Abject pool
 native/                 # Bundled WASM system packages (committed main.wasm, e.g. C++ KnowledgeBase)
 sdk/cpp/                # C++ SDK for writing WASM abjects
-examples/               # User-loadable WASM abject packages (pnpm forge)
-docs/                   # WASM_ABI.md and other specs
+sdk/script/             # TypeScript types for script packages
+examples/               # User-loadable abject packages, WASM and script (pnpm forge)
+docs/                   # PACKAGES.md, WASM_ABI.md and other specs
 ```
 
 ## Key Conventions
@@ -168,6 +169,32 @@ replaces the built-in KnowledgeBase. Rebuild bundled packages with
    through the generic `WasmAbject` host (already registered on main +
    worker) and are referenced by content hash (`wasm:sha256:...`) riding the
    normal `source` field, so persistence/clone/respawn work unchanged
+
+### New Script Package (TypeScript or JavaScript)
+
+Abjects can also ship as script packages: a JavaScript handler map run as a
+ScriptableAbject in the sandbox, optionally authored in TypeScript. This is
+the way to add abjects to an instance by configuration rather than by
+changing the server. Format, load order, `packages.json` and settings:
+`docs/PACKAGES.md`. Working examples: `examples/tally-ts` (TypeScript, with
+settings) and `examples/scene-showcase` (plain JS, no build).
+
+1. Write the handler map in `<name>.ts` against `sdk/script/abject.d.ts`
+   (`({ ... }) satisfies AbjectHandlers<State>`, type-only imports)
+2. Add an `abject.json`: name, version, `runtime: 'script'`,
+   `scope: 'workspace'` (script packages are always workspace-scoped),
+   `entry`, `manifest` (inline or a path), optional `replaces` and `settings`
+3. `pnpm forge <dir>` compiles, checks the handler map in the sandbox, and
+   installs into `.abjects/extensions/`; or point `ABJECTS_PACKAGE_DIRS` /
+   Settings → Packages at the directory (`--build-only` first for a `.ts`
+   entry)
+4. No constructor registration is needed: the Factory spawns package types as
+   ScriptableAbjects (on the worker pool), owned by `package:<name>`, which
+   keeps them read-only and their data under `package/<Type>` in AbjectStore
+
+The `Packages` system abject (`src/objects/packages.ts`, worker-eligible)
+lists packages, edits `packages.json`, and serves `getSettings` to a package's
+own abjects; the Packages tab of GlobalSettings is its UI.
 
 ### New LLM Provider
 

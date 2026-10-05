@@ -1,24 +1,32 @@
-# examples/ - Loadable WASM Abject Examples
+# examples/ - Loadable Abject Packages
 
-Example abjects written in other languages (C++ via `sdk/cpp`) that you can
-build and load into your workspaces. Each example is a forge package: an
-`abject.json` describing it plus its sources.
+Example abject packages you can build and load into your workspaces: WASM
+modules written in other languages (C++ via `sdk/cpp`), and script abjects
+written in TypeScript or JavaScript (`sdk/script`). Each example is a package:
+an `abject.json` describing it plus its sources. `docs/PACKAGES.md` covers the
+format and where packages load from.
 
 Install one:
 
 ```bash
-pnpm forge examples/echo-cpp   # compile + validate + install the package
-pnpm awaken                    # extensions load at boot
+pnpm forge examples/echo-cpp   # build + validate + install the package
+pnpm forge examples/tally-ts   # same for a TypeScript script package
+pnpm awaken                    # packages load at boot
 ```
 
-Workspace-scoped packages spawn in every workspace alongside the built-in
-objects; discover them by name like any other abject. Uninstall by deleting
-the package directory from `.abjects/extensions/` and restarting.
+Or load a package straight from its directory without installing it: add the
+directory in Settings → Packages, or set `ABJECTS_PACKAGE_DIRS` (a script
+package with a TypeScript entry needs `pnpm forge <dir> --build-only` first).
 
-Building requires the [WASI SDK](https://github.com/WebAssembly/wasi-sdk)
+Workspace-scoped packages spawn in every workspace alongside the built-in
+objects; discover them by name like any other abject. Disable one in Settings →
+Packages, or uninstall it by deleting its directory from `.abjects/extensions/`,
+and restart.
+
+Building WASM examples requires the [WASI SDK](https://github.com/WebAssembly/wasi-sdk)
 (default location `~/tools/wasi-sdk`, override with `WASI_SDK`).
 
-## The examples
+## WASM examples
 
 - **echo-cpp**: the full ABI surface in the smallest useful object: sync
   replies, `changed` events to dependents, guest-initiated requests with
@@ -27,14 +35,18 @@ Building requires the [WASI SDK](https://github.com/WebAssembly/wasi-sdk)
 
 ## Script examples
 
-ScriptableAbjects saved as `{ manifest, source }`, the same shape users' own
-abjects take. No build step: load one through AbjectStore (its README says how).
-
+- **tally-ts**: a script package written in TypeScript. Typed handlers
+  (`sdk/script/abject.d.ts`), durable `this.data`, and settings declared in
+  `abject.json` that the Packages tab renders as a form and the object reads
+  with `Packages.getSettings`.
 - **scene-showcase**: a tour of the 3D scene vocabulary. Material presets under
   a studio look, a neon arcade with bloom and GPU particles, an extruded gold
   title with an orbit camera, a draggable desktop companion with a trail, and a
-  guide panel window riding a turning world node.
+  guide panel window riding a turning world node. A plain JavaScript package
+  that loads with no build step; it can also be loaded through AbjectStore as a
+  user object (its README says how).
 
 Bundled system packages (like the C++ KnowledgeBase) live in `native/`, not
 here; those ship with the app and load automatically. See `docs/WASM_ABI.md`
-for the package format and `sdk/cpp/README.md` for the C++ programming model.
+for the WASM contract, `sdk/cpp/README.md` for the C++ programming model and
+`sdk/script/README.md` for script packages.
