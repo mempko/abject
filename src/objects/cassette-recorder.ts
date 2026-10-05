@@ -245,9 +245,11 @@ export class CassetteRecorder extends Abject {
   }
 
   private armFlush(typeId: TypeId, delayMs: number): void {
-    const existing = this.flushTimers.get(typeId);
-    if (existing) clearTimeout(existing);
-    this.flushTimers.set(typeId, setTimeout(() => {
+    this.cancelTimer(this.flushTimers.get(typeId));
+    this.flushTimers.delete(typeId);
+    // A flush that fails with "Object stopped" after stop() must not re-arm.
+    if (this._status === 'stopped') return;
+    this.flushTimers.set(typeId, this.setTimer(() => {
       this.flushTimers.delete(typeId);
       void this.flush(typeId);
     }, delayMs));
