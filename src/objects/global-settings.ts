@@ -20,6 +20,7 @@ import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import type { PackageView, PackageDirView, PackageProblem } from './packages.js';
 import type { PackageSettingSpec } from '../sandbox/extensions.js';
+import { parsePrivateHost } from './capabilities/address-policy.js';
 
 const log = new Log('GlobalSettings');
 
@@ -129,6 +130,7 @@ const STORAGE_KEY_SHELL_DENIED_CMDS = 'global-settings:shellDeniedCmds';
 const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
 const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
 const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
+const STORAGE_KEY_WEB_PRIVATE_HOSTS = 'global-settings:webPrivateHosts';
 const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
 /** Index of object names holding per-object shell grants; one key per name. */
 const STORAGE_KEY_OBJECT_PERM_NAMES = 'global-settings:objectPermNames';
@@ -354,6 +356,10 @@ export class GlobalSettings extends Abject {
   private statusLabelId?: AbjectId;
   /** Permission list id -> its empty-state note. */
   private listEmptyNoteIds = new Map<AbjectId, AbjectId>();
+  /** List -> the scrollable body holding it. A scrollable VBox gives
+   *  expanding children no room, so these lists take a fixed height that
+   *  collapses to nothing while the list is empty. */
+  private scrollBodyListLayouts = new Map<AbjectId, AbjectId>();
   private skillBrowserBtnId?: AbjectId;
   private catalogBrowserBtnId?: AbjectId;
 
@@ -432,6 +438,10 @@ export class GlobalSettings extends Abject {
   private webDeniedAddBtnId?: AbjectId;
   private webDeniedListId?: AbjectId;
   private webDeniedRemoveBtnId?: AbjectId;
+  private webPrivateInputId?: AbjectId;
+  private webPrivateAddBtnId?: AbjectId;
+  private webPrivateListId?: AbjectId;
+  private webPrivateRemoveBtnId?: AbjectId;
   // Permissions save
   private permsSaveBtnId?: AbjectId;
   // In-memory permissions state
@@ -449,6 +459,9 @@ export class GlobalSettings extends Abject {
   private webEnabled = true;
   private webAllowedDomains: string[] = [];
   private webDeniedDomains: string[] = [];
+  /** Private and internal hosts HttpClient and StreamClient may reach
+   *  (address-policy.ts). Empty: every private address is refused. */
+  private webPrivateHosts: string[] = [];
   /** Bus-level capability enforcement for scriptable objects. */
   private capabilityEnforcement: 'off' | 'warn' | 'enforce' = 'warn';
   private capEnforceSelectId?: AbjectId;
@@ -1097,6 +1110,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           { id: this.shellDeniedListId, get: () => this.shellDeniedCmds, set: v => { this.shellDeniedCmds = v; } },
           { id: this.webDomainListId, get: () => this.webAllowedDomains, set: v => { this.webAllowedDomains = v; } },
           { id: this.webDeniedListId, get: () => this.webDeniedDomains, set: v => { this.webDeniedDomains = v; } },
+          { id: this.webPrivateListId, get: () => this.webPrivateHosts, set: v => { this.webPrivateHosts = v; } },
         ];
         const target = lists.find(l => l.id && l.id === fromId);
         if (target) {
@@ -1253,6 +1267,31 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         }
         return;
       }
+      // Web: add private host
+      if (fromId === this.webPrivateAddBtnId && aspect === 'click') {
+        const raw = await this.request<string>(request(this.id, this.webPrivateInputId!, 'getValue', {}));
+        const val = raw?.trim().toLowerCase();
+        if (val && !parsePrivateHost(val)) {
+          await this.rejectWith('Not a host, host:port, address, or address range (e.g. 10.0.0.0/8).', this.theme.statusWarning);
+          return;
+        }
+        const added = !!val && !this.webPrivateHosts.includes(val);
+        if (added) {
+          this.webPrivateHosts.push(val);
+          await this.updateStringList(this.webPrivateListId!, this.webPrivateHosts);
+          await this.request(request(this.id, this.webPrivateInputId!, 'update', { text: '' }));
+        }
+        await this.listAddFeedback(val, added);
+        return;
+      }
+      if (fromId === this.webPrivateRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.webPrivateListId!, 'getValue', {}));
+        if (sel) {
+          this.webPrivateHosts = this.webPrivateHosts.filter(h => h !== sel);
+          await this.updateStringList(this.webPrivateListId!, this.webPrivateHosts);
+        }
+        return;
+      }
 
       // Permissions save button
       if (fromId === this.permsSaveBtnId && aspect === 'click') {
@@ -1276,6 +1315,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    */
   async show(): Promise<boolean> {
     if (this.windowId) return true;
+
+    // Providers other abjects register (LLM registerProvider) arrive after
+    // boot, so re-read the list each time the window opens.
+    await this.loadProviderDescriptions();
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
@@ -2620,6 +2663,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.listEmptyNoteIds.clear();
+    this.scrollBodyListLayouts.clear();
     this.authCheckboxId = undefined;
     this.authUserInputId = undefined;
     this.authPassInputId = undefined;
@@ -2668,6 +2712,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.webDeniedAddBtnId = undefined;
     this.webDeniedListId = undefined;
     this.webDeniedRemoveBtnId = undefined;
+    this.webPrivateInputId = undefined;
+    this.webPrivateAddBtnId = undefined;
+    this.webPrivateListId = undefined;
+    this.webPrivateRemoveBtnId = undefined;
     this.capEnforceSelectId = undefined;
     this.permsSaveBtnId = undefined;
     this.packagesContainerId = undefined;
@@ -2717,6 +2765,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     try {
       await this.request(request(this.id, listId, 'update', { style: { visible: !empty } }));
       await this.request(request(this.id, noteId, 'update', { style: { visible: empty } }));
+      const bodyId = this.scrollBodyListLayouts.get(listId);
+      if (bodyId) {
+        await this.request(request(this.id, bodyId, 'updateLayoutChild', {
+          widgetId: listId, preferredSize: { height: empty ? 0 : 80 },
+        }));
+      }
     } catch { /* settings window closed */ }
   }
 
@@ -3976,6 +4030,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
       if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
 
+      const webPrivateJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_PRIVATE_HOSTS })
+      );
+      if (webPrivateJson) { try { this.webPrivateHosts = JSON.parse(webPrivateJson); } catch { /* ignore */ } }
+
       const capMode = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CAP_ENFORCEMENT })
       );
@@ -4142,7 +4201,22 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // ── Web card ──
     const webCard = await this.sectionCard(cId, 'Web',
-      'Which domains agents may reach over HTTP. An empty allowed list permits every domain except the denied ones.', 34, true);
+      'Which domains agents may reach over HTTP and streams. An empty allowed list permits every domain except the denied ones. ' +
+      'Local and internal addresses (localhost, your network, cloud metadata) are refused unless listed under Private hosts.', 50, true);
+
+    // Three lists outgrow the card on a short window, so the card's body
+    // scrolls: the description stays put, the checkbox and lists move.
+    const webBody = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: webCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, webCard, 'addLayoutChild', {
+      widgetId: webBody,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
 
     const { widgetIds: [webEnCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -4151,25 +4225,33 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
     this.webEnabledCheckboxId = webEnCheckId;
     await this.request(request(this.id, this.webEnabledCheckboxId, 'addDependent', {}));
-    await this.request(request(this.id, webCard, 'addLayoutChild', {
+    await this.request(request(this.id, webBody, 'addLayoutChild', {
       widgetId: this.webEnabledCheckboxId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
     }));
 
     {
-      const ed = await this.stringListEditor(webCard, 'Allowed domains (empty = allow all)', 'e.g. api.example.com', this.webAllowedDomains);
+      const ed = await this.stringListEditor(webBody, 'Allowed domains (empty = allow all)', 'e.g. api.example.com', this.webAllowedDomains, true);
       this.webDomainInputId = ed.inputId;
       this.webAddBtnId = ed.addBtnId;
       this.webDomainListId = ed.listId;
       this.webRemoveBtnId = ed.removeBtnId;
     }
     {
-      const ed = await this.stringListEditor(webCard, 'Denied domains (always refused)', 'e.g. evil.example.com', this.webDeniedDomains);
+      const ed = await this.stringListEditor(webBody, 'Denied domains (always refused)', 'e.g. evil.example.com', this.webDeniedDomains, true);
       this.webDeniedInputId = ed.inputId;
       this.webDeniedAddBtnId = ed.addBtnId;
       this.webDeniedListId = ed.listId;
       this.webDeniedRemoveBtnId = ed.removeBtnId;
+    }
+    {
+      const ed = await this.stringListEditor(webBody, 'Private hosts (local and internal addresses allowed; empty = none)',
+        'e.g. localhost:11434, models.internal, 10.0.0.0/8', this.webPrivateHosts, true);
+      this.webPrivateInputId = ed.inputId;
+      this.webPrivateAddBtnId = ed.addBtnId;
+      this.webPrivateListId = ed.listId;
+      this.webPrivateRemoveBtnId = ed.removeBtnId;
     }
 
     // ── Objects card (capability enforcement) ──
@@ -4258,13 +4340,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * A labeled add/remove string-list editor: label, input + Add row, a list
    * whose rows carry an inline Remove action, and a Remove Selected button.
    * Returns the widget ids — the changed() handlers key on the fields the
-   * caller stores them in.
+   * caller stores them in. `inScrollBody`: the parent is a scrollable VBox,
+   * where the list gets a fixed height instead of stretching.
    */
   private async stringListEditor(
     cardId: AbjectId,
     label: string,
     placeholder: string,
     items: string[],
+    inScrollBody = false,
   ): Promise<{ inputId: AbjectId; addBtnId: AbjectId; listId: AbjectId; removeBtnId: AbjectId }> {
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -4319,9 +4403,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, listId, 'addDependent', {}));
     await this.request(request(this.id, cardId, 'addLayoutChild', {
       widgetId: listId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      sizePolicy: { vertical: inScrollBody ? 'preferred' : 'expanding', horizontal: 'expanding' },
       preferredSize: { height: 80 },
     }));
+    if (inScrollBody) this.scrollBodyListLayouts.set(listId, cardId);
 
     // Empty-state note that stands in for the list while it has no entries.
     {
@@ -4402,6 +4487,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
     await this.request(request(this.id, this.storageId, 'set', {
       key: STORAGE_KEY_WEB_DENIED_DOMAINS, value: JSON.stringify(this.webDeniedDomains),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_WEB_PRIVATE_HOSTS, value: JSON.stringify(this.webPrivateHosts),
     }));
     await this.request(request(this.id, this.storageId, 'set', {
       key: STORAGE_KEY_CAP_ENFORCEMENT, value: this.capabilityEnforcement,
@@ -5158,6 +5246,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         enabled: this.webEnabled,
         allowedDomains: this.webAllowedDomains,
         deniedDomains: this.webDeniedDomains,
+        privateHosts: this.webPrivateHosts,
       });
     }
 
@@ -5235,6 +5324,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
     );
     if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
+
+    const webPrivateJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_PRIVATE_HOSTS })
+    );
+    if (webPrivateJson) { try { this.webPrivateHosts = JSON.parse(webPrivateJson); } catch { /* ignore */ } }
 
     await this.propagatePermissions();
 

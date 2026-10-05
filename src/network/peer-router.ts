@@ -47,18 +47,20 @@ const PROPAGATION_EXPIRY = 30_000; // Phase 3: propagation dedup window
  * methods a REMOTE peer may invoke on it. Anything else addressed to that
  * object falls through to the normal curation check, so a permitted system
  * object cannot be used as a universal proxy.
+ *
+ * Only the two methods peers send each other. The rest of PeerRouter's
+ * interface (registerRoute, removeRoute, clearRoutesForPeer, getRoutes, ...)
+ * is for local objects: reachable from any connected peer, it let a stranger
+ * point another peer's object at itself and receive that object's traffic.
  */
 const PEER_ROUTER_REMOTE_METHODS: ReadonlySet<string> = new Set([
-  'registerRoute',
-  'removeRoute',
-  'clearRoutesForPeer',
-  'announceRoutes',
   'handleRouteAnnouncement',
   'handleRouteDigest',
-  'resolveRemoteObject',
-  'resolveWorkspaceRegistry',
-  'getRoutes',
 ]);
+
+/** Largest hop count accepted in an announcement; routes travel at most
+ *  MAX_GOSSIP_HOPS gossip rounds, so anything far beyond is malformed. */
+const MAX_ANNOUNCED_HOPS = 32;
 
 /** Workspace signaling protocol — the only WSR surface a peer may reach. */
 const WORKSPACE_SHARE_REGISTRY_REMOTE_METHODS: ReadonlySet<string> = new Set([
@@ -576,7 +578,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   // ==========================================================================
 
   private setupHandlers(): void {
+    // Route-table writes are for local objects only. The inbound check
+    // already refuses these to remote peers; refusing here as well keeps a
+    // future change to that set from reopening route hijacking.
     this.on('registerRoute', async (msg: AbjectMessage) => {
+      if (fromRemotePeer(msg)) return false;
       const { objectId, peerId, hops } = msg.payload as {
         objectId: string; peerId: string; hops?: number;
       };
@@ -584,11 +590,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     });
 
     this.on('removeRoute', async (msg: AbjectMessage) => {
+      if (fromRemotePeer(msg)) return false;
       const { objectId } = msg.payload as { objectId: string };
       return this.removeSystemRoute(objectId as AbjectId);
     });
 
     this.on('clearRoutesForPeer', async (msg: AbjectMessage) => {
+      if (fromRemotePeer(msg)) return 0;
       const { peerId } = msg.payload as { peerId: string };
       return this.clearRoutesForPeerImpl(peerId);
     });
@@ -604,6 +612,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // through this reply. Ordinary sends to a remote object do not come
     // through here — intercept() captures them and routes from the table.
     this.on('forwardToPeer', async (msg: AbjectMessage) => {
+      if (fromRemotePeer(msg)) return false;
       const { peerId, message, expectReply } = msg.payload as {
         peerId: string; message: AbjectMessage; expectReply?: boolean;
       };
@@ -621,6 +630,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     });
 
     this.on('announceRoutes', async (msg: AbjectMessage) => {
+      if (fromRemotePeer(msg)) return false;
       const { peerId } = msg.payload as { peerId: string };
       return this.announceRoutesToPeer(peerId);
     });
@@ -1016,27 +1026,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return;
     }
 
-    // Record sender's route for reply routing — but ONLY for requests/events.
-    // For reply/error messages, msg.routing.from is the TARGET of the original
-    // request (e.g. the remote registry), NOT the actual peer that generated it.
-    // Recording it would create a bogus systemRoute that shadows the correct
-    // workspace route, causing a routing loop.
-    //
-    // Also skip if the sender ID is registered locally — a remote SharedState
-    // (or similar P2P object) may share the same well-known pattern but have a
-    // different UUID. If a local object exists with this ID, creating a remote
-    // route would shadow it, causing local messages to be mis-routed to the
-    // remote peer.
-    if (msg.header.type === 'request' || msg.header.type === 'event') {
-      const senderId = msg.routing.from;
-      if (!this._messageBus?.isRegistered(senderId as AbjectId)) {
-        this.systemRoutes.set(senderId as AbjectId, {
-          nextHop: fromPeerId,
-          hops: 0,
-          ttl: Date.now() + ROUTE_TTL,
-        });
-      }
-    }
+    // The sender's reply route is recorded only once the message is admitted
+    // or relayed (recordSenderRoute), never for one about to be refused: a
+    // refused request must not leave a route behind.
 
     // A reply/error off the wire settles whatever outbound request it
     // correlates to, so that request's timeout must not fire afterwards.
@@ -1102,6 +1094,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         return;
       }
 
+      this.recordSenderRoute(msg, fromPeerId);
+
       // Remember where this request came from. The local reply is addressed
       // to the caller's AbjectId, which lives on the remote peer's bus; a
       // caller is not an announced object, so it may have no route entry of
@@ -1123,6 +1117,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Check if target is in routing table pointing to a different peer (relay)
     const route = this.getRoute(targetId);
     if (route && route.nextHop !== fromPeerId && this.isPeerConnected(route.nextHop)) {
+      // The answer comes back through this peer, addressed to the sender.
+      this.recordSenderRoute(msg, fromPeerId);
       this.sendToPeerTransport(route.nextHop, msg).catch((err) => {
         log.error(`Failed to relay message via ${route.nextHop.slice(0, 16)}:`, err);
       });
@@ -1140,6 +1136,26 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         `Remote object ${targetId} is not available on this peer`);
       this.sendToPeerTransport(fromPeerId, errMsg).catch(() => { /* best-effort */ });
     }
+  }
+
+  /**
+   * Route answers to an admitted or relayed request or event back to the peer
+   * it came from. Only requests and events: a reply's routing.from is the
+   * object that answered, not the peer that sent it, and recording it would
+   * shadow that object's real route. Never for a locally registered id: a
+   * remote object sharing a local id's well-known pattern would otherwise
+   * capture local traffic. handleIncomingMessage has already dropped a sender
+   * whose id is known to live behind a different peer.
+   */
+  private recordSenderRoute(msg: AbjectMessage, fromPeerId: PeerId): void {
+    if (msg.header.type !== 'request' && msg.header.type !== 'event') return;
+    const senderId = msg.routing.from as AbjectId;
+    if (this._messageBus?.isRegistered(senderId)) return;
+    this.systemRoutes.set(senderId, {
+      nextHop: fromPeerId,
+      hops: 0,
+      ttl: Date.now() + ROUTE_TTL,
+    });
   }
 
   // ==========================================================================
@@ -1206,6 +1222,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       const cached = this.permissionCache.get(targetId);
       if (cached && this.evaluatePermission(cached, fromPeerId, targetId)) {
         log.info(`deferred permission ALLOWED: ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
+        this.recordSenderRoute(msg, fromPeerId);
         if (msg.header.type === 'request') {
           this.rememberInboundOrigin(msg.header.messageId, fromPeerId);
         }
@@ -1527,11 +1544,41 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * These hints survive beyond workspace route TTL expiry, helping
    * speculative routing when workspace routes haven't propagated yet.
    */
-  private recordRegistryOwnerHint(wsRoute: WorkspaceRoute): void {
-    this.registryOwnerHints.set(wsRoute.registryId, wsRoute.ownerPeerId);
-    for (const objId of wsRoute.exposedObjectIds) {
-      this.registryOwnerHints.set(objId, wsRoute.ownerPeerId);
+  /**
+   * Map a workspace route's registry and exposed objects to it, and record
+   * their owner for speculative routing. An id already reached through a
+   * live route to a different owner keeps that route: an announcement may
+   * not claim another owner's objects, which would send their traffic to
+   * the announcing peer.
+   */
+  private mapWorkspaceObjects(wsKey: string, route: WorkspaceRoute): void {
+    for (const objId of [route.registryId, ...route.exposedObjectIds]) {
+      if (typeof objId !== 'string') continue;
+      const currentKey = this.objectToWorkspace.get(objId);
+      const current = currentKey && currentKey !== wsKey ? this.workspaceRoutes.get(currentKey) : undefined;
+      if (current && current.ownerPeerId !== route.ownerPeerId && this.isLive(current)) {
+        log.warn(`REFUSED mapping ${objId.slice(0, 16)} to ${wsKey.slice(0, 24)}: it belongs to ${currentKey!.slice(0, 24)}`);
+        continue;
+      }
+      this.objectToWorkspace.set(objId, wsKey);
+      this.registryOwnerHints.set(objId, route.ownerPeerId);
     }
+  }
+
+  /** A route counts while its TTL runs or its next hop is still connected
+   *  (getRoute renews such routes on use). */
+  private isLive(route: { nextHop: PeerId; ttl: number }): boolean {
+    return Date.now() < route.ttl || this.isPeerConnected(route.nextHop);
+  }
+
+  /** Whether objectId is reached through a live route via a peer other
+   *  than `peerId`. A peer may not take such an object over by announcing it. */
+  private routedElsewhere(objectId: AbjectId, peerId: PeerId): boolean {
+    const sys = this.systemRoutes.get(objectId);
+    if (sys && sys.nextHop !== peerId && this.isLive(sys)) return true;
+    const wsKey = this.objectToWorkspace.get(objectId);
+    const ws = wsKey ? this.workspaceRoutes.get(wsKey) : undefined;
+    return !!ws && ws.nextHop !== peerId && this.isLive(ws);
   }
 
   private getRoutesImpl(): Array<{ objectId: string; nextHop: string; hops: number; ttl: number; workspaceKey?: string }> {
@@ -1927,9 +1974,14 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     let newRoutes = false;
 
-    // Handle system routes (always per-object)
+    // Handle system routes (always per-object). A peer announces only its
+    // own system objects (at hop 0); a negative count would beat any route.
     const sysRoutes = payload.systemRoutes ?? [];
     for (const announced of sysRoutes) {
+      if (typeof announced.objectId !== 'string' || !validHops(announced.hops)) {
+        log.warn(`REFUSED system route from ${fromPeerId.slice(0, 16)}: hops=${String(announced.hops)}`);
+        continue;
+      }
       const objectId = announced.objectId as AbjectId;
       const newHops = announced.hops + 1;
 
@@ -1953,6 +2005,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       // exactly the ids that need them — it only keeps a genuinely local
       // object from being shadowed by a remote announcement.
       if (this._messageBus?.isRegistered(objectId)) {
+        continue;
+      }
+      if (this.routedElsewhere(objectId, fromPeerId)) {
+        log.warn(`REFUSED system route claim for ${objectId.slice(0, 16)} from ${fromPeerId.slice(0, 16)}: reached through another peer`);
         continue;
       }
 
@@ -1983,6 +2039,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
       // Add new routes
       for (const announced of payload.workspaceRoutes) {
+        if (!validWorkspaceAnnouncement(announced, fromPeerId)) {
+          log.warn(`REFUSED workspace route from ${fromPeerId.slice(0, 16)}: owner=${String(announced.ownerPeerId).slice(0, 16)} hops=${String(announced.hops)}`);
+          continue;
+        }
         const wsKey = `${announced.ownerPeerId}/${announced.workspaceId}`;
         const newHops = announced.hops + 1;
 
@@ -1995,7 +2055,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           accessMode: announced.accessMode as WorkspaceAccessMode,
           registryId: announced.registryId as AbjectId,
           exposedNames: announced.exposedNames ?? [],
-          exposedObjectIds: (announced.exposedObjectIds ?? []) as AbjectId[],
+          exposedObjectIds: stringsOnly(announced.exposedObjectIds) as AbjectId[],
         };
 
         // Skip if we already have a shorter route via different peer
@@ -2007,18 +2067,18 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         this.workspaceRoutes.set(wsKey, wsRoute);
         this.recordRouteChange('add', wsKey, wsRoute);
         newRoutes = true;
-        this.recordRegistryOwnerHint(wsRoute);
 
         // Cache object → workspace mappings for exposed objects
-        for (const objId of wsRoute.exposedObjectIds) {
-          this.objectToWorkspace.set(objId, wsKey);
-        }
-        this.objectToWorkspace.set(wsRoute.registryId, wsKey);
+        this.mapWorkspaceObjects(wsKey, wsRoute);
       }
     } else if (payload.type === 'diff') {
       // Diff announcement: apply incremental changes
       if (payload.added) {
         for (const announced of payload.added) {
+          if (!validWorkspaceAnnouncement(announced, fromPeerId)) {
+            log.warn(`REFUSED workspace route from ${fromPeerId.slice(0, 16)}: owner=${String(announced.ownerPeerId).slice(0, 16)} hops=${String(announced.hops)}`);
+            continue;
+          }
           const wsKey = `${announced.ownerPeerId}/${announced.workspaceId}`;
           const newHops = announced.hops + 1;
 
@@ -2031,7 +2091,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
             accessMode: announced.accessMode as WorkspaceAccessMode,
             registryId: announced.registryId as AbjectId,
             exposedNames: announced.exposedNames ?? [],
-            exposedObjectIds: (announced.exposedObjectIds ?? []) as AbjectId[],
+            exposedObjectIds: stringsOnly(announced.exposedObjectIds) as AbjectId[],
           };
 
           const existing = this.workspaceRoutes.get(wsKey);
@@ -2042,12 +2102,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           this.workspaceRoutes.set(wsKey, wsRoute);
           this.recordRouteChange(existing ? 'update' : 'add', wsKey, wsRoute);
           newRoutes = true;
-          this.recordRegistryOwnerHint(wsRoute);
 
-          for (const objId of wsRoute.exposedObjectIds) {
-            this.objectToWorkspace.set(objId, wsKey);
-          }
-          this.objectToWorkspace.set(wsRoute.registryId, wsKey);
+          this.mapWorkspaceObjects(wsKey, wsRoute);
         }
       }
       if (payload.removed) {
@@ -2087,6 +2143,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     let newRoutes = false;
 
     for (const announced of routes) {
+      if (typeof announced.objectId !== 'string' || !validHops(announced.hops)) {
+        log.warn(`REFUSED legacy route from ${fromPeerId.slice(0, 16)}: hops=${String(announced.hops)}`);
+        continue;
+      }
       const objectId = announced.objectId as AbjectId;
       const newHops = announced.hops + 1;
 
@@ -2107,6 +2167,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       // the same consequence: with no stand-ins, a peer's announced route is
       // learned instead of being dropped on arrival.
       if (this._messageBus?.isRegistered(objectId)) {
+        continue;
+      }
+      if (this.routedElsewhere(objectId, fromPeerId)) {
+        log.warn(`REFUSED legacy route claim for ${objectId.slice(0, 16)} from ${fromPeerId.slice(0, 16)}: reached through another peer`);
         continue;
       }
 
@@ -2307,4 +2371,32 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 - Incremental diffs and gossip propagation minimize network overhead.
 - Multi-hop routing is transparent — messages are forwarded along the shortest path.`;
   }
+}
+
+/** True for a message that arrived from a remote peer: handleIncomingMessage
+ *  stamps the transport-authenticated sender on every inbound message. */
+function fromRemotePeer(msg: AbjectMessage): boolean {
+  return !!(msg.routing as typeof msg.routing & { authenticatedPeerId?: PeerId }).authenticatedPeerId;
+}
+
+function validHops(hops: unknown): hops is number {
+  return Number.isSafeInteger(hops) && (hops as number) >= 0 && (hops as number) <= MAX_ANNOUNCED_HOPS;
+}
+
+/**
+ * A workspace route as announced: hop 0 is the announcing peer's own
+ * workspace, and a workspace owned by anyone else is at least one hop away.
+ * Without this a peer could claim to be the shortest path to any workspace.
+ */
+function validWorkspaceAnnouncement(
+  announced: { ownerPeerId: unknown; workspaceId: unknown; hops: unknown; registryId: unknown },
+  fromPeerId: PeerId,
+): boolean {
+  if (typeof announced.ownerPeerId !== 'string' || typeof announced.workspaceId !== 'string') return false;
+  if (typeof announced.registryId !== 'string' || !validHops(announced.hops)) return false;
+  return (announced.ownerPeerId === fromPeerId) === (announced.hops === 0);
+}
+
+function stringsOnly(values: unknown): string[] {
+  return Array.isArray(values) ? values.filter((v): v is string => typeof v === 'string') : [];
 }

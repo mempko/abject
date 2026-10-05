@@ -1,3 +1,4 @@
 *.wasm
 # Script packages built in place (pnpm forge --build-only)
 tally-ts/main.js
+openai-compatible-provider/main.js

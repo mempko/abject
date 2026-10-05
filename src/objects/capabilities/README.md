@@ -25,9 +25,25 @@ Each capability object:
 
 ### http-client.ts
 
-- **Methods**: `request`, `get`, `post`, `postJson`
-- **Security**: `allowedDomains`/`deniedDomains` sets for domain filtering
+- **Methods**: `request`, `get`, `post`, `postJson`, `getBase64`
+- **Security**: `allowedDomains`/`deniedDomains` sets for domain filtering, and
+  the private-address guard (`address-policy.ts`). Redirects are followed by
+  hand so every hop passes the same checks; a hop to another origin drops
+  credential headers.
 - **Timeout**: via `AbortController` (default 30s)
+
+### address-policy.ts
+
+The private-address (SSRF) guard shared by `HttpClient` and `StreamClient`.
+Private, loopback, link-local and reserved addresses are refused, judged on
+what a host resolves to, unless listed in the owner's Private hosts
+(Settings → Permissions → Web, pushed with `updatePermissions { privateHosts }`).
+Entries are names (`localhost:11434`, `*.corp.example`), addresses
+(`127.0.0.1:8080`) or ranges (`10.0.0.0/8`). `StreamClient` also passes
+`connectLookup` to its sockets, so the check covers the address actually
+connected to. `HttpClient` uses `fetch`, which takes no lookup hook, so a name
+whose DNS answer changes between the check and the connection (DNS rebinding)
+is not caught there.
 
 ### storage.ts
 

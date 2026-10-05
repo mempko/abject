@@ -112,6 +112,7 @@ import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MCPBridge } from '../src/objects/mcp-bridge.js';
+import { signalAllChildren } from '../src/runtime/child-processes.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WasmAbject } from '../src/objects/wasm-abject.js';
 import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
@@ -408,6 +409,14 @@ port.on('message', async (data: WorkerInboundMessage) => {
 
     case 'peer:dead': {
       if (data.workerIndex !== undefined) workerBus.failPeer(data.workerIndex);
+      break;
+    }
+
+    case 'children:signal': {
+      // Shutdown, first step: every child process this worker started, now,
+      // whatever later happens to the objects that own them.
+      const children = signalAllChildren((data.signal ?? 'SIGTERM') as NodeJS.Signals);
+      port.postMessage({ type: 'children:signalled', requestId: data.requestId, children });
       break;
     }
 

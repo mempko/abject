@@ -35,6 +35,13 @@ Building WASM examples requires the [WASI SDK](https://github.com/WebAssembly/wa
 
 ## Script examples
 
+- **openai-compatible-provider**: an LLM provider for any OpenAI-compatible
+  chat endpoint, written in TypeScript. It registers with the LLM object on
+  startup (`docs/LLM_PROVIDERS.md`), so its models appear in Settings → AI.
+  Its endpoint, key and models are package settings. A local or internal
+  endpoint must also be listed under Private hosts in Settings → Permissions
+  (for example `localhost:1234`); `HttpClient` refuses private addresses
+  otherwise.
 - **tally-ts**: a script package written in TypeScript. Typed handlers
   (`sdk/script/abject.d.ts`), durable `this.data`, and settings declared in
   `abject.json` that the Packages tab renders as a form and the object reads

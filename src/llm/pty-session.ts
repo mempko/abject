@@ -41,6 +41,7 @@ import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { require as requires, ensure, invariant, requirePositive } from '../core/contracts.js';
+import { trackChild, untrackIfGone } from '../runtime/child-processes.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -234,6 +235,7 @@ const WRITE_CHUNK_PAUSE_MS = 6;
 // Minimal structural types for the lazily imported modules, so this file
 // carries no compile-time dependency on their shapes.
 interface PtyProcess {
+  readonly pid: number;
   onData(cb: (data: string) => void): void;
   onExit(cb: (e: { exitCode: number; signal?: number }) => void): void;
   write(data: string): void;
@@ -371,9 +373,11 @@ export class PtySession {
     }
 
     this.proc = proc;
+    // A pty child leads its own session, so the whole group is signalled.
+    trackChild(proc.pid, `CLI session: ${this.dialect.bin}`, { group: true });
     this.lastDataAt = Date.now();
     proc.onData((d) => { this.lastDataAt = Date.now(); term.write(d); });
-    proc.onExit((e) => { this.exitInfo = e; this.state = 'dead'; });
+    proc.onExit((e) => { this.exitInfo = e; this.state = 'dead'; untrackIfGone(proc.pid); });
 
     try {
       await this.waitForReady(this.startupTimeoutMs);
@@ -497,6 +501,7 @@ export class PtySession {
   dispose(): void {
     if (this.proc) {
       try { this.proc.kill(); } catch { /* already gone */ }
+      untrackIfGone(this.proc.pid);
       this.proc = undefined;
     }
     if (this.term) {

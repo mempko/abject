@@ -9,9 +9,12 @@
  * triggers, agents, and spoken-into-existence objects.
  *
  * Security model mirrors HttpClient: allow/deny domain sets, scheme
- * allowlist, private-address (SSRF) blocking, a master switch, and a single
- * permissions authority (GlobalSettings) that answers requestPermission for
- * unlisted domains with accept_once / accept_always / deny / deny_always.
+ * allowlist, private-address (SSRF) blocking with the owner's Private hosts
+ * exceptions, a master switch, and a single permissions authority
+ * (GlobalSettings) that answers requestPermission for unlisted domains with
+ * accept_once / accept_always / deny / deny_always. The private-address check
+ * runs again on the addresses each socket connects to, so a name whose DNS
+ * answer changes after the first check is still refused.
  */
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
@@ -21,7 +24,9 @@ import { Capabilities } from '../../core/capability.js';
 import { require } from '../../core/contracts.js';
 import WebSocket from 'ws';
 import * as http from 'http';
+import type * as net from 'net';
 import * as https from 'https';
+import { AddressPolicy, HostLookup, portOf } from './address-policy.js';
 
 const STREAM_INTERFACE = 'abjects:stream';
 
@@ -50,12 +55,19 @@ export class StreamClient extends Abject {
   private allowedDomains?: Set<string>;
   private deniedDomains?: Set<string>;
   private streamsDisabled = false;
+  /** Private and internal addresses the owner allowed (Settings > Permissions,
+   *  Private hosts). Every other private address is refused. */
+  private addressPolicy: AddressPolicy;
+  private readonly lookup?: HostLookup;
   /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
   private permissionsAuthorityId?: AbjectId;
 
   constructor(config?: {
     allowedDomains?: string[];
     deniedDomains?: string[];
+    privateHosts?: string[];
+    /** Name resolution for the private-address guard (tests). */
+    lookup?: HostLookup;
   }) {
     super({
       manifest: {
@@ -158,6 +170,8 @@ export class StreamClient extends Abject {
     if (config?.deniedDomains) {
       this.deniedDomains = new Set(config.deniedDomains);
     }
+    this.lookup = config?.lookup;
+    this.addressPolicy = new AddressPolicy(config?.privateHosts, this.lookup);
 
     this.setupHandlers();
   }
@@ -224,10 +238,11 @@ export class StreamClient extends Abject {
       if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
         return { success: false, error: 'Unauthorized: only the permissions authority can update permissions' };
       }
-      const { enabled, allowedDomains, deniedDomains } = msg.payload as {
+      const { enabled, allowedDomains, deniedDomains, privateHosts } = msg.payload as {
         enabled?: boolean;
         allowedDomains?: string[];
         deniedDomains?: string[];
+        privateHosts?: string[];
       };
       if (enabled !== undefined) this.streamsDisabled = !enabled;
       if (allowedDomains !== undefined) {
@@ -235,6 +250,9 @@ export class StreamClient extends Abject {
       }
       if (deniedDomains !== undefined) {
         this.deniedDomains = deniedDomains.length > 0 ? new Set(deniedDomains) : undefined;
+      }
+      if (privateHosts !== undefined) {
+        this.addressPolicy = new AddressPolicy(privateHosts, this.lookup);
       }
       return { success: true };
     });
@@ -276,7 +294,7 @@ export class StreamClient extends Abject {
     const parsed = new URL(url);
     const resolvedKind = kind ?? (parsed.protocol === 'ws:' || parsed.protocol === 'wss:' ? 'ws' : 'sse');
     this.validateScheme(parsed.protocol, resolvedKind);
-    await this.validateDomain(parsed.hostname);
+    await this.validateDomain(parsed.hostname, portOf(parsed));
 
     const connectionId = crypto.randomUUID();
     const conn: StreamConnection = {
@@ -300,7 +318,13 @@ export class StreamClient extends Abject {
   }
 
   private openWebSocket(conn: StreamConnection, headers?: Record<string, string>): void {
-    const ws = new WebSocket(conn.url, { headers });
+    // ws hands its options to net/tls connect, which honour lookup; the
+    // ClientOptions type does not declare it.
+    const options: WebSocket.ClientOptions & { lookup: net.LookupFunction } = {
+      headers,
+      lookup: this.addressPolicy.connectLookup(portOf(new URL(conn.url))),
+    };
+    const ws = new WebSocket(conn.url, options);
     conn.ws = ws;
 
     ws.on('open', () => {
@@ -352,6 +376,7 @@ export class StreamClient extends Abject {
 
     const req = requestFn(conn.url, {
       method: 'GET',
+      lookup: this.addressPolicy.connectLookup(portOf(parsed)),
       headers: {
         Accept: 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -469,20 +494,19 @@ export class StreamClient extends Abject {
   }
 
   /**
-   * Validate a domain: deny list, allow list, SSRF guard, and when the domain
+   * Validate a domain: deny list, SSRF guard, allow list, and when the domain
    * is unlisted, ask the permissions authority (accept_once / accept_always /
    * deny / deny_always). Absent an authority, unlisted domains are allowed
    * only when no allow list is configured, matching HttpClient's behavior.
    */
-  private async validateDomain(hostname: string): Promise<void> {
+  private async validateDomain(hostname: string, port: number): Promise<void> {
     if (this.deniedDomains?.has(hostname)) {
       throw new Error(`Domain ${hostname} is denied`);
     }
 
-    // SSRF protection: block connections to private/internal addresses.
-    if (this.isPrivateHost(hostname)) {
-      throw new Error(`Domain ${hostname} is blocked: private/internal addresses are not allowed`);
-    }
+    // SSRF protection: refuse private/internal addresses, checked on what the
+    // host resolves to, before the user is asked about the domain.
+    await this.addressPolicy.check(hostname, port);
 
     if (this.allowedDomains && !this.allowedDomains.has(hostname)) {
       // Unlisted domain: ask the permissions authority before failing.
@@ -512,36 +536,6 @@ export class StreamClient extends Abject {
       }
       throw new Error(`Domain ${hostname} is not in allowed list`);
     }
-  }
-
-  /**
-   * Check if a hostname resolves to a private/internal address.
-   * Same rules as HttpClient's SSRF guard.
-   */
-  private isPrivateHost(hostname: string): boolean {
-    const lower = hostname.toLowerCase();
-
-    if (lower === 'localhost' || lower === 'localhost.') return true;
-
-    if (lower === '::1' || lower === '[::1]') return true;
-    if (lower.startsWith('fe80:') || lower.startsWith('[fe80:')) return true;
-    if (lower.startsWith('fd') && (lower[2] === ':' || lower[2] === undefined || /^fd[0-9a-f]{2}:/.test(lower))) return true;
-    if (lower.startsWith('[fd')) return true;
-
-    const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
-
-    const ipv4Match = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ipv4Match) {
-      const [, a, b, c] = ipv4Match.map(Number);
-      if (a === 127) return true;
-      if (a === 10) return true;
-      if (a === 172 && b >= 16 && b <= 31) return true;
-      if (a === 192 && b === 168) return true;
-      if (a === 169 && b === 254) return true;
-      if (a === 0 && b === 0 && c === 0) return true;
-    }
-
-    return false;
   }
 
   protected override askPrompt(_question: string): string {
@@ -592,7 +586,8 @@ reacts to live feeds instead of polling.
 - Up to ${MAX_CONNECTIONS} concurrent connections.
 - Permissions: connections to domains outside the allow list prompt the user
   once (accept once/always or deny once/always) via Settings > Permissions.
-  Private and internal addresses stay blocked.` + this.getRestrictionsGuide();
+  Private and internal addresses (and names that resolve to one) are refused
+  unless the user lists them under Private hosts in Settings > Permissions.` + this.getRestrictionsGuide();
   }
 
   private getRestrictionsGuide(): string {
@@ -605,6 +600,9 @@ reacts to live feeds instead of polling.
     }
     if (this.deniedDomains && this.deniedDomains.size > 0) {
       parts.push(`Denied domains: ${[...this.deniedDomains].join(', ')}`);
+    }
+    if (this.addressPolicy.entries.length > 0) {
+      parts.push(`Private hosts allowed: ${this.addressPolicy.entries.join(', ')}`);
     }
     return parts.length > 0 ? `\n\n### RESTRICTIONS\n${parts.join('\n')}` : '';
   }

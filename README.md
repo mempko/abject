@@ -321,6 +321,9 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
 | `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
 | `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
+| `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated `ws://`/`wss://`); servers learned from peers and the public default are never used (see [WHISPER.md](WHISPER.md)) |
+| `ABJECTS_PEER_ADMISSION` | `open` | `allowlist`: connect only with allowed peers (Network → Servers & Peers → Who Can Connect, or `ABJECTS_ALLOWED_PEERS`) |
+| `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |
 
 API keys can also be configured through the Global Settings UI at runtime.
 

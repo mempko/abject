@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { Abject } from '../../core/abject.js';
 import type { AbjectId, AbjectMessage } from '../../core/types.js';
+import { trackChild, untrackIfGone } from '../../runtime/child-processes.js';
 
 export interface ProcessSpec {
   command: string; args?: string[]; shell?: boolean; cwd?: string;
@@ -68,6 +69,7 @@ export class RunningProcess extends Abject {
     this.logDir = await fs.mkdtemp(path.join(os.tmpdir(), 'abject-process-'));
     this.logFile = await fs.open(path.join(this.logDir, 'output.log'), 'w+');
     this.child = spawn(this.spec.command, this.spec.args ?? [], { cwd: this.spec.cwd, env: this.spec.env, shell: this.spec.shell, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+    trackChild(this.child.pid, `process: ${this.spec.command}`, { group: true });
     const append = (kind: 'stdout' | 'stderr', data: Buffer) => {
       const combined = this[kind] + data.toString();
       if (combined.length > 65536) {
@@ -86,7 +88,7 @@ export class RunningProcess extends Abject {
     this.child.stderr?.on('data', (data: Buffer) => append('stderr', data));
     this.child.stdin?.on('error', () => {});
     this.child.on('error', err => { this.processError = err.message; void this.finish(1); });
-    this.child.on('close', code => { void this.finish(code ?? (this.cancelled ? 130 : 1)); });
+    this.child.on('close', code => { untrackIfGone(this.child?.pid); void this.finish(code ?? (this.cancelled ? 130 : 1)); });
     if ((this.spec.timeout ?? 0) > 0) this.timeoutTimer = setTimeout(() => this.terminate(), this.spec.timeout);
   }
   private async finish(code: number): Promise<void> {
@@ -110,6 +112,7 @@ export class RunningProcess extends Abject {
   protected override async onStop(): Promise<void> {
     this.terminate(); await this.completion;
     if (this.killTimer) { clearTimeout(this.killTimer); this.signal('SIGKILL'); }
+    untrackIfGone(this.child?.pid);
     await this.logFile?.close();
     if (this.logDir) await fs.rm(this.logDir, { recursive: true, force: true });
   }

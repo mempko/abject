@@ -66,6 +66,9 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
 | `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
 | `OPENAI_API_KEY` | - | OpenAI API key |
 | `ABJECTS_WORKER_COUNT` | CPU cores | Worker thread pool size |
+| `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated); pinned, not changeable at runtime |
+| `ABJECTS_PEER_ADMISSION` | `open` | `allowlist` pins allowlist mode: only allowed peers may connect |
+| `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |
 
 ### backend-ui.ts
 

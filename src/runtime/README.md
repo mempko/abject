@@ -43,6 +43,7 @@ Main orchestrator managing the bootstrap sequence.
 - **Singleton**: `getRuntime()`, `resetRuntime()` for testing
 - **Invariant**: running runtime must have >= 2 core objects (Registry + Factory)
 - **Accessors**: `messageBus`, `objectRegistry`, `objectFactory`
+- **Shutdown helpers**: `signalChildProcesses(signal)` signals every child process started on this thread or in a pool worker (the first step of shutdown); `shutdownWorkerPool()` stops the pool early so it can run alongside other teardown (`stop()` then skips it)
 
 ### message-bus.ts
 
@@ -88,6 +89,7 @@ Manages a pool of reusable Web Workers (or Node.js worker_threads) for object ex
 - Assigns objects to workers for isolated execution
 - Tracks which objects are running on which workers
 - Handles worker termination and cleanup
+- **Shutdown** stops every hosted object at once, each given at most 2.5s, then terminates the workers; `signalChildren(signal)` asks every worker to signal the child processes it started
 
 ### worker-bridge.ts
 
@@ -96,6 +98,15 @@ Bridge connecting main-thread MessageBus to worker-thread MessageBus instances.
 - Forwards messages between the main bus and worker buses via `postMessage`
 - Serializes/deserializes `AbjectMessage` across the worker boundary
 - Handles worker lifecycle events (ready, error, termination)
+
+### child-processes.ts
+
+Child processes this thread started that must not outlive the app (MCP servers, CLI providers, PTY sessions, running processes).
+
+- Spawners call `trackChild(pid, label, { group })`; a `group` child leads its own process group (or, on Windows, the tree `taskkill /T` walks) and the whole group is signalled
+- `untrackIfGone(pid)` forgets a group only once it is empty: a leader can exit while its descendants run on
+- `signalAllChildren(signal)` is the shutdown step: it signals every tracked child, and any child tracked afterwards is signalled as soon as it is recorded
+- Module state is per thread; the main thread asks pool workers with a `children:signal` message
 
 ### worker-bus.ts
 

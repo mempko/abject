@@ -87,6 +87,15 @@ Message interceptor for transparent cross-peer routing.
 - Receives messages from remote peers, injects into local MessageBus
 - Permission-aware route propagation for multi-hop delivery
 - Replaces the earlier `NetworkBridge` approach
+- **Route trust.** Peers may call only the route protocol
+  (`handleRouteAnnouncement`, `handleRouteDigest`); `registerRoute`,
+  `removeRoute`, `clearRoutesForPeer`, `getRoutes` and the rest are for local
+  objects. Announcements must carry honest hop counts (0 only for the
+  announcer's own workspace) and may not claim an object already reached
+  through another peer's live route. A sender's reply route is recorded only
+  once its message is admitted or relayed. A peer can still be first to claim
+  an object nobody has announced yet, and a relay sees the traffic it carries;
+  mesh admission (`PeerRegistry`) limits both to admitted peers.
 
 ## Integration with MessageBus
 

@@ -10,6 +10,7 @@ import { AbjectMessage, AbjectId } from '../core/types.js';
 import { error as errorMessage } from '../core/message.js';
 import type { MessageBus } from './message-bus.js';
 import { Log } from '../core/timed-log.js';
+import type { TrackedChild } from './child-processes.js';
 
 const log = new Log('WorkerBridge');
 
@@ -31,7 +32,7 @@ export interface WorkerLike {
 export interface WorkerInboundMessage {
   type: 'init' | 'spawn' | 'kill' | 'bus:deliver'
       | 'peer:port' | 'peer:place' | 'peer:remove' | 'peer:dead'
-      | 'live:add' | 'live:remove';
+      | 'live:add' | 'live:remove' | 'children:signal';
   objectId?: AbjectId;
   constructorName?: string;
   constructorArgs?: unknown;
@@ -40,6 +41,9 @@ export interface WorkerInboundMessage {
   message?: AbjectMessage;
   workerIndex?: number;
   port?: unknown;  // MessagePort (transferred)
+  /** children:signal — the signal, and the id its answer carries back. */
+  signal?: string;
+  requestId?: number;
 }
 
 /**
@@ -63,11 +67,14 @@ export interface WorkerHeapSample {
 /** Message types sent from worker to main thread. */
 export interface WorkerOutboundMessage {
   type: 'ready' | 'spawned' | 'stopped' | 'bus:send' | 'error'
-      | 'bus:registered' | 'bus:unregistered' | 'worker:heap';
+      | 'bus:registered' | 'bus:unregistered' | 'worker:heap' | 'children:signalled';
   objectId?: AbjectId;
   message?: AbjectMessage;
   error?: string;
   heap?: WorkerHeapSample;
+  /** children:signalled — answers the children:signal with this id. */
+  requestId?: number;
+  children?: TrackedChild[];
 }
 
 /**
@@ -85,6 +92,8 @@ export class WorkerBridge {
   private readyPromise: Promise<void>;
   private pendingSpawns: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
   private pendingKills: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
+  private pendingChildSignals: Map<number, (children: TrackedChild[]) => void> = new Map();
+  private nextChildSignalId = 1;
   private _dead = false;
   /**
    * Requests forwarded into the worker whose reply has not come back
@@ -173,6 +182,7 @@ export class WorkerBridge {
         pending.reject(new Error(`Worker exited with code ${e.code}`));
       }
       this.pendingKills.clear();
+      this.settleChildSignals();
       // Only an unexpected exit is a death. A terminate() we issued during
       // shutdown must not trip the "the UI is gone" alarms.
       if (!this.terminating) {
@@ -275,6 +285,41 @@ export class WorkerBridge {
   }
 
   /**
+   * Have this worker signal every child process it started
+   * (runtime/child-processes.ts) and report which it reached. Shutdown calls
+   * this first, so a teardown that later wedges or crashes still leaves no
+   * process behind. Resolves with [] if the worker is gone or does not answer
+   * within `timeoutMs`; this must never hold a shutdown up.
+   */
+  signalChildren(signal: NodeJS.Signals, timeoutMs: number): Promise<TrackedChild[]> {
+    if (this._dead) return Promise.resolve([]);
+    const requestId = this.nextChildSignalId++;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingChildSignals.delete(requestId);
+        resolve([]);
+      }, timeoutMs);
+      this.pendingChildSignals.set(requestId, (children) => {
+        clearTimeout(timer);
+        resolve(children);
+      });
+      try {
+        this.worker.postMessage({ type: 'children:signal', signal, requestId } as WorkerInboundMessage);
+      } catch {
+        this.pendingChildSignals.get(requestId)?.([]);
+        this.pendingChildSignals.delete(requestId);
+      }
+    });
+  }
+
+  /** Answer every outstanding signalChildren with nothing (the worker is gone). */
+  private settleChildSignals(): void {
+    const waiting = [...this.pendingChildSignals.values()];
+    this.pendingChildSignals.clear();
+    for (const settle of waiting) settle([]);
+  }
+
+  /**
    * Send a direct MessagePort to this worker for peer-to-peer communication.
    * The port is transferred (not cloned) to the worker.
    */
@@ -345,6 +390,7 @@ export class WorkerBridge {
       pending.reject(new Error('Worker terminated'));
     }
     this.pendingKills.clear();
+    this.settleChildSignals();
   }
 
   /**
@@ -415,6 +461,15 @@ export class WorkerBridge {
         // half-torn-down registration.
         this.onLocalUnregistered?.(objectId);
         this.bus.unregisterWorkerObject(objectId);
+        break;
+      }
+
+      case 'children:signalled': {
+        const settle = data.requestId !== undefined ? this.pendingChildSignals.get(data.requestId) : undefined;
+        if (settle) {
+          this.pendingChildSignals.delete(data.requestId!);
+          settle(data.children ?? []);
+        }
         break;
       }
 

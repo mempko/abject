@@ -7,6 +7,10 @@ the system (or between the system and external toolchains).
 
 ## Documents
 
+- **LLM_PROVIDERS.md**: how an abject becomes an LLM provider by registering
+  with the LLM object (`registerProvider`), the messages it then answers
+  (`providerComplete`, `providerStream` with `providerChunk` events,
+  `providerModels`), naming rules, credentials, and network limits.
 - **PACKAGES.md**: abject packages in both runtimes (WASM and script):
   the `abject.json` format, building with `pnpm forge` (including TypeScript),
   where packages load from, `packages.json`, declared settings and how a

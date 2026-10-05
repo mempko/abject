@@ -248,6 +248,33 @@ consumers:
 - `src/objects/remote-ui-access.ts` (the server answering paired UI clients)
 - `src/objects/peer-registry.ts` (the desktop peer-to-peer mesh)
 
+## A private signaling server
+
+A server of your own is only private if your instances use nothing else. By
+default an instance starts on `wss://signal.abject.world`, adds signaling
+servers it learns from peers, and connects to every peer it finds there. Two
+settings close that:
+
+- **Fixed signaling.** `ABJECTS_SIGNALING_URLS=wss://signal.example.org`
+  makes those the only servers the instance uses: no public default, no
+  servers learned from peers or contacts' addresses. Pairing for the remote
+  UI uses the first of them unless `REMOTE_UI_SIGNALING_URL` names another.
+  Without the variable, the same choice is the "Use only these servers"
+  checkbox under Network → Servers & Peers, applied to the servers listed
+  there.
+- **Mesh admission.** Whisper accepts any registration, so anyone who knows
+  the address can register, see the peer list, and try to connect.
+  `ABJECTS_PEER_ADMISSION=allowlist` makes an instance refuse every peer not
+  on its allowed list. The list is set at runtime (Who Can Connect in the
+  Network window, or `PeerRegistry.setPeerAdmission` / `allowPeer` by
+  message) and seeded by `ABJECTS_ALLOWED_PEERS`. The check runs on each
+  incoming offer, before each outgoing connection, and again on the peer's
+  proven identity once the encrypted handshake completes; removing a peer
+  disconnects it.
+
+Admission applies to the peer mesh. Remote UI clients pair with single-use
+tokens and are not on the peer list.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

@@ -27,11 +27,18 @@ interface State { count: number }
   sandbox, and forge refuses it.
 - `PackageSettings<V>` types what `Packages.getSettings` returns to a
   package's own abjects.
+- **A script package is one handler-map expression and nothing else.**
+  Helpers and constants go inside it as `_` members (not message handlers);
+  forge refuses top-level declarations.
+- **LLM providers:** `LLMProviderSpec`, `ProviderCompleteRequest` /
+  `ProviderCompleteReply` and `ProviderStreamRequest` / `ProviderStreamReply`
+  type the provider protocol (`docs/LLM_PROVIDERS.md`).
 
 ## Files
 
 - **abject.d.ts**: `AbjectMessage`, `AbjectThis`, `AbjectHandlers`,
-  `PackageSettings`.
+  `PackageSettings`, the LLM provider protocol types, and `HttpResponse`.
 
-See `examples/tally-ts` for a complete package, and `docs/PACKAGES.md` for the
-package format, settings and lifecycle.
+See `examples/tally-ts` and `examples/openai-compatible-provider` for complete
+packages, and `docs/PACKAGES.md` for the package format, settings and
+lifecycle.

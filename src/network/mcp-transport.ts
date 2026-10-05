@@ -12,6 +12,7 @@ import type {
 } from '../core/mcp-types.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { trackChild, untrackIfGone } from '../runtime/child-processes.js';
 
 const log = new Log('MCPTransport');
 
@@ -152,6 +153,9 @@ export class MCPTransport {
 
       this.childPid = this.child.pid ?? null;
       const child = this.child;
+      // So shutdown can signal the server tree first, before any slow teardown
+      // and whether or not this transport's stop() is ever reached.
+      trackChild(this.child.pid, `MCP server: ${command}`, { group: true });
 
       // Read stdout line-by-line for JSON-RPC messages
       this.reader = createInterface({ input: child.stdout! });
@@ -176,6 +180,7 @@ export class MCPTransport {
 
       child.on('close', (code, signal) => {
         log.info(`Process exited: code=${code} signal=${signal}`);
+        untrackIfGone(child.pid);
         if (this.state !== 'closed') {
           this.setState('closed');
           this.rejectAll(new Error(this.withStderr(`MCP server exited: code=${code} signal=${signal}`)));
@@ -292,8 +297,11 @@ export class MCPTransport {
       }, 3000);
 
       // No child to wait on when the shell already exited; the group kill above
-      // is the whole of the work, so do not sit on the timer for it.
-      if (!child) {
+      // is the whole of the work, so do not sit on the timer for it. That
+      // includes a child that has exited but is still held here: its 'close'
+      // has already fired and will not fire again. Shutdown signals servers
+      // before their bridges stop, so this is the usual case there.
+      if (!child || child.exitCode !== null || child.signalCode !== null) {
         clearTimeout(forceTimer);
         signalTree('SIGKILL');
         resolve();
@@ -304,6 +312,9 @@ export class MCPTransport {
         resolve();
       });
     });
+    // Forgotten only once the group is empty: descendants that outlived a
+    // leader which left on SIGTERM must still be signalled at shutdown.
+    untrackIfGone(pid ?? undefined);
   }
 
   // ═══════════════════════════════════════════════════════════════════

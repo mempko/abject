@@ -1,0 +1,37 @@
+{
+  "name": "OpenAICompatible",
+  "description": "An LLM provider for any OpenAI-compatible chat endpoint (vLLM, LM Studio, llama.cpp server, a company gateway). It registers with the LLM object on startup, so its models appear in Settings → AI tier routing beside the built-in providers.",
+  "version": "1.0.0",
+  "icon": "🔌",
+  "interface": {
+    "id": "abjects:example:openai-compatible-provider",
+    "name": "OpenAICompatible",
+    "description": "LLM provider backed by an OpenAI-compatible endpoint",
+    "methods": [
+      {
+        "name": "startup",
+        "description": "Register with the LLM object using this package's settings. Returns { registered, reason?, backends? }.",
+        "parameters": [],
+        "returns": { "kind": "object", "properties": {} }
+      },
+      {
+        "name": "providerComplete",
+        "description": "Called by the LLM object: run one chat completion on the configured endpoint. Returns { content, finishReason, usage? }.",
+        "parameters": [
+          { "name": "messages", "type": { "kind": "array", "elementType": { "kind": "reference", "reference": "LLMMessage" } }, "description": "The conversation" },
+          { "name": "options", "type": { "kind": "object", "properties": {} }, "description": "Call options; options.model is the model to run" }
+        ],
+        "returns": { "kind": "object", "properties": {} }
+      },
+      {
+        "name": "changed",
+        "description": "Receives change notifications from the Packages service and re-registers when this package's settings change.",
+        "parameters": [],
+        "returns": { "kind": "primitive", "primitive": "boolean" }
+      }
+    ]
+  },
+  "requiredCapabilities": [],
+  "providedCapabilities": [],
+  "tags": ["autostart", "llm-provider"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "OpenAICompatible",
+  "version": "1.0.0",
+  "runtime": "script",
+  "scope": "workspace",
+  "entry": "provider.ts",
+  "manifest": "manifest.json",
+  "settings": [
+    { "key": "baseUrl", "label": "Base URL", "type": "string", "required": true, "description": "The endpoint's OpenAI API root, for example http://localhost:8000/v1." },
+    { "key": "apiKey", "label": "API key", "type": "secret", "description": "Sent as a bearer token. Leave empty for endpoints without one." },
+    { "key": "models", "label": "Models", "type": "string", "required": true, "description": "Model ids the endpoint serves, comma separated. The first is the default for smart, balanced and code; the last for fast." },
+    { "key": "name", "label": "Provider id", "type": "string", "default": "openai-compatible", "description": "The id tier routing and the ledger use. Lowercase letters, digits, dots, dashes, underscores." },
+    { "key": "label", "label": "Label", "type": "string", "default": "OpenAI-compatible", "description": "What the provider dropdown shows." }
+  ]
+}

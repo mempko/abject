@@ -7,6 +7,7 @@ import { require, ensure, invariant } from '../core/contracts.js';
 import { MessageBus, LoggingInterceptor } from './message-bus.js';
 import { WorkerPool, WorkerPoolConfig } from './worker-pool.js';
 import type { WorkerLike } from './worker-bridge.js';
+import { signalAllChildren, type TrackedChild } from './child-processes.js';
 import { Registry } from '../objects/registry.js';
 import { Factory } from '../objects/factory.js';
 import { Abject } from '../core/abject.js';
@@ -34,6 +35,8 @@ export class Runtime {
   private factory: Factory;
   private coreObjects: Map<AbjectId, Abject> = new Map();
   private _workerPool?: WorkerPool;
+  /** The pool's shutdown once begun (shutdownWorkerPool), so it runs once. */
+  private poolShutdown?: Promise<void>;
 
   constructor(private readonly _config: RuntimeConfig = {}) {
     this.bus = new MessageBus();
@@ -122,6 +125,31 @@ export class Runtime {
   /**
    * Stop the runtime.
    */
+  /**
+   * Shutdown, first step: signal every child process started on this thread
+   * or in any pool worker (runtime/child-processes.ts), and from then on any
+   * started late. Returns the ones reached, so the caller can make sure of
+   * them later. Cheap and fast: nothing here waits on an object.
+   */
+  async signalChildProcesses(signal: NodeJS.Signals = 'SIGTERM'): Promise<TrackedChild[]> {
+    const own = signalAllChildren(signal);
+    const pooled = this._workerPool ? await this._workerPool.signalChildren(signal) : [];
+    return [...own, ...pooled];
+  }
+
+  /**
+   * Stop the worker pool's objects and threads now, ahead of stop(), so a
+   * caller can run it alongside other slow teardown. stop() then skips it.
+   */
+  shutdownWorkerPool(): Promise<void> {
+    this.poolShutdown ??= (async () => {
+      if (!this._workerPool) return;
+      await this._workerPool.shutdown();
+      this._workerPool = undefined;
+    })();
+    return this.poolShutdown;
+  }
+
   async stop(): Promise<void> {
     require(
       this.state === 'running',
@@ -131,10 +159,7 @@ export class Runtime {
     this.state = 'stopping';
 
     // Shut down worker pool first (kills all worker-hosted objects)
-    if (this._workerPool) {
-      await this._workerPool.shutdown();
-      this._workerPool = undefined;
-    }
+    await this.shutdownWorkerPool();
 
     // Stop all spawned objects
     for (const obj of this.factory.getAllObjects()) {

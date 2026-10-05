@@ -8,6 +8,7 @@ import { error, event } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { ensure } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
+import { AddressPolicy, HostLookup, NetworkPolicyError, portOf } from './address-policy.js';
 
 const log = new Log('HTTP');
 
@@ -56,6 +57,9 @@ const EXCHANGE_BODY_CAP = 64 * 1024; // characters, not bytes
  *  registry request per interval, and bounds the gap after a recorder
  *  restart (recipientGone clears the wait entirely). */
 const RECORDER_RETRY_MS = 1000;
+/** Redirect hops followed per request, each checked like the first URL. */
+const MAX_REDIRECTS = 10;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /**
  * HTTP Client capability object.
@@ -64,6 +68,10 @@ export class HttpClient extends Abject {
   private allowedDomains?: Set<string>;
   private deniedDomains?: Set<string>;
   private webDisabled = false;
+  /** Private and internal addresses the owner allowed (Settings > Permissions,
+   *  Private hosts). Every other private address is refused. */
+  private addressPolicy: AddressPolicy;
+  private readonly lookup?: HostLookup;
   /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
   private permissionsAuthorityId?: AbjectId;
   /** The one recipient of httpExchange events, found through the registry.
@@ -82,6 +90,9 @@ export class HttpClient extends Abject {
   constructor(config?: {
     allowedDomains?: string[];
     deniedDomains?: string[];
+    privateHosts?: string[];
+    /** Name resolution for the private-address guard (tests). */
+    lookup?: HostLookup;
   }) {
     super({
       manifest: {
@@ -225,6 +236,8 @@ export class HttpClient extends Abject {
     if (config?.deniedDomains) {
       this.deniedDomains = new Set(config.deniedDomains);
     }
+    this.lookup = config?.lookup;
+    this.addressPolicy = new AddressPolicy(config?.privateHosts, this.lookup);
 
     this.setupHandlers();
   }
@@ -337,10 +350,11 @@ export class HttpClient extends Abject {
       if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
         return { success: false, error: 'Unauthorized: only the permissions authority can update permissions' };
       }
-      const { enabled, allowedDomains, deniedDomains } = msg.payload as {
+      const { enabled, allowedDomains, deniedDomains, privateHosts } = msg.payload as {
         enabled?: boolean;
         allowedDomains?: string[];
         deniedDomains?: string[];
+        privateHosts?: string[];
       };
       if (enabled !== undefined) this.webDisabled = !enabled;
       if (allowedDomains !== undefined) {
@@ -348,6 +362,9 @@ export class HttpClient extends Abject {
       }
       if (deniedDomains !== undefined) {
         this.deniedDomains = deniedDomains.length > 0 ? new Set(deniedDomains) : undefined;
+      }
+      if (privateHosts !== undefined) {
+        this.addressPolicy = new AddressPolicy(privateHosts, this.lookup);
       }
       return { success: true };
     });
@@ -420,21 +437,10 @@ export class HttpClient extends Abject {
    */
   async makeRequest(req: HttpRequest): Promise<HttpResponse> {
     if (this.webDisabled) throw new Error('Web access is disabled. Enable it in Settings > Permissions.');
-    // Validate URL
-    const url = new URL(req.url);
-    this.validateScheme(url.protocol);
-    this.validateDomain(url.hostname);
+    this.validateUrl(new URL(req.url));
 
-    // Build fetch options
-    const options: RequestInit = {
-      method: req.method,
-      headers: req.headers,
-    };
-
-    if (req.body) {
-      options.body =
-        typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-    }
+    const requestBody = !req.body ? undefined
+      : typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
 
     const maxAttempts = 3;
     const timeout = req.timeout ?? 30000;
@@ -444,7 +450,7 @@ export class HttpClient extends Abject {
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
       try {
-        const response = await fetch(req.url, { ...options, signal: controller.signal });
+        const response = await this.fetchChecked(req.url, req.method, req.headers, requestBody, controller.signal);
         clearTimeout(timeoutId);
 
         // Retry on 429 (rate limit) or 5xx (server error)
@@ -472,6 +478,7 @@ export class HttpClient extends Abject {
         };
       } catch (err) {
         clearTimeout(timeoutId);
+        if (err instanceof NetworkPolicyError) throw err;
         if (attempt < maxAttempts) {
           const delay = Math.pow(2, attempt - 1) * 1000;
           await new Promise((r) => setTimeout(r, delay));
@@ -492,18 +499,14 @@ export class HttpClient extends Abject {
     url: string,
     headers?: Record<string, string>
   ): Promise<{ dataUri: string; mimeType: string; size: number; ok: boolean; status: number }> {
-    const parsed = new URL(url);
-    this.validateScheme(parsed.protocol);
-    this.validateDomain(parsed.hostname);
+    if (this.webDisabled) throw new Error('Web access is disabled. Enable it in Settings > Permissions.');
+    this.validateUrl(new URL(url));
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
     try {
-      const response = await fetch(url, {
-        headers,
-        signal: controller.signal,
-      });
+      const response = await this.fetchChecked(url, 'GET', headers, undefined, controller.signal);
       clearTimeout(timeoutId);
 
       if (!response.ok) {
@@ -549,70 +552,71 @@ export class HttpClient extends Abject {
   }
 
   /**
+   * fetch, following redirects by hand so every hop passes the checks the
+   * first URL did (scheme, domain lists, private addresses). fetch's own
+   * redirect handling would go wherever a Location header pointed, internal
+   * addresses included. Hops follow fetch's rules: 303, and 301/302 after a
+   * POST, continue as a body-less GET; a hop to another origin drops
+   * credential headers.
+   */
+  private async fetchChecked(
+    url: string,
+    method: string,
+    headers: Record<string, string> | undefined,
+    body: string | undefined,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    let current = new URL(url);
+    for (let hop = 0; ; hop++) {
+      this.validateUrl(current);
+      await this.addressPolicy.check(current.hostname, portOf(current));
+      const response = await fetch(current.href, { method, headers, body, signal, redirect: 'manual' });
+      const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get('location') : null;
+      if (location === null) return response;
+      await response.body?.cancel();
+      if (hop >= MAX_REDIRECTS) throw new NetworkPolicyError(`Too many redirects (more than ${MAX_REDIRECTS})`);
+
+      const next = new URL(location, current);
+      const verb = method.toUpperCase();
+      if (response.status === 303 ? verb !== 'HEAD' : (response.status === 301 || response.status === 302) && verb === 'POST') {
+        method = 'GET';
+        body = undefined;
+        headers = withoutHeaders(headers, name => name.toLowerCase().startsWith('content-'));
+      }
+      if (next.origin !== current.origin) {
+        headers = withoutHeaders(headers, name => SECRET_NAME_STEM.test(name));
+      }
+      current = next;
+    }
+  }
+
+  /** Scheme and domain lists: the checks that need no name resolution. */
+  private validateUrl(url: URL): void {
+    this.validateScheme(url.protocol);
+    this.validateDomain(url.hostname);
+  }
+
+  /**
    * Reject non-HTTP(S) schemes to prevent file:/ftp:/etc. abuse.
    */
   private validateScheme(protocol: string): void {
     if (protocol !== 'http:' && protocol !== 'https:') {
-      throw new Error(`Scheme ${protocol} is not allowed — only http: and https: are permitted`);
+      throw new NetworkPolicyError(`Scheme ${protocol} is not allowed — only http: and https: are permitted`);
     }
   }
 
   /**
-   * Validate that a domain is allowed. Blocks private/internal IPs by default (SSRF protection).
+   * Validate a domain against the allow and deny lists. Private and internal
+   * addresses are refused separately, after resolution (addressPolicy).
    */
   private validateDomain(hostname: string): void {
     if (this.deniedDomains?.has(hostname)) {
-      throw new Error(`Domain ${hostname} is denied`);
+      throw new NetworkPolicyError(`Domain ${hostname} is denied`);
     }
 
     if (this.allowedDomains && !this.allowedDomains.has(hostname)) {
-      throw new Error(`Domain ${hostname} is not in allowed list`);
+      throw new NetworkPolicyError(`Domain ${hostname} is not in allowed list`);
     }
-
-    // SSRF protection: block requests to private/internal addresses
-    if (this.isPrivateHost(hostname)) {
-      throw new Error(`Domain ${hostname} is blocked — private/internal addresses are not allowed`);
-    }
-  }
-
-  /**
-   * Check if a hostname resolves to a private/internal address.
-   */
-  private isPrivateHost(hostname: string): boolean {
-    const lower = hostname.toLowerCase();
-
-    // Block localhost variants
-    if (lower === 'localhost' || lower === 'localhost.') return true;
-
-    // Block IPv6 loopback and link-local
-    if (lower === '::1' || lower === '[::1]') return true;
-    if (lower.startsWith('fe80:') || lower.startsWith('[fe80:')) return true;
-    // IPv6 ULA (fd00::/8)
-    if (lower.startsWith('fd') && (lower[2] === ':' || lower[2] === undefined || /^fd[0-9a-f]{2}:/.test(lower))) return true;
-    if (lower.startsWith('[fd')) return true;
-
-    // Strip brackets for IPv6 literal
-    const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
-
-    // Check IPv4 patterns
-    const ipv4Match = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ipv4Match) {
-      const [, a, b, c] = ipv4Match.map(Number);
-      // 127.0.0.0/8
-      if (a === 127) return true;
-      // 10.0.0.0/8
-      if (a === 10) return true;
-      // 172.16.0.0/12
-      if (a === 172 && b >= 16 && b <= 31) return true;
-      // 192.168.0.0/16
-      if (a === 192 && b === 168) return true;
-      // 169.254.0.0/16 (link-local / cloud metadata)
-      if (a === 169 && b === 254) return true;
-      // 0.0.0.0
-      if (a === 0 && b === 0 && c === 0) return true;
-    }
-
-    return false;
   }
 
   /**
@@ -683,7 +687,11 @@ Every response has: { status, statusText, headers, body, ok }
 ### IMPORTANT
 - Do NOT use fetch() directly — always go through the HttpClient object.
 - Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
-- Requests auto-retry on 429 and 5xx errors (up to 3 attempts).` + this.getRestrictionsGuide();
+- Requests auto-retry on 429 and 5xx errors (up to 3 attempts).
+- Private and internal addresses (localhost, 10.x, 192.168.x, cloud metadata,
+  and any name that resolves to one) are refused unless the user lists them
+  under Private hosts in Settings > Permissions. Redirects are checked the same
+  way.` + this.getRestrictionsGuide();
   }
 
   private getRestrictionsGuide(): string {
@@ -696,6 +704,9 @@ Every response has: { status, statusText, headers, body, ok }
     }
     if (this.deniedDomains && this.deniedDomains.size > 0) {
       parts.push(`Denied domains: ${[...this.deniedDomains].join(', ')}`);
+    }
+    if (this.addressPolicy.entries.length > 0) {
+      parts.push(`Private hosts allowed: ${this.addressPolicy.entries.join(', ')}`);
     }
     return parts.length > 0 ? `\n\n### RESTRICTIONS\n${parts.join('\n')}` : '';
   }
@@ -731,6 +742,14 @@ function buildExchange(caller: AbjectId, req: HttpRequest, res: HttpResponse, du
 
 /** Secret-bearing query params and headers are replaced, never dropped:
  *  the shape of the request stays visible, the credential does not. */
+function withoutHeaders(
+  headers: Record<string, string> | undefined,
+  drop: (name: string) => boolean,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  return Object.fromEntries(Object.entries(headers).filter(([name]) => !drop(name)));
+}
+
 function redactUrl(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);

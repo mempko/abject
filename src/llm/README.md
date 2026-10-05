@@ -47,6 +47,16 @@ Local LLM via Ollama.
 - `listModels()`: enumerate available local models
 - No API key required
 
+### remote-provider.ts
+
+`RemoteLLMProvider`: a provider implemented by another abject. An abject sends
+`registerProvider` to the LLM object; the LLM object wraps it in this adapter
+and routes calls to it as `providerComplete` / `providerStream` messages (the
+stream's pieces come back as `providerChunk` events). Several abjects of one
+installed package may back one provider name, with failover between them.
+`parseRemoteProviderSpec` validates registrations. Protocol:
+`docs/LLM_PROVIDERS.md`.
+
 ## Usage
 
-LLM providers are registered with the `LLMObject` system object, which exposes them to all other objects via the message bus. `ProxyGenerator` and `ObjectCreator` are the primary consumers. The `AgentAbject` also uses LLM completions for the observe→think→act loop.
+LLM providers are registered with the `LLMObject` system object, which exposes them to all other objects via the message bus. Built-in providers are registered by `configure()`; abject-backed ones by the `registerProvider` message. `ProxyGenerator` and `ObjectCreator` are the primary consumers. The `AgentAbject` also uses LLM completions for the observe→think→act loop.

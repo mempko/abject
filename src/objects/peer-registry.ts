@@ -27,8 +27,25 @@ const STORAGE_KEY_SIGNALING_URLS = 'peer-registry:signaling-urls';
 const STORAGE_KEY_REMOVED_SIGNALING = 'peer-registry:removed-signaling-urls';
 const STORAGE_KEY_BLOCKED = 'peer-registry:blocked-peers';
 const STORAGE_KEY_GOSSIP_PEERS = 'peer-registry:gossip-peers';
+const STORAGE_KEY_NETWORK_POLICY = 'peer-registry:network-policy';
 const MAX_GOSSIP_PEERS = 30;
 const DEFAULT_SIGNALING_URL = 'wss://signal.abject.world';
+/** PeerId = hex(SHA-256(SPKI public key)), see core/identity.ts. */
+const PEER_ID_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Who this peer connects to. 'open': any peer it finds or that calls it.
+ * 'allowlist': only peers on the allowed list (set at runtime) or pinned by
+ * ABJECTS_ALLOWED_PEERS, checked on every offer, every outgoing connection,
+ * and again on the authenticated identity once the handshake completes.
+ */
+export type PeerAdmissionMode = 'open' | 'allowlist';
+
+interface StoredNetworkPolicy {
+  fixedSignaling?: boolean;
+  admissionMode?: PeerAdmissionMode;
+  allowedPeers?: string[];
+}
 
 export const PEER_REGISTRY_ID = 'abjects:peer-registry' as AbjectId;
 
@@ -45,6 +62,21 @@ interface StoredContact {
   addresses: string[];
   addedAt: number;
   lastSeen?: number;
+}
+
+/** A list from an environment variable: entries separated by commas or spaces. */
+function envList(name: string): string[] {
+  const raw = (typeof process !== 'undefined' && process.env?.[name]) || '';
+  return raw.split(/[\s,]+/).filter(Boolean);
+}
+
+function isSignalingUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'ws:' || parsed.protocol === 'wss:';
+  } catch {
+    return false;
+  }
 }
 
 interface StoredGossipPeer {
@@ -107,6 +139,28 @@ export class PeerRegistry extends Abject {
 
   // Track which signaling URL facilitated each transport
   private transportSignalingUrl: Map<string, string> = new Map();
+
+  /**
+   * Signaling servers fixed by ABJECTS_SIGNALING_URLS: the only servers used,
+   * unchangeable at runtime. Undefined when the variable is not set.
+   */
+  private readonly pinnedSignalingUrls?: readonly string[];
+  /**
+   * Use only the configured signaling servers (the pinned ones, or the saved
+   * list), never servers learned from peers, from contacts' addresses, or the
+   * first-run default. Off: today's behaviour, where gossip adds servers.
+   */
+  private fixedSignaling = false;
+  private admissionMode: PeerAdmissionMode = 'open';
+  /** Peers admitted in 'allowlist' mode, set at runtime (setPeerAdmission). */
+  private allowedPeers: Set<PeerId> = new Set();
+  /** Peers admitted by ABJECTS_ALLOWED_PEERS; always admitted, not removable. */
+  private readonly pinnedPeers: ReadonlySet<PeerId>;
+  /** ABJECTS_PEER_ADMISSION=allowlist: the mode cannot be opened at runtime. */
+  private readonly admissionPinned: boolean;
+  /** The policy as last stored, so a pinned setting keeps the user's own
+   *  stored choice for when the pin is lifted. */
+  private storedPolicy: StoredNetworkPolicy = {};
 
   // Pending introductions awaiting user acceptance
   private pendingIntroductions: Map<PeerId, {
@@ -333,6 +387,60 @@ export class PeerRegistry extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'getSignalingPolicy',
+                description: 'Whether signaling is fixed to the configured servers, whether ABJECTS_SIGNALING_URLS pins them, and the servers allowed',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  fixed: { kind: 'primitive', primitive: 'boolean' },
+                  pinned: { kind: 'primitive', primitive: 'boolean' },
+                  urls: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                } },
+              },
+              {
+                name: 'setFixedSignaling',
+                description: 'Use only the configured signaling servers (true), or also servers learned from peers and contacts (false). Refused while ABJECTS_SIGNALING_URLS pins the list.',
+                parameters: [
+                  { name: 'fixed', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Fix signaling to the configured servers' },
+                ],
+                returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, error: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'getPeerAdmission',
+                description: 'Mesh admission: the mode (open or allowlist), the allowed peers, the peers pinned by ABJECTS_ALLOWED_PEERS, and whether ABJECTS_PEER_ADMISSION pins the mode',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  mode: { kind: 'primitive', primitive: 'string' },
+                  peers: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                  pinnedPeers: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                  pinned: { kind: 'primitive', primitive: 'boolean' },
+                } },
+              },
+              {
+                name: 'setPeerAdmission',
+                description: 'Set the admission mode and/or replace the allowed peer list. In allowlist mode only listed peers may connect; connected peers no longer admitted are disconnected.',
+                parameters: [
+                  { name: 'mode', type: { kind: 'primitive', primitive: 'string' }, description: 'open or allowlist', optional: true },
+                  { name: 'peers', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Allowed peer IDs (replaces the list)', optional: true },
+                ],
+                returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, error: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'allowPeer',
+                description: 'Add a peer ID to the allowed list',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to allow' },
+                ],
+                returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, error: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'disallowPeer',
+                description: 'Remove a peer ID from the allowed list; in allowlist mode it is disconnected',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to remove' },
+                ],
+                returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' }, error: { kind: 'primitive', primitive: 'string' } } },
+              },
             ],
             events: [
               {
@@ -397,6 +505,16 @@ export class PeerRegistry extends Abject {
                 description: 'A peer has been unblocked',
                 payload: { kind: 'object', properties: { peerId: { kind: 'primitive', primitive: 'string' } } },
               },
+              {
+                name: 'signalingPolicyChanged',
+                description: 'Fixed signaling was turned on or off (payload as getSignalingPolicy)',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'peerAdmissionChanged',
+                description: 'The admission mode or allowed peers changed (payload as getPeerAdmission)',
+                payload: { kind: 'object', properties: {} },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -407,6 +525,29 @@ export class PeerRegistry extends Abject {
         tags: ['system', 'peer'],
       },
     });
+
+    // Provisioning pins (a hosted image, an org member's machine): read once.
+    const signalingUrls = envList('ABJECTS_SIGNALING_URLS');
+    if (signalingUrls.length > 0) {
+      const valid = signalingUrls.filter(isSignalingUrl);
+      for (const bad of signalingUrls.filter(u => !isSignalingUrl(u))) {
+        log.warn(`ABJECTS_SIGNALING_URLS: ignoring ${bad} (not a ws:// or wss:// URL)`);
+      }
+      this.pinnedSignalingUrls = valid;
+      this.fixedSignaling = true;
+    }
+    const pinnedPeers = envList('ABJECTS_ALLOWED_PEERS').map(p => p.toLowerCase());
+    for (const bad of pinnedPeers.filter(p => !PEER_ID_PATTERN.test(p))) {
+      log.warn(`ABJECTS_ALLOWED_PEERS: ignoring ${bad} (not a peer ID)`);
+    }
+    this.pinnedPeers = new Set(pinnedPeers.filter(p => PEER_ID_PATTERN.test(p)));
+    const admission = (typeof process !== 'undefined' && process.env?.ABJECTS_PEER_ADMISSION) || '';
+    if (admission && admission !== 'open' && admission !== 'allowlist') {
+      log.warn(`ABJECTS_PEER_ADMISSION: ignoring "${admission}" (use open or allowlist)`);
+    }
+    this.admissionPinned = admission === 'allowlist';
+    if (this.admissionPinned) this.admissionMode = 'allowlist';
+
     this.setupHandlers();
   }
 
@@ -445,6 +586,7 @@ export class PeerRegistry extends Abject {
 
     this.on('connectSignaling', async (msg: AbjectMessage) => {
       const { url } = msg.payload as { url: string };
+      if (this.pinnedSignalingUrls && !this.pinnedSignalingUrls.includes(url)) return false;
       // User explicitly connecting — clear from removed list and persist
       this.removedSignalingUrls.delete(url);
       this.savedSignalingUrls.add(url);
@@ -485,6 +627,7 @@ export class PeerRegistry extends Abject {
 
     this.on('removeSignalingServer', async (msg: AbjectMessage) => {
       const { url } = msg.payload as { url: string };
+      if (this.pinnedSignalingUrls?.includes(url)) return false;
       return this.removeSignalingServer(url);
     });
 
@@ -559,6 +702,30 @@ export class PeerRegistry extends Abject {
       const { peerId } = msg.payload as { peerId: string };
       return this.blockedPeers.has(peerId);
     });
+
+    this.on('getSignalingPolicy', async () => this.signalingPolicy());
+
+    this.on('setFixedSignaling', async (msg: AbjectMessage) => {
+      const { fixed } = msg.payload as { fixed?: boolean };
+      return this.setFixedSignalingImpl(fixed === true);
+    });
+
+    this.on('getPeerAdmission', async () => this.peerAdmission());
+
+    this.on('setPeerAdmission', async (msg: AbjectMessage) => {
+      const { mode, peers } = msg.payload as { mode?: string; peers?: unknown };
+      return this.setPeerAdmissionImpl(mode, peers);
+    });
+
+    this.on('allowPeer', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId?: string };
+      return this.allowPeerImpl(peerId);
+    });
+
+    this.on('disallowPeer', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId?: string };
+      return this.disallowPeerImpl(peerId);
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -571,6 +738,9 @@ export class PeerRegistry extends Abject {
 
     // Load blocked peers from storage
     await this.loadBlockedPeers();
+
+    // Fixed signaling and mesh admission, before any connection is made
+    await this.loadNetworkPolicy();
 
     // Load contacts from storage
     await this.loadContacts();
@@ -716,6 +886,7 @@ export class PeerRegistry extends Abject {
 
     const contact = this.contacts.get(peerId);
     if (!contact) return false;
+    if (!this.admits(peerId)) return false;
     if (this.transports.has(peerId)) return true; // already connected
 
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
@@ -856,6 +1027,7 @@ export class PeerRegistry extends Abject {
    * Persists the URL and attempts connection.
    */
   async addSignalingUrl(url: string): Promise<boolean> {
+    if (this.fixedSignaling) return false;
     if (this.removedSignalingUrls.has(url)) return false;
     if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) {
       return true; // Already known
@@ -871,6 +1043,7 @@ export class PeerRegistry extends Abject {
    * Add a signaling URL received via gossip (best-effort, no await).
    */
   addSignalingUrlFromGossip(url: string): void {
+    if (this.fixedSignaling) return;
     if (this.removedSignalingUrls.has(url)) return;
     if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) return;
     this.savedSignalingUrls.add(url);
@@ -889,6 +1062,12 @@ export class PeerRegistry extends Abject {
 
   private async connectSignalingImpl(url: string): Promise<boolean> {
     if (this.signalingClients.has(url)) return true;
+    // The one gate for every route to a server: saved list, gossip, contacts'
+    // addresses, the no-signaling fallback, explicit connects.
+    if (!this.signalingAllowed(url)) {
+      if (this.shouldLogSignalingIssue(url)) log.info(`Not connecting to signaling ${url}: signaling is fixed to the configured servers`);
+      return false;
+    }
 
     const client = new SignalingClient();
     client.setPersistent(true);
@@ -1051,9 +1230,11 @@ export class PeerRegistry extends Abject {
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
 
-    // Reject inbound offers from blocked peers
-    if (this.blockedPeers.has(fromPeerId)) {
-      log.info(`Rejecting SDP offer from blocked peer ${fromPeerId.slice(0, 16)}`);
+    // Reject inbound offers from blocked peers, and in allowlist mode from
+    // anyone not listed. The peer id here is only claimed; onConnect checks
+    // it again once the handshake has proved it.
+    if (!this.admits(fromPeerId)) {
+      log.info(`Rejecting SDP offer from ${fromPeerId.slice(0, 16)}: ${this.blockedPeers.has(fromPeerId) ? 'blocked' : 'not on the allowed list'}`);
       return;
     }
 
@@ -1209,7 +1390,7 @@ export class PeerRegistry extends Abject {
 
     for (const [peerId, contact] of this.contacts) {
       if (contact.state !== 'offline') continue;
-      if (this.blockedPeers.has(peerId)) continue;
+      if (!this.admits(peerId)) continue;
       if (this.manuallyDisconnected.has(peerId)) continue;
       if (this.transports.has(peerId)) continue;
 
@@ -1317,6 +1498,17 @@ export class PeerRegistry extends Abject {
           void transport.disconnect();
           return;
         }
+        // Admission on the proven identity. The list may also have changed
+        // while the handshake ran. No session was accepted, so the disconnect
+        // handler would skip cleanup: drop the transport here first.
+        if (!this.admits(peerId)) {
+          log.warn(`refusing ${peerId.slice(0, 16)}: not admitted`);
+          this.transports.delete(peerId);
+          this.offerTimestamps.delete(peerId);
+          this.setContactState(peerId, 'offline');
+          void transport.disconnect();
+          return;
+        }
 
         // PeerTransport renews and expires the heartbeat lease. PeerRegistry
         // binds its authenticated identity and epoch to the currently active
@@ -1388,7 +1580,7 @@ export class PeerRegistry extends Abject {
         // for the next auto-connect cycle (30s)
         if (this.contacts.has(peerId) &&
             !this.manuallyDisconnected.has(peerId) &&
-            !this.blockedPeers.has(peerId)) {
+            this.admits(peerId)) {
           setTimeout(() => {
             if (!this.transports.has(peerId) && this.contacts.get(peerId)?.state === 'offline') {
               this.connectToPeer(peerId).catch(() => {});
@@ -1539,7 +1731,7 @@ export class PeerRegistry extends Abject {
    * Used by SignalingRelayObject for peer-relayed connections.
    */
   async connectToPeerViaRelay(peerId: string, relay: SignalingRelay): Promise<boolean> {
-    if (this.blockedPeers.has(peerId)) return false;
+    if (!this.admits(peerId)) return false;
     if (this.transports.has(peerId)) return true; // already connected
 
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
@@ -1589,7 +1781,7 @@ export class PeerRegistry extends Abject {
 
     for (const peer of peers) {
       if (peer.peerId === myPeerId) continue;
-      if (this.blockedPeers.has(peer.peerId)) continue;
+      if (!this.admits(peer.peerId)) continue;
       if (this.contacts.has(peer.peerId)) continue;
       if (this.transports.has(peer.peerId)) continue;
       this.connectToPeerViaRelay(peer.peerId, client).catch(() => {});
@@ -1715,6 +1907,144 @@ export class PeerRegistry extends Abject {
   }
 
   // ==========================================================================
+  // Fixed signaling and mesh admission
+  // ==========================================================================
+
+  /** The servers signaling may use while fixed: the pinned ones, else the saved list. */
+  private allowedSignalingUrls(): string[] {
+    return this.pinnedSignalingUrls ? [...this.pinnedSignalingUrls] : Array.from(this.savedSignalingUrls);
+  }
+
+  private signalingAllowed(url: string): boolean {
+    return !this.fixedSignaling || this.allowedSignalingUrls().includes(url);
+  }
+
+  private signalingPolicy(): { fixed: boolean; pinned: boolean; urls: string[] } {
+    return { fixed: this.fixedSignaling, pinned: !!this.pinnedSignalingUrls, urls: this.allowedSignalingUrls() };
+  }
+
+  private async setFixedSignalingImpl(fixed: boolean): Promise<{ success: boolean; error?: string }> {
+    if (!fixed && this.pinnedSignalingUrls) {
+      return { success: false, error: 'Signaling servers are fixed by ABJECTS_SIGNALING_URLS' };
+    }
+    this.fixedSignaling = fixed;
+    await this.persistNetworkPolicy();
+    if (fixed) {
+      for (const url of Array.from(this.signalingClients.keys())) {
+        if (!this.signalingAllowed(url)) await this.disconnectSignalingImpl(url);
+      }
+    }
+    this.changed('signalingPolicyChanged', this.signalingPolicy());
+    return { success: true };
+  }
+
+  /** Whether a connection with `peerId` may exist: never a blocked peer, and
+   *  in allowlist mode only a listed or pinned one. */
+  private admits(peerId: string): boolean {
+    if (this.blockedPeers.has(peerId)) return false;
+    return this.admissionMode === 'open' || this.allowedPeers.has(peerId) || this.pinnedPeers.has(peerId);
+  }
+
+  private peerAdmission(): { mode: PeerAdmissionMode; peers: string[]; pinnedPeers: string[]; pinned: boolean } {
+    return {
+      mode: this.admissionMode,
+      peers: Array.from(this.allowedPeers),
+      pinnedPeers: Array.from(this.pinnedPeers),
+      pinned: this.admissionPinned,
+    };
+  }
+
+  private async setPeerAdmissionImpl(mode: unknown, peers: unknown): Promise<{ success: boolean; error?: string }> {
+    if (mode !== undefined && mode !== 'open' && mode !== 'allowlist') {
+      return { success: false, error: `Unknown admission mode "${String(mode)}" (use open or allowlist)` };
+    }
+    if (mode === 'open' && this.admissionPinned) {
+      return { success: false, error: 'Admission is fixed to allowlist by ABJECTS_PEER_ADMISSION' };
+    }
+    let next: Set<PeerId> | undefined;
+    if (peers !== undefined) {
+      if (!Array.isArray(peers)) return { success: false, error: 'peers must be a list of peer IDs' };
+      const ids = peers.map(p => (typeof p === 'string' ? p.trim().toLowerCase() : ''));
+      const bad = ids.find(p => !PEER_ID_PATTERN.test(p));
+      if (bad !== undefined) return { success: false, error: `Not a peer ID: ${bad || '(empty)'}` };
+      next = new Set(ids);
+    }
+    if (next) this.allowedPeers = next;
+    if (mode) this.admissionMode = mode;
+    await this.admissionChanged();
+    return { success: true };
+  }
+
+  private async allowPeerImpl(peerId: unknown): Promise<{ success: boolean; error?: string }> {
+    const id = typeof peerId === 'string' ? peerId.trim().toLowerCase() : '';
+    if (!PEER_ID_PATTERN.test(id)) return { success: false, error: `Not a peer ID: ${id || '(empty)'}` };
+    if (!this.allowedPeers.has(id)) {
+      this.allowedPeers.add(id);
+      await this.admissionChanged();
+    }
+    return { success: true };
+  }
+
+  private async disallowPeerImpl(peerId: unknown): Promise<{ success: boolean; error?: string }> {
+    const id = typeof peerId === 'string' ? peerId.trim().toLowerCase() : '';
+    if (this.pinnedPeers.has(id)) return { success: false, error: 'This peer is allowed by ABJECTS_ALLOWED_PEERS' };
+    if (this.allowedPeers.delete(id)) await this.admissionChanged();
+    return { success: true };
+  }
+
+  /** Persist, drop connections that are no longer admitted, and announce. */
+  private async admissionChanged(): Promise<void> {
+    await this.persistNetworkPolicy();
+    for (const [peerId, transport] of Array.from(this.transports)) {
+      if (this.admits(peerId)) continue;
+      log.info(`Disconnecting ${peerId.slice(0, 16)}: no longer admitted`);
+      // The disconnect handler clears this peer's maps and announces it, so
+      // PeerRouter drops its routes; a transport still mid-handshake has no
+      // accepted session for that handler to match, so clear it here too.
+      try { await transport.disconnect(); } catch { /* closing regardless */ }
+      if (this.transports.get(peerId) === transport) {
+        this.transports.delete(peerId);
+        this.offerTimestamps.delete(peerId);
+        this.networkPeers.delete(peerId);
+        this.setContactState(peerId, 'offline');
+      }
+    }
+    this.changed('peerAdmissionChanged', this.peerAdmission());
+  }
+
+  private async loadNetworkPolicy(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const stored = await this.request<StoredNetworkPolicy | null>(
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_NETWORK_POLICY }),
+      );
+      if (!stored || typeof stored !== 'object') return;
+      this.storedPolicy = stored;
+      if (!this.pinnedSignalingUrls) this.fixedSignaling = stored.fixedSignaling === true;
+      if (!this.admissionPinned && (stored.admissionMode === 'open' || stored.admissionMode === 'allowlist')) {
+        this.admissionMode = stored.admissionMode;
+      }
+      if (Array.isArray(stored.allowedPeers)) {
+        this.allowedPeers = new Set(stored.allowedPeers.filter(p => typeof p === 'string' && PEER_ID_PATTERN.test(p)));
+      }
+    } catch { /* not saved yet */ }
+  }
+
+  /** Stores the runtime choices only; environment pins are re-read at boot. */
+  private async persistNetworkPolicy(): Promise<void> {
+    if (!this.storageId) return;
+    const stored: StoredNetworkPolicy = {
+      fixedSignaling: this.pinnedSignalingUrls ? this.storedPolicy.fixedSignaling : this.fixedSignaling,
+      admissionMode: this.admissionPinned ? this.storedPolicy.admissionMode : this.admissionMode,
+      allowedPeers: Array.from(this.allowedPeers),
+    };
+    this.storedPolicy = stored;
+    await this.request(
+      createRequest(this.id, this.storageId, 'set', { key: STORAGE_KEY_NETWORK_POLICY, value: stored }),
+    );
+  }
+
+  // ==========================================================================
   // Block / Unblock
   // ==========================================================================
 
@@ -1820,6 +2150,8 @@ export class PeerRegistry extends Abject {
 
   private async persistSignalingUrls(): Promise<void> {
     if (!this.storageId) return;
+    // The pinned list lives in the environment; keep the user's own list.
+    if (this.pinnedSignalingUrls) return;
 
     const urls = Array.from(this.savedSignalingUrls);
     await this.request(
@@ -1973,7 +2305,10 @@ export class PeerRegistry extends Abject {
 
     let urls: string[] = [];
     let hasStoredKey = false;
-    try {
+    if (this.pinnedSignalingUrls) {
+      urls = [...this.pinnedSignalingUrls];
+      hasStoredKey = true;
+    } else try {
       const result = await this.request<string[] | null>(
         createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
       );

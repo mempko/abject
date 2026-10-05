@@ -198,10 +198,21 @@ own abjects; the Packages tab of GlobalSettings is its UI.
 
 ### New LLM Provider
 
+Prefer an abject-backed provider, which needs no core change: any abject (usually a script package
+tagged `autostart`) sends `registerProvider` to `LLM` on startup and answers `providerComplete` (and
+optionally `providerStream` / `providerModels`). It then appears in Settings → AI, tier routing, fallbacks
+and the ledger like a built-in. Protocol: `docs/LLM_PROVIDERS.md`; adapter: `src/llm/remote-provider.ts`;
+example: `examples/openai-compatible-provider`. `HttpClient` refuses private and loopback addresses
+(checked after DNS resolution and on every redirect) unless the owner lists them under Private hosts in
+Settings → Permissions, so a provider for a local model server needs an entry such as `localhost:11434`.
+
+A built-in provider (compiled into the server):
+
 1. Create in `src/llm/`
 2. Implement `LLMProvider` interface (or extend `BaseLLMProvider`)
 3. Include both `complete()` and `stream()` methods
-4. Add configuration to `LLMObject.configure()`
+4. Add configuration to `LLMObject.configure()` and an entry to `LLMObject.PROVIDER_DESCRIPTORS`
+   (which also reserves its name against abject-backed providers)
 5. Export from `src/index.ts`
 
 ## Common Pitfalls

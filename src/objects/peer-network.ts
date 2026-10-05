@@ -70,13 +70,13 @@ const SELF_NODE = 'self';
 const REFRESH_COALESCE_MS = 250;
 
 /** What the tabs read, by source. */
-type NetData = 'identity' | 'contacts' | 'servers' | 'signalingPeers' | 'networkPeers' | 'discovery' | 'blocked' | 'intros' | 'frontends' | 'web';
+type NetData = 'identity' | 'contacts' | 'servers' | 'signalingPeers' | 'networkPeers' | 'discovery' | 'blocked' | 'intros' | 'frontends' | 'web' | 'policy';
 
 /** What each tab shows, by source (in tab order). */
 const TAB_DATA: ReadonlyArray<readonly NetData[]> = [
   /* Identity */ ['identity', 'contacts', 'networkPeers'],
   /* Contacts */ ['contacts'],
-  /* Servers & Peers */ ['servers', 'signalingPeers', 'contacts', 'networkPeers', 'discovery', 'blocked'],
+  /* Servers & Peers */ ['servers', 'signalingPeers', 'contacts', 'networkPeers', 'discovery', 'blocked', 'policy'],
   /* Introductions */ ['intros', 'contacts'],
   /* Frontends */ ['frontends'],
   /* Web Access */ ['web'],
@@ -102,6 +102,8 @@ const REGISTRY_EVENT_DATA: ReadonlyMap<string, readonly NetData[]> = new Map<str
   ['networkPeerDisconnected', ['networkPeers', 'signalingPeers', 'discovery']],
   ['peerBlocked', ['blocked', 'contacts', 'networkPeers', 'signalingPeers', 'intros']],
   ['peerUnblocked', ['blocked', 'contacts', 'networkPeers', 'signalingPeers', 'intros']],
+  ['signalingPolicyChanged', ['policy', 'servers']],
+  ['peerAdmissionChanged', ['policy', 'contacts', 'networkPeers', 'signalingPeers']],
 ]);
 
 interface ContactSnap { peerId: string; name: string; state: string; addedAt: number }
@@ -111,6 +113,11 @@ interface NetworkPeerSnap { peerId: string; name: string; connectedAt: number }
 interface FrontendSnap { clientId: string; kind: string; peerId: string; name: string; connectedAt: number; ready: boolean }
 interface IntroSnap { peerId: string; name: string; fromPeerId: string; receivedAt: number }
 interface DiscoverySnap { cacheSize: number; connectedNetworkPeers: number }
+/** Fixed signaling and mesh admission, as PeerRegistry reports them. */
+interface PolicySnap {
+  signaling: { fixed: boolean; pinned: boolean; urls: string[] };
+  admission: { mode: 'open' | 'allowlist'; peers: string[]; pinnedPeers: string[]; pinned: boolean };
+}
 
 /**
  * One pass's reads. Each source is asked at most once per pass, and what it
@@ -127,12 +134,14 @@ interface NetReads {
   blocked(): Promise<string[]>;
   intros(): Promise<IntroSnap[]>;
   frontends(): Promise<FrontendSnap[]>;
+  policy(): Promise<PolicySnap>;
 }
 
 /** What a row button does; the row's key says to whom. */
 type RowAction =
   | 'removeServer' | 'addSignalingPeer' | 'block' | 'trust' | 'unblock'
-  | 'acceptIntro' | 'rejectIntro' | 'disconnectFrontend' | 'revokeFrontend';
+  | 'acceptIntro' | 'rejectIntro' | 'disconnectFrontend' | 'revokeFrontend'
+  | 'allowPeer' | 'disallowPeer';
 
 /** A row button's action: what it does, for whom, and what the row knew of them when drawn. */
 interface RowButtonAction { kind: RowAction; key: string; peer?: SignalingPeerSnap }
@@ -278,6 +287,15 @@ export class PeerNetwork extends Abject {
   private netMeshId?: AbjectId;
   private netEmptyId?: AbjectId;
   private blockedCardId?: AbjectId;
+  /** "Use only these servers" (fixed signaling) and its pinned note. */
+  private fixedSignalingCheckboxId?: AbjectId;
+  private sigPinnedNoteId?: AbjectId;
+  /** Who Can Connect: the allowlist toggle, its pinned note, and the add row. */
+  private admissionCardId?: AbjectId;
+  private admissionCheckboxId?: AbjectId;
+  private admissionPinnedNoteId?: AbjectId;
+  private allowInputId?: AbjectId;
+  private allowAddBtnId?: AbjectId;
 
   // Contacts tab
   private addContactInputId?: AbjectId;
@@ -894,6 +912,12 @@ Interface: abjects:peer-network`;
         await this.ensureFrontendDeps();
         return (snap.frontends = await ask<FrontendSnap[]>(this.uiServerId, 'listFrontendClients', []));
       }),
+      policy: source('policy', async () => ({
+        signaling: await ask<PolicySnap['signaling']>(this.peerRegistryId, 'getSignalingPolicy',
+          { fixed: false, pinned: false, urls: [] }),
+        admission: await ask<PolicySnap['admission']>(this.peerRegistryId, 'getPeerAdmission',
+          { mode: 'open', peers: [], pinnedPeers: [], pinned: false }),
+      })),
     };
   }
 
@@ -1173,6 +1197,8 @@ Interface: abjects:peer-network`;
       case 'acceptIntro': await this.acceptIntroduction(key); return;
       case 'rejectIntro': await this.rejectIntroduction(key); return;
       case 'disconnectFrontend': await this.disconnectFrontend(key); return;
+      case 'allowPeer': await this.allowPeer(key); return;
+      case 'disallowPeer': await this.disallowPeer(key); return;
       case 'revokeFrontend':
         if (!this.remoteUIAccessId) return;
         try {
@@ -1408,6 +1434,25 @@ Interface: abjects:peer-network`;
       // Signaling section
       if (fromId === this.signalingConnectBtnId && aspect === 'click') {
         await this.connectSignaling();
+        return;
+      }
+      if (fromId === this.fixedSignalingCheckboxId && aspect === 'change') {
+        await this.setFixedSignaling(value === true || value === 'true');
+        return;
+      }
+
+      // Who Can Connect
+      if (fromId === this.admissionCheckboxId && aspect === 'change') {
+        await this.setAdmissionMode(value === true || value === 'true' ? 'allowlist' : 'open');
+        return;
+      }
+      if (fromId === this.allowAddBtnId && aspect === 'click') {
+        const peerId = this.allowInputId
+          ? await this.request<string>(request(this.id, this.allowInputId, 'getValue', {}))
+          : '';
+        if (await this.allowPeer(peerId ?? '') && this.allowInputId) {
+          await this.request(request(this.id, this.allowInputId, 'update', { text: '' }));
+        }
         return;
       }
 
@@ -1889,10 +1934,18 @@ Interface: abjects:peer-network`;
       this.builtTabs.add(SERVERS_TAB);
       await this.buildServersTab(this.tabContents[SERVERS_TAB]);
     }
-    const [servers, signalingPeers, contacts, networkPeers, discovery, blocked] = await Promise.all([
+    const [servers, signalingPeers, contacts, networkPeers, discovery, blocked, policy] = await Promise.all([
       reads.servers(), reads.signalingPeers(), reads.contacts(), reads.networkPeers(), reads.discovery(), reads.blocked(),
+      reads.policy(),
     ]);
     const windowId = this.windowId;
+    const { signaling, admission } = policy;
+    const allowlist = admission.mode === 'allowlist';
+    const admitted = new Set([...admission.peers, ...admission.pinnedPeers]);
+
+    // Fixed signaling: the toggle (locked while the environment pins it).
+    await this.updateIfChanged(this.fixedSignalingCheckboxId, { checked: signaling.fixed, disabled: signaling.pinned });
+    await this.setShown(this.sigPinnedNoteId, signaling.pinned);
 
     // Signaling servers: url and status per row; a status change recolours in place.
     await this.setShown(this.sigEmptyId, servers.length === 0);
@@ -1903,13 +1956,18 @@ Interface: abjects:peer-network`;
       const statusText = status === 'connected' ? 'connected'
         : status === 'connecting' ? 'connecting...'
         : 'offline';
+      // A server pinned by the environment cannot be removed here.
+      const removable = !(signaling.pinned && signaling.urls.includes(url));
+      const cells: RowCell[] = [
+        { spec: { type: 'label', windowId, text: url, style: { color: urlColor, fontSize: 12, selectable: true } }, height: 28 },
+        { spec: { type: 'label', windowId, text: statusText, style: { color: urlColor, fontSize: 11, selectable: true } }, height: 28, width: 80 },
+      ];
+      if (removable) {
+        cells.push({ spec: { type: 'button', windowId, text: 'Remove', style: { fontSize: 11 } }, height: 26, width: 70, action: { kind: 'removeServer' as const, key: url } });
+      }
       return {
         key: url, sig: `${statusText}|${urlColor}`, height: 28,
-        cells: [
-          { spec: { type: 'label', windowId, text: url, style: { color: urlColor, fontSize: 12, selectable: true } }, height: 28 },
-          { spec: { type: 'label', windowId, text: statusText, style: { color: urlColor, fontSize: 11, selectable: true } }, height: 28, width: 80 },
-          { spec: { type: 'button', windowId, text: 'Remove', style: { fontSize: 11 } }, height: 26, width: 70, action: { kind: 'removeServer' as const, key: url } },
-        ],
+        cells,
         updates: [{ style: { color: urlColor } }, { text: statusText, style: { color: urlColor } }, undefined],
       };
     })));
@@ -1917,13 +1975,19 @@ Interface: abjects:peer-network`;
     // Peers visible on the signaling servers (a busy server churns these).
     await this.syncRows('signalingPeers', this.spCardId!, uniqueKeys(signalingPeers.map((sp) => {
       const displayName = sp.name || sp.peerId.slice(0, 12) + '...';
+      // While only listed peers may connect, a peer seen here can be allowed in one step.
+      const offerAllow = allowlist && !admitted.has(sp.peerId);
+      const cells: RowCell[] = [
+        { spec: { type: 'label', windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 28 },
+        { spec: { type: 'button', windowId, text: 'Add', style: this.rowPositiveStyle() }, height: 26, width: 60, action: { kind: 'addSignalingPeer' as const, key: sp.peerId, peer: sp } },
+      ];
+      if (offerAllow) {
+        cells.push({ spec: { type: 'button', windowId, text: 'Allow', style: this.rowPositiveStyle() }, height: 26, width: 60, action: { kind: 'allowPeer' as const, key: sp.peerId } });
+      }
       return {
-        key: `${sp.serverUrl} ${sp.peerId}`, sig: displayName, height: 28,
-        cells: [
-          { spec: { type: 'label', windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 28 },
-          { spec: { type: 'button', windowId, text: 'Add', style: this.rowPositiveStyle() }, height: 26, width: 60, action: { kind: 'addSignalingPeer' as const, key: sp.peerId, peer: sp } },
-        ],
-        updates: [{ text: displayName }, undefined],
+        key: `${sp.serverUrl} ${sp.peerId}${offerAllow ? ' allow' : ''}`, sig: displayName, height: 28,
+        cells,
+        updates: [{ text: displayName }, undefined, undefined],
       };
     })));
     await this.setShown(this.spCardId, signalingPeers.length > 0);
@@ -1968,6 +2032,31 @@ Interface: abjects:peer-network`;
       });
     }
     await this.syncRows('network', this.netCardId!, uniqueKeys(netRows));
+
+    // Who Can Connect: the mode toggle and the allowed peers (pinned ones
+    // cannot be removed here). Names come from contacts where known.
+    await this.updateIfChanged(this.admissionCheckboxId, { checked: allowlist, disabled: admission.pinned });
+    await this.setShown(this.admissionPinnedNoteId, admission.pinned);
+    const nameOf = (peerId: string) => contacts.find((c) => c.peerId === peerId)?.name || peerId.slice(0, 16) + '...';
+    const allowedRows: RowSpec[] = [
+      ...admission.pinnedPeers.map((peerId) => ({
+        key: `pinned ${peerId}`, sig: nameOf(peerId), height: 28,
+        cells: [
+          { spec: { type: 'label', windowId, text: nameOf(peerId), style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 28 },
+          { spec: { type: 'label', windowId, text: 'pinned', style: { color: this.theme.textMeta, fontSize: 11 } }, height: 28, width: 70 },
+        ],
+        updates: [{ text: nameOf(peerId) }, undefined],
+      })),
+      ...admission.peers.filter((peerId) => !admission.pinnedPeers.includes(peerId)).map((peerId) => ({
+        key: peerId, sig: nameOf(peerId), height: 28,
+        cells: [
+          { spec: { type: 'label', windowId, text: nameOf(peerId), style: { color: this.theme.textDescription, fontSize: 12, selectable: true } }, height: 28 },
+          { spec: { type: 'button', windowId, text: 'Remove', style: { fontSize: 11 } }, height: 26, width: 70, action: { kind: 'disallowPeer' as const, key: peerId } },
+        ],
+        updates: [{ text: nameOf(peerId) }, undefined],
+      })),
+    ];
+    await this.syncRows('allowed', this.admissionCardId!, uniqueKeys(allowedRows));
 
     // Blocked peers.
     await this.syncRows('blocked', this.blockedCardId!, uniqueKeys(blocked.map((bPeerId) => ({
@@ -2024,6 +2113,14 @@ Interface: abjects:peer-network`;
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
+    this.fixedSignalingCheckboxId = await this.addWidget(sigCard,
+      { type: 'checkbox', windowId: this.windowId, checked: false,
+        text: 'Use only these servers (ignore servers learned from peers and contacts)' }, 26);
+    await this.request(request(this.id, this.fixedSignalingCheckboxId, 'addDependent', {}));
+    this.sigPinnedNoteId = await this.addWidget(sigCard,
+      { type: 'label', windowId: this.windowId, text: 'Fixed by ABJECTS_SIGNALING_URLS when this instance was started.',
+        style: { color: this.theme.textMeta, fontSize: 11 } }, 18);
+    await this.setShown(this.sigPinnedNoteId, false);
     const sigEmpty = this.emptySpec('No signaling servers', 'Enter a server URL above and press Connect to find peers on the network.');
     this.sigEmptyId = await this.addWidget(sigCard, sigEmpty.spec, sigEmpty.height);
 
@@ -2039,6 +2136,35 @@ Interface: abjects:peer-network`;
       { type: 'label', windowId: this.windowId, text: '', style: livingStyle(this.theme, 11) }, 18);
     const netEmpty = this.emptySpec('No peers connected', 'Peers appear here once you connect to a signaling server or a contact comes online.');
     this.netEmptyId = await this.addWidget(this.netCardId, netEmpty.spec, netEmpty.height);
+
+    // ── Who Can Connect (card): the allowlist toggle, an add row, then the
+    //    allowed peers ──
+    this.admissionCardId = await this.sectionCard(tab2, 'Who Can Connect',
+      'Any peer you find or that calls you can connect, unless you allow only listed peers. Blocked peers never can.', 34);
+    this.admissionCheckboxId = await this.addWidget(this.admissionCardId,
+      { type: 'checkbox', windowId: this.windowId, checked: false, text: 'Allow only the peers listed below' }, 26);
+    await this.request(request(this.id, this.admissionCheckboxId, 'addDependent', {}));
+    this.admissionPinnedNoteId = await this.addWidget(this.admissionCardId,
+      { type: 'label', windowId: this.windowId, text: 'Fixed by ABJECTS_PEER_ADMISSION when this instance was started.',
+        style: { color: this.theme.textMeta, fontSize: 11 } }, 18);
+    await this.setShown(this.admissionPinnedNoteId, false);
+    const allowRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.admissionCardId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.admissionCardId, 'addLayoutChild', {
+      widgetId: allowRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    this.allowInputId = await this.addWidget(allowRowId,
+      { type: 'textInput', windowId: this.windowId, placeholder: 'Peer ID (64 hex characters)' }, 32);
+    this.allowAddBtnId = await this.addWidget(allowRowId,
+      { type: 'button', windowId: this.windowId, text: 'Allow', style: this.positiveButtonStyle() }, 32, 80);
+    await this.request(request(this.id, this.allowAddBtnId, 'addDependent', {}));
 
     // ── Blocked Peers (card), shown while it lists someone ──
     this.blockedCardId = await this.sectionCard(tab2, 'Blocked Peers',
@@ -2526,6 +2652,13 @@ Interface: abjects:peer-network`;
     this.netMeshId = undefined;
     this.netEmptyId = undefined;
     this.blockedCardId = undefined;
+    this.fixedSignalingCheckboxId = undefined;
+    this.sigPinnedNoteId = undefined;
+    this.admissionCardId = undefined;
+    this.admissionCheckboxId = undefined;
+    this.admissionPinnedNoteId = undefined;
+    this.allowInputId = undefined;
+    this.allowAddBtnId = undefined;
     this.introCardId = undefined;
     this.introEmptyId = undefined;
     this.feCardId = undefined;
@@ -2708,6 +2841,66 @@ Interface: abjects:peer-network`;
     } catch {
       await this.reject('Failed to remove server.');
     }
+  }
+
+  /** Fix signaling to the listed servers, or let peers and contacts add more. */
+  private async setFixedSignaling(fixed: boolean): Promise<void> {
+    if (!this.peerRegistryId) return;
+    const result = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.peerRegistryId, 'setFixedSignaling', { fixed }),
+    ).catch(() => ({ success: false, error: 'Could not change signaling.' }));
+    if (!result.success) {
+      await this.reject(result.error ?? 'Could not change signaling.');
+      // The checkbox flipped itself; show the setting as it really is.
+      if (this.fixedSignalingCheckboxId) this.lastSent.delete(this.fixedSignalingCheckboxId);
+      await this.refresh();
+      return;
+    }
+    await this.acknowledge(fixed ? 'Signaling uses only the listed servers.' : 'Signaling may use servers learned from peers.');
+  }
+
+  private async setAdmissionMode(mode: 'open' | 'allowlist'): Promise<void> {
+    if (!this.peerRegistryId) return;
+    const result = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.peerRegistryId, 'setPeerAdmission', { mode }),
+    ).catch(() => ({ success: false, error: 'Could not change who can connect.' }));
+    if (!result.success) {
+      await this.reject(result.error ?? 'Could not change who can connect.');
+      if (this.admissionCheckboxId) this.lastSent.delete(this.admissionCheckboxId);
+      await this.refresh();
+      return;
+    }
+    await this.acknowledge(mode === 'allowlist'
+      ? 'Only listed peers can connect; others were disconnected.'
+      : 'Any peer can connect.');
+  }
+
+  /** Add a peer to the allowed list. True when it was added. */
+  private async allowPeer(peerId: string): Promise<boolean> {
+    if (!this.peerRegistryId) return false;
+    const id = peerId.trim();
+    if (!id) {
+      await this.reject('Enter a peer ID.');
+      return false;
+    }
+    const result = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.peerRegistryId, 'allowPeer', { peerId: id }),
+    ).catch(() => ({ success: false, error: 'Could not allow that peer.' }));
+    if (!result.success) {
+      await this.reject(result.error ?? 'Could not allow that peer.');
+      return false;
+    }
+    await this.acknowledge('Peer allowed.');
+    return true;
+  }
+
+  private async disallowPeer(peerId: string): Promise<void> {
+    if (!this.peerRegistryId) return;
+    const result = await this.request<{ success: boolean; error?: string }>(
+      request(this.id, this.peerRegistryId, 'disallowPeer', { peerId }),
+    ).catch(() => ({ success: false, error: 'Could not remove that peer.' }));
+    if (!result.success) await this.reject(result.error ?? 'Could not remove that peer.');
+    else await this.acknowledge('Peer removed from the allowed list.');
   }
 
   private async connectSignaling(): Promise<void> {

@@ -42,6 +42,8 @@ import {
 } from '../llm/decision.js';
 import { emulateDecision, type EmulationTransport } from '../llm/decision-emulator.js';
 import { TypeSafeProvider } from '../llm/typesafe.js';
+import { RemoteLLMProvider, parseRemoteProviderSpec, type RemoteProviderHost } from '../llm/remote-provider.js';
+import { packageNameOf } from '../core/packages.js';
 import {
   DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode,
   type DecisionMode, type DecisionPolicy, type DecisionGates,
@@ -552,6 +554,14 @@ interface WarmEntry {
  */
 export class LLMObject extends Abject {
   private providers: Map<string, LLMProvider> = new Map();
+  /**
+   * Providers implemented by other abjects (registerProvider), by name. They
+   * sit in `providers` like any built-in; this map records which ones may be
+   * re-registered or withdrawn by message.
+   */
+  private remoteProviders: Map<string, RemoteLLMProvider> = new Map();
+  /** Open provider streams: stream id → the backend allowed to feed it and where its chunks go. */
+  private remoteStreams: Map<string, { backend: AbjectId; sink: (content: string) => void }> = new Map();
   private defaultProvider?: string;
   private tierRouting: TierRouting = {};
   private tierFallbacks: TierFallbacks = {};
@@ -780,6 +790,36 @@ export class LLMObject extends Abject {
                   kind: 'array',
                   elementType: { kind: 'reference', reference: 'LLMProviderDescription' },
                 },
+              },
+              {
+                name: 'registerProvider',
+                description:
+                  'Register the sending abject as an LLM provider, usually from its startup handler. ' +
+                  'The provider then appears beside the built-in ones (Settings → AI tier routing, listProviders, the ledger) and the calls routed to it arrive as messages to the abject: ' +
+                  'providerComplete { messages, options } → reply { content, finishReason?, usage? }. ' +
+                  'With streaming: true, providerStream { streamId, messages, options } instead: emit providerChunk { streamId, content } events to this LLM object for each piece, then reply { chunks, stopReason?, usage? } where chunks is how many you emitted. ' +
+                  'With liveModels: true, providerModels {} → ModelInfo[]. options.model is always filled in. ' +
+                  'usage is { inputTokens, outputTokens, costUsd? }; reporting costUsd prices the call in the ledger. ' +
+                  'Built-in provider names are reserved. A name is held by one abject, or by every abject of one installed package (each workspace runs one; any may serve). ' +
+                  'Registration lives as long as this LLM object: register again on startup. Returns { name, registered, backends }.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id: lowercase letters, digits, ".", "_" or "-"' },
+                  { name: 'label', type: { kind: 'primitive', primitive: 'string' }, description: 'Label shown in the provider dropdown', optional: true },
+                  { name: 'models', type: { kind: 'array', elementType: { kind: 'reference', reference: 'ModelInfo' } }, description: 'Models offered: [{ id, name, vision?, efforts?, contextWindow? }]', optional: true },
+                  { name: 'defaultTierModels', type: { kind: 'object', properties: {} }, description: 'Model per tier when routing names none: { smart?, balanced?, fast?, code? }', optional: true },
+                  { name: 'streaming', type: { kind: 'primitive', primitive: 'boolean' }, description: 'The abject implements providerStream', optional: true },
+                  { name: 'liveModels', type: { kind: 'primitive', primitive: 'boolean' }, description: 'The abject implements providerModels', optional: true },
+                  { name: 'timeoutMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Longest a call may run without progress, 5000 to 3600000 ms (default 600000)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'unregisterProvider',
+                description: 'Withdraw the sending abject from a provider it serves. The provider is removed when no abject serves it. Returns true when the sender was serving it.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'setProvider',
@@ -1057,6 +1097,7 @@ export class LLMObject extends Abject {
               { name: 'requestProgress', description: 'Emitted periodically during streaming with output progress', payload: { kind: 'object', properties: {} } },
               { name: 'paused', description: 'Emitted when the LLM is paused', payload: { kind: 'primitive', primitive: 'boolean' } },
               { name: 'unpaused', description: 'Emitted when the LLM is unpaused', payload: { kind: 'primitive', primitive: 'boolean' } },
+              { name: 'providersChanged', description: 'A provider implemented by another abject was registered, updated or withdrawn; payload { name, registered }', payload: { kind: 'object', properties: {} } },
             ],
           },
         requiredCapabilities: [],
@@ -1384,6 +1425,20 @@ export class LLMObject extends Abject {
       return true;
     });
 
+    // Providers implemented by other abjects (see src/llm/remote-provider.ts).
+    this.on('registerProvider', async (m: AbjectMessage) => this.registerRemoteProvider(m.routing.from, m.payload));
+    this.on('unregisterProvider', async (m: AbjectMessage) => {
+      const { name } = (m.payload ?? {}) as { name?: unknown };
+      return this.unregisterRemoteProvider(m.routing.from, typeof name === 'string' ? name : '');
+    });
+    // A chunk of an open provider stream, accepted only from the abject serving it.
+    this.on('providerChunk', (m: AbjectMessage) => {
+      const { streamId, content } = (m.payload ?? {}) as { streamId?: unknown; content?: unknown };
+      const stream = typeof streamId === 'string' ? this.remoteStreams.get(streamId) : undefined;
+      if (!stream || stream.backend !== m.routing.from || typeof content !== 'string') return;
+      stream.sink(content);
+    });
+
     this.on('listProviderModels', async (m: AbjectMessage) => {
       const { provider: providerName, ollamaUrl } = m.payload as { provider: string; ollamaUrl?: string };
       // For Ollama, allow listing models from a URL even if provider not yet registered
@@ -1625,6 +1680,99 @@ export class LLMObject extends Abject {
       return true;
     });
 
+  }
+
+  /** The LLM object's side of the conversation with provider abjects. */
+  private remoteHost(): RemoteProviderHost {
+    return {
+      request: <T>(to: AbjectId, method: string, payload: unknown, timeoutMs: number) =>
+        this.request<T>(msg.request(this.id, to, method, payload), timeoutMs),
+      openStream: (streamId, backend, sink) => { this.remoteStreams.set(streamId, { backend, sink }); },
+      closeStream: (streamId) => { this.remoteStreams.delete(streamId); },
+    };
+  }
+
+  /**
+   * The owner the Factory registered an abject with, looked up where the
+   * Factory registered it. A package owner marks an installed package's
+   * abjects; nothing in a message can claim one.
+   */
+  private async registeredOwner(objectId: AbjectId): Promise<string | undefined> {
+    try {
+      const factoryId = await this.discoverDep('Factory');
+      if (!factoryId) return undefined;
+      const info = await this.request<{ registryId?: AbjectId }>(
+        msg.request(this.id, factoryId, 'getObjectInfo', { objectId }), 5000);
+      if (!info?.registryId) return undefined;
+      const reg = await this.request<{ owner?: string } | null>(
+        msg.request(this.id, info.registryId, 'lookup', { objectId }), 5000);
+      return reg?.owner || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Register the sending abject as an LLM provider. Calls tier routing sends
+   * to this provider are then routed to the abject by message.
+   *
+   * A provider name is held by one abject, or by every abject of one
+   * installed package (a package spawns in each workspace; any of them may
+   * serve). Built-in provider names are reserved, and a name held by another
+   * abject that is still running is refused. Re-registering from a current
+   * backend updates what it offers.
+   */
+  private async registerRemoteProvider(sender: AbjectId, payload: unknown): Promise<{ name: string; registered: true; backends: number }> {
+    const spec = parseRemoteProviderSpec(payload);
+    const { name } = spec;
+    require(
+      !LLMObject.PROVIDER_DESCRIPTORS.some(d => d.id === name) && !this.decisionProviders.has(name),
+      `'${name}' is a built-in provider name; register under another name`,
+    );
+    const existing = this.remoteProviders.get(name);
+    require(existing !== undefined || !this.providers.has(name), `provider '${name}' is already registered`);
+
+    const owner = await this.registeredOwner(sender);
+    const packageOwner = packageNameOf(owner) ? owner : undefined;
+
+    if (existing) {
+      if (existing.hasBackend(sender)) {
+        existing.update(spec);
+        log.info(`provider '${name}' re-registered by ${sender.slice(0, 8)}`);
+        this.changed('providersChanged', { name, registered: true });
+        return { name, registered: true, backends: existing.backendIds().length };
+      }
+      if (packageOwner && existing.owner === packageOwner) {
+        existing.addBackend(sender);
+        log.info(`provider '${name}' gained a backend ${sender.slice(0, 8)} (${packageOwner}, ${existing.backendIds().length} now)`);
+        return { name, registered: true, backends: existing.backendIds().length };
+      }
+      require(!(await existing.isAvailable()), `provider '${name}' is registered by another abject that is still running`);
+      // Every abject that held the name is gone: the name is free again.
+    }
+
+    const provider = new RemoteLLMProvider(spec, sender, packageOwner, this.remoteHost());
+    this.remoteProviders.set(name, provider);
+    this.registerProvider(provider);
+    log.info(`provider '${name}' registered by ${sender.slice(0, 8)}${packageOwner ? ` (${packageOwner})` : ''}` +
+      `${spec.streaming ? ', streaming' : ''}, ${spec.models?.length ?? 0} model(s)`);
+    this.changed('providersChanged', { name, registered: true });
+    return { name, registered: true, backends: 1 };
+  }
+
+  /** Withdraw the sending abject from a provider; the provider goes when no abject serves it. */
+  private unregisterRemoteProvider(sender: AbjectId, name: string): boolean {
+    const existing = this.remoteProviders.get(name);
+    if (!existing) return false;
+    require(existing.hasBackend(sender), `only an abject serving '${name}' may unregister it`);
+    if (existing.removeBackend(sender) > 0) return true;
+    this.remoteProviders.delete(name);
+    this.providers.delete(name);
+    this.modelListCache.delete(name);
+    if (this.defaultProvider === name) this.defaultProvider = this.providers.keys().next().value;
+    log.info(`provider '${name}' unregistered`);
+    this.changed('providersChanged', { name, registered: false });
+    return true;
   }
 
   /**
@@ -2550,6 +2698,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         descriptions.push(factory.describe());
       }
     }
+    // Providers other abjects registered, after the built-in ones.
+    for (const remote of this.remoteProviders.values()) descriptions.push(remote.describe());
     return descriptions;
   }
 

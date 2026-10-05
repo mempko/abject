@@ -101,7 +101,7 @@ Cryptographic identity and peer-to-peer networking.
 | File | Class | Description |
 |------|-------|-------------|
 | `identity.ts` | `IdentityObject` | ECDSA P-256 signing + ECDH P-256 key exchange. Keys persisted via Storage |
-| `peer-registry.ts` | `PeerRegistry` | Contact management, WebRTC connection orchestration via signaling |
+| `peer-registry.ts` | `PeerRegistry` | Contact management, WebRTC connection orchestration via signaling, fixed signaling (`setFixedSignaling`, `ABJECTS_SIGNALING_URLS`) and mesh admission (`setPeerAdmission`, `allowPeer`, `ABJECTS_PEER_ADMISSION`, `ABJECTS_ALLOWED_PEERS`) |
 | `peer-network.ts` | `PeerNetwork` | Modal window for managing identity, signaling servers, and contacts |
 | `remote-registry.ts` | `RemoteRegistry` | Distributed object discovery across connected peers with 5-min TTL cache |
 

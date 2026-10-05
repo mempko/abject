@@ -11,9 +11,31 @@ import { require, invariant } from '../core/contracts.js';
 import { WorkerBridge } from './worker-bridge.js';
 import type { WorkerLike, WorkerHeapSample } from './worker-bridge.js';
 import type { MessageBus } from './message-bus.js';
+import type { TrackedChild } from './child-processes.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WorkerPool');
+
+/**
+ * How long shutdown waits for any one worker-hosted object to stop. Every
+ * object stops at once, so this bounds the whole pool's teardown, which has
+ * to fit inside Electron's quit deadline (5s) alongside the dedicated
+ * workers'. An MCP bridge waiting on a server that ignores SIGTERM is the
+ * slow case; the server was already signalled at the start of shutdown.
+ */
+const SHUTDOWN_OBJECT_DEADLINE_MS = 2500;
+
+/** Resolve when `work` settles or `ms` passes, whichever is first. */
+function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as { unref?: () => void }).unref?.();
+    work.then(
+      () => { clearTimeout(timer); resolve(); },
+      () => { clearTimeout(timer); resolve(); },
+    );
+  });
+}
 
 export interface WorkerPoolConfig {
   workerCount: number;
@@ -275,17 +297,39 @@ export class WorkerPool {
   }
 
   /**
-   * Shut down all workers. Kills all worker-hosted objects first.
+   * Have every worker signal the child processes it started, and collect
+   * the ones reached. Workers that do not answer within `timeoutMs` count as
+   * having none.
    */
-  async shutdown(): Promise<void> {
-    // Kill all hosted objects
+  async signalChildren(signal: NodeJS.Signals, timeoutMs = 1000): Promise<TrackedChild[]> {
+    const answers = await Promise.all(this.bridges.map((b) => b.signalChildren(signal, timeoutMs)));
+    return answers.flat();
+  }
+
+  /**
+   * Shut down all workers. Kills all worker-hosted objects first.
+   *
+   * All at once, each given at most `objectDeadlineMs`. One at a time, as
+   * this used to, the teardown grew with the object count, and with a few
+   * workspaces it ran past Electron's quit deadline; the objects at the end
+   * of the list, MCP bridges among them, were never stopped and their
+   * servers outlived the app.
+   */
+  async shutdown(objectDeadlineMs = SHUTDOWN_OBJECT_DEADLINE_MS): Promise<void> {
     const objectIds = Array.from(this.objectToBridge.keys());
-    for (const objectId of objectIds) {
-      try {
-        await this.killInWorker(objectId);
-      } catch {
-        // Best effort during shutdown
-      }
+    const startedAt = Date.now();
+    let late = 0;
+    await Promise.all(objectIds.map(async (objectId) => {
+      const killed = this.killInWorker(objectId).then(() => true, () => true);
+      let done = false;
+      void killed.then(() => { done = true; });
+      await settleWithin(killed, objectDeadlineMs);
+      if (!done) late++;
+    }));
+    if (late > 0) {
+      log.warn(`${late} of ${objectIds.length} worker objects had not stopped after ${objectDeadlineMs}ms; terminating their workers`);
+    } else {
+      log.info(`stopped ${objectIds.length} worker objects in ${Date.now() - startedAt}ms`);
     }
 
     // Terminate all workers

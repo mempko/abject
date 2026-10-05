@@ -57,6 +57,7 @@ import {
   runCliIdleStreaming,
 } from './cli-process.js';
 import { sessionSandboxDir } from './pty-session.js';
+import { trackChild, untrackChild } from '../runtime/child-processes.js';
 import type { PromptGuidance } from './execution-context.js';
 import { discoverModels, peekCachedModels } from './cli-model-discovery.js';
 import {
@@ -379,6 +380,8 @@ export class AntigravityCliProvider extends BaseLLMProvider {
 
   private async *streamOnce(argv: string[], stdin: string): AsyncIterable<LLMStreamChunk> {
     const proc = spawn(this.bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd: this.sandboxDir() });
+    trackChild(proc.pid, `CLI: ${this.bin}`, { group: false });
+    proc.on('exit', () => untrackChild(proc.pid));
     if (stdin.length > 0) proc.stdin.end(stdin);
     else proc.stdin.end();
 

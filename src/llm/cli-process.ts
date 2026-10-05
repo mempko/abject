@@ -14,6 +14,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { LLMMessage } from './provider.js';
+import { trackChild, untrackChild } from '../runtime/child-processes.js';
 import { getTextContent } from './provider.js';
 
 export interface CliResult {
@@ -81,6 +82,8 @@ function runCli(
 ): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd });
+    trackChild(proc.pid, `CLI: ${bin}`, { group: false });
+    proc.on('exit', () => untrackChild(proc.pid));
     let stdout = '';
     let stderr = '';
     let buffer = '';

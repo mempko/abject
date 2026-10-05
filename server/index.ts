@@ -64,6 +64,7 @@ import { GoalObserver } from '../src/objects/goal-observer.js';
 import { TaskReviewer } from '../src/objects/task-reviewer.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
+import { signalChild, type TrackedChild } from '../src/runtime/child-processes.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
 import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkerRecovery } from '../src/objects/worker-recovery.js';
@@ -1178,8 +1179,9 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
    *
    * A separate *process* has its own everything and goes on running while
    * ours is stuck, so it can still fire. It sends SIGKILL, the one signal
-   * nothing can swallow. Every child process of our own has already been
-   * reaped before this is armed, so there is nothing left to orphan.
+   * nothing can swallow. The app's own child processes were signalled at the
+   * start of shutdown (runtime.signalChildProcesses), so a SIGKILL here does
+   * not leave them orphaned.
    *
    * It cannot be a worker thread. A worker can rescue a main thread blocked
    * in native code — that much was measured — but not one blocked inside
@@ -1235,6 +1237,9 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
    */
   const SHUTDOWN_DEADLINE_MS = 10_000;
 
+  /** How long a child process gets to leave on SIGTERM before SIGKILL. */
+  const CHILD_KILL_GRACE_MS = 2_000;
+
   // Handle graceful shutdown
   let shuttingDown = false;
 
@@ -1260,6 +1265,23 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     // departure, and both callers inherit it.
     armExitWatchdog(SHUTDOWN_DEADLINE_MS, 'shutdown');
     sessionStore.destroy();
+    // Child processes first, before anything that can be slow. MCP servers
+    // run in sessions of their own, so nothing takes them down with us: if
+    // the teardown below wedges, outlasts Electron's quit deadline, or
+    // crashes at exit (all three have happened), a server whose bridge was
+    // never reached stays alive holding the AppImage mount, and the app
+    // never finishes quitting. Signalling them here does not depend on any
+    // object getting to its onStop.
+    const children = await runtime.signalChildProcesses('SIGTERM').catch(() => [] as TrackedChild[]);
+    if (children.length > 0) {
+      alog.info(`Signalled ${children.length} child process(es) to stop: ${children.map((c) => c.label).join(', ')}`);
+      // Whatever ignores SIGTERM gets SIGKILL on a timer of its own, so it
+      // does not depend on the teardown below reaching its owner either.
+      const escalate = setTimeout(() => {
+        for (const child of children) signalChild(child, 'SIGKILL');
+      }, CHILD_KILL_GRACE_MS);
+      escalate.unref();
+    }
     // Release every listening socket before the slow work. Whatever happens
     // to the runtime teardown after this, the next `awaken` can bind.
     await Promise.allSettled([
@@ -1285,9 +1307,15 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
     //
     // Before runtime.stop(), because the bus those objects speak on is only
     // up until it returns.
+    //
+    // The worker pool stops alongside them rather than after: waiting for the
+    // P2P worker (up to 3s) and then stopping the pool used to run past
+    // Electron's 5s quit deadline. The pool needs only the bus, which stays
+    // up until runtime.stop() below.
     const [p2pSettled] = await Promise.allSettled([
       p2pBridge?.shutdownWorker(3000),
       uiBridge?.shutdownWorker(2000),
+      runtime.shutdownWorkerPool(),
     ]);
 
     // Did the P2P worker manage to shut libdatachannel down on its own thread?

@@ -94,6 +94,105 @@ export interface AbjectThis<D extends object = Record<string, unknown>> {
 export type AbjectHandlers<D extends object = Record<string, unknown>, Self = Record<string, any>> =
   Record<string, unknown> & ThisType<AbjectThis<D> & Self>;
 
+// ── LLM providers (docs/LLM_PROVIDERS.md) ─────────────────────────────
+
+export type ModelTier = 'smart' | 'balanced' | 'fast' | 'code';
+export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface LLMModel {
+  id: string;
+  name: string;
+  vision?: boolean;
+  efforts?: EffortLevel[];
+  contextWindow?: number;
+}
+
+/** What a provider abject sends to the LLM object with `registerProvider`. */
+export interface LLMProviderSpec {
+  /** Provider id: lowercase letters, digits, ".", "_" or "-". Built-in names are reserved. */
+  name: string;
+  label?: string;
+  models?: LLMModel[];
+  defaultTierModels?: Partial<Record<ModelTier, string>>;
+  /** You implement providerStream and emit providerChunk events. */
+  streaming?: boolean;
+  /** You implement providerModels for a live model list. */
+  liveModels?: boolean;
+  /** Longest a call may run without progress, 5000 to 3600000 ms. */
+  timeoutMs?: number;
+}
+
+export interface RegisterProviderReply {
+  name: string;
+  registered: true;
+  /** How many abjects serve this provider (one per workspace for a package). */
+  backends: number;
+}
+
+export type LLMContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string }
+  | { type: 'document'; mediaType: 'application/pdf'; data: string; name?: string };
+
+export interface LLMMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string | LLMContentPart[];
+  cacheBreakpoint?: boolean;
+}
+
+/** Call options as a provider receives them: the model is always filled in. */
+export interface LLMCallOptions {
+  model: string;
+  tier?: ModelTier;
+  maxTokens?: number;
+  stopSequences?: string[];
+  effort?: EffortLevel;
+  cacheKey?: string;
+  jsonMode?: boolean;
+}
+
+export interface LLMUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /** What the call cost; when reported it prices the call in the ledger. */
+  costUsd?: number;
+}
+
+/** `providerComplete` payload. */
+export interface ProviderCompleteRequest {
+  messages: LLMMessage[];
+  options: LLMCallOptions;
+}
+
+export interface ProviderCompleteReply {
+  content: string;
+  finishReason?: 'stop' | 'length' | 'error';
+  usage?: LLMUsage;
+}
+
+/** `providerStream` payload: emit `providerChunk { streamId, content }` events to the sender. */
+export interface ProviderStreamRequest extends ProviderCompleteRequest {
+  streamId: string;
+}
+
+export interface ProviderStreamReply {
+  /** How many providerChunk events you emitted. */
+  chunks?: number;
+  stopReason?: string;
+  usage?: LLMUsage;
+}
+
+/** HttpClient `request` reply. */
+export interface HttpResponse {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  ok: boolean;
+}
+
 /** What `Packages.getSettings` returns to a package's own abjects. */
 export interface PackageSettings<V extends { [K in keyof V]: string | number | boolean } = Record<string, string | number | boolean>> {
   package: string;

@@ -763,7 +763,11 @@ export class RemoteUIAccess extends Abject {
   private async loadConfig(): Promise<void> {
     // Env vars take precedence over Storage so dev/CI can pin endpoints
     // without mutating persisted state.
-    const envSignaling = (typeof process !== 'undefined' && process.env?.REMOTE_UI_SIGNALING_URL) || '';
+    // With signaling pinned (ABJECTS_SIGNALING_URLS) and no remote-UI server
+    // named, pair through the first pinned server rather than the public one.
+    const pinnedSignaling = ((typeof process !== 'undefined' && process.env?.ABJECTS_SIGNALING_URLS) || '')
+      .split(/[\s,]+/).find(u => /^wss?:\/\//.test(u)) ?? '';
+    const envSignaling = (typeof process !== 'undefined' && process.env?.REMOTE_UI_SIGNALING_URL) || pinnedSignaling;
     const envClientBase = (typeof process !== 'undefined' && process.env?.REMOTE_UI_CLIENT_BASE_URL) || '';
     if (envSignaling) this.signalingUrl = envSignaling;
     if (envClientBase) this.clientBaseUrl = envClientBase;

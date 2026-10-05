@@ -66,10 +66,17 @@ ScriptableAbject runs:
 })
 ```
 
+Nothing may sit outside the expression. Helpers and constants go inside it
+as `_` members, which are not message handlers; forge refuses top-level
+declarations.
+
 The sandbox has no Node or browser globals (no `require`, `fetch`, `crypto`);
 everything else is reached by message through `this` (`call`, `dep`, `find`,
 `emit`, `observe`, `changed`, `data`, `saveData`). `sdk/script/abject.d.ts`
 types all of it for TypeScript; see `examples/tally-ts`.
+
+A package can add an LLM provider by registering with the LLM object on
+startup; see `docs/LLM_PROVIDERS.md` and `examples/openai-compatible-provider`.
 
 ## Building and installing
 

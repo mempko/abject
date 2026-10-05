@@ -249,6 +249,13 @@ async function forgeScript(
   }
   if (isTypeScript(entry)) code = await compileTypeScript(code, entryPath);
   const source = asHandlerMapSource(code);
+  if (!source.startsWith('(')) {
+    fail(
+      `${path.basename(entry)}: a script package is one handler-map expression, \`({ ... })\`, and nothing else. ` +
+      'Move top-level declarations (const, function, class) inside it as `_` members, and start the file with the expression ' +
+      '(a JavaScript entry must not begin with a comment).',
+    );
+  }
   let handlers: string[];
   try {
     handlers = checkScriptSource(source, path.basename(entry));
