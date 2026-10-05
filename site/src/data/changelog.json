@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.14.3",
+    "date": "2026-10-05",
+    "title": "Bring your own abjects, in TypeScript",
+    "summary": "You can now add abjects to an Abject instance by writing a small TypeScript or JavaScript package; you no longer need to change the server or compile to WebAssembly. Packages are turned on, turned off and configured from a new Packages tab in Settings, so one release can be set up as a different kind of instance for each person or team.",
+    "highlights": [
+      "Script packages: write an abject as a plain JavaScript handler map (or in TypeScript, with full type definitions in sdk/script) and it runs in the same sandbox as abjects made in the app, on the worker pool",
+      "pnpm forge now builds script packages: it compiles TypeScript, checks that the result runs as a handler map in the sandbox, validates the manifest and settings, warns about declared methods with no handler, and installs the package; a plain .js package with a manifest needs no build step at all",
+      "New Packages tab in Settings: see every installed package, enable or disable each one, add package directories, and fill in the settings a package asks for (including secrets such as API tokens)",
+      "Packages can declare their own settings in abject.json; the Packages tab shows them as a form, and the package's abjects read them back by message",
+      "Packages load from several places in a predictable order: bundled native packages, installed extensions, the ABJECTS_PACKAGE_DIRS environment variable, and directories added in Settings; a newer version wins and an older copy never downgrades a type",
+      "A package can replace a built-in object type by name, so you can swap in your own version of a system service without forking the code",
+      "Package abjects are owned by their package and stay read-only in the editor; their saved data is kept in its own area so it doesn't mix with your other abjects",
+      "packages.json can be written by provisioning tools before first boot to set up an instance ahead of time; a malformed file is ignored and the defaults apply, so a typo won't stop the instance from starting",
+      "Two working examples to start from: tally-ts (TypeScript, with settings) and scene-showcase (plain JavaScript, no build), plus a new guide in docs/PACKAGES.md"
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.14.2",
     "date": "2026-10-03",
     "title": "The browser agent gets hands and eyes",
