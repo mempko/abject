@@ -7,6 +7,9 @@
     "email": "max@mempko.com"
   },
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "main": "dist-electron/main.js",
   "scripts": {
     "conjure": "pnpm install",
@@ -32,6 +35,7 @@
     "incarnate:win": "pnpm incarnate && electron-builder --win",
     "incarnate:mac": "pnpm incarnate && electron-builder --mac",
     "incarnate:all": "pnpm incarnate:linux && pnpm incarnate:win && pnpm incarnate:mac",
+    "incarnate:server": "node scripts/package-server.mjs",
     "release": "node release.mjs",
     "typecheck": "tsc --noEmit",
     "test:agents": "node --import tsx --test --test-isolation=none src/objects/agent-system.*.test.ts",

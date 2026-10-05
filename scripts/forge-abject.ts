@@ -33,7 +33,7 @@
  *     "name": "Tally",
  *     "version": "1.0.0",
  *     "runtime": "script",
- *     "scope": "workspace",         // script packages are always workspace-scoped
+ *     "scope": "workspace",         // or "system": one per instance, data kept by Packages
  *     "entry": "tally.ts",          // .ts is compiled with esbuild; .js is used as is
  *     "manifest": "manifest.json",  // or the manifest inline
  *     "settings": [ { "key": "label", "type": "string", "default": "Visits" } ]
@@ -51,7 +51,7 @@ import { execSync } from 'node:child_process';
 import { extractWasmManifest } from '../src/sandbox/wasm-instance.js';
 import { WASM_ABI_VERSION, looksLikeManifest } from '../src/sandbox/wasm-abi.js';
 import {
-  extensionsDir, checkScriptSource, loadPackageManifest, parseSettingSpecs,
+  extensionsDir, checkScriptSource, loadPackageManifest, parseSettingSpecs, parseProfiles,
 } from '../src/sandbox/extensions.js';
 import type { AbjectManifest } from '../src/core/types.js';
 
@@ -65,6 +65,7 @@ interface ForgeMeta {
   source?: string;
   manifest?: unknown;
   settings?: unknown;
+  profiles?: unknown;
   scope?: string;
   replaces?: string;
   build?: string;
@@ -108,6 +109,12 @@ async function main(): Promise<void> {
     } catch {
       fail('build command failed');
     }
+  }
+
+  try {
+    parseProfiles(meta.profiles, scope as 'system' | 'workspace');
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
   }
 
   const runtime = meta.runtime ?? 'wasm';
@@ -164,6 +171,7 @@ async function main(): Promise<void> {
           ...(meta.replaces ? { replaces: meta.replaces } : {}),
           ...(meta.build ? { build: meta.build } : {}),
           ...(meta.settings !== undefined ? { settings: meta.settings } : {}),
+          ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
           manifest,
         },
         null,
@@ -190,6 +198,7 @@ async function main(): Promise<void> {
         scope,
         ...(meta.replaces ? { replaces: meta.replaces } : {}),
         ...(meta.settings !== undefined ? { settings: meta.settings } : {}),
+          ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
         manifest,
       },
       null,
@@ -233,9 +242,6 @@ function asHandlerMapSource(code: string): string {
 async function forgeScript(
   pkgDir: string, metaPath: string, meta: ForgeMeta, scope: string, buildOnly: boolean, dest: string,
 ): Promise<void> {
-  if (scope !== 'workspace') {
-    fail('abject.json: script packages must be workspace-scoped (their data persists through the workspace\'s AbjectStore)');
-  }
   const typeName = meta.replaces ?? meta.name!;
 
   // 2. Compile and check the source
@@ -325,6 +331,7 @@ async function forgeScript(
         source: 'main.js',
         ...(meta.replaces ? { replaces: meta.replaces } : {}),
         ...(settings.length > 0 ? { settings } : {}),
+        ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
         manifest,
       },
       null,

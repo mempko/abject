@@ -17,6 +17,10 @@
 
 import { build } from 'esbuild';
 import { builtinModules } from 'node:module';
+import { readFileSync } from 'node:fs';
+
+// Baked in so the compiled server reports its release without package.json.
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 // All node: built-ins plus their un-prefixed variants
 const nodeExternals = [
@@ -43,11 +47,11 @@ const shared = {
   bundle: true,
   format: 'esm',
   platform: 'node',
-  target: 'node20',
+  target: 'node22',
   external,
   sourcemap: true,
   // Preserve import.meta.url so worker path resolution works
-  define: {},
+  define: { __ABJECT_VERSION__: JSON.stringify(version) },
 };
 
 await build({

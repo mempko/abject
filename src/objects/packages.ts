@@ -15,6 +15,10 @@
  *   values entered here apply at once. A package's own abjects read them with
  *   `getSettings` (secret values included, for them only) and can observe
  *   this object for `settingsChanged`.
+ * - **System-scope package data.** A script package spawned once at system
+ *   scope has no workspace AbjectStore; its abject saves and loads its data
+ *   here (`savePackageData`, `getPackageData`), kept in the global Storage
+ *   and answered only to that package's own system-scope abject.
  *
  * The Packages tab of the system settings is a view over this object.
  */
@@ -26,7 +30,7 @@ import { Abject } from '../core/abject.js';
 import { require as precondition } from '../core/contracts.js';
 import { request } from '../core/message.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
-import { packageNameOf } from '../core/packages.js';
+import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 import {
   type PackageOrigin, type PackageRuntime, type PackageScope, type PackageSettingSpec,
@@ -97,8 +101,14 @@ function settingValueValid(spec: PackageSettingSpec, v: unknown): v is PackageSe
   return typeof v === 'string';
 }
 
+/** Global Storage key holding a system-scope script package's data. */
+const packageDataKey = (packageName: string) => `packages:data:${packageName}`;
+
 export class Packages extends Abject {
   private factoryId?: AbjectId;
+  private storageId?: AbjectId;
+  /** The global registry: where this object, and system-scope packages, are registered. */
+  private globalRegistryId?: AbjectId;
 
   constructor() {
     const text = { kind: 'primitive' as const, primitive: 'string' as const };
@@ -164,6 +174,20 @@ export class Packages extends Abject {
               parameters: [],
               returns: obj,
             },
+            {
+              name: 'getPackageData',
+              description: 'For a script package abject spawned at system scope: its saved data, or null. Answered only to that abject; workspace package abjects keep their data in their workspace\'s AbjectStore.',
+              parameters: [],
+              returns: obj,
+            },
+            {
+              name: 'savePackageData',
+              description: 'For a script package abject spawned at system scope: replace its saved data. Answered only to that abject. Returns { success }.',
+              parameters: [
+                { name: 'data', type: obj, description: 'The abject\'s data (JSON)' },
+              ],
+              returns: obj,
+            },
           ],
           events: [
             { name: 'packagesChanged', description: 'Package configuration changed (enabled set or directories); payload { restartRequired }', payload: obj },
@@ -207,6 +231,49 @@ export class Packages extends Abject {
     });
 
     this.on('getSettings', async (msg: AbjectMessage) => this.getSettingsFor(msg.routing.from));
+
+    this.on('getPackageData', async (msg: AbjectMessage) => {
+      const name = await this.systemPackageOf(msg.routing.from);
+      this.storageId ??= await this.discoverDep('Storage') ?? undefined;
+      // Without Storage nothing can have been saved; saving still fails loudly.
+      if (!this.storageId) return null;
+      return await this.request<unknown>(request(this.id, this.storageId, 'get', { key: packageDataKey(name) })) ?? null;
+    });
+
+    this.on('savePackageData', async (msg: AbjectMessage) => {
+      const name = await this.systemPackageOf(msg.routing.from);
+      const { data } = msg.payload as { data?: unknown };
+      precondition(!!data && typeof data === 'object' && !Array.isArray(data), 'data must be an object');
+      const storageId = await this.storage();
+      await this.request(request(this.id, storageId, 'set', { key: packageDataKey(name), value: data }));
+      return { success: true };
+    });
+  }
+
+  private async storage(): Promise<AbjectId> {
+    this.storageId ??= await this.discoverDep('Storage') ?? undefined;
+    precondition(!!this.storageId, 'Storage is not available');
+    return this.storageId!;
+  }
+
+  /**
+   * The package name of a script package abject registered at system scope,
+   * found from where the Factory registered it, never from the message. Its
+   * data is keyed by package, so a workspace package abject (one per
+   * workspace, data in its workspace's AbjectStore) is refused.
+   */
+  private async systemPackageOf(callerId: AbjectId): Promise<string> {
+    const reg = await this.callerRegistration(callerId);
+    if (!this.globalRegistryId && this.factoryId) {
+      const own = await this.request<{ registryId?: AbjectId }>(
+        request(this.id, this.factoryId, 'getObjectInfo', { objectId: this.id })).catch(() => undefined);
+      this.globalRegistryId = own?.registryId;
+    }
+    precondition(!!reg && isPackageOwner(reg.owner),
+      'package data is kept only for abjects spawned from an installed script package');
+    precondition(!!this.globalRegistryId && reg!.registryId === this.globalRegistryId,
+      'package data here is for system-scope packages; a workspace package keeps its data in its workspace\'s AbjectStore');
+    return packageNameOf(reg!.owner)!;
   }
 
   // ── Reading ────────────────────────────────────────────────────────
@@ -407,15 +474,16 @@ export class Packages extends Abject {
    * The caller's registration, looked up in the registry the Factory says it
    * registered the caller in. Nothing in the message is trusted.
    */
-  private async callerRegistration(callerId: AbjectId): Promise<{ owner?: string; typeId?: string } | null> {
+  private async callerRegistration(callerId: AbjectId): Promise<{ owner?: string; typeId?: string; registryId: AbjectId } | null> {
     if (!this.factoryId) this.factoryId = await this.discoverDep('Factory') ?? undefined;
     if (!this.factoryId) return null;
     try {
       const info = await this.request<{ registryId?: AbjectId }>(
         request(this.id, this.factoryId, 'getObjectInfo', { objectId: callerId }));
       if (!info?.registryId) return null;
-      return await this.request<{ owner?: string; typeId?: string } | null>(
+      const reg = await this.request<{ owner?: string; typeId?: string } | null>(
         request(this.id, info.registryId, 'lookup', { objectId: callerId }));
+      return reg ? { ...reg, registryId: info.registryId } : null;
     } catch {
       return null;
     }

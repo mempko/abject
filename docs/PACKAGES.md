@@ -10,12 +10,13 @@ configured from the Packages tab of the system settings.
 | Runtime | What it runs | Written in | Scope |
 |---|---|---|---|
 | `wasm` (default) | A WebAssembly module hosted by `WasmAbject` (`docs/WASM_ABI.md`) | Any language with an SDK (`sdk/cpp/`) | `system` (one per instance) or `workspace` (one per workspace) |
-| `script` | A JavaScript handler map hosted by `ScriptableAbject`, the same form as abjects made in the app | JavaScript, or TypeScript compiled by `pnpm forge` (`sdk/script/`) | `workspace` only |
+| `script` | A JavaScript handler map hosted by `ScriptableAbject`, the same form as abjects made in the app | JavaScript, or TypeScript compiled by `pnpm forge` (`sdk/script/`) | `system` or `workspace` |
 
 Both run on the worker pool when workers are enabled (the default).
 
-Script packages are workspace-scoped because a script abject saves its data
-through its workspace's AbjectStore.
+A `workspace` package is spawned in each workspace whose profile it joins
+(below); a `system` package once per instance, in the global registry, for
+work that belongs to the instance rather than to a workspace.
 
 ## The package directory
 
@@ -42,6 +43,7 @@ A package is a directory with an `abject.json`:
 | `runtime` | `wasm` (default) or `script` |
 | `scope` | `system` or `workspace` (script packages: `workspace`) |
 | `replaces` | Optional. Take over a built-in type of that name: every spawn of it resolves to the package |
+| `profiles` | Optional, workspace scope. The workspace profiles the package joins (`docs/WORKSPACE_PROFILES.md`); none means `default` only |
 | `manifest` | The manifest inline, or a path to a JSON file holding it. An AbjectStore snapshot file (`{ manifest, source }`) works too. WASM packages may omit it; `pnpm forge` extracts the module's own. |
 | `entry` | Script packages: the source to build. `.ts` is compiled; `.js` is used as is |
 | `source` | Script packages: the built JavaScript (`main.js` after `pnpm forge`). A `.js` entry needs none |
@@ -149,16 +151,23 @@ Values come back with defaults filled in and secrets included. Observe the
 ## How package abjects behave
 
 - **Spawned from the package.** WorkspaceManager spawns each workspace-scoped
-  package type in every workspace; the bootstrap spawns system-scoped WASM
-  types once. Abjects tagged `autostart` get a `startup` call after spawning.
+  package type in every workspace whose profile it joins; the bootstrap
+  spawns system-scoped types (WASM and script) once, under the Supervisor.
+  Abjects tagged `autostart` get a `startup` call after spawning, at either
+  scope.
 - **Read-only.** Script package abjects are owned by `package:<name>`. They
   refuse source and manifest edits from everyone, ObjectCreator and
   AbjectEditor included. Change the package and reinstall it. The Factory
   refuses that owner to anything not spawned from the package.
-- **Data survives restarts.** `saveData` stores a script package abject's data
-  under `package/<TypeName>` in its workspace's AbjectStore. WorkspaceManager
-  hands it back at the next spawn. AbjectStore never restores package abjects
-  as user objects, and its `list` leaves them out.
+- **Data survives restarts.** `saveData` stores a workspace package abject's
+  data under `package/<TypeName>` in its workspace's AbjectStore, and
+  WorkspaceManager hands it back at the next spawn. AbjectStore never restores
+  package abjects as user objects, and its `list` leaves them out. A
+  system-scope package abject has no AbjectStore (there is none at system
+  scope): its data is kept by the `Packages` service in the global Storage
+  (`savePackageData`, `getPackageData`, answered only to that package's own
+  system abject), and read back before its first handler runs, after a
+  supervised restart too.
 - **A clone is an ordinary object.** Cloning a package abject drops the
   package owner and the `package` tag, so the copy is editable and persists as
   a user object.

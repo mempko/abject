@@ -254,8 +254,8 @@ export class CommuneClient {
     return this.request('listWorkspaces');
   }
 
-  createWorkspace(name: string): Promise<{ workspaceId: string }> {
-    return this.request('createWorkspace', { name });
+  createWorkspace(name: string, profile?: string): Promise<{ workspaceId: string }> {
+    return this.request('createWorkspace', { name, ...(profile ? { profile } : {}) });
   }
 
   switchWorkspace(workspaceId: string): Promise<boolean> {

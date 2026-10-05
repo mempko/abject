@@ -86,13 +86,15 @@ Multi-workspace isolation and sharing.
 
 | File | Class | Description |
 |------|-------|-------------|
-| `workspace-manager.ts` | `WorkspaceManager` | Orchestrates workspace lifecycle: create, delete, switch, spawn per-workspace objects |
+| `workspace-manager.ts` | `WorkspaceManager` | Orchestrates workspace lifecycle: create (with a profile), delete, switch, spawn per-workspace objects by profile |
+| `workspace-profiles.ts` | — | Workspace profiles: the per-workspace object lists, `default` and `service`, `profiles.json`, dependency checks (`docs/WORKSPACE_PROFILES.md`) |
 | `workspace-registry.ts` | `WorkspaceRegistry` | Per-workspace Registry that chains to global registry on discovery miss |
 | `workspace-switcher.ts` | `WorkspaceSwitcher` | Global chromeless window for switching workspaces (outside all workspaces to avoid deadlock) |
 | `workspace-browser.ts` | `WorkspaceBrowser` | Browse discovered remote workspaces from connected peers |
 | `workspace-share-registry.ts` | `WorkspaceShareRegistry` | Manages workspace sharing metadata and peer discovery (transitive multi-hop) |
 | `settings.ts` | `Settings` | Per-workspace configuration UI (General and Access tabs) |
 | `global-settings.ts` | `GlobalSettings` | Global LLM API key configuration. Auto-shows on first boot if no keys present |
+| `instance-info.ts` | `InstanceInfo` | The running version, readiness, uptime and platform, for abjects; backs `GET /healthz` on the UI port |
 
 ## P2P / Identity
 

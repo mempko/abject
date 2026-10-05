@@ -30,15 +30,34 @@ const STORAGE_KEY = 'web-exposure:config';
 
 export type WebAccessLevel = 'public' | 'authenticated';
 
+/**
+ * How the gateway serves an abject. `methods` (the default): each allowed
+ * method is a route, `POST /<ws>/<abject>/<method>` with a JSON body, and the
+ * reply is JSON. `http`: every request under `/<ws>/<abject>` (any HTTP
+ * method, any sub-path) goes to one handler method, which sees the whole
+ * request and answers with status, headers, cookies and body: web pages,
+ * sign-in flows, webhooks.
+ */
+export type WebEntryMode = 'methods' | 'http';
+
+/** The handler method an `http` entry uses unless it names another. */
+export const DEFAULT_HTTP_HANDLER = 'handleHttp';
+
+const METHOD_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 export interface WebExposureEntry {
   /** Access level for this abject's routes. */
   access: WebAccessLevel;
   /**
    * Methods a caller may invoke. `null` means every non-meta method the
    * manifest declares. Meta and editing methods are never invokable whatever
-   * this says; the gateway enforces that.
+   * this says; the gateway enforces that. Unused in `http` mode.
    */
   methods: string[] | null;
+  /** Absent means `methods`. */
+  mode?: WebEntryMode;
+  /** `http` mode: the method that handles requests (default handleHttp). */
+  handler?: string;
 }
 
 export interface WebExposureConfig {
@@ -87,10 +106,12 @@ export class WebExposure extends Abject {
           methods: [
             { name: 'getConfig', description: 'The current exposure config: { enabled, entries }.', parameters: [], returns: { kind: 'object', properties: {} } },
             { name: 'setEnabled', description: 'Turn web serving on or off for this workspace.', parameters: [{ name: 'enabled', type: { kind: 'primitive', primitive: 'boolean' }, description: 'On or off' }], returns: { kind: 'object', properties: {} } },
-            { name: 'setEntry', description: 'Expose one abject by name, or update how it is exposed.', parameters: [
+            { name: 'setEntry', description: 'Expose one abject by name, or update how it is exposed. mode "http" hands every request under its route to one handler method (default handleHttp) that answers with status, headers, cookies and body.', parameters: [
               { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Registered abject name' },
               { name: 'access', type: { kind: 'primitive', primitive: 'string' }, description: '"public" or "authenticated"' },
               { name: 'methods', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Method allowlist; omit for all non-meta methods', optional: true },
+              { name: 'mode', type: { kind: 'primitive', primitive: 'string' }, description: '"methods" (default) or "http"', optional: true },
+              { name: 'handler', type: { kind: 'primitive', primitive: 'string' }, description: 'http mode: the handler method (default handleHttp)', optional: true },
             ], returns: { kind: 'object', properties: {} } },
             { name: 'removeEntry', description: 'Stop exposing one abject.', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Registered abject name' }], returns: { kind: 'object', properties: {} } },
             { name: 'setConfig', description: 'Replace the whole config in one call (used by the settings UI).', parameters: [{ name: 'config', type: { kind: 'object', properties: {} }, description: '{ enabled, entries }' }], returns: { kind: 'object', properties: {} } },
@@ -112,12 +133,13 @@ export class WebExposure extends Abject {
       return { success: true, config: structuredClone(this.config) };
     });
     this.on('setEntry', async (msg: AbjectMessage) => {
-      const { name, access, methods } = msg.payload as { name: string; access?: string; methods?: string[] };
-      if (!name || typeof name !== 'string') return { success: false, error: 'name is required' };
-      this.config.entries[name] = {
-        access: access === 'public' ? 'public' : 'authenticated',
-        methods: Array.isArray(methods) ? methods.filter(m => typeof m === 'string') : null,
+      const { name, access, methods, mode, handler } = msg.payload as {
+        name: string; access?: string; methods?: string[]; mode?: string; handler?: string;
       };
+      if (!name || typeof name !== 'string') return { success: false, error: 'name is required' };
+      if (mode !== undefined && mode !== 'methods' && mode !== 'http') return { success: false, error: 'mode must be "methods" or "http"' };
+      if (handler !== undefined && (typeof handler !== 'string' || !METHOD_NAME.test(handler))) return { success: false, error: 'handler must be a method name' };
+      this.config.entries[name] = this.sanitizeEntry({ access, methods, mode, handler } as Partial<WebExposureEntry>)!;
       await this.persistAndPush();
       return { success: true, config: structuredClone(this.config) };
     });
@@ -135,18 +157,32 @@ export class WebExposure extends Abject {
     });
   }
 
+  /**
+   * A whole config from outside. An entry that says nothing about its mode
+   * keeps the one it has: the settings window rewrites every entry and knows
+   * only access levels, and saving there must not turn a web page back into
+   * a method list.
+   */
   private sanitize(input: Partial<WebExposureConfig> | undefined): WebExposureConfig {
     const entries: Record<string, WebExposureEntry> = {};
     const raw = input?.entries ?? {};
     for (const [name, e] of Object.entries(raw)) {
       if (!e || typeof e !== 'object') continue;
-      const access = (e as WebExposureEntry).access === 'public' ? 'public' : 'authenticated';
-      const methods = Array.isArray((e as WebExposureEntry).methods)
-        ? (e as WebExposureEntry).methods!.filter(m => typeof m === 'string')
-        : null;
-      entries[name] = { access, methods };
+      const current = this.config.entries[name];
+      const given = e as Partial<WebExposureEntry>;
+      const merged = 'mode' in given || !current?.mode ? given : { ...given, mode: current.mode, handler: current.handler };
+      const entry = this.sanitizeEntry(merged);
+      if (entry) entries[name] = entry;
     }
     return { enabled: !!input?.enabled, entries };
+  }
+
+  private sanitizeEntry(e: Partial<WebExposureEntry>): WebExposureEntry | undefined {
+    const access = e.access === 'public' ? 'public' : 'authenticated';
+    const methods = Array.isArray(e.methods) ? e.methods.filter(m => typeof m === 'string') : null;
+    if (e.mode !== 'http') return { access, methods };
+    const handler = typeof e.handler === 'string' && METHOD_NAME.test(e.handler) ? e.handler : DEFAULT_HTTP_HANDLER;
+    return { access, methods, mode: 'http', ...(handler !== DEFAULT_HTTP_HANDLER ? { handler } : {}) };
   }
 
   protected override async onInit(): Promise<void> {

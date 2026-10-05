@@ -28,7 +28,7 @@ import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
 import { validateCode, compileSandboxed } from '../core/sandbox.js';
-import { packageNameOf } from '../core/packages.js';
+import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ScriptableAbject');
@@ -161,6 +161,14 @@ export class ScriptableAbject extends Abject {
   private _pendingSave?: { promise: Promise<void>; resolve: () => void; reject: (err: unknown) => void };
   private _lastSaveStart = 0;
   private _storeId?: AbjectId;
+  /**
+   * Set for a package abject spawned at system scope: its registry has no
+   * AbjectStore, so its data is kept by the Packages service instead.
+   */
+  private _packagesId?: AbjectId;
+  /** That data's first load, in flight; settled once it has been read. */
+  private _packageDataLoad?: Promise<void>;
+  private _packageDataLoaded = false;
 
   constructor(
     manifest: AbjectManifest,
@@ -309,6 +317,10 @@ export class ScriptableAbject extends Abject {
 
   /** Keep synchronous UI handlers synchronous while tracking async work for activation. */
   private invokeUserHandler(handler: MessageHandlerFn, msg: AbjectMessage): unknown {
+    // A system-scope package abject's data arrives before its first handler
+    // runs; after that this path is synchronous again.
+    const loading = this.packageDataReady();
+    if (loading) return loading.then(() => this.invokeUserHandler(handler, msg));
     if (this.activating) throw new Error('Source activation in progress; retry against the committed revision');
     this.activeUserCalls++;
     try {
@@ -330,6 +342,12 @@ export class ScriptableAbject extends Abject {
       const { expectedSource } = msg.payload as { expectedSource?: string };
       if (expectedSource !== undefined && expectedSource !== this._source) return { success: false, conflict: true, error: 'Source changed before persistence' };
       await this.saveData();
+      if (this._packagesId) {
+        // A system-scope package abject: its source is the package's, and its
+        // data is what Packages now holds.
+        const data = await this.request<Record<string, unknown> | null>(request(this.id, this._packagesId, 'getPackageData', {}));
+        return { success: true, source: this._source, data: data ?? {} };
+      }
       const saved = await this.request<{ source: string; data?: Record<string, unknown> } | null>(request(this.id, this._storeId!, 'getDurableSnapshot', { objectId: this.id }));
       if (!saved || saved.source !== this._source) throw new Error('Durable source does not match the live deployment');
       return { success: true, source: saved.source, data: saved.data ?? {} };
@@ -338,7 +356,8 @@ export class ScriptableAbject extends Abject {
       return this._source;
     });
 
-    this.on('getData', () => {
+    this.on('getData', async () => {
+      await this.packageDataReady();
       // Deep-copy via JSON round-trip so callers can't mutate the live record.
       try {
         return JSON.parse(JSON.stringify(this._data));
@@ -851,6 +870,13 @@ export class ScriptableAbject extends Abject {
    */
   private async persistDataNow(): Promise<void> {
     try {
+      if (this._packagesId) {
+        // Never write before the stored data has been read: that would
+        // replace it with whatever this fresh instance started with.
+        await this.packageDataReady();
+        await this.request(request(this.id, this._packagesId, 'savePackageData', { data: this._data }));
+        return;
+      }
       if (!this._storeId) {
         this._storeId = await this.discoverDep('AbjectStore') ?? undefined;
       }
@@ -874,6 +900,49 @@ export class ScriptableAbject extends Abject {
     }
   }
 
+  /**
+   * A package abject spawned at system scope lives in the global registry,
+   * which has no AbjectStore: workspaces have one each, the system level
+   * none. Its data is kept by the Packages service instead, which answers
+   * only that package's own abjects; it is read before the first handler
+   * runs (packageDataReady), so after a supervised restart too. Workspace
+   * package abjects find their workspace's store and get their data from
+   * WorkspaceManager at spawn, as before.
+   */
+  protected override async onInit(): Promise<void> {
+    await super.onInit();
+    if (!isPackageOwner(this._owner)) return;
+    this._storeId = await this.discoverDep('AbjectStore') ?? undefined;
+    if (this._storeId) return;
+    this._packagesId = await this.discoverDep('Packages') ?? undefined;
+  }
+
+  /**
+   * Load a system-scope package abject's saved data, once, the first time
+   * anything needs it. Not in onInit: the Factory registers an object only
+   * after its init, and Packages hands data only to an abject it can find
+   * registered as the package's own. A failed read is retried next time and
+   * fails the call meanwhile, rather than going on with empty data.
+   * Undefined when there is nothing (left) to wait for.
+   */
+  private packageDataReady(): Promise<void> | undefined {
+    if (!this._packagesId || this._packageDataLoaded) return undefined;
+    this._packageDataLoad ??= (async () => {
+      try {
+        const stored = await this.request<Record<string, unknown> | null>(
+          request(this.id, this._packagesId!, 'getPackageData', {}));
+        if (stored && typeof stored === 'object') this._data = stored;
+        this._packageDataLoaded = true;
+      } catch (err) {
+        log.warn(`[${this.manifest.name}] could not load package data:`, err);
+        throw err;
+      } finally {
+        this._packageDataLoad = undefined;
+      }
+    })();
+    return this._packageDataLoad;
+  }
+
   protected override async onStop(): Promise<void> {
     await super.onStop();
     // Flush a queued save so the last data mutations survive shutdown.
@@ -884,7 +953,9 @@ export class ScriptableAbject extends Abject {
     if (!ticket) return;
     this._pendingSave = undefined;
     try {
-      if (this._storeId) {
+      if (this._packagesId) {
+        this.bus.send(event(this.id, this._packagesId, 'savePackageData', { data: this._data }));
+      } else if (this._storeId) {
         this.bus.send(event(this.id, this._storeId, 'save', {
           objectId: this.id,
           manifest: this.manifest,

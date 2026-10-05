@@ -30,6 +30,8 @@ interface State { count: number }
 - **A script package is one handler-map expression and nothing else.**
   Helpers and constants go inside it as `_` members (not message handlers);
   forge refuses top-level declarations.
+- **Serving HTTP:** `WebRequest`, `WebResponse` and `WebCookie` type a
+  handler exposed in the gateway's `http` mode (`docs/WEB_GATEWAY.md`).
 - **LLM providers:** `LLMProviderSpec`, `ProviderCompleteRequest` /
   `ProviderCompleteReply` and `ProviderStreamRequest` / `ProviderStreamReply`
   type the provider protocol (`docs/LLM_PROVIDERS.md`).
@@ -37,7 +39,8 @@ interface State { count: number }
 ## Files
 
 - **abject.d.ts**: `AbjectMessage`, `AbjectThis`, `AbjectHandlers`,
-  `PackageSettings`, the LLM provider protocol types, and `HttpResponse`.
+  `PackageSettings`, the LLM provider protocol types, `HttpResponse`, and the
+  web handler types (`WebRequest`, `WebResponse`, `WebCookie`).
 
 See `examples/tally-ts` and `examples/openai-compatible-provider` for complete
 packages, and `docs/PACKAGES.md` for the package format, settings and

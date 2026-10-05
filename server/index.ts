@@ -114,6 +114,8 @@ import { ClawHubClient } from '../src/objects/clawhub-client.js';
 import { CatalogBrowser } from '../src/objects/catalog-browser.js';
 import { SecretsVault } from '../src/objects/secrets-vault.js';
 import { Packages } from '../src/objects/packages.js';
+import { InstanceInfo, instanceReport, type InstanceInfoSource } from '../src/objects/instance-info.js';
+import { abjectVersion } from './version.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
@@ -124,7 +126,7 @@ import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collaborator-inspector.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
-import { NodeWorkerAdapter } from './node-worker-adapter.js';
+import { NodeWorkerAdapter, planWorkerHeaps, workerHeapMb } from './node-worker-adapter.js';
 import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
 import { WebSocketUITransport, toUIWireData, postUIWireData, normalizeWsPayload } from './ui-transport.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
@@ -199,6 +201,20 @@ async function main(): Promise<void> {
   const workerCount = envOverride !== undefined ? parseInt(envOverride, 10) : defaultWorkerCount;
   const workerEnabled = workerCount > 0;
   const workerScriptPath = new URL('../workers/abject-worker-node.ts', import.meta.url);
+  // Heap ceilings are shared out over every worker thread: the pool and the
+  // dedicated UI and P2P workers.
+  planWorkerHeaps(workerCount + (DEDICATED_WORKERS ? 2 : 0));
+
+  // What InstanceInfo and the health endpoint report.
+  let serving = false;
+  const instanceSource: InstanceInfoSource = {
+    version: abjectVersion(),
+    startedAt: Date.now(),
+    workerCount,
+    ready: () => serving,
+  };
+  alog.info(`Abject ${instanceSource.version} on Node ${process.versions.node}; ` +
+    `${workerCount} pool worker(s), heap ceiling ${workerHeapMb()} MB each`);
 
   // Create runtime
   const runtime = getRuntime({
@@ -500,6 +516,18 @@ async function main(): Promise<void> {
     port: WS_PORT,
     host: '127.0.0.1',
     perMessageDeflate: false,
+    // Local health and version, for a service manager or a host agent on the
+    // same machine (the port binds loopback). 503 until boot has finished.
+    onHttpRequest: (req, res) => {
+      const path = (req.url ?? '').split('?')[0];
+      if (req.method !== 'GET' || (path !== '/healthz' && path !== '/version')) return false;
+      const report = instanceReport(instanceSource);
+      const body = path === '/version' ? { version: report.version }
+        : { status: report.ready ? 'ok' : 'starting', ...report };
+      res.writeHead(path === '/healthz' && !report.ready ? 503 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+      return true;
+    },
   });
 
   wsServer.onConnection((ws) => {
@@ -671,6 +699,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('CatalogBrowser', () => new CatalogBrowser());
   runtime.objectFactory.registerConstructor('SecretsVault', () => new SecretsVault());
   runtime.objectFactory.registerConstructor('Packages', () => new Packages());
+  runtime.objectFactory.registerConstructor('InstanceInfo', () => new InstanceInfo(instanceSource));
   runtime.objectFactory.registerConstructor('OAuthHelper', () => new OAuthHelper());
   runtime.objectFactory.registerConstructor('RemoteUIAccess', () => new RemoteUIAccess());
   runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
@@ -1026,6 +1055,8 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   // Worker-eligible like the other global services: it only reads and writes
   // packages.json and the package directories, and asks the Factory by message.
   await supervisedSpawn('Packages', 'permanent', systemTypeId('Packages'));
+  // Version and readiness for abjects (main thread: it reads this process's state).
+  await supervisedSpawn('InstanceInfo', 'permanent', systemTypeId('InstanceInfo'));
 
   // Capability-enforcement mode: register the interceptor's mailbox as a
   // GlobalSettings dependent (mode-change events land there) and pull the
@@ -1072,17 +1103,28 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
 
   log.timed('global UI + services spawned');
 
-  // System-scoped WASM extensions spawn as global objects here (after the
-  // peerId is known so they get {peerId}/system/{Name} typeIds). Extensions
-  // that replace a built-in need no spawn of their own — the built-in's
-  // normal spawn already resolved to the WASM implementation.
+  // System-scoped packages (WASM and script) spawn once, as global objects,
+  // here (after the peerId is known so they get {peerId}/system/{Name}
+  // typeIds). A script package runs on the worker pool like any other
+  // ScriptableAbject and keeps its data with Packages, spawned above.
+  // Packages that replace a built-in need no spawn of their own: the
+  // built-in's normal spawn already resolved to the package.
+  const autostartTypes = new Set(runtime.objectFactory.listPackageTypes()
+    .filter((t) => t.tags.includes('autostart')).map((t) => t.name));
   for (const ext of wasmExtensions) {
     if (ext.scope !== 'system' || ext.replaces) continue;
     try {
-      await supervisedSpawn(ext.typeName, 'permanent', systemTypeId(ext.typeName));
-      log.timed(`WASM extension '${ext.typeName}' spawned`);
+      const id = await supervisedSpawn(ext.typeName, 'permanent', systemTypeId(ext.typeName));
+      log.timed(`system package '${ext.typeName}' (${ext.runtime}) spawned`);
+      // As WorkspaceManager does for workspace packages: an autostart package
+      // gets its `startup` call once spawned. Not awaited: a slow startup
+      // must not hold the boot up.
+      if (autostartTypes.has(ext.typeName)) {
+        void bootstrapRequest(id, 'startup', {}).catch((err: unknown) =>
+          alog.warn(`system package '${ext.typeName}' startup failed:`, err));
+      }
     } catch (err) {
-      alog.error(`Failed to spawn WASM extension '${ext.typeName}':`, err);
+      alog.error(`Failed to spawn system package '${ext.typeName}':`, err);
     }
   }
 
@@ -1158,6 +1200,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   await bootLoop;
 
   log.summary('server ready');
+  serving = true;
   console.log('');
   console.log(`  ABJECTS server running`);
   console.log('');

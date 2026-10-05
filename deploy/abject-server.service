@@ -1,0 +1,34 @@
+# systemd unit for the Abject headless server.
+# Install: see README.md in this directory.
+[Unit]
+Description=Abject server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=abject
+Group=abject
+EnvironmentFile=/etc/abject/abject.env
+ExecStart=/opt/abject/bin/abject-server
+WorkingDirectory=/var/lib/abject
+StateDirectory=abject
+Restart=on-failure
+RestartSec=5
+# On SIGTERM the server signals its child processes (MCP servers, CLI
+# sessions) first and exits within 10 s, with a watchdog of its own behind
+# that. Whatever is left after this timeout, the whole control group is
+# killed, child processes included.
+TimeoutStopSec=30
+KillMode=control-group
+LimitNOFILE=65536
+
+# Hardening. The server writes only to its data directory and /tmp.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/abject
+
+[Install]
+WantedBy=multi-user.target

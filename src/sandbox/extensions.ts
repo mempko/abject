@@ -31,8 +31,9 @@
  *   spawned once at boot by server/index.ts, 'workspace' scope is spawned
  *   per workspace by the WorkspaceManager.
  *
- * Script packages are workspace-scoped only: their data persists through the
- * workspace's AbjectStore, and there is none at system scope.
+ * Both runtimes may be either scope. A system-scope script package abject
+ * keeps its data with the Packages service (there is no AbjectStore at
+ * system scope); a workspace-scope one in its workspace's AbjectStore.
  */
 
 import * as fs from 'node:fs/promises';
@@ -82,6 +83,8 @@ export interface ExtensionPackage {
   replaces?: string;
   manifest: AbjectManifest;
   settings: PackageSettingSpec[];
+  /** Workspace profiles this package joins (workspace scope); none: `default` only. */
+  profiles?: string[];
   /** wasm runtime: the ABI version the module speaks. */
   abi?: number;
   /** wasm runtime: the compiled module. */
@@ -140,6 +143,18 @@ interface PackageMeta {
   replaces?: string;
   manifest?: unknown;
   settings?: unknown;
+  profiles?: unknown;
+}
+
+const PROFILE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** Validate a package's declared workspace profiles. */
+export function parseProfiles(raw: unknown, scope: PackageScope): string[] | undefined {
+  if (raw === undefined) return undefined;
+  require(Array.isArray(raw) && raw.length > 0 && raw.every(p => typeof p === 'string' && PROFILE_NAME.test(p)),
+    'abject.json: profiles must be a non-empty list of profile names (lowercase letters, digits, - and _)');
+  require(scope === 'workspace', 'abject.json: profiles apply to workspace-scope packages; a system-scope one runs once per instance');
+  return [...new Set(raw as string[])];
 }
 
 const SETTING_KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
@@ -216,6 +231,7 @@ export async function readPackage(pkgDir: string): Promise<ExtensionPackage> {
     `manifest name '${(manifest as AbjectManifest).name}' must equal ${meta.replaces ? `replaces '${meta.replaces}'` : `package name '${meta.name}'`} so discovery finds it`,
   );
   const settings = parseSettingSpecs(meta.settings);
+  const profiles = parseProfiles(meta.profiles, meta.scope as PackageScope);
 
   const base = {
     dir: pkgDir,
@@ -226,6 +242,7 @@ export async function readPackage(pkgDir: string): Promise<ExtensionPackage> {
     replaces: meta.replaces,
     manifest: manifest as AbjectManifest,
     settings,
+    ...(profiles ? { profiles } : {}),
   };
 
   if (runtime === 'wasm') {
@@ -238,10 +255,6 @@ export async function readPackage(pkgDir: string): Promise<ExtensionPackage> {
     return { ...base, abi: meta.abi, wasmPath };
   }
 
-  require(
-    meta.scope === 'workspace',
-    "abject.json: script packages must be workspace-scoped (their data persists through the workspace's AbjectStore)",
-  );
   const rel = meta.source ?? (isJsFile(meta.entry) ? meta.entry : undefined);
   require(
     typeof rel === 'string' && rel.length > 0,
@@ -432,6 +445,7 @@ async function registerPackage(factory: Factory, pkg: ExtensionPackage): Promise
     factory.registerPackageType(typeName, {
       runtime: 'wasm', manifest: packageManifest(pkg), source, scope: pkg.scope,
       package: { name: pkg.name, version: pkg.version },
+      ...(pkg.profiles ? { profiles: pkg.profiles } : {}),
     });
     return;
   }
@@ -441,6 +455,7 @@ async function registerPackage(factory: Factory, pkg: ExtensionPackage): Promise
     runtime: 'script', manifest: packageManifest(pkg), source, scope: pkg.scope,
     owner: packageOwner(pkg.name),
     package: { name: pkg.name, version: pkg.version },
+    ...(pkg.profiles ? { profiles: pkg.profiles } : {}),
   });
 }
 

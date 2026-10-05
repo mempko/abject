@@ -198,3 +198,56 @@ export interface PackageSettings<V extends { [K in keyof V]: string | number | b
   package: string;
   values: Partial<V>;
 }
+
+// ── Serving HTTP (WebGateway `http` entries) ─────────────────────────────
+//
+// Expose an abject with WebExposure.setEntry({ name, access, mode: 'http' })
+// and every request under /<workspace>/<abject> reaches its `handleHttp`
+// (or the handler the entry names) as a WebRequest; answer with a WebResponse.
+
+/** One HTTP request, whole. */
+export interface WebRequest {
+  method: string;
+  /** The path after the abject's route, from '/'. */
+  path: string;
+  /** The abject's route, `/<workspace>/<abject>`: prefix links and redirects with it. */
+  basePath: string;
+  /** Query parameters; a repeated name gives a list. */
+  query: Record<string, string | string[]>;
+  /** Request headers, lowercased names. */
+  headers: Record<string, string>;
+  cookies: Record<string, string>;
+  /** The body as text, for JSON, forms, text and XML. */
+  body?: string;
+  /** The body as base64, for anything else. */
+  bodyBase64?: string;
+  remoteAddress?: string;
+}
+
+/** A cookie to set. Defaults: Path is the abject's route, HttpOnly, SameSite=Lax. */
+export interface WebCookie {
+  name: string;
+  /** null deletes the cookie. */
+  value: string | null;
+  path?: string;
+  domain?: string;
+  maxAge?: number;
+  expires?: string;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
+/** The answer. Everything is optional; {} is an empty 200. */
+export interface WebResponse {
+  status?: number;
+  headers?: Record<string, string>;
+  cookies?: WebCookie[];
+  /** Text body; Content-Type defaults to text/plain. */
+  body?: string;
+  bodyBase64?: string;
+  /** JSON body; sets Content-Type to application/json. */
+  json?: unknown;
+  /** Redirect here; status defaults to 302. */
+  redirect?: string;
+}

@@ -13,6 +13,7 @@ pnpm conjure                      # Gather dependencies
 pnpm awaken                       # Awaken the backend (ws://localhost:7719)
 pnpm scry                         # Scry into the abyss (http://localhost:5174)
 pnpm whisper                      # Start P2P signaling server (:7720)
+pnpm incarnate:server             # Package the headless server + systemd unit (deploy/README.md)
 ```
 
 ## Project Structure
@@ -182,8 +183,11 @@ settings) and `examples/scene-showcase` (plain JS, no build).
 1. Write the handler map in `<name>.ts` against `sdk/script/abject.d.ts`
    (`({ ... }) satisfies AbjectHandlers<State>`, type-only imports)
 2. Add an `abject.json`: name, version, `runtime: 'script'`,
-   `scope: 'workspace'` (script packages are always workspace-scoped),
-   `entry`, `manifest` (inline or a path), optional `replaces` and `settings`
+   `scope: 'workspace'` (one per workspace) or `'system'` (one per instance,
+   data kept by `Packages`), `entry`, `manifest` (inline or a path), optional
+   `replaces`, `settings` and `profiles` (the workspace profiles it joins:
+   `docs/WORKSPACE_PROFILES.md`). To serve web pages, expose it in `http` mode
+   (`docs/WEB_GATEWAY.md`)
 3. `pnpm forge <dir>` compiles, checks the handler map in the sandbox, and
    installs into `.abjects/extensions/`; or point `ABJECTS_PACKAGE_DIRS` /
    Settings → Packages at the directory (`--build-only` first for a `.ts`

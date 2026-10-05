@@ -18,6 +18,11 @@ export interface WsServerConfig {
    * retained blob refs) leaks forever. Default 30s. Set 0 to disable.
    */
   heartbeatMs?: number;
+  /**
+   * Plain HTTP requests (not WebSocket upgrades): return true when handled.
+   * The server uses it for its local health endpoint.
+   */
+  onHttpRequest?: (req: http.IncomingMessage, res: http.ServerResponse) => boolean;
 }
 
 /** A ws socket carrying our liveness flag (set on pong, checked on ping). */
@@ -39,6 +44,7 @@ export class NodeWebSocketServer {
     // instead of ws's built-in "Upgrade Required" (426). WebSocket upgrade
     // requests are forwarded to ws unchanged.
     this.httpServer = http.createServer((req, res) => {
+      if (config.onHttpRequest?.(req, res)) return;
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end(
         `This is an Abject WebSocket endpoint (ws://${req.headers.host ?? 'localhost'}).\n` +
@@ -134,12 +140,16 @@ export class NodeWebSocketServer {
     }
     this.connections.clear();
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.wss.close((err) => {
         if (err) reject(err);
         else resolve();
       });
     });
+    // ws leaves a server it was given open: close the listener too, or the
+    // port stays bound (and the process alive) after close() returns.
+    this.httpServer.closeAllConnections?.();
+    await new Promise<void>((resolve) => this.httpServer.close(() => resolve()));
   }
 
   /**

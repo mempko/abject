@@ -12,6 +12,10 @@
  *   GET  /<workspace>/<abject>/openapi.json
  *   POST /<workspace>/<abject>/<method>   invoke a method; JSON body is the
  *                                  payload, JSON reply is the result
+ *   *    /<workspace>/<abject>[/…] an `http` entry: the abject's handler gets
+ *                                  the whole request (WebRequest) and answers
+ *                                  with status, headers, cookies and body
+ *                                  (WebResponse): web pages, sign-in, webhooks
  *
  * Workspaces and abjects are addressed by a slug of their registered name, so
  * routes survive restarts (AbjectIds do not). A method result maps to a status
@@ -35,6 +39,7 @@ import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { AuthConfig, SessionStore } from '../../server/auth.js';
 import type { WorkspaceExposure, WebExposureEntry } from './web-exposure.js';
+import { DEFAULT_HTTP_HANDLER } from './web-exposure.js';
 
 const log = new Log('WebGateway');
 
@@ -52,6 +57,60 @@ const BLOCKED_METHODS = new Set([
 ]);
 
 interface ApiToken { id: string; name: string; hash: string; createdAt: number; lastUsedAt?: number; }
+
+/** What an `http` entry's handler receives: one HTTP request, whole. */
+export interface WebRequest {
+  method: string;
+  /** The part of the path after the abject's route, from '/'. */
+  path: string;
+  /** The abject's route, `/<workspace>/<abject>`: prefix links and redirects with it. */
+  basePath: string;
+  /** Query parameters; a repeated name gives a list. */
+  query: Record<string, string | string[]>;
+  /** Request headers, lowercased names. */
+  headers: Record<string, string>;
+  /** Cookies the browser sent for this route. */
+  cookies: Record<string, string>;
+  /** The body as text, for textual content types (JSON, forms, text, XML). */
+  body?: string;
+  /** The body as base64, for anything else. */
+  bodyBase64?: string;
+  remoteAddress?: string;
+}
+
+/** A cookie to set. Defaults: Path is the abject's route, HttpOnly, SameSite=Lax. */
+export interface WebCookie {
+  name: string;
+  /** null deletes the cookie. */
+  value: string | null;
+  path?: string;
+  domain?: string;
+  maxAge?: number;
+  expires?: string;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
+/** What an `http` entry's handler answers. Everything is optional; {} is an empty 200. */
+export interface WebResponse {
+  status?: number;
+  headers?: Record<string, string>;
+  cookies?: WebCookie[];
+  /** A text body. Content-Type defaults to text/plain. */
+  body?: string;
+  /** A binary body. */
+  bodyBase64?: string;
+  /** A JSON body; sets Content-Type to application/json. */
+  json?: unknown;
+  /** Redirect here; status defaults to 302. */
+  redirect?: string;
+}
+
+/** Headers that belong to the connection, never to a handler. */
+const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'content-length']);
+const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface WebGatewayArgs { port: number; bind?: string; authConfig: AuthConfig; sessions: SessionStore; }
 
@@ -224,11 +283,12 @@ export class WebGateway extends Abject {
   }
 
   private routes() {
-    const out: Array<{ workspace: string; workspaceSlug: string; abject: string; access: string; methods: string[] | null; path: string }> = [];
+    const out: Array<{ workspace: string; workspaceSlug: string; abject: string; access: string; methods: string[] | null; mode: string; path: string }> = [];
     for (const ws of this.workspaces.values()) {
       if (!ws.enabled) continue;
       for (const [name, e] of Object.entries(ws.entries)) {
-        out.push({ workspace: ws.name, workspaceSlug: ws.slug, abject: name, access: e.access, methods: e.methods, path: `/${ws.slug}/${this.slug(name)}` });
+        out.push({ workspace: ws.name, workspaceSlug: ws.slug, abject: name, access: e.access, methods: e.methods,
+          mode: e.mode ?? 'methods', path: `/${ws.slug}/${this.slug(name)}` });
       }
     }
     return out;
@@ -323,6 +383,8 @@ export class WebGateway extends Abject {
       const reg = await this.resolveAbject(ws, entryName);
       if (!reg) return this.fail(res, 404, 'Abject is not running', wantsJson);
 
+      if (entry.mode === 'http') return this.serveHttp(req, res, url, ws, entryName, entry, reg);
+
       // GET /<ws>/<abject>[/openapi.json]  — the interface
       if (req.method === 'GET') {
         if (parts.length === 3 && parts[2] === 'openapi.json') return this.sendJson(res, 200, this.openapi(ws, entryName, reg.manifest, entry));
@@ -346,6 +408,65 @@ export class WebGateway extends Abject {
       log.warn(`request failed: ${err instanceof Error ? err.message : String(err)}`);
       try { this.fail(res, 500, 'Internal error', false); } catch { /* response already gone */ }
     }
+  }
+
+  /**
+   * An `http` entry: hand the whole request to the abject's handler and
+   * write back what it answers. The handler owns the response; the gateway
+   * keeps what must not be the handler's to decide: hop-by-hop headers,
+   * content length, cookie scoping (one route's cookies stay off another's,
+   * so two workspaces on one host cannot read each other's sessions), and
+   * errors that do not leak the handler's internals to the public.
+   */
+  private async serveHttp(
+    req: http.IncomingMessage, res: http.ServerResponse, url: URL,
+    ws: WorkspaceExposure, name: string, entry: WebExposureEntry,
+    reg: { id: AbjectId; manifest: AbjectManifest },
+  ): Promise<void> {
+    const handler = entry.handler ?? DEFAULT_HTTP_HANDLER;
+    if (BLOCKED_METHODS.has(handler) || !reg.manifest.interface.methods.some(m => m.name === handler)) {
+      log.warn(`${name} is exposed in http mode but does not declare its handler '${handler}'`);
+      return this.fail(res, 500, 'This route is not available', false);
+    }
+    const basePath = `/${ws.slug}/${this.slug(name)}`;
+    const raw = await this.readRawBody(req);
+    if (raw === undefined) return this.fail(res, 413, 'Body too large', false);
+    const contentType = String(req.headers['content-type'] ?? '');
+    const payload: WebRequest = {
+      method: req.method ?? 'GET',
+      path: url.pathname.slice(basePath.length) || '/',
+      basePath,
+      query: queryObject(url.searchParams),
+      headers: requestHeaders(req.headers),
+      cookies: parseCookies(req.headers.cookie),
+      ...(raw.length === 0 ? {}
+        : isTextual(contentType) ? { body: raw.toString('utf8') } : { bodyBase64: raw.toString('base64') }),
+      ...(req.socket.remoteAddress ? { remoteAddress: req.socket.remoteAddress } : {}),
+    };
+    let reply: WebResponse | null;
+    try {
+      reply = await this.request<WebResponse | null>(request(this.id, reg.id, handler, payload), CALL_TIMEOUT_MS);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn(`${name}.${handler} failed on ${payload.method} ${url.pathname}: ${message}`);
+      return this.fail(res, /timeout/i.test(message) ? 504 : 500, /timeout/i.test(message) ? 'Timed out' : 'Internal error', false);
+    }
+    try {
+      writeWebResponse(res, reply ?? {}, basePath);
+    } catch (err) {
+      log.warn(`${name}.${handler} answered something that is not a valid response: ${err instanceof Error ? err.message : String(err)}`);
+      if (!res.headersSent) this.fail(res, 500, 'Internal error', false);
+      else res.destroy();
+    }
+  }
+
+  private readRawBody(req: http.IncomingMessage): Promise<Buffer | undefined> {
+    return new Promise((resolve) => {
+      let size = 0; const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => { size += c.length; if (size > MAX_BODY_BYTES) { resolve(undefined); req.destroy(); } else chunks.push(c); });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', () => resolve(Buffer.alloc(0)));
+    });
   }
 
   private checkAuth(req: http.IncomingMessage, entry: WebExposureEntry): string | undefined {
@@ -469,6 +590,109 @@ export class WebGateway extends Abject {
     if (json) return this.sendJson(res, status, { ok: false, error: message });
     this.sendHtml(res, status, `${status}`, `<h1>${status}</h1><p>${esc(message)}</p><p><a href="/">gateway</a></p>`);
   }
+}
+
+function queryObject(params: URLSearchParams): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const key of new Set(params.keys())) {
+    const all = params.getAll(key);
+    out[key] = all.length === 1 ? all[0] : all;
+  }
+  return out;
+}
+
+function requestHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined || HOP_BY_HOP.has(name)) continue;
+    out[name] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return out;
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const name = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    if (!COOKIE_NAME.test(name) || name in out) continue;
+    try { out[name] = decodeURIComponent(value); } catch { out[name] = value; }
+  }
+  return out;
+}
+
+function isTextual(contentType: string): boolean {
+  return /^(text\/|application\/(json|[a-z0-9.+-]*\+json|x-www-form-urlencoded|xml|[a-z0-9.+-]*\+xml|javascript))/i.test(contentType.trim());
+}
+
+function serializeCookie(cookie: WebCookie, basePath: string): string {
+  if (!cookie || typeof cookie.name !== 'string' || !COOKIE_NAME.test(cookie.name)) {
+    throw new Error(`invalid cookie name ${JSON.stringify(cookie?.name)}`);
+  }
+  const parts = [`${cookie.name}=${cookie.value === null ? '' : encodeURIComponent(String(cookie.value))}`];
+  const path = cookie.path ?? basePath;
+  if (!/^\/[^;\r\n]*$/.test(path)) throw new Error(`invalid cookie path ${JSON.stringify(path)}`);
+  parts.push(`Path=${path}`);
+  if (cookie.domain !== undefined) {
+    if (!/^[A-Za-z0-9.-]+$/.test(cookie.domain)) throw new Error(`invalid cookie domain ${JSON.stringify(cookie.domain)}`);
+    parts.push(`Domain=${cookie.domain}`);
+  }
+  if (cookie.value === null) parts.push('Max-Age=0');
+  else if (cookie.maxAge !== undefined) parts.push(`Max-Age=${Math.trunc(Number(cookie.maxAge))}`);
+  if (cookie.expires !== undefined && cookie.value !== null) {
+    const when = new Date(cookie.expires);
+    if (Number.isNaN(when.getTime())) throw new Error(`invalid cookie expiry ${JSON.stringify(cookie.expires)}`);
+    parts.push(`Expires=${when.toUTCString()}`);
+  }
+  if (cookie.httpOnly !== false) parts.push('HttpOnly');
+  const sameSite = cookie.sameSite ?? 'Lax';
+  if (!['Strict', 'Lax', 'None'].includes(sameSite)) throw new Error(`invalid SameSite ${JSON.stringify(sameSite)}`);
+  parts.push(`SameSite=${sameSite}`);
+  // Browsers drop SameSite=None cookies that are not Secure.
+  if (cookie.secure || sameSite === 'None') parts.push('Secure');
+  return parts.join('; ');
+}
+
+/**
+ * Write an http handler's reply. Throws (before anything is sent) on a reply
+ * that is not a valid response: a bad status, header, or cookie.
+ */
+function writeWebResponse(res: http.ServerResponse, reply: WebResponse, basePath: string): void {
+  let status = reply.status ?? (reply.redirect !== undefined ? 302 : 200);
+  if (!Number.isInteger(status) || status < 100 || status > 599) throw new Error(`invalid status ${String(reply.status)}`);
+  const headers: Record<string, string | string[]> = { 'X-Content-Type-Options': 'nosniff' };
+  for (const [name, value] of Object.entries(reply.headers ?? {})) {
+    const lower = name.toLowerCase();
+    // Cookies go through `cookies`, which scopes them to this route.
+    if (HOP_BY_HOP.has(lower) || lower === 'set-cookie') continue;
+    headers[name] = String(value);
+  }
+  if (reply.redirect !== undefined) {
+    if (typeof reply.redirect !== 'string' || /[\r\n]/.test(reply.redirect)) throw new Error('invalid redirect');
+    if (status < 300 || status > 399) status = 302;
+    headers.Location = reply.redirect;
+  }
+  const cookies = (reply.cookies ?? []).map((c) => serializeCookie(c, basePath));
+  if (cookies.length > 0) headers['Set-Cookie'] = cookies;
+
+  let body: Buffer | undefined;
+  const hasType = Object.keys(headers).some((h) => h.toLowerCase() === 'content-type');
+  if (reply.json !== undefined) {
+    body = Buffer.from(JSON.stringify(reply.json));
+    if (!hasType) headers['Content-Type'] = 'application/json; charset=utf-8';
+  } else if (reply.bodyBase64 !== undefined) {
+    body = Buffer.from(String(reply.bodyBase64), 'base64');
+    if (!hasType) headers['Content-Type'] = 'application/octet-stream';
+  } else if (reply.body !== undefined) {
+    body = Buffer.from(String(reply.body), 'utf8');
+    if (!hasType) headers['Content-Type'] = 'text/plain; charset=utf-8';
+  }
+  if (body && body.length > MAX_RESPONSE_BYTES) throw new Error(`body over ${MAX_RESPONSE_BYTES} bytes`);
+  // writeHead validates names and values (no CR/LF) and throws before sending.
+  res.writeHead(status, headers);
+  res.end(body);
 }
 
 function esc(s: string): string {

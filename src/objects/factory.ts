@@ -55,6 +55,8 @@ export interface PackageTypeRegistration {
   owner?: AbjectId;
   /** The package this type came from, for the Packages settings view. */
   package?: { name: string; version: string };
+  /** Workspace scope: the workspace profiles it joins; none means `default`. */
+  profiles?: string[];
 }
 
 /**
@@ -381,7 +383,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       require(registration.runtime === 'script', `unknown package runtime '${String(registration.runtime)}'`);
       require(registration.source.trim() !== '' && !isWasmSourceRef(registration.source),
         'a script package type needs JavaScript handler-map source');
-      require(registration.scope === 'workspace', 'script package types must be workspace-scoped');
+      require(registration.scope === 'workspace' || registration.scope === 'system',
+        `unknown package scope '${String(registration.scope)}'`);
       require(isPackageOwner(registration.owner), 'a script package type needs a package owner');
     }
     this.packageTypes.set(name, registration);
@@ -392,7 +395,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
    *  workspace-scoped packages alongside the built-in per-workspace set. */
   listPackageTypes(): Array<{
     name: string; scope: 'system' | 'workspace'; runtime: 'wasm' | 'script'; tags: string[];
-    package?: { name: string; version: string };
+    package?: { name: string; version: string }; profiles?: string[];
   }> {
     return Array.from(this.packageTypes.entries()).map(([name, t]) => ({
       name,
@@ -400,6 +403,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       runtime: t.runtime,
       tags: [...(t.manifest.tags ?? [])],
       ...(t.package ? { package: { ...t.package } } : {}),
+      ...(t.profiles ? { profiles: [...t.profiles] } : {}),
     }));
   }
 
@@ -634,6 +638,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       if (trackedName === WASM_ABJECT_CONSTRUCTOR
           || (existingReg?.source && isWasmSourceRef(existingReg.source))) {
         constructorName = WASM_ABJECT_CONSTRUCTOR;
+      } else if (trackedName === 'ScriptableAbject' && existingReg?.source) {
+        // Same for source-backed objects: a script package abject is
+        // supervised under its type name, which no worker has a constructor
+        // for; it runs, and so restarts, as a ScriptableAbject.
+        constructorName = 'ScriptableAbject';
       }
       const isScriptable = constructorName === 'ScriptableAbject';
       const isWasm = constructorName === WASM_ABJECT_CONSTRUCTOR;

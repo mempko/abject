@@ -27,6 +27,7 @@ import {
   readPackage, resolvePackages, discoverPackages, packageRoots, ingestAllExtensions, parseSettingSpecs,
 } from '../sandbox/extensions.js';
 import { readPackageConfig, writePackageConfig } from '../sandbox/package-config.js';
+import { Registry } from './registry.js';
 
 // ── Fixtures ────────────────────────────────────────────────────────
 
@@ -157,10 +158,9 @@ test('readPackage reads a script package: inline manifest, plain JS entry, snaps
 test('readPackage refuses script packages it could not run correctly', async () => {
   const env = tempEnv();
   try {
-    await assert.rejects(
-      readPackage(writePackage(path.join(env.pkgDir, 'Sys'), scriptMeta('Sys', { scope: 'system' }), { 'main.js': COUNTER_SOURCE })),
-      /workspace-scoped/,
-    );
+    // System scope is allowed for script packages (one per instance, data kept by Packages).
+    const sys = await readPackage(writePackage(path.join(env.pkgDir, 'Sys'), scriptMeta('Sys', { scope: 'system' }), { 'main.js': COUNTER_SOURCE }));
+    assert.equal(sys.scope, 'system');
     await assert.rejects(
       readPackage(writePackage(path.join(env.pkgDir, 'Unbuilt'),
         { name: 'Unbuilt', version: '1.0.0', runtime: 'script', scope: 'workspace', entry: 'x.ts', manifest: manifestFor('Unbuilt') },
@@ -298,6 +298,47 @@ test('package data persists under package/<Type>, comes back through getPackageD
       typeId: 'peer/ws2/Counter',
     });
     assert.equal(await probe.ask<number>(again, 'get'), 3);
+  } finally {
+    await rt.stop();
+    env.restore();
+  }
+});
+
+test('a system-scope script package keeps its data with Packages, which answers only that abject', async () => {
+  const env = tempEnv();
+  const { rt, probe } = await startRuntime();
+  try {
+    const factory = rt.objectFactory;
+    await factory.spawnInstance(new Storage());
+    const packages = new Packages();
+    await factory.spawnInstance(packages);
+    factory.registerPackageType('Beacon', {
+      runtime: 'script', scope: 'system', manifest: manifestFor('Beacon'), source: COUNTER_SOURCE,
+      owner: packageOwner('beacon-pkg'), package: { name: 'beacon-pkg', version: '1.0.0' },
+    });
+
+    // Spawned the way the bootstrap does: by name, into the global registry,
+    // which has no AbjectStore.
+    const id = await spawnByName(rt, 'Beacon', { typeId: 'peer/system/Beacon' });
+    assert.equal(await probe.ask<number>(id, 'add', { by: 4 }), 4);
+    const persisted = await probe.ask<{ success: boolean; data: unknown }>(id, 'persistSnapshot', {});
+    assert.deepEqual(persisted.data, { count: 4 }, 'the durable copy is the one Packages holds');
+
+    // Spawned again (a restart): it loads its own data before handling anything.
+    const again = await spawnByName(rt, 'Beacon', { typeId: 'peer/system/Beacon-restarted' });
+    assert.equal(await probe.ask<number>(again, 'get'), 4);
+
+    // Nobody else reads or writes it: not an ordinary object...
+    await assert.rejects(probe.ask(packages.id, 'getPackageData', {}), /installed script package/);
+    await assert.rejects(probe.ask(packages.id, 'savePackageData', { data: { count: 99 } }), /installed script package/);
+    // ...and not the same package's abject in a workspace, which keeps its data
+    // in that workspace's AbjectStore.
+    const workspaceRegistry = new Registry();
+    await factory.spawnInstance(workspaceRegistry);
+    const inWorkspace = await spawnByName(rt, 'Beacon', { typeId: 'peer/ws/Beacon', registryHint: workspaceRegistry.id });
+    await assert.rejects(probe.ask(inWorkspace, 'add', { by: 1 }), /AbjectStore unavailable/,
+      'a workspace copy without its store is not let into the system copy\'s data');
+    assert.equal(await probe.ask<number>(again, 'get'), 4);
   } finally {
     await rt.stop();
     env.restore();

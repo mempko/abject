@@ -22,6 +22,9 @@ import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from './sidebar.js';
 import { namesFromTypeIds, nameFromTypeId } from './exposure-selectors.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
+import {
+  DEFAULT_PROFILE, INFRA_OBJECTS, loadWorkspaceProfiles, packageInProfile, type WorkspaceProfile,
+} from './workspace-profiles.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
 const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
@@ -48,30 +51,6 @@ const STORAGE_KEY_LIST = 'workspaces:list';
 const STORAGE_KEY_ACTIVE = 'workspaces:active';
 
 const wsLog = new Log('WORKSPACE-MANAGER');
-
-/** Infrastructure objects — always spawned for every workspace (no UI). */
-const INFRA_OBJECTS = [
-  'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
-  'GoalManager', 'JobManager', 'TaskSession', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
-  // ExternalProjectRegistry precedes ExternalCreator: the agent resolves it at init.
-  'ExternalProjectRegistry', 'ExternalCreator', 'ObjectCreator',
-  // TaskReviewer discovers KnowledgeBase, so it spawns after it.
-  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'AgentEvaluation', 'ChatManager',
-  'Console', 'CollectionStore', 'TriggerManager', 'WebExposure',
-] as const;
-
-/** UI objects — deferred for inactive workspaces, spawned on first switch. */
-const UI_OBJECTS = [
-  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ExternalProjectBrowser', 'ChatBrowser',
-  // Taskbar resolves its optional browsers at init, so every object it offers a
-  // row for has to be spawned before it.
-  'AbjectEditor', 'PeersViewer', 'Taskbar',
-  'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
-] as const;
-
-/** All per-workspace objects in dependency order. */
-const PER_WORKSPACE_OBJECTS = [...INFRA_OBJECTS, ...UI_OBJECTS];
 
 export type WorkspaceAccessMode = 'local' | 'shared' | 'public';
 
@@ -110,6 +89,14 @@ export interface WorkspaceInfo {
   uiObjects: Array<{ id: AbjectId; iface: InterfaceId }>;
   childTypeIds: Map<AbjectId, TypeId>;
   uiSpawned: boolean;
+  /**
+   * The profile this workspace was created with, and the objects it named
+   * when the workspace came up. Recovery rebuilds from these, so a later
+   * change to profiles.json does not reshape a running workspace.
+   */
+  profile: string;
+  profileObjects: readonly string[];
+  profileUi: readonly string[];
   /**
    * True when this record mirrors a workspace hosted by a remote peer. Joined
    * records are first-class workspaces locally — own registry, own taskbar —
@@ -168,6 +155,8 @@ interface PersistedWorkspace {
   joined?: boolean;
   ownerPeerId?: string;
   participants?: string[];
+  /** Workspace profile; absent for workspaces created before profiles (default). */
+  profile?: string;
 }
 
 /** Route shape both invite-link forms parse into (what WorkspaceShareRegistry consumes). */
@@ -230,6 +219,8 @@ export class WorkspaceManager extends Abject {
    * to recover fields its call site does not carry (joined/owner/participants).
    */
   private persistedById: Map<string, PersistedWorkspace> = new Map();
+  /** Saved workspaces not brought up because their profile is not defined. */
+  private unrestored: Map<string, PersistedWorkspace> = new Map();
   private activeWorkspaceId?: string;
   private peerId?: string;
   private globalStorageId?: AbjectId;
@@ -260,15 +251,27 @@ export class WorkspaceManager extends Abject {
             methods: [
               {
                 name: 'createWorkspace',
-                description: 'Create a new workspace',
+                description: 'Create a new workspace. Its profile decides which built-in objects and packages it gets (listProfiles); the default profile is the full set.',
                 parameters: [
                   {
                     name: 'name',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Workspace name',
                   },
+                  {
+                    name: 'profile',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Workspace profile (default: "default")',
+                    optional: true,
+                  },
                 ],
                 returns: { kind: 'object', properties: { workspaceId: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'listProfiles',
+                description: 'The workspace profiles this instance knows: built-in (default, service) and those in profiles.json, each with the objects it gives a workspace; and any problems reading profiles.json.',
+                parameters: [],
+                returns: { kind: 'object', properties: {} },
               },
               {
                 name: 'deleteWorkspace',
@@ -527,9 +530,11 @@ export class WorkspaceManager extends Abject {
 
   private setupHandlers(): void {
     this.on('createWorkspace', async (msg: AbjectMessage) => {
-      const { name } = msg.payload as { name: string };
-      return this.createWorkspace(name);
+      const { name, profile } = msg.payload as { name: string; profile?: string };
+      return this.createWorkspace(name, profile);
     });
+
+    this.on('listProfiles', async () => this.listProfiles());
 
     this.on('recoverLostObjects', async (msg: AbjectMessage) => {
       const { objectIds, reason } = msg.payload as { objectIds: string[]; reason?: string };
@@ -789,7 +794,7 @@ export class WorkspaceManager extends Abject {
       const activeWs = persisted.find(ws => ws.id === targetId)!;
       await this.restoreWorkspace(activeWs.id, activeWs.name, normalizeAccessMode(activeWs.accessMode),
         activeWs.whitelist ?? [], activeWs.exposedTypeIds ?? [], activeWs.description ?? '',
-        activeWs.tags ?? [], true);
+        activeWs.tags ?? [], true, activeWs.profile);
       log.timed(`active workspace '${activeWs.name}' restored`);
 
       // Switch to active workspace immediately — UI is ready
@@ -815,7 +820,7 @@ export class WorkspaceManager extends Abject {
     for (const ws of workspaces) {
       try {
         await this.restoreWorkspace(ws.id, ws.name, normalizeAccessMode(ws.accessMode), ws.whitelist ?? [],
-          ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? [], false);
+          ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? [], false, ws.profile);
       } catch (err) {
         wsLog.warn(`Failed to restore workspace '${ws.name}':`, err);
       }
@@ -826,17 +831,36 @@ export class WorkspaceManager extends Abject {
 
   // ── Workspace Lifecycle ──
 
-  async createWorkspace(name: string): Promise<{ workspaceId: string }> {
+  async createWorkspace(name: string, profileName: string = DEFAULT_PROFILE): Promise<{ workspaceId: string }> {
     precondition(name !== '', 'workspace name must not be empty');
+    const profile = this.profileNamed(profileName);
+    precondition(!!profile, `no workspace profile named '${profileName}' (listProfiles)`);
 
     const workspaceId = uuidv4();
-    const info = await this.spawnWorkspaceObjects(workspaceId, name);
+    const info = await this.spawnWorkspaceObjects(workspaceId, name, [...profile!.objects, ...profile!.ui], profile!);
     this.workspaces.set(workspaceId, info);
 
     await this.persistWorkspaceList();
 
-    wsLog.info(`Created workspace '${name}' (${workspaceId})`);
+    wsLog.info(`Created workspace '${name}' (${workspaceId}, profile ${profile!.name})`);
     return { workspaceId };
+  }
+
+  /** A profile by name, read fresh from profiles.json (so one added there needs no restart to use). */
+  private profileNamed(name: string): WorkspaceProfile | undefined {
+    const { profiles, problems } = loadWorkspaceProfiles();
+    for (const problem of problems) wsLog.warn(`profiles.json: ${problem}`);
+    return profiles.get(name);
+  }
+
+  listProfiles(): { profiles: Array<{ name: string; description: string; objects: string[]; origin: string }>; problems: string[] } {
+    const { profiles, problems } = loadWorkspaceProfiles();
+    return {
+      profiles: [...profiles.values()].map((p) => ({
+        name: p.name, description: p.description, objects: [...p.objects, ...p.ui], origin: p.origin,
+      })),
+      problems,
+    };
   }
 
   async deleteWorkspace(workspaceId: string): Promise<boolean> {
@@ -984,8 +1008,9 @@ export class WorkspaceManager extends Abject {
         try { await this.request(request(this.id, this.globalRegistryId, 'unregister', { objectId: ws.registryId })); } catch { /* already gone */ }
       }
 
-      const objects = ws.uiSpawned ? PER_WORKSPACE_OBJECTS : INFRA_OBJECTS;
-      const info = await this.spawnWorkspaceObjects(workspaceId, ws.name, objects);
+      const objects = ws.uiSpawned ? [...ws.profileObjects, ...ws.profileUi] : ws.profileObjects;
+      const info = await this.spawnWorkspaceObjects(workspaceId, ws.name, objects,
+        { name: ws.profile, objects: ws.profileObjects, ui: ws.profileUi });
       info.accessMode = ws.accessMode;
       info.whitelist = ws.whitelist;
       info.description = ws.description;
@@ -1253,6 +1278,7 @@ export class WorkspaceManager extends Abject {
     accessMode: WorkspaceAccessMode;
     joined?: boolean;
     ownerPeerId?: string;
+    profile: string;
   }> {
     // Joined records deliberately keep `accessMode: 'local'` so restart recovery
     // never re-advertises a peer's workspace as one we host. That makes access
@@ -1264,6 +1290,7 @@ export class WorkspaceManager extends Abject {
       accessMode: ws.accessMode,
       joined: ws.joined,
       ownerPeerId: ws.ownerPeerId,
+      profile: ws.profile,
     }));
   }
 
@@ -1726,7 +1753,7 @@ export class WorkspaceManager extends Abject {
       ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
-    for (const objName of UI_OBJECTS) {
+    for (const objName of ws.profileUi) {
       const typeId = this.computeTypeId(workspaceId, objName);
       let result: SpawnResult;
       try {
@@ -1786,7 +1813,8 @@ export class WorkspaceManager extends Abject {
    */
   private async spawnWorkspaceObjects(
     workspaceId: string, name: string,
-    objectsToSpawn: readonly string[] = PER_WORKSPACE_OBJECTS,
+    objectsToSpawn: readonly string[],
+    profile: Pick<WorkspaceProfile, 'name' | 'objects' | 'ui'>,
   ): Promise<WorkspaceInfo> {
     const log = new Log(`WS-SPAWN:${name}`);
     // 1. Spawn WorkspaceRegistry (skip all registries — we register manually)
@@ -1916,11 +1944,12 @@ export class WorkspaceManager extends Abject {
     // ones tagged 'autostart' get a `startup` call once spawned.
     const scriptPackages = new Map<string, { autostart: boolean }>();
     try {
-      const packageTypes = await this.request<Array<{ name: string; scope: string; runtime: string; tags?: string[] }>>(
+      const packageTypes = await this.request<Array<{ name: string; scope: string; runtime: string; tags?: string[]; profiles?: string[] }>>(
         request(this.id, this.factoryId!, 'listPackageTypes', {})
       );
+      // Only the packages that join this workspace's profile.
       extensionNames = packageTypes
-        .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name))
+        .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name) && packageInProfile(profile.name, t.profiles))
         .map((t) => t.name);
       for (const t of packageTypes) {
         if (t.runtime === 'script') scriptPackages.set(t.name, { autostart: !!t.tags?.includes('autostart') });
@@ -2059,7 +2088,10 @@ export class WorkspaceManager extends Abject {
       uiObjects,
       childTypeIds,
       participants: [],
-      uiSpawned: objectsToSpawn.includes('Taskbar'),
+      uiSpawned: profile.ui.every((o) => objectsToSpawn.includes(o)),
+      profile: profile.name,
+      profileObjects: [...profile.objects],
+      profileUi: [...profile.ui],
     };
   }
 
@@ -2070,10 +2102,20 @@ export class WorkspaceManager extends Abject {
     workspaceId: string, name: string,
     accessMode: WorkspaceAccessMode = 'local', whitelist: string[] = [],
     exposedTypeIds: string[] = [], description: string = '', tags: string[] = [],
-    isActive: boolean = true,
+    isActive: boolean = true, profileName: string = DEFAULT_PROFILE,
   ): Promise<void> {
-    const objectsToSpawn = isActive ? PER_WORKSPACE_OBJECTS : INFRA_OBJECTS;
-    const info = await this.spawnWorkspaceObjects(workspaceId, name, objectsToSpawn);
+    // Never under another profile: an organization's partition brought up as
+    // `default` would get the agent stack it was created without. Left down
+    // and kept in the saved list until the profile is defined again.
+    const profile = this.profileNamed(profileName);
+    if (!profile) {
+      wsLog.error(`Not restoring workspace '${name}' (${workspaceId}): its profile '${profileName}' is not defined (profiles.json)`);
+      const persisted = this.persistedById.get(workspaceId);
+      if (persisted) this.unrestored.set(workspaceId, persisted);
+      return;
+    }
+    const objectsToSpawn = isActive ? [...profile.objects, ...profile.ui] : profile.objects;
+    const info = await this.spawnWorkspaceObjects(workspaceId, name, objectsToSpawn, profile);
     info.accessMode = accessMode;
     info.whitelist = whitelist;
     info.description = description;
@@ -2522,7 +2564,8 @@ export class WorkspaceManager extends Abject {
     const wsName = name || `Shared ${workspaceId.slice(0, 8)}`;
     // INFRA_OBJECTS only: the dedicated registry has to exist right now (the
     // catalog sync targets it), while the UI follows on the first switch.
-    const info = await this.spawnWorkspaceObjects(workspaceId, wsName, INFRA_OBJECTS);
+    const info = await this.spawnWorkspaceObjects(workspaceId, wsName, INFRA_OBJECTS,
+      this.profileNamed(DEFAULT_PROFILE)!);
     info.joined = true;
     info.ownerPeerId = ownerPeerId;
     info.description = `Shared workspace hosted by peer ${ownerPeerId}`;
@@ -2613,9 +2656,14 @@ export class WorkspaceManager extends Abject {
         joined: ws.joined,
         ownerPeerId: ws.ownerPeerId,
         participants: ws.participants ? [...ws.participants] : undefined,
+        profile: ws.profile,
         createdAt: Date.now(),
       };
     });
+    // Workspaces left down because their profile is missing stay on the list.
+    for (const [id, rec] of this.unrestored) {
+      if (!this.workspaces.has(id)) list.push(rec);
+    }
     try {
       await this.request(
         request(this.id, this.globalStorageId!, 'set', {

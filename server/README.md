@@ -66,6 +66,19 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
 | `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
 | `OPENAI_API_KEY` | - | OpenAI API key |
 | `ABJECTS_WORKER_COUNT` | CPU cores | Worker thread pool size |
+| `ABJECTS_WORKER_MAX_OLD_SPACE_MB` | sized from memory | Heap ceiling per worker thread (default: three quarters of memory less 512 MB, shared across pool and dedicated workers, 512 MB to 8 GB) |
+| `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | HTTP gateway port and address |
+
+**Health and version.** The WebSocket port also answers plain HTTP: `GET
+/healthz` (503 `starting` until boot finishes, then 200 `ok` with version,
+uptime, Node, platform, worker count) and `GET /version`. Abjects read the
+same from the `InstanceInfo` object. The compiled server (`pnpm bind`) has its
+version built in.
+
+**Running headless.** `pnpm incarnate:server` packages the compiled server,
+its workers, the bundled packages and its runtime dependencies as a tarball
+with a launcher (`bin/abject-server`, which checks for Node 22.5+) and a
+systemd unit; see `deploy/README.md`.
 | `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated); pinned, not changeable at runtime |
 | `ABJECTS_PEER_ADMISSION` | `open` | `allowlist` pins allowlist mode: only allowed peers may connect |
 | `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |

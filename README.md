@@ -106,7 +106,7 @@ who can reach, who can speak.
 
 ### Prerequisites
 
-- **Node.js 20+** (recommended). Node 18 works but requires the `--experimental-global-webcrypto` flag. Download from [nodejs.org](https://nodejs.org) or use [nvm](https://github.com/nvm-sh/nvm).
+- **Node.js 22.5+** (the server uses `node:sqlite`). Download from [nodejs.org](https://nodejs.org) or use [nvm](https://github.com/nvm-sh/nvm) (`.nvmrc` pins 22).
 - **pnpm** - install via `npm install -g pnpm` or see [pnpm.io/installation](https://pnpm.io/installation) for other methods (Homebrew, Corepack, standalone script, etc.).
 
 ### Setup
@@ -139,6 +139,7 @@ pnpm commune                    # connects to ws://localhost:7723
 | `pnpm scry` | Start the thin browser client (Canvas UI over WebSocket) |
 | `pnpm whisper` | Start a local signaling server (optional, `signal.abject.world` is used by default) |
 | `pnpm commune` | Terminal client: chat with your Abjects from a tabbed TUI |
+| `pnpm incarnate:server` | Package the headless server (no desktop) as a tarball with a systemd unit; see [deploy/README.md](deploy/README.md) |
 
 Three processes. One living system.
 
@@ -319,6 +320,8 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
+| `ABJECTS_WORKER_MAX_OLD_SPACE_MB` | sized from memory | Heap ceiling per worker (default: three quarters of memory less 512 MB, shared across workers, 512 MB to 8 GB) |
+| `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | The HTTP gateway's port and address (see [docs/WEB_GATEWAY.md](docs/WEB_GATEWAY.md)) |
 | `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
 | `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
 | `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated `ws://`/`wss://`); servers learned from peers and the public default are never used (see [WHISPER.md](WHISPER.md)) |
@@ -326,6 +329,11 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |
 
 API keys can also be configured through the Global Settings UI at runtime.
+
+Beside the environment, the data directory holds `packages.json` (packages and
+their settings, [docs/PACKAGES.md](docs/PACKAGES.md)) and `profiles.json`
+(workspace profiles, [docs/WORKSPACE_PROFILES.md](docs/WORKSPACE_PROFILES.md)).
+The server answers `GET /healthz` and `GET /version` on its WebSocket port.
 
 The signaling server and its optional TURN relay have their own environment and
 deployment guide in [WHISPER.md](WHISPER.md).

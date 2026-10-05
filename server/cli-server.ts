@@ -331,7 +331,11 @@ export class CliServer extends Abject {
       case 'switchWorkspace': return this.wsmRequest('switchWorkspace', {
         workspaceId: this.str(params, 'workspaceId'),
       });
-      case 'createWorkspace': return this.wsmRequest('createWorkspace', { name: this.str(params, 'name') });
+      case 'createWorkspace': return this.wsmRequest('createWorkspace', {
+        name: this.str(params, 'name'),
+        ...(typeof params.profile === 'string' && params.profile !== '' ? { profile: params.profile } : {}),
+      });
+      case 'listProfiles': return this.wsmRequest('listProfiles', {});
       case 'renameWorkspace': return this.wsmRequest('renameWorkspace', {
         workspaceId: this.str(params, 'workspaceId'), name: this.str(params, 'name'),
       });
