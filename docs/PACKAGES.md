@@ -158,6 +158,11 @@ Values come back with defaults filled in and secrets included. Observe the
   spawns system-scoped types (WASM and script) once, under the Supervisor.
   Abjects tagged `autostart` get a `startup` call after spawning, at either
   scope.
+- **A row in the System section.** A system-scoped abject tagged `launcher`
+  that has `show` and `hide` methods gets a row in the dock's System section
+  (GlobalToolbar), with its manifest's name and icon; clicking the row calls
+  `show`. Rows come and go as such abjects register and unregister. Tag it
+  `system` as well, or it is also listed in each workspace's Abjects section.
 - **Read-only.** Script package abjects are owned by `package:<name>`. They
   refuse source and manifest edits from everyone, ObjectCreator and
   AbjectEditor included. Change the package and reinstall it. The Factory

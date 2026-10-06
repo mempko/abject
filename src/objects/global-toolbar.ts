@@ -2,10 +2,13 @@
  * GlobalToolbar -- persistent chromeless panel positioned below WorkspaceSwitcher.
  *
  * Provides quick-access buttons for GlobalSettings (API Keys) and
- * PeerNetwork (identity, signaling, contacts).
+ * PeerNetwork (identity, signaling, contacts), plus a row for every global
+ * abject that asks for one: tagged `launcher`, with `show` and `hide` methods
+ * (a system-scope package with a window, say). Tag it `system` as well to keep
+ * it out of the per-workspace Abjects list.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { event, request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
@@ -20,6 +23,21 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
 const PEER_NETWORK_INTERFACE: InterfaceId = 'abjects:peer-network';
+
+/**
+ * The registrations that get a System row: local abjects tagged `launcher`
+ * that can `show` and `hide`, by name, with a plain icon when they have none.
+ */
+export function launchersFrom(all: ObjectRegistration[]): Array<{ id: AbjectId; name: string; icon: string }> {
+  return all
+    .filter(o => !o.ownerPeerId && (o.manifest.tags ?? []).includes('launcher'))
+    .filter(o => {
+      const names = (o.manifest.interface?.methods ?? []).map(m => m.name);
+      return names.includes('show') && names.includes('hide');
+    })
+    .map(o => ({ id: o.id, name: o.manifest.name, icon: o.manifest.icon?.trim() || '\u25A3' }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
 
 export class GlobalToolbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -48,6 +66,12 @@ export class GlobalToolbar extends Abject {
   private processesBtnId?: AbjectId;
   private llmMonitorBtnId?: AbjectId;
   private notificationsBtnId?: AbjectId;
+  /** Launcher rows: button widget → the abject it shows. */
+  private launcherBtns = new Map<AbjectId, AbjectId>();
+  /** The launchers the section was last built with (id:name:icon), to rebuild only on change. */
+  private launcherSignature = '';
+  private launcherRecheck?: ReturnType<typeof setTimeout>;
+  private registryId?: AbjectId;
 
   // Cached lookup for the active workspace's NotificationCenter. Refreshed
   // on every click in case the workspace switched.
@@ -144,6 +168,37 @@ LLMMonitor (The Eye).
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     await this.watchModelCalls();
+    // Launchers come and go with the global registry (packages spawn after us).
+    this.registryId = await this.discoverDep('Registry') ?? undefined;
+    if (this.registryId) {
+      try { await this.request(request(this.id, this.registryId, 'subscribe', {})); } catch { /* rows still load on show */ }
+    }
+  }
+
+  /** Global abjects asking for a System row: tagged `launcher`, with show and hide. */
+  private async listLaunchers(): Promise<Array<{ id: AbjectId; name: string; icon: string }>> {
+    if (!this.registryId) this.registryId = await this.discoverDep('Registry') ?? undefined;
+    if (!this.registryId) return [];
+    let all: ObjectRegistration[] = [];
+    try {
+      all = await this.request<ObjectRegistration[]>(request(this.id, this.registryId, 'list', {}));
+    } catch { return []; }
+    return launchersFrom(all);
+  }
+
+  /** A registry change may have added or removed a launcher: rebuild if the set changed. */
+  private scheduleLauncherRecheck(): void {
+    if (this.launcherRecheck) clearTimeout(this.launcherRecheck);
+    this.launcherRecheck = setTimeout(() => {
+      this.launcherRecheck = undefined;
+      void (async () => {
+        if (!this.windowId || this.collapsed) return;
+        const sig = (await this.listLaunchers()).map(l => `${l.id}:${l.name}:${l.icon}`).join('|');
+        if (sig === this.launcherSignature) return;
+        if (this.buildingUI) { this.scheduleLauncherRecheck(); return; }
+        await this.show();
+      })().catch(() => { /* best effort */ });
+    }, 400);
   }
 
   /**
@@ -211,6 +266,11 @@ LLMMonitor (The Eye).
       return this.hide();
     });
 
+    // The global registry announces spawns, exits and manifest swaps.
+    this.on('objectRegistered', async () => this.scheduleLauncherRecheck());
+    this.on('objectUnregistered', async () => this.scheduleLauncherRecheck());
+    this.on('manifestUpdated', async () => this.scheduleLauncherRecheck());
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (msg.routing.from === this.llmId
@@ -226,6 +286,13 @@ LLMMonitor (The Eye).
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
+
+      // A package's launcher row
+      const launcherTarget = this.launcherBtns.get(fromId);
+      if (launcherTarget) {
+        this.send(request(this.id, launcherTarget, 'show', {}));
+        return;
+      }
 
       // Section header — accordion toggle
       if (fromId === this.headerBtnId) {
@@ -373,6 +440,9 @@ LLMMonitor (The Eye).
     this.processesBtnId = undefined;
     this.llmMonitorBtnId = undefined;
     this.notificationsBtnId = undefined;
+    this.launcherBtns.clear();
+    const launchers = this.collapsed ? [] : await this.listLaunchers();
+    this.launcherSignature = launchers.map(l => `${l.id}:${l.name}:${l.icon}`).join('|');
 
     const btnW = 120;
     const btnH = 30;
@@ -420,6 +490,9 @@ LLMMonitor (The Eye).
         { type: 'button', windowId: this.windowId, text: row('eye', 'The Eye'), style: rowStyle('The Eye', 'eye') },
         { type: 'button', windowId: this.windowId, text: row('notifications', 'Notifications'), style: rowStyle('Notifications', 'notifications') },
       );
+      for (const l of launchers) {
+        specs.push({ type: 'button', windowId: this.windowId, text: compact ? l.icon : `${l.icon}  ${l.name}`, style: compact ? { ...rowStyle(l.name), tooltip: l.name } : rowStyle(l.name) });
+      }
     }
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs })
@@ -451,8 +524,10 @@ LLMMonitor (The Eye).
           { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
           { widgetId: this.llmMonitorBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
           { widgetId: this.notificationsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+          ...launchers.map((_, i) => ({ widgetId: widgetIds[rowStartIdx + 5 + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } })),
         ],
       }));
+      launchers.forEach((l, i) => this.launcherBtns.set(widgetIds[rowStartIdx + 5 + i], l.id));
     }
 
     // Fire-and-forget: register as dependent for all buttons
