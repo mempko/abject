@@ -4,6 +4,14 @@ copyright: Copyright © 2024-2026
 
 afterPack: electron/afterPack.cjs
 
+# Where the app's updater looks for new versions (written into the app as
+# resources/app-update.yml). CI builds with --publish never: the release job
+# uploads the assets, including latest*.yml and the .blockmap files.
+publish:
+  provider: github
+  owner: mempko
+  repo: abject
+
 directories:
   output: release
 
@@ -60,5 +68,9 @@ mac:
   category: public.app-category.utilities
 
 nsis:
+  # No spaces: latest.yml records this name, and GitHub turns spaces in an
+  # uploaded file's name into dots, so the default "Abject Setup X.exe" could
+  # not be found by the updater.
+  artifactName: ${productName}-Setup-${version}.${ext}
   oneClick: false
   allowToChangeInstallationDirectory: true

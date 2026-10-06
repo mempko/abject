@@ -8,11 +8,11 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
-import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
+import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
 import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
@@ -21,14 +21,26 @@ import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import type { PackageView, PackageDirView, PackageProblem } from './packages.js';
 import type { PackageSettingSpec } from '../sandbox/extensions.js';
 import { parsePrivateHost } from './capabilities/address-policy.js';
+import type { UpdateStatus } from './app-updater.js';
 
 const log = new Log('GlobalSettings');
 
-/** The settings window's tabs, in tab-bar order. */
-const SETTINGS_TABS = ['ai', 'auth', 'permissions', 'skills', 'packages'] as const;
+/**
+ * The settings window's tabs, in tab-bar order. Updates shows only in the
+ * packaged desktop app, where AppUpdater exists (see visibleTabs).
+ */
+const SETTINGS_TABS = ['ai', 'auth', 'permissions', 'skills', 'packages', 'updates'] as const;
 type SettingsTab = typeof SETTINGS_TABS[number];
 const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
-  ai: 'AI', auth: 'Auth', permissions: 'Permissions', skills: 'Skills & MCP', packages: 'Packages',
+  ai: 'AI', auth: 'Auth', permissions: 'Permissions', skills: 'Skills & MCP', packages: 'Packages', updates: 'Updates',
+};
+
+/** How each install gets a new version, as the Updates tab says it. */
+const UPDATE_INSTALL_NOTE: Record<UpdateStatus['installKind'], string> = {
+  nsis: 'New versions install when Abject restarts or quits.',
+  appimage: 'New versions replace this AppImage when Abject restarts or quits.',
+  deb: 'New versions install when you restart Abject, which asks for your password.',
+  manual: 'New versions are downloaded by hand.',
 };
 
 /** Content width of a settings card, for sizing word-wrapped labels. */
@@ -70,6 +82,19 @@ function packageStatusSentence(p: PackageView): string {
 }
 
 /** Convert a string array to ListItem array for list widgets. */
+/** "just now", "5 min ago", "3 h ago", "2 d ago". */
+function timeSince(t: number): string {
+  const min = Math.round((Date.now() - t) / 60_000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const h = Math.round(min / 60);
+  return h < 24 ? `${h} h ago` : `${Math.round(h / 24)} d ago`;
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
+}
+
 function toListItems(
   arr: string[],
 ): Array<{ label: string; value: string; actions: Array<{ id: string; label: string }> }> {
@@ -370,6 +395,20 @@ export class GlobalSettings extends Abject {
   private authContainerId?: AbjectId;
   private skillsContainerId?: AbjectId;
 
+  // Updates tab (packaged desktop app only: a view over AppUpdater)
+  private appUpdaterId?: AbjectId;
+  private updateStatus?: UpdateStatus;
+  /** The version the user was last notified about, so each is announced once. */
+  private announcedUpdateVersion?: string;
+  private workspaceManagerId?: AbjectId;
+  private updatesContainerId?: AbjectId;
+  private updStatusLabelId?: AbjectId;
+  private updProgressId?: AbjectId;
+  private updPrimaryBtnId?: AbjectId;
+  private updCheckBtnId?: AbjectId;
+  private updNotesBtnId?: AbjectId;
+  private updAutoCheckboxId?: AbjectId;
+
   // Packages tab (a view over the Packages object)
   private packagesContainerId?: AbjectId;
   private packagesObjectId?: AbjectId;
@@ -591,6 +630,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.uiServerId = await this.requireDep('UIServer');
+    // Packaged desktop app only: AppUpdater (spawned before us) feeds the Updates tab.
+    await this.connectAppUpdater();
 
     // Fetch provider descriptions before reading storage so we can derive
     // the per-provider credential keys, default tier models, and dropdown
@@ -946,11 +987,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return;
       }
 
+      // AppUpdater changes and Updates tab widgets
+      if (await this.handleUpdatesEvent(fromId, aspect, value)) return;
+
       // Tab bar changed
       if (fromId === this.tabBarId && aspect === 'change') {
-        this.activeTab = SETTINGS_TABS[value as number] ?? 'ai';
+        this.activeTab = this.visibleTabs()[value as number] ?? 'ai';
         await this.switchTab();
         if (this.activeTab === 'packages') await this.refreshPackages();
+        if (this.activeTab === 'updates') await this.refreshUpdatesTab();
         return;
       }
 
@@ -1353,9 +1398,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'tabBar', windowId: this.windowId,
-          tabs: SETTINGS_TABS.map(t => SETTINGS_TAB_LABELS[t]),
+          tabs: this.visibleTabs().map(t => SETTINGS_TAB_LABELS[t]),
           closable: false,
-          selectedIndex: SETTINGS_TABS.indexOf(this.activeTab) },
+          selectedIndex: Math.max(0, this.visibleTabs().indexOf(this.activeTab)) },
       ]})
     );
     this.tabBarId = tabBarId;
@@ -1433,6 +1478,21 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Updates container (packaged desktop app only; scrollable VBox, initially hidden)
+    if (this.appUpdaterId) {
+      this.updatesContainerId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+          parentLayoutId: this.rootLayoutId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+        widgetId: this.updatesContainerId,
+        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      }));
+    }
+
     // Status label at bottom (always visible)
     const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -1457,6 +1517,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.buildSkillsTab();
     // Build Packages tab content
     await this.buildPackagesTab();
+    // Build Updates tab content (packaged desktop app only)
+    if (this.updatesContainerId) await this.buildUpdatesTab();
     // Show correct tab
     await this.switchTab();
 
@@ -1937,6 +1999,277 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     await this.setStatus('Directory removed. Restart Abject to stop loading packages from it.');
     await this.refreshPackages();
+  }
+
+  // ========== UPDATES TAB (packaged desktop app only) ==========
+
+  /**
+   * Find AppUpdater, which exists only in the packaged desktop app, and watch
+   * it: its status feeds the Updates tab and the new-version notification.
+   */
+  private async connectAppUpdater(): Promise<void> {
+    this.appUpdaterId = await this.discoverDep('AppUpdater') ?? undefined;
+    if (!this.appUpdaterId) return;
+    try {
+      await this.request(request(this.id, this.appUpdaterId, 'addDependent', {}));
+      this.updateStatus = await this.request<UpdateStatus>(request(this.id, this.appUpdaterId, 'getStatus', {}));
+    } catch (err) {
+      log.warn(`AppUpdater did not answer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private askUpdater<T>(method: string, payload: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    return this.request<T>(request(this.id, this.appUpdaterId!, method, payload), timeoutMs);
+  }
+
+  /** Build Updates tab content into updatesContainerId. */
+  private async buildUpdatesTab(): Promise<void> {
+    const cId = this.updatesContainerId!;
+    const u = this.updateStatus;
+    const note = u
+      ? `${UPDATE_INSTALL_NOTE[u.installKind]}${u.installKind === 'manual' && u.manualReason ? ` (${u.manualReason}.)` : ''}`
+      : '';
+    const card = await this.sectionCard(cId, u ? `Abject ${u.currentVersion}` : 'Abject', note, 34);
+
+    const action = { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder };
+    const { widgetIds: [statusId, progressId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textPrimary, fontSize: 13, wordWrap: true, selectable: true } },
+        { type: 'progress', windowId: this.windowId, value: 0, style: { visible: false } },
+      ] })
+    );
+    this.updStatusLabelId = statusId;
+    this.updProgressId = progressId;
+    await this.request(request(this.id, card, 'addLayoutChild', {
+      widgetId: statusId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 54 },
+    }));
+    await this.request(request(this.id, card, 'addLayoutChild', {
+      widgetId: progressId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 12 },
+    }));
+
+    const row = await this.request<AbjectId>(request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+      parentLayoutId: card, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 8,
+    }));
+    await this.request(request(this.id, card, 'addLayoutChild', {
+      widgetId: row, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 },
+    }));
+    const { widgetIds: [primaryId, checkId, notesId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Download', style: { ...action, visible: false } },
+        { type: 'button', windowId: this.windowId, text: 'Check now' },
+        { type: 'button', windowId: this.windowId, text: 'Release notes', style: { visible: false } },
+      ] })
+    );
+    this.updPrimaryBtnId = primaryId;
+    this.updCheckBtnId = checkId;
+    this.updNotesBtnId = notesId;
+    for (const [id, width] of [[primaryId, 150], [checkId, 110], [notesId, 120]] as const) {
+      await this.request(request(this.id, id, 'addDependent', {}));
+      await this.request(request(this.id, row, 'addLayoutChild', {
+        widgetId: id, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width, height: 30 },
+      }));
+    }
+
+    if (u && u.installKind !== 'manual') {
+      const { widgetIds: [autoId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'checkbox', windowId: this.windowId, checked: u.autoDownload, text: 'Download new versions automatically' },
+        ] })
+      );
+      this.updAutoCheckboxId = autoId;
+      await this.request(request(this.id, autoId, 'addDependent', {}));
+      await this.request(request(this.id, card, 'addLayoutChild', {
+        widgetId: autoId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 24 },
+      }));
+    }
+
+    await this.refreshUpdatesTab();
+  }
+
+  /** What the Updates tab's main button does in the current state, if anything. */
+  private updatesPrimaryAction(): { label: string; run: () => Promise<void> } | undefined {
+    const u = this.updateStatus;
+    if (!u) return undefined;
+    const manual = u.installKind === 'manual';
+    if (u.state === 'ready') return { label: 'Restart to update', run: () => this.restartToUpdate() };
+    if (u.state === 'available' && manual) return { label: 'Download', run: async () => { await this.askUpdater('openPage', { page: 'download' }); } };
+    if (u.state === 'available') return { label: 'Download', run: async () => { await this.askUpdater('download'); } };
+    if (u.state === 'error' && !manual && u.latestVersion && u.latestVersion !== u.currentVersion) {
+      return { label: 'Retry download', run: async () => { await this.askUpdater('download'); } };
+    }
+    return undefined;
+  }
+
+  private updatesStatusText(): string {
+    const u = this.updateStatus;
+    if (!u) return 'Software updates are not available right now.';
+    const checked = u.lastCheckedAt ? ` Checked ${timeSince(u.lastCheckedAt)}.` : '';
+    switch (u.state) {
+      case 'idle': return `Abject ${u.currentVersion} is running.${checked}`;
+      case 'checking': return 'Checking for a new version…';
+      case 'upToDate': return `Abject ${u.currentVersion} is the newest version.${checked}`;
+      case 'available':
+        if (u.installKind === 'manual') {
+          return process.platform === 'darwin'
+            ? `Version ${u.latestVersion} is available. Download it, open the disk image, and drag Abject into Applications, replacing the old one.`
+            : `Version ${u.latestVersion} is available. Download it and replace the old Abject with it.`;
+        }
+        return `Version ${u.latestVersion} is available.`;
+      case 'downloading': {
+        const of = u.totalBytes ? ` (${megabytes(u.transferredBytes ?? 0)} of ${megabytes(u.totalBytes)})` : '';
+        return `Downloading version ${u.latestVersion}: ${u.percent ?? 0}%${of}`;
+      }
+      case 'ready':
+        return u.installKind === 'deb'
+          ? `Version ${u.latestVersion} is ready. Restart Abject to install it; installing asks for your password.`
+          : `Version ${u.latestVersion} is ready. Restart Abject to finish updating, or it installs the next time you quit.`;
+      case 'error': return `The update did not work: ${u.error ?? 'unknown error'}`;
+    }
+  }
+
+  private async refreshUpdatesTab(): Promise<void> {
+    if (!this.updatesContainerId) return;
+    const u = this.updateStatus;
+    const act = this.updatesPrimaryAction();
+    const set = async (id: AbjectId | undefined, payload: Record<string, unknown>): Promise<void> => {
+      if (!id) return;
+      try { await this.request(request(this.id, id, 'update', payload)); } catch { /* widget gone */ }
+    };
+    const text = { fontSize: 13, wordWrap: true, selectable: true };
+    const statusStyle = u?.state === 'error' ? { ...text, color: this.theme.statusError }
+      : u?.state === 'ready' || u?.state === 'available' ? { ...livingStyle(this.theme), ...text }
+      : { ...text, color: this.theme.textPrimary };
+    await set(this.updStatusLabelId, { text: this.updatesStatusText(), style: statusStyle });
+    // A fraction: the bar reads values up to 1 as fractions, so 1% would draw full.
+    await set(this.updProgressId, { visible: u?.state === 'downloading', value: (u?.percent ?? 0) / 100 });
+    await set(this.updPrimaryBtnId, act ? { visible: true, text: act.label } : { visible: false });
+    await set(this.updNotesBtnId, { visible: !!u?.releaseUrl && !!u.latestVersion && u.latestVersion !== u.currentVersion });
+    if (u) await set(this.updAutoCheckboxId, { checked: u.autoDownload });
+  }
+
+  /** AppUpdater's changes and the Updates tab's widgets. True when handled. */
+  private async handleUpdatesEvent(fromId: AbjectId, aspect: string, value: unknown): Promise<boolean> {
+    if (!this.appUpdaterId) return false;
+    if (fromId === this.appUpdaterId) {
+      if (aspect === 'updateStatus') {
+        this.updateStatus = value as UpdateStatus;
+        await this.refreshUpdatesTab();
+        await this.announceUpdate();
+      } else if (aspect === 'showRequested') {
+        await this.showUpdatesTab();
+      }
+      return true;
+    }
+    const ours = fromId === this.updPrimaryBtnId || fromId === this.updCheckBtnId
+      || fromId === this.updNotesBtnId || fromId === this.updAutoCheckboxId;
+    if (!ours) return false;
+    try {
+      if (fromId === this.updAutoCheckboxId) {
+        if (aspect === 'change') {
+          this.updateStatus = await this.askUpdater<UpdateStatus>('setAutoDownload', { enabled: value === 'true' });
+          await this.refreshUpdatesTab();
+        }
+      } else if (aspect === 'click') {
+        if (fromId === this.updPrimaryBtnId) await this.updatesPrimaryAction()?.run();
+        else if (fromId === this.updCheckBtnId) await this.askUpdater('checkNow', {}, 60_000);
+        else await this.askUpdater('openPage', { page: 'release' });
+      }
+    } catch (err) {
+      await this.request(request(this.id, this.updStatusLabelId!, 'update', {
+        text: `That did not work: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
+        style: { color: this.theme.statusError, fontSize: 13, wordWrap: true, selectable: true },
+      })).catch(() => { /* widget gone */ });
+    }
+    return true;
+  }
+
+  /** Open the settings window on the Updates tab (Help → Check for Updates…). */
+  private async showUpdatesTab(): Promise<void> {
+    this.activeTab = 'updates';
+    if (!this.windowId) { await this.show(); return; }
+    if (this.tabBarId) {
+      await this.request(request(this.id, this.tabBarId, 'update', { selectedIndex: this.visibleTabs().indexOf('updates') }));
+    }
+    await this.switchTab();
+    await this.refreshUpdatesTab();
+  }
+
+  /**
+   * Restart into the new version. Goals still running anywhere are
+   * interrupted by a restart, so the user is told how many first and can
+   * wait; the choice stays theirs.
+   */
+  private async restartToUpdate(): Promise<void> {
+    const running = await this.countRunningGoals();
+    if (running > 0) {
+      const ok = await this.confirm({
+        title: 'Restart to update',
+        message: `${running} goal${running === 1 ? ' is' : 's are'} still running. Restarting now interrupts ${running === 1 ? 'it' : 'them'}.`,
+        confirmLabel: 'Restart anyway',
+        cancelLabel: 'Later',
+      });
+      if (!ok) return;
+    }
+    await this.askUpdater('restartToUpdate');
+  }
+
+  private async workspaceManager(): Promise<AbjectId | undefined> {
+    this.workspaceManagerId = await this.resolveDep('WorkspaceManager', this.workspaceManagerId);
+    return this.workspaceManagerId;
+  }
+
+  /** Active goals across every workspace, background ones included. */
+  private async countRunningGoals(): Promise<number> {
+    const wsm = await this.workspaceManager();
+    if (!wsm) return 0;
+    let workspaces: Array<{ registryId?: AbjectId }> = [];
+    try {
+      workspaces = await this.request<Array<{ registryId?: AbjectId }>>(request(this.id, wsm, 'listWorkspacesDetailed', {}));
+    } catch { return 0; }
+    const counts = await Promise.all(workspaces.map(async (ws) => {
+      if (!ws.registryId) return 0;
+      try {
+        const [gm] = await this.request<Array<{ id: AbjectId }>>(request(this.id, ws.registryId, 'discover', { name: 'GoalManager' }), 5000);
+        if (!gm) return 0;
+        const stats = await this.request<{ active?: number }>(request(this.id, gm.id, 'getStats', {}), 5000);
+        return stats.active ?? 0;
+      } catch { return 0; }
+    }));
+    return counts.reduce((a, b) => a + b, 0);
+  }
+
+  /**
+   * Notify the user of a new version, once per version: when it is ready to
+   * install, or, when it will not download by itself (a manual install, or
+   * automatic downloads off), as soon as it is found.
+   */
+  private async announceUpdate(): Promise<void> {
+    const u = this.updateStatus;
+    if (!u?.latestVersion || u.latestVersion === this.announcedUpdateVersion) return;
+    const downloadsItself = u.installKind !== 'manual' && u.autoDownload;
+    const ready = u.state === 'ready';
+    const found = u.state === 'available' && !downloadsItself;
+    if (!ready && !found) return;
+    this.announcedUpdateVersion = u.latestVersion;
+    const message = ready
+      ? `Abject ${u.latestVersion} is ready to install. Restart from Settings, under Updates.`
+      : `Abject ${u.latestVersion} is available. Get it from Settings, under Updates.`;
+    const nc = await this.activeNotificationCenter();
+    if (nc) this.send(event(this.id, nc, 'notify', { message, level: 'info', durationMs: 12_000 }));
+  }
+
+  /** NotificationCenter is per workspace: the active workspace's, through WorkspaceManager. */
+  private async activeNotificationCenter(): Promise<AbjectId | undefined> {
+    const wsm = await this.workspaceManager();
+    if (!wsm) return undefined;
+    try {
+      const active = await this.request<{ registryId?: AbjectId } | null>(request(this.id, wsm, 'getActiveWorkspace', {}));
+      if (!active?.registryId) return undefined;
+      const found = await this.request<Array<{ id: AbjectId }>>(request(this.id, active.registryId, 'discover', { name: 'NotificationCenter' }));
+      return found?.[0]?.id;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Build AI tab content into aiContainerId. */
@@ -2730,6 +3063,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.pkgDirAddBtnId = undefined;
     this.pkgDirListId = undefined;
     this.pkgDirRemoveBtnId = undefined;
+    this.updatesContainerId = undefined;
+    this.updStatusLabelId = undefined;
+    this.updProgressId = undefined;
+    this.updPrimaryBtnId = undefined;
+    this.updCheckBtnId = undefined;
+    this.updNotesBtnId = undefined;
+    this.updAutoCheckboxId = undefined;
     this.unmasked.clear();
 
     this.changed('visibility', false);
@@ -2745,6 +3085,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, this.permissionsContainerId, 'update', { style: { visible: this.activeTab === 'permissions' } }));
     await this.request(request(this.id, this.skillsContainerId, 'update', { style: { visible: this.activeTab === 'skills' } }));
     await this.request(request(this.id, this.packagesContainerId, 'update', { style: { visible: this.activeTab === 'packages' } }));
+    if (this.updatesContainerId) {
+      await this.request(request(this.id, this.updatesContainerId, 'update', { style: { visible: this.activeTab === 'updates' } }));
+    }
+  }
+
+  /** The tabs this window shows: Updates only where AppUpdater exists. */
+  private visibleTabs(): SettingsTab[] {
+    return SETTINGS_TABS.filter(t => t !== 'updates' || this.appUpdaterId !== undefined);
   }
 
   // ========== HELPERS ==========

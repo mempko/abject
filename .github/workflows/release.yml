@@ -60,7 +60,8 @@ jobs:
             release/*.exe
             release/*.dmg
             release/*.zip
-            release/*.yml
+            release/*.blockmap
+            release/latest*.yml
             dist-cli/abject-commune-*
           if-no-files-found: error
 
@@ -92,8 +93,7 @@ jobs:
           notes="$(git tag -l --format='%(contents)' "$tag")"
           # The build job uploads from two roots (release/, dist-cli/), so
           # the merged artifact keeps that directory structure — collect the
-          # files themselves. mapfile keeps names with spaces intact
-          # (electron-builder emits "Abject Setup X.Y.Z.exe").
+          # files themselves. mapfile keeps any name with spaces intact.
           mapfile -t assets < <(find artifacts -type f)
           if [ "$(printf '%s' "$notes" | wc -c)" -gt 40 ]; then
             printf '%s\n' "$notes" > /tmp/release-notes.md

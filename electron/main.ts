@@ -271,6 +271,12 @@ app.whenReady().then(async () => {
           label: 'Abject Website',
           click: () => shell.openExternal('https://abject.world'),
         },
+        // AppUpdater (in the backend, packaged builds only) listens for this
+        // event on app; the name is CHECK_FOR_UPDATES_EVENT in app-updater.ts.
+        ...(app.isPackaged ? [{
+          label: 'Check for Updates…',
+          click: () => { app.emit('abjects:check-for-updates'); },
+        }] : []),
       ],
     },
   ]);

@@ -40,7 +40,7 @@ fs.cpSync(path.join(root, 'native'), path.join(stage, 'native'), { recursive: tr
 fs.cpSync(path.join(root, 'deploy'), path.join(stage, 'deploy'), { recursive: true });
 
 // The dependencies build-server.mjs keeps external, minus the desktop-only
-// and development-only ones (electron, tsx).
+// and development-only ones (electron, electron-updater, tsx).
 const runtimeDeps = ['ws', 'node-datachannel', 'linkedom'];
 const dependencies = Object.fromEntries(runtimeDeps.map((d) => [d, pkg.dependencies[d]]));
 for (const [dep, version] of Object.entries(dependencies)) {

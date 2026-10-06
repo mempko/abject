@@ -136,6 +136,7 @@ import { CliServer } from './cli-server.js';
 import { WebGateway } from '../src/objects/web-gateway.js';
 import { WebExposure } from '../src/objects/web-exposure.js';
 import { WebGatewayBrowser } from '../src/objects/web-gateway-browser.js';
+import { AppUpdater } from '../src/objects/app-updater.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -683,6 +684,14 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   if (process.versions.electron) {
     runtime.objectFactory.registerConstructor('BrowserWindowHost', () => new BrowserWindowHost());
   }
+  // Packaged desktop app only: software updates. A dev run (pnpm awaken), the
+  // headless server and an unpackaged Electron have nothing to update, and
+  // electron-updater ships only inside the app. Main-thread only: it needs
+  // Electron's app. Its UI is the Updates tab in GlobalSettings.
+  const packagedElectron = !!process.versions.electron && (await import('electron')).app.isPackaged;
+  if (packagedElectron) {
+    runtime.objectFactory.registerConstructor('AppUpdater', () => new AppUpdater());
+  }
   runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
   runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
@@ -766,6 +775,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       // Deliberately NOT worker-eligible:
       // - PeerRouter: synchronous MessageInterceptor installed on the bus.
       // - BrowserWindowHost: Electron's window APIs live on the main thread.
+      // - AppUpdater: Electron's app, and electron-updater, on the main thread.
       // - Supervisor: must not depend on the workers it restarts.
       // - MediaStream: holds live RTCPeerConnection/MediaStreamTrack handles;
       //   needs its track ops turned into P2P-worker RPCs before it can move.
@@ -1067,6 +1077,8 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const permissionBrokerId = await supervisedSpawn(
     'PermissionBroker', 'permanent', systemTypeId('PermissionBroker'));
 
+  // Before GlobalSettings, which shows the Updates tab only when AppUpdater exists.
+  if (packagedElectron) await supervisedSpawn('AppUpdater', 'permanent', systemTypeId('AppUpdater'));
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   // Installed packages and their configuration (the Packages settings tab).
   // Worker-eligible like the other global services: it only reads and writes

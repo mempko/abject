@@ -37,6 +37,9 @@ const runtimeExternals = [
   // Only the desktop app's main thread imports it (BrowserWindowHost);
   // Electron resolves it at runtime.
   'electron',
+  // Only the packaged desktop app loads it (AppUpdater), from the app's own
+  // node_modules; the headless server package does not ship it.
+  'electron-updater',
   'linkedom',
   'tsx/esm/api',
 ];
