@@ -70,7 +70,7 @@
     "@types/uuid": "^9.0.0",
     "@types/ws": "^8.5.0",
     "assemblyscript": "^0.27.0",
-    "electron": "^35.0.0",
+    "electron": "^44.5.1",
     "electron-builder": "^26.0.0",
     "esbuild": "^0.25.0",
     "postject": "1.0.0-alpha.6",
