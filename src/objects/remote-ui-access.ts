@@ -25,6 +25,7 @@ import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { randomToken, utf8ToBase64Url } from '../core/encoding.js';
 import {
   PeerId,
   exportKeyToJwk,
@@ -306,7 +307,7 @@ export class RemoteUIAccess extends Abject {
     precondition(this.signingPubJwk !== undefined, 'signing key not exported');
     precondition(this.exchangePubJwk !== undefined, 'exchange key not exported');
 
-    const token = randomTokenBase64(32);
+    const token = randomToken(32);
     const expires = Date.now() + TOKEN_TTL_MS;
     this.pendingTokens.set(token, { expires, name });
     this.pruneExpiredTokens();
@@ -322,7 +323,7 @@ export class RemoteUIAccess extends Abject {
       name: this.deviceLabel || name || 'Abjects',
     };
 
-    const encoded = base64UrlEncode(JSON.stringify(payload));
+    const encoded = utf8ToBase64Url(JSON.stringify(payload));
     const qrUrl = `${this.clientBaseUrl}/?pair=${encoded}`;
     const qrDataUrl = await QRCode.toDataURL(qrUrl, {
       width: 512,
@@ -813,21 +814,4 @@ export class RemoteUIAccess extends Abject {
       authorizedCount: this.authorizedClients.size,
     });
   }
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Helpers (module-private)
-// ────────────────────────────────────────────────────────────────────────
-
-function randomTokenBase64(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function base64UrlEncode(s: string): string {
-  return btoa(unescape(encodeURIComponent(s)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }

@@ -17,6 +17,8 @@
  * widget can drop its layout cache and redraw.
  */
 
+import { base64ToBytes } from '../../core/encoding.js';
+
 /** Prefix marking a FileSystem-Abject-backed image reference. */
 export const ABJECT_URL_SCHEME = 'abject://';
 
@@ -105,10 +107,7 @@ export function decodeDataUriImageDims(url: string): { width: number; height: nu
   let bytes: Uint8Array;
   try {
     if (isBase64) {
-      // atob exists in modern Node (and browsers). Decode base64 → bytes.
-      const bin = (typeof atob === 'function') ? atob(data) : Buffer.from(data, 'base64').toString('binary');
-      bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      bytes = base64ToBytes(data);
     } else {
       const decoded = decodeURIComponent(data);
       bytes = new Uint8Array(decoded.length);

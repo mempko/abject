@@ -22,6 +22,7 @@ Each capability object:
 | `filesystem.ts` | `FileSystem` | `FILESYSTEM_ID` | `FILESYSTEM_READ`, `FILESYSTEM_WRITE` | In-memory virtual filesystem with path normalization and `..` traversal |
 | `web-browser.ts` | `WebBrowser` | `WEB_BROWSER_ID` | `WEB_BROWSER` | Headless browser automation via Playwright (server-only) |
 | `web-parser.ts` | `WebParser` | `WEB_PARSER_ID` | `WEB_PARSER` | HTML parsing and content extraction (server-only, via linkedom) |
+| `crypto.ts` | `Crypto` | (discovered by name) | none | Secure random bytes, hashes, HMACs, constant-time compare, scrypt passwords, encodings, signature checks against a supplied public key |
 
 ### http-client.ts
 
@@ -31,6 +32,17 @@ Each capability object:
   hand so every hop passes the same checks; a hop to another origin drops
   credential headers.
 - **Timeout**: via `AbortController` (default 30s)
+
+### crypto.ts
+
+- **Methods**: `randomBytes`, `randomUUID`, `hash`, `hmac`, `timingSafeEqual`,
+  `hashPassword`, `verifyPassword`, `encode`, `verifySignature`
+- **Why**: the script sandbox has no `crypto` and `Math.random` is predictable,
+  so script abjects that mint session ids or tokens, check webhook signatures,
+  store passwords or verify signed tokens ask this object.
+- **Holds nothing**: keys arrive with each request. `verifySignature` takes a
+  JWK or PEM public key and JOSE algorithm names (RS256, PS256, ES256, EdDSA…).
+  `verifyPassword` refuses stored hashes asking for unbounded scrypt work.
 
 ### address-policy.ts
 

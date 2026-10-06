@@ -8,6 +8,7 @@
 
 import crypto from 'node:crypto';
 import type { WebSocket } from 'ws';
+import { safeEqual } from '../src/objects/capabilities/crypto.js';
 
 // =============================================================================
 // Configuration
@@ -89,24 +90,14 @@ export class SessionStore {
 // Credential validation (timing-safe)
 // =============================================================================
 
-function timingSafeCompare(a: string, b: string): boolean {
-  // Pad to equal length to avoid leaking length info
-  const maxLen = Math.max(a.length, b.length);
-  const bufA = Buffer.alloc(maxLen);
-  const bufB = Buffer.alloc(maxLen);
-  bufA.write(a);
-  bufB.write(b);
-  return crypto.timingSafeEqual(bufA, bufB) && a.length === b.length;
-}
-
 function validateCredentials(
   username: string,
   password: string,
   config: AuthConfig
 ): boolean {
   return (
-    timingSafeCompare(username, config.username) &&
-    timingSafeCompare(password, config.password)
+    safeEqual(username, config.username) &&
+    safeEqual(password, config.password)
   );
 }
 

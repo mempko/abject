@@ -510,6 +510,23 @@ export class WorkspaceShareRegistry extends Abject {
         await this.dropRegistrySubscription(workspaceId);
         return;
       }
+
+      // WorkspaceManager: workspaceAccessChanged — a whitelist or exposure change
+      // on a workspace that stays shared. Without it the cached whitelist is the
+      // one the workspace was shared with, so a peer added later is filtered out
+      // of discovery answers even though PeerRouter would admit it.
+      if (aspect === 'workspaceAccessChanged') {
+        const change = value as { workspaceId: string; accessMode?: string; whitelist?: string[]; exposedObjectIds?: string[] };
+        const cached = this.localShared.get(change.workspaceId);
+        if (!cached || change.accessMode === 'local') return;
+        this.localShared.set(change.workspaceId, {
+          ...cached,
+          ...(change.accessMode ? { accessMode: change.accessMode as SharedWorkspaceInfo['accessMode'] } : {}),
+          ...(change.whitelist ? { whitelist: [...change.whitelist] } : {}),
+          ...(change.exposedObjectIds ? { exposedObjectIds: [...change.exposedObjectIds] } : {}),
+        });
+        return;
+      }
     });
   }
 

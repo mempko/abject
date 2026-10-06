@@ -267,6 +267,10 @@ export type { SandboxOptions } from './core/sandbox.js';
 export { formatManifestAsDescription } from './core/introspect.js';
 export type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from './core/identity.js';
 export { derivePeerId, derivePeerIdFromJwk, deriveSessionKey, aesEncrypt, aesDecrypt } from './core/identity.js';
+export {
+  bytesToBase64, base64ToBytes, bytesToBase64Url, base64UrlToBytes, bytesToHex,
+  utf8ToBase64Url, base64UrlToUtf8, randomToken,
+} from './core/encoding.js';
 export type { IntrospectResult } from './core/introspect.js';
 
 // Export LLM providers

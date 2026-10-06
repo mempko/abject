@@ -1,4 +1,6 @@
 /** Durable learning protocol. Identities and versions belong to receivers, not prompts. */
+import { bytesToHex } from './encoding.js';
+
 export type LearningState = 'proposed' | 'applied' | 'needs_repair' | 'waiting' | 'abandoned';
 export interface LearningEffect {
   id: string;
@@ -35,7 +37,7 @@ export function canonical(value: unknown): string {
 }
 export async function learningFingerprint(value: unknown): Promise<string> {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(value)));
-  return [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return bytesToHex(bytes);
 }
 export interface KnowledgeLearning {
   revision: number;

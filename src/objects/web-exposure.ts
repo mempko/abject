@@ -90,6 +90,7 @@ export class WebExposure extends Abject {
   private gatewayId?: AbjectId;
   private workspaceId?: string;
   private workspaceName = '';
+  private pushPending = false;
   private config: WebExposureConfig = { enabled: false, entries: {} };
 
   constructor() {
@@ -212,8 +213,7 @@ export class WebExposure extends Abject {
   }
 
   private async ensureWorkspaceId(): Promise<string | undefined> {
-    if (this.workspaceId) return this.workspaceId;
-    if (this.widgetManagerId) {
+    if (!this.workspaceId && this.widgetManagerId) {
       try {
         const wsId = await this.request<string | null>(request(this.id, this.widgetManagerId, 'getObjectWorkspace', { objectId: this.id }));
         if (wsId) this.workspaceId = wsId;
@@ -228,10 +228,25 @@ export class WebExposure extends Abject {
     return this.workspaceId;
   }
 
+  /**
+   * Push once our workspace id is known, and again once its name is. A
+   * workspace created while the server runs spawns its objects before
+   * WorkspaceManager lists it, so a push made during that window carries no
+   * name and the gateway would route the workspace by its id from then on.
+   */
   private async pushWhenReady(): Promise<void> {
-    for (let i = 0; i < 30; i++) {
-      if (await this.ensureWorkspaceId()) { await this.push(); return; }
-      await new Promise(r => setTimeout(r, 500));
+    if (this.pushPending) return;
+    this.pushPending = true;
+    try {
+      let pushedWithoutName = false;
+      for (let i = 0; i < 60; i++) {
+        const workspaceId = await this.ensureWorkspaceId();
+        if (workspaceId && this.workspaceName) { await this.push(); return; }
+        if (workspaceId && !pushedWithoutName) { await this.push(); pushedWithoutName = true; }
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } finally {
+      this.pushPending = false;
     }
   }
 
@@ -263,6 +278,8 @@ export class WebExposure extends Abject {
     };
     try { this.send(request(this.id, gateway, 'syncWorkspace', payload)); }
     catch (err) { log.warn(`could not push to gateway: ${err instanceof Error ? err.message : String(err)}`); }
+    // Pushed before the workspace had a name: push again once it has one.
+    if (!this.workspaceName) void this.pushWhenReady();
   }
 }
 

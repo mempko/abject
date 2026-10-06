@@ -6,6 +6,7 @@
  */
 
 import { require as precondition } from './contracts.js';
+import { base64ToBytes, bytesToBase64, bytesToHex } from './encoding.js';
 
 export type PeerId = string;
 
@@ -109,7 +110,7 @@ export async function importExchangePrivateKey(jwkString: string): Promise<Crypt
 export async function derivePeerId(publicSigningKey: CryptoKey): Promise<PeerId> {
   const spki = await crypto.subtle.exportKey('raw', publicSigningKey);
   const hash = await crypto.subtle.digest('SHA-256', spki);
-  return bufferToHex(hash);
+  return bytesToHex(hash);
 }
 
 /**
@@ -155,8 +156,8 @@ export async function aesEncrypt(
     plaintext as BufferSource,
   );
   return {
-    iv: bufferToBase64(iv),
-    ciphertext: bufferToBase64(new Uint8Array(ciphertext)),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
   };
 }
 
@@ -168,8 +169,8 @@ export async function aesDecrypt(
   iv: string,
   ciphertext: string,
 ): Promise<Uint8Array> {
-  const ivBytes = base64ToBuffer(iv);
-  const ctBytes = base64ToBuffer(ciphertext);
+  const ivBytes = base64ToBytes(iv);
+  const ctBytes = base64ToBytes(ciphertext);
   const plaintext = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: ivBytes as BufferSource },
     key,
@@ -207,34 +208,4 @@ export async function aesDecryptBytes(
     ciphertext as BufferSource,
   );
   return new Uint8Array(plaintext);
-}
-
-// =============================================================================
-// Encoding Helpers
-// =============================================================================
-
-function bufferToHex(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let hex = '';
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, '0');
-  }
-  return hex;
-}
-
-function bufferToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToBuffer(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
 }

@@ -5,7 +5,9 @@
  * methods answer messages. It runs as a ScriptableAbject in a sandbox with no
  * Node or browser globals (no fetch, require, timers beyond setTimeout /
  * setInterval, no crypto); everything else is reached by message through
- * `this`. `pnpm forge` compiles the TypeScript and erases these types, so
+ * `this`. Secure randomness, hashes, HMACs and password hashing come from the
+ * Crypto object (`this.call(this.dep('Crypto'), 'randomBytes', {})`).
+ * `pnpm forge` compiles the TypeScript and erases these types, so
  * import them with `import type` only:
  *
  *   import type { AbjectHandlers, AbjectMessage } from '../../sdk/script/abject';

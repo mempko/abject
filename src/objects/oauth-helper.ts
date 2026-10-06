@@ -24,6 +24,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { bytesToBase64Url, randomToken } from '../core/encoding.js';
 
 const log = new Log('OAuthHelper');
 
@@ -201,9 +202,9 @@ MCPs and skills can pull them via SecretsVault.bindEnv mappings.
   private async authorize(config: OAuthProviderConfig): Promise<ConnectedAccount> {
     validateConfig(config);
 
-    const verifier = randomUrlSafe(64);
+    const verifier = randomToken(64);
     const challenge = await sha256Base64Url(verifier);
-    const state = randomUrlSafe(24);
+    const state = randomToken(24);
 
     // Spin up a one-shot listener on an ephemeral port.
     const { server, port } = await listenEphemeral((req, res) => this.handleCallback(req, res, state));
@@ -473,23 +474,10 @@ function validateConfig(config: OAuthProviderConfig): void {
   contractRequire(Array.isArray(config.scopes) && config.scopes.every(s => typeof s === 'string'), 'scopes must be string[]');
 }
 
-function randomUrlSafe(bytes: number): string {
-  const buf = new Uint8Array(bytes);
-  crypto.getRandomValues(buf);
-  return bytesToBase64Url(buf);
-}
-
 async function sha256Base64Url(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data as BufferSource));
   return bytesToBase64Url(hash);
-}
-
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  const b64 = typeof btoa !== 'undefined' ? btoa(binary) : Buffer.from(bytes).toString('base64');
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function listenEphemeral(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void): Promise<{ server: http.Server; port: number }> {

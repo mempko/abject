@@ -880,6 +880,14 @@ export class WorkspaceManager extends Abject {
     this.workspaces.delete(workspaceId);
     await this.persistWorkspaceList();
 
+    // A shared workspace stops being shared when it is deleted. Without this,
+    // WorkspaceShareRegistry keeps answering discovery queries with the deleted
+    // workspace (same name, dead registry), so a workspace recreated under that
+    // name cannot be found by the peers it is shared with.
+    if (ws.accessMode !== 'local' && !ws.joined) {
+      this.changed('workspaceUnshared', { workspaceId, name: ws.name });
+    }
+
     // Never leave the active pointer on a workspace that no longer exists.
     // `workspaces:active` is read back on the next boot, and a dangling id
     // there is precisely what lands refreshTaskbar with no local record. The

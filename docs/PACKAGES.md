@@ -75,7 +75,10 @@ declarations.
 The sandbox has no Node or browser globals (no `require`, `fetch`, `crypto`);
 everything else is reached by message through `this` (`call`, `dep`, `find`,
 `emit`, `observe`, `changed`, `data`, `saveData`). `sdk/script/abject.d.ts`
-types all of it for TypeScript; see `examples/tally-ts`.
+types all of it for TypeScript; see `examples/tally-ts`. For secure random
+tokens, hashes, HMACs, password hashing and signature checks, ask the `Crypto`
+object (`this.call(this.dep('Crypto'), 'randomBytes', {})`); `Math.random` is
+not secure.
 
 A package can add an LLM provider by registering with the LLM object on
 startup; see `docs/LLM_PROVIDERS.md` and `examples/openai-compatible-provider`.

@@ -149,6 +149,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   private routeVersion = 0;
   private routeChangelog: RouteChange[] = [];
   private peerAnnounceState: Map<PeerId, PeerAnnounceState> = new Map();
+  /**
+   * Identifies this run of the router in its announcements. A peer whose id
+   * changes has restarted and lost the routes we told its previous run, which a
+   * replaced transport does not always surface as a disconnect.
+   */
+  private readonly bootId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  private peerBootIds: Map<PeerId, string> = new Map();
 
   // Phase 3: Gossip dedup
   private seenPropagations: Map<string, number> = new Map(); // propagationId → expiry
@@ -368,7 +375,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     this.peerRegistryRef = peerRegistry;
     peerRegistry.onPeerConnected((peerId: string) => {
       log.info(`direct peerConnected callback for ${peerId.slice(0, 16)}`);
-      this.announceRoutesToPeer(peerId as PeerId).catch(() => {});
+      this.announceRoutesToNewConnection(peerId as PeerId);
     });
   }
 
@@ -708,7 +715,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       if (aspect === 'contactConnected') {
         const { peerId } = value as { peerId: string };
         log.info(`contactConnected event for ${peerId.slice(0, 16)}, announcing routes`);
-        this.announceRoutesToPeer(peerId as PeerId).catch(() => { /* best-effort */ });
+        this.announceRoutesToNewConnection(peerId as PeerId);
         return;
       }
 
@@ -1668,6 +1675,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   // ==========================================================================
 
   /**
+   * A connection was (re)established. The peer may have restarted under the
+   * same identity and lost every route it had, while we still remember what we
+   * sent its previous run; a diff against that would leave it without the base
+   * routes, unable to reach anything (RECIPIENT_NOT_FOUND) until the next
+   * anti-entropy round happens to pick it. A new connection starts from a full
+   * announcement.
+   */
+  announceRoutesToNewConnection(peerId: PeerId): void {
+    this.peerAnnounceState.delete(peerId);
+    this.announceRoutesToPeer(peerId).catch(() => { /* best-effort */ });
+  }
+
+  /**
    * Announce local routes to a specific peer.
    * Phase 2: Sends diff if possible, full otherwise.
    */
@@ -1683,6 +1703,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
 
     const localPeerId = this.getLocalPeer();
+    // The route version this announcement covers, taken before any await: a
+    // change made while routes are being collected must still count as unsent,
+    // or the next diff skips it and the peer never hears of it (a workspace's
+    // exposure updated right after it was shared, say).
+    const version = this.routeVersion;
 
     // Collect system routes (always sent as full)
     const systemRouteEntries = this.collectSystemRoutesForPeer(peerId);
@@ -1694,10 +1719,23 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (diff && peerState) {
       // Send diff
       const wsRoutesForPeer = await this.collectWorkspaceRoutesForPeer(peerId);
-      // Filter diff to only include routes appropriate for this peer
-      const peerWorkspaceKeys = new Set(wsRoutesForPeer.map(r => `${r.ownerPeerId}/${r.workspaceId}`));
-      const filteredAdded = diff.added.filter(r => peerWorkspaceKeys.has(`${r.ownerPeerId}/${r.workspaceId}`));
-      const filteredRemoved = diff.removed.filter(k => peerState.announcedRoutes.has(k));
+      const keyOf = (r: { ownerPeerId: string; workspaceId: string }) => `${r.ownerPeerId}/${r.workspaceId}`;
+      const visible = new Map(wsRoutesForPeer.map(r => [keyOf(r), r]));
+      // Changed routes this peer may see, as they stand now.
+      const addedByKey = new Map(diff.added.filter(r => visible.has(keyOf(r))).map(r => [keyOf(r), visible.get(keyOf(r))!]));
+      // Routes this peer may now see that it was never told about: its access
+      // changed (it joined a whitelist), not the route, so the changelog has
+      // nothing new for it and the diff alone would never carry them.
+      for (const [k, r] of visible) {
+        if (!peerState.announcedRoutes.has(k)) addedByKey.set(k, r);
+      }
+      const filteredAdded = [...addedByKey.values()];
+      // Removed routes it was told about, and routes it may no longer see.
+      const removedKeys = new Set(diff.removed.filter(k => peerState.announcedRoutes.has(k)));
+      for (const k of peerState.announcedRoutes) {
+        if (!visible.has(k)) removedKeys.add(k);
+      }
+      const filteredRemoved = [...removedKeys];
 
       if (filteredAdded.length === 0 && filteredRemoved.length === 0 && systemRouteEntries.length === 0) {
         return true; // Nothing changed for this peer
@@ -1720,6 +1758,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           version: this.routeVersion,
           systemRoutes: systemRouteEntries,
           fromPeerId: localPeerId,
+          bootId: this.bootId,
         },
       );
 
@@ -1732,7 +1771,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         for (const k of filteredRemoved) {
           peerState.announcedRoutes.delete(k);
         }
-        peerState.lastVersion = this.routeVersion;
+        peerState.lastVersion = version;
         log.info(`announceRoutesToPeer(${peerId.slice(0, 16)}) — sent DIFF: +${filteredAdded.length} -${filteredRemoved.length}`);
         return true;
       } catch (err) {
@@ -1772,6 +1811,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         systemRoutes: systemRouteEntries,
         routes: legacyRoutes,  // backward compat: old peers read this field
         fromPeerId: localPeerId,
+        bootId: this.bootId,
       },
     );
 
@@ -1780,7 +1820,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       // Update peer announce state
       const announcedRoutes = new Set(wsRoutes.map(r => `${r.ownerPeerId}/${r.workspaceId}`));
       this.peerAnnounceState.set(peerId, {
-        lastVersion: this.routeVersion,
+        lastVersion: version,
         announcedRoutes,
       });
       log.info(`announceRoutesToPeer(${peerId.slice(0, 16)}) — sent FULL OK`);
@@ -1959,10 +1999,23 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       routes?: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }>;
       fromPeerId: string;
       systemRoutes?: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }>;
+      bootId?: string;
     },
   ): boolean {
     const fromPeerId = payload.fromPeerId as PeerId;
     log.info(`handleRouteAnnouncement from=${fromPeerId.slice(0, 16)}, type=${payload.type ?? 'legacy'}`);
+
+    // The peer restarted: what we announced to its previous run is gone, so it
+    // gets everything again rather than a diff against routes it no longer has.
+    if (typeof payload.bootId === 'string' && payload.bootId.length <= 64) {
+      const previous = this.peerBootIds.get(fromPeerId);
+      this.peerBootIds.set(fromPeerId, payload.bootId);
+      if (previous !== undefined && previous !== payload.bootId) {
+        log.info(`peer ${fromPeerId.slice(0, 16)} restarted; announcing all routes to it again`);
+        this.peerAnnounceState.delete(fromPeerId);
+        this.announceRoutesToPeer(fromPeerId).catch(() => { /* best-effort */ });
+      }
+    }
 
     // Phase 3: Dedup propagation
     if (payload.propagationId) {

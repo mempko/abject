@@ -8,6 +8,7 @@ import { error, event } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { ensure } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
+import { bytesToBase64 } from '../../core/encoding.js';
 import { AddressPolicy, HostLookup, NetworkPolicyError, portOf } from './address-policy.js';
 
 const log = new Log('HTTP');
@@ -523,20 +524,7 @@ export class HttpClient extends Abject {
       const arrayBuffer = await blob.arrayBuffer();
       const mimeType = blob.type || 'application/octet-stream';
 
-      // Use Buffer in Node.js for efficiency, btoa for browser
-      let b64: string;
-      if (typeof Buffer !== 'undefined') {
-        b64 = Buffer.from(arrayBuffer).toString('base64');
-      } else {
-        const bytes = new Uint8Array(arrayBuffer);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        b64 = btoa(binary);
-      }
-
-      const dataUri = `data:${mimeType};base64,${b64}`;
+      const dataUri = `data:${mimeType};base64,${bytesToBase64(new Uint8Array(arrayBuffer))}`;
 
       return {
         dataUri,

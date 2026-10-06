@@ -71,6 +71,7 @@ import {
   lookAtEuler, followStep, MOTION_PRESETS, expandMotionPreset,
 } from './gl/anim-tracks.js';
 import { buildNodeCamera, OrbitController } from './gl/orbit-camera.js';
+import { bytesToBase64 } from '../core/encoding.js';
 
 /** A picked interactive scene node (what input routing needs to reach its owner). */
 export interface NodeHit {
@@ -1107,11 +1108,8 @@ export class Compositor {
       // convertToBlob throws on a canvas tainted by a cross-origin image.
       const blob = await surface.canvas.convertToBlob({ type: 'image/png' });
       const buffer = await blob.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       return {
-        imageBase64: btoa(binary),
+        imageBase64: bytesToBase64(new Uint8Array(buffer)),
         width: surface.rect.width,
         height: surface.rect.height,
       };
@@ -1219,11 +1217,8 @@ export class Compositor {
     try {
       const blob = await out.convertToBlob({ type: 'image/png' });
       const buffer = await blob.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       return {
-        imageBase64: btoa(binary),
+        imageBase64: bytesToBase64(new Uint8Array(buffer)),
         width: Math.round(cropW),
         height: Math.round(cropH),
       };

@@ -30,6 +30,7 @@ import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
 import { validateCode, compileSandboxed } from '../core/sandbox.js';
 import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
+import { bytesToHex } from '../core/encoding.js';
 
 const log = new Log('ScriptableAbject');
 
@@ -403,8 +404,7 @@ export class ScriptableAbject extends Abject {
           const digestSrc = new TextEncoder().encode(
             `${manifest.name}@${manifest.version}\n${this._source}`);
           const digestBuf = await crypto.subtle.digest('SHA-256', digestSrc as BufferSource);
-          const digest = Array.from(new Uint8Array(digestBuf))
-            .map(b => b.toString(16).padStart(2, '0')).join('');
+          const digest = bytesToHex(digestBuf);
           const signature = await this.request<string>(
             request(this.id, identityId, 'sign', { data: digest }));
           const identity = await this.request<{ peerId?: string }>(

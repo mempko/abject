@@ -40,6 +40,8 @@ import { Log } from '../core/timed-log.js';
 import type { AuthConfig, SessionStore } from '../../server/auth.js';
 import type { WorkspaceExposure, WebExposureEntry } from './web-exposure.js';
 import { DEFAULT_HTTP_HANDLER } from './web-exposure.js';
+import { safeEqual } from './capabilities/crypto.js';
+import { randomToken } from '../core/encoding.js';
 
 const log = new Log('WebGateway');
 
@@ -180,7 +182,7 @@ export class WebGateway extends Abject {
     this.on('getRoutes', () => this.routes());
     this.on('mintToken', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name?: string };
-      const secret = `abjk_${crypto.randomBytes(24).toString('base64url')}`;
+      const secret = `abjk_${randomToken(24)}`;
       const token: ApiToken = { id: crypto.randomUUID(), name: (name ?? 'token').slice(0, 80), hash: this.hash(secret), createdAt: Date.now() };
       this.tokens.push(token);
       await this.persistTokens();
@@ -476,7 +478,7 @@ export class WebGateway extends Abject {
     if (!m) return 'Authentication required';
     const token = m[1].trim();
     const hash = this.hash(token);
-    const api = this.tokens.find(t => crypto.timingSafeEqual(Buffer.from(t.hash), Buffer.from(hash)));
+    const api = this.tokens.find(t => safeEqual(t.hash, hash));
     if (api) { api.lastUsedAt = Date.now(); return undefined; }
     if (this.sessions.validateSession(token)) return undefined;
     return 'Invalid token';

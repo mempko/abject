@@ -115,6 +115,7 @@ import { CatalogBrowser } from '../src/objects/catalog-browser.js';
 import { SecretsVault } from '../src/objects/secrets-vault.js';
 import { Packages } from '../src/objects/packages.js';
 import { InstanceInfo, instanceReport, type InstanceInfoSource } from '../src/objects/instance-info.js';
+import { Crypto } from '../src/objects/capabilities/crypto.js';
 import { abjectVersion } from './version.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
@@ -700,6 +701,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('SecretsVault', () => new SecretsVault());
   runtime.objectFactory.registerConstructor('Packages', () => new Packages());
   runtime.objectFactory.registerConstructor('InstanceInfo', () => new InstanceInfo(instanceSource));
+  runtime.objectFactory.registerConstructor('Crypto', () => new Crypto());
   runtime.objectFactory.registerConstructor('OAuthHelper', () => new OAuthHelper());
   runtime.objectFactory.registerConstructor('RemoteUIAccess', () => new RemoteUIAccess());
   runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
@@ -717,7 +719,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'Clipboard', 'Console', 'FileSystem',
       'ShellExecutor', 'HostFileSystem',
       'WebSearch', 'WebFetch', 'Screenshot',
-      'Storage', 'StreamClient', 'AudioOutput', 'Speech',
+      'Storage', 'StreamClient', 'AudioOutput', 'Speech', 'Crypto',
       // Global services
       'GlobalSettings', 'PermissionBroker', 'PeerNetwork', 'SceneLibrary',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
@@ -808,6 +810,8 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
 
   const storageId = await supervisedSpawn('Storage');
   const timerId = await supervisedSpawn('Timer');
+  // Randomness, hashing and signature checks for abjects without node:crypto.
+  await supervisedSpawn('Crypto');
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
   // FileSystem is now per-workspace (spawned by WorkspaceManager rooted at
@@ -942,9 +946,10 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       const peers = (data.connectedPeers as string[]).map(p => p as PeerId);
       peerRouterObj.updateConnectedPeers(peers);
 
-      // On new connection, announce routes
+      // On new connection, announce routes, from scratch: the peer may have
+      // restarted, or been dropped and readmitted, and lost what it was told.
       if (data.event === 'connected' && data.peerId) {
-        peerRouterObj.announceRoutesToPeer(data.peerId as string as PeerId).catch(() => {});
+        peerRouterObj.announceRoutesToNewConnection(data.peerId as string as PeerId);
       }
     });
 

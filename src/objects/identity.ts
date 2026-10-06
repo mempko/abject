@@ -28,6 +28,7 @@ import {
   aesEncrypt,
   aesDecrypt,
 } from '../core/identity.js';
+import { base64ToBytes, bytesToBase64, bytesToHex } from '../core/encoding.js';
 
 const IDENTITY_INTERFACE = 'abjects:identity';
 const STORAGE_KEY_SIGNING = 'identity:signing-keypair';
@@ -415,7 +416,7 @@ export class IdentityObject extends Abject {
       this.signingKeyPair!.privateKey,
       dataBytes,
     );
-    return bufferToBase64(new Uint8Array(signature));
+    return bytesToBase64(new Uint8Array(signature));
   }
 
   private async verifySignature(
@@ -428,7 +429,7 @@ export class IdentityObject extends Abject {
 
     const encoder = new TextEncoder();
     const dataBytes = encoder.encode(data);
-    const sigBytes = base64ToBuffer(signature);
+    const sigBytes = base64ToBytes(signature);
 
     return crypto.subtle.verify(
       { name: 'ECDSA', hash: 'SHA-256' },
@@ -496,7 +497,7 @@ export class IdentityObject extends Abject {
     // Export raw key bits and hash for verification fingerprint
     const rawBits = await crypto.subtle.exportKey('raw', sessionKey);
     const hash = await crypto.subtle.digest('SHA-256', rawBits);
-    return bufferToHex(new Uint8Array(hash));
+    return bytesToHex(hash);
   }
 
   protected override checkInvariants(): void {
@@ -560,33 +561,4 @@ export class IdentityObject extends Abject {
 - Keys are persisted via the Storage capability — they survive restarts.
 - importContact must be called before encrypt/decrypt/verify with a remote peer.`;
   }
-}
-
-// =============================================================================
-// Encoding Helpers
-// =============================================================================
-
-function bufferToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToBuffer(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function bufferToHex(bytes: Uint8Array): string {
-  let hex = '';
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, '0');
-  }
-  return hex;
 }

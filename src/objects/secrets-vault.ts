@@ -23,6 +23,8 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { aesDecrypt, aesEncrypt } from '../core/identity.js';
+import { base64ToBytes, bytesToBase64 } from '../core/encoding.js';
 
 const log = new Log('SecretsVault');
 
@@ -340,27 +342,12 @@ directly into a child process's environment.
 
   private async encrypt(plaintext: string): Promise<{ iv: string; ciphertext: string }> {
     contractRequire(this.vaultKey !== undefined, 'vault key not ready');
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const cipher = new Uint8Array(
-      await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: iv as BufferSource },
-        this.vaultKey!,
-        new TextEncoder().encode(plaintext) as BufferSource,
-      ),
-    );
-    return { iv: bytesToBase64(iv), ciphertext: bytesToBase64(cipher) };
+    return aesEncrypt(this.vaultKey!, new TextEncoder().encode(plaintext));
   }
 
   private async decrypt(stored: StoredSecret): Promise<string> {
     contractRequire(this.vaultKey !== undefined, 'vault key not ready');
-    const iv = base64ToBytes(stored.iv);
-    const cipher = base64ToBytes(stored.ciphertext);
-    const plain = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv as BufferSource },
-      this.vaultKey!,
-      cipher as BufferSource,
-    );
-    return new TextDecoder().decode(plain);
+    return new TextDecoder().decode(await aesDecrypt(this.vaultKey!, stored.iv, stored.ciphertext));
   }
 
   // ─── Persistence ───────────────────────────────────────────────
@@ -394,23 +381,4 @@ directly into a child process's environment.
       );
     } catch { /* best effort */ }
   }
-}
-
-// ─── Base64 helpers ──────────────────────────────────────────────
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  if (typeof btoa !== 'undefined') return btoa(binary);
-  return Buffer.from(bytes).toString('base64');
-}
-
-function base64ToBytes(b64: string): Uint8Array {
-  if (typeof atob !== 'undefined') {
-    const binary = atob(b64);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-    return out;
-  }
-  return Uint8Array.from(Buffer.from(b64, 'base64'));
 }
