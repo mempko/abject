@@ -289,6 +289,49 @@ export function projectUnitQuadToCss(
   return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
 }
 
+/**
+ * Nearest-neighbour upscale of RGBA pixels placed at CSS (dx, dy) onto a
+ * backing store `dpr` times larger. Returns the device-space block to hand to
+ * putImageData. Bytes are copied verbatim (no canvas round trip, so
+ * semi-transparent pixels are not altered by premultiplication). The block's
+ * edges are rounded CSS edges, so adjacent blocks tile without seams at a
+ * fractional dpr; each device pixel takes the source pixel under its centre.
+ *
+ * Exported so the mapping can be checked without a canvas.
+ */
+export function upscalePixels(
+  src: Uint8ClampedArray, w: number, h: number, dx: number, dy: number, dpr: number,
+): { data: Uint8ClampedArray<ArrayBuffer>; width: number; height: number; x: number; y: number } {
+  const x = Math.round(dx * dpr), y = Math.round(dy * dpr);
+  const width = Math.round((dx + w) * dpr) - x, height = Math.round((dy + h) * dpr) - y;
+  const data = new Uint8ClampedArray(Math.max(0, width * height * 4));
+  // Source index for a device column/row; the clamps only absorb float error.
+  const pick = (d: number, origin: number, css: number, n: number) =>
+    Math.min(n - 1, Math.max(0, Math.floor((d + origin + 0.5) / dpr - css)));
+  const cols = new Int32Array(Math.max(0, width));
+  for (let X = 0; X < width; X++) cols[X] = pick(X, x, dx, w);
+  // One 32-bit copy per device pixel: an RGBA pixel moves as a unit, so the
+  // bytes are unchanged whatever the platform's endianness.
+  const aligned = src.byteOffset % 4 === 0 ? src : src.slice();
+  const from = new Uint32Array(aligned.buffer, aligned.byteOffset, w * h);
+  const to = new Uint32Array(data.buffer);
+  let o = 0;
+  for (let Y = 0; Y < height; Y++) {
+    const row = pick(Y, y, dy, h) * w;
+    for (let X = 0; X < width; X++) to[o++] = from[row + cols[X]];
+  }
+  return { data, width, height, x, y };
+}
+
+/**
+ * Backing-store size in canvas px for `css` px at `dpr`. Rounded, so float
+ * error (100 * 1.1 = 110.00000000000001) cannot add a stray column; at dpr 1
+ * the CSS size is passed through unchanged, exactly as before.
+ */
+function backingPx(css: number, dpr: number): number {
+  return dpr === 1 ? css : Math.round(css * dpr);
+}
+
 /** How far (CSS px) a window's glow may extend past its own edge. */
 const BLOOM_SPILL_PX = 24;
 
@@ -301,6 +344,8 @@ export interface Surface {
   inputPassthrough: boolean;
   inputMonitor: boolean;
   canvas: OffscreenCanvas;
+  /** Backing-store scale: canvas pixels per CSS pixel, fixed at allocation. */
+  dpr: number;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
   tainted: boolean;      // canvas tainted by a cross-origin image; texture upload is unsafe, render the last-good texture
@@ -915,12 +960,38 @@ export class Compositor {
     this.startRenderLoop();
   }
 
+  /** Window backing-store dpr before the per-surface size cap: the screen's dpr, clamped to [1, 2]. */
+  private baseSurfaceDpr(): number {
+    return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  }
+
+  /**
+   * Backing-store dpr for a window of `width` x `height` CSS px: the base dpr,
+   * lowered so neither backing dimension exceeds the GPU's max texture size,
+   * never below 1 (a window already too large at 1x keeps today's behaviour).
+   */
+  private surfaceDpr(width: number, height: number): number {
+    const maxTex = this.renderer.maxBufferSize();
+    return Math.max(1, Math.min(this.baseSurfaceDpr(), maxTex / width, maxTex / height));
+  }
+
+  /** baseSurfaceDpr() at the last handleResize; a change re-allocates every window surface. */
+  private lastSurfaceDpr = 0;
+
   /**
    * Handle canvas resize.
    */
   private handleResize(): void {
     const dpr = window.devicePixelRatio || 1;
     const rect = this.canvas.getBoundingClientRect();
+
+    // Zoom or a move to another display changed the dpr: re-allocate every
+    // window surface so none is left at the old backing-store resolution.
+    const surfaceDpr = this.baseSurfaceDpr();
+    if (this.lastSurfaceDpr !== 0 && surfaceDpr !== this.lastSurfaceDpr) {
+      for (const s of this.surfaces.values()) this.resizeSurface(s.id, s.rect.width, s.rect.height);
+    }
+    this.lastSurfaceDpr = surfaceDpr;
 
     this.renderer.setSize(rect.width, rect.height, dpr);
     this.renderer.cssWidth = rect.width;
@@ -953,9 +1024,11 @@ export class Compositor {
 
     const id = surfaceId ?? `surface-${objectId}-${Date.now()}`;
 
-    const offscreen = new OffscreenCanvas(rect.width, rect.height);
+    const dpr = this.surfaceDpr(rect.width, rect.height);
+    const offscreen = new OffscreenCanvas(backingPx(rect.width, dpr), backingPx(rect.height, dpr));
     const ctx = offscreen.getContext('2d');
     require(ctx !== null, 'Failed to get offscreen 2D context');
+    ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const surface: Surface = {
       id,
@@ -966,6 +1039,7 @@ export class Compositor {
       inputPassthrough,
       inputMonitor,
       canvas: offscreen,
+      dpr,
       ctx: ctx!,
       dirty: true,
       tainted: false,
@@ -1416,14 +1490,18 @@ export class Compositor {
       surface.rect.width = width;
       surface.rect.height = height;
 
-      // Recreate offscreen canvas
-      const offscreen = new OffscreenCanvas(width, height);
+      // Recreate offscreen canvas at the current device pixel ratio
+      const dpr = this.surfaceDpr(width, height);
+      const offscreen = new OffscreenCanvas(backingPx(width, dpr), backingPx(height, dpr));
       const ctx = offscreen.getContext('2d');
       require(ctx !== null, 'Failed to get offscreen context');
 
       // Preserve old content so the surface is never blank between
-      // resize and the next draw cycle (avoids flash-of-blank during resize)
-      ctx!.drawImage(oldCanvas, 0, 0);
+      // resize and the next draw cycle (avoids flash-of-blank during resize).
+      // Draw the old bitmap at its old CSS size, scaled into device pixels.
+      ctx!.drawImage(oldCanvas, 0, 0, (oldCanvas.width / surface.dpr) * dpr, (oldCanvas.height / surface.dpr) * dpr);
+      ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+      surface.dpr = dpr;
 
       surface.canvas = offscreen;
       surface.ctx = ctx!;
@@ -2101,7 +2179,7 @@ export class Compositor {
         break;
 
       default:
-        this.execShapeCommand(ctx, command.surfaceId, command);
+        this.execShapeCommand(ctx, command.surfaceId, command, surface.dpr);
         break;
     }
 
@@ -2118,7 +2196,7 @@ export class Compositor {
    * `key` identifies the target for the async image caches (a surfaceId or a
    * canvas layer's full key).
    */
-  private execShapeCommand(ctx: OffscreenCanvasRenderingContext2D, key: string, command: DrawCommand): void {
+  private execShapeCommand(ctx: OffscreenCanvasRenderingContext2D, key: string, command: DrawCommand, dpr: number): void {
     switch (command.type) {
       case 'rect': {
         const p = command.params as RectParams;
@@ -2206,7 +2284,7 @@ export class Compositor {
           type: params.url !== undefined ? 'imageUrl' : 'image',
           surfaceId: command.surfaceId,
           params,
-        });
+        }, dpr);
         break;
       }
 
@@ -2244,7 +2322,7 @@ export class Compositor {
             }
             this.imageCache.set(p.url, { img, loaded: true });
 
-            this.lateBlit(sid, savedTransform, img, p);
+            this.lateBlit(sid, savedTransform, dpr, img, p);
             this.needsRender = true;
           };
           // On error, keep showing the old image (don't update liveDataImages)
@@ -2279,7 +2357,7 @@ export class Compositor {
                 // Remember this as the target's live frame so the next swap can
                 // fall back to it instead of the background.
                 this.liveDataImages.set(sid, { img: image, width: image.naturalWidth, height: image.naturalHeight });
-                this.lateBlit(sid, savedTransform, image, p);
+                this.lateBlit(sid, savedTransform, dpr, image, p);
                 this.needsRender = true;
               };
               // Load with CORS so the decoded pixels can be uploaded to WebGL.
@@ -2497,9 +2575,10 @@ export class Compositor {
       case 'shadow': {
         const p = command.params as ShadowParams;
         ctx.shadowColor = p.color;
-        ctx.shadowBlur = p.blur;
-        ctx.shadowOffsetX = p.offsetX ?? 0;
-        ctx.shadowOffsetY = p.offsetY ?? 0;
+        // Shadow geometry ignores the CTM; scale it into device pixels.
+        ctx.shadowBlur = p.blur * dpr;
+        ctx.shadowOffsetX = (p.offsetX ?? 0) * dpr;
+        ctx.shadowOffsetY = (p.offsetY ?? 0) * dpr;
         break;
       }
 
@@ -2545,7 +2624,16 @@ export class Compositor {
       case 'putImageData': {
         const p = command.params as { data: number[] | Uint8ClampedArray; width: number; height: number; dx?: number; dy?: number };
         const pixels = (p.data instanceof Uint8ClampedArray ? p.data : new Uint8ClampedArray(p.data)) as Uint8ClampedArray<ArrayBuffer>;
-        ctx.putImageData(new ImageData(pixels, p.width, p.height), p.dx ?? 0, p.dy ?? 0);
+        // Constructing the ImageData validates length and size at every dpr.
+        const img = new ImageData(pixels, p.width, p.height);
+        if (dpr === 1) {
+          ctx.putImageData(img, p.dx ?? 0, p.dy ?? 0);
+        } else {
+          // putImageData replaces pixels in device space (it ignores the CTM,
+          // alpha, clip and shadow), so scale the block itself to the dpr.
+          const s = upscalePixels(img.data, p.width, p.height, p.dx ?? 0, p.dy ?? 0, dpr);
+          if (s.width > 0 && s.height > 0) ctx.putImageData(new ImageData(s.data, s.width, s.height), s.x, s.y);
+        }
         break;
       }
 
@@ -2592,7 +2680,7 @@ export class Compositor {
       default:
         // Canvas 2D API pass-through: context methods (named args per
         // CANVAS_CTX_METHODS) and settable properties ({ value } commands).
-        this.applyContextCommand(ctx, command.type, command.params as Record<string, unknown> | undefined);
+        this.applyContextCommand(ctx, command.type, command.params as Record<string, unknown> | undefined, dpr);
         break;
     }
   }
@@ -2602,11 +2690,14 @@ export class Compositor {
    * whichever target issued the command — a window surface or a canvas-layer
    * scene node.
    */
-  private lateBlit(key: string, transform: DOMMatrix, image: CanvasImageSource, p: ImageUrlParams): void {
+  private lateBlit(key: string, transform: DOMMatrix, dpr: number, image: CanvasImageSource, p: ImageUrlParams): void {
     const surf = this.surfaces.get(key);
     if (surf) {
       surf.ctx.save();
-      surf.ctx.setTransform(transform);
+      // If the surface was re-allocated at another dpr since the command ran,
+      // swap the old dpr base scale in the saved transform for the new one
+      // (re-allocation kept the old content at its CSS size).
+      surf.ctx.setTransform(surf.dpr === dpr ? transform : new DOMMatrix().scale(surf.dpr / dpr).multiply(transform));
       blitImage(surf.ctx, image, p);
       surf.ctx.restore();
       surf.dirty = true;
@@ -2630,16 +2721,15 @@ export class Compositor {
    * the full surface.
    */
   private resetSurfaceState(surface: Surface): void {
-    this.resetCtxState(surface.ctx, surface.rect.width, surface.rect.height);
+    this.resetCtxState(surface.ctx, surface.rect.width, surface.rect.height, surface.dpr);
   }
 
-  /** Reset one 2D context's state and wipe its bitmap to transparent. */
-  private resetCtxState(ctx: OffscreenCanvasRenderingContext2D, width: number, height: number): void {
+  /** Reset one 2D context's state and wipe its bitmap to transparent. `scale` is the backing-store dpr. */
+  private resetCtxState(ctx: OffscreenCanvasRenderingContext2D, width: number, height: number, scale: number): void {
     if (typeof (ctx as unknown as { reset?: () => void }).reset === 'function') {
       (ctx as unknown as { reset: () => void }).reset();
-    } else {
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
     ctx.globalAlpha = 1.0;
     ctx.shadowColor = 'transparent';
     ctx.shadowBlur = 0;
@@ -2657,7 +2747,30 @@ export class Compositor {
     ctx: OffscreenCanvasRenderingContext2D,
     type: DrawCommandType,
     params: Record<string, unknown> | undefined,
+    dpr: number,
   ): void {
+    if (dpr !== 1) {
+      // Device-space state on a dpr-scaled surface: keep the dpr base transform
+      // and scale CTM-independent shadow geometry.
+      if (type === 'setTransform' || type === 'resetTransform') {
+        const n = (k: string, d: number) => (typeof params?.[k] === 'number' ? (params[k] as number) : d);
+        const [a, b, c, d, e, f] = type === 'resetTransform'
+          ? [1, 0, 0, 1, 0, 0]
+          : [n('a', 1), n('b', 0), n('c', 0), n('d', 1), n('e', 0), n('f', 0)];
+        ctx.setTransform(a * dpr, b * dpr, c * dpr, d * dpr, e * dpr, f * dpr);
+        return;
+      }
+      if (type === 'shadowBlur' || type === 'shadowOffsetX' || type === 'shadowOffsetY') {
+        const v = params?.value;
+        (ctx as unknown as Record<string, unknown>)[type] = typeof v === 'number' ? v * dpr : v;
+        return;
+      }
+      if (type === 'filter' && typeof params?.value === 'string') {
+        // Filter lengths ignore the CTM too: scale every <number>px outside url() by the dpr.
+        ctx.filter = params.value.replace(/url\([^)]*\)|(-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)px/gi, (m, n?: string) => (n === undefined ? m : `${Number(n) * dpr}px`));
+        return;
+      }
+    }
     const argNames = CANVAS_CTX_METHODS[type];
     if (argNames) {
       const args = argNames.map((name) => params?.[name]);
@@ -2813,7 +2926,7 @@ export class Compositor {
   ): void {
     const ctx = surface.ctx;
     ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.setTransform(surface.dpr, 0, 0, surface.dpr, 0, 0);
     // Clip to the region rect, tightened by any scroll-viewport bounds.
     const top = Math.max(region.y, region.clipTop ?? region.y);
     const bottom = Math.min(region.y + region.height, region.clipBottom ?? region.y + region.height);
@@ -3538,7 +3651,7 @@ export class Compositor {
       // Full repaint. A layer starts transparent each revision — everything
       // left unpainted shows the scene behind it; a 'clear' with a color (or
       // any painted background) opts into opacity.
-      this.resetCtxState(entry.ctx, w, h);
+      this.resetCtxState(entry.ctx, w, h, 1);
       const commands = node.params.commands;
       if (Array.isArray(commands)) {
         for (const raw of commands) {
@@ -3546,16 +3659,16 @@ export class Compositor {
           if (!cmd || typeof cmd !== 'object' || typeof cmd.type !== 'string') continue;
           this.resolveCommandColors(cmd);
           if (cmd.type === 'clear') {
-            this.resetCtxState(entry.ctx, w, h);
+            this.resetCtxState(entry.ctx, w, h, 1);
             const p = cmd.params as { color?: string };
             if (p?.color) {
               entry.ctx.fillStyle = p.color;
               entry.ctx.fillRect(0, 0, w, h);
             }
           } else if (cmd.type === 'reset') {
-            this.resetCtxState(entry.ctx, w, h);
+            this.resetCtxState(entry.ctx, w, h, 1);
           } else if (cmd.type !== 'videoFrame') { // videoFrame is surface-only
-            this.execShapeCommand(entry.ctx, fullKey, cmd);
+            this.execShapeCommand(entry.ctx, fullKey, cmd, 1);
           }
         }
       }
@@ -3610,16 +3723,16 @@ export class Compositor {
     if (!entry) return;
     this.resolveCommandColors(command);
     if (command.type === 'clear') {
-      this.resetCtxState(entry.ctx, entry.w, entry.h);
+      this.resetCtxState(entry.ctx, entry.w, entry.h, 1);
       const p = command.params as { color?: string };
       if (p?.color) {
         entry.ctx.fillStyle = p.color;
         entry.ctx.fillRect(0, 0, entry.w, entry.h);
       }
     } else if (command.type === 'reset') {
-      this.resetCtxState(entry.ctx, entry.w, entry.h);
+      this.resetCtxState(entry.ctx, entry.w, entry.h, 1);
     } else if (command.type !== 'videoFrame') { // videoFrame is surface-only
-      this.execShapeCommand(entry.ctx, `${surfaceId}/${nodeId}`, command);
+      this.execShapeCommand(entry.ctx, `${surfaceId}/${nodeId}`, command, 1);
     }
     entry.needsUpload = true;
     if (this.isSurfaceKeyRenderable(surfaceId)) this.needsRender = true;
@@ -7383,8 +7496,8 @@ void main() { fragColor = vec4(0.0); }`));
       if (!slabHit) continue;
       try {
         const pixel = surface.ctx.getImageData(
-          Math.max(0, Math.min(rect.width - 1, Math.floor(slabHit.x))),
-          Math.max(0, Math.min(rect.height - 1, Math.floor(slabHit.y))),
+          Math.max(0, Math.min(surface.canvas.width - 1, Math.floor(slabHit.x * surface.dpr))),
+          Math.max(0, Math.min(surface.canvas.height - 1, Math.floor(slabHit.y * surface.dpr))),
           1, 1
         ).data;
         if (pixel[3] === 0) continue;
@@ -7568,8 +7681,8 @@ void main() { fragColor = vec4(0.0); }`));
       // loaded without CORS); treat those surfaces as fully opaque.
       try {
         const pixel = surface.ctx.getImageData(
-          Math.max(0, Math.min(rect.width - 1, Math.floor(hit.x))),
-          Math.max(0, Math.min(rect.height - 1, Math.floor(hit.y))),
+          Math.max(0, Math.min(surface.canvas.width - 1, Math.floor(hit.x * surface.dpr))),
+          Math.max(0, Math.min(surface.canvas.height - 1, Math.floor(hit.y * surface.dpr))),
           1, 1
         ).data;
         if (pixel[3] === 0) continue;
