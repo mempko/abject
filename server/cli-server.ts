@@ -20,6 +20,7 @@ import { Abject } from '../src/core/abject.js';
 import { request } from '../src/core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../src/core/contracts.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
+import { refuseAllOrigins } from '../src/network/origin-policy.js';
 import { authenticateConnection, AuthConfig, SessionStore } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
 
@@ -222,6 +223,10 @@ export class CliServer extends Abject {
       port: this.port,
       host: '127.0.0.1',
       perMessageDeflate: false,
+      // No browser client speaks this protocol; commune and scripts send no
+      // Origin. A web page has no business here: it could send to agents and
+      // answer their permission dialogs (respondDialog).
+      allowOrigin: refuseAllOrigins,
     });
     this.wsServer.onConnection((ws) => this.handleConnection(ws));
     await this.wsServer.ready();

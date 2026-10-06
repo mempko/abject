@@ -68,6 +68,7 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
 | `ABJECTS_WORKER_COUNT` | CPU cores | Worker thread pool size |
 | `ABJECTS_WORKER_MAX_OLD_SPACE_MB` | sized from memory | Heap ceiling per worker thread (default: three quarters of memory less 512 MB, shared across pool and dedicated workers, 512 MB to 8 GB) |
 | `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | HTTP gateway port and address |
+| `ABJECTS_ALLOWED_ORIGINS` | - | Web pages allowed to open the UI WebSocket besides the desktop app (`ABJECTS_CLIENT_ORIGIN`, set by Electron) and the dev client (`VITE_CLIENT_PORT`, default 5174); comma-separated. See `src/network/origin-policy.ts` |
 
 **Health and version.** The WebSocket port also answers plain HTTP: `GET
 /healthz` (503 `starting` until boot finishes, then 200 `ok` with version,

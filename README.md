@@ -322,6 +322,7 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
 | `ABJECTS_WORKER_MAX_OLD_SPACE_MB` | sized from memory | Heap ceiling per worker (default: three quarters of memory less 512 MB, shared across workers, 512 MB to 8 GB) |
 | `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | The HTTP gateway's port and address (see [docs/WEB_GATEWAY.md](docs/WEB_GATEWAY.md)) |
+| `ABJECTS_ALLOWED_ORIGINS` | - | Web pages allowed to open the UI WebSocket besides the desktop app and the dev client (`http://127.0.0.1:VITE_CLIENT_PORT`, default 5174), comma-separated, e.g. `https://abject.example.com` for a client served through a reverse proxy that forwards `/ws`. Pages of any other origin are refused; the CLI gateway refuses all pages |
 | `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
 | `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
 | `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated `ws://`/`wss://`); servers learned from peers and the public default are never used (see [WHISPER.md](WHISPER.md)) |

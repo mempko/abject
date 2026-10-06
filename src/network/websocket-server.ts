@@ -3,7 +3,9 @@
  */
 
 import * as http from 'http';
+import type { Duplex } from 'stream';
 import { WebSocketServer as WsServer, WebSocket } from 'ws';
+import type { OriginPolicy } from './origin-policy.js';
 
 export interface WsServerConfig {
   port: number;
@@ -23,10 +25,32 @@ export interface WsServerConfig {
    * The server uses it for its local health endpoint.
    */
   onHttpRequest?: (req: http.IncomingMessage, res: http.ServerResponse) => boolean;
+  /**
+   * Which web pages may connect (see origin-policy.ts). A handshake that
+   * carries an Origin the policy refuses is answered 403 before it reaches
+   * the WebSocket layer. Handshakes without an Origin come from clients that
+   * are not browsers and are always let through. Unset: every page may
+   * connect, as before this option existed.
+   */
+  allowOrigin?: OriginPolicy;
 }
 
 /** A ws socket carrying our liveness flag (set on pong, checked on ping). */
 type LivenessWs = WebSocket & { isAlive?: boolean };
+
+/** Answer a refused handshake and close the socket once the answer is out. */
+function refuseUpgrade(socket: Duplex): void {
+  const body = 'Forbidden: pages of this origin may not open this WebSocket.\n';
+  socket.once('finish', () => socket.destroy());
+  socket.end(
+    'HTTP/1.1 403 Forbidden\r\n' +
+    'Connection: close\r\n' +
+    'Content-Type: text/plain; charset=utf-8\r\n' +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+    '\r\n' +
+    body,
+  );
+}
 
 /**
  * Thin wrapper around the `ws` WebSocketServer for use in Node.js.
@@ -42,7 +66,7 @@ export class NodeWebSocketServer {
     // Back the WebSocket server with a real http.Server so plain HTTP
     // requests (curl, health checks, a stray browser) get a helpful answer
     // instead of ws's built-in "Upgrade Required" (426). WebSocket upgrade
-    // requests are forwarded to ws unchanged.
+    // requests are handed to ws once their Origin has passed allowOrigin.
     this.httpServer = http.createServer((req, res) => {
       if (config.onHttpRequest?.(req, res)) return;
       res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -52,9 +76,28 @@ export class NodeWebSocketServer {
       );
     });
     this.httpServer.listen(config.port, config.host ?? '0.0.0.0');
+    // The upgrade is taken here rather than by ws itself so the Origin can be
+    // checked before the handshake completes.
     this.wss = new WsServer({
-      server: this.httpServer,
+      noServer: true,
       perMessageDeflate: config.perMessageDeflate ?? false,
+    });
+    this.httpServer.on('upgrade', (req, socket, head) => {
+      const origin = req.headers.origin;
+      if (origin !== undefined && config.allowOrigin && !config.allowOrigin(origin)) {
+        // The client may already be gone; an error on a socket nobody is
+        // listening to would otherwise be an uncaught exception.
+        socket.on('error', () => socket.destroy());
+        console.warn(`[WS-SERVER] refused a WebSocket on port ${this.port ?? config.port} from origin ${origin.slice(0, 200)}`);
+        refuseUpgrade(socket);
+        return;
+      }
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req));
+    });
+    // Handed the server, ws used to re-emit its errors as its own 'error'
+    // event (logged below). Without a server it does not, so log them here.
+    this.httpServer.on('error', (err) => {
+      console.error(`[WS-SERVER] error:`, err);
     });
 
     const heartbeatMs = config.heartbeatMs ?? 30_000;
@@ -76,8 +119,8 @@ export class NodeWebSocketServer {
       this.heartbeat.unref?.();
     }
 
-    // In server mode, ws does not emit 'listening' itself — wait on the
-    // underlying http.Server.
+    // ws does not listen itself (noServer) — wait on the underlying
+    // http.Server.
     this._ready = new Promise<void>((resolve, reject) => {
       this.httpServer.once('listening', () => {
         const addr = this.httpServer.address();
@@ -108,6 +151,12 @@ export class NodeWebSocketServer {
    */
   ready(): Promise<void> {
     return this._ready;
+  }
+
+  /** The port actually bound (the one the OS chose when given port 0), once listening. */
+  get port(): number | undefined {
+    const addr = this.httpServer.address();
+    return typeof addr === 'object' && addr ? addr.port : undefined;
   }
 
   /**

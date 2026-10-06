@@ -279,6 +279,11 @@ app.whenReady().then(async () => {
   // Start the client HTTP server
   const port = await startClientServer();
 
+  // The window loads the client from this origin, and the backend's UI socket
+  // refuses pages of any origin it was not told about. The port is only
+  // known now, so it travels in the environment the backend reads at boot.
+  process.env.ABJECTS_CLIENT_ORIGIN = `http://127.0.0.1:${port}`;
+
   // Import the compiled server -- this triggers its top-level main() call,
   // which starts the WebSocket server on WS_PORT. The namespace is kept so
   // shutdown can reach the backend's own teardown at window close.

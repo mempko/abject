@@ -127,6 +127,7 @@ import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { WorkspaceCollaboratorInspector } from '../src/objects/workspace-collaborator-inspector.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
+import { allowOrigins, clientOriginsFromEnv } from '../src/network/origin-policy.js';
 import { NodeWorkerAdapter, planWorkerHeaps, workerHeapMb } from './node-worker-adapter.js';
 import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
 import { WebSocketUITransport, toUIWireData, postUIWireData, normalizeWsPayload } from './ui-transport.js';
@@ -513,10 +514,21 @@ async function main(): Promise<void> {
     };
   }
 
+  // Pages that may open the UI socket: the desktop app's own client, the Vite
+  // dev client, and ABJECTS_ALLOWED_ORIGINS. Any other site open in a browser
+  // on this machine is refused (src/network/origin-policy.ts). Paired remote
+  // clients (client.abject.world) arrive over WebRTC, not through this socket.
+  const clientOrigins = clientOriginsFromEnv(process.env);
+  for (const bad of clientOrigins.ignored) {
+    log.warn(`ABJECTS_ALLOWED_ORIGINS: ignoring ${bad} (not an http:// or https:// origin)`);
+  }
+  log.info(`UI socket accepts pages from ${clientOrigins.origins.join(', ') || 'no origin (non-browser clients only)'}`);
+
   const wsServer = new NodeWebSocketServer({
     port: WS_PORT,
     host: '127.0.0.1',
     perMessageDeflate: false,
+    allowOrigin: allowOrigins(clientOrigins.origins),
     // Local health and version, for a service manager or a host agent on the
     // same machine (the port binds loopback). 503 until boot has finished.
     onHttpRequest: (req, res) => {
