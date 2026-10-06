@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.14.6",
+    "date": "2026-10-06",
+    "title": "The app now updates itself",
+    "summary": "Abject's desktop app can now find, download and install new versions without you visiting the website. Install v0.14.6 by hand once; releases after it arrive on their own.",
+    "highlights": [
+      "The packaged desktop app checks GitHub releases for new versions, downloads them in the background and installs them when you quit, or right away when you choose Restart to Update.",
+      "How updates install depends on how you installed the app: the Windows installer and AppImage update in place; .deb installs update only when you restart, because dpkg asks for your password; macOS builds are unsigned for now, so they offer the new DMG as a manual download.",
+      "A new Updates tab in Settings shows update status and download progress, with buttons to check now, download, restart, and read the release notes. It also lets you turn automatic downloading on or off.",
+      "A workspace notification tells you when a new version is downloaded and ready to install.",
+      "The Help menu has a new Check for Updates... item, which opens Settings on the Updates tab.",
+      "Only the Settings window can download an update, restart the app or change the auto-download setting. Other objects can check for updates and read the status, but they cannot start an install.",
+      "The headless server package does not include the updater; server deployments keep updating the way they do now."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.14.5",
     "date": "2026-10-06",
     "title": "Headless servers, web pages, and a locked door",
