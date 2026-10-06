@@ -1,5 +1,28 @@
 [
   {
+    "version": "0.14.5",
+    "date": "2026-10-06",
+    "title": "Headless servers, web pages, and a locked door",
+    "summary": "Abject can now run as a headless server, and script packages can serve web pages, join workspace profiles, and use a new Crypto capability. This release also closes a hole that let any web page open on your machine connect to Abject's UI socket.",
+    "highlights": [
+      "Script packages can serve web pages: in http mode a package answers WebRequest messages with WebResponses, and its cookies are scoped to its own route (see docs/WEB_GATEWAY.md).",
+      "Headless server packaging: pnpm incarnate:server builds a self-contained server bundle with a systemd unit, and a new InstanceInfo abject reports the running version and answers GET /healthz.",
+      "Workspace profiles decide which abjects a workspace spawns. There are built-in default and service profiles, you can override them with a profiles.json, and packages declare which profiles they join (see docs/WORKSPACE_PROFILES.md).",
+      "The UI WebSocket now accepts connections only from the desktop app, the dev client, and origins you list in ABJECTS_ALLOWED_ORIGINS (for reverse-proxied clients). Before this, any web page open in a browser on the same machine could connect and drive the UI.",
+      "New Crypto capability for script packages: random bytes and UUIDs, hashes and HMACs, password hashing and verification, timing-safe comparison, byte encoding, and signature verification.",
+      "System-scope script packages run once per instance instead of once per workspace, and the Packages abject keeps their data.",
+      "Packages tagged launcher that have show and hide methods get a row in the dock's System section, with the name and icon from their manifest; clicking the row opens them.",
+      "The desktop app moves from Electron 35 to Electron 44, so the app and its built-in web browser run on a current Chromium."
+    ],
+    "fixes": [
+      "Pairing QR codes and images embedded in markdown decode correctly again; a shared encoding module replaces the old ad hoc base64 handling.",
+      "Peers keep accurate routes to each other: route announcements are versioned and sent as diffs, and a full reconnect now triggers a complete resync.",
+      "A peer added to a shared workspace's whitelist after sharing now shows up in discovery, instead of being filtered out by a stale cached list.",
+      "Deleting a shared workspace now unshares it, so a new workspace with the same name can be found by the peers it is shared with.",
+      "A workspace created while the server is running is now served under its name on the web gateway, not under its internal id."
+    ]
+  },
+  {
     "version": "0.14.4",
     "date": "2026-10-05",
     "title": "Your Own Models, Your Own Peers",
