@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.14.7",
+    "date": "2026-10-07",
+    "title": "Updates that install while the app runs",
+    "summary": "This release changes when the desktop app installs updates. Installation now begins while Abject is still running normally instead of at the very end of shutdown, so a crash or a slow exit can no longer leave an update half-installed or skipped.",
+    "highlights": [
+      "Updates now start installing while the app is running and healthy. After a restart, the new version is launched by a small separate helper once the old process has fully exited.",
+      "Linux AppImage: once a download is verified, the new AppImage replaces the old one right away. The new version runs the next time you launch or restart.",
+      "Windows: the installer starts when you choose Restart to Update, or as soon as the app begins to quit, and then finishes after the app has closed.",
+      "Linux .deb: the package installs during Restart to Update, so the password prompt shows up while the app is still open. You get up to five minutes to answer it, and if you close the prompt the app keeps running and tries again on the next attempt.",
+      "The status messages in Settings → Updates, the workspace update notification and the README now describe what happens for each type of install."
+    ],
+    "fixes": [
+      "Fixed updates that could be lost when a native crash or the exit watchdog ended shutdown before the installer had finished."
+    ]
+  },
+  {
     "version": "0.14.6",
     "date": "2026-10-06",
     "title": "The app now updates itself",
