@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.14.9",
+    "date": "2026-10-07",
+    "title": "Stalled Goals Wake Up Again",
+    "summary": "Goals that used to sit idle with no work left in flight now get noticed and reviewed, so they either start moving again or fail cleanly instead of hanging. Agents also handle more models correctly, including those that write tool calls in their own native format.",
+    "highlights": [
+      "Stalled goals get a second look: when an active goal has nothing running, queued or left to do, the team holds a review scrum to restart it, and if two reviews in a row leave it stuck, the goal is marked failed so it stops hanging",
+      "Agents now read a model's native tool-call markup as actions instead of plain text, so models that use their own tool-call format work properly",
+      "Work that a goal's task starts now belongs to that same goal, and goal health checks count queued work, so progress reporting is more accurate"
+    ],
+    "fixes": [
+      "Cancelling a goal's outstanding tasks no longer cancels the task that asked for the cleanup, which had been stopping goals partway through",
+      "A planning round whose scrum was cancelled with nothing to replace it now runs again instead of leaving the goal waiting",
+      "Retries waiting on backoff count as a scrum still to come, so they are no longer mistaken for a stall"
+    ]
+  },
+  {
     "version": "0.14.8",
     "date": "2026-10-07",
     "title": "Settings from the terminal, instances in your pocket",
