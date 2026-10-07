@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.14.8",
+    "date": "2026-10-07",
+    "title": "Settings from the terminal, instances in your pocket",
+    "summary": "You can now read and change every global setting from the commune terminal client, and one browser or phone can hold several Abject instances and switch between them. Window screenshots also work for windows that are hidden, covered, or in another workspace.",
+    "highlights": [
+      "Edit settings from the terminal: commune gains /settings, /get, /set, /add, /wset, /preset apply, /skill enable and /update check, in both the tabbed TUI and the plain REPL; keys and passwords are hidden as you type and never shown again",
+      "The p2p client can remember several instances and show one at a time: a pill on desktop (Ctrl+Shift+O) or a sheet on your phone lists them, your choice is saved, and the picker, connecting screen and login card all say which instance you are on",
+      "Global settings now live in a dedicated SettingsManager that saves them, checks every change, applies it to AI, UI and permissions right away, and announces the change; the Settings window is now just its view",
+      "Updates can be checked, downloaded and installed from the terminal as well as from the Settings window",
+      "Window screenshots work wherever the window is: off-screen, under other windows, or in another workspace, and everything is put back afterwards"
+    ],
+    "fixes": [
+      "Changing capability enforcement in Settings now takes effect immediately",
+      "Objects can no longer move a window into a different workspace; only the workspace system can, and other objects can only place a new object in their own workspace"
+    ]
+  },
+  {
     "version": "0.14.7",
     "date": "2026-10-07",
     "title": "Updates that install while the app runs",
