@@ -1,24 +1,36 @@
 /**
  * Browser entry point for the thin rendering client.
  *
- * Decides which transport to use:
+ * The `VITE_DEFAULT_MODE=p2p` build (client.abject.world) knows several
+ * instances and connects to the selected one (startP2P below): a `?pair=…`
+ * link pairs a new desktop, a saved desktop is reached over WebRTC, a saved
+ * server address over WebSocket, and with nothing selected it shows the
+ * instance picker (or the "Pair this device" splash when there are none).
+ *
+ * Every other build decides once:
  *   1. `?pair=…` query param → WebRTC pairing mode (first-time pair).
- *   2. localStorage has a paired desktop AND we're configured for p2p →
- *      WebRTC reconnect mode.
- *   3. `VITE_DEFAULT_MODE=p2p` build (e.g. client.abject.world) with no
- *      paired desktop → render the "Scan QR" splash and wait.
- *   4. Otherwise → WebSocket (current local-dev behaviour).
+ *   2. localStorage has a paired desktop → WebRTC reconnect mode.
+ *   3. Otherwise → WebSocket (current local-dev behaviour).
  */
 
 import { FrontendClient } from './frontend-client.js';
 import { startBackdrop } from './backdrop.js';
 import { WebSocketClientTransport } from './ws-transport.js';
 import { WebRTCClientTransport } from './webrtc-transport.js';
-import { getPairingPayloadFromUrl, clearPairingParamFromUrl, type PairingPayload } from './pairing.js';
+import { getPairingPayloadFromUrl, clearPairingParamFromUrl, parsePairingText, type PairingPayload } from './pairing.js';
 import { getMostRecentPairedDesktop, clearAllPairedDesktops } from './paired-desktops.js';
 import { clearBrowserIdentity } from './identity-store.js';
 import type { ClientTransport } from './transport.js';
 import { startQrScanner, type QrScannerHandle } from './qr-scanner.js';
+import { InstanceSwitcher } from './instance-switcher.js';
+import {
+  authTokenKey,
+  clearAllInstances,
+  getSelectedInstance,
+  migrateInstances,
+  savePairedInstance,
+  selectInstance,
+} from './instances.js';
 
 const T0 = performance.now();
 const clog = (msg: string) => console.log(`[CLIENT T+${Math.round(performance.now() - T0)}ms] ${msg}`);
@@ -59,8 +71,7 @@ function chooseTransport(): ClientTransport | null {
     }
     clog(`pairing mode → ${payload.peerId.slice(0, 16)}…`);
     clearPairingParamFromUrl();
-    const clientName = navigator.userAgent.includes('Mobile') ? 'Phone' : 'Browser';
-    return new WebRTCClientTransport({ pairing: { payload, clientName } });
+    return new WebRTCClientTransport({ pairing: { payload, clientName: clientName() } });
   }
 
   // 2. Reconnect mode — paired desktop in localStorage
@@ -70,14 +81,7 @@ function chooseTransport(): ClientTransport | null {
     return new WebRTCClientTransport({ reconnect: { desktop } });
   }
 
-  // 3. P2P-default build with no pairing — show the pair prompt.
-  if (isP2PDefault()) {
-    clog('p2p-default build with no pairing → pair prompt');
-    showPairPrompt();
-    return null;
-  }
-
-  // 4. Default: WebSocket to local backend
+  // 3. Default: WebSocket to local backend
   const url = buildWsUrl();
   clog(`websocket mode → ${url}`);
   return new WebSocketClientTransport(url);
@@ -85,6 +89,87 @@ function chooseTransport(): ClientTransport | null {
 
 let pendingClient: FrontendClient | undefined;
 let activeScanner: QrScannerHandle | undefined;
+/** What the splash's Scan button does; the p2p client routes scans through its instance list. */
+let splashScan: () => void = () => { void launchScanner(); };
+
+function clientName(): string {
+  return navigator.userAgent.includes('Mobile') ? 'Phone' : 'Browser';
+}
+
+/**
+ * The p2p client: connect to the selected instance, or show the picker.
+ * Switching instances writes the choice and reloads, landing back here.
+ */
+function startP2P(client: FrontendClient): void {
+  migrateInstances();
+  const switcher = new InstanceSwitcher({
+    client,
+    showPairSplash: (message) => showPairPrompt(message),
+    scanQr: (onText, onProblem) => { void launchScanner(onText, onProblem); },
+  });
+  splashScan = () => switcher.scanFromSplash();
+
+  const connect = (transport: ClientTransport) => {
+    clog('Calling connect()...');
+    client.connect(transport).catch((err) => {
+      // A refused or expired pairing has already been reported by the switcher.
+      console.error('[Frontend] connect failed:', err);
+      switcher.connectFailed();
+    });
+  };
+
+  // A pairing link adds a desktop, saved and selected once it accepts.
+  if (new URLSearchParams(location.search).has('pair')) {
+    const payload = getPairingPayloadFromUrl();
+    clearPairingParamFromUrl();
+    if (!payload) {
+      switcher.showPicker('That pairing link is not valid. Copy it again from your desktop.');
+      return;
+    }
+    if (payload.expires < Date.now()) {
+      switcher.showPicker('This pairing link has expired. Make a new one on your desktop.');
+      return;
+    }
+    clog(`pairing mode → ${payload.peerId.slice(0, 16)}…`);
+    switcher.beginSession({ kind: 'pairing', name: payload.name });
+    connect(new WebRTCClientTransport({
+      pairing: { payload, clientName: clientName() },
+      events: {
+        onPaired: (desktop) => {
+          const instance = savePairedInstance(desktop);
+          selectInstance(instance.id);
+          switcher.setInstance(instance);
+        },
+        onAccepted: () => switcher.noteAccepted(),
+        onPairingFailed: (reason) => switcher.pairingFailed(reason),
+        onRetry: (info) => switcher.noteRetry(info),
+      },
+    }));
+    return;
+  }
+
+  const instance = getSelectedInstance();
+  if (!instance) {
+    clog('no instance selected → picker');
+    switcher.showPicker();
+    return;
+  }
+  switcher.beginSession({ kind: 'instance', instance });
+  if (instance.kind === 'paired') {
+    clog(`reconnect mode → ${instance.desktop.peerId.slice(0, 16)}…`);
+    connect(new WebRTCClientTransport({
+      reconnect: { desktop: instance.desktop },
+      events: {
+        onAccepted: () => switcher.noteAccepted(),
+        onRetry: (info) => switcher.noteRetry(info),
+      },
+    }));
+  } else {
+    clog(`websocket mode → ${instance.url}`);
+    client.setAuthTokenKey(authTokenKey(instance.id));
+    connect(new WebSocketClientTransport(instance.url));
+  }
+}
 
 function showPairPrompt(message?: string): void {
   // Hide the loading overlay; show the dedicated pairing prompt.
@@ -99,8 +184,12 @@ function showPairPrompt(message?: string): void {
   const scanBtn = document.getElementById('pair-scan-btn') as HTMLButtonElement | null;
   if (scanBtn && !scanBtn.dataset.wired) {
     scanBtn.dataset.wired = '1';
-    scanBtn.addEventListener('click', () => { void launchScanner(); });
+    scanBtn.addEventListener('click', () => splashScan());
   }
+  wireScannerCancel();
+}
+
+function wireScannerCancel(): void {
   const cancelBtn = document.getElementById('qr-scanner-cancel') as HTMLButtonElement | null;
   if (cancelBtn && !cancelBtn.dataset.wired) {
     cancelBtn.dataset.wired = '1';
@@ -135,32 +224,27 @@ function stopScanner(): void {
   hideScanner();
 }
 
-async function launchScanner(): Promise<void> {
+async function launchScanner(
+  onText: (text: string) => void = pairFromScannedText,
+  onProblem: (message: string) => void = showPairingError,
+): Promise<void> {
   const video = document.getElementById('qr-scanner-video') as HTMLVideoElement | null;
   if (!video) return;
+  wireScannerCancel();
   showScanner();
   try {
     activeScanner = await startQrScanner({
       video,
       onResult: (text) => {
         stopScanner();
-        const payload = parseScannedQr(text);
-        if (!payload) {
-          showPairingError('That QR code is not a valid pairing link.');
-          return;
-        }
-        if (payload.expires < Date.now()) {
-          showPairingError('Pairing link has expired. Generate a new QR on your desktop.');
-          return;
-        }
-        beginPairing(payload);
+        onText(text);
       },
       onError: (err) => {
         stopScanner();
         const msg = (err.name === 'NotAllowedError' || err.name === 'SecurityError')
           ? 'Camera permission denied. You can also scan with your phone\'s native camera app.'
           : `Camera unavailable: ${err.message}`;
-        showPairingError(msg);
+        onProblem(msg);
       },
     });
   } catch (err) {
@@ -169,44 +253,28 @@ async function launchScanner(): Promise<void> {
     const msg = (e.name === 'NotAllowedError' || e.name === 'SecurityError')
       ? 'Camera permission denied.'
       : `Camera unavailable: ${e.message}`;
-    showPairingError(msg);
+    onProblem(msg);
   }
 }
 
-/** Extract a pairing payload from a scanned QR string. The QR encodes a
- *  full URL (`https://client.abject.world/?pair=…`); we only need the
- *  `pair` query param. */
-function parseScannedQr(text: string): PairingPayload | null {
-  try {
-    const url = new URL(text);
-    const raw = url.searchParams.get('pair');
-    if (!raw) return null;
-    return decodePairPayload(raw);
-  } catch {
-    // Maybe the QR encoded just the base64 payload itself.
-    return decodePairPayload(text);
+function pairFromScannedText(text: string): void {
+  const payload = parsePairingText(text);
+  if (!payload) {
+    showPairingError('That QR code is not a valid pairing link.');
+    return;
   }
-}
-
-function decodePairPayload(raw: string): PairingPayload | null {
-  try {
-    const pad = raw.length % 4 === 0 ? '' : '='.repeat(4 - (raw.length % 4));
-    const b64 = raw.replace(/-/g, '+').replace(/_/g, '/') + pad;
-    const json = decodeURIComponent(escape(atob(b64)));
-    const parsed = JSON.parse(json);
-    if (!parsed || parsed.v !== 1 || typeof parsed.peerId !== 'string') return null;
-    return parsed as PairingPayload;
-  } catch {
-    return null;
+  if (payload.expires < Date.now()) {
+    showPairingError('Pairing link has expired. Generate a new QR on your desktop.');
+    return;
   }
+  beginPairing(payload);
 }
 
 function beginPairing(payload: PairingPayload): void {
   hidePairPrompt();
   const connecting = document.getElementById('connecting-overlay');
   if (connecting) connecting.classList.remove('hidden');
-  const clientName = navigator.userAgent.includes('Mobile') ? 'Phone' : 'Browser';
-  const transport = new WebRTCClientTransport({ pairing: { payload, clientName } });
+  const transport = new WebRTCClientTransport({ pairing: { payload, clientName: clientName() } });
   if (!pendingClient) {
     console.error('[client] no FrontendClient available');
     return;
@@ -224,6 +292,7 @@ async function resetClientState(): Promise<void> {
   } catch (err) {
     console.warn('[Frontend] clearBrowserIdentity failed:', err);
   }
+  if (isP2PDefault()) clearAllInstances();
   clearAllPairedDesktops();
   try { localStorage.removeItem('abjects_auth_token'); } catch { /* ignore */ }
   // Drop any ?pair=… so reload lands on the clean splash.
@@ -279,6 +348,11 @@ function start(): void {
   const client = new FrontendClient(canvas, backdropControl);
   pendingClient = client;
   (window as unknown as Record<string, unknown>).frontendClient = client;
+
+  if (isP2PDefault()) {
+    startP2P(client);
+    return;
+  }
 
   const transport = chooseTransport();
   if (!transport) {

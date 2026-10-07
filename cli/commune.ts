@@ -20,6 +20,11 @@ import {
 import { Screen, parseKeys, Key, Line, LineColor, TabInfo } from './tui.js';
 import { renderMarkdown, stripAnsi } from './markdown.js';
 import { extractImages, renderImage } from './image.js';
+import {
+  SETTINGS_HELP, SettingsSnapshot, SettingsSectionSchema, SettingField, ResolvedPath,
+  buildUpdate, editText, formatValue, isSettingsCommand, loadSettings, readField, resolvePath,
+  runSettingsCommand, settingsErrorText,
+} from './settings.js';
 // Shared with the windowed surfaces so the terminal and the desktop cannot
 // drift into disagreeing about the shape of one round.
 import { orderTopologically, blockedOn, indexById } from '../src/core/task-graph.js';
@@ -45,6 +50,7 @@ function helpLines(p: string): string[] {
     `${P} ${P} jumps to line start. Set COMMUNE_PREFIX=ctrl+x (etc.) to change the prefix.`,
     'desktop dialogs appear here too: y/n or Enter/Esc answers them, and prompts',
     'type into the input line. Toasts show briefly in the top bar.',
+    ...SETTINGS_HELP,
   ];
 }
 
@@ -232,10 +238,26 @@ interface Tab {
   };
 }
 
+/** One line of the settings view: a section heading, or a field that can be edited. */
+type SettingsRow =
+  | { kind: 'heading'; text: string }
+  | { kind: 'field'; scope: 'global' | 'workspace'; section: SettingsSectionSchema; field: SettingField; value: unknown };
+
 type Mode =
   | { kind: 'normal' }
   | { kind: 'pickWorkspace'; items: WorkspaceRow[] }
-  | { kind: 'pickChat'; ws: WorkspaceRow; items: ConversationRow[] };
+  | { kind: 'pickChat'; ws: WorkspaceRow; items: ConversationRow[] }
+  | {
+    kind: 'settings';
+    snap: SettingsSnapshot;
+    rows: SettingsRow[];
+    /** Index into rows of the selected field. */
+    selected: number;
+    /** Set while the input line edits the selected field. */
+    editing: boolean;
+    /** The last save's outcome, shown under the list. */
+    message?: Line;
+  };
 
 const MAX_TAB_LINES = 2000;
 
@@ -434,6 +456,10 @@ class TuiApp {
 
   private handleEvent(event: PushedEvent): void {
     if (this.quitting) return;
+    if (event.event === 'settingsChanged') {
+      if (this.mode.kind === 'settings' && !this.mode.editing) void this.reloadSettings();
+      return;
+    }
     switch (event.event) {
       case 'message': {
         const data = event.data as unknown as MessageEvent;
@@ -881,6 +907,10 @@ class TuiApp {
       return;
     }
 
+    if (this.mode.kind === 'settings') {
+      this.handleSettingsKey(key);
+      return;
+    }
     if (this.mode.kind !== 'normal') {
       this.handlePickerKey(key);
       return;
@@ -1138,17 +1168,224 @@ class TuiApp {
             }
           }
           break;
+        case 'settings':
+          await this.openSettings();
+          break;
         case 'quit':
         case 'exit':
           this.quit();
           break;
         default:
+          if (isSettingsCommand(cmd)) {
+            const lines = await runSettingsCommand(this.client, cmd, rest,
+              tab ? { id: tab.workspaceId, name: tab.wsName } : undefined);
+            if (tab) this.appendTo(tab, lines);
+            break;
+          }
           this.note(`unknown command: /${cmd} (try /help)`, 'yellow');
       }
     } catch (err) {
-      this.note(String(err instanceof Error ? err.message : err), 'red');
+      this.note(settingsErrorText(err), 'red');
     }
     this.render();
+  }
+
+  // ── Settings view ────────────────────────────────────────────────────
+
+  private settingsRows(snap: SettingsSnapshot): SettingsRow[] {
+    const rows: SettingsRow[] = [];
+    const add = (scope: 'global' | 'workspace', schema: SettingsSectionSchema[], values: SettingsSnapshot['values'], prefix: string) => {
+      for (const section of schema) {
+        rows.push({ kind: 'heading', text: `${prefix}${section.label}: ${section.description}` });
+        for (const field of section.fields) {
+          rows.push({ kind: 'field', scope, section, field, value: readField(values[section.id], field.key) });
+        }
+      }
+    };
+    add('global', snap.schema, snap.values, '');
+    if (snap.workspace) add('workspace', snap.workspace.schema, snap.workspace.values, `Workspace ${snap.workspace.name} · `);
+    return rows;
+  }
+
+  private async openSettings(): Promise<void> {
+    const tab = this.tab();
+    const snap = await loadSettings(this.client, tab ? { id: tab.workspaceId, name: tab.wsName } : undefined);
+    const rows = this.settingsRows(snap);
+    if (!this.stashedInput) this.stashedInput = { input: this.input, cursor: this.cursor };
+    this.input = '';
+    this.cursor = 0;
+    this.mode = { kind: 'settings', snap, rows, selected: rows.findIndex(r => r.kind === 'field'), editing: false };
+    this.render();
+  }
+
+  /** Re-read every setting, keeping the selection on the same field. */
+  private async reloadSettings(message?: Line): Promise<void> {
+    if (this.mode.kind !== 'settings') return;
+    const current = this.mode.rows[this.mode.selected];
+    const ws = this.mode.snap.workspace;
+    try {
+      const snap = await loadSettings(this.client, ws ? { id: ws.id, name: ws.name } : undefined);
+      if (this.mode.kind !== 'settings') return;
+      const rows = this.settingsRows(snap);
+      const same = current?.kind === 'field'
+        ? rows.findIndex(r => r.kind === 'field' && r.scope === current.scope && r.section.id === current.section.id && r.field.key === current.field.key)
+        : -1;
+      this.mode = { ...this.mode, snap, rows, selected: same >= 0 ? same : this.mode.selected, ...(message ? { message } : {}) };
+    } catch (err) {
+      this.mode = { ...this.mode, message: { text: settingsErrorText(err), color: 'red' } };
+    }
+    this.render();
+  }
+
+  private leaveSettings(): void {
+    this.mode = { kind: 'normal' };
+    if (this.stashedInput) {
+      this.input = this.stashedInput.input;
+      this.cursor = this.stashedInput.cursor;
+      this.stashedInput = undefined;
+    }
+    this.render();
+  }
+
+  private handleSettingsKey(key: Key): void {
+    const mode = this.mode;
+    if (mode.kind !== 'settings') return;
+    const row = mode.rows[mode.selected];
+    if (mode.editing) {
+      if (key.type === 'esc') {
+        this.mode = { ...mode, editing: false, message: { text: 'edit cancelled', color: 'dim' } };
+        this.input = '';
+        this.cursor = 0;
+        this.render();
+        return;
+      }
+      if (key.type === 'enter' && row?.kind === 'field') {
+        const text = this.input;
+        this.input = '';
+        this.cursor = 0;
+        this.mode = { ...mode, editing: false };
+        void this.saveSettingsField(row, text);
+        return;
+      }
+      if (this.applyEditKey(key)) this.render();
+      return;
+    }
+    const step = (delta: number) => {
+      let i = mode.selected;
+      do { i += delta; } while (i >= 0 && i < mode.rows.length && mode.rows[i].kind !== 'field');
+      if (i >= 0 && i < mode.rows.length) this.mode = { ...mode, selected: i, message: undefined };
+    };
+    switch (key.type) {
+      case 'esc': this.leaveSettings(); return;
+      case 'up': step(-1); break;
+      case 'down': step(1); break;
+      case 'pageup': for (let n = 0; n < 10; n++) step(-1); break;
+      case 'pagedown': for (let n = 0; n < 10; n++) step(1); break;
+      case 'enter':
+        if (row?.kind === 'field') {
+          const mapField = row.field.type === 'rules' || row.field.type === 'grants';
+          this.input = mapField ? '' : editText(row.field, row.value);
+          this.cursor = this.input.length;
+          this.mode = { ...mode, editing: true, message: { text: this.editHint(row.field), color: 'cyan' } };
+        }
+        break;
+      case 'char':
+        if (key.ch === 'r') void this.reloadSettings({ text: 'reloaded', color: 'dim' });
+        else if (key.ch === 'q') { this.leaveSettings(); return; }
+        break;
+      default: break;
+    }
+    this.render();
+  }
+
+  private editHint(field: SettingField): string {
+    switch (field.type) {
+      case 'secret': return `type the new ${field.label} (hidden as you type); Enter saves, Esc cancels, none clears`;
+      case 'boolean': return 'on or off, Enter saves, Esc cancels';
+      case 'enum': return `one of ${field.options?.join(', ')}; Enter saves, Esc cancels`;
+      case 'list': return 'comma-separated, none for empty; Enter saves, Esc cancels';
+      case 'model': return `<provider> <model> [effort], or none; providers: ${field.options?.join(', ')}`;
+      case 'rules': return field.key === 'entries'
+        ? '<Abject> public|authenticated|none; Enter saves, Esc cancels'
+        : '<Object> allow a,b deny c (either part), or <Object> none';
+      case 'grants': return '<skill> cmd1,cmd2, or <skill> none';
+      default: return 'Enter saves, Esc cancels';
+    }
+  }
+
+  private async saveSettingsField(row: Extract<SettingsRow, { kind: 'field' }>, text: string): Promise<void> {
+    const mode = this.mode;
+    if (mode.kind !== 'settings') return;
+    try {
+      const mapField = row.field.type === 'rules' || row.field.type === 'grants';
+      let target: ResolvedPath = { section: row.section as never, field: row.field };
+      let valueText = text;
+      if (mapField) {
+        const [name, ...rest] = text.trim().split(/\s+/);
+        if (!name || rest.length === 0) throw new Error(this.editHint(row.field));
+        target = { ...target, subKey: name };
+        valueText = rest.join(' ');
+      }
+      const scopeValues = row.scope === 'global' ? mode.snap.values : mode.snap.workspace!.values;
+      if (row.scope === 'global') {
+        const values = buildUpdate(target, valueText, scopeValues[row.section.id]);
+        await this.client.request('setSettings', { section: row.section.id, values }, 60_000);
+      } else {
+        const ws = mode.snap.workspace!;
+        const values = row.section.id === 'appearance'
+          ? { theme: valueText.trim() }
+          : buildUpdate(target, valueText, scopeValues[row.section.id]);
+        await this.client.request('setWorkspaceSettings', { workspaceId: ws.id, section: row.section.id, values }, 60_000);
+      }
+      await this.reloadSettings({ text: `saved ${row.section.id}.${row.field.key}`, color: 'green' });
+    } catch (err) {
+      if (this.mode.kind === 'settings') this.mode = { ...this.mode, message: { text: settingsErrorText(err), color: 'red' } };
+      this.render();
+    }
+  }
+
+  /**
+   * The settings view as exactly one screen: the key help pinned on top, the
+   * last message or edit hint pinned at the bottom, and the list scrolled in
+   * between so the selected field stays in view. Lines are clipped to the
+   * width so none wraps and the arithmetic holds.
+   */
+  private settingsLines(): Line[] {
+    const mode = this.mode;
+    if (mode.kind !== 'settings') return [];
+    const width = Math.max(20, (process.stdout.columns ?? 80) - 1);
+    const clip = (t: string) => (t.length > width ? `${t.slice(0, width - 1)}…` : t);
+    const body: Line[] = [];
+    let selectedLine = 0;
+    mode.rows.forEach((row, i) => {
+      if (row.kind === 'heading') {
+        if (body.length > 0) body.push({ text: '', color: 'normal' });
+        body.push({ text: clip(row.text), color: 'bold' });
+        return;
+      }
+      const selected = i === mode.selected;
+      if (selected) selectedLine = body.length;
+      const label = `${row.section.id}.${row.field.key}`;
+      body.push({
+        text: clip(`${selected ? '›' : ' '} ${label.padEnd(30)} ${formatValue(row.field, row.value)}`),
+        color: selected ? (mode.editing ? 'yellow' : 'cyan') : 'normal',
+      });
+    });
+    const footer: Line = mode.message
+      ? { ...mode.message, text: clip(mode.message.text) }
+      : { text: '', color: 'normal' };
+    const header: Line = { text: clip('settings · ↑/↓ select · Enter edits · r reloads · Esc leaves'), color: 'dim' };
+    const room = Math.max(1, this.screen.contentRows - 3);
+    const top = Math.max(0, Math.min(body.length - room, selectedLine - Math.floor(room / 2)));
+    return [header, ...body.slice(top, top + room), { text: '', color: 'normal' }, footer];
+  }
+
+  /** The input line as drawn: hidden while it holds a key or password. */
+  private maskedInput(): string {
+    const mode = this.mode;
+    if (mode.kind !== 'settings' || !mode.editing) return this.input;
+    const row = mode.rows[mode.selected];
+    return row?.kind === 'field' && row.field.type === 'secret' ? '•'.repeat(this.input.length) : this.input;
   }
 
   // ── Render ───────────────────────────────────────────────────────────
@@ -1166,12 +1403,16 @@ class TuiApp {
     const tabLines = tab
       ? (tab.goal ? [...tab.lines, ...this.goalPanelLines(tab)] : tab.lines)
       : [];
+    const settingsLines = this.mode.kind === 'settings' && !dialogActive ? this.settingsLines() : [];
     this.screen.render({
       tabs,
       lines: dialogActive ? this.dialogLines()
-        : this.mode.kind === 'normal' ? tabLines : this.pickerLines(),
-      scrollOffset: !dialogActive && this.mode.kind === 'normal' ? (tab?.scroll ?? 0) : 0,
-      input: this.input,
+        : this.mode.kind === 'normal' ? tabLines
+        : this.mode.kind === 'settings' ? settingsLines : this.pickerLines(),
+      scrollOffset: dialogActive ? 0
+        : this.mode.kind === 'normal' ? (tab?.scroll ?? 0)
+        : 0,
+      input: this.maskedInput(),
       cursor: this.cursor,
       status: this.status || undefined,
       toast: this.currentToast,
@@ -1241,6 +1482,9 @@ async function runPlain(url: string): Promise<void> {
           pendingDialog = null;
           print({ text: '[dialog] answered elsewhere', color: 'dim' });
         }
+      } else if (event.event === 'settingsChanged') {
+        const { section } = event.data as { section?: string };
+        print({ text: `[settings] ${section ?? 'settings'} changed`, color: 'dim' });
       }
     },
     onClose: (reason) => {
@@ -1342,6 +1586,14 @@ async function runPlain(url: string): Promise<void> {
           }
         } else if (text === '/help') {
           print({ text: 'plain mode: /chats /open N /new [title] /ws [n|name] /use N /stop /yes /no /answer <text> /quit — anything else is sent to the chat. /ws N sets the active workspace; /use N only retargets this REPL', color: 'dim' });
+          for (const line of SETTINGS_HELP.filter(l => !l.includes('/settings'))) print({ text: line, color: 'dim' });
+        } else if (text.startsWith('/') && isSettingsCommand(text.slice(1).split(/\s+/)[0])) {
+          const [cmd, ...args] = text.slice(1).split(/\s+/);
+          try {
+            for (const line of await runSettingsCommand(client, cmd, args, workspace ?? undefined)) print(line);
+          } catch (err) {
+            print({ text: settingsErrorText(err), color: 'red' });
+          }
         } else if (text) {
           await client.send(workspace!.id, conversationId!, text);
         }

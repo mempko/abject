@@ -1,0 +1,518 @@
+/* Instance switcher (p2p client only; injected by instance-switcher.ts).
+   Same shell vocabulary as index.html: void ground, bone type, square
+   corners, hard black print shadows, a red block marking what is current. */
+
+/* ── Pill (desktop) ───────────────────────────────────────────────── */
+.instance-pill {
+  position: fixed;
+  right: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  max-width: min(280px, 45vw);
+  padding: 0.32rem 0.75rem 0.32rem 0.6rem;
+  background: var(--card);
+  color: var(--ink);
+  border: 2px solid var(--rule);
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--shade);
+  font-family: var(--display);
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.1s linear, background 0.1s linear, color 0.1s linear;
+}
+.instance-pill[hidden] { display: none; }
+.instance-pill:hover,
+.instance-pill[aria-expanded="true"] {
+  opacity: 1;
+  background: var(--ink);
+  color: var(--paper);
+}
+.instance-pill:active {
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 var(--shade);
+}
+.instance-pill:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 3px;
+}
+.instance-pill-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Square status dot: phosphor when live, ochre while reaching, red when off. */
+.instance-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--rule);
+}
+.instance-dot[data-status="connected"] { background: var(--living); }
+.instance-dot[data-status="connecting"],
+.instance-dot[data-status="login"] {
+  background: var(--ochre);
+  animation: instance-blink 1.2s steps(2, end) infinite;
+}
+.instance-dot[data-status="login"] { animation: none; }
+.instance-dot[data-status="offline"] { background: var(--red); }
+.instance-dot[data-status="idle"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--rule);
+}
+@keyframes instance-blink {
+  0% { opacity: 1; }
+  100% { opacity: 0.25; }
+}
+
+/* ── Floating phone button (beside the palette and Exposé buttons) ── */
+#mobile-instance-btn {
+  position: fixed;
+  right: 148px;
+  bottom: 20px;
+  width: 52px;
+  height: 52px;
+  border-radius: 0;
+  border: 2px solid var(--rule);
+  background: var(--card);
+  color: var(--ink);
+  font-size: 1.45rem;
+  font-weight: 700;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 500;
+  box-shadow: 4px 4px 0 var(--shade);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+#mobile-instance-btn:active {
+  transform: translate(4px, 4px);
+  box-shadow: 0 0 0 var(--shade);
+}
+#mobile-instance-btn:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 3px;
+}
+#mobile-instance-btn[hidden] { display: none; }
+#mobile-instance-btn .instance-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+}
+
+/* ── Panel ────────────────────────────────────────────────────────── */
+.instance-panel {
+  position: fixed;
+  right: 16px;
+  bottom: calc(58px + env(safe-area-inset-bottom, 0px));
+  z-index: 10001;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  max-height: min(72vh, 600px);
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  color: var(--ink);
+  border: 2px solid var(--rule);
+  border-radius: 0;
+  box-shadow: 6px 6px 0 var(--shade);
+  font-family: var(--body);
+  outline: none;
+}
+.instance-panel[hidden] { display: none; }
+.instance-panel::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: -2px;
+  width: 44px;
+  height: 10px;
+  background: var(--red);
+}
+.instance-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.95rem 0.9rem 0.55rem 1rem;
+  border-bottom: 2px solid var(--rule);
+}
+.instance-panel-title {
+  font-family: var(--display);
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.instance-panel-hint {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--ink-soft);
+  letter-spacing: 0.02em;
+  margin-left: auto;
+}
+.instance-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--ink);
+  border: 2px solid transparent;
+  border-radius: 0;
+  font-family: var(--display);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.instance-close:hover { border-color: var(--rule); }
+.instance-close:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+.instance-panel-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  padding: 0.35rem 1rem 1rem;
+}
+
+/* Phone: a full-width sheet rising from the bottom edge. */
+.instance-panel.phone {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: auto;
+  max-width: none;
+  max-height: 86vh;
+  border-width: 2px 0 0;
+  box-shadow: 0 -6px 0 var(--shade);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.instance-panel.phone .instance-panel-hint { display: none; }
+.instance-panel.phone .instance-close { width: 40px; height: 40px; font-size: 1.3rem; }
+
+/* ── Shared list (panel and picker) ───────────────────────────────── */
+.instance-message {
+  color: var(--red);
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  margin: 0.6rem 0 0.2rem;
+}
+.instance-message:empty { display: none; }
+.instance-empty {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  padding: 0.75rem 0 0.25rem;
+}
+.instance-row {
+  position: relative;
+  padding: 0.7rem 0 0.75rem 0.85rem;
+  border-bottom: 1px solid rgba(141, 135, 120, 0.35);
+}
+.instance-row:last-child { border-bottom: none; }
+.instance-row.current::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.7rem;
+  bottom: 0.75rem;
+  width: 4px;
+  background: var(--red);
+}
+.instance-row-top {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.instance-name {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--display);
+  font-size: 0.98rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.instance-badge {
+  flex: none;
+  font-family: var(--display);
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  padding: 0.1rem 0.4rem;
+  background: var(--red);
+  color: var(--cream);
+}
+.instance-badge.quiet {
+  background: transparent;
+  color: var(--ink-soft);
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.instance-detail {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--ink-soft);
+  margin: 0.2rem 0 0.5rem calc(8px + 0.5rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.instance-detail .instance-state { color: var(--ink); }
+.instance-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-left: calc(8px + 0.5rem);
+}
+.instance-confirm {
+  font-size: 0.85rem;
+  color: var(--ink);
+  margin-right: 0.25rem;
+}
+
+.instance-btn {
+  font-family: var(--display);
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 0.28rem 0.6rem;
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--rule);
+  border-radius: 0;
+  cursor: pointer;
+  transition: background 0.1s linear, color 0.1s linear;
+}
+.instance-btn:hover { background: var(--ink); color: var(--paper); }
+.instance-btn:active { transform: translate(2px, 2px); }
+.instance-btn:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+.instance-btn:disabled { opacity: 0.5; cursor: default; }
+.instance-btn.primary {
+  background: var(--red);
+  border-color: var(--red);
+  color: var(--cream);
+  box-shadow: 2px 2px 0 var(--shade);
+}
+.instance-btn.primary:hover { background: var(--red-deep); border-color: var(--red-deep); }
+.instance-btn.primary:active { box-shadow: 0 0 0 var(--shade); }
+.instance-btn.danger:hover { background: var(--red); border-color: var(--red); color: var(--cream); }
+.instance-btn.wide { width: 100%; padding: 0.55rem 0.75rem; font-size: 0.78rem; }
+
+.instance-foot {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+}
+.instance-foot .instance-btn { flex: 1; padding: 0.5rem 0.75rem; font-size: 0.76rem; }
+
+/* ── Add instance ─────────────────────────────────────────────────── */
+.instance-add-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.75rem 0 0.25rem;
+}
+.instance-section {
+  margin-top: 0.9rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid rgba(141, 135, 120, 0.35);
+}
+.instance-message + .instance-section { border-top: none; padding-top: 0.25rem; }
+.instance-section h3 {
+  font-family: var(--display);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--ink);
+  margin-bottom: 0.3rem;
+}
+.instance-section h3::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 0.5rem;
+  background: var(--red);
+  vertical-align: -1px;
+}
+.instance-hint {
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  margin-bottom: 0.55rem;
+}
+.instance-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+.instance-form + .instance-form,
+.instance-form + .instance-btn,
+.instance-fields + .instance-form { margin-top: 0.5rem; }
+.instance-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-top: 0.6rem;
+}
+.instance-fields label {
+  font-family: var(--display);
+  font-size: 0.66rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+}
+.instance-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.45rem 0.6rem;
+  background: var(--paper);
+  border: 2px solid var(--rule);
+  border-radius: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  outline: none;
+  transition: box-shadow 0.08s linear;
+}
+.instance-input:focus {
+  border-color: var(--red);
+  box-shadow: inset 4px 0 0 var(--red);
+}
+.instance-input::placeholder { color: var(--ink-soft); opacity: 0.7; }
+.instance-name-input {
+  font-family: var(--display);
+  font-size: 0.9rem;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.45rem;
+}
+.instance-working {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  margin-top: 0.5rem;
+}
+
+/* Phone: thumb-sized targets sharing the row evenly, and 16px inputs so iOS does not zoom. */
+.instance-panel.phone .instance-btn,
+.instance-picker-card.phone .instance-btn { padding: 0.55rem 0.6rem; font-size: 0.76rem; }
+.instance-panel.phone .instance-actions .instance-btn,
+.instance-picker-card.phone .instance-actions .instance-btn { flex: 1 1 0; min-width: 0; }
+.instance-panel.phone .instance-confirm,
+.instance-picker-card.phone .instance-confirm { flex-basis: 100%; }
+.instance-panel.phone .instance-input,
+.instance-picker-card.phone .instance-input { font-size: 16px; padding: 0.55rem 0.65rem; }
+
+/* ── Picker screen (no live connection) ───────────────────────────── */
+#instance-picker-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  background: var(--paper);
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+#instance-picker-overlay.visible { display: flex; }
+@media (max-width: 480px) {
+  #instance-picker-overlay { padding: 0.75rem; }
+  .instance-picker-card.pair-card { padding: 1.75rem 1.1rem 1.5rem; }
+}
+.instance-picker-card {
+  outline: none;
+  max-height: calc(100vh - 3rem);
+  max-height: calc(100dvh - 3rem);
+  display: flex;
+  flex-direction: column;
+}
+.instance-picker-card .pair-logo { align-self: flex-start; }
+.instance-picker-card .instance-panel-body {
+  padding: 0;
+  margin-top: 0.25rem;
+}
+
+/* ── Connecting screen additions ──────────────────────────────────── */
+.connecting-instance {
+  margin-top: 0.9rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  letter-spacing: 0.04em;
+  max-width: calc(100vw - 2rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity 0.2s steps(2, end);
+}
+.connecting-instance:empty { display: none; }
+.connecting-trouble {
+  margin-top: 1rem;
+  max-width: min(420px, calc(100vw - 2rem));
+  text-align: center;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--card);
+  border: 2px solid var(--rule);
+  border-left: 6px solid var(--red);
+  padding: 0.6rem 0.8rem;
+}
+.connecting-trouble[hidden] { display: none; }
+#connecting-overlay.landed .connecting-instance,
+#connecting-overlay.landed .connecting-trouble { opacity: 0; }
+.connecting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 2.5rem;
+  max-width: calc(100vw - 2rem);
+}
+.connecting-actions .connecting-reset { margin-top: 0; }
+.connecting-actions .connecting-reset[hidden] { display: none; }
+/* A faded-out overlay keeps no clickable buttons behind the desktop. */
+#connecting-overlay.hidden .connecting-actions .connecting-reset { visibility: hidden; }
+
+/* ── Login card additions ─────────────────────────────────────────── */
+.login-instance {
+  margin: -0.9rem 0 1.1rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.login-card .login-switch {
+  margin-top: 0.75rem;
+  background: var(--card);
+  border-color: var(--rule);
+  color: var(--ink);
+  font-size: 0.8rem;
+  padding: 0.5rem;
+}
+.login-card .login-switch:hover { background: var(--ink); color: var(--paper); }

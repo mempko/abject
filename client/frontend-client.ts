@@ -177,6 +177,8 @@ export class FrontendClient {
   }> = new Map();
   private currentSelectedText = '';
   private authenticated = false;
+  /** localStorage key of the saved login token (the p2p client keeps one per instance). */
+  private authTokenKey = 'abjects_auth_token';
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
@@ -382,7 +384,8 @@ export class FrontendClient {
   private updateMobileButtons(): void {
     // Out of the way while the virtual keyboard is up (it would cover the field).
     const show = this.authenticated && this.mobileMode && !this.keyboardVisible;
-    for (const id of ['mobile-palette-btn', 'mobile-expose-btn']) {
+    // mobile-instance-btn exists only in the p2p client (its instance switcher).
+    for (const id of ['mobile-palette-btn', 'mobile-expose-btn', 'mobile-instance-btn']) {
       const btn = document.getElementById(id);
       if (!btn) continue;
       if (show) {
@@ -973,6 +976,27 @@ export class FrontendClient {
     this.compositor.stop();
   }
 
+  /** Keep this connection's login token under its own key (one per instance in the p2p client). */
+  setAuthTokenKey(key: string): void {
+    this.authTokenKey = key;
+  }
+
+  /** Whether the backend is live, still being (re)reached, or never asked for. */
+  get connectionState(): 'connected' | 'connecting' | 'closed' {
+    if (!this.transport) return 'closed';
+    return this.authenticated && this.transport.ready ? 'connected' : 'connecting';
+  }
+
+  /** True while the phone layout is active. */
+  get mobileLayout(): boolean {
+    return this.mobileMode;
+  }
+
+  /** Bring the connecting screen back over a session that dropped and is not recovering. */
+  showConnectingScreen(): void {
+    this.showConnecting();
+  }
+
   // ── Auth handling ────────────────────────────────────────────────────
 
   private handleAuthMessage(msg: { type: string; [key: string]: unknown }): void {
@@ -987,7 +1011,7 @@ export class FrontendClient {
 
       case 'authRequired': {
         // Try stored session token first
-        const token = localStorage.getItem('abjects_auth_token');
+        const token = localStorage.getItem(this.authTokenKey);
         if (token) {
           this.sendRaw({ type: 'auth', token });
         } else {
@@ -999,7 +1023,7 @@ export class FrontendClient {
       case 'authResult': {
         const result = msg as unknown as AuthResultMsg;
         if (result.success && result.token) {
-          localStorage.setItem('abjects_auth_token', result.token);
+          localStorage.setItem(this.authTokenKey, result.token);
           this.authenticated = true;
           this.hideConnecting();
           this.hideLoginForm();
@@ -1007,7 +1031,7 @@ export class FrontendClient {
           this.updateMobileButtons();
         } else {
           // Token was rejected — clear it and show form
-          localStorage.removeItem('abjects_auth_token');
+          localStorage.removeItem(this.authTokenKey);
           this.showLoginForm(result.error as string | undefined);
         }
         break;

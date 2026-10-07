@@ -76,8 +76,8 @@ export interface UpdateStatus {
   lastCheckedAt?: number;
 }
 
-/** The only caller allowed to download, restart, open pages or change settings: the Settings window. */
-const ADMITTED_CALLER = 'GlobalSettings';
+/** Who may download, restart, open pages or change the setting: the Settings window and the terminal client's gateway. */
+const ADMITTED_CALLERS = ['GlobalSettings', 'CliServer'];
 
 /** Electron app event the native Help menu emits; see electron/main.ts. */
 export const CHECK_FOR_UPDATES_EVENT = 'abjects:check-for-updates';
@@ -271,16 +271,17 @@ export class AppUpdater extends Abject {
   }
 
   /**
-   * Only the Settings window may download, restart, open pages or change the
-   * setting. Restarting the app is the user's call; an agent or a user object
-   * calling itself GlobalSettings carries a namespaced typeId and is turned
-   * away. Reading the status and checking stay open to everyone.
+   * Only the Settings window and the terminal client may download, restart,
+   * open pages or change the setting. Restarting the app is the user's call;
+   * an agent or a user object calling itself one of them carries a namespaced
+   * typeId and is turned away. Reading the status and checking stay open to
+   * everyone.
    */
   private async admit(msg: AbjectMessage): Promise<void> {
     const identity = await this.resolveCallerIdentity(msg.routing.from);
     const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-    precondition(identity?.name === ADMITTED_CALLER && typeSegments <= 3,
-      `AppUpdater takes this request from ${ADMITTED_CALLER} only`);
+    precondition(!!identity && ADMITTED_CALLERS.includes(identity.name) && typeSegments <= 3,
+      `AppUpdater takes this request from ${ADMITTED_CALLERS.join(' or ')} only`);
   }
 
   private requireElectron(): ElectronModule {

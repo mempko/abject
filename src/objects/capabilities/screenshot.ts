@@ -36,7 +36,7 @@ export class Screenshot extends Abject {
           methods: [
             {
               name: 'captureWindow',
-              description: 'Capture a screenshot of an object\'s window. Returns base64-encoded PNG image data, or { error } describing why nothing could be captured.',
+              description: 'Capture a screenshot of an object\'s window, wherever it is: off-screen, under other windows, or in a workspace other than the one on screen. Returns base64-encoded PNG image data, or { error } describing why nothing could be captured.',
               parameters: [
                 {
                   name: 'objectId',
@@ -55,7 +55,7 @@ export class Screenshot extends Abject {
             },
             {
               name: 'captureDesktop',
-              description: 'Capture a screenshot of the entire desktop. Returns base64-encoded PNG image data.',
+              description: 'Capture a screenshot of the desktop the user is looking at: the active workspace only. Returns base64-encoded PNG image data. To see one object\'s window, use captureWindow.',
               parameters: [],
               returns: {
                 kind: 'object',
@@ -249,7 +249,8 @@ Use listWindows to get surfaceIds, then click/type/keyPress to interact.
 - captureWindow accepts the owning object's registered name, its FULL AbjectId, or a windowId; truncated ids never match.
 - When nothing can be captured, captureWindow returns { error: "..." } explaining why — a result WITHOUT imageBase64 means you have NOT seen the window; do not treat it as visual confirmation.
 - Screenshots capture the current rendered state; ensure the target has drawn before capturing.
-- captureWindow captures the window's region AS COMPOSITED ON SCREEN — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) all appear, so it verifies 3D rendering. Because it is a screen crop, a window overlapping the target shows up too: raise the target first (WidgetManager.raiseWindow { windowId }) for a clean capture. When the window is scrolled mostly off-screen the capture falls back to the window's own 2D content, WITHOUT 3D nodes — bring it on-screen to verify 3D.
+- captureWindow shows the window AS COMPOSITED — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) — so it verifies 3D rendering. It works wherever the window is: off-screen, under other windows, or in a workspace other than the one the user is looking at. The capture brings the window forward for that one shot and puts everything back, so capture each window where it lives.
+- captureDesktop shows only the workspace the user is looking at; windows of other workspaces are not on it. That is normal: the user moves between workspaces while you work, and every object stays in its own workspace.
 - Click/type/keyPress are on UIServer, not Screenshot. Use both together for visual interaction.`;
   }
 }

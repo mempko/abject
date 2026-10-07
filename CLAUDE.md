@@ -200,6 +200,17 @@ The `Packages` system abject (`src/objects/packages.ts`, worker-eligible)
 lists packages, edits `packages.json`, and serves `getSettings` to a package's
 own abjects; the Packages tab of GlobalSettings is its UI.
 
+### New Global Setting
+
+Global settings (AI keys and tiers, auth, filesystem, shell, web, capability
+enforcement) are owned by `SettingsManager` (`src/objects/settings-manager.ts`):
+it persists them, validates writes, applies them to LLM, UIServer and the
+capability objects, and emits `settingsChanged`. `GlobalSettings` is only its
+window, and `CliServer` exposes the same `getSettingsSchema` / `getSettings` /
+`setSettings` to `commune`. Add a field to the section's type, `schema()`
+and the section's setter in SettingsManager; then show it in the window. Only
+GlobalSettings and CliServer may write, and only GlobalSettings may read secrets.
+
 ### New LLM Provider
 
 Prefer an abject-backed provider, which needs no core change: any abject (usually a script package

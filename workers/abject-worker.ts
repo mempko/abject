@@ -40,6 +40,7 @@ import { ThemeAbject } from '../src/objects/theme.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
+import { SettingsManager } from '../src/objects/settings-manager.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
 
@@ -82,6 +83,7 @@ constructors.set('Theme', () => new ThemeAbject());
 constructors.set('Taskbar', () => new Taskbar());
 constructors.set('ProcessExplorer', () => new ProcessExplorer());
 constructors.set('GlobalSettings', () => new GlobalSettings());
+constructors.set('SettingsManager', () => new SettingsManager());
 constructors.set('PeerNetwork', () => new PeerNetwork());
 constructors.set('ScriptableAbject', (args?: unknown) => {
   const opts = args as { manifest: import('../src/core/types.js').AbjectManifest; source: string; owner: string };

@@ -330,8 +330,8 @@ export class CapabilityInterceptor implements MessageInterceptor {
   }
 
   /**
-   * Apply a GlobalSettings enforcement-mode change delivered to our mailbox.
-   * The bootstrap registers this interceptor as a GlobalSettings dependent, so
+   * Apply a SettingsManager enforcement-mode change delivered to our mailbox.
+   * The bootstrap registers this interceptor as a SettingsManager dependent, so
    * `changed` events with the capabilityEnforcementChanged aspect land here.
    */
   private maybeApplyModeEvent(msg: AbjectMessage): void {

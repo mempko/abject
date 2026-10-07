@@ -729,6 +729,11 @@ export class Compositor {
   private animationFrameId?: number;
   private needsRender = false;
   private activeWorkspaceId?: string;
+  /**
+   * The surface captureSurfaceFromFrame is rendering. It passes the workspace
+   * filter for that one synchronous render, never for a presented frame.
+   */
+  private captureSurfaceId?: string;
   // Focused window gets an accent rim + bloom and lifts toward the camera.
   private focusedSurfaceId?: string;
   private focusGlowColor = 'rgba(91, 229, 160, 0.45)'; // Red Sigil living light
@@ -1094,8 +1099,10 @@ export class Compositor {
    * GL frame. The surface's own 2D canvas holds only widget/canvas content —
    * 3D scene nodes render onto the GL canvas and never touch it — so a GL
    * crop is the only capture that shows what the user actually sees (meshes,
-   * lights, bloom, slab chrome). Falls back to the plain 2D surface canvas
-   * when the window is off-screen, on another workspace, or in mobile mode.
+   * lights, bloom, slab chrome). A window in a workspace other than the one on
+   * screen is rendered for the capture too, so an agent checking its work
+   * sees the whole window wherever the user has gone. Falls back to the plain
+   * 2D surface canvas in mobile mode or when the GL context is lost.
    */
   async captureSurface(surfaceId: string): Promise<{ imageBase64: string; width: number; height: number } | null> {
     const surface = this.surfaces.get(surfaceId);
@@ -1120,9 +1127,10 @@ export class Compositor {
 
   /**
    * Crop the surface's projected screen region out of a freshly rendered GL
-   * frame. Returns null when no faithful crop is possible — workspace
-   * filtered, mobile layout, GL context lost — so the caller can fall back
-   * to the 2D surface canvas.
+   * frame. Returns null when no faithful crop is possible — mobile layout,
+   * GL context lost — so the caller can fall back to the 2D surface canvas.
+   * A surface of another workspace is let through the workspace filter for
+   * this one render (captureSurfaceId).
    *
    * The capture frame is rendered with the surface centered in the viewport
    * (when it is mostly off-screen) and raised above its siblings, so an
@@ -1132,7 +1140,7 @@ export class Compositor {
    */
   private async captureSurfaceFromFrame(surface: Surface): Promise<{ imageBase64: string; width: number; height: number } | null> {
     if (this.renderer.isContextLost || this.mobileMode) return null;
-    if (!surface.visible || this.isWorkspaceFiltered(surface)) return null;
+    if (!surface.visible) return null;
 
     // Mutate → render → crop → restore all happens synchronously: the first
     // await comes only after state is restored, so the capture layout is
@@ -1165,6 +1173,8 @@ export class Compositor {
       }
       surface.zIndex = maxZ + 1;
       this.sortSurfaces();
+      // Render it even when its workspace is not the one on screen.
+      this.captureSurfaceId = surface.id;
 
       // The GL drawing buffer is invalidated after compositing, so render
       // synchronously and read back in the same task (same as captureDesktop).
@@ -1207,6 +1217,7 @@ export class Compositor {
     } catch {
       out = null;
     } finally {
+      this.captureSurfaceId = undefined;
       surface.zIndex = savedZ;
       this.sortSurfaces();
       this.scrollTo(savedScrollX, savedScrollY);
@@ -1345,6 +1356,7 @@ export class Compositor {
    * Check if a surface is filtered out by the active workspace.
    */
   private isWorkspaceFiltered(surface: Surface): boolean {
+    if (surface.id === this.captureSurfaceId) return false;
     return !!(this.activeWorkspaceId && surface.workspaceId &&
       surface.workspaceId !== this.activeWorkspaceId);
   }

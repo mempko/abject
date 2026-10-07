@@ -190,6 +190,12 @@ export class CliServer extends Abject {
       this.broadcast({ event: 'dialogClosed', workspaceId: '', data: msg.payload });
     });
 
+    // Global settings changed (from here, the Settings window, or elsewhere).
+    this.on('settingsChanged', (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.globalDeps.get('SettingsManager')) return;
+      this.broadcast({ event: 'settingsChanged', workspaceId: '', data: msg.payload });
+    });
+
     // Toasts from per-workspace NotificationCenters we subscribed to.
     this.on('notificationAdded', (msg: AbjectMessage) => {
       const workspaceId = this.notificationCenterToWorkspace.get(msg.routing.from);
@@ -218,6 +224,13 @@ export class CliServer extends Abject {
       this.widgetManagerId = await this.requireDep('WidgetManager');
       this.send(request(this.id, this.widgetManagerId, 'addDependent', {}));
     } catch { /* dialogs just won't mirror */ }
+
+    // Settings changes, so an open settings view repaints whoever made them.
+    try {
+      const settingsManagerId = await this.requireDep('SettingsManager');
+      this.globalDeps.set('SettingsManager', settingsManagerId);
+      this.send(request(this.id, settingsManagerId, 'addDependent', {}));
+    } catch { /* settings views refresh on their own reads */ }
 
     this.wsServer = new NodeWebSocketServer({
       port: this.port,
@@ -394,9 +407,182 @@ export class CliServer extends Abject {
         return this.request<boolean>(
           request(this.id, this.widgetManagerId, 'respondDialog', { dialogId, confirmed, value, option }), 15000);
       }
+
+      // ── Settings ──────────────────────────────────────────────────────
+      // Global settings go to SettingsManager, which takes changes from this
+      // object and the Settings window only and never hands secrets out.
+      // Workspace settings go to the abjects that own them. A fixed set of
+      // ops, not a general call: this socket may have no login.
+      case 'getSettingsSchema': return this.settingsRequest('getSettingsSchema', {});
+      case 'getSettings': return this.settingsRequest('getSettings',
+        typeof params.section === 'string' && params.section !== '' ? { section: params.section } : {});
+      case 'setSettings': return this.settingsRequest('setSettings', {
+        section: this.str(params, 'section'), values: this.obj(params, 'values'),
+      }, 60_000);
+      case 'listPresets': return this.settingsRequest('listPresets', {}, 60_000);
+      case 'applyPreset': return this.settingsRequest('applyPreset', { name: this.str(params, 'name') }, 60_000);
+      case 'savePreset': return this.settingsRequest('savePreset', { name: this.str(params, 'name') }, 60_000);
+      case 'deletePreset': return this.settingsRequest('deletePreset', { name: this.str(params, 'name') });
+      case 'listModels': return this.settingsRequest('listModels', { provider: this.str(params, 'provider') }, 60_000);
+      case 'getWorkspaceSettings': return this.opGetWorkspaceSettings(this.str(params, 'workspaceId'));
+      case 'setWorkspaceSettings': return this.opSetWorkspaceSettings(
+        this.str(params, 'workspaceId'), this.str(params, 'section'), this.obj(params, 'values'));
+      case 'listPackages': return this.depRequest('Packages', 'list', {});
+      case 'setPackageEnabled': return this.depRequest('Packages', 'setEnabled', {
+        name: this.str(params, 'name'), enabled: params.enabled === true,
+      });
+      case 'setPackageSettings': return this.depRequest('Packages', 'setSettings', {
+        name: this.str(params, 'name'), values: this.obj(params, 'values'),
+      });
+      case 'listSkills': return this.depRequest('SkillRegistry', 'listSkills', {});
+      case 'setSkillEnabled': return this.depRequest('SkillRegistry',
+        params.enabled === true ? 'enableSkill' : 'disableSkill', { name: this.str(params, 'name') }, 60_000);
+      case 'getUpdateStatus': return this.opUpdates('status', params);
+      case 'updateAction': return this.opUpdates(this.str(params, 'action'), params);
+
       default:
         throw new Error(`Unknown op: ${op}`);
     }
+  }
+
+  private obj(params: Record<string, unknown>, name: string): Record<string, unknown> {
+    const value = params[name];
+    contractRequire(!!value && typeof value === 'object' && !Array.isArray(value), `${name} must be an object`);
+    return value as Record<string, unknown>;
+  }
+
+  /** Ids of global abjects these ops reach, found by name once. */
+  private globalDeps = new Map<string, AbjectId>();
+
+  private async depRequest<T = unknown>(name: string, method: string, payload: unknown, timeoutMs = 30_000): Promise<T> {
+    let id = this.globalDeps.get(name);
+    if (!id) {
+      id = await this.discoverDep(name) ?? undefined;
+      if (!id) throw new Error(`${name} is not running on this instance`);
+      this.globalDeps.set(name, id);
+    }
+    try {
+      return await this.request<T>(request(this.id, id, method, payload), timeoutMs);
+    } catch (err) {
+      // A respawned abject has a new id: look it up again next time.
+      this.globalDeps.delete(name);
+      throw err;
+    }
+  }
+
+  private settingsRequest<T = unknown>(method: string, payload: unknown, timeoutMs?: number): Promise<T> {
+    return this.depRequest<T>('SettingsManager', method, payload, timeoutMs);
+  }
+
+  /** Software updates (the packaged desktop app only): status, check, download, restart, auto-download. */
+  private async opUpdates(action: string, params: Record<string, unknown>): Promise<unknown> {
+    switch (action) {
+      case 'status': return this.depRequest('AppUpdater', 'getStatus', {});
+      case 'check': return this.depRequest('AppUpdater', 'checkNow', {}, 60_000);
+      case 'download': return this.depRequest('AppUpdater', 'download', {});
+      // The terminal asks about running goals before it sends this.
+      case 'restart': return this.depRequest('AppUpdater', 'restartToUpdate', {}, 300_000);
+      case 'autoDownload': return this.depRequest('AppUpdater', 'setAutoDownload', { enabled: params.enabled === true });
+      default: throw new Error(`Unknown update action: ${action}. Actions: status, check, download, restart, autoDownload`);
+    }
+  }
+
+  /** Everything a workspace's Settings window shows, in one read. */
+  private async opGetWorkspaceSettings(workspaceId: string): Promise<unknown> {
+    const detailed = await this.wsmRequest<Array<{
+      workspaceId: string; name: string; accessMode: string; whitelist: string[];
+      exposedObjectIds: string[]; registryId: AbjectId; joined?: boolean;
+    }>>('listWorkspacesDetailed', {});
+    const ws = detailed.find(w => w.workspaceId === workspaceId);
+    if (!ws) throw new Error(`Unknown workspace: ${workspaceId}`);
+    const [description, tags] = await Promise.all([
+      this.wsmRequest<string>('getDescription', { workspaceId }),
+      this.wsmRequest<string[]>('getTags', { workspaceId }),
+    ]);
+    const webExposureId = await this.discoverInRegistry(ws.registryId, 'WebExposure');
+    const themeId = await this.discoverInRegistry(ws.registryId, 'Theme');
+    const web = webExposureId ? await this.request<unknown>(request(this.id, webExposureId, 'getConfig', {})) : null;
+    const theme = themeId ? {
+      active: await this.request<string>(request(this.id, themeId, 'getActiveThemeId', {})),
+      presets: (await this.request<Array<{ id: string; name: string }>>(request(this.id, themeId, 'listPresets', {})))
+        .map(p => ({ id: p.id, name: p.name })),
+    } : null;
+    return {
+      general: { name: ws.name, description: description ?? '', tags: tags ?? [] },
+      access: { accessMode: ws.accessMode, whitelist: ws.whitelist ?? [], exposedObjectIds: ws.exposedObjectIds ?? [], joined: !!ws.joined },
+      web,
+      appearance: theme,
+    };
+  }
+
+  /**
+   * Change one section of a workspace's settings: general (name,
+   * description, tags), access (accessMode, whitelist, exposedObjectIds),
+   * web (enabled, entries: name to { access, methods?, mode?, handler? } or
+   * null to remove), appearance (theme id).
+   */
+  private async opSetWorkspaceSettings(workspaceId: string, section: string, values: Record<string, unknown>): Promise<unknown> {
+    const known = (allowed: string[]): void => {
+      const unknown = Object.keys(values).filter(k => !allowed.includes(k));
+      contractRequire(unknown.length === 0, `Unknown ${section} setting${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}`);
+    };
+    const strings = (v: unknown, what: string): string[] => {
+      contractRequire(Array.isArray(v) && v.every(x => typeof x === 'string'), `${what} must be a list of strings`);
+      return v as string[];
+    };
+    const wsDeps = async (name: string): Promise<AbjectId> => {
+      const detailed = await this.wsmRequest<Array<{ workspaceId: string; registryId: AbjectId }>>('listWorkspacesDetailed', {});
+      const ws = detailed.find(w => w.workspaceId === workspaceId);
+      if (!ws) throw new Error(`Unknown workspace: ${workspaceId}`);
+      const id = await this.discoverInRegistry(ws.registryId, name);
+      if (!id) throw new Error(`${name} is not running in this workspace`);
+      return id;
+    };
+    switch (section) {
+      case 'general': {
+        known(['name', 'description', 'tags']);
+        if (values.name !== undefined) await this.wsmRequest('renameWorkspace', { workspaceId, name: String(values.name) });
+        if (values.description !== undefined) await this.wsmRequest('setDescription', { workspaceId, description: String(values.description) });
+        if (values.tags !== undefined) await this.wsmRequest('setTags', { workspaceId, tags: strings(values.tags, 'tags') });
+        break;
+      }
+      case 'access': {
+        known(['accessMode', 'whitelist', 'exposedObjectIds']);
+        if (values.accessMode !== undefined) await this.wsmRequest('setAccessMode', { workspaceId, accessMode: String(values.accessMode) });
+        if (values.whitelist !== undefined) await this.wsmRequest('setWhitelist', { workspaceId, whitelist: strings(values.whitelist, 'whitelist') });
+        if (values.exposedObjectIds !== undefined) await this.wsmRequest('setExposedObjects', { workspaceId, objectIds: strings(values.exposedObjectIds, 'exposedObjectIds') });
+        break;
+      }
+      case 'web': {
+        known(['enabled', 'entries']);
+        const webExposureId = await wsDeps('WebExposure');
+        const check = (r: { success?: boolean; error?: string } | undefined): void => {
+          if (r && r.success === false) throw new Error(r.error ?? 'WebExposure refused the change');
+        };
+        if (values.enabled !== undefined) {
+          check(await this.request(request(this.id, webExposureId, 'setEnabled', { enabled: values.enabled === true })));
+        }
+        if (values.entries !== undefined) {
+          contractRequire(!!values.entries && typeof values.entries === 'object', 'entries must map abject name to an entry or null');
+          for (const [name, entry] of Object.entries(values.entries as Record<string, unknown>)) {
+            if (entry === null) check(await this.request(request(this.id, webExposureId, 'removeEntry', { name })));
+            else check(await this.request(request(this.id, webExposureId, 'setEntry', { name, ...(entry as object) })));
+          }
+        }
+        break;
+      }
+      case 'appearance': {
+        known(['theme']);
+        if (values.theme !== undefined) {
+          const themeId = await wsDeps('Theme');
+          await this.request(request(this.id, themeId, 'setThemeById', { id: String(values.theme) }));
+        }
+        break;
+      }
+      default:
+        throw new Error(`Unknown workspace settings section: ${section}. Sections: general, access, web, appearance`);
+    }
+    return this.opGetWorkspaceSettings(workspaceId);
   }
 
   private str(params: Record<string, unknown>, name: string): string {

@@ -72,6 +72,7 @@ import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
+import { SettingsManager } from '../src/objects/settings-manager.js';
 import { PermissionBroker } from '../src/objects/permission-broker.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
@@ -657,6 +658,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('Sidebar', () => new Sidebar());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('SettingsManager', () => new SettingsManager());
   runtime.objectFactory.registerConstructor('PermissionBroker', () => new PermissionBroker());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
@@ -742,7 +744,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'WebSearch', 'WebFetch', 'Screenshot',
       'Storage', 'StreamClient', 'AudioOutput', 'Speech', 'Crypto',
       // Global services
-      'GlobalSettings', 'PermissionBroker', 'PeerNetwork', 'SceneLibrary',
+      'GlobalSettings', 'SettingsManager', 'PermissionBroker', 'PeerNetwork', 'SceneLibrary',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor', 'CassetteRecorder',
       'SkillRegistry', 'SkillBrowser',
@@ -1077,6 +1079,12 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const permissionBrokerId = await supervisedSpawn(
     'PermissionBroker', 'permanent', systemTypeId('PermissionBroker'));
 
+  // The settings as data: loads and applies them at boot, then takes changes
+  // from the Settings window and the terminal client. After PermissionBroker,
+  // whose settings authority it claims (first caller wins), and before
+  // GlobalSettings, the window over it.
+  const settingsManagerId = await supervisedSpawn('SettingsManager', 'permanent', systemTypeId('SettingsManager'));
+
   // Before GlobalSettings, which shows the Updates tab only when AppUpdater exists.
   if (packagedElectron) await supervisedSpawn('AppUpdater', 'permanent', systemTypeId('AppUpdater'));
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
@@ -1088,12 +1096,12 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   await supervisedSpawn('InstanceInfo', 'permanent', systemTypeId('InstanceInfo'));
 
   // Capability-enforcement mode: register the interceptor's mailbox as a
-  // GlobalSettings dependent (mode-change events land there) and pull the
+  // SettingsManager dependent (mode-change events land there) and pull the
   // initial value in case the boot announce fired before the registration.
   try {
-    bus.send(message.request(capInterceptor.mailboxId, globalSettingsId, 'addDependent', {}));
+    bus.send(message.request(capInterceptor.mailboxId, settingsManagerId, 'addDependent', {}));
     const mode = await bootstrapRequest<'off' | 'warn' | 'enforce'>(
-      globalSettingsId, 'getCapabilityEnforcement', {});
+      settingsManagerId, 'getCapabilityEnforcement', {});
     if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
       capInterceptor.setMode(mode);
     }

@@ -13,6 +13,8 @@ export interface PairedDesktop {
   name: string;
   pairedAt: number;
   lastConnected?: number;
+  /** Name the user gave this desktop in the p2p client's instance switcher. */
+  label?: string;
 }
 
 export function listPairedDesktops(): PairedDesktop[] {

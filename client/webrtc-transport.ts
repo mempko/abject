@@ -26,6 +26,32 @@ export interface WebRTCTransportOptions {
   pairing?: { payload: PairingPayload; clientName: string };
   /** Set when reconnecting to an already-paired desktop. */
   reconnect?: { desktop: PairedDesktop };
+  /**
+   * Lifecycle reports for a caller that keeps its own record of desktops
+   * (the p2p client's instance list). Passing this switches the transport to
+   * confirmed mode: the channel opens for app data only once the desktop
+   * answers the `pair` or `reconnect` message, nothing is written to the
+   * paired-desktop list here, and a refused pairing ends the transport
+   * instead of retrying.
+   */
+  events?: WebRTCTransportEvents;
+}
+
+export interface WebRTCTransportEvents {
+  /** The desktop accepted the pairing (its first message arrived). */
+  onPaired?(desktop: PairedDesktop): void;
+  /** The desktop accepted a reconnect. */
+  onAccepted?(): void;
+  /**
+   * The pairing will not complete: the desktop hung up on the token, or the
+   * link expired before the desktop could be reached. The transport is closed.
+   */
+  onPairingFailed?(reason: 'refused' | 'expired'): void;
+  /**
+   * An attempt failed and the next one is scheduled. `refused`: the encrypted
+   * channel opened but the desktop hung up instead of accepting.
+   */
+  onRetry?(info: { attempt: number; delayMs: number; refused: boolean }): void;
 }
 
 export class WebRTCClientTransport implements ClientTransport {
@@ -55,6 +81,12 @@ export class WebRTCClientTransport implements ClientTransport {
    * session on every offer, reconnecting the phone every couple of seconds.
    */
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Confirmed mode: the peer whose `pair`/`reconnect` message is sent but not
+   * yet answered. The desktop answers an accepted client with its first
+   * message (`authNotRequired`) and hangs up on a refused one.
+   */
+  private awaitingAccept?: PeerTransport;
 
   constructor(opts: WebRTCTransportOptions) {
     if (!opts.pairing && !opts.reconnect) {
@@ -118,7 +150,9 @@ export class WebRTCClientTransport implements ClientTransport {
   }
 
   get ready(): boolean {
-    return !this.closed && !!this.peer && this.peer.isEncrypted;
+    // A channel still waiting for the desktop's answer carries nothing else:
+    // any frame sent then would land in the desktop's pre-auth parser.
+    return !this.closed && !!this.peer && this.peer.isEncrypted && this.awaitingAccept !== this.peer;
   }
 
   // ── Internal ────────────────────────────────────────────────────────
@@ -234,6 +268,7 @@ export class WebRTCClientTransport implements ClientTransport {
     // must not disturb the peer that replaced it.
     peer.onRawMessage((data) => {
       if (this.peer !== peer) return;
+      if (this.awaitingAccept === peer) this.acceptAnswered(peer);
       this.msgHandler?.(data);
     });
 
@@ -246,7 +281,14 @@ export class WebRTCClientTransport implements ClientTransport {
       onDisconnect: (reason) => {
         if (this.peer !== peer) return;
         console.log(`[webrtc-transport] peer disconnected: ${reason ?? 'unknown'}`);
-        this.scheduleReconnect();
+        // Hanging up before answering is how the desktop refuses a client.
+        const refused = this.awaitingAccept === peer;
+        this.awaitingAccept = undefined;
+        if (refused && this.opts.pairing) {
+          this.failPairing('refused');
+          return;
+        }
+        this.scheduleReconnect(undefined, refused);
       },
       onError: (err) => {
         if (this.peer !== peer) return;
@@ -264,6 +306,10 @@ export class WebRTCClientTransport implements ClientTransport {
 
   private async sendPairOrReconnect(peer: PeerTransport): Promise<void> {
     if (this.peer !== peer) return;
+    if (this.opts.events) {
+      await this.sendAndAwaitAnswer(peer);
+      return;
+    }
     try {
       if (this.opts.pairing) {
         const p = this.opts.pairing.payload;
@@ -301,6 +347,69 @@ export class WebRTCClientTransport implements ClientTransport {
     }
   }
 
+  /**
+   * Confirmed mode: send `pair` or `reconnect` and wait. The channel opens
+   * (and a pairing is reported) only when the desktop answers; see
+   * acceptAnswered and the peer's onDisconnect.
+   */
+  private async sendAndAwaitAnswer(peer: PeerTransport): Promise<void> {
+    // Marked before sending, so an answer that arrives at once finds it.
+    this.awaitingAccept = peer;
+    try {
+      const msg = this.opts.pairing
+        ? { type: 'pair', token: this.opts.pairing.payload.token, clientName: this.opts.pairing.clientName }
+        : { type: 'reconnect' };
+      await peer.sendRaw(JSON.stringify(msg));
+    } catch (err) {
+      if (this.peer !== peer) return;
+      this.awaitingAccept = undefined;
+      console.warn('[webrtc-transport] sendPairOrReconnect failed:', err);
+      this.scheduleReconnect(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /** The desktop answered: it accepted this client. Open the channel for app data. */
+  private acceptAnswered(peer: PeerTransport): void {
+    this.awaitingAccept = undefined;
+    const events = this.opts.events;
+    if (this.opts.pairing) {
+      const p = this.opts.pairing.payload;
+      const now = Date.now();
+      const desktop: PairedDesktop = {
+        peerId: p.peerId,
+        signKey: p.signKey,
+        exKey: p.exKey,
+        signalingUrl: p.signalingUrl,
+        name: p.name,
+        pairedAt: now,
+        lastConnected: now,
+      };
+      // The token is single-use: every later attempt is a reconnect.
+      this.opts = { reconnect: { desktop }, events };
+      events?.onPaired?.(desktop);
+    } else {
+      events?.onAccepted?.();
+    }
+    if (this.peer !== peer) return;
+    this.reconnectAttempt = 0;
+    this.fireOpen();
+  }
+
+  /** Confirmed mode: the pairing cannot complete. Stop for good and say why. */
+  private failPairing(reason: 'refused' | 'expired'): void {
+    const events = this.opts.events;
+    console.warn(`[webrtc-transport] pairing ${reason}`);
+    this.close();
+    if (this.firstOpenReject && !this.firstOpenSettled) {
+      this.firstOpenSettled = true;
+      this.firstOpenReject(new Error(`pairing ${reason}`));
+      this.firstOpenResolve = undefined;
+      this.firstOpenReject = undefined;
+    }
+    this.closeHandler?.();
+    events?.onPairingFailed?.(reason);
+  }
+
   private fireOpen(): void {
     if (this.firstOpenResolve && !this.firstOpenSettled) {
       this.firstOpenSettled = true;
@@ -312,9 +421,15 @@ export class WebRTCClientTransport implements ClientTransport {
     this.openHandler?.();
   }
 
-  private scheduleReconnect(err?: Error): void {
+  private scheduleReconnect(err?: Error, refused = false): void {
     if (this.closed) return;
     if (err) console.warn('[webrtc-transport] reconnect after error:', err.message);
+
+    // Confirmed mode: a pairing link is only good until it expires.
+    if (this.opts.events && this.opts.pairing && this.opts.pairing.payload.expires < Date.now()) {
+      this.failPairing('expired');
+      return;
+    }
 
     // Tear down the previous peer/signaling before retrying. References are
     // cleared before disconnect() runs, so the torn-down peer's own
@@ -334,6 +449,7 @@ export class WebRTCClientTransport implements ClientTransport {
       if (this.closed) return;
       void this.openPeerConnection();
     }, delay);
+    this.opts.events?.onRetry?.({ attempt: this.reconnectAttempt, delayMs: delay, refused });
   }
 
   private handleFatal(err: Error): void {

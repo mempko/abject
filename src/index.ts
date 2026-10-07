@@ -93,6 +93,7 @@ export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-re
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 export { Sidebar, SIDEBAR_ID, SIDEBAR_WIDTH } from './objects/sidebar.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
+export { SettingsManager, SETTINGS_MANAGER_ID } from './objects/settings-manager.js';
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
 export { ProcessExplorer, PROCESS_EXPLORER_ID } from './objects/process-explorer.js';

@@ -1,9 +1,13 @@
 /**
- * GlobalSettings object — provides UI for configuring global LLM API keys.
+ * GlobalSettings: the Settings window.
  *
- * This is a global (non-per-workspace) object that manages API keys in
- * global Storage. On first boot with no keys, it auto-shows to prompt
- * the user. Keys are persisted with the 'global-settings:' prefix.
+ * A view over SettingsManager, which owns the global settings as data
+ * (credentials and tier routing, presets, login, permissions): the window
+ * loads its forms from it, saves through it, and repaints when it reports a
+ * change (the terminal client edits the same settings). It also raises the
+ * permission prompts PermissionBroker asks for, and shows the Skills,
+ * Packages and Updates tabs over their own objects. On first boot with
+ * nothing configured it opens itself.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -14,7 +18,7 @@ import { Log } from '../core/timed-log.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
-import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
+import { LATEST_MODEL, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
 import { TITLE_BAR_HEIGHT } from './widgets/widget-types.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
@@ -22,6 +26,7 @@ import type { PackageView, PackageDirView, PackageProblem } from './packages.js'
 import type { PackageSettingSpec } from '../sandbox/extensions.js';
 import { parsePrivateHost } from './capabilities/address-policy.js';
 import type { UpdateStatus } from './app-updater.js';
+import type { SettingsBySection, SettingsSectionId, TierPreset as ManagedPreset } from './settings-manager.js';
 
 const log = new Log('GlobalSettings');
 
@@ -95,6 +100,12 @@ function megabytes(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
+/** A SettingsManager refusal as a sentence: the contract prefix dropped. */
+function settingsError(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err);
+  return text.replace(/^.*\[(REQUIRE|ENSURE|INVARIANT)\]\s*/, '').slice(0, 200);
+}
+
 function toListItems(
   arr: string[],
 ): Array<{ label: string; value: string; actions: Array<{ id: string; label: string }> }> {
@@ -112,17 +123,6 @@ interface ObjectCommandRules {
   deny: string[];
 }
 
-/** Read a stored rules record, tolerating the plain allow-array first written. */
-function parseObjectRules(json: string): ObjectCommandRules {
-  const parsed = JSON.parse(json) as unknown;
-  if (Array.isArray(parsed)) return { allow: parsed as string[], deny: [] };
-  const record = parsed as Partial<ObjectCommandRules>;
-  return {
-    allow: Array.isArray(record.allow) ? record.allow : [],
-    deny: Array.isArray(record.deny) ? record.deny : [],
-  };
-}
-
 function parseObjectPermEntry(entry: string): { objectName: string; commandName: string } | undefined {
   const sep = entry.indexOf(':');
   if (sep <= 0) return undefined;
@@ -138,55 +138,8 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
-const STORAGE_PREFIX = 'global-settings:';
-const STORAGE_KEY_AI_ACTIVE_PROVIDER = `${STORAGE_PREFIX}aiActiveProvider`;
-/** Build a per-provider credential storage key from a description's `storageSuffix`. */
-function storageKeyFor(suffix: string): string { return `${STORAGE_PREFIX}${suffix}`; }
-const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
-const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
-const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
-
-// Permissions storage keys
-const STORAGE_KEY_FS_ALLOWED_PATHS = 'global-settings:fsAllowedPaths';
-const STORAGE_KEY_FS_READ_ONLY = 'global-settings:fsReadOnly';
-const STORAGE_KEY_SHELL_ENABLED = 'global-settings:shellEnabled';
-const STORAGE_KEY_SHELL_ALLOWED_CMDS = 'global-settings:shellAllowedCmds';
-const STORAGE_KEY_SHELL_DENIED_CMDS = 'global-settings:shellDeniedCmds';
-const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
-const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
-const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
-const STORAGE_KEY_WEB_PRIVATE_HOSTS = 'global-settings:webPrivateHosts';
-const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
-/** Index of object names holding per-object shell grants; one key per name. */
-const STORAGE_KEY_OBJECT_PERM_NAMES = 'global-settings:objectPermNames';
-const objectPermKey = (objectName: string) => `global-settings:objectPerms:${objectName}`;
-
-// Per-tier routing storage keys
-const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
-const STORAGE_KEY_TIER_SMART_MODEL = 'global-settings:tierSmartModel';
-const STORAGE_KEY_TIER_SMART_EFFORT = 'global-settings:tierSmartEffort';
-const STORAGE_KEY_TIER_BALANCED_PROVIDER = 'global-settings:tierBalancedProvider';
-const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
-const STORAGE_KEY_TIER_BALANCED_EFFORT = 'global-settings:tierBalancedEffort';
-const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
-const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
-const STORAGE_KEY_TIER_FAST_EFFORT = 'global-settings:tierFastEffort';
-const STORAGE_KEY_TIER_CODE_PROVIDER = 'global-settings:tierCodeProvider';
-const STORAGE_KEY_TIER_CODE_MODEL = 'global-settings:tierCodeModel';
-const STORAGE_KEY_TIER_CODE_EFFORT = 'global-settings:tierCodeEffort';
-// Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
-const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
-const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
-// Optional tier-fallback model: stands in for any tier whose own model has failed (outage cover)
-const STORAGE_KEY_FALLBACK_PROVIDER = 'global-settings:tierFallbackProvider';
-const STORAGE_KEY_FALLBACK_MODEL = 'global-settings:tierFallbackModel';
-// Prompt-cache keepalive toggle (default off — pings spend real money)
-const STORAGE_KEY_CACHE_KEEPALIVE = 'global-settings:cacheKeepalive';
-// Decision route: a decision model (e.g. TypeSafe Jev) or a chat model emulating one; unset = auto
-const STORAGE_KEY_DECISION_PROVIDER = 'global-settings:decisionProvider';
-const STORAGE_KEY_DECISION_MODEL = 'global-settings:decisionModel';
-// Decision gates: on | off for every built-in decision site (see src/core/decision-sites.ts)
-const STORAGE_KEY_DECISION_GATES = 'global-settings:decisionGates';
+/** Which provider's credential panel was open last: the window's own view state. */
+const STORAGE_KEY_AI_ACTIVE_PROVIDER = 'global-settings:aiActiveProvider';
 const DECISION_GATE_OPTIONS: Array<{ gates: DecisionGates; label: string }> = [
   { gates: 'on', label: 'On (decision sites advise and act live)' },
   { gates: 'off', label: 'Off (built-in decision sites do not run)' },
@@ -205,14 +158,6 @@ type ModelTierName = 'smart' | 'balanced' | 'fast' | 'code';
 const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast', 'Code'];
 const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast', 'code'];
 
-/** Per-tier storage keys, so every load/persist path loops instead of hardcoding tiers. */
-const TIER_STORAGE_KEYS: Record<ModelTierName, { provider: string; model: string; effort: string }> = {
-  smart:    { provider: STORAGE_KEY_TIER_SMART_PROVIDER,    model: STORAGE_KEY_TIER_SMART_MODEL,    effort: STORAGE_KEY_TIER_SMART_EFFORT },
-  balanced: { provider: STORAGE_KEY_TIER_BALANCED_PROVIDER, model: STORAGE_KEY_TIER_BALANCED_MODEL, effort: STORAGE_KEY_TIER_BALANCED_EFFORT },
-  fast:     { provider: STORAGE_KEY_TIER_FAST_PROVIDER,     model: STORAGE_KEY_TIER_FAST_MODEL,     effort: STORAGE_KEY_TIER_FAST_EFFORT },
-  code:     { provider: STORAGE_KEY_TIER_CODE_PROVIDER,     model: STORAGE_KEY_TIER_CODE_MODEL,     effort: STORAGE_KEY_TIER_CODE_EFFORT },
-};
-
 /** 'Default' = no override (provider's tier default applies). */
 const EFFORT_DEFAULT_LABEL = 'Default';
 
@@ -224,20 +169,8 @@ interface TierRoutingRow {
   effort?: string | null;
 }
 
-/** Saved tier presets: name → full tier routing + optional vision fallback. */
-const STORAGE_KEY_TIER_PRESETS = 'global-settings:tierPresets';
-
-interface TierPreset {
-  routing: Partial<Record<ModelTierName, { provider: string; model: string; effort?: string }>>;
-  vision: { provider: string; model: string } | null;
-  /** Optional so presets saved before the row existed still load. */
-  fallback?: { provider: string; model: string } | null;
-  /**
-   * The Decision row: a provider and model, or null for Auto. Undefined (a
-   * preset saved before presets carried it) leaves the row as it is.
-   */
-  decision?: { provider: string; model: string } | null;
-}
+/** A tier preset (SettingsManager keeps the saved ones and derives the built-ins). */
+type TierPreset = ManagedPreset;
 
 /**
  * The two optional single-model rows under the tiers: which model stands in
@@ -249,8 +182,6 @@ interface TierPreset {
 type AuxRowKey = 'vision' | 'fallback' | 'decision';
 interface AuxRowSpec {
   label: string;
-  storageProvider: string;
-  storageModel: string;
   /** Land on the first vision-capable model when nothing better is selected. */
   preferVision: boolean;
   /** How the save-time credential toast names the row. */
@@ -263,9 +194,9 @@ interface AuxRowSpec {
   decision?: boolean;
 }
 const AUX_ROWS: Record<AuxRowKey, AuxRowSpec> = {
-  vision: { label: 'Vision', storageProvider: STORAGE_KEY_VISION_PROVIDER, storageModel: STORAGE_KEY_VISION_MODEL, preferVision: true, toastName: 'Vision fallback' },
-  fallback: { label: 'Fallback', storageProvider: STORAGE_KEY_FALLBACK_PROVIDER, storageModel: STORAGE_KEY_FALLBACK_MODEL, preferVision: false, toastName: 'Tier fallback' },
-  decision: { label: 'Decision', storageProvider: STORAGE_KEY_DECISION_PROVIDER, storageModel: STORAGE_KEY_DECISION_MODEL, preferVision: false, toastName: 'Decision model', decision: true },
+  vision: { label: 'Vision', preferVision: true, toastName: 'Vision fallback' },
+  fallback: { label: 'Fallback', preferVision: false, toastName: 'Tier fallback' },
+  decision: { label: 'Decision', preferVision: false, toastName: 'Decision model', decision: true },
 };
 const AUX_ROW_KEYS: AuxRowKey[] = ['vision', 'fallback', 'decision'];
 /** One aux row's widgets and the intended model id (same stale-label protection as the tier rows). */
@@ -277,15 +208,6 @@ interface AuxRowState {
 }
 type AuxModel = { provider: string | null; model: string | null };
 const emptyAuxModels = (): Record<AuxRowKey, AuxModel> => ({ vision: { provider: null, model: null }, fallback: { provider: null, model: null }, decision: { provider: null, model: null } });
-
-// Legacy keys for migration
-const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
-const LEGACY_KEY_OPENAI = 'settings:openaiApiKey';
-const LEGACY_KEY_PROVIDER = 'global-settings:llmProvider';
-const LEGACY_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel';
-const LEGACY_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
-const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
-const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 
 interface ModelInfo { id: string; name: string; vision?: boolean; efforts?: string[]; created?: number; pricing?: { inputPerMTok: number; outputPerMTok: number }; }
 
@@ -300,7 +222,17 @@ export class GlobalSettings extends Abject {
   private llmId?: AbjectId;
   private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
-  private uiServerId?: AbjectId;
+  /** Owns the settings this window edits. */
+  private settingsManagerId?: AbjectId;
+  /** The settings as last loaded from SettingsManager (secrets included: this window may read them). */
+  private managed?: SettingsBySection;
+  /** Saved and built-in presets, as SettingsManager lists them. */
+  private presetList: Array<{ name: string; builtin: boolean; preset: TierPreset }> = [];
+  /**
+   * The section this window saved last, and when: its own change comes back
+   * as a settingsChanged event, which needs no repaint.
+   */
+  private lastOwnSave?: { section: string; at: number };
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
@@ -375,7 +307,6 @@ export class GlobalSettings extends Abject {
   private presetApplyBtnId?: AbjectId;
   private presetSaveBtnId?: AbjectId;
   private presetDeleteBtnId?: AbjectId;
-  private savedPresets: Record<string, TierPreset> = {};
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -527,7 +458,7 @@ export class GlobalSettings extends Abject {
       manifest: {
         name: 'GlobalSettings',
         description:
-          'Global configuration UI for LLM API keys.',
+          'The Settings window: model keys and tiers, login, permissions, skills, packages and updates. The settings themselves live in SettingsManager.',
         version: '1.0.0',
         interface: {
             id: GLOBAL_SETTINGS_INTERFACE,
@@ -545,31 +476,6 @@ export class GlobalSettings extends Abject {
                 description: 'Hide the global settings window',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'getCapabilityEnforcement',
-                description: 'Current bus-level capability enforcement mode for scriptable objects',
-                parameters: [],
-                returns: { kind: 'primitive', primitive: 'string' },
-              },
-              {
-                name: 'setCapabilityEnforcement',
-                description: 'Set the capability enforcement mode: off, warn, or enforce. Emits capabilityEnforcementChanged.',
-                parameters: [
-                  {
-                    name: 'mode',
-                    type: { kind: 'primitive', primitive: 'string' },
-                    description: 'off, warn, or enforce',
-                  },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-            ],
-            events: [
-              {
-                name: 'capabilityEnforcementChanged',
-                description: 'The capability enforcement mode changed; value is the new mode',
-                payload: { kind: 'primitive', primitive: 'string' },
               },
             ],
           },
@@ -591,32 +497,18 @@ export class GlobalSettings extends Abject {
 
 Interface: abjects:global-settings
 
-GlobalSettings provides the global configuration UI for LLM API keys,
-authentication, and permissions (filesystem, shell, web access).
-It is a singleton (not per-workspace) and persists settings in global Storage.
+GlobalSettings is the Settings window: tabs for AI (model keys, tier routing, presets), Auth (a login for the UI and CLI),
+Permissions (filesystem, shell, web, capability enforcement), Skills & MCP, Packages, and Updates in the packaged app.
+The settings themselves live in SettingsManager, which this window loads from and saves through; ask SettingsManager to read them.
 
-### Show the Settings Window
+### Show or hide the window
 
-  await this.call(
-    this.dep('GlobalSettings'), 'show', {});
-  // Opens the settings window with tabs: AI, Auth, Permissions
-
-### Hide the Settings Window
-
-  await this.call(
-    this.dep('GlobalSettings'), 'hide', {});
-
-### What It Manages
-- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, an optional tier fallback model (stands in when a tier\'s own model fails), and tier PRESETS (apply/save/delete a named tier configuration including the Decision row; built-in presets are each provider's recommended models from its live catalog, with tiers on "Latest" that follow new releases, plus one ladder per vendor for catalogs with moving aliases such as OpenRouter; a saved preset freezes the concrete models it had when saved)
-- Auth tab: optional HTTP basic auth for the UI server
-- Permissions tab: category sub-tabs — Filesystem (allowed paths, read-only mode), Shell (enable + command allow/deny), Web (enable + domain allow/deny), Objects (capability enforcement mode)
-- Skills & MCP tab: installed skills (SKILL.md files) and the skills/MCP catalog browser
+  await this.call(this.dep('GlobalSettings'), 'show', {});
+  await this.call(this.dep('GlobalSettings'), 'hide', {});
 
 ### IMPORTANT
-- API keys are stored in global Storage (persisted across restarts).
-- On first boot with no keys configured, the settings window auto-shows.
-- Changes take effect after clicking Save and are applied to the LLM object.
-- This object manages UI only; use it to show/hide the configuration window.`;
+- Changing settings is the person's call: open the window for them, or ask them.
+- On first boot with nothing configured, the window opens by itself.`;
   }
 
   /** Display face for section titles and captions. */
@@ -629,276 +521,91 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
-    this.uiServerId = await this.requireDep('UIServer');
+    this.settingsManagerId = await this.requireDep('SettingsManager');
+    // Its settingsChanged events repaint an open window.
+    try { await this.request(request(this.id, this.settingsManagerId, 'addDependent', {})); } catch { /* repaints on reopen */ }
     // Packaged desktop app only: AppUpdater (spawned before us) feeds the Updates tab.
     await this.connectAppUpdater();
 
-    // Fetch provider descriptions before reading storage so we can derive
-    // the per-provider credential keys, default tier models, and dropdown
-    // entries from them — no per-provider hardcoding lives here.
+    // Provider descriptions drive the AI tab's dropdowns and labels.
     await this.loadProviderDescriptions();
+    const savedActive = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER })
+    );
+    if (savedActive && this.providerDescById.has(savedActive)) this.activeAiProvider = savedActive;
 
-    const credentials: Partial<Record<LLMProviderName, string>> = {};
-    const tierRouting: Record<ModelTierName, TierRoutingRow> = {
-      smart: { provider: null, model: null, effort: null },
-      balanced: { provider: null, model: null, effort: null },
-      fast: { provider: null, model: null, effort: null },
-      code: { provider: null, model: null, effort: null },
-    };
-    const aux = emptyAuxModels();
+    // First boot with nothing configured: open so the person can add a key.
+    const configured = await this.request<boolean>(request(this.id, this.settingsManagerId, 'isConfigured', {}));
+    if (!configured) void this.openWhenRegistered();
+  }
 
-    if (this.storageId) {
-      // Per-provider credential keys derived from each description's
-      // storageSuffix — CLI providers contribute nothing (their auth
-      // lives in the binary).
-      for (const desc of this.providerDescriptions) {
-        if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
-        const value = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: storageKeyFor(desc.storageSuffix) })
-        );
-        if (value) credentials[desc.id] = value;
+  /**
+   * Open the window once the Registry knows this object. SettingsManager
+   * hands settings (keys included) to the Settings window only, and tells it
+   * apart by its registration, which the Factory makes after onInit returns.
+   */
+  private async openWhenRegistered(): Promise<void> {
+    for (let i = 0; i < 40; i++) {
+      if (await this.discoverDep('GlobalSettings') === this.id) {
+        await this.show();
+        return;
       }
-      const savedActive = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER })
-      );
-      if (savedActive && this.providerDescById.has(savedActive)) {
-        this.activeAiProvider = savedActive;
-      }
-
-      // Load per-tier routing
-      for (const tier of TIER_NAMES) {
-        tierRouting[tier].provider = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].provider })
-        );
-        tierRouting[tier].model = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
-        );
-        tierRouting[tier].effort = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
-        );
-      }
-      for (const key of AUX_ROW_KEYS) {
-        aux[key].provider = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageProvider })
-        );
-        aux[key].model = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageModel })
-        );
-      }
-      const savedGates = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_DECISION_GATES })
-      );
-      if (savedGates && DECISION_GATE_OPTIONS.some(o => o.gates === savedGates)) this.decisionGates = savedGates as DecisionGates;
-      this.cacheKeepaliveEnabled = (await this.request<boolean | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CACHE_KEEPALIVE })
-      )) === true;
-
-      // Apply each provider's optional `modelMigrations` map to saved
-      // tier-routing model ids. Used when an upstream API drops a model
-      // name (e.g. codex no longer accepts `gpt-5` under ChatGPT login —
-      // migrates to `auto`). Self-described per provider, no special
-      // casing here.
-      for (const tier of TIER_NAMES) {
-        const providerId = tierRouting[tier].provider;
-        if (!providerId) continue;
-        const migrations = this.descById(providerId)?.modelMigrations;
-        if (!migrations) continue;
-        const saved = tierRouting[tier].model;
-        if (!saved) continue;
-        const migrated = migrations[saved];
-        if (migrated && migrated !== saved) {
-          tierRouting[tier].model = migrated;
-          try {
-            await this.request(request(this.id, this.storageId, 'set', { key: TIER_STORAGE_KEYS[tier].model, value: migrated }));
-          } catch { /* best-effort migration */ }
-          log.info(`Migrated ${providerId} ${tier} tier model "${saved}" → "${migrated}"`);
-        }
-      }
-
-      // Legacy migration from per-workspace keys (anthropic/openai only —
-      // those were the only two providers when the legacy keys existed).
-      const anthropicSuffix = this.descById('anthropic')?.storageSuffix;
-      const openaiSuffix = this.descById('openai')?.storageSuffix;
-      if (!credentials.anthropic && !credentials.openai && anthropicSuffix && openaiSuffix) {
-        const legacyAnthropic = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_ANTHROPIC })
-        );
-        const legacyOpenai = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OPENAI })
-        );
-        if (legacyAnthropic || legacyOpenai) {
-          if (legacyAnthropic) {
-            credentials.anthropic = legacyAnthropic;
-            await this.request(
-              request(this.id, this.storageId, 'set', { key: storageKeyFor(anthropicSuffix), value: legacyAnthropic })
-            );
-          }
-          if (legacyOpenai) {
-            credentials.openai = legacyOpenai;
-            await this.request(
-              request(this.id, this.storageId, 'set', { key: storageKeyFor(openaiSuffix), value: legacyOpenai })
-            );
-          }
-          log.info('Migrated API keys from legacy storage');
-        }
-      }
-
-      // Legacy migration: old single-provider setting to per-tier routing
-      const hasTierRouting = TIER_NAMES.some(t => tierRouting[t].provider);
-      if (!hasTierRouting) {
-        const oldProvider = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_PROVIDER })
-        );
-        const oldDesc = oldProvider ? this.descById(oldProvider) : undefined;
-        if (oldProvider && oldDesc) {
-          const providerName = oldProvider;
-          const defaults = oldDesc.defaultTierModels;
-
-          // For URL-credential providers (Ollama), preserve the old
-          // per-tier model keys if present.
-          if (oldDesc.credentialMode === 'url') {
-            const oldSmart = await this.request<string | null>(
-              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_SMART })
-            );
-            const oldBalanced = await this.request<string | null>(
-              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_BALANCED })
-            );
-            const oldFast = await this.request<string | null>(
-              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_FAST })
-            );
-            const legacyModel = await this.request<string | null>(
-              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL })
-            );
-            tierRouting.smart = { provider: providerName, model: oldSmart || legacyModel || '' };
-            tierRouting.balanced = { provider: providerName, model: oldBalanced || legacyModel || '' };
-            tierRouting.fast = { provider: providerName, model: oldFast || legacyModel || '' };
-          } else {
-            for (const tier of TIER_NAMES) {
-              tierRouting[tier] = { provider: providerName, model: defaults[tier] };
-            }
-          }
-
-          // Persist migrated tier routing
-          await this.persistTierRouting(tierRouting);
-          log.info(`Migrated single-provider '${providerName}' to per-tier routing`);
-        }
-      }
-
-      await this.applySavedAuthConfig();
-      await this.applySavedPermissions();
+      await new Promise(resolve => setTimeout(resolve, 250));
     }
+    log.warn('Not registered after 10s; the settings window stays closed until opened');
+  }
 
-    // Seed in-memory credential cache so the settings panel opens prefilled.
-    this.credentialValues = { ...credentials };
+  /**
+   * Load every section from SettingsManager (secrets included) into the
+   * forms' working state: the window edits copies and saves them back.
+   */
+  private async loadFromManager(): Promise<void> {
+    this.managed = await this.request<SettingsBySection>(
+      request(this.id, this.settingsManagerId!, 'getSettings', { reveal: true }));
+    const m = this.managed;
+    this.credentialValues = Object.fromEntries(
+      Object.entries(m.ai.credentials).filter(([, v]) => v.value).map(([id, v]) => [id, v.value!]));
+    this.decisionGates = m.ai.decisionGates;
+    this.cacheKeepaliveEnabled = m.ai.cacheKeepalive;
+    this.fsAllowedPaths = [...m.filesystem.allowedPaths];
+    this.fsReadOnly = m.filesystem.readOnly;
+    this.shellEnabled = m.shell.enabled;
+    this.shellAllowedCmds = [...m.shell.allowedCommands];
+    this.shellDeniedCmds = [...m.shell.deniedCommands];
+    this.objectPermissions = new Map(Object.entries(m.shell.objectRules)
+      .map(([name, r]) => [name, { allow: [...r.allow], deny: [...r.deny] }]));
+    this.webEnabled = m.web.enabled;
+    this.webAllowedDomains = [...m.web.allowedDomains];
+    this.webDeniedDomains = [...m.web.deniedDomains];
+    this.webPrivateHosts = [...m.web.privateHosts];
+    this.capabilityEnforcement = m.objects.capabilityEnforcement;
+    await this.loadPresetList();
+  }
 
-    // Configure all providers and tier routing
-    const hasAnyConfig = Object.keys(credentials).length > 0;
-    const hasTierConfig = TIER_NAMES.some(t => tierRouting[t].provider);
-    if ((hasAnyConfig || hasTierConfig) && this.llmId) {
-      await this.configureProviders(credentials, tierRouting, aux);
-      log.info('Loaded saved provider configuration');
-    } else {
-      await this.show();
+  private async loadPresetList(): Promise<void> {
+    try {
+      this.presetList = await this.request<Array<{ name: string; builtin: boolean; preset: TierPreset }>>(
+        request(this.id, this.settingsManagerId!, 'listPresets', {}), 60_000);
+    } catch (err) {
+      log.warn(`Could not list presets: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  private async persistTierRouting(
-    tierRouting: Record<ModelTierName, TierRoutingRow>,
-  ): Promise<void> {
-    if (!this.storageId) return;
-    const keys: [string, string | null][] = TIER_NAMES.flatMap((tier): [string, string | null][] => [
-      [TIER_STORAGE_KEYS[tier].provider, tierRouting[tier].provider],
-      [TIER_STORAGE_KEYS[tier].model, tierRouting[tier].model],
-    ]);
-    for (const [key, value] of keys) {
-      if (value) {
-        await this.request(request(this.id, this.storageId, 'set', { key, value }));
-      }
+  /**
+   * Change one section through SettingsManager. Returns the error to show,
+   * or undefined when it took.
+   */
+  private async saveSection(section: SettingsSectionId, values: Record<string, unknown>): Promise<string | undefined> {
+    this.lastOwnSave = { section, at: Date.now() };
+    try {
+      await this.request(request(this.id, this.settingsManagerId!, 'setSettings', { section, values }), 60_000);
+      return undefined;
+    } catch (err) {
+      return settingsError(err);
     }
-    // Effort override: persisted when set, DELETED when cleared back to
-    // Default — unlike provider/model, absence is a meaningful state.
-    for (const tier of TIER_NAMES) {
-      const effort = tierRouting[tier].effort;
-      const key = TIER_STORAGE_KEYS[tier].effort;
-      if (effort) {
-        await this.request(request(this.id, this.storageId, 'set', { key, value: effort }));
-      } else {
-        await this.request(request(this.id, this.storageId, 'delete', { key })).catch(() => undefined);
-      }
-    }
-  }
-
-  private async configureProviders(
-    credentials: Partial<Record<LLMProviderName, string>>,
-    tierRouting: Record<ModelTierName, TierRoutingRow>,
-    aux?: Record<AuxRowKey, AuxModel>,
-  ): Promise<void> {
-    if (!this.llmId) return;
-
-    // Build tier routing for LLMObject (only include tiers with both provider and model)
-    const routing: Record<string, { provider: string; model: string; effort?: string }> = {};
-    for (const tier of TIER_NAMES) {
-      const { provider, model, effort } = tierRouting[tier];
-      if (provider && model) {
-        routing[tier] = { provider, model, ...(effort ? { effort } : {}) };
-      }
-    }
-
-    // Generic per-provider credentials map keyed by provider id, derived
-    // from descriptions so adding a new provider doesn't touch this code.
-    const credMap: Record<string, string> = {};
-    for (const [id, value] of Object.entries(credentials)) {
-      if (value) credMap[id] = value;
-    }
-
-    // null clears a previously-set row; undefined leaves it untouched
-    const vision = aux === undefined
-      ? undefined
-      : (aux.vision.provider && aux.vision.model ? { provider: aux.vision.provider, model: aux.vision.model } : null);
-    // One fallback model covers every tier: outage cover, not per-tier routing.
-    const fallback = aux === undefined
-      ? undefined
-      : (aux.fallback.provider && aux.fallback.model ? { provider: aux.fallback.provider, model: aux.fallback.model } : null);
-    const tierFallbacks = fallback === undefined
-      ? undefined
-      : (fallback ? Object.fromEntries(TIER_NAMES.map(tier => [tier, [fallback]])) : null);
-
-    // Decision route: Auto (null) is a keyed decision provider, else Fast-tier emulation.
-    const decisionRoute = aux === undefined
-      ? undefined
-      : (aux.decision.provider && aux.decision.model ? { provider: aux.decision.provider, model: aux.decision.model } : null);
-
-    await this.request(request(this.id, this.llmId, 'configure', {
-      credentials: credMap,
-      tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
-      tierFallbacks,
-      visionFallback: vision,
-      cacheKeepalive: { enabled: this.cacheKeepaliveEnabled },
-      decisionRoute,
-      decisionPolicy: { gates: this.decisionGates },
-    }));
   }
 
   private setupHandlers(): void {
-    this.on('getCapabilityEnforcement', async () => {
-      return this.capabilityEnforcement;
-    });
-
-    this.on('setCapabilityEnforcement', async (msg: AbjectMessage) => {
-      const { mode } = msg.payload as { mode: string };
-      if (mode !== 'off' && mode !== 'warn' && mode !== 'enforce') return false;
-      this.capabilityEnforcement = mode;
-      if (this.storageId) {
-        try {
-          await this.request(request(this.id, this.storageId, 'set', {
-            key: STORAGE_KEY_CAP_ENFORCEMENT, value: mode,
-          }));
-        } catch { /* persistence is best-effort */ }
-      }
-      this.changed('capabilityEnforcementChanged', mode);
-      return true;
-    });
-
     this.on('show', async () => {
       return this.show();
     });
@@ -984,6 +691,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (fromId === this._promptResourceBlockId && aspect === 'contentHeight') {
         const height = typeof value === 'number' ? value : Number(value);
         if (Number.isFinite(height) && height > 0) await this.resizePromptForResource(height);
+        return;
+      }
+
+      // Settings changed through another surface (the terminal client):
+      // repaint the forms that show them.
+      if (fromId === this.settingsManagerId && aspect === 'settingsChanged') {
+        await this.onSettingsChanged((value as { section?: string } | undefined)?.section);
         return;
       }
 
@@ -1263,12 +977,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         this.webEnabled = value as boolean;
         return;
       }
-      // Capability enforcement mode select
+      // Capability enforcement mode select: takes effect at once.
       if (fromId === this.capEnforceSelectId && aspect === 'change') {
         const mode = value as string;
         if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
           this.capabilityEnforcement = mode;
-          this.changed('capabilityEnforcementChanged', mode);
+          const error = await this.saveSection('objects', { capabilityEnforcement: mode });
+          if (error) await this.rejectWith(error);
         }
         return;
       }
@@ -1364,6 +1079,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Providers other abjects register (LLM registerProvider) arrive after
     // boot, so re-read the list each time the window opens.
     await this.loadProviderDescriptions();
+    await this.loadFromManager();
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
@@ -2280,7 +1996,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async buildAiTab(): Promise<void> {
     const cId = this.aiContainerId!;
 
-    // Load tier routing (credentials already loaded into this.credentialValues in onInit)
+    // Tier routing and the single-model rows, as SettingsManager holds them.
     const savedTierRouting: Record<ModelTierName, TierRoutingRow> = {
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
@@ -2288,29 +2004,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       code: { provider: null, model: null },
     };
     const savedAux = emptyAuxModels();
-    if (this.storageId) {
-      for (const tier of TIER_NAMES) {
-        savedTierRouting[tier].provider = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].provider })
-        );
-        savedTierRouting[tier].model = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
-        );
-        savedTierRouting[tier].effort = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].effort })
-        );
-      }
-      for (const key of AUX_ROW_KEYS) {
-        savedAux[key].provider = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageProvider })
-        );
-        savedAux[key].model = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: AUX_ROWS[key].storageModel })
-        );
-      }
+    for (const tier of TIER_NAMES) {
+      const route = this.managed?.ai.tiers[tier];
+      if (route) savedTierRouting[tier] = { provider: route.provider, model: route.model, effort: route.effort ?? null };
     }
-
-    this.savedPresets = await this.loadSavedPresets();
+    for (const key of AUX_ROW_KEYS) {
+      const ref = this.managed?.ai[key];
+      if (ref) savedAux[key] = { provider: ref.provider, model: ref.model };
+    }
 
     // Populate cache with defaults synchronously so the UI can render now.
     // Live per-provider fetches run lazily (when the user looks at a provider
@@ -2812,22 +2513,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const authParent: AbjectId = await this.sectionCard(cId, 'Authentication',
       'Ask for a username and password whenever a client connects to this desktop. Saving reconnects open clients.', 34);
 
-    // Load saved auth settings
-    let savedAuthEnabled = false;
-    let savedAuthUser = '';
-    let savedAuthPass = '';
-    if (this.storageId) {
-      const enabled = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_ENABLED })
-      );
-      savedAuthEnabled = enabled === 'true';
-      savedAuthUser = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_USER })
-      ) ?? '';
-      savedAuthPass = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_PASS })
-      ) ?? '';
-    }
+    // The login as SettingsManager holds it
+    const savedAuthEnabled = this.managed?.auth.enabled ?? false;
+    const savedAuthUser = this.managed?.auth.username ?? '';
+    const savedAuthPass = this.managed?.auth.password.value ?? '';
 
     // Enable auth checkbox row
     const authEnableRowId = await this.request<AbjectId>(
@@ -3218,80 +2907,73 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
   }
 
-  // ========== TIER PRESETS ==========
+  // ========== CHANGES FROM ELSEWHERE ==========
 
   /**
-   * Built-in starter presets, derived from each provider's description and
-   * live catalog, with no per-provider knowledge here:
-   * - "<Provider> recommended": every tier on Latest where the provider can
-   *   recommend it from its catalog (so it follows new releases), else the
-   *   provider's default model.
-   * - one "<Provider> · <Vendor>" ladder per vendor, for catalogs that
-   *   publish moving aliases (OpenRouter), in alphabetical order.
-   * Each sets the Decision row to Auto: a keyed decision provider when
-   * there is one, else decisions emulated on the Fast tier.
+   * A section changed through SettingsManager. An open window reloads it
+   * and repaints its widgets; this window's own saves come back too and need
+   * nothing. Unsaved edits in the section that changed give way to the saved
+   * values.
    */
-  private builtinPresets(): Array<{ name: string; preset: TierPreset }> {
-    const out: Array<{ name: string; preset: TierPreset }> = [];
-    for (const desc of this.providerDescriptions) {
-      const d = desc.defaultTierModels;
-      if (!d || !d.smart) continue;
-      const catalog = this.providerModelCache.get(desc.id) ?? desc.models;
-      const routing: TierPreset['routing'] = {};
-      for (const tier of TIER_NAMES) {
-        routing[tier] = { provider: desc.id, model: hasTierRules(desc, tier) ? LATEST_MODEL : (d[tier] || d.smart) };
-      }
-      // Vision: the first recommended tier model that takes images, else the
-      // first vision model in the catalog.
-      const recommended = TIER_NAMES.map(t => resolveTier(desc, catalog, t).model);
-      const visionModel = recommended.map(id => catalog.find(m => m.id === id)).find(m => m?.vision === true)
-        ?? catalog.find(m => m.vision === true);
-      out.push({
-        name: `${desc.label} recommended`,
-        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null, fallback: null, decision: null },
-      });
-      for (const ladder of aliasLadders(desc, catalog)) {
-        const ladderRouting: TierPreset['routing'] = {};
-        for (const tier of TIER_NAMES) ladderRouting[tier] = { provider: desc.id, model: ladder.tiers[tier] };
-        out.push({
-          name: `${desc.label} · ${ladder.label}`,
-          preset: { routing: ladderRouting, vision: ladder.vision ? { provider: desc.id, model: ladder.vision } : null, fallback: null, decision: null },
-        });
-      }
+  private async onSettingsChanged(section: string | undefined): Promise<void> {
+    if (!this.windowId || !section) return;
+    const own = this.lastOwnSave;
+    if (own && (own.section === section || section === 'presets') && Date.now() - own.at < 5000) return;
+    if (section === 'presets') {
+      await this.loadPresetList();
+      await this.refreshPresetOptions();
+      return;
     }
-    return out;
+    await this.loadFromManager();
+    switch (section) {
+      case 'ai': await this.showAiSettings(); break;
+      case 'auth': await this.showAuthSettings(); break;
+      default: await this.showPermissionSettings(); break;
+    }
+    await this.setStatus('Settings changed elsewhere; showing the saved values.', this.theme.textDescription);
   }
 
-  /** Dropdown options: user-saved presets first, then the built-ins. */
+  private async showAuthSettings(): Promise<void> {
+    const auth = this.managed?.auth;
+    if (!auth) return;
+    const set = async (id: AbjectId | undefined, payload: Record<string, unknown>): Promise<void> => {
+      if (!id) return;
+      try { await this.request(request(this.id, id, 'update', payload)); } catch { /* widget gone */ }
+    };
+    await set(this.authCheckboxId, { checked: auth.enabled });
+    await set(this.authUserInputId, { text: auth.username });
+    await set(this.authPassInputId, { text: auth.password.value ?? '' });
+    await this.setAuthFieldsDisabled(!auth.enabled);
+  }
+
+  private async showPermissionSettings(): Promise<void> {
+    const set = async (id: AbjectId | undefined, payload: Record<string, unknown>): Promise<void> => {
+      if (!id) return;
+      try { await this.request(request(this.id, id, 'update', payload)); } catch { /* widget gone */ }
+    };
+    for (const [listId, items] of [
+      [this.fsPathListId, this.fsAllowedPaths],
+      [this.shellCmdListId, this.shellAllowedCmds],
+      [this.shellDeniedListId, this.shellDeniedCmds],
+      [this.webDomainListId, this.webAllowedDomains],
+      [this.webDeniedListId, this.webDeniedDomains],
+      [this.webPrivateListId, this.webPrivateHosts],
+    ] as Array<[AbjectId | undefined, string[]]>) {
+      if (listId) { try { await this.updateStringList(listId, items); } catch { /* widget gone */ } }
+    }
+    await this.refreshObjectPermLists();
+    await set(this.fsReadOnlyCheckboxId, { checked: this.fsReadOnly });
+    await set(this.shellEnabledCheckboxId, { checked: this.shellEnabled });
+    await set(this.webEnabledCheckboxId, { checked: this.webEnabled });
+    await set(this.capEnforceSelectId, { selectedIndex: Math.max(0, ['off', 'warn', 'enforce'].indexOf(this.capabilityEnforcement)) });
+  }
+
+  // ========== TIER PRESETS ==========
+
+  /** Dropdown options: saved presets first, then the built-ins (SettingsManager's order). */
   private presetOptionNames(): string[] {
-    const names = [...Object.keys(this.savedPresets).sort(), ...this.builtinPresets().map(b => b.name)];
+    const names = this.presetList.map(p => p.name);
     return names.length > 0 ? names : ['(no presets)'];
-  }
-
-  /** Saved presets win a name collision with a built-in. */
-  private resolvePreset(name: string): TierPreset | undefined {
-    return this.savedPresets[name] ?? this.builtinPresets().find(b => b.name === name)?.preset;
-  }
-
-  private async loadSavedPresets(): Promise<Record<string, TierPreset>> {
-    if (!this.storageId) return {};
-    try {
-      const raw = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_PRESETS })
-      );
-      if (!raw || typeof raw !== 'string') return {};
-      const parsed = JSON.parse(raw) as Record<string, TierPreset>;
-      return parsed && typeof parsed === 'object' ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-
-  private async persistSavedPresets(): Promise<void> {
-    if (!this.storageId) return;
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_TIER_PRESETS, value: JSON.stringify(this.savedPresets),
-    }));
   }
 
   private async refreshPresetOptions(): Promise<void> {
@@ -3303,7 +2985,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     } catch { /* widget gone */ }
   }
 
-  /** Read the tier + vision dropdowns as a preset (current UI state). */
+  /**
+   * Read the tier and single-model dropdowns as a preset: the form as it
+   * stands, before Save. SettingsManager freezes moving models when saving.
+   */
   private async readCurrentTierSelections(): Promise<TierPreset> {
     const routing: TierPreset['routing'] = {};
     for (const tier of TIER_NAMES) {
@@ -3320,13 +3005,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (providerName && modelName && modelName !== '(no models)') {
         const info = this.tierModelList(providerName, tier).find(m => m.name === modelName);
         const effort = this.tierDesiredEfforts[tier];
-        // A saved preset is frozen: "Latest" and moving aliases become the
-        // concrete model they point at today, so the preset never drifts.
-        const desc = this.descById(providerName);
-        const catalog = this.providerModelCache.get(providerName) ?? [];
-        const chosen = info ? info.id : modelName;
-        const model = desc ? freezeModel(desc, catalog, tier, chosen) : chosen;
-        routing[tier] = { provider: providerName, model, ...(effort ? { effort } : {}) };
+        routing[tier] = { provider: providerName, model: info ? info.id : modelName, ...(effort ? { effort } : {}) };
       }
     }
     const vision = await this.readAuxRow('vision');
@@ -3340,12 +3019,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     };
   }
 
-  /**
-   * Point every tier/vision dropdown at the preset's routing, then run the
-   * normal save path (persist + configure + status toast) so applying a
-   * preset behaves exactly like picking the values by hand and hitting Save.
-   */
-  private async applyTierPreset(preset: TierPreset): Promise<void> {
+  /** Point every tier and single-model dropdown at a routing, without saving. */
+  private async showTierSelections(preset: TierPreset): Promise<void> {
     const providerIds = this.providerIds();
     const providerLabels = this.providerLabels();
     for (const tier of TIER_NAMES) {
@@ -3377,7 +3052,29 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       row.desiredModelId = vIdx >= 0 ? (wanted?.model ?? null) : null;
       await this.refreshAuxModelOptions(key);
     }
-    await this.saveSettings();
+  }
+
+  /** Repaint the AI tab from the settings as SettingsManager holds them. */
+  private async showAiSettings(): Promise<void> {
+    const ai = this.managed?.ai;
+    if (!ai || !this.windowId) return;
+    await this.showTierSelections({
+      routing: Object.fromEntries(TIER_NAMES.filter(t => ai.tiers[t]).map(t => [t, ai.tiers[t]!])),
+      vision: ai.vision, fallback: ai.fallback, decision: ai.decision,
+    });
+    if (this.credentialInputId) {
+      const desc = this.descById(this.activeAiProvider);
+      const value = this.credentialValues[this.activeAiProvider]
+        ?? (desc?.credentialMode === 'url' ? (desc.credentialPlaceholder ?? '') : '');
+      try { await this.request(request(this.id, this.credentialInputId, 'update', { text: value })); } catch { /* widget gone */ }
+    }
+    if (this.decisionGatesSelectId) {
+      const idx = Math.max(0, DECISION_GATE_OPTIONS.findIndex(o => o.gates === this.decisionGates));
+      try { await this.request(request(this.id, this.decisionGatesSelectId, 'update', { selectedIndex: idx })); } catch { /* widget gone */ }
+    }
+    if (this.cacheKeepaliveCheckboxId) {
+      try { await this.request(request(this.id, this.cacheKeepaliveCheckboxId, 'update', { checked: this.cacheKeepaliveEnabled })); } catch { /* widget gone */ }
+    }
   }
 
   private async onPresetApply(): Promise<void> {
@@ -3385,12 +3082,24 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const name = await this.request<string>(
       request(this.id, this.presetSelectId, 'getValue', {})
     );
-    const preset = name ? this.resolvePreset(name) : undefined;
-    if (!preset) {
+    if (!name || !this.presetList.some(p => p.name === name)) {
       await this.rejectWith('Pick a preset to apply.', this.theme.statusWarning);
       return;
     }
-    await this.applyTierPreset(preset);
+    await this.setSaveControlsDisabled(true);
+    this.lastOwnSave = { section: 'ai', at: Date.now() };
+    try {
+      await this.request(request(this.id, this.settingsManagerId!, 'applyPreset', { name }), 60_000);
+    } catch (err) {
+      await this.rejectWith(settingsError(err));
+      await this.setSaveControlsDisabled(false);
+      return;
+    }
+    await this.loadFromManager();
+    await this.showAiSettings();
+    this.windowEffect('flash');
+    await this.setStatus(`Preset '${name}' applied.`, this.theme.statusSuccess);
+    await this.setSaveControlsDisabled(false);
   }
 
   private async onPresetSave(): Promise<void> {
@@ -3407,13 +3116,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       await this.rejectWith('Configure at least one tier before saving a preset.', this.theme.statusWarning);
       return;
     }
-    this.savedPresets[name] = preset;
     try {
-      await this.persistSavedPresets();
-    } catch {
-      await this.rejectWith(`Could not save preset '${name}'.`);
+      await this.request(request(this.id, this.settingsManagerId!, 'savePreset', { name, preset }), 60_000);
+    } catch (err) {
+      await this.rejectWith(`Could not save preset '${name}': ${settingsError(err)}`);
       return;
     }
+    await this.loadPresetList();
     await this.refreshPresetOptions();
     this.windowEffect('flash');
     await this.setStatus(`Preset '${name}' saved.`, this.theme.statusSuccess);
@@ -3424,12 +3133,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const name = await this.request<string>(
       request(this.id, this.presetSelectId, 'getValue', {})
     );
-    if (!name || !this.savedPresets[name]) {
+    if (!name || !this.presetList.some(p => p.name === name && !p.builtin)) {
       await this.rejectWith('Only saved presets can be deleted (built-ins stay).', this.theme.statusWarning);
       return;
     }
-    delete this.savedPresets[name];
-    await this.persistSavedPresets();
+    try {
+      await this.request(request(this.id, this.settingsManagerId!, 'deletePreset', { name }));
+    } catch (err) {
+      await this.rejectWith(settingsError(err));
+      return;
+    }
+    await this.loadPresetList();
     await this.refreshPresetOptions();
     await this.setStatus(`Preset '${name}' deleted.`, this.theme.statusSuccess);
   }
@@ -3673,15 +3387,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const isCli = desc.credentialMode === 'cli';
     const isUrl = desc.credentialMode === 'url';
     let newValue = this.credentialValues[newProvider];
-    if (!newValue && this.storageId && desc.storageSuffix) {
-      const key = `${STORAGE_PREFIX}${desc.storageSuffix}`;
-      const val = await this.request<string | null>(request(this.id, this.storageId, 'get', { key }));
-      // The dropdown may have moved again while the storage read was in
-      // flight; caching is still fine, but stop before painting stale widgets.
-      if (val) this.credentialValues[newProvider] = val;
-      if (this.activeAiProvider !== newProvider) return;
-      if (val) newValue = val;
-    }
     if (!newValue) newValue = isUrl ? (desc.credentialPlaceholder ?? '') : '';
 
     // Reset masking state for the input
@@ -3722,11 +3427,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
 
     // Preselect the provider's default preset so applying it is one click.
-    // Deliberately NOT auto-applied: applyTierPreset ends in saveSettings(),
-    // so applying here would silently overwrite and persist the user's custom
-    // tier routing every time they browse the provider dropdown.
+    // Deliberately NOT auto-applied: applying saves, so it would silently
+    // overwrite the user's custom tier routing every time they browse the
+    // provider dropdown.
     const presetName = `${desc.label} recommended`;
-    if (this.resolvePreset(presetName) && this.presetSelectId) {
+    if (this.presetList.some(p => p.name === presetName) && this.presetSelectId) {
       const options = this.presetOptionNames();
       const pIdx = options.indexOf(presetName);
       if (pIdx >= 0) {
@@ -4254,34 +3959,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   /**
-   * Load saved auth config from Storage and apply to BackendUI.
-   * Called once during onInit so Storage-based settings override env vars.
-   */
-  private async applySavedAuthConfig(): Promise<void> {
-    if (!this.storageId || !this.uiServerId) return;
-
-    const enabledStr = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_ENABLED })
-    );
-    // Only override if settings have been explicitly saved
-    if (enabledStr === null) return;
-
-    const enabled = enabledStr === 'true';
-    const username = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_USER })
-    ) ?? '';
-    const password = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_PASS })
-    ) ?? '';
-
-    await this.request(
-      request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
-    );
-    log.info(`Applied saved auth config (enabled=${enabled})`);
-  }
-
-  /**
-   * Read auth widget values, save to storage, and apply to BackendUI.
+   * Read the auth widgets and save them through SettingsManager, which
+   * persists them and applies them (signing every client out).
    */
   private async saveAuthSettings(): Promise<void> {
     if (!this.windowId) return;
@@ -4295,40 +3974,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const password = await this.request<string>(
       request(this.id, this.authPassInputId!, 'getValue', {})
     );
-
     const enabled = !!checked;
 
-    if (enabled && (!username || !password)) {
-      await this.rejectWith('Username and password are required.');
+    const error = await this.saveSection('auth', { enabled, username: username ?? '', password: password ?? '' });
+    if (error) {
+      await this.rejectWith(error);
       return;
     }
-
-    try {
-      // Persist to storage
-      if (this.storageId) {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_ENABLED, value: String(enabled) })
-        );
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_USER, value: username })
-        );
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_PASS, value: password })
-        );
-      }
-
-      // Apply to BackendUI (updates config, clears sessions, disconnects frontend)
-      if (this.uiServerId) {
-        await this.request(
-          request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
-        );
-      }
-    } catch (err) {
-      log.warn('Failed to save auth settings:', err);
-      await this.rejectWith('Could not save auth settings.');
-      return;
-    }
-
     log.info(`Auth settings saved (enabled=${enabled})`);
     this.windowEffect('flash');
     await this.setStatus(enabled ? 'Auth enabled. Reconnecting...' : 'Auth disabled.');
@@ -4340,62 +3992,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async buildPermissionsTab(): Promise<void> {
     const cId = this.permissionsContainerId!;
 
-    // Load saved permission values
-    if (this.storageId) {
-      const fsPathsJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_ALLOWED_PATHS })
-      );
-      if (fsPathsJson) { try { this.fsAllowedPaths = JSON.parse(fsPathsJson); } catch { /* ignore */ } }
-
-      const fsRo = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_READ_ONLY })
-      );
-      if (fsRo !== null) this.fsReadOnly = fsRo === 'true';
-
-      const shellEn = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ENABLED })
-      );
-      if (shellEn !== null) this.shellEnabled = shellEn === 'true';
-
-      const shellAllowJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ALLOWED_CMDS })
-      );
-      if (shellAllowJson) { try { this.shellAllowedCmds = JSON.parse(shellAllowJson); } catch { /* ignore */ } }
-
-      const shellDenyJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_DENIED_CMDS })
-      );
-      if (shellDenyJson) { try { this.shellDeniedCmds = JSON.parse(shellDenyJson); } catch { /* ignore */ } }
-
-      const webEn = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ENABLED })
-      );
-      if (webEn !== null) this.webEnabled = webEn === 'true';
-
-      const webAllowJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ALLOWED_DOMAINS })
-      );
-      if (webAllowJson) { try { this.webAllowedDomains = JSON.parse(webAllowJson); } catch { /* ignore */ } }
-
-      const webDenyJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
-      );
-      if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
-
-      const webPrivateJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_PRIVATE_HOSTS })
-      );
-      if (webPrivateJson) { try { this.webPrivateHosts = JSON.parse(webPrivateJson); } catch { /* ignore */ } }
-
-      const capMode = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CAP_ENFORCEMENT })
-      );
-      if (capMode === 'off' || capMode === 'warn' || capMode === 'enforce') {
-        this.capabilityEnforcement = capMode;
-        // Re-announce so a wired interceptor picks up the persisted mode.
-        this.changed('capabilityEnforcementChanged', capMode);
-      }
-    }
+    // Permission values were loaded from SettingsManager when the window opened.
 
     // Platform info (shown inside the Shell card)
     let platformText = 'Platform: unknown';
@@ -4486,6 +4083,20 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const shellCard = await this.sectionCard(cId, 'Shell',
       'Which shell commands agents may run. Commands not on the allowed list prompt you for approval; denied commands are always refused.', 34, true);
 
+    // Four lists outgrow the card on any window, so the card's body scrolls
+    // (as the Web card's does): the description stays put, the rest moves.
+    const shellBody = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: shellCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, shellCard, 'addLayoutChild', {
+      widgetId: shellBody,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     const { widgetIds: [platLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: platformText,
@@ -4493,7 +4104,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ]})
     );
     this.platformLabelId = platLabelId;
-    await this.request(request(this.id, shellCard, 'addLayoutChild', {
+    await this.request(request(this.id, shellBody, 'addLayoutChild', {
       widgetId: this.platformLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 16 },
@@ -4506,21 +4117,21 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
     this.shellEnabledCheckboxId = shellEnCheckId;
     await this.request(request(this.id, this.shellEnabledCheckboxId, 'addDependent', {}));
-    await this.request(request(this.id, shellCard, 'addLayoutChild', {
+    await this.request(request(this.id, shellBody, 'addLayoutChild', {
       widgetId: this.shellEnabledCheckboxId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
     }));
 
     {
-      const ed = await this.stringListEditor(shellCard, 'Allowed commands', 'e.g. git, ls, npm', this.shellAllowedCmds);
+      const ed = await this.stringListEditor(shellBody, 'Allowed commands', 'e.g. git, ls, npm', this.shellAllowedCmds, true);
       this.shellCmdInputId = ed.inputId;
       this.shellAddBtnId = ed.addBtnId;
       this.shellCmdListId = ed.listId;
       this.shellRemoveBtnId = ed.removeBtnId;
     }
     {
-      const ed = await this.stringListEditor(shellCard, 'Denied commands (always refused)', 'e.g. rm, sudo', this.shellDeniedCmds);
+      const ed = await this.stringListEditor(shellBody, 'Denied commands (always refused)', 'e.g. rm, sudo', this.shellDeniedCmds, true);
       this.shellDeniedInputId = ed.inputId;
       this.shellDeniedAddBtnId = ed.addBtnId;
       this.shellDeniedListId = ed.listId;
@@ -4528,10 +4139,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     {
       const ed = await this.stringListEditor(
-        shellCard,
+        shellBody,
         'Per-object allowed (object runs it with any arguments)',
         'e.g. TmuxSession: tmux',
         this.objectPermEntries('allow'),
+        true,
       );
       this.objectPermInputId = ed.inputId;
       this.objectPermAddBtnId = ed.addBtnId;
@@ -4540,10 +4152,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     {
       const ed = await this.stringListEditor(
-        shellCard,
+        shellBody,
         'Per-object blocked (refused before any allow list)',
         'e.g. TmuxSession: rm',
         this.objectPermEntries('deny'),
+        true,
       );
       this.objectDenyInputId = ed.inputId;
       this.objectDenyAddBtnId = ed.addBtnId;
@@ -4795,60 +4408,29 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   /**
-   * Persist permission state to Storage and propagate to target objects.
+   * Save the permission forms through SettingsManager, which persists them
+   * and pushes them to the capability objects.
    */
   private async savePermissions(): Promise<void> {
-    if (!this.storageId) return;
-
-    try {
-      await this.persistAndPropagatePermissions();
-    } catch (err) {
-      log.warn('Failed to save permissions:', err);
-      await this.rejectWith('Could not save permissions.');
-      return;
+    const sections: Array<[SettingsSectionId, Record<string, unknown>]> = [
+      ['filesystem', { allowedPaths: this.fsAllowedPaths, readOnly: this.fsReadOnly }],
+      ['shell', {
+        enabled: this.shellEnabled, allowedCommands: this.shellAllowedCmds, deniedCommands: this.shellDeniedCmds,
+        objectRules: Object.fromEntries(this.objectPermissions),
+      }],
+      ['web', { enabled: this.webEnabled, allowedDomains: this.webAllowedDomains, deniedDomains: this.webDeniedDomains, privateHosts: this.webPrivateHosts }],
+      ['objects', { capabilityEnforcement: this.capabilityEnforcement }],
+    ];
+    for (const [section, values] of sections) {
+      const error = await this.saveSection(section, values);
+      if (error) {
+        await this.rejectWith(`Could not save permissions: ${error}`);
+        return;
+      }
     }
-    log.info('Permissions saved and propagated');
+    log.info('Permissions saved');
     this.windowEffect('flash');
     await this.setStatus('Permissions saved!');
-  }
-
-  /** Write every permission setting to Storage and push it to the capabilities. */
-  private async persistAndPropagatePermissions(): Promise<void> {
-    if (!this.storageId) return;
-
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_FS_ALLOWED_PATHS, value: JSON.stringify(this.fsAllowedPaths),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_FS_READ_ONLY, value: String(this.fsReadOnly),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_SHELL_ENABLED, value: String(this.shellEnabled),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_SHELL_ALLOWED_CMDS, value: JSON.stringify(this.shellAllowedCmds),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_SHELL_DENIED_CMDS, value: JSON.stringify(this.shellDeniedCmds),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_WEB_ENABLED, value: String(this.webEnabled),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_WEB_ALLOWED_DOMAINS, value: JSON.stringify(this.webAllowedDomains),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_WEB_DENIED_DOMAINS, value: JSON.stringify(this.webDeniedDomains),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_WEB_PRIVATE_HOSTS, value: JSON.stringify(this.webPrivateHosts),
-    }));
-    await this.request(request(this.id, this.storageId, 'set', {
-      key: STORAGE_KEY_CAP_ENFORCEMENT, value: this.capabilityEnforcement,
-    }));
-
-    await this.saveObjectPermissions();
-    await this.propagatePermissions();
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -5186,14 +4768,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async setObjectCommandRule(
     objectName: string, commandName: string, rule: 'allow' | 'deny',
   ): Promise<void> {
+    this.lastOwnSave = { section: 'shell', at: Date.now() };
+    try {
+      await this.request(request(this.id, this.settingsManagerId!, 'setObjectCommandRule', { objectName, commandName, rule }));
+    } catch (err) {
+      log.warn(`Could not record the ${rule} rule for ${objectName}: ${settingsError(err)}`);
+      return;
+    }
+    // Keep an open form in step, leaving its other unsaved edits alone.
     const record = this.objectPermissions.get(objectName) ?? { allow: [], deny: [] };
-    const [into, outOf] = rule === 'allow'
-      ? ['allow', 'deny'] as const
-      : ['deny', 'allow'] as const;
+    const [into, outOf] = rule === 'allow' ? ['allow', 'deny'] as const : ['deny', 'allow'] as const;
     if (!record[into].includes(commandName)) record[into].push(commandName);
     record[outOf] = record[outOf].filter((c) => c !== commandName);
     this.objectPermissions.set(objectName, record);
-    await this.saveObjectPermissions();
     await this.refreshObjectPermLists();
   }
 
@@ -5227,7 +4814,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     record[kind] = record[kind].filter((c) => c !== parsed.commandName);
     if (record.allow.length === 0 && record.deny.length === 0) {
       this.objectPermissions.delete(parsed.objectName);
-      this.staleObjectPermNames.add(parsed.objectName);
     }
     await this.updateStringList(listId, this.objectPermEntries(kind));
   }
@@ -5253,80 +4839,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     return entries.sort();
   }
-
-  /** Persist every per-object rule and push the whole set to ShellExecutor. */
-  private async saveObjectPermissions(): Promise<void> {
-    const names = Array.from(this.objectPermissions.keys());
-    // A dropped name keeps its storage key and its live rules inside
-    // ShellExecutor, so both are overwritten with empty lists.
-    const revoked = Array.from(this.staleObjectPermNames)
-      .filter((name) => !this.objectPermissions.has(name));
-    this.staleObjectPermNames.clear();
-
-    if (this.storageId) {
-      try {
-        for (const [objectName, record] of this.objectPermissions) {
-          await this.request(request(this.id, this.storageId, 'set', {
-            key: objectPermKey(objectName), value: JSON.stringify(record),
-          }));
-        }
-        for (const stale of revoked) {
-          await this.request(request(this.id, this.storageId, 'set', {
-            key: objectPermKey(stale), value: JSON.stringify({ allow: [], deny: [] }),
-          }));
-        }
-        await this.request(request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_OBJECT_PERM_NAMES, value: JSON.stringify(names),
-        }));
-      } catch (e) { log.warn('Failed to persist object permissions', e); }
-    }
-
-    const updates: Array<[string, ObjectCommandRules]> = [
-      ...this.objectPermissions.entries(),
-      ...revoked.map((name) => [name, { allow: [], deny: [] }] as [string, ObjectCommandRules]),
-    ];
-    for (const [objectName, record] of updates) {
-      try {
-        await this.applyCapability('ShellExecutor', 'updateObjectPermissions', {
-          objectName, allowedCommands: record.allow, deniedCommands: record.deny,
-        });
-      } catch (e) { log.warn(`Failed to propagate object permissions for ${objectName}`, e); }
-    }
-  }
-
-  /** Names whose rules were dropped this session, pending a storage rewrite. */
-  private staleObjectPermNames: Set<string> = new Set();
-
-  /** Read persisted per-object rules and hand them to ShellExecutor. */
-  private async loadObjectPermissions(): Promise<void> {
-    if (!this.storageId) return;
-    const namesJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OBJECT_PERM_NAMES })
-    );
-    if (!namesJson) return;
-
-    let names: string[];
-    try { names = JSON.parse(namesJson); } catch { return; }
-
-    for (const objectName of names) {
-      const recordJson = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: objectPermKey(objectName) })
-      );
-      if (!recordJson) continue;
-      let record: ObjectCommandRules;
-      try { record = parseObjectRules(recordJson); } catch { continue; }
-      if (record.allow.length === 0 && record.deny.length === 0) continue;
-      this.objectPermissions.set(objectName, record);
-      try {
-        await this.applyCapability('ShellExecutor', 'updateObjectPermissions', {
-          objectName, allowedCommands: record.allow, deniedCommands: record.deny,
-        });
-      } catch (e) { log.warn(`Failed to restore object permissions for ${objectName}`, e); }
-    }
-  }
-
-  /** Per-skill allowed commands (persisted). */
-  private skillPermissions: Map<string, string[]> = new Map();
 
   private async showSkillPermissionPrompt(
     skillName: string,
@@ -5427,33 +4939,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         stopBeating();
       }
 
-      // Persist if allowed
+      // Allowed: SettingsManager records the grant and applies it.
       if (decision === 'accept_always' || decision === 'accept') {
-        const existing = this.skillPermissions.get(skillName) ?? [];
-        if (!existing.includes(cmdName)) existing.push(cmdName);
-        this.skillPermissions.set(skillName, existing);
-
-        // Persist skill permissions + skill names index
-        if (this.storageId) {
-          try {
-            await this.request(request(this.id, this.storageId, 'set', {
-              key: `global-settings:skillPerms:${skillName}`,
-              value: JSON.stringify(existing),
-            }));
-            const allNames = Array.from(this.skillPermissions.keys());
-            await this.request(request(this.id, this.storageId, 'set', {
-              key: 'global-settings:skillPermNames',
-              value: JSON.stringify(allNames),
-            }));
-          } catch { /* best effort */ }
-        }
-
+        this.lastOwnSave = { section: 'shell', at: Date.now() };
         try {
-          await this.applyCapability('ShellExecutor', 'updateSkillPermissions', {
-            skillName, allowedCommands: existing,
-          });
-        } catch { /* best effort */ }
-
+          await this.request(request(this.id, this.settingsManagerId!, 'addSkillGrant', { skillName, command: cmdName }));
+        } catch (err) {
+          log.warn(`Could not record the grant for ${skillName}: ${settingsError(err)}`);
+        }
         return { decision: 'accept' };
       }
 
@@ -5521,200 +5014,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.refreshAutonomyStatus();
   }
 
-  /** Whether we've registered as the settings authority with the broker. */
-  private authorityClaimed = false;
-  private permissionBrokerId?: AbjectId;
-
-  /**
-   * Register with PermissionBroker as the object allowed to push capability
-   * settings.
-   *
-   * The broker holds the permissions authority on the capability objects
-   * themselves, because policy lives there: it knows which project a command
-   * runs in and how reachable the calling workspace is, and this window knows
-   * neither. Settings changes made here are forwarded through it.
-   */
-  private async claimAuthority(): Promise<void> {
-    if (this.authorityClaimed) return;
-    this.authorityClaimed = true;
-
-    this.permissionBrokerId = await this.discoverDep('PermissionBroker') ?? undefined;
-    if (this.permissionBrokerId) {
-      try {
-        await this.request(request(this.id, this.permissionBrokerId, 'setSettingsAuthority', {}));
-      } catch { /* may already be claimed on restart */ }
-      return;
-    }
-
-    // No broker (a stripped bootstrap): fall back to talking to the capability
-    // objects directly, so permissions still apply.
-    log.warn('PermissionBroker not found; claiming capability authority directly');
-    for (const name of ['HostFileSystem', 'ShellExecutor', 'HttpClient', 'StreamClient']) {
-      const id = await this.discoverDep(name);
-      if (!id) continue;
-      try {
-        await this.request(request(this.id, id, 'setPermissionsAuthority', {}));
-      } catch { /* may already be claimed on restart */ }
-    }
-  }
-
-  /**
-   * Apply a permission change to a capability object, through the broker when
-   * one is present.
-   */
-  private async applyCapability(
-    capability: string, method: string, payload: Record<string, unknown>,
-  ): Promise<void> {
-    await this.claimAuthority();
-    if (this.permissionBrokerId) {
-      await this.request(request(this.id, this.permissionBrokerId, 'applyToCapability', {
-        capability, method, payload,
-      }));
-      return;
-    }
-    const id = await this.discoverDep(capability);
-    if (id) await this.request(request(this.id, id, method, payload));
-  }
-
-  private async propagatePermissions(): Promise<void> {
-    await this.claimAuthority();
-
-    const push = async (capability: string, payload: Record<string, unknown>) => {
-      try {
-        await this.applyCapability(capability, 'updatePermissions', payload);
-      } catch (e) { log.warn(`Failed to propagate ${capability} permissions`, e); }
-    };
-
-    await push('HostFileSystem', { allowedPaths: this.fsAllowedPaths, readOnly: this.fsReadOnly });
-    await push('ShellExecutor', {
-      enabled: this.shellEnabled,
-      allowedCommands: this.shellAllowedCmds,
-      deniedCommands: this.shellDeniedCmds,
-    });
-    // Streaming permissions follow the web settings: streams are web access
-    // held open, so one switch and one domain list govern both.
-    for (const capability of ['HttpClient', 'StreamClient']) {
-      await push(capability, {
-        enabled: this.webEnabled,
-        allowedDomains: this.webAllowedDomains,
-        deniedDomains: this.webDeniedDomains,
-        privateHosts: this.webPrivateHosts,
-      });
-    }
-
-    // Capability enforcement mode: announced as an event; the bootstrap wires
-    // the bus interceptor as a dependent and applies the mode on each change.
-    this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
-  }
-
-  /**
-   * Load saved permissions from Storage and propagate to target objects.
-   * Called once during onInit so persisted permissions are applied on boot.
-   */
-  private async applySavedPermissions(): Promise<void> {
-    if (!this.storageId) return;
-
-    // Check if any permission keys have been saved
-    const fsRo = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_READ_ONLY })
-    );
-    const shellEn = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ENABLED })
-    );
-    const webEn = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ENABLED })
-    );
-
-    // Always claim authority, even if no permissions saved yet
-    await this.claimAuthority();
-
-    // Per-object grants load ahead of the "nothing saved" early return below:
-    // they are written on their own, without the rest of the permission set.
-    await this.loadObjectPermissions();
-
-    // Capability enforcement mode loads independently of the permission keys
-    // so the interceptor hears the persisted (or default) mode at boot.
-    const capMode = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CAP_ENFORCEMENT })
-    );
-    if (capMode === 'off' || capMode === 'warn' || capMode === 'enforce') {
-      this.capabilityEnforcement = capMode;
-    }
-
-    // Only propagate saved values if at least one permission key was explicitly saved
-    if (fsRo === null && shellEn === null && webEn === null) {
-      this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
-      return;
-    }
-
-    // Load all values
-    if (fsRo !== null) this.fsReadOnly = fsRo === 'true';
-    if (shellEn !== null) this.shellEnabled = shellEn === 'true';
-    if (webEn !== null) this.webEnabled = webEn === 'true';
-
-    const fsPathsJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_ALLOWED_PATHS })
-    );
-    if (fsPathsJson) { try { this.fsAllowedPaths = JSON.parse(fsPathsJson); } catch { /* ignore */ } }
-
-    const shellAllowJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ALLOWED_CMDS })
-    );
-    if (shellAllowJson) { try { this.shellAllowedCmds = JSON.parse(shellAllowJson); } catch { /* ignore */ } }
-
-    const shellDenyJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_DENIED_CMDS })
-    );
-    if (shellDenyJson) { try { this.shellDeniedCmds = JSON.parse(shellDenyJson); } catch { /* ignore */ } }
-
-    const webAllowJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ALLOWED_DOMAINS })
-    );
-    if (webAllowJson) { try { this.webAllowedDomains = JSON.parse(webAllowJson); } catch { /* ignore */ } }
-
-    const webDenyJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
-    );
-    if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
-
-    const webPrivateJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_PRIVATE_HOSTS })
-    );
-    if (webPrivateJson) { try { this.webPrivateHosts = JSON.parse(webPrivateJson); } catch { /* ignore */ } }
-
-    await this.propagatePermissions();
-
-    // Load per-skill permissions
-    const skillNamesJson = await this.request<string | null>(
-      request(this.id, this.storageId, 'get', { key: 'global-settings:skillPermNames' })
-    );
-    if (skillNamesJson) {
-      try {
-        const skillNames: string[] = JSON.parse(skillNamesJson);
-        for (const name of skillNames) {
-          const permsJson = await this.request<string | null>(
-            request(this.id, this.storageId, 'get', { key: `global-settings:skillPerms:${name}` })
-          );
-          if (permsJson) {
-            try {
-              const cmds: string[] = JSON.parse(permsJson);
-              this.skillPermissions.set(name, cmds);
-              await this.applyCapability('ShellExecutor', 'updateSkillPermissions', {
-                skillName: name, allowedCommands: cmds,
-              });
-            } catch { /* ignore parse errors */ }
-          }
-        }
-      } catch { /* ignore */ }
-    }
-
-    log.info('Applied saved permissions');
-  }
-
   // ========== API KEYS ACTIONS ==========
 
   /**
-   * Read widget values for the selected provider, save to global storage, and configure LLM.
+   * Read the AI tab's form and save it through SettingsManager, which
+   * validates it (a tier configured, a key for every provider that needs
+   * one), persists it and configures the LLM.
    */
   private async saveSettings(): Promise<void> {
     if (!this.windowId) return;
@@ -5729,153 +5034,58 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.credentialValues[this.activeAiProvider] = currentValue ?? '';
     }
 
-    // Default Ollama URL if empty
-    if (!this.credentialValues.ollama) {
-      this.credentialValues.ollama = 'http://localhost:11434';
-    }
-
     // Read per-tier provider + model selections
-    const tierRouting: Record<ModelTierName, TierRoutingRow> = {
-      smart: { provider: null, model: null },
-      balanced: { provider: null, model: null },
-      fast: { provider: null, model: null },
-      code: { provider: null, model: null },
-    };
-
+    const tiers: Record<string, { provider: string; model: string; effort?: string } | null> = {};
     for (const tier of TIER_NAMES) {
       const providerSelectId = this.tierProviderSelectIds[tier];
       const modelSelectId = this.tierModelSelectIds[tier];
       if (!providerSelectId || !modelSelectId) continue;
-
       const providerLabel = await this.request<string>(
         request(this.id, providerSelectId, 'getValue', {})
       );
       const providerName = this.idForLabel(providerLabel) ?? null;
-
       const modelName = await this.request<string>(
         request(this.id, modelSelectId, 'getValue', {})
       );
-
       if (providerName && modelName && modelName !== '(no models)') {
-        const modelList = this.tierModelList(providerName, tier);
-        const modelInfo = modelList.find(m => m.name === modelName);
-        tierRouting[tier] = {
-          provider: providerName,
-          model: modelInfo ? modelInfo.id : modelName,
-          effort: this.tierDesiredEfforts[tier],
-        };
-        this.tierDesiredModelIds[tier] = tierRouting[tier].model;
+        const modelInfo = this.tierModelList(providerName, tier).find(m => m.name === modelName);
+        const model = modelInfo ? modelInfo.id : modelName;
+        const effort = this.tierDesiredEfforts[tier];
+        tiers[tier] = { provider: providerName, model, ...(effort ? { effort } : {}) };
+        this.tierDesiredModelIds[tier] = model;
+      } else {
+        tiers[tier] = null;
       }
     }
 
-    // Read the optional aux rows (vision substitute, tier fallback)
-    const aux = emptyAuxModels();
-    for (const key of AUX_ROW_KEYS) aux[key] = await this.readAuxRow(key);
-
-    // Validate: at least one tier must have a valid config
-    const hasAnyTier = TIER_NAMES.some(t => tierRouting[t].provider && tierRouting[t].model);
-    if (!hasAnyTier) {
-      await this.rejectWith('Configure at least one model tier.');
-      await this.setSaveControlsDisabled(false);
-      return;
-    }
-
-    // Validate: each tier's provider must have credentials. URL-only
-    // (e.g. Ollama) and CLI providers manage their own auth — neither
-    // needs an API key.
-    for (const tier of TIER_NAMES) {
-      const { provider } = tierRouting[tier];
-      if (!provider) continue;
-      const desc = this.descById(provider);
-      if (!desc) continue;
-      if (desc.credentialMode === 'cli' || desc.credentialMode === 'url' || desc.credentialMode === 'none') continue;
-      if (!this.credentialValues[provider] && this.storageId && desc.storageSuffix) {
-        const key = `${STORAGE_PREFIX}${desc.storageSuffix}`;
-        const val = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key })
-        );
-        if (val) {
-          this.credentialValues[provider] = val;
-        }
-      }
-      if (!this.credentialValues[provider]) {
-        const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
-        await this.rejectWith(`${tierLabel} tier uses ${desc.label} but no API key provided.`);
-        await this.setSaveControlsDisabled(false);
-        return;
-      }
-    }
-
-    // Same credential check for each aux row's provider
+    // Read the optional single-model rows (vision substitute, tier fallback, decision)
+    const aux: Record<string, { provider: string; model: string } | null> = {};
     for (const key of AUX_ROW_KEYS) {
-      const provider = aux[key].provider;
-      if (!provider) continue;
-      const desc = this.descById(provider);
-      if (desc && desc.credentialMode === 'apiKey' && !this.credentialValues[provider]) {
-        await this.rejectWith(`${AUX_ROWS[key].toastName} uses ${desc.label} but no API key provided.`);
-        await this.setSaveControlsDisabled(false);
-        return;
-      }
+      const { provider, model } = await this.readAuxRow(key);
+      aux[key] = provider && model ? { provider, model } : null;
     }
 
-    // Persist and apply. A failure here re-enables the controls and says so,
-    // rather than leaving the form disabled with no word.
-    try {
-      // Persist credentials to storage. Per-provider keys derived from
-      // each description's storageSuffix; CLI providers contribute nothing
-      // (their auth lives in the binary).
-      if (this.storageId) {
-        for (const desc of this.providerDescriptions) {
-          if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
-          const value = this.credentialValues[desc.id];
-          if (value) {
-            await this.request(
-              request(this.id, this.storageId, 'set', { key: storageKeyFor(desc.storageSuffix), value })
-            );
-          }
-        }
-        await this.request(
-          request(this.id, this.storageId, 'set', {
-            key: STORAGE_KEY_AI_ACTIVE_PROVIDER,
-            value: this.activeAiProvider,
-          })
-        );
+    // Every credential the form holds, CLI providers excepted (their auth lives in the binary).
+    const credentials: Record<string, string | null> = {};
+    for (const desc of this.providerDescriptions) {
+      if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
+      if (this.credentialValues[desc.id] !== undefined) credentials[desc.id] = this.credentialValues[desc.id] || null;
+    }
 
-        // Persist tier routing
-        await this.persistTierRouting(tierRouting);
-
-        // Persist each aux row ('None' clears the saved keys)
-        for (const key of AUX_ROW_KEYS) {
-          const { provider, model } = aux[key];
-          const { storageProvider, storageModel } = AUX_ROWS[key];
-          if (provider && model) {
-            await this.request(request(this.id, this.storageId, 'set', { key: storageProvider, value: provider }));
-            await this.request(request(this.id, this.storageId, 'set', { key: storageModel, value: model }));
-          } else {
-            try {
-              await this.request(request(this.id, this.storageId, 'delete', { key: storageProvider }));
-              await this.request(request(this.id, this.storageId, 'delete', { key: storageModel }));
-            } catch { /* nothing saved yet */ }
-          }
-        }
-
-        // Persist the cache-keepalive opt-in
-        await this.request(request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_CACHE_KEEPALIVE, value: this.cacheKeepaliveEnabled,
-        }));
-        await this.request(request(this.id, this.storageId, 'set', {
-          key: STORAGE_KEY_DECISION_GATES, value: this.decisionGates,
-        }));
-      }
-
-      // Configure all providers, tier routing, and the aux rows
-      await this.configureProviders(this.credentialValues, tierRouting, aux);
-    } catch (err) {
-      log.warn('Failed to save provider settings:', err);
-      await this.rejectWith(`Could not save settings: ${err instanceof Error ? err.message.slice(0, 80) : String(err)}`);
+    const error = await this.saveSection('ai', {
+      credentials, tiers, ...aux,
+      decisionGates: this.decisionGates,
+      cacheKeepalive: this.cacheKeepaliveEnabled,
+    });
+    if (error) {
+      await this.rejectWith(error);
       await this.setSaveControlsDisabled(false);
       return;
     }
+    // The window's own view state: which provider's panel was open.
+    try {
+      await this.request(request(this.id, this.storageId!, 'set', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER, value: this.activeAiProvider }));
+    } catch { /* a view preference */ }
 
     log.info('Saved provider settings with per-tier routing');
     // Keys saved, providers configured: the window lights up.
@@ -5888,13 +5098,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // that provider, so the UI never blocks on a slow API.
     this.fetchedLiveModels.clear();
     const prefetch = new Set<LLMProviderName>([this.activeAiProvider]);
-    for (const tier of TIER_NAMES) {
-      const p = tierRouting[tier].provider;
-      if (p && this.providerDescById.has(p)) prefetch.add(p);
-    }
-    for (const key of AUX_ROW_KEYS) {
-      const p = aux[key].provider;
-      if (p && this.providerDescById.has(p)) prefetch.add(p);
+    for (const route of [...Object.values(tiers), ...Object.values(aux)]) {
+      if (route && this.providerDescById.has(route.provider)) prefetch.add(route.provider);
     }
     for (const p of prefetch) {
       void this.refreshProviderModels(p, { force: true });

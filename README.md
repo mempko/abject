@@ -159,6 +159,24 @@ or arrows (switch tab), `1`-`9` (jump), `x` (close tab), `w` (list),
 rebind. Every action also exists as a slash command (`/help` lists them),
 and `--plain` gives a line-oriented REPL for pipes and dumb terminals.
 
+Settings work from the terminal too. `/settings` opens every setting the
+Settings window has (AI keys and tiers, login, filesystem, shell, web,
+capability checks) plus the current workspace's (name, access, web
+exposure, theme): arrow to one, press Enter, type the new value. Keys and
+passwords are hidden as you type and never shown again. The same changes
+are one-liners for scripts and `--plain`:
+
+```
+/get shell                          /set shell.enabled off
+/set ai.credentials.anthropic sk-…  /set ai.tiers.smart anthropic claude-sonnet-4-5
+/add web.allowedDomains example.com /wset appearance.theme agitprop
+/preset apply OpenAI recommended    /skill enable <name>      /update check
+```
+
+Changes go through the same Abject that serves the Settings window, so the
+window repaints when the terminal changes something and the other way
+round.
+
 `commune` is a companion, not a standalone: it requires a running Abject
 desktop app (or `pnpm awaken` backend) on the same machine, and speaks
 only to it. If the app has password protection enabled, `commune` prompts

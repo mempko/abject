@@ -446,15 +446,6 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'number' },
               },
               {
-                name: 'setObjectWorkspace',
-                description: 'Associate an object with a workspace. All surfaces owned by this object will be tagged with the workspace ID for compositor-level filtering.',
-                parameters: [
-                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to tag' },
-                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'The workspace ID' },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
                 name: 'getObjectWorkspace',
                 description: 'Get the workspace ID associated with an object, or null if not tagged.',
                 parameters: [
@@ -1226,8 +1217,14 @@ export class WidgetManager extends Abject {
       return true;
     });
 
+    // Workspace plumbing, deliberately left out of the manifest: the objects
+    // that build workspaces (WorkspaceManager, each workspace's AbjectStore and
+    // ChatManager) place objects with it. See admitWorkspacePlacement.
     this.on('setObjectWorkspace', async (msg: AbjectMessage) => {
       const { objectId, workspaceId } = msg.payload as { objectId: AbjectId; workspaceId: string };
+      require(typeof objectId === 'string' && objectId !== '', 'setObjectWorkspace: objectId must be a non-empty string');
+      require(typeof workspaceId === 'string' && workspaceId !== '', 'setObjectWorkspace: workspaceId must be a non-empty string');
+      await this.admitWorkspacePlacement(msg.routing.from, objectId, workspaceId);
       this.objectWorkspaces.set(objectId, workspaceId);
       // Retroactively tag any existing windows owned by this object
       let ownsWindows = false;
@@ -1244,6 +1241,7 @@ export class WidgetManager extends Abject {
       // them onto their workspace's theme if it is already known.
       const wsTheme = this.workspaceThemes.get(workspaceId)?.theme;
       if (ownsWindows && wsTheme) this.propagateWorkspaceTheme(workspaceId, wsTheme);
+      return true;
     });
 
     this.on('registerWorkspaceTheme', async (msg: AbjectMessage) => {
@@ -1986,6 +1984,35 @@ export class WidgetManager extends Abject {
       ? this.workspaceThemes.get(this.activeWorkspaceId)
       : undefined;
     return entry?.theme ?? this.defaultTheme;
+  }
+
+  /**
+   * Who may place an object in a workspace. An object stays in the workspace
+   * it was created in: WorkspaceManager places anything, and any other caller
+   * only puts a new (untagged) object into its OWN workspace, or confirms one
+   * already there. That covers every builder (an AbjectStore saving or
+   * restoring its objects, a ChatManager opening a chat) and refuses a move
+   * across workspaces, which an agent once made to bring a window it was
+   * screenshotting onto the screen the user had switched to.
+   *
+   * Decided from what this object already knows, with no lookups: the
+   * callers above run while workspaces boot, when asking WorkspaceManager who
+   * is calling could deadlock against the boot that is waiting on them.
+   */
+  private async admitWorkspacePlacement(caller: AbjectId, objectId: AbjectId, workspaceId: string): Promise<void> {
+    if (caller === this.workspaceManagerId) return;
+    if (!this.objectWorkspaces.has(caller)) {
+      // Untagged callers are global objects; of those only WorkspaceManager
+      // places objects. Look it up again in case it was respawned.
+      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+      if (caller === this.workspaceManagerId) return;
+    }
+    const callerWorkspace = this.objectWorkspaces.get(caller);
+    require(callerWorkspace === workspaceId,
+      'setObjectWorkspace: an object can only be placed in the caller\'s own workspace');
+    const current = this.objectWorkspaces.get(objectId);
+    require(current === undefined || current === workspaceId,
+      'setObjectWorkspace: the object belongs to another workspace, and objects stay in the workspace they were created in');
   }
 
   /**
