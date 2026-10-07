@@ -1421,6 +1421,28 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   private delegations = new Map<string, { parentTaskId:string; taskId:string; agentId:AbjectId; task:string; status:'starting'|'running'|'done'|'error'; result?:unknown; error?:string }>();
+  /**
+   * The goal of the live task whose current action is a message to this
+   * agent. An agent that starts a task because another task called it (an
+   * ObjectAgent `call` to SkillAgent's runTask, say) is doing the caller's
+   * work: sharing its goal lets cancelling the goal reach that work, lets
+   * waiting for the goal to go quiet see it, and keeps its evidence on the
+   * goal. Anything ambiguous (callers without a goal, or on different goals)
+   * links nothing.
+   */
+  private goalOfCallingTask(agentId: AbjectId): string | undefined {
+    const name = this.registeredAgents.get(agentId)?.name;
+    const goals = new Set<string | undefined>();
+    for (const e of this.taskEntries.values()) {
+      if (e.finished || e.state.phase === 'error') continue;
+      const target = (e.outstandingOperation as { action?: { object?: unknown } } | undefined)?.action?.object;
+      if (target === undefined || (target !== agentId && target !== name)) continue;
+      goals.add(e.goalId ?? e.incomingGoalId);
+    }
+    const [only] = goals;
+    return goals.size === 1 ? only : undefined;
+  }
+
   private cancelDescendants(parentTaskId:string):void {
     for (const child of this.delegations.values()) {
       if (child.parentTaskId!==parentTaskId || child.status==='done' || child.status==='error') continue;
@@ -1834,8 +1856,11 @@ The registered object must implement these handlers to participate in the agent 
       const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
 
       // Use the provided goal if given. Goal creation is the responsibility
-      // of the calling agent, not the runtime.
-      const goalId = incomingGoalId;
+      // of the calling agent, not the runtime. Work an agent starts on its own
+      // because a goal's task called it is that task's work, and shares its
+      // goal (queued and delegated work arrive with theirs).
+      const goalId = incomingGoalId
+        ?? (queued || delegation ? undefined : this.goalOfCallingTask(agentId));
 
       const entry: TaskEntry = {
         admissionKey,
@@ -2196,7 +2221,14 @@ The registered object must implement these handlers to participate in the agent 
     this.on('getGoalExecutionHealth', msg => {
       const {goalId}=msg.payload as {goalId:string};
       const tasks=[...this.taskEntries.values()].filter(e=>(e.goalId===goalId||e.incomingGoalId===goalId)&&!e.finished);
-      return {ownedWorkActive:tasks.length>0,tasks:tasks.map(e=>({taskId:e.state.id,phase:e.state.phase,step:e.state.step,operation:e.outstandingOperation}))};
+      // Work admitted but not yet running: waiting in an agent's queue, or
+      // holding a slot while its agent sets up.
+      let queued=0;
+      for (const q of this.agentTaskQueues.values()) {
+        queued+=q.pending.filter(t=>t.goalId===goalId).length;
+        for (const [taskId,f] of q.inFlight) if (f.goalId===goalId && !this.taskEntries.has(taskId)) queued++;
+      }
+      return {ownedWorkActive:tasks.length>0,queued,tasks:tasks.map(e=>({taskId:e.state.id,agentId:e.agentId,phase:e.state.phase,step:e.state.step,operation:e.outstandingOperation}))};
     });
 
     this.on('awaitGoalQuiescence', async msg => {
@@ -6231,6 +6263,12 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     if (!parsed) {
       take(this.tryParseActionJson(content));
     }
+    // 5. The model's own tool-call markup: the action is plain, so read it.
+    const toolCalls = parsed ? [] : AgentAbject.parseToolCallMarkup(content);
+    if (toolCalls.length > 0) {
+      take({ action: toolCalls[0], repaired: false });
+      log.info(`[parse] read tool-call markup as action "${toolCalls[0].action}"${toolCalls.length > 1 ? ` (+${toolCalls.length - 1} more)` : ''}`);
+    }
 
     if (parsed) {
       // A terminal action salvaged from a cut-off stream carries incomplete
@@ -6264,6 +6302,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // response means the tail is untrustworthy.
       if (!streamTruncated && !repaired && primaryFromBalancedScan && balancedObjects.length > 1) {
         this.queueBatchedActions(entry, parsed, balancedObjects.slice(1));
+      } else if (!streamTruncated && toolCalls.length > 1) {
+        this.queueBatchedActions(entry, parsed, toolCalls.slice(1).map(a => JSON.stringify(a)));
       }
       return parsed;
     }
@@ -6436,6 +6476,54 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       out += ch;
     }
     return out;
+  }
+
+  /**
+   * Actions written in a model's native tool-call markup instead of the JSON
+   * envelope. Models trained on tool calling fall back to their own syntax
+   * (`<tool_call>load_skill<arg_key>name</arg_key><arg_value>thetix</arg_value></tool_call>`),
+   * and the action it names is unambiguous, so it is read rather than sent
+   * back for a JSON copy of the same thing. Three shapes: GLM's key/value
+   * pairs, a JSON `{name, arguments}` body (Hermes, Qwen), and
+   * `<invoke name><parameter name>` blocks. Complete calls only.
+   */
+  static parseToolCallMarkup(content: string): AgentAction[] {
+    const value = (raw: string): unknown => {
+      const text = raw.trim();
+      if (/^(\{[\s\S]*\}|\[[\s\S]*\]|true|false|null|-?\d+(\.\d+)?([eE][+-]?\d+)?)$/.test(text)) {
+        try { return JSON.parse(text); } catch { /* keep the text */ }
+      }
+      return text;
+    };
+    const actions: AgentAction[] = [];
+    for (const m of content.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)) {
+      const body = m[1].trim();
+      if (body.startsWith('{')) {
+        try {
+          const call = JSON.parse(body) as { name?: unknown; arguments?: unknown };
+          const args = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments;
+          if (typeof call.name === 'string' && call.name && (args === undefined || (args && typeof args === 'object' && !Array.isArray(args)))) {
+            actions.push({ ...(args as Record<string, unknown> | undefined), action: call.name });
+          }
+        } catch { /* not a call body */ }
+        continue;
+      }
+      const name = /^([A-Za-z_][\w.-]*)/.exec(body)?.[1];
+      if (!name) continue;
+      const args: Record<string, unknown> = {};
+      for (const pair of body.matchAll(/<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g)) {
+        args[pair[1].trim()] = value(pair[2]);
+      }
+      actions.push({ ...args, action: name });
+    }
+    for (const m of content.matchAll(/<invoke name="([^"]+)">([\s\S]*?)<\/invoke>/g)) {
+      const args: Record<string, unknown> = {};
+      for (const param of m[2].matchAll(/<parameter name="([^"]+)">([\s\S]*?)<\/parameter>/g)) {
+        args[param[1]] = value(param[2]);
+      }
+      actions.push({ ...args, action: m[1] });
+    }
+    return actions;
   }
 
   private tryParseActionJson(raw: string): { action: AgentAction; repaired: boolean } | null {

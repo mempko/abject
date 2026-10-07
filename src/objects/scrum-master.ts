@@ -42,6 +42,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import type { SessionRecord } from './task-session.js';
 import { Abject, isTemporaryAskResponse } from '../core/abject.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
+import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
@@ -193,8 +194,12 @@ export class ScrumMaster extends Abject {
   private scrumAttempts = new Map<string, { goalId: string; priorScrumNumber: number; attempt: number }>();
   /** Pending retry timers so onStop can cancel them. */
   private scrumRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Goals with a scrum retry waiting on its backoff: a scrum is coming for them. */
+  private scrumRetryGoals = new Set<string>();
   private static readonly MAX_SCRUM_ATTEMPTS = 3;
   private static readonly SCRUM_RETRY_BASE_MS = 15_000;
+  /** How long a cancelled scrum's goal gets to show what replaced it. */
+  private static readonly CANCELLED_SCRUM_GRACE_MS = 5_000;
 
   /**
    * Tasks waiting on upstream dependencies. As `taskCompleted` events arrive
@@ -297,7 +302,21 @@ export class ScrumMaster extends Abject {
           id: SCRUM_MASTER_INTERFACE,
           name: 'ScrumMaster',
           description: 'Scrum facilitator for goal-driven sprints (agent-based)',
-          methods: [],
+          methods: [
+            {
+              name: 'goalStalled',
+              description: 'The goal watchdog found an active goal with nothing running, queued or left to run. Starts a review scrum for it unless one is already coming. Taken from GoalObserver only.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The stalled goal' },
+                { name: 'reason', type: { kind: 'primitive', primitive: 'string' }, description: 'What the watchdog saw', optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                started: { kind: 'primitive', primitive: 'boolean' },
+                coming: { kind: 'primitive', primitive: 'boolean' },
+                reason: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+          ],
           events: [
             {
               name: 'scrumPlanned',
@@ -380,6 +399,7 @@ export class ScrumMaster extends Abject {
     if (this.recoveryTimer) this.cancelTimer(this.recoveryTimer);
     for (const timer of this.scrumRetryTimers) this.cancelTimer(timer);
     this.scrumRetryTimers.clear();
+    this.scrumRetryGoals.clear();
     for (const timer of this.interjectionTimers.values()) this.cancelTimer(timer);
     this.interjectionTimers.clear();
     await super.onStop();
@@ -542,6 +562,32 @@ export class ScrumMaster extends Abject {
       }
     });
 
+    // The watchdog's word that a goal has nobody left to move it: nothing
+    // running, nothing queued, no task left to run. A review scrum is the
+    // only thing that can decide what happens next.
+    this.on('goalStalled', async (msg: AbjectMessage) => {
+      const identity = await this.resolveCallerIdentity(msg.routing.from);
+      const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
+      precondition(identity?.name === 'GoalObserver' && typeSegments <= 3, 'ScrumMaster takes goalStalled from GoalObserver only');
+      const { goalId, reason } = msg.payload as { goalId: string; reason?: string };
+      requireNonEmpty(goalId, 'goalId');
+      if (this.scrumActiveFor(goalId)) return { started: false, coming: true, reason: 'A scrum for this goal is already coming' };
+      if (!this.goalManagerId) return { started: false, reason: 'GoalManager unavailable' };
+      if (await this.isRemoteGoal(goalId).catch(() => false)) return { started: false, reason: 'A peer plans this goal' };
+      const goal = await this.request<{ status?: string; currentScrumNumber?: number; parentId?: string } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId }), 10000,
+      );
+      if (goal?.status !== 'active') return { started: false, reason: 'Goal is not active' };
+      if (goal.parentId) return { started: false, reason: 'Sub-goals are planned by their parent goal' };
+      const round = goal.currentScrumNumber ?? 0;
+      log.warn(`Goal ${goalId.slice(0, 8)} stalled after round ${round} (${(reason ?? 'nothing left to run').slice(0, 160)}) — starting a review scrum`);
+      this.scrummedRounds.delete(`${goalId}#${round}`);
+      await this.enqueueScrumTask(goalId, round, 1,
+        `Nothing is running or queued for this goal and no task is left to run (${reason ?? 'the watchdog found it idle'}). ` +
+        'Review what the earlier rounds produced and what failed, then plan the remaining work, or complete or fail the goal.');
+      return { started: this.scrumActiveFor(goalId) };
+    });
+
     // Agent-callback handlers. AgentAbject's runStateMachine calls these
     // for tasks queued under our agentId.
     this.on('agentObserve', async (msg: AbjectMessage) => { await this.requireTaskRuntime(msg,this.agentAbjectId); return this.handleObserve(msg); });
@@ -618,6 +664,8 @@ export class ScrumMaster extends Abject {
         const wasCancelled = (payload.error ?? '').includes('Cancelled');
         if (payload.success === false && !wasCancelled) {
           this.scheduleScrumRetry(attemptInfo, payload.error);
+        } else if (payload.success === false) {
+          this.recoverCancelledScrum(attemptInfo, payload.error);
         }
       }
     });
@@ -762,6 +810,31 @@ export class ScrumMaster extends Abject {
    * 60s). After MAX_SCRUM_ATTEMPTS the goal fails with an instructive
    * error — a visible failure the user can act on beats a silent hang.
    */
+  /**
+   * A cancelled scrum was usually replaced on purpose: the goal ended, or a
+   * newer scrum cancelled the round to re-plan. When neither holds once that
+   * has had a moment to show, nothing is left to plan the goal (an agent's
+   * job once cancelled the very scrum that ran it), so the cancel counts as a
+   * death and the round runs again, within the usual attempt budget.
+   */
+  private recoverCancelledScrum(info: { goalId: string; priorScrumNumber: number; attempt: number }, error?: string): void {
+    const timer = this.setTimer(() => {
+      this.scrumRetryTimers.delete(timer);
+      void (async () => {
+        if (this.scrumActiveFor(info.goalId) || !this.goalManagerId) return;
+        const goal = await this.request<{ status?: string } | null>(
+          request(this.id, this.goalManagerId, 'getGoal', { goalId: info.goalId }), 10000,
+        ).catch(() => null);
+        if (goal?.status !== 'active' || this.scrumActiveFor(info.goalId)) return;
+        log.warn(`Scrum for goal ${info.goalId.slice(0, 8)} round ${info.priorScrumNumber} was cancelled and nothing replaced it — running the round again`);
+        this.scheduleScrumRetry(info, error ?? 'Cancelled');
+      })().catch(err =>
+        log.warn(`recovering cancelled scrum for ${info.goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),
+      );
+    }, ScrumMaster.CANCELLED_SCRUM_GRACE_MS);
+    this.scrumRetryTimers.add(timer);
+  }
+
   private scheduleScrumRetry(info: { goalId: string; priorScrumNumber: number; attempt: number }, error?: string): void {
     const { goalId, priorScrumNumber, attempt } = info;
     if (attempt >= ScrumMaster.MAX_SCRUM_ATTEMPTS) {
@@ -778,6 +851,7 @@ export class ScrumMaster extends Abject {
     }
     const delay = ScrumMaster.SCRUM_RETRY_BASE_MS * 2 ** (attempt - 1);
     log.info(`Scrum for goal ${goalId.slice(0, 8)} round ${priorScrumNumber} died (attempt ${attempt}: ${(error ?? 'unknown').slice(0, 120)}) — retrying in ${Math.round(delay / 1000)}s`);
+    this.scrumRetryGoals.add(goalId);
     const timer = this.setTimer(() => {
       this.scrumRetryTimers.delete(timer);
       void this.retryScrum(goalId, priorScrumNumber, attempt + 1);
@@ -802,6 +876,7 @@ export class ScrumMaster extends Abject {
     } catch { /* GoalManager unreachable — fall through to reschedule */ }
 
     if (status === 'paused' || status === undefined) {
+      // Still owed: the retry stays pending while the goal is paused.
       const timer = this.setTimer(() => {
         this.scrumRetryTimers.delete(timer);
         void this.retryScrum(goalId, priorScrumNumber, attempt);
@@ -809,12 +884,16 @@ export class ScrumMaster extends Abject {
       this.scrumRetryTimers.add(timer);
       return;
     }
-    if (status !== 'active') return; // completed/failed/archived while we backed off
-
-    this.scrummedRounds.delete(`${goalId}#${priorScrumNumber}`);
-    await this.enqueueScrumTask(goalId, priorScrumNumber, attempt).catch(err =>
-      log.warn(`scrum retry enqueue for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),
-    );
+    try {
+      if (status !== 'active') return; // completed/failed/archived while we backed off
+      this.scrummedRounds.delete(`${goalId}#${priorScrumNumber}`);
+      await this.enqueueScrumTask(goalId, priorScrumNumber, attempt).catch(err =>
+        log.warn(`scrum retry enqueue for ${goalId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`),
+      );
+    } finally {
+      // The enqueued scrum (if any) is tracked as an attempt from here on.
+      this.scrumRetryGoals.delete(goalId);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -834,8 +913,9 @@ export class ScrumMaster extends Abject {
     return (goal.interjections ?? []).filter(i => i.status === 'pending').length;
   }
 
-  /** True when a scrum task for this goal is already queued or running. */
+  /** True when a scrum task for this goal is already queued, running, or waiting to retry. */
   private scrumActiveFor(goalId: string): boolean {
+    if (this.scrumRetryGoals.has(goalId)) return true;
     for (const info of this.scrumAttempts.values()) {
       if (info.goalId === goalId) return true;
     }

@@ -205,6 +205,25 @@ export class GoalManager extends Abject {
   }
 
   /**
+   * The agent task(s) a request comes from. A job's call names its task
+   * through JobManager; an agent's own `call` action is the task of that
+   * agent currently waiting on this method. Empty for a system object
+   * speaking for itself, or when the origin cannot be read.
+   */
+  private async requestingTaskIds(msg: AbjectMessage, goalId: GoalId, runtimeId: AbjectId): Promise<string[]> {
+    const caller = await this.capabilityCaller(msg).catch(() => undefined);
+    if (!caller) return [];
+    if (caller.taskId) return [caller.taskId];
+    const method = msg.routing.method;
+    const health = await this.request<{ tasks?: Array<{ taskId: string; agentId?: string; operation?: { action?: { method?: unknown } } }> }>(
+      request(this.id, runtimeId, 'getGoalExecutionHealth', { goalId }), 5000,
+    ).catch(() => null);
+    return (health?.tasks ?? [])
+      .filter(t => t.agentId === caller.callerId && method !== undefined && t.operation?.action?.method === method)
+      .map(t => t.taskId);
+  }
+
+  /**
    * Cancel every task of a goal: release + remove its tuples, abort running
    * agent tasks, clean the per-goal SharedState namespace. Shared by the
    * `cancelTasksForGoal` handler and `stopGoal` (handlers are serialized, so
@@ -2514,13 +2533,20 @@ reviews results and either plans another round or completes/fails the goal.
      * a fresh round immediately.
      */
     this.on('cancelOutstandingTasks', async (msg: AbjectMessage) => {
-      const { goalId, preserveTaskIds = [] } = msg.payload as { goalId: GoalId; preserveTaskIds?: string[] };
+      const { goalId, preserveTaskIds: requested = [] } = msg.payload as { goalId: GoalId; preserveTaskIds?: string[] };
       const goal = this.goals.get(goalId);
       if (!goal || goal.status !== 'active') return { cancelled: 0, safe: false, inactive: true, error: 'Goal is no longer active' };
       if (!this.tupleSpaceId) return { cancelled: 0, safe: false, error: 'TupleSpace unavailable' };
 
       const runtimeId = await this.taskRuntime();
       if (!runtimeId) return { cancelled: 0, safe: false, error: 'Task runtime unavailable' };
+
+      // The task asking is never part of the work it clears: cancelling it
+      // would leave the goal with nothing to plan the next round (a planner's
+      // own job once cancelled the planner this way), and waiting for it to
+      // go quiet would wait on this very request.
+      const requesters = await this.requestingTaskIds(msg, goalId, runtimeId);
+      const preserveTaskIds = [...new Set([...requested, ...requesters])];
 
       const ns = this.getTupleNamespace(goalId);
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(

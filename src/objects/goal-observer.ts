@@ -36,6 +36,10 @@ const GOAL_OBSERVER_INTERFACE: InterfaceId = 'abjects:goal-observer';
 const SWEEP_INTERVAL_MS    = 60_000;          // 1 min
 const STALE_WARN_MS        = 20 * 60_000;     // 20 min no progress → warning
 const STALE_FAIL_MS        = 30 * 60_000;     // 30 min → auto-fail backstop
+const STALLED_QUIET_MS     = 2 * 60_000;      // quiet this long with nothing left to run → stalled
+const MAX_STALL_WAKES      = 2;               // review scrums started for one stall before failing
+/** Task states nobody will act on again. */
+const SETTLED_TASK_STATES  = new Set(['done', 'failed', 'permanently_failed', 'cancelled', 'superseded']);
 
 // ─── GoalObserver ───────────────────────────────────────────────────
 
@@ -44,6 +48,12 @@ export class GoalObserver extends Abject {
   private sweepTimer?: ReturnType<typeof setInterval>;
 
   private warningsIssued = new Set<string>(); // goalIds already warned about
+  /** Goals last seen with nothing running, queued or left to run, and since when. */
+  private stalledSince = new Map<string, number>();
+  /** Review scrums started for a goal's current stall. */
+  private stallWakes = new Map<string, number>();
+  /** Stalled goals the planner does not plan (a peer's, a sub-goal): left to the stale backstop. */
+  private stallDeclined = new Set<string>();
 
   constructor() {
     super({
@@ -138,12 +148,13 @@ decisions belong to ScrumMaster.
   // All parameters are optional; only provided values are updated.
 
 ### Events
-- goalWarning: emitted when a goal is stale (20+ min with no progress)
+- goalWarning: emitted when a goal is stale (20+ min with no progress) or stalled
 - goalAutoFailed: emitted when a goal is auto-failed by the observer
 
 ### IMPORTANT
 - Default stale warning at 20 min, auto-fail at 30 min of no progress.
-- Auto-fail only triggers on staleness; per-task failures are ScrumMaster's call.
+- A goal with nothing running, queued or left to run for two sweeps (and at least 2 min quiet) is stalled: the observer asks ScrumMaster for a review scrum, and fails the goal if two of those do not get it moving.
+- Auto-fail only triggers on staleness or a stall nothing can restart; per-task failures are ScrumMaster's call.
 - failAllGoals cleans up TupleSpace and shared state entries.`;
   }
 
@@ -225,10 +236,15 @@ decisions belong to ScrumMaster.
     const activeIds = new Set(goals.map(g => g.id));
     for (const id of this.warningsIssued) if (!activeIds.has(id)) this.warningsIssued.delete(id);
     for (const id of this.healthCheckedAt.keys()) if (!activeIds.has(id)) this.healthCheckedAt.delete(id);
+    for (const id of this.stalledSince.keys()) if (!activeIds.has(id)) this.stalledSince.delete(id);
+    for (const id of this.stallWakes.keys()) if (!activeIds.has(id)) this.stallWakes.delete(id);
+    for (const id of this.stallDeclined) if (!activeIds.has(id)) this.stallDeclined.delete(id);
 
     for (const goal of goals) {
-      // Stale check
       const age = now - (goal.lastMeaningfulProgressAt ?? goal.createdAt ?? goal.updatedAt);
+      if (await this.tendStall(goal.id, age, now).catch(() => false)) continue;
+
+      // Stale check
       if (age < Math.min(this.staleWarnMs, this.staleFailMs)) {
         // Progress resumed: a later stall is a new one and earns its own warning.
         this.warningsIssued.delete(goal.id);
@@ -264,6 +280,75 @@ decisions belong to ScrumMaster.
       // No task-level auto-fail under the Scrum model — ScrumMaster owns
       // those decisions. Staleness above is the only auto-fail trigger.
     }
+  }
+
+  /**
+   * A goal with nothing running, nothing queued and no task left to run has
+   * nobody to move it: waiting cannot help, and a health reading has nothing
+   * to read. Seen that way on two sweeps, the planner is asked for a review
+   * scrum; when two of those leave it stalled again, the goal fails with the
+   * reason instead of idling until the stale backstop. Returns true when this
+   * sweep acted on the goal.
+   */
+  private async tendStall(goalId: string, age: number, now: number): Promise<boolean> {
+    if (age < STALLED_QUIET_MS) {
+      // It moved: a later stall is a new one.
+      this.stalledSince.delete(goalId);
+      this.stallWakes.delete(goalId);
+      this.stallDeclined.delete(goalId);
+      return false;
+    }
+    if (this.stallDeclined.has(goalId)) return false;
+    if (!await this.nothingLeftToRun(goalId)) {
+      this.stalledSince.delete(goalId);
+      return false;
+    }
+    const since = this.stalledSince.get(goalId);
+    if (since === undefined) {
+      this.stalledSince.set(goalId, now); // a hand-off between rounds looks like this for a moment
+      return false;
+    }
+    if (now - since < SWEEP_INTERVAL_MS / 2) return false;
+    this.stalledSince.delete(goalId);
+
+    const wakes = this.stallWakes.get(goalId) ?? 0;
+    if (wakes >= MAX_STALL_WAKES) {
+      log.info(`sweep: goal ${goalId.slice(0, 8)} still stalled after ${wakes} review scrums — auto-failing`);
+      await this.autoFailGoal(goalId,
+        `Nothing was left running or planned for this goal, and ${wakes} review rounds started for it did not get it moving`);
+      return true;
+    }
+    const reason = `quiet ${Math.round(age / 60000)} min with nothing running, queued or left to run`;
+    const scrum = await this.discoverDep('ScrumMaster');
+    const reply: { started?: boolean; coming?: boolean; reason?: string } = scrum
+      ? await this.request<{ started?: boolean; coming?: boolean; reason?: string }>(
+        request(this.id, scrum, 'goalStalled', { goalId, reason }), 20000).catch(err => ({ started: false, reason: String(err) }))
+      : { started: false, reason: 'ScrumMaster unavailable' };
+    if (reply.coming) return false; // a retry is on its backoff; the goal is not abandoned
+    if (!reply.started) {
+      this.stallDeclined.add(goalId);
+      log.info(`sweep: goal ${goalId.slice(0, 8)} stalled (${reason}); no review scrum (${reply.reason ?? 'unknown'}) — leaving it to the stale backstop`);
+      return false;
+    }
+    this.stallWakes.set(goalId, wakes + 1);
+    log.info(`sweep: goal ${goalId.slice(0, 8)} stalled (${reason}) — review scrum started (${wakes + 1}/${MAX_STALL_WAKES})`);
+    if (!this.warningsIssued.has(goalId)) {
+      this.warningsIssued.add(goalId);
+      this.changed('goalWarning', { goalId, reason: `Stalled: ${reason}` });
+    }
+    return true;
+  }
+
+  /** True when the runtime holds no work for the goal and none of its tasks is still to run. */
+  private async nothingLeftToRun(goalId: string): Promise<boolean> {
+    const runtime = await this.discoverDep('AgentAbject');
+    if (!runtime || !this.goalManagerId) return false;
+    const health = await this.request<{ ownedWorkActive?: boolean; queued?: number }>(
+      request(this.id, runtime, 'getGoalExecutionHealth', { goalId }), 5000);
+    if (health.ownedWorkActive || (health.queued ?? 0) > 0) return false;
+    const tasks = await this.request<Array<{ fields?: { status?: unknown } }>>(
+      request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }), 5000);
+    return tasks.every(t => SETTLED_TASK_STATES.has(String(t.fields?.status ?? 'pending')));
   }
 
   /** A goal's last health judgment, reused until the recheck interval passes. */
