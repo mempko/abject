@@ -8,19 +8,23 @@
  * drives it.
  *
  * How an update is applied depends on how Abject was installed:
- * - Windows (NSIS): the downloaded installer runs silently once the app has
- *   exited, and starts it again after a restart.
- * - Linux AppImage: the new AppImage replaces the old file at the same path.
- * - Linux .deb: dpkg installs it, which asks for an administrator password, so
- *   that happens only when the user restarts to update.
+ * - Linux AppImage: as soon as the download is verified, the new AppImage
+ *   replaces the old file at the same path. The running copy keeps the old
+ *   file open and carries on; the new version starts with the next launch.
+ * - Windows (NSIS): the installer starts when the user restarts to update, or
+ *   as the app begins to quit, then waits for the app to exit and installs.
+ * - Linux .deb: dpkg installs it when the user restarts to update; it asks for
+ *   an administrator password, and a cancelled prompt leaves the app running.
  * - macOS, or a Linux install it cannot replace: the update is offered as a
  *   download. Squirrel.Mac only updates a signed app, and builds are not
  *   signed yet.
  *
- * Installing runs in Electron's `will-quit`, after the backend has shut down
- * and released its database, ports and single-instance lock. A restart then
- * starts the new version once this process is gone; started any earlier, it
- * would find the lock taken and quit.
+ * Nothing waits for the end of shutdown, because it does not always come:
+ * native code can abort on the way out, and the exit watchdog SIGKILLs a
+ * process that wedges. Every install starts while this process is healthy.
+ * A restart starts the new version from a detached waiter once this process
+ * is gone, however it goes; started any earlier, the new copy would find the
+ * single-instance lock taken and quit.
  *
  * Spawned only in the packaged Electron app, on the main thread: it needs
  * Electron's `app`, and `electron-updater` ships only in the desktop app.
@@ -90,10 +94,9 @@ const STORAGE_KEY_AUTO_DOWNLOAD = 'appUpdater:autoDownload';
 const FEED_URL_ENV = 'ABJECTS_UPDATE_FEED_URL';
 
 /**
- * The install to run in `will-quit`. Module level, so it outlives the
- * AppUpdater instance (which is stopped with the rest of the backend before
- * `will-quit`) and so a restarted instance replaces the hook rather than
- * adding a second one.
+ * Windows: the installer to start when the app begins to quit with an update
+ * downloaded. Module level so a restarted AppUpdater replaces the hook rather
+ * than adding a second one.
  */
 let installOnQuit: (() => void) | undefined;
 let quitHookRegistered = false;
@@ -107,8 +110,6 @@ export class AppUpdater extends Abject {
   };
   /** The verified file a finished download left in the updater's cache. */
   private downloadedFile?: string;
-  /** Set by restartToUpdate: start the new version after installing. */
-  private restartRequested = false;
   /** Listeners added to the shared updater, removed again in onStop. */
   private detach: Array<() => void> = [];
   private lastProgressPercent = -1;
@@ -210,7 +211,7 @@ export class AppUpdater extends Abject {
   }
 
   protected override async onStop(): Promise<void> {
-    // The install hook stays: it runs in will-quit, after this has stopped.
+    // The Windows install-on-quit hook stays on app; it fires as quitting begins.
     for (const off of this.detach) off();
     this.detach = [];
   }
@@ -240,8 +241,8 @@ export class AppUpdater extends Abject {
     this.on('restartToUpdate', async (msg: AbjectMessage) => {
       await this.admit(msg);
       precondition(this.current.state === 'ready', 'No downloaded update to install');
-      this.restartRequested = true;
-      log.info(`restarting to install ${this.current.latestVersion}`);
+      this.installForRestart();
+      log.info(`restarting into ${this.current.latestVersion}`);
       // Reply first; quitting tears down the bus.
       setTimeout(() => this.requireElectron().app.quit(), 200);
       return true;
@@ -301,7 +302,7 @@ export class AppUpdater extends Abject {
   // ===========================================================================
 
   private configureUpdater(updater: ElectronUpdater): void {
-    // Downloads start here, when the setting allows; installs run in will-quit.
+    // Downloads start here, when the setting allows; installs are started here too.
     updater.autoDownload = false;
     updater.autoInstallOnAppQuit = false;
     updater.allowPrerelease = false;
@@ -397,10 +398,21 @@ export class AppUpdater extends Abject {
   }
 
   private onDownloaded(e: UpdateDownloadedEvent): void {
-    this.downloadedFile = e.downloadedFile;
-    this.current = { ...this.current, state: 'ready', latestVersion: e.version, percent: 100, error: undefined };
-    this.armInstallOnQuit();
     log.info(`downloaded ${e.version} to ${e.downloadedFile}`);
+    try {
+      if (this.current.installKind === 'appimage') {
+        replaceAppImage(e.downloadedFile);
+        log.info(`installed ${e.version} at ${process.env.APPIMAGE}; it starts with the next launch`);
+      } else if (this.current.installKind === 'nsis') {
+        this.armInstallOnQuit();
+      }
+      this.downloadedFile = e.downloadedFile;
+      this.current = { ...this.current, state: 'ready', latestVersion: e.version, percent: 100, error: undefined };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.error(`could not install ${e.version}: ${reason}`);
+      this.current = { ...this.current, state: 'error', latestVersion: e.version, percent: undefined, error: `Could not replace the AppImage: ${reason}` };
+    }
     this.publish();
   }
 
@@ -408,46 +420,60 @@ export class AppUpdater extends Abject {
   // Installing
   // ===========================================================================
 
+  /**
+   * Windows: start the installer as soon as the app begins to quit, not at
+   * the end of shutdown, which a crash or the exit watchdog can cut short.
+   * The installer waits for this process to exit before it installs.
+   */
   private armInstallOnQuit(): void {
     const { app } = this.requireElectron();
-    installOnQuit = () => this.install();
+    const updater = this.updater!;
+    installOnQuit = () => {
+      installOnQuit = undefined;
+      try {
+        asInstaller(updater).install(true, false);
+        log.info('installer started; it installs once the app has exited');
+      } catch (err) {
+        log.error(`could not start the installer: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
     if (!quitHookRegistered) {
       quitHookRegistered = true;
-      // Runs after main.ts's own will-quit work: the backend is down by then.
-      app.on('will-quit', () => installOnQuit?.());
+      app.on('before-quit', () => installOnQuit?.());
     }
   }
 
-  /** Runs in will-quit. Synchronous: nothing after will-quit waits for promises. */
-  private install(): void {
-    const file = this.downloadedFile;
-    if (!file || !this.updater) return;
-    installOnQuit = undefined;
-    const restart = this.restartRequested;
-    try {
-      switch (this.current.installKind) {
-        case 'nsis':
-          // The installer waits for this process to exit; --force-run starts the app after.
-          asInstaller(this.updater).install(true, restart);
-          break;
-        case 'appimage': {
-          const target = replaceAppImage(file);
-          if (restart) relaunchAfterExit(target);
-          break;
+  /**
+   * Start what a restart into the new version needs, now, while this process
+   * is healthy. Throws when the update cannot be installed, and then the app
+   * keeps running.
+   */
+  private installForRestart(): void {
+    precondition(this.updater !== undefined && this.downloadedFile !== undefined, 'No downloaded update to install');
+    const updater = this.updater!;
+    switch (this.current.installKind) {
+      case 'appimage':
+        // Already in place since the download finished.
+        relaunchAfterExit(process.env.APPIMAGE!);
+        return;
+      case 'nsis':
+        // The installer waits for this process to exit; --force-run starts the app after.
+        installOnQuit = undefined;
+        precondition(asInstaller(updater).install(true, true), 'The installer did not start');
+        return;
+      case 'deb': {
+        // dpkg runs now and asks for a password; the app quits only once it has installed.
+        const installed = asInstaller(updater).install(true, false);
+        if (!installed) {
+          // Let the next attempt run: electron-updater refuses a second install() otherwise.
+          (updater as unknown as { quitAndInstallCalled: boolean }).quitAndInstallCalled = false;
         }
-        case 'deb':
-          // dpkg asks for a password, which only makes sense when the user asked to restart.
-          if (!restart) return;
-          if (asInstaller(this.updater).install(true, false)) {
-            relaunchAfterExit(launcherPath());
-          }
-          break;
-        case 'manual':
-          break;
+        precondition(installed, 'The package was not installed (was the password prompt closed?)');
+        relaunchAfterExit(launcherPath());
+        return;
       }
-      log.info(`installed ${this.current.latestVersion}${restart ? ', restarting' : ''}`);
-    } catch (err) {
-      log.error(`install failed: ${err instanceof Error ? err.message : String(err)}`);
+      case 'manual':
+        precondition(false, 'This install is updated by hand');
     }
   }
 

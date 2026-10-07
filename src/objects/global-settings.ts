@@ -38,7 +38,7 @@ const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
 /** How each install gets a new version, as the Updates tab says it. */
 const UPDATE_INSTALL_NOTE: Record<UpdateStatus['installKind'], string> = {
   nsis: 'New versions install when Abject restarts or quits.',
-  appimage: 'New versions replace this AppImage when Abject restarts or quits.',
+  appimage: 'New versions replace this AppImage as soon as they download, and start the next time Abject does.',
   deb: 'New versions install when you restart Abject, which asks for your password.',
   manual: 'New versions are downloaded by hand.',
 };
@@ -2120,6 +2120,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return `Downloading version ${u.latestVersion}: ${u.percent ?? 0}%${of}`;
       }
       case 'ready':
+        if (u.installKind === 'appimage') return `Version ${u.latestVersion} is installed. Restart Abject to start using it.`;
         return u.installKind === 'deb'
           ? `Version ${u.latestVersion} is ready. Restart Abject to install it; installing asks for your password.`
           : `Version ${u.latestVersion} is ready. Restart Abject to finish updating, or it installs the next time you quit.`;
@@ -2210,7 +2211,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       });
       if (!ok) return;
     }
-    await this.askUpdater('restartToUpdate');
+    // A .deb install asks for a password before the reply comes back.
+    await this.askUpdater('restartToUpdate', {}, 300_000);
   }
 
   private async workspaceManager(): Promise<AbjectId | undefined> {
@@ -2251,9 +2253,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const found = u.state === 'available' && !downloadsItself;
     if (!ready && !found) return;
     this.announcedUpdateVersion = u.latestVersion;
-    const message = ready
-      ? `Abject ${u.latestVersion} is ready to install. Restart from Settings, under Updates.`
-      : `Abject ${u.latestVersion} is available. Get it from Settings, under Updates.`;
+    const message = !ready
+      ? `Abject ${u.latestVersion} is available. Get it from Settings, under Updates.`
+      : u.installKind === 'appimage'
+        ? `Abject ${u.latestVersion} is installed. Restart from Settings, under Updates, to start using it.`
+        : `Abject ${u.latestVersion} is ready to install. Restart from Settings, under Updates.`;
     const nc = await this.activeNotificationCenter();
     if (nc) this.send(event(this.id, nc, 'notify', { message, level: 'info', durationMs: 12_000 }));
   }

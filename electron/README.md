@@ -29,9 +29,15 @@ AppUpdater exists), plus a notification in the active workspace when a new
 version is ready (or found, when it will not download by itself). Help →
 Check for Updates… opens Settings on that tab.
 
-- **Windows (NSIS)** and **Linux AppImage** download in the background and
-  install on restart or quit. The AppImage is replaced at its own path, so
-  shortcuts keep working.
+- **Linux AppImage** downloads in the background and replaces itself, at its
+  own path (shortcuts keep working), as soon as the download is verified; the
+  new version starts with the next launch or a restart.
+- **Windows (NSIS)** downloads in the background; the installer starts when
+  the user restarts to update or as the app begins to quit, and installs once
+  the app has exited.
+- Installs never wait for the end of shutdown, which a native crash or the
+  exit watchdog can cut short. A restart relaunches from a detached waiter
+  that starts the new version once the old process is gone.
 - **Linux .deb** installs only on an explicit restart (dpkg asks for a password).
 - **macOS** builds are unsigned, so Squirrel.Mac cannot apply an update: the
   window offers the DMG as a download instead. Once builds are signed, switch
