@@ -205,6 +205,10 @@ interface ReviewTaskExtra {
   evidenceTaskIds?: string[];
   /** Entries this review has already confirmed from held predictions that cited them. */
   confirmedEntries?: string[];
+  /** Plan-declared patterns whose goal-level application the KnowledgeBase holds. */
+  planApplicationsRecorded?: string[];
+  /** Verdicts refused because the pattern had no recorded use in the goal. */
+  ignoredApplications?: number;
   /** Set once the goal's summary-fidelity verdict is on record. */
   summaryFidelityRecorded?: boolean;
   /** Decision-model judgments made at launch; priors in the dossier, automated records when a site acts. */
@@ -910,7 +914,11 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
     }
     decision = await this.applyDecision(decision, extra);
-    for (const e of decision.effects) if (e.state === 'applied' && e.input.action === 'record_pattern_application') (extra.applicationAssessments ??= {})[`${e.input.taskId}:${e.input.step}:${e.input.id}`] = String(e.input.verdict);
+    for (const e of decision.effects) if (e.state === 'applied' && e.input.action === 'record_pattern_application') {
+      const assessed = (extra.applicationAssessments ??= {});
+      assessed[`${e.input.taskId}:${e.input.step}:${e.input.id}`] = String(e.input.verdict);
+      if (typeof e.input.applicationRef === 'string') assessed[e.input.applicationRef] = String(e.input.verdict);
+    }
     extra.decisions = [...(extra.decisions ?? []).filter(d => d.id !== decision.id), decision];
     return decision;
   }
@@ -924,7 +932,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    */
   private bindApplication(extra: ReviewTaskExtra, patternId: string, app: Record<string, unknown>): Record<string, unknown> | undefined {
     const taskGiven = typeof app.taskId === 'string' && app.taskId !== '';
-    if (!taskGiven && extra.goalId && extra.planPatternIds?.includes(patternId)) {
+    // The plan's use binds when the KnowledgeBase holds it (or, unread, when the plan declared it).
+    if (!taskGiven && extra.goalId && (extra.planApplicationsRecorded ?? extra.planPatternIds)?.includes(patternId)) {
       return { applicationRef: `${extra.goalId}:${patternId}`, outcome: extra.goalOutcome === 'failed' ? 'failure' : 'success' };
     }
     const episodes = (extra.records ?? []).flatMap(r => (r.predictions ?? []).flatMap(p => (p.patterns ?? [])
@@ -1076,6 +1085,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           return this.trackReviewAction(taskId, action, { success: false, error: advice.join(' '), duplicateOf: screened.rejected[0].duplicateOf });
         }
         action = action.action === 'save_entry' ? screened.kept[0] as AgentAction : { ...action, effects: screened.kept };
+      }
+      // Only a recorded use can be judged. Refusing here, before the journal,
+      // keeps a verdict on a merely woven pattern from becoming pending work
+      // that a repair pass would later pay to revisit.
+      if (extra?.goalId && this.goalManagerId && action.action === 'record_pattern_application' && action.application && typeof action.application === 'object'
+        && !this.bindApplication(extra, String(action.id), action.application as Record<string, unknown>)) {
+        extra.ignoredApplications = (extra.ignoredApplications ?? 0) + 1;
+        return { success: false, error: `No recorded use of pattern ${String(action.id)} in this goal to judge. Applications cover the uses listed under Pattern applications: the plan's (no taskId) or an agent's own (its taskId). A woven pattern that shaped the work without being declared can be strengthened with update_pattern instead.` };
       }
       if (extra?.goalId && this.goalManagerId && (action.action === 'learn' || ['save_entry','update_entry','archive_entry','supersede_entry','dispute_entry','narrow_entry','confirm_entry','no_change','save_pattern','update_pattern','record_pattern_application'].includes(action.action))) {
         const app = action.application as Record<string, unknown> | undefined;
@@ -1301,7 +1318,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   private learningReport(extra?: ReviewTaskExtra, interrupted = false) {
     const updates = extra?.updates ?? [];
     const assessments = extra?.assessments ?? {};
-    const episodes = new Map<string, PredictionRecord>((extra?.records ?? []).flatMap(r => (r.predictions ?? []).map(p => [`${r.taskId}:${p.step}`, p] as const)));
+    // Only steps with a stated expectation are predictions; the rest have nothing to assess.
+    const episodes = new Map<string, PredictionRecord>((extra?.records ?? []).flatMap(r => (r.predictions ?? []).filter(isPredicted).map(p => [`${r.taskId}:${p.step}`, p] as const)));
     const unassessed = [...episodes].filter(([key]) => !assessments[key]).map(([key]) => key);
     const counts = { supported: 0, contradicted: 0, unresolved: unassessed.length };
     for (const [key, a] of Object.entries(assessments)) if (episodes.has(key) && a.verdict in counts) counts[a.verdict as keyof typeof counts]++;
@@ -1309,12 +1327,26 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const journaled = (u: LearningUpdate) => !!u.result && typeof u.result === 'object' && (u.result as Partial<LearningDecision>).version === 1;
     const saved = [...new Map(updates.filter(u => u.status === 'saved' && !journaled(u)).map(u => [u.key, u])).values()];
     const pending = [...latest.values()].filter(u => u.status !== 'saved' && u.status !== 'duplicate' && !journaled(u));
-    const patternCounts = { helpful: 0, harmful: 0, inconclusive: 0, unresolved: 0 };
-    const unassessedApplications: Array<{ taskId: string; step: number; id: string; applicationRef?: string }> = [];
+    // One count per application: a task's steps that cited a pattern share one,
+    // and the plan's use of a pattern is its own.
+    const patternCounts = { helpful: 0, no_effect: 0, harmful: 0, inconclusive: 0, unresolved: 0 };
+    const unassessedApplications: Array<{ taskId?: string; step?: number; id: string; applicationRef?: string }> = [];
+    const counted = new Set<string>();
+    const tally = (key: string, verdict: string | undefined, unassessed: { taskId?: string; step?: number; id: string; applicationRef?: string }) => {
+      if (counted.has(key)) return;
+      counted.add(key);
+      if (verdict === 'helpful' || verdict === 'no_effect' || verdict === 'harmful' || verdict === 'inconclusive') patternCounts[verdict]++;
+      else { patternCounts.unresolved++; unassessedApplications.push(unassessed); }
+    };
     for (const r of extra?.records ?? []) for (const p of r.predictions ?? []) for (const applied of p.patterns ?? []) {
-      const verdict = extra?.applicationAssessments?.[`${r.taskId}:${p.step}:${applied.id}`];
-      if (verdict === 'helpful' || verdict === 'harmful' || verdict === 'inconclusive') patternCounts[verdict]++;
-      else { patternCounts.unresolved++; unassessedApplications.push({ taskId: r.taskId, step: p.step, id: applied.id, applicationRef: applied.applicationRef }); }
+      const ref = applied.applicationRef;
+      const verdict = (ref && extra?.applicationAssessments?.[ref]) || extra?.applicationAssessments?.[`${r.taskId}:${p.step}:${applied.id}`];
+      tally(ref ?? `${r.taskId}:${p.step}:${applied.id}`, verdict, { taskId: r.taskId, step: p.step, id: applied.id, applicationRef: ref });
+    }
+    for (const id of extra?.planPatternIds ?? []) {
+      if (!extra?.goalId) break;
+      const ref = `${extra.goalId}:${id}`;
+      if (extra.planApplicationsRecorded?.includes(id)) tally(ref, extra.applicationAssessments?.[ref], { id, applicationRef: ref });
     }
     // Report the causal chain using recorded references, not a second model pass.
     // A shared decision may consider several episodes; it is not proof that each
@@ -1350,7 +1382,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       decisions: (extra?.decisions ?? []).map(d => ({ id: d.id, effects: d.effects.map(e => ({ id: e.id, state: e.state, action: e.input.action, knowledgeId: e.input.id })) })),
       attempts: updates.map(brief), limitations: extra?.completionIssues ?? [],
       predictions: { total: episodes.size, ...counts, unassessed, episodes: episodesWithLearning },
-      patterns: { ...patternCounts, unassessed: unassessedApplications },
+      patterns: { ...patternCounts, unassessed: unassessedApplications, ...(extra?.ignoredApplications ? { refusedWithoutRecordedUse: extra.ignoredApplications } : {}) },
       summary: `Learning review ${status}: ${allSaved.length} updates saved, ${allPending.length} pending. Predictions: ${counts.supported} supported, ${counts.contradicted} contradicted, ${counts.unresolved} unresolved. Pattern applications: ${patternCounts.helpful} helpful, ${patternCounts.harmful} harmful, ${patternCounts.inconclusive} inconclusive, ${patternCounts.unresolved} unassessed.` };
   }
 
@@ -2156,7 +2188,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
 
   /** Budget the whole dossier; full records remain addressable through this receiver. */
   private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string,
-    briefing: ReviewBriefing & { goalId?: string } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = []): Promise<string> {
+    briefing: ReviewBriefing & { goalId?: string } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [],
+    planRecorded: string[] = []): Promise<string> {
     const pieces: string[] = [];
     const executionRecord = briefing.executionRecord?.trim();
     let remaining = GOAL_TRANSCRIPT_BUDGET;
@@ -2215,7 +2248,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       const fetchIds = [...new Set([...ids, ...applied])];
       const fetched = new Map(await Promise.all(fetchIds.map(async id => [id, await this.request<ShownEntry | null>(request(this.id, kb, 'get', { id })).catch(() => null)] as const)));
       const entries = ids.map(id => fetched.get(id) ?? null);
-      const applications = this.renderPatternApplications(trail, records, fetched, briefing.goalId, recurrences, knowledgeRefs);
+      const applications = this.renderPatternApplications(trail, records, fetched, briefing.goalId, recurrences, knowledgeRefs, planRecorded);
       if (applications) append(applications, PATTERN_APPLICATIONS_BUDGET);
       append('Knowledge reconciliation: use explicit parent evidenceRefs such as learning/task/<taskId>, learning/observation/<taskId>:<step>, learning/assessment/<taskId>:<step>. Put shared evidence and evidenceRefs alongside knowledgeUpdates in done.result; archive items inherit this shared context. Effects can update_entry, archive_entry (global only), supersede_entry (replacementId, optional scope), dispute_entry, narrow_entry (scope), confirm_entry, save_entry, save_pattern, update_pattern, or no_change. A single learn action uses {context:{evidence,evidenceRefs,scope},effects:[...]}. Connect interpretation to the affected claim; no_change and uncertainty are valid. Compare historical claims with observed actions and completion evidence. Correct obsolete claims even when the task succeeded and no pattern was applied. Injection does not prove usefulness. Excerpts are bounded; use recall by id before replacing a partially shown entry.', 600);
       const perEntry = Math.floor(8400 / Math.max(1, ids.length));
@@ -2318,7 +2351,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * lessons the plan applied are recurrences, ready for promotion.
    */
   private renderPatternApplications(trail: Map<string, PlanPatternUse>, records: TranscriptResponse[], fetched: Map<string, ShownEntry | null>,
-    goalId: string | undefined, recurrences: NonNullable<ReviewTaskExtra['recurrences']>, knowledgeRefs: Record<string, string>): string {
+    goalId: string | undefined, recurrences: NonNullable<ReviewTaskExtra['recurrences']>, knowledgeRefs: Record<string, string>,
+    planRecorded: string[] = []): string {
     const agentUses = new Map<string, Array<{ taskId: string; agent: string; steps: number[]; why: string }>>();
     for (const r of records) for (const p of r.predictions ?? []) for (const d of p.patterns ?? []) {
       const list = agentUses.get(d.id) ?? [];
@@ -2374,6 +2408,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       if (governed.length) out.push(`  predictions in the tasks it governed: ${tally.held} held, ${tally.missed} missed, ${tally.unclear} unclear, ${tally.unread} not read by the agent${misses.length ? `; misses: ${misses.join(' | ')}` : ''}`);
       const recorded = (pattern?.learning?.applications ?? []).filter(a => (goalId && a.id === `${goalId}:${id}`) || records.some(r => a.id.startsWith(`${r.taskId}:`)));
+      if (goalId && recorded.some(a => a.id === `${goalId}:${id}`)) planRecorded.push(id);
       out.push(`  recorded applications: ${recorded.length ? recorded.map(a => `${a.id === `${goalId}:${id}` ? 'plan' : a.id.split(':')[0]} (${a.verdict})`).join(', ') : 'none captured'}`);
       lines.push(out.join('\n'));
     }
@@ -2408,8 +2443,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       evidenceTaskIds: briefing.evidenceTaskIds ?? [] });
     const refs: Record<string, string> = {};
     const recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [];
-    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), { ...briefing, goalId }, recurrences);
+    const planRecorded: string[] = [];
+    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), { ...briefing, goalId }, recurrences, planRecorded);
     this.taskExtras.get(taskId)!.knowledgeRefs = refs;
+    if (await this.getKbId()) this.taskExtras.get(taskId)!.planApplicationsRecorded = planRecorded;
     if (recurrences.length) (this.taskExtras.get(taskId)!.recurrences ??= []).push(...recurrences);
     try {
       const { ticketId } = await this.request<{ ticketId: string }>(
