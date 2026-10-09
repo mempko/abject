@@ -19,6 +19,9 @@ import { WasmAbject } from './wasm-abject.js';
 import { storeWasmModule } from '../sandbox/wasm-module-store.js';
 import { extractWasmManifest } from '../sandbox/wasm-instance.js';
 
+/** DialogBroker's reply to `askPerson`: the person picked this option. */
+const answer = (option: string) => ({ answered: true, confirmed: true, option });
+
 class Endpoint extends Abject {
   constructor(name: string) {
     super({ manifest: { name, version: '1', description: 'Review regression fixture',
@@ -69,8 +72,8 @@ test('permission-rule mutations require receiver-owned approval, even for direct
     assert.equal((await caller.call(broker.id, 'addRule', { rule })).success, false, 'no dialog means no authority');
     let decision = 'deny';
     const prompts: any[] = [];
-    const settings = new Endpoint('GlobalSettings');
-    settings.on('showPermissionPrompt', m => { prompts.push(m); return { decision }; });
+    const settings = new Endpoint('DialogBroker');
+    settings.on('askPerson', m => { prompts.push(m); return answer(decision); });
     await f.add(settings);
     assert.equal((await caller.call(broker.id, 'addRule', { rule })).success, false);
     assert.deepEqual(await caller.call(broker.id, 'listRules'), []);
@@ -95,21 +98,21 @@ test('queued rule approvals cannot overwrite a rule changed while awaiting appro
   try {
     const caller = await f.add(new Endpoint('Editor'));
     const broker = await f.add(new HeadlessBroker());
-    const settings = await f.add(new Endpoint('GlobalSettings'));
-    settings.on('showPermissionPrompt', () => ({ decision: 'approve_rule_change' }));
+    const settings = await f.add(new Endpoint('DialogBroker'));
+    settings.on('askPerson', () => answer('approve_rule_change'));
     const rule = { kind: 'exact', caller: '*', command: 'initial command', allow: true };
     await caller.call(broker.id, 'addRule', { rule });
-    const approvals: Array<(value: { decision: string }) => void> = [];
-    settings.on('showPermissionPrompt', () => new Promise(resolve => { approvals.push(resolve); }));
+    const approvals: Array<(value: ReturnType<typeof answer>) => void> = [];
+    settings.on('askPerson', () => new Promise(resolve => { approvals.push(resolve); }));
     const first = caller.call(broker.id, 'updateRule', { index: 0, rule: { ...rule, command: 'first edit' } });
     const second = caller.call(broker.id, 'updateRule', { index: 0, rule: { ...rule, command: 'second edit' } });
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(approvals.length, 1, 'only one dialog owns approval at a time');
-    approvals[0]({ decision: 'approve_rule_change' });
+    // Both questions are open at once (a terminal lists and answers either);
+    // whichever is approved second finds the rule it would replace gone.
+    for (let i = 0; i < 200 && approvals.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(approvals.length, 2, 'both changes wait on the person at once');
+    approvals[0](answer('approve_rule_change'));
     assert.equal((await first).success, true);
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(approvals.length, 2);
-    approvals[1]({ decision: 'approve_rule_change' });
+    approvals[1](answer('approve_rule_change'));
     assert.equal((await second).success, false);
     assert.equal((await caller.call(broker.id, 'listRules'))[0].command, 'first edit');
   } finally { await f.stop(); }

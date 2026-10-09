@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
@@ -30,7 +31,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - uses: pnpm/action-setup@v4
         with:
@@ -39,16 +40,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # The app carries the `abject` command too (dist-cli, built by
+      # incarnate), run by the app's own binary.
       - name: Build desktop app
         env:
           GH_TOKEN: ${{ github.token }}
         run: ${{ matrix.cmd }}
-
-      # commune, the terminal client — a single self-contained executable
-      # (Node SEA). Companion to the desktop app: it connects to the running
-      # app's CLI gateway and does nothing without it.
-      - name: Package terminal client
-        run: pnpm distill
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -62,11 +59,94 @@ jobs:
             release/*.zip
             release/*.blockmap
             release/latest*.yml
-            dist-cli/abject-commune-*
           if-no-files-found: error
 
+  # The headless edition: the `abject` command with its own backend and no
+  # display, one archive per platform (scripts/package-headless.mjs). Its
+  # binary is a copy of the runner's Node, and node-datachannel and node-pty
+  # are native, so each platform builds on its own runner.
+  headless:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-latest
+            target: mac-arm64
+          - os: macos-15-intel
+            target: mac-x64
+          - os: windows-latest
+            target: win-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: pnpm install
+
+      - name: Package headless edition
+        run: pnpm incarnate:headless
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-${{ matrix.target }}
+          path: |
+            release/abject-*.tar.gz
+            release/abject-*.zip
+            release/abject-*.sha256
+          if-no-files-found: error
+
+  # The same edition as a container image: ghcr.io/<owner>/abject:<version>
+  # and :latest, for linux/amd64 and linux/arm64.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Image name
+        id: image
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner}/abject" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+
   release:
-    needs: build
+    needs: [build, headless]
     runs-on: ubuntu-latest
 
     steps:
@@ -91,9 +171,8 @@ jobs:
           # (old tags carried just "vX.Y.Z") fall back to auto-notes.
           git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
           notes="$(git tag -l --format='%(contents)' "$tag")"
-          # The build job uploads from two roots (release/, dist-cli/), so
-          # the merged artifact keeps that directory structure — collect the
-          # files themselves. mapfile keeps any name with spaces intact.
+          # Collect the files themselves, wherever the merged artifacts put
+          # them. mapfile keeps any name with spaces intact.
           mapfile -t assets < <(find artifacts -type f)
           if [ "$(printf '%s' "$notes" | wc -c)" -gt 40 ]; then
             printf '%s\n' "$notes" > /tmp/release-notes.md

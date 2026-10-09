@@ -43,7 +43,7 @@ class HeadlessChat extends Chat {
   constructor() {
     super();
     const self = this as any;
-    for (const method of ['enterGoalControls', 'exitGoalControls', 'removeActivityBubble', 'removeWelcomeState', 'appendBubble']) self[method] = async () => {};
+    self.appendMessage = () => {};
     self.scheduleActivityRefresh = () => {};
     self.schedulePersist = () => {};
   }

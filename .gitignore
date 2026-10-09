@@ -29,3 +29,4 @@ site/.astro/
 
 # Local demo assets
 site/abject_demo.webm
+packaging/out/

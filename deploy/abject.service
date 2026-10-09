@@ -1,7 +1,8 @@
-# systemd unit for the Abject headless server.
-# Install: see README.md in this directory.
+# systemd unit for the Abject headless edition, machine-wide.
+# Install: see README.md in this directory. (For one person's login session,
+# `abject service install` writes a user unit instead.)
 [Unit]
-Description=Abject server
+Description=Abject (headless)
 Wants=network-online.target
 After=network-online.target
 
@@ -10,7 +11,7 @@ Type=simple
 User=abject
 Group=abject
 EnvironmentFile=/etc/abject/abject.env
-ExecStart=/opt/abject/bin/abject-server
+ExecStart=/opt/abject/abject serve
 WorkingDirectory=/var/lib/abject
 StateDirectory=abject
 Restart=on-failure

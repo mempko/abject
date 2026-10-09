@@ -37,7 +37,6 @@ import type {
   AudioVoiceSpec,
 } from './ws-protocol.js';
 import { validateSceneOps, normalizeSceneOps, SCENE_NODE_KINDS, RAIL_Z_THRESHOLD, parseDraggable, SCREEN_ANCHORS, isScreenAnchor, type ScreenAnchor, type SceneOp, type SceneTheme } from '../src/ui/gl/scene-types.js';
-import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
 import { WebSocketUITransport } from './ui-transport.js';
 import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
@@ -379,8 +378,6 @@ export class BackendUI extends Abject {
   private lastActionClientId?: string;
   private lastMonitorMoveTime = 0;
   private activeWorkspaceId?: string;
-  private authConfig?: AuthConfig;
-  private sessionStore?: SessionStore;
   /** Font metrics from frontend: font -> char -> pixel width */
   private fontMetrics: Map<string, Map<string, number>> = new Map();
 
@@ -1518,27 +1515,11 @@ export class BackendUI extends Abject {
       this.destroyDecorationsForObject(objectId);
     });
 
-    this.on('updateAuth', async (msg: AbjectMessage) => {
-      const { enabled, username, password } = msg.payload as {
-        enabled: boolean;
-        username: string;
-        password: string;
-      };
-      if (!this.authConfig || !this.sessionStore) return false;
-
-      const changed = this.authConfig.enabled !== enabled
-        || this.authConfig.username !== username
-        || this.authConfig.password !== password;
-
-      this.authConfig.enabled = enabled;
-      this.authConfig.username = username;
-      this.authConfig.password = password;
-
-      if (changed) {
-        this.sessionStore.clearAll();
-        this.disconnectFrontend();
-        log.info(`Auth config updated (enabled=${enabled}), sessions cleared, frontend disconnected`);
-      }
+    // The login changed (AuthGate holds it and has already cleared the
+    // sessions): browser clients reconnect and go through the gate again.
+    this.on('signOutClients', async () => {
+      this.disconnectFrontend();
+      log.info('Login changed: frontend clients signed out');
       return true;
     });
 
@@ -2186,15 +2167,6 @@ IMPORTANT:
   }
 
   // ── Auth gate ───────────────────────────────────────────────────────
-
-  /**
-   * Store references to the shared AuthConfig and SessionStore so
-   * the `updateAuth` handler can mutate them at runtime.
-   */
-  setAuthGate(config: AuthConfig, sessions: SessionStore): void {
-    this.authConfig = config;
-    this.sessionStore = sessions;
-  }
 
   /**
    * Force-disconnect all frontend WebSockets.

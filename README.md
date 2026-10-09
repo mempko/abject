@@ -128,8 +128,11 @@ pnpm scry                       # http://localhost:5174
 # Start a local signaling server (optional, signal.abject.world is used by default)
 pnpm whisper                    # :7720
 
-# Chat with the system from your terminal (optional, needs awaken running)
-pnpm commune                    # connects to ws://localhost:7723
+# Chat with the system from your terminal (optional, waits for awaken)
+pnpm abject                     # connects to ws://localhost:7723
+
+# Or run with no display at all: the headless edition
+pnpm awaken:headless            # then pnpm abject in another terminal
 ```
 
 | Command | What it does |
@@ -138,26 +141,41 @@ pnpm commune                    # connects to ws://localhost:7723
 | `pnpm awaken` | Start the Node.js backend where all Abjects live |
 | `pnpm scry` | Start the thin browser client (Canvas UI over WebSocket) |
 | `pnpm whisper` | Start a local signaling server (optional, `signal.abject.world` is used by default) |
-| `pnpm commune` | Terminal client: chat with your Abjects from a tabbed TUI |
-| `pnpm incarnate:server` | Package the headless server (no desktop) as a tarball with a systemd unit; see [deploy/README.md](deploy/README.md) |
+| `pnpm abject` | The `abject` command: chat with your Abjects from a tabbed TUI, answer their questions, change settings |
+| `pnpm awaken:headless` | Start the headless edition: the same backend with no display |
+| `pnpm incarnate:headless` | Package the headless edition (the `abject` binary and its backend, nothing to install); see [deploy/README.md](deploy/README.md) |
 
 Three processes. One living system.
 
-### Commune (Terminal Client)
+### abject (The Command Line)
 
-The desktop has a canvas; the terminal gets `commune`. It connects to the
-backend's CLI gateway (`ws://127.0.0.1:7723`) and mirrors the desktop's
-chats: one tab per open chat window, across every workspace at once. New
-chats opened in the GUI appear as tabs live; goals render as a panel with
-the task list and per-agent activity; permission dialogs and toasts reach
-the terminal, and answering a dialog in either place resolves it in both.
-Markdown renders as terminal styling.
+The desktop has a canvas; the terminal gets `abject`. It is a whole way to
+run Abject, not only a view: the headless edition is the same backend with
+no display, and `abject` starts it in the background, walks you through
+setup the first time (a model, what agents may do without asking), and
+connects. Quitting the chat leaves the backend running so goals keep going;
+`abject stop` stops it and `abject service install` starts it at login.
+When the desktop app is running, `abject` talks to it instead (the app ships
+its own copy, Help → Install the abject Command), and both share one data
+directory, so the workspaces are the same either way.
+
+The chat mirrors the desktop's: one tab per open chat, across every
+workspace at once. Chats opened in the GUI appear as tabs live; goals render
+as a panel with the task list and per-agent activity; questions from agents
+(permission prompts, confirmations) and toasts reach the terminal, and
+answering a question in either place resolves it in both. A question waits
+until someone answers it: `/questions` in the chat, or `abject questions`
+and `abject answer N <choice>` from any shell. For a machine nobody watches,
+`abject mode allow|deny` answers requests no rule covers. Markdown renders
+as terminal styling.
 
 Keys are tmux-safe chords: `Ctrl+A` then `c` (open chat picker), `n`/`p`
 or arrows (switch tab), `1`-`9` (jump), `x` (close tab), `w` (list),
-`d` (quit). `Ctrl+A Ctrl+A` jumps to line start; set `COMMUNE_PREFIX` to
+`d` (quit). `Ctrl+A Ctrl+A` jumps to line start; set `ABJECT_PREFIX` to
 rebind. Every action also exists as a slash command (`/help` lists them),
 and `--plain` gives a line-oriented REPL for pipes and dumb terminals.
+`abject help` lists the commands (`status`, `logs`, `setup`, `doctor`,
+`update`, `settings get|set`, `serve`, ...).
 
 Settings work from the terminal too. `/settings` opens every setting the
 Settings window has (AI keys and tiers, login, filesystem, shell, web,
@@ -177,13 +195,14 @@ Changes go through the same Abject that serves the Settings window, so the
 window repaints when the terminal changes something and the other way
 round.
 
-`commune` is a companion, not a standalone: it requires a running Abject
-desktop app (or `pnpm awaken` backend) on the same machine, and speaks
-only to it. If the app has password protection enabled, `commune` prompts
-for the same credentials and shares the same session tokens as the browser
-client. Packaged single-file executables for Linux, Windows, and macOS
-ship with every [release](https://github.com/mempko/abject/releases) —
-no Node install needed.
+On the same machine, `abject` gets in with the owner token the backend
+writes into its data directory. From elsewhere (`abject --url
+ws://host:7723`, through an SSH tunnel), it asks for the login set in
+settings and shares the browser client's session tokens. Install it with
+one line (`curl -fsSL https://abject.world/install.sh | sh`, or
+`irm https://abject.world/install.ps1 | iex` on Windows); every
+[release](https://github.com/mempko/abject/releases) also carries the
+archives, and a container image is at `ghcr.io/mempko/abject`.
 
 ### Incarnation (Desktop App)
 
@@ -204,7 +223,7 @@ pnpm incarnate:all
 | `pnpm incarnate:<platform>` | Package as a standalone Electron desktop app |
 | `pnpm bind` | Compile the server bundle only |
 | `pnpm etch` | Compile the client bundle only |
-| `pnpm distill` | Package `commune` as a single self-contained terminal executable for the current platform |
+| `pnpm distill` | Bundle the `abject` command (`dist-cli/abject.mjs`), which the desktop app and the headless edition both ship |
 
 Requires Electron. Cross-compilation from Linux to Windows works out of the
 box. macOS builds from Linux produce unsigned binaries (code signing requires

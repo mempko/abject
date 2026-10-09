@@ -133,15 +133,19 @@ Per-workspace Abjects are spawned automatically for every workspace by `Workspac
 
 1. **Create the Abject** in `src/objects/` (or `src/objects/capabilities/` for capabilities)
 2. **Register its constructor in three places:**
-   - `server/index.ts` — `runtime.objectFactory.registerConstructor('MyAbject', () => new MyAbject())`
-   - `workers/abject-worker-node.ts` — import the class and add `constructors.set('MyAbject', () => new MyAbject())`
-   - (Optional) Mark worker-eligible in `server/index.ts` if it should run in workers
+   - `server/boot.ts` — `runtime.objectFactory.registerConstructor('MyAbject', () => new MyAbject())`
+     (an Abject with windows: `server/ui-layer.ts`, so the headless edition never loads it)
+   - `workers/core-constructors.ts` — import the class and add `map.set('MyAbject', () => new MyAbject())`
+     (an Abject with windows: `workers/ui-constructors.ts`)
+   - (Optional) Mark worker-eligible in the `workerEligible` list in `server/boot.ts` (or `server/ui-layer.ts`) if it should run in workers
 3. **Add to workspace spawn list** in `src/objects/workspace-manager.ts`:
    - `INFRA_OBJECTS` — for non-UI Abjects (always spawned, even for inactive workspaces)
    - `UI_OBJECTS` — for Abjects with windows/UI (only spawned for active workspaces)
 4. **Export** from `src/index.ts`
 
-**Critical**: If you register the constructor in `server/index.ts` but forget `workers/abject-worker-node.ts`, the Abject will fail to spawn silently when workers are enabled (the default). Both files must have the constructor.
+**Critical**: If you register the constructor on the main thread but forget the worker table (`workers/core-constructors.ts` or `ui-constructors.ts`), the Abject will fail to spawn silently when workers are enabled (the default). Both must have the constructor.
+
+A non-UI Abject must not import widget or window modules: the headless edition's bundle check fails the build. Ask `InstanceInfo` whether there is a display, and ask the person through `this.confirm()` / `this.prompt()` (DialogBroker), which reach a window or a terminal.
 
 ## Subdirectories
 

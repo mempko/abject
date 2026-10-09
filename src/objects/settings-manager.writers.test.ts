@@ -120,6 +120,12 @@ async function harness(): Promise<Harness> {
   ui.hook('*', () => ({}));
   reg.registerObject(ui.id, ui.manifest, undefined, undefined, undefined, 'UIServer');
 
+  // Login and sessions belong to AuthGate; SettingsManager hands auth changes to it.
+  const authGate = new Stub('AuthGate', 'Login and session stand-in');
+  await authGate.init(bus);
+  authGate.hook('*', () => ({}));
+  reg.registerObject(authGate.id, authGate.manifest, undefined, undefined, undefined, 'AuthGate');
+
   // discoverDep caches its answer (including a miss), so every dependency
   // must be registered before SettingsManager.init runs requireDep.
   const settings = new SettingsManager();

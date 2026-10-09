@@ -20,7 +20,10 @@ await build({
   format: 'esm',
   platform: 'node',
   target: 'node20',
-  external: [...nodeExternals, 'electron'],
+  // ws ships in the app's node_modules (electron-builder.yml): the main
+  // process reaches a backend's CLI gateway with it (cli/backend.ts), and as
+  // CommonJS it cannot be inlined into this ESM bundle.
+  external: [...nodeExternals, 'electron', 'ws'],
   sourcemap: true,
 });
 

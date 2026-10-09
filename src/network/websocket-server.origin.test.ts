@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 import { NodeWebSocketServer, type WsServerConfig } from './websocket-server.js';
 import { allowOrigins, refuseAllOrigins } from './origin-policy.js';
-import { CommuneClient } from '../../cli/client.js';
+import { AbjectClient } from '../../cli/client.js';
 
 const CLIENT_ORIGIN = 'http://127.0.0.1:5174';
 
@@ -73,7 +73,7 @@ test('commune still completes its handshake with a gateway that refuses every pa
   // As CliServer is configured, answering the handshake as it does with auth off.
   const { server, port } = await startServer({ allowOrigin: refuseAllOrigins });
   server.onConnection((ws) => ws.send(JSON.stringify({ type: 'authNotRequired' })));
-  const client = new CommuneClient({
+  const client = new AbjectClient({
     url: `ws://127.0.0.1:${port}`,
     getCredentials: async () => null,
     onEvent: () => {},

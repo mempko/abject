@@ -1,5 +1,5 @@
 /**
- * Minimal hand-rolled ANSI terminal UI for commune: alternate screen with a
+ * Minimal hand-rolled ANSI terminal UI for the `abject` command: alternate screen with a
  * scrollable message area, a tmux-style tab bar, and an editable input line.
  *
  * Deliberately avoids every key chord tmux or screen intercepts: navigation

@@ -15,6 +15,7 @@ import { Abject } from '../core/abject.js';
 import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { require as contractRequire } from '../core/contracts.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
@@ -29,6 +30,11 @@ import type { UpdateStatus } from './app-updater.js';
 import type { SettingsBySection, SettingsSectionId, TierPreset as ManagedPreset } from './settings-manager.js';
 
 const log = new Log('GlobalSettings');
+
+/** A permission prompt closed by its window's close button: the person declined. */
+const DECLINED = '\u0000declined';
+/** A permission prompt taken down because a terminal answered it first. */
+const DISMISSED = '\u0000dismissed';
 
 /**
  * The settings window's tabs, in tab-bar order. Updates shows only in the
@@ -50,6 +56,9 @@ const UPDATE_INSTALL_NOTE: Record<UpdateStatus['installKind'], string> = {
 
 /** Content width of a settings card, for sizing word-wrapped labels. */
 const SETTINGS_CARD_TEXT_WIDTH = 440;
+
+/** PermissionBroker's prompt modes, in the order the Permissions tab lists them. */
+const PROMPT_MODE_OPTIONS: ReadonlyArray<'ask' | 'allow' | 'deny'> = ['ask', 'allow', 'deny'];
 
 /** Where a package directory comes from, as the Packages tab says it. */
 const PACKAGE_DIR_ORIGINS: Record<PackageDirView['origin'], string> = {
@@ -435,6 +444,9 @@ export class GlobalSettings extends Abject {
   /** Bus-level capability enforcement for scriptable objects. */
   private capabilityEnforcement: 'off' | 'warn' | 'enforce' = 'warn';
   private capEnforceSelectId?: AbjectId;
+  /** What a request no rule decides gets: ask, allow once, or deny (PermissionBroker's prompt mode). */
+  private promptMode: 'ask' | 'allow' | 'deny' = 'ask';
+  private promptModeSelectId?: AbjectId;
 
   private unmasked: Set<AbjectId> = new Set();
 
@@ -579,6 +591,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     this.webDeniedDomains = [...m.web.deniedDomains];
     this.webPrivateHosts = [...m.web.privateHosts];
     this.capabilityEnforcement = m.objects.capabilityEnforcement;
+    this.promptMode = m.permissions.mode;
     await this.loadPresetList();
   }
 
@@ -615,11 +628,11 @@ The settings themselves live in SettingsManager, which this window loads from an
     });
 
     this.on('windowCloseRequested', async (msg: AbjectMessage) => {
-      // Closing an open permission prompt answers it: deny. Every other
-      // close (the settings window) hides the settings window as before.
+      // Closing an open permission prompt declines it. Every other close
+      // (the settings window) hides the settings window as before.
       const { windowId } = (msg.payload ?? {}) as { windowId?: AbjectId };
       if (windowId && windowId === this._promptWindowId) {
-        this._pendingPermissionPrompt?.resolve('deny');
+        this._pendingPermissionPrompt?.resolve(DECLINED);
         return;
       }
       await this.hide();
@@ -629,51 +642,32 @@ The settings themselves live in SettingsManager, which this window loads from an
       return { visible: !!this.windowId };
     });
 
-    // Put a question to the user on PermissionBroker's behalf.
-    //
-    // The broker owns policy and decides what needs asking at all; this object
-    // owns the window. The buttons arrive already grouped, because which
-    // grants are meaningful depends on the project and the command analysis,
-    // and neither of those is a settings-window concern.
-    this.on('showPermissionPrompt', async (msg: AbjectMessage) => {
-      const p = msg.payload as {
-        type: string; title: string; description: string; resource: string;
-        detail?: string[];
+    // DialogBroker hands this window the permission questions to draw, one at
+    // a time (the options kind). PermissionBroker decides what needs asking
+    // and builds the grouped answers; DialogBroker owns the question and who
+    // may answer it; this object only draws it and reports the click.
+    this.on('presentDialog', async (m: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(m))) return;
+      const d = m.payload as {
+        dialogId: string; title: string; message: string; resource?: string; detail?: string[];
         groups?: Array<{ label: string; options: Array<{ id: string; label: string; tone?: string }> }>;
       };
-      if (p.type === 'skill_shell') {
-        const skillName = (msg.payload as { skillName?: string }).skillName;
-        if (skillName) return this.showSkillPermissionPrompt(skillName, p.resource, p.description);
-      }
-      return this.showPermissionPrompt({
-        taskId: (msg.payload as { taskId?: string }).taskId,
-        type: p.type,
-        title: p.title || 'Permission',
-        description: p.description || '',
-        resource: p.resource || '',
-        detail: p.detail ?? [],
-        groups: p.groups ?? [{ label: 'This request', options: [
-          { id: 'accept_once', label: 'Allow once' },
-          { id: 'deny', label: 'Deny' },
-        ]}],
+      contractRequire(typeof d?.dialogId === 'string' && d.dialogId.length > 0, 'presentDialog needs a dialogId');
+      void this.presentPermission({
+        dialogId: d.dialogId,
+        title: d.title || 'Permission',
+        description: d.message || '',
+        resource: d.resource || '',
+        detail: d.detail ?? [],
+        groups: d.groups ?? [],
       });
     });
 
-    // Remote answer to the active permission prompt, relayed exclusively by
-    // WidgetManager's respondDialog gate (boot-sealed responder allowlist).
-    // Anything else attempting to answer a permission prompt directly is
-    // refused — this is a security boundary, not a convenience check.
-    this.on('respond', async (m: AbjectMessage) => {
-      if (!this.widgetManagerId || m.routing.from !== this.widgetManagerId) return false;
-      const { dialogId, option, confirmed } = m.payload as {
-        dialogId?: string; option?: string; confirmed?: boolean;
-      };
-      const pending = this._pendingPermissionPrompt;
-      if (!pending) return false;
-      if (dialogId && this._promptDialogId && dialogId !== this._promptDialogId) return false;
-      if (confirmed === false) { pending.resolve('deny'); return true; }
-      if (option && this._promptDecisions.includes(option)) { pending.resolve(option); return true; }
-      return false;
+    // A terminal answered first: take the prompt down without reporting.
+    this.on('dismissDialog', async (m: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(m))) return;
+      const { dialogId } = m.payload as { dialogId?: string };
+      if (dialogId && dialogId === this._promptDialogId) this._pendingPermissionPrompt?.resolve(DISMISSED);
     });
 
     // Handle 'changed' events from widget dependents
@@ -975,6 +969,16 @@ The settings themselves live in SettingsManager, which this window loads from an
       // Web: enabled checkbox
       if (fromId === this.webEnabledCheckboxId && aspect === 'change') {
         this.webEnabled = value as boolean;
+        return;
+      }
+      // Permission prompt mode select: takes effect at once.
+      if (fromId === this.promptModeSelectId && aspect === 'change') {
+        const mode = value as string;
+        if (mode === 'ask' || mode === 'allow' || mode === 'deny') {
+          this.promptMode = mode;
+          const error = await this.saveSection('permissions', { mode });
+          if (error) await this.rejectWith(error);
+        }
         return;
       }
       // Capability enforcement mode select: takes effect at once.
@@ -2743,6 +2747,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     this.webPrivateListId = undefined;
     this.webPrivateRemoveBtnId = undefined;
     this.capEnforceSelectId = undefined;
+    this.promptModeSelectId = undefined;
     this.permsSaveBtnId = undefined;
     this.packagesContainerId = undefined;
     this.pkgListCardId = undefined;
@@ -2966,6 +2971,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     await set(this.shellEnabledCheckboxId, { checked: this.shellEnabled });
     await set(this.webEnabledCheckboxId, { checked: this.webEnabled });
     await set(this.capEnforceSelectId, { selectedIndex: Math.max(0, ['off', 'warn', 'enforce'].indexOf(this.capabilityEnforcement)) });
+    await set(this.promptModeSelectId, { selectedIndex: Math.max(0, PROMPT_MODE_OPTIONS.indexOf(this.promptMode)) });
   }
 
   // ========== TIER PRESETS ==========
@@ -4054,6 +4060,45 @@ The settings themselves live in SettingsManager, which this window loads from an
     }));
     void this.refreshAutonomyStatus();
 
+    // What a request nothing else decides gets. "allow" and "deny" are for
+    // running unattended, when nobody may be at a desktop or a terminal.
+    const promptRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: autoCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, autoCard, 'addLayoutChild', {
+      widgetId: promptRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+    const { widgetIds: [promptLabelId, promptSelectId, promptHintId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Prompts',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'select', windowId: this.windowId, options: [...PROMPT_MODE_OPTIONS],
+          selectedIndex: Math.max(0, PROMPT_MODE_OPTIONS.indexOf(this.promptMode)) },
+        { type: 'label', windowId: this.windowId,
+          text: 'ask waits for you here or in the terminal; allow approves once without asking (dangerous commands still ask); deny refuses.',
+          style: { color: this.theme.textSecondary, fontSize: 11, wordWrap: true } },
+      ]})
+    );
+    this.promptModeSelectId = promptSelectId;
+    await this.request(request(this.id, this.promptModeSelectId, 'addDependent', {}));
+    await this.request(request(this.id, promptRowId, 'addLayoutChild', {
+      widgetId: promptLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 30 },
+    }));
+    await this.request(request(this.id, promptRowId, 'addLayoutChild', {
+      widgetId: promptSelectId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 120, height: 30 },
+    }));
+    await this.request(request(this.id, autoCard, 'addLayoutChild', {
+      widgetId: promptHintId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+
     // ── Filesystem card ──
     const fsCard = await this.sectionCard(cId, 'Filesystem',
       'Where agents may read and write files. Paths outside the allowed list prompt you for approval; read-only mode blocks every write.', 34, true);
@@ -4437,12 +4482,14 @@ The settings themselves live in SettingsManager, which this window loads from an
   // Permission Prompt
   // ═══════════════════════════════════════════════════════════════════
 
-  /** Active permission prompt: resolves when user clicks a button. */
+  /** Active permission prompt: resolves when the person clicks, closes it, or a terminal answers. */
   private _pendingPermissionPrompt?: { resolve: (decision: string) => void };
-  /** Decisions offered by the active prompt (remote respond validates against these). */
-  private _promptDecisions: string[] = [];
+  /** DialogBroker's id for the prompt on screen. */
   private _promptDialogId?: string;
-  private _promptCounter = 0;
+  /** DialogBroker, which hands this window the permission prompts to draw. */
+  private dialogBrokerId?: AbjectId;
+  /** Settles once the prompt on screen has been taken down. */
+  private _promptDone?: Promise<void>;
   private _promptWindowId?: AbjectId;
   /** Button widget -> the decision it stands for, for the active prompt. */
   private _promptButtons = new Map<AbjectId, string>();
@@ -4463,21 +4510,28 @@ The settings themselves live in SettingsManager, which this window loads from an
    *        (a shell line with metacharacters), so only the block half is
    *        offered.
    */
-  private async showPermissionPrompt(opts: {
-    /** The task the question belongs to, so the heartbeat reaches its callers. */
-    taskId?: string;
-    type: string;
+  private async presentPermission(opts: {
+    /** DialogBroker's id for the question. */
+    dialogId: string;
     title: string;
     description: string;
     resource: string;
     detail: string[];
     groups: Array<{ label: string; options: Array<{ id: string; label: string; tone?: string }> }>;
-  }): Promise<{ decision: string }> {
-    if (!this.widgetManagerId) return { decision: 'deny' };
-
-    // Prompts queue at the broker, so arriving here while one is open means
-    // something bypassed it. Refusing is still the safe answer.
-    if (this._pendingPermissionPrompt) return { decision: 'deny' };
+  }): Promise<void> {
+    // The broker presents one at a time, so a second while one is up means the
+    // broker restarted and the first question is gone: take it down first.
+    if (this._pendingPermissionPrompt) this._pendingPermissionPrompt.resolve(DISMISSED);
+    await this._promptDone;
+    if (!this.widgetManagerId) return;
+    this._promptDialogId = opts.dialogId;
+    // Settled before the window is built, so an answer from a terminal that
+    // arrives mid-build still takes the prompt down.
+    const decided = new Promise<string>((resolve) => {
+      this._pendingPermissionPrompt = { resolve };
+    });
+    let finished!: () => void;
+    this._promptDone = new Promise<void>((resolve) => { finished = resolve; });
 
     const WIDTH = 620;
     const MARGIN = 16;
@@ -4606,49 +4660,14 @@ The settings themselves live in SettingsManager, which this window loads from an
       await this.setPromptModal(windowId, true);
       this.windowEffect('pulse', undefined, windowId);
 
-      // Announce to mirroring surfaces (terminal clients) via WidgetManager;
-      // they answer with a `respond` message back to us.
-      const options = groups.flatMap(g => g.options.map(o => ({ id: o.id, label: o.label })));
-      this._promptDecisions = options.map(o => o.id);
-      this._promptDialogId = `perm-${++this._promptCounter}`;
-      try {
-        this.send(request(this.id, this.widgetManagerId, 'announceDialog', {
-          dialogId: this._promptDialogId,
-          kind: 'options',
-          title: opts.title,
-          message: [opts.description, ...opts.detail].join('\n'),
-          resource: opts.resource,
-          options,
-        }));
-      } catch { /* mirroring is best-effort */ }
-
-      // A permission question is the one thing in the system that is allowed
-      // to take as long as it likes. The heartbeat holds open every request
-      // stacked up behind it, all the way back to the chat that started the
-      // work, so an answer given after a coffee break still lands somewhere.
-      const stopBeating = this.awaitingHuman(`permission: ${opts.title}`, opts.taskId);
-      let decision: string;
-      try {
-        decision = await new Promise<string>((resolve) => {
-          this._pendingPermissionPrompt = { resolve };
-        });
-      } finally {
-        stopBeating();
-      }
-
-      return { decision };
+      // The broker holds the question open, heartbeats for the asker, and
+      // takes a terminal's answer too; this window waits only for its click.
+      const decision = await decided;
+      if (decision !== DISMISSED) await this.reportPermission(opts.dialogId, decision);
     } finally {
       // Clean up prompt window
       this._pendingPermissionPrompt = undefined;
-      if (this._promptDialogId && this.widgetManagerId) {
-        try {
-          this.send(request(this.id, this.widgetManagerId, 'retractDialog', {
-            dialogId: this._promptDialogId,
-          }));
-        } catch { /* best effort */ }
-      }
       this._promptDialogId = undefined;
-      this._promptDecisions = [];
       this._promptButtons.clear();
       await this.setPromptModal(this._promptWindowId, false);
       if (this._promptWindowId && this.widgetManagerId) {
@@ -4662,7 +4681,25 @@ The settings themselves live in SettingsManager, which this window loads from an
       this._promptResourceBlockId = undefined;
       this._promptResourceLayoutId = undefined;
       this._promptRect = undefined;
+      finished();
     }
+  }
+
+  /** Tell DialogBroker what the person clicked. */
+  private async reportPermission(dialogId: string, decision: string): Promise<void> {
+    if (!this.dialogBrokerId) return;
+    const answer = decision === DECLINED ? { confirmed: false } : { confirmed: true, option: decision };
+    try {
+      await this.request(request(this.id, this.dialogBrokerId, 'respond', { dialogId, ...answer }));
+    } catch (err) {
+      log.warn(`could not report the permission answer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Accept presentDialog/dismissDialog only from DialogBroker itself. */
+  private async fromDialogBroker(m: AbjectMessage): Promise<boolean> {
+    this.dialogBrokerId = await this.resolveDep('DialogBroker', this.dialogBrokerId);
+    return !!this.dialogBrokerId && m.routing.from === this.dialogBrokerId;
   }
 
   /** Small caption introducing a group of prompt buttons. */
@@ -4838,132 +4875,6 @@ The settings themselves live in SettingsManager, which this window loads from an
       for (const cmd of record[kind]) entries.push(`${objectName}: ${cmd}`);
     }
     return entries.sort();
-  }
-
-  private async showSkillPermissionPrompt(
-    skillName: string,
-    cmdName: string,
-    description: string,
-  ): Promise<{ decision: string }> {
-    if (!this.widgetManagerId) return { decision: 'deny' };
-    if (this._pendingPermissionPrompt) return { decision: 'deny' };
-
-    try {
-      const windowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId, 'createWindowAbject', {
-          title: 'Skill Permission',
-          rect: { x: 300, y: 200, width: 440, height: 180 },
-          resizable: false,
-          chromeless: false,
-        })
-      );
-      this._promptWindowId = windowId;
-
-      const layoutId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId, 'createVBox', {
-          windowId,
-          margins: { top: 16, right: 16, bottom: 16, left: 16 },
-          spacing: 12,
-        })
-      );
-
-      const { widgetIds: [descLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId, 'create', { specs: [
-          { type: 'label', windowId, text: description,
-            style: { color: this.theme.textPrimary, fontSize: 14, wordWrap: true } },
-        ]})
-      );
-      await this.request(request(this.id, layoutId, 'addLayoutChild', {
-        widgetId: descLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 40 },
-      }));
-
-      const { widgetIds: [resLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId, 'create', { specs: [
-          { type: 'label', windowId, text: `"${cmdName}"`,
-            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'mono' } },
-        ]})
-      );
-      await this.request(request(this.id, layoutId, 'addLayoutChild', {
-        widgetId: resLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 24 },
-      }));
-
-      // Two buttons only for skills: Allow / Deny
-      const btnRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId, 'createHBox', {
-          windowId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, layoutId, 'addLayoutChild', {
-        widgetId: btnRowId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 36 },
-      }));
-
-      const { widgetIds: [allowBtnId, denyBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId, 'create', { specs: [
-          { type: 'button', windowId, text: 'Allow', style: { fontSize: 12, color: this.theme.statusSuccess } },
-          { type: 'button', windowId, text: 'Deny', style: { fontSize: 12, color: this.theme.statusError } },
-        ]})
-      );
-
-      this._promptButtons.clear();
-      this._promptButtons.set(allowBtnId, 'accept_always');
-      this._promptButtons.set(denyBtnId, 'deny');
-
-      for (const btnId of [allowBtnId, denyBtnId]) {
-        await this.request(request(this.id, btnId, 'addDependent', {}));
-        await this.request(request(this.id, btnRowId, 'addLayoutChild', {
-          widgetId: btnId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-      }
-
-      // Modal for the question's lifetime, with one pulse for attention.
-      await this.setPromptModal(windowId, true);
-      this.windowEffect('pulse', undefined, windowId);
-
-      const stopBeating = this.awaitingHuman(`permission: ${skillName}`);
-      let decision: string;
-      try {
-        decision = await new Promise<string>((resolve) => {
-          this._pendingPermissionPrompt = { resolve };
-        });
-      } finally {
-        stopBeating();
-      }
-
-      // Allowed: SettingsManager records the grant and applies it.
-      if (decision === 'accept_always' || decision === 'accept') {
-        this.lastOwnSave = { section: 'shell', at: Date.now() };
-        try {
-          await this.request(request(this.id, this.settingsManagerId!, 'addSkillGrant', { skillName, command: cmdName }));
-        } catch (err) {
-          log.warn(`Could not record the grant for ${skillName}: ${settingsError(err)}`);
-        }
-        return { decision: 'accept' };
-      }
-
-      return { decision: 'deny' };
-    } finally {
-      this._pendingPermissionPrompt = undefined;
-      await this.setPromptModal(this._promptWindowId, false);
-      if (this._promptWindowId && this.widgetManagerId) {
-        try {
-          await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
-            windowId: this._promptWindowId,
-          }));
-        } catch { /* best effort */ }
-      }
-      this._promptWindowId = undefined;
-      this._promptButtons.clear();
-    }
   }
 
   /**

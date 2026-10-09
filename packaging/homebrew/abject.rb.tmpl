@@ -1,0 +1,49 @@
+# Homebrew formula for the headless edition (the `abject` command).
+# Filled in by scripts/fill-manifests.mjs from a release's .sha256 files;
+# publish the result to a tap (mempko/homebrew-abject) as Formula/abject.rb.
+class Abject < Formula
+  desc "Distributed object system where agents work through messages between objects"
+  homepage "https://abject.world"
+  version "{{version}}"
+  license "{{license}}"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-mac-arm64.tar.gz"
+      sha256 "{{sha256_mac_arm64}}"
+    end
+    on_intel do
+      url "https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-mac-x64.tar.gz"
+      sha256 "{{sha256_mac_x64}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-linux-arm64.tar.gz"
+      sha256 "{{sha256_linux_arm64}}"
+    end
+    on_intel do
+      url "https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-linux-x64.tar.gz"
+      sha256 "{{sha256_linux_x64}}"
+    end
+  end
+
+  def install
+    # The binary finds its lib/ beside itself, so the directory stays whole.
+    libexec.install Dir["*"]
+    bin.install_symlink libexec/"abject"
+  end
+
+  def caveats
+    <<~EOS
+      Run `abject` to set up and start chatting. The backend keeps running in
+      the background; `abject stop` stops it, and `abject service install`
+      starts it at login. Update with `brew upgrade abject`.
+    EOS
+  end
+
+  test do
+    assert_equal version.to_s, shell_output("#{bin}/abject version").strip
+  end
+end

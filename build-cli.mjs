@@ -1,71 +1,38 @@
 /**
- * Package the commune terminal client as a single self-contained executable
- * for the current platform, using Node's Single Executable Application
- * support: esbuild bundles cli/commune.ts into one CJS file, which is
- * injected into a copy of the running Node binary.
+ * Bundle the `abject` command into one ESM file: `pnpm distill`.
  *
- *   pnpm distill  ->  dist-cli/abject-commune-<platform>-<arch>[.exe]
+ *   dist-cli/abject.mjs
  *
- * The result needs no Node install on the user's machine. It is a companion
- * to the desktop app: it connects to the CLI gateway (ws://127.0.0.1:7723)
- * of a running Abject backend.
+ * Self-contained apart from Node's built-ins (ws is bundled in), so it runs
+ * from wherever it is copied: the headless edition's lib/cli/ (run by the
+ * `abject` single-executable launcher, scripts/sea-bootstrap.cjs), and the
+ * desktop app's resources/cli/ (run by the app's own Electron binary as Node).
  */
 
 import { build } from 'esbuild';
-import { execFileSync } from 'node:child_process';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { builtinModules } from 'node:module';
+import { readFileSync, mkdirSync } from 'node:fs';
 
-const outDir = 'dist-cli';
-fs.mkdirSync(outDir, { recursive: true });
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
-// 1) Bundle the TUI into a single CJS file (SEA requires CommonJS).
+mkdirSync('dist-cli', { recursive: true });
+
 await build({
-  entryPoints: { commune: 'cli/commune.ts' },
-  outfile: path.join(outDir, 'commune.cjs'),
+  entryPoints: { abject: 'cli/abject.ts' },
+  outdir: 'dist-cli',
+  outExtension: { '.js': '.mjs' },
   bundle: true,
-  format: 'cjs',
+  format: 'esm',
   platform: 'node',
-  target: 'node20',
+  target: 'node22',
   // ws's optional native accelerators; absent at runtime, guarded by try/catch
-  external: ['bufferutil', 'utf-8-validate'],
+  external: [...builtinModules, ...builtinModules.map((m) => `node:${m}`), 'bufferutil', 'utf-8-validate'],
+  define: { __ABJECT_VERSION__: JSON.stringify(version) },
+  banner: {
+    // ws is CommonJS and requires Node built-ins; give the ESM bundle a require.
+    js: `import { createRequire as __abjectCreateRequire } from 'node:module'; const require = __abjectCreateRequire(import.meta.url);`,
+  },
   sourcemap: false,
 });
 
-// 2) Generate the SEA preparation blob.
-const seaConfig = {
-  main: path.join(outDir, 'commune.cjs'),
-  output: path.join(outDir, 'sea-prep.blob'),
-  disableExperimentalSEAWarning: true,
-};
-fs.writeFileSync(path.join(outDir, 'sea-config.json'), JSON.stringify(seaConfig, null, 2));
-execFileSync(process.execPath, ['--experimental-sea-config', path.join(outDir, 'sea-config.json')], { stdio: 'inherit' });
-
-// 3) Copy the Node binary and inject the blob.
-const platform = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'win' : 'linux';
-const binaryName = `abject-commune-${platform}-${process.arch}${platform === 'win' ? '.exe' : ''}`;
-const binaryPath = path.join(outDir, binaryName);
-fs.copyFileSync(process.execPath, binaryPath);
-fs.chmodSync(binaryPath, 0o755);
-
-if (platform === 'mac') {
-  execFileSync('codesign', ['--remove-signature', binaryPath], { stdio: 'inherit' });
-}
-
-const postjectArgs = [
-  binaryPath,
-  'NODE_SEA_BLOB',
-  path.join(outDir, 'sea-prep.blob'),
-  '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
-];
-if (platform === 'mac') {
-  postjectArgs.push('--macho-segment-name', 'NODE_SEA');
-}
-execFileSync('pnpm', ['exec', 'postject', ...postjectArgs], { stdio: 'inherit', shell: platform === 'win' });
-
-if (platform === 'mac') {
-  // Re-sign ad hoc so macOS will execute the modified binary.
-  execFileSync('codesign', ['--sign', '-', binaryPath], { stdio: 'inherit' });
-}
-
-console.log(`Terminal client packaged -> ${binaryPath}`);
+console.log('CLI bundle complete → dist-cli/abject.mjs');

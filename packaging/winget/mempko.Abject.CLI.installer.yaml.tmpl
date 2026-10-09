@@ -1,0 +1,16 @@
+# winget installer manifest for the headless edition. Submit with the
+# version and locale manifests beside it to microsoft/winget-pkgs under
+# manifests/m/mempko/Abject/CLI/{{version}}/.
+PackageIdentifier: mempko.Abject.CLI
+PackageVersion: {{version}}
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: abject-{{version}}-win-x64\abject.exe
+    PortableCommandAlias: abject
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-win-x64.zip
+    InstallerSha256: {{SHA256_WIN_X64}}
+ManifestType: installer
+ManifestVersion: 1.6.0

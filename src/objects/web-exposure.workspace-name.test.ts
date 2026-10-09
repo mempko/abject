@@ -16,17 +16,17 @@ test('the workspace name is looked up again until WorkspaceManager lists the wor
   const exposure = new WebExposure();
   let listed = false;
   const any = exposure as unknown as {
-    widgetManagerId: string;
     workspaceManagerId: string;
     workspaceName: string;
     request(msg: AbjectMessage): Promise<unknown>;
     ensureWorkspaceId(): Promise<string | undefined>;
   };
-  any.widgetManagerId = 'wm-widgets';
+  // The workspace registry it was spawned into knows its workspace.
+  exposure.setRegistryHint('ws-registry' as never);
   any.workspaceManagerId = 'wm';
   any.request = async (msg: AbjectMessage) => {
     const method = (msg.routing as { method?: string }).method;
-    if (method === 'getObjectWorkspace') return 'ws-1';
+    if (method === 'getWorkspaceId') return 'ws-1';
     if (method === 'listWorkspaces') return listed ? [{ id: 'ws-1', name: 'org-acme' }] : [];
     throw new Error(`unexpected ${method}`);
   };

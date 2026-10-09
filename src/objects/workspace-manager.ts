@@ -18,7 +18,7 @@ import { Abject } from '../core/abject.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from './sidebar.js';
+import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from '../core/dock-layout.js';
 import { namesFromTypeIds, nameFromTypeId } from './exposure-selectors.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
@@ -213,6 +213,8 @@ export function parseInviteLink(link: string): InviteLinkRoute | undefined {
 }
 
 export class WorkspaceManager extends Abject {
+  /** False on an instance with no display (the headless edition): no workspace windows. */
+  private display = true;
   private workspaces: Map<string, WorkspaceInfo> = new Map();
   /**
    * Last loaded persisted records, indexed by id. restoreWorkspace reads this
@@ -744,6 +746,7 @@ export class WorkspaceManager extends Abject {
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+    await this.learnDisplay();
 
     // Re-measure the sidebar dock when a frontend client (re)connects: the
     // dock is sized to the display, and display info is only live once a
@@ -751,6 +754,27 @@ export class WorkspaceManager extends Abject {
     if (this.uiServerId) {
       this.send(request(this.id, this.uiServerId, 'addDependent', {}));
     }
+  }
+
+  /**
+   * Whether this instance has a display, from InstanceInfo. Without one a
+   * workspace brings up its objects and none of its windows: the profiles on
+   * disk keep their UI lists, so the same data opens with its desktop again in
+   * the desktop edition.
+   */
+  private async learnDisplay(): Promise<void> {
+    const infoId = await this.discoverDep('InstanceInfo');
+    if (!infoId) return;
+    try {
+      const info = await this.request<{ display?: boolean }>(request(this.id, infoId, 'getInfo', {}), 5000);
+      if (typeof info?.display === 'boolean') this.display = info.display;
+    } catch { /* keep the default: a display */ }
+    if (!this.display) wsLog.info('No display: workspaces start without their windows');
+  }
+
+  /** A profile's UI objects, or none where there is no display to show them on. */
+  private uiOf(profile: Pick<WorkspaceProfile, 'ui'>): readonly string[] {
+    return this.display ? profile.ui : [];
   }
 
   /**
@@ -837,7 +861,7 @@ export class WorkspaceManager extends Abject {
     precondition(!!profile, `no workspace profile named '${profileName}' (listProfiles)`);
 
     const workspaceId = uuidv4();
-    const info = await this.spawnWorkspaceObjects(workspaceId, name, [...profile!.objects, ...profile!.ui], profile!);
+    const info = await this.spawnWorkspaceObjects(workspaceId, name, [...profile!.objects, ...this.uiOf(profile!)], profile!);
     this.workspaces.set(workspaceId, info);
 
     await this.persistWorkspaceList();
@@ -1833,6 +1857,7 @@ export class WorkspaceManager extends Abject {
           version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
         skipGlobalRegistry: true,
         typeId: wsRegistryTypeId,
+        constructorArgs: { workspaceId },
       })
     );
     const wsRegistryId = wsRegResult.objectId;
@@ -2096,10 +2121,10 @@ export class WorkspaceManager extends Abject {
       uiObjects,
       childTypeIds,
       participants: [],
-      uiSpawned: profile.ui.every((o) => objectsToSpawn.includes(o)),
+      uiSpawned: this.uiOf(profile).every((o) => objectsToSpawn.includes(o)),
       profile: profile.name,
       profileObjects: [...profile.objects],
-      profileUi: [...profile.ui],
+      profileUi: [...this.uiOf(profile)],
     };
   }
 
@@ -2122,7 +2147,7 @@ export class WorkspaceManager extends Abject {
       if (persisted) this.unrestored.set(workspaceId, persisted);
       return;
     }
-    const objectsToSpawn = isActive ? [...profile.objects, ...profile.ui] : profile.objects;
+    const objectsToSpawn = isActive ? [...profile.objects, ...this.uiOf(profile)] : profile.objects;
     const info = await this.spawnWorkspaceObjects(workspaceId, name, objectsToSpawn, profile);
     info.accessMode = accessMode;
     info.whitelist = whitelist;

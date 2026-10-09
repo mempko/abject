@@ -1,12 +1,20 @@
 /**
- * Chat — conversational LLM agent.
+ * Chat — a conversation with the system, as data and behaviour.
  *
- * Provides a chat window where users type natural language requests.
- * Registers with AgentAbject as an agent — AgentAbject drives the
- * think-act-observe state machine, calling back Chat for observe and act.
+ * Registers with AgentAbject as an agent: AgentAbject drives the
+ * think-act-observe loop and calls back here to observe and act. Chat routes
+ * what the person asks into goals, follows those goals through GoalManager,
+ * and keeps the transcript.
+ *
+ * It draws nothing. Everything a person sees of it goes out as events: every
+ * message as `messageAdded` (the terminal gateway, bridges and the chat window
+ * all listen), the title, whether it is working, and (to its window only) the
+ * live activity and composer state. On a desktop `show` spawns a ChatWindow, a
+ * separate view abject, and `hide` closes it; with no display, `show` reports
+ * false and the conversation carries on exactly the same.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types.js';
 import { v4 as uuidv4 } from 'uuid';
 import { captureConversation, identifyMessages, type ConversationContext } from '../core/conversation-context.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
@@ -14,14 +22,10 @@ import { looksLikeAbsenceClaim, looksLikeClaim } from '../core/claims.js';
 import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from '../core/decision-questions.js';
 import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
+import { require as precondition, invariant } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
-import { estimateWrappedLineCount } from './widgets/word-wrap.js';
-import { buildGoalRows, type GoalNode } from './goal-tree.js';
-import { estimateMarkdownHeight } from './widgets/markdown.js';
-import { chromeCase } from '../core/theme-data.js';
-import { sectionHeaderText, livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps } from './ui-kit.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Chat');
@@ -76,79 +80,92 @@ const ROUTE_HINTS: Record<string, string> = {
 
 type ChatTurn = { success: boolean; result?: unknown; error?: string; maxStepsReached?: boolean; goalCreated: boolean };
 
-const DEFAULT_WIN_W = 640;
-const DEFAULT_WIN_H = 620;
+/**
+ * The desktop-only part of the routing prompt: windows, the 3D scene and
+ * decorating them exist only where there is a display.
+ */
+const DESKTOP_SCENE_PROMPT = `## The desktop is a 3D scene
 
-// ── Bubble styling ─────────────────────────────────────────────────────
-const BUBBLE_MAX_FRACTION = 0.75;
-const BUBBLE_MIN_WIDTH = 240;
-const SENDER_LABEL_HEIGHT = 18;
-// Static welcome-card body copy; shared by creation and resize reflow so the
-// height estimate never diverges between the two paths.
-const WELCOME_BODY_TEXT = 'Abjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents.\n\nAsk me to explore what objects exist, create new ones, fetch your email, or anything else \u2014 specialized agents pick up the work automatically.';
-const GROUP_WINDOW_MS = 3 * 60_000;
+The desktop is a native 3D scene: every window is a slab in it, and objects can attach real 3D content (meshes, lights, transforms) through their window in addition to drawing 2D content on canvases. 3D objects can also live free-floating in the global scene with no window at all — the right shape when the user asks for a standalone object on the desktop (a pet, a draggable shape, ambient décor) rather than an app UI. Word goals to match: a standalone object should float on the desktop itself, not live in a window. Existing windows — including built-in apps' windows — can be DECORATED by a separate object that finds the window and attaches 3D content to it, so "add X to the Y window" goals should say to decorate the existing window, keeping the original app untouched (never to rebuild or clone the app). When a request involves visuals, describe the desired OUTCOME in the goal and let the builders discover the current rendering capabilities live (they ask the UI objects for up-to-date vocabularies) — do not prescribe rendering implementation details (like "use 2D canvas with projection math") from memory; such recalled how-tos may predate current capabilities.
 
-// ── Composer ───────────────────────────────────────────────────────────
-const SEND_GLYPH = '\u27A4';       // ➤
-const ATTACH_GLYPH = '📎'; // 📎
-// Two ASCII pipes, not U+2016 DOUBLE VERTICAL LINE — the canvas font renders
-// that glyph as a single stroke, which reads as anything but "pause".
-const PAUSE_GLYPH = '||';          // pause the running goal
-const RESUME_GLYPH = '\u25B6';     // ▶ resume the paused goal
-const STOP_GLYPH = '\u25A0';       // ■ stop the goal entirely
-const SEND_BTN_SIZE = 44;
-const INPUT_MIN_HEIGHT = 44;
-const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
-const COMPOSER_HINT_GOAL = `\u21B5  Queue a note for the goal   \u00B7   ${PAUSE_GLYPH}  Pause   \u00B7   ${STOP_GLYPH}  Stop`;
-const COMPOSER_HINT_PAUSED = `\u21B5  Send note   \u00B7   ${RESUME_GLYPH}  Resume   \u00B7   ${STOP_GLYPH}  Stop`;
-const COMPOSER_HINT_CLARIFY = `\u21B5  Answer to continue the goal   \u00B7   ${STOP_GLYPH}  Stop`;
-
-// ── Status strip + eye ─────────────────────────────────────────────────
-/** Height of the status strip above the message log. */
-const STATUS_STRIP_H = 18;
-const CHAT_EYE_PREFIX = 'chat-eye';
-const CHAT_EYE_SIZE = 18;
-/** Motes per second rising off the eye while the chat is working. */
-const CHAT_STREAM_RATE = 6;
-/** Leading mark on the activity header (the kit's sigil ring). */
-const THINKING_TEXT = '\u25C9 Thinking\u2026';
+`;
 
 // ── Attachments ────────────────────────────────────────────────────────
 /** Image MIME types the LLM vision content part accepts. */
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 /** Max characters of a text/code attachment injected into the prompt. */
 const MAX_ATTACHMENT_CHARS = 40_000;
+const ATTACH_GLYPH = '📎';
 
 // ── Conversation ───────────────────────────────────────────────────────
 const MAX_CONVERSATION_ENTRIES = 40;
 const MAX_STEPS = 20;
+/** Leading mark on the activity header (the kit's sigil ring). */
+const THINKING_TEXT = '◉ Thinking…';
 
-// Role → bubble styling map. Values are resolved lazily against `this.theme`
-// in `bubbleStyleForRole`.
-type BubbleRole = 'user' | 'assistant' | 'system' | 'error' | 'activity';
-type BubbleAlign = 'left' | 'center' | 'right';
+/** How long the answer to "does this instance have a display" is trusted. */
+const DISPLAY_CHECK_TTL_MS = 60_000;
 
-interface MessageMeta {
-  role: BubbleRole;
+/** Who a message is from, as the transcript and its listeners see it. */
+export type ChatRole = 'user' | 'assistant' | 'system' | 'error' | 'activity';
+
+/** A pasted image the person sent along with a message. */
+export interface ChatImage { name: string; mimeType: string; base64: string }
+
+/**
+ * What the composer can do right now, for the window. A goal in progress turns
+ * the send button into pause/resume and adds stop; a clarification question
+ * waits for the next message as its answer.
+ */
+export interface ChatControls {
+  /** A routing turn is running and no goal has taken over yet. */
+  turnBusy: boolean;
+  /** A goal this conversation owns is running or paused. */
+  goalActive: boolean;
+  paused: boolean;
+  clarifying: boolean;
+}
+
+/** One goal in the live progress tree, for the window's activity view. */
+export interface ChatActivityGoal {
+  id: string;
+  parentId?: string;
+  title: string;
+  description?: string;
+  status: 'active' | 'completed' | 'failed';
+  latestMessage?: string;
+  latestAgent?: string;
+}
+
+export interface ChatActivityTask {
+  id: string;
+  description: string;
+  status: string;
+  agentName?: string;
+  claimedBy?: string;
+  attempts: number;
+  maxAttempts: number;
+  dependsOn?: string[];
+}
+
+/** The live "thinking / goal progress" state the window shows under the log. */
+export interface ChatActivity {
+  active: boolean;
+  header: string;
+  rootId?: string;
+  goals: ChatActivityGoal[];
+  tasks: Record<string, ChatActivityTask[]>;
+}
+
+/** A transcript entry as listeners render it. */
+export interface ChatMessageView {
+  id: string;
+  role: ChatRole;
   sender: string;
-  ts: number;
   text: string;
   markdown: boolean;
-  align: BubbleAlign;
-  /** Last layout height applied from the bubble's contentHeight report. */
-  h?: number;
+  at: number;
 }
-
-interface SuggestionChip {
-  label: string;
-  prompt: string;
-}
-
-const DEFAULT_SUGGESTIONS: SuggestionChip[] = [
-  { label: 'What objects do I have?', prompt: 'What objects do I have?' },
-  { label: 'Create a weather reporter', prompt: 'Create a weather reporter that posts daily briefings to chat.' },
-  { label: 'Show me the system', prompt: 'Give me a tour of what this system can do.' },
-];
 
 // ─── Chat-specific types ─────────────────────────────────────────────
 
@@ -158,20 +175,17 @@ interface ConversationEntry {
   role: 'user' | 'assistant' | 'system';
   content: string;
   /**
-   * Display-only entry. Persisted so close+reopen replays it as a bubble,
-   * but skipped when assembling the LLM context — the markdown typically
-   * carries a data URI (image, screenshot) whose raw bytes would balloon
-   * every subsequent LLM call with no benefit. Set true on `attachMedia`.
+   * Display-only entry. Persisted so a reopened window replays it, but
+   * skipped when assembling the LLM context: the markdown typically carries a
+   * data URI (image, screenshot) whose raw bytes would balloon every
+   * subsequent LLM call with no benefit. Set true on `attachMedia`.
    */
   media?: boolean;
-  /**
-   * Optional display-name override. When set, `renderHistoryBubbles` uses
-   * this instead of the role-derived default ("You" / "Agent" / "System").
-   */
+  /** Display-name override; otherwise "You" / "Agent" / "System" by role. */
   sender?: string;
   /**
    * An uploaded file stored in the workspace FileSystem. Unlike `media`,
-   * attachments ARE included in the LLM context — once with full content (on
+   * attachments ARE included in the LLM context: once with full content (on
    * the turn after upload), then as a short text reference on later turns to
    * keep token cost bounded. `injected` flips true after the full content has
    * been sent once.
@@ -185,14 +199,7 @@ interface ConversationEntry {
   };
 }
 
-interface ObjectSummary {
-  id: AbjectId;
-  name: string;
-  description: string;
-}
-
-type UiPhase = 'closed' | 'idle' | 'busy';
-
+type TurnPhase = 'idle' | 'busy';
 
 interface ChatConstructorArgs {
   conversationId?: string;
@@ -201,84 +208,46 @@ interface ChatConstructorArgs {
 }
 
 export class Chat extends Abject {
-  private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private storageId?: AbjectId;
   private chatManagerId?: AbjectId;
+  private fileSystemId?: AbjectId;
+  private factoryId?: AbjectId;
+  private instanceInfoId?: AbjectId;
 
   // Conversation identity (passed via constructor args; unset for legacy callers)
   private conversationId?: string;
   private conversationTitle?: string;
+  /** Where the window opens; the window reports moves back here. */
   private initialRect?: { x: number; y: number; width: number; height: number };
-  private currentRect?: { x: number; y: number; width: number; height: number };
   private rectPersistTimer?: ReturnType<typeof setTimeout>;
   private persistTimer?: ReturnType<typeof setTimeout>;
   private historyLoaded = false;
 
-  // Window/widget IDs
+  /** The ChatWindow drawing this conversation, while one is open. */
   private windowId?: AbjectId;
-  private rootLayoutId?: AbjectId;
-  private messageLogId?: AbjectId;
-  private inputRowId?: AbjectId;
-  private textInputId?: AbjectId;
-  private sendBtnId?: AbjectId;
-  /** Status strip above the log: "Ready" when idle, phosphor while working. */
-  private statusStripId?: AbjectId;
-  /** Eye sigil shown in the status strip while the chat is working. */
-  private eyeShown = false;
-  /** Stop button shown next to Send while a goal is in progress. */
-  private stopBtnId?: AbjectId;
-  /** True while the composer shows goal controls (Pause/Resume + Stop). */
-  private goalControlsActive = false;
-  private _goalPaused = false;
-  /** True while the current goal is paused (input unlocked for interjections). */
-  private get goalPaused(): boolean { return this._goalPaused; }
-  private set goalPaused(paused: boolean) {
-    if (paused === this._goalPaused) return;
-    this._goalPaused = paused;
-    // A paused goal is resting: the thinking stream rests with it.
-    void this.syncThinkingStream();
-  }
-  /** Rate the eye's thinking stream was last given (0 = resting or no eye). */
-  private streamRate = 0;
+  /** Whether this instance has a display, and when that was last asked. */
+  private displayCheck?: { at: number; display: boolean };
+
+  private turnPhase: TurnPhase = 'idle';
+  private goalPaused = false;
   /** Goal the user asked to stop: its failure is their doing, not an error. */
   private stopRequestedGoalId?: string;
   /**
    * The scrum master paused the goal to ask the user a question (ask_user).
-   * The next typed message answers it and auto-resumes the goal — unlike a
-   * user-initiated pause, which resumes only on the Resume button.
+   * The next message answers it and auto-resumes the goal, unlike a
+   * user-initiated pause, which resumes only when asked to.
    */
   private clarificationPending = false;
-  private uploadBtnId?: AbjectId;
-  private fileSystemId?: AbjectId;
 
-  private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
   private turnContext?: ConversationContext;
-  private uiPhase: UiPhase = 'closed';
   /** Last goalActivity value emitted (dedupe transitions). */
   private lastGoalActivity?: boolean;
 
-  /** Current content width of the window (updated on resize). */
-  private currentWindowWidth = DEFAULT_WIN_W;
-
-  /** Per-message metadata (role/sender/timestamp) keyed by label AbjectId. */
-  private messageMetadata = new Map<AbjectId, MessageMeta>();
-
-  /** bubble label id → its preceding sender header label id (if any). */
-  private bubbleSenderLabels = new Map<AbjectId, AbjectId>();
-
-  /** Pending debounced resize-reflow timer. */
-  private reflowTimer?: ReturnType<typeof setTimeout>;
-
-  /** Consolidated "Thinking / activity" bubble used during task execution. */
-  private activityBubbleLabelId?: AbjectId;
-  /** Goals the user folded in the inline progress tree (open by default). */
-  private collapsedGoals = new Set<string>();
-  /** Embedded goal-progress widget shown beneath the activity header. */
-  private activityGoalWidgetId?: AbjectId;
-  private activityGoalHeight = 0;
+  // ── Live activity (the window's "thinking / goal progress" view) ──
+  private activityActive = false;
   private activityStep = 0;
   private activityHeader = THINKING_TEXT;
   private activityRefreshTimer?: ReturnType<typeof setTimeout>;
@@ -286,10 +255,8 @@ export class Chat extends Abject {
   private stepStreamChars = 0;
 
   /**
-   * Live snapshot of goals being worked on for the current task. Mirrors what
-   * GoalBrowser shows but rendered as indented text inside the activity
-   * bubble. Updated from goalCreated/goalUpdated/goalCompleted/goalFailed
-   * events emitted by GoalManager.
+   * Live snapshot of goals being worked on for the current task, fed by
+   * GoalManager's goalCreated/goalUpdated/goalCompleted/goalFailed events.
    */
   private liveGoals = new Map<string, {
     title: string;
@@ -320,30 +287,7 @@ export class Chat extends Abject {
   }> = [];
 
   /** Task info per goal, fetched from GoalManager. */
-  private liveTasks = new Map<string, Array<{
-    id: string;
-    description: string;
-    status: string;
-    agentName?: string;
-    claimedBy?: string;
-    attempts: number;
-    maxAttempts: number;
-    dependsOn?: string[];
-  }>>();
-
-  /** Welcome-card widget ids (destroyed on first send / clear). */
-  private welcomeWidgetIds: AbjectId[] = [];
-
-  /** Composer hint label (rendered under the input row). */
-  private composerHintLabelId?: AbjectId;
-  private composerRowId?: AbjectId;
-  private composerColumnId?: AbjectId;
-
-  /**
-   * Images pasted into the composer (the input emitted their bytes via an
-   * `attach` event). Stored + committed as attachments when the message is sent.
-   */
-  private pendingImages: Array<{ name: string; mimeType: string; base64: string }> = [];
+  private liveTasks = new Map<string, ChatActivityTask[]>();
 
   /** Pending routing-task replies, with scoped inactivity timeouts. */
   private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
@@ -388,30 +332,31 @@ export class Chat extends Abject {
       manifest: {
         name: 'Chat',
         description:
-          'Conversational LLM agent. Chat naturally to explore, create, and control Abjects. Uses a think-act-observe loop with structured actions.',
+          'A conversation with the system. Chat naturally to explore, create, and control Abjects; requests become goals the agents carry out. Uses a think-act-observe loop with structured actions.',
         version: '1.0.0',
         interface: {
             id: CHAT_INTERFACE,
             name: 'Chat',
-            description: 'Conversational LLM agent UI',
+            description: 'A conversational LLM agent',
             methods: [
               {
                 name: 'show',
-                description: 'Show the chat window',
+                description: 'Open the conversation in a window on the desktop. Returns false when this instance has no display.',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'hide',
-                description: 'Hide the chat window',
+                description: 'Close the conversation window (the conversation itself goes on).',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'sendMessage',
-                description: 'Send a message programmatically to the chat agent',
+                description: 'Send a message to the chat agent, as though the user typed it. While a goal runs, the message goes to that goal as a note.',
                 parameters: [
                   { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'The message text' },
+                  { name: 'images', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Pasted images: [{ name, mimeType, base64 }]', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -427,8 +372,32 @@ export class Chat extends Abject {
                 }},
               },
               {
+                name: 'getTranscript',
+                description: 'The conversation so far as rendered messages, with the title, composer state and live activity: what a view needs to draw it.',
+                parameters: [],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'pauseGoal',
+                description: 'Pause the goal this conversation is running.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'resumeGoal',
+                description: 'Resume the paused goal.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'stopGoal',
+                description: 'Stop the goal entirely.',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'addNotification',
-                description: 'Display a message in the chat window without triggering the agent loop. Use this for notifications, status updates, or results from other agents.',
+                description: 'Display a message in the chat without triggering the agent loop. Use this for notifications, status updates, or results from other agents.',
                 parameters: [
                   { name: 'sender', type: { kind: 'primitive', primitive: 'string' }, description: 'Display name of the sender (e.g. agent name)' },
                   { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'The notification text (supports markdown)' },
@@ -437,10 +406,20 @@ export class Chat extends Abject {
               },
               {
                 name: 'attachMedia',
-                description: 'Append an assistant bubble containing markdown media (typically an image data URI from a screenshot or render). Bypasses conversationHistory so large data URIs never enter the LLM context — the LLM sees the agent\'s text summary instead. Use this from sub-task agents that captured user-facing media.',
+                description: 'Append an assistant message containing markdown media (typically an image data URI from a screenshot or render). Bypasses the LLM context so large data URIs never enter it; the LLM sees the agent\'s text summary instead. Use this from sub-task agents that captured user-facing media.',
                 parameters: [
                   { name: 'markdown', type: { kind: 'primitive', primitive: 'string' }, description: 'Markdown content to render (e.g. ![alt|WxH](data:image/png;base64,...))' },
                   { name: 'sender', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional display name; defaults to "Agent"' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'fileUploaded',
+                description: 'Store a file in the workspace FileSystem and attach it to the conversation for the next turn.',
+                parameters: [
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'File name' },
+                  { name: 'mimeType', type: { kind: 'primitive', primitive: 'string' }, description: 'MIME type' },
+                  { name: 'base64', type: { kind: 'primitive', primitive: 'string' }, description: 'File bytes, base64' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -452,7 +431,7 @@ export class Chat extends Abject {
               },
               {
                 name: 'setTitle',
-                description: 'Update the conversation title (reflected in the window title bar).',
+                description: 'Update the conversation title.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'New conversation title' },
                 ],
@@ -462,9 +441,10 @@ export class Chat extends Abject {
             events: [
               {
                 name: 'messageAdded',
-                description: 'Fires every time a bubble is appended to the chat log (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. The "activity" role represents in-progress agent state and is filtered out; subscribers see only durable bubbles. Includes conversationId for multi-chat subscribers.',
+                description: 'Fires every time a message joins the conversation (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. In-progress agent activity is not a message and never fires this. Includes conversationId for multi-chat subscribers and a message id.',
                 payload: { kind: 'object', properties: {
                   conversationId: { kind: 'primitive', primitive: 'string' },
+                  id: { kind: 'primitive', primitive: 'string' },
                   role: { kind: 'primitive', primitive: 'string' },
                   sender: { kind: 'primitive', primitive: 'string' },
                   text: { kind: 'primitive', primitive: 'string' },
@@ -481,34 +461,25 @@ export class Chat extends Abject {
                 }},
               },
               {
-                name: 'rectChanged',
-                description: 'Fires when the chat window is moved or resized; ChatManager uses this to persist per-conversation window geometry.',
-                payload: { kind: 'object', properties: {
-                  conversationId: { kind: 'primitive', primitive: 'string' },
-                  rect: { kind: 'object', properties: {
-                    x: { kind: 'primitive', primitive: 'number' },
-                    y: { kind: 'primitive', primitive: 'number' },
-                    width: { kind: 'primitive', primitive: 'number' },
-                    height: { kind: 'primitive', primitive: 'number' },
-                  } },
-                }},
-              },
-              {
                 name: 'goalActivity',
-                description: 'Fires when this chat starts or stops working on a goal (a turn is running, or a goal this conversation owns is active and not yet terminal). ChatManager forwards it to UI surfaces so the chat icon can pulse while busy.',
+                description: 'Fires when this chat starts or stops working (a turn is running, or a goal this conversation owns is active and not yet terminal). ChatManager forwards it so surfaces can mark the chat busy.',
                 payload: { kind: 'object', properties: {
                   active: { kind: 'primitive', primitive: 'boolean' },
                   goalId: { kind: 'primitive', primitive: 'string' },
                 }},
               },
+              {
+                name: 'visibility',
+                description: 'Fires when the conversation window opens (true) or closes (false).',
+                payload: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
           },
         requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display chat window', required: true },
           { capability: Capabilities.LLM_QUERY, reason: 'Query LLM for responses', required: true },
         ],
         providedCapabilities: [],
-        tags: ['system', 'ui', 'agent'],
+        tags: ['system', 'agent'],
       },
     });
 
@@ -522,8 +493,6 @@ export class Chat extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    await this.fetchTheme();
-    this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.agentAbjectId = await this.requireDep('AgentAbject');
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
@@ -580,69 +549,93 @@ export class Chat extends Abject {
         firstThinkTier: CHAT_THINK_TIER,
       },
     }));
+    this.checkInvariants();
   }
 
   protected override checkInvariants(): void {
     super.checkInvariants();
+    invariant(this.turnPhase === 'idle' || this.turnPhase === 'busy', 'Chat: unknown turn phase');
+    invariant(!this.clarificationPending || this._currentGoalId !== undefined,
+      'Chat: a clarification is pending only while its goal is current');
+  }
+
+  protected override async onStop(): Promise<void> {
+    // The window is a view of this conversation and has nothing to show once
+    // it is gone. An event: a stopping object cannot wait for replies.
+    if (this.windowId) {
+      try { this.send(event(this.id, this.windowId, 'chatGone', {})); } catch { /* window gone */ }
+      this.windowId = undefined;
+    }
   }
 
   private setupHandlers(): void {
-    this.on('show', async () => {
-      return this.show();
+    this.on('show', async () => this.openWindow());
+
+    this.on('hide', async () => this.closeWindow());
+
+    // The window closed itself (its close button): forget it.
+    this.on('windowClosed', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.windowId) return;
+      await this.closeWindow();
     });
 
-    this.on('hide', async () => {
-      return this.hide();
+    // The window moved or resized: reopen it there, and keep the roster's copy.
+    this.on('windowRect', (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.windowId) return;
+      const { rect } = msg.payload as { rect?: { x: number; y: number; width: number; height: number } };
+      if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(n => typeof n === 'number' && Number.isFinite(n))) return;
+      this.initialRect = { ...rect };
+      this.notifyRectChanged();
     });
 
     this.on('sendMessage', async (msg: AbjectMessage) => {
-      const { message } = msg.payload as { message: string };
-      if (!message?.trim()) return false;
-      const text = message.trim();
-      // While a goal runs, external messages (terminal client, command
-      // palette, speech) queue as interjections — same path as typing into
-      // the composer.
-      if (this.goalControlsActive && this._currentGoalId) {
+      const { message, images } = msg.payload as { message?: string; images?: ChatImage[] };
+      const text = (message ?? '').trim();
+      const pasted = Array.isArray(images) ? images.filter(i => i && typeof i.base64 === 'string' && i.base64.length > 0) : [];
+      if (!text && pasted.length === 0) return false;
+      // While a goal runs, a message (typed in the window, sent from the
+      // terminal, a bridge) goes to that goal as a note the scrum master weighs.
+      if (this._currentGoalId) {
+        if (!text) return false;
         log.info(`[Chat] sendMessage → goal interjection: "${text.slice(0, 80)}"`);
         await this.sendInterjection(text);
         return true;
       }
-      if (this.uiPhase !== 'idle') {
-        log.info(`[Chat] sendMessage dropped (uiPhase=${this.uiPhase}): "${text.slice(0, 80)}"`);
+      if (this.turnPhase !== 'idle') {
+        log.info(`[Chat] sendMessage dropped (turn busy): "${text.slice(0, 80)}"`);
         return false;
       }
       log.info(`[Chat] sendMessage: "${text.slice(0, 80)}"`);
-      this.triggerSend(text);
+      if (pasted.length > 0) await this.commitImages(pasted);
+      this.runChatTask(text);
       return true;
     });
+
+    this.on('pauseGoal', async () => this.pauseGoal());
+    this.on('resumeGoal', async () => this.resumeGoal());
+    this.on('stopGoal', async () => this.stopGoal());
 
     this.on('attachMedia', async (msg: AbjectMessage) => {
       const { markdown, sender } = msg.payload as { markdown: string; sender?: string };
       if (!markdown?.trim()) return false;
       const trimmed = markdown.trim();
       const displaySender = sender || 'Agent';
-      await this.removeWelcomeState();
-      await this.appendBubble('assistant', displaySender, trimmed, true);
       // Persist as a media-flagged entry. The flag keeps the data URI out of
-      // every subsequent LLM call (see initialMessages assembly in handleAct
-      // → goal action) while still letting renderHistoryBubbles replay the
-      // image bubble after a close+reopen of the chat window.
-      this.conversationHistory.push({
-        id: uuidv4(),
-        role: 'assistant',
-        content: trimmed,
-        media: true,
-        sender: displaySender,
-      });
+      // every subsequent LLM call while still letting a reopened window replay
+      // the image.
+      const id = uuidv4();
+      this.conversationHistory.push({ id, role: 'assistant', content: trimmed, media: true, sender: displaySender });
+      this.appendMessage('assistant', displaySender, trimmed, true, id);
       this.schedulePersist();
       return true;
     });
 
-    // A file picked or dropped onto this chat window (forwarded from
-    // UIServer → WindowAbject → WidgetManager). Store it in the workspace
-    // FileSystem and record an attachment entry for the LLM context.
+    // A file picked or dropped onto the conversation (the window forwards it).
+    // Store it in the workspace FileSystem and record an attachment entry for
+    // the LLM context.
     this.on('fileUploaded', async (msg: AbjectMessage) => {
       const { name, mimeType, base64 } = msg.payload as { name: string; mimeType: string; base64: string };
+      precondition(typeof name === 'string' && name.length > 0, 'fileUploaded needs a file name');
       await this.handleFileUploaded(name, mimeType ?? 'application/octet-stream', base64 ?? '');
       return true;
     });
@@ -651,21 +644,30 @@ export class Chat extends Abject {
       const { sender, message } = msg.payload as { sender: string; message: string };
       if (!message?.trim()) return false;
       log.info(`[Chat] addNotification from "${sender}": "${message.trim().slice(0, 80)}"`);
-      await this.removeWelcomeState();
-      await this.appendBubble('system', sender || 'System', message.trim(), true);
-      this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: `[${sender}]: ${message.trim()}` });
+      const id = uuidv4();
+      this.conversationHistory.push({ id, role: 'assistant', content: `[${sender}]: ${message.trim()}` });
+      this.appendMessage('system', sender || 'System', message.trim(), true, id);
       this.schedulePersist();
       return true;
     });
 
     this.on('getState', async () => {
       return {
-        phase: this.uiPhase,
+        phase: this.turnPhase,
         messageCount: this.conversationHistory.length,
         visible: !!this.windowId,
         currentGoalId: this._currentGoalId ?? null,
       };
     });
+
+    this.on('getTranscript', async () => ({
+      conversationId: this.conversationId ?? '',
+      title: this.conversationTitle ?? '',
+      messages: this.transcriptViews(),
+      controls: this.controls(),
+      activity: this.activitySnapshot(),
+      working: this.isGoalActive(),
+    }));
 
     this.on('clearHistory', async () => {
       this.conversationHistory = [];
@@ -679,8 +681,7 @@ export class Chat extends Abject {
         } catch { /* best effort */ }
       }
       if (this.windowId) {
-        await this.clearMessageLabels();
-        await this.showWelcomeState();
+        try { this.send(event(this.id, this.windowId, 'chatCleared', {})); } catch { /* window gone */ }
       }
       return true;
     });
@@ -690,14 +691,6 @@ export class Chat extends Abject {
       const next = (title ?? '').trim().slice(0, 80);
       if (!next || next === this.conversationTitle) return false;
       this.conversationTitle = next;
-      // Reflect in the open window's title bar, if any
-      if (this.windowId) {
-        try {
-          await this.request(request(this.id, this.windowId, 'setTitle', {
-            title: this.formatWindowTitle(next),
-          }));
-        } catch { /* best effort */ }
-      }
       // Notify ChatManager for roster updates
       if (this.chatManagerId && this.conversationId) {
         this.send(event(this.id, this.chatManagerId, 'titleChanged', {
@@ -709,256 +702,100 @@ export class Chat extends Abject {
       return true;
     });
 
-    this.on('windowCloseRequested', async () => { await this.hide(); });
-
-    // The text input keeps focus but doesn't consume PageUp/PageDown, so the
-    // window bubbles them here. Forward to the message log so the conversation
-    // scrolls a page at a time without reaching for the mouse.
-    this.on('keyUnhandled', async (msg: AbjectMessage) => {
-      const { key } = msg.payload as { key?: string };
-      if (!this.messageLogId) return;
-      if (key === 'PageUp' || key === 'PageDown' || key === 'Home' || key === 'End') {
-        try {
-          await this.request(request(this.id, this.messageLogId, 'scrollKey', { key }));
-        } catch { /* log gone */ }
-      }
-    });
-
-    this.on('windowResized', async (msg: AbjectMessage) => {
-      const { width, height } = msg.payload as { width: number; height: number };
-      if (typeof width === 'number' && width > 0 && width !== this.currentWindowWidth) {
-        this.currentWindowWidth = width;
-        this.scheduleReflow();
-      }
-      if (this.currentRect) {
-        if (typeof width === 'number' && width > 0) this.currentRect.width = width;
-        if (typeof height === 'number' && height > 0) this.currentRect.height = height;
-        this.notifyRectChanged();
-      }
-      // Keep the eye anchored to the status strip's right end.
-      if (this.eyeShown) {
-        await this.sendEyeOps([{ op: 'update', id: `${CHAT_EYE_PREFIX}-sigil`, transform: { position: this.eyePosition() } }]);
-      }
-    });
-
-    this.on('windowMoved', async (msg: AbjectMessage) => {
-      const { x, y } = msg.payload as { x: number; y: number };
-      if (this.currentRect) {
-        if (typeof x === 'number') this.currentRect.x = x;
-        if (typeof y === 'number') this.currentRect.y = y;
-        this.notifyRectChanged();
-      }
-    });
-
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
-      if (fromId === this.sendBtnId && aspect === 'click') {
-        // While a goal runs, the send button is the Pause/Resume control.
-        if (this.goalControlsActive) {
-          await this.handlePauseResumeClick();
-          return;
-        }
-        await this.handleSendClick();
-        return;
-      }
-
-      if (fromId === this.stopBtnId && aspect === 'click') {
-        await this.handleStopClick();
-        return;
-      }
-
-      if (fromId === this.textInputId && aspect === 'submit') {
-        await this.handleSendClick();
-        return;
-      }
-
-      // The composer references a pasted image inline (data: URI) and handed us
-      // its bytes; remember them so the next send stores + attaches for the LLM.
-      if (fromId === this.textInputId && aspect === 'attach') {
-        const a = value as { name: string; mimeType: string; base64: string } | undefined;
-        if (a?.base64) this.pendingImages.push({ name: a.name, mimeType: a.mimeType, base64: a.base64 });
-        return;
-      }
-
-      if (fromId === this.uploadBtnId && aspect === 'click') {
-        await this.handleUploadClick();
-        return;
-      }
-
-      // Welcome suggestion chips: clicking a chip sends the chip's prompt.
-      if (aspect === 'click' && this.welcomeWidgetIds.includes(fromId)) {
-        const chipText = value as string | undefined;
-        const prompt = chipText ? this.promptForChipText(chipText) : undefined;
-        if (prompt && this.uiPhase === 'idle') {
-          await this.removeWelcomeState();
-          this.triggerSend(prompt);
-        }
-        return;
-      }
-
-      if (fromId === this.textInputId && aspect === 'resize') {
-        const { preferredHeight } = (msg.payload as { aspect: string; value: { preferredHeight: number } }).value;
-        // The composer is nested three deep: input → composerRow → composerColumn
-        // → root VBox. Each layout sizes its child by the child's preferredSize,
-        // so the height must be pushed down all three levels or an inner fixed
-        // height caps the input.
-        try {
-          // 1. Input within its row (HBox: attach + input + send).
-          await this.request(request(this.id, this.composerRowId!, 'updateLayoutChild', {
-            widgetId: this.textInputId,
-            preferredSize: { height: preferredHeight },
-          }));
-          // 2. The row within the composer column.
-          await this.request(request(this.id, this.composerColumnId!, 'updateLayoutChild', {
-            widgetId: this.composerRowId,
-            preferredSize: { height: preferredHeight },
-          }));
-          // 3. The column within the root VBox (row + hint label + spacing).
-          const columnHeight = preferredHeight + this.theme.tokens.space.xs + this.theme.tokens.space.xl;
-          await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
-            widgetId: this.composerColumnId,
-            preferredSize: { height: columnHeight },
-          }));
-        } catch { /* layout may be gone */ }
-        return;
-      }
-
-      // The inline goal tree's arrow (and status mark) fold a goal's tasks
-      // away and back, as in the Goals window.
-      if (aspect === 'toggle' && fromId === this.activityGoalWidgetId) {
-        try {
-          const { id } = JSON.parse(value as string) as { id?: string };
-          if (id) {
-            if (this.collapsedGoals.has(id)) this.collapsedGoals.delete(id);
-            else this.collapsedGoals.add(id);
-            await this.refreshActivityBubble();
-          }
-        } catch { /* malformed toggle */ }
-        return;
-      }
-
-      // Self-sizing log children (contentBlock bubbles, embedded goal widget)
-      // report their natural height; resize their log slot so content grows to
-      // fit and the message log scrolls (no inner scrollbar, no estimation).
-      if (aspect === 'contentHeight') {
-        const h = typeof value === 'number' ? value : Number(value);
-        if (!Number.isFinite(h)) return;
-        if (fromId === this.activityGoalWidgetId) {
-          if (Math.abs(h - this.activityGoalHeight) >= 1) {
-            this.activityGoalHeight = h;
-            await this.setLabelHeight(fromId, h);
-          }
-          return;
-        }
-        const meta = this.messageMetadata.get(fromId);
-        if (meta) {
-          // Breathing room around the text inside the bubble background.
-          const padded = h + this.theme.tokens.space.md;
-          if (meta.h === undefined || Math.abs(padded - meta.h) >= 1) {
-            meta.h = padded;
-            await this.setLabelHeight(fromId, padded);
-          }
-        }
-        return;
-      }
-
       // GoalManager events
-      if (fromId === this.goalManagerId) {
-        const { value } = msg.payload as { aspect: string; value: unknown };
+      if (fromId !== this.goalManagerId) return;
 
-        // Task completion/failure — resolve pending waitForTaskCompletion promises
-        if (aspect === 'taskCompleted') {
-          const data = value as { taskId: string; goalId?: string; result?: unknown };
-          const hasPending = this.pendingTaskCompletions.has(data.taskId);
-          log.info(`[Chat] GoalManager taskCompleted ${data.taskId.slice(0, 8)} hasPending=${hasPending}`);
-          const pending = this.pendingTaskCompletions.get(data.taskId);
-          if (pending) {
-            this.pendingTaskCompletions.delete(data.taskId);
-            pending.resolve({ taskId: data.taskId, result: data.result });
-          }
-          // Refresh task cache for the goal
-          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-          return;
+      // Task completion/failure — resolve pending waitForTaskCompletion promises
+      if (aspect === 'taskCompleted') {
+        const data = value as { taskId: string; goalId?: string; result?: unknown };
+        const hasPending = this.pendingTaskCompletions.has(data.taskId);
+        log.info(`[Chat] GoalManager taskCompleted ${data.taskId.slice(0, 8)} hasPending=${hasPending}`);
+        const pending = this.pendingTaskCompletions.get(data.taskId);
+        if (pending) {
+          this.pendingTaskCompletions.delete(data.taskId);
+          pending.resolve({ taskId: data.taskId, result: data.result });
         }
-        if (aspect === 'taskPermanentlyFailed') {
-          const data = value as { taskId: string; goalId?: string; error?: string; attempts?: number };
-          const hasPending = this.pendingTaskCompletions.has(data.taskId);
-          log.info(`[Chat] GoalManager taskPermanentlyFailed ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'} hasPending=${hasPending} error="${(data.error ?? '').slice(0, 60)}"`);
-          const pending = this.pendingTaskCompletions.get(data.taskId);
-          if (pending) {
-            this.pendingTaskCompletions.delete(data.taskId);
-            pending.reject(new Error(data.error ?? 'Task permanently failed'));
-          }
-          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-          return;
+        // Refresh task cache for the goal
+        if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
+        return;
+      }
+      if (aspect === 'taskPermanentlyFailed') {
+        const data = value as { taskId: string; goalId?: string; error?: string; attempts?: number };
+        const hasPending = this.pendingTaskCompletions.has(data.taskId);
+        log.info(`[Chat] GoalManager taskPermanentlyFailed ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'} hasPending=${hasPending} error="${(data.error ?? '').slice(0, 60)}"`);
+        const pending = this.pendingTaskCompletions.get(data.taskId);
+        if (pending) {
+          this.pendingTaskCompletions.delete(data.taskId);
+          pending.reject(new Error(data.error ?? 'Task permanently failed'));
         }
-        // Goal lifecycle events — feed the liveGoals tree so the activity
-        // bubble can render the same hierarchy the GoalBrowser shows.
-        if (this._currentGoalId) {
-          if (aspect === 'goalClarificationRequested') {
-            const data = value as { goalId: string; question: string };
-            if (data.goalId === this._currentGoalId) {
-              await this.handleClarificationRequested(data.question);
-            }
-            return;
-          }
+        if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
+        return;
+      }
+      // Goal lifecycle events feed the live goal tree.
+      if (!this._currentGoalId) return;
 
-          if (aspect === 'goalCreated') {
-            const data = value as { goalId: string; title: string; description?: string; parentId?: string };
-            // Only track goals that are part of the current task's tree
-            // (the current goal itself, or descendants of any goal we know).
-            if (data.goalId === this._currentGoalId
-                || (data.parentId && this.liveGoals.has(data.parentId))) {
-              this.liveGoals.set(data.goalId, {
-                title: data.title,
-                description: data.description,
-                status: 'active',
-                parentId: data.parentId,
-              });
-              // Fetch tasks for this goal so we can render them
-              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-              this.scheduleActivityRefresh();
-            }
-            return;
-          }
-
-          if (aspect === 'goalUpdated') {
-            const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
-            // Lazily seed the goal entry if we missed its creation event
-            // (e.g. it was created before our subscription took effect).
-            if (!this.liveGoals.has(data.goalId)
-                && (data.goalId === this._currentGoalId
-                    || (data.parentId && this.liveGoals.has(data.parentId)))) {
-              this.liveGoals.set(data.goalId, {
-                title: '(in progress)',
-                status: 'active',
-                parentId: data.parentId,
-              });
-              // Fetch the real title from GoalManager
-              this.fetchGoalTitle(data.goalId);
-              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-            }
-
-            const entry = this.liveGoals.get(data.goalId);
-            if (entry) {
-              if (data.message) this.updateActivityHeader(data.message);
-              if (data.message) entry.latestMessage = data.message;
-              if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
-              // Refetch tasks on any progress so we always show current state
-              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-              this.scheduleActivityRefresh();
-            }
-            return;
-          }
-
-          if (aspect === 'goalCompleted' || aspect === 'goalFailed') {
-            const data = value as { goalId: string; result?: unknown; error?: string };
-            await this.acceptGoalOutcome(data.goalId, aspect === 'goalCompleted' ? 'completed' : 'failed', data.result, data.error);
-            return;
-          }
+      if (aspect === 'goalClarificationRequested') {
+        const data = value as { goalId: string; question: string };
+        if (data.goalId === this._currentGoalId) {
+          await this.handleClarificationRequested(data.question);
         }
+        return;
+      }
+
+      if (aspect === 'goalCreated') {
+        const data = value as { goalId: string; title: string; description?: string; parentId?: string };
+        // Only track goals that are part of the current task's tree
+        // (the current goal itself, or descendants of any goal we know).
+        if (data.goalId === this._currentGoalId
+            || (data.parentId && this.liveGoals.has(data.parentId))) {
+          this.liveGoals.set(data.goalId, {
+            title: data.title,
+            description: data.description,
+            status: 'active',
+            parentId: data.parentId,
+          });
+          this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
+          this.scheduleActivityRefresh();
+        }
+        return;
+      }
+
+      if (aspect === 'goalUpdated') {
+        const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
+        // Lazily seed the goal entry if we missed its creation event
+        // (e.g. it was created before our subscription took effect).
+        if (!this.liveGoals.has(data.goalId)
+            && (data.goalId === this._currentGoalId
+                || (data.parentId && this.liveGoals.has(data.parentId)))) {
+          this.liveGoals.set(data.goalId, {
+            title: '(in progress)',
+            status: 'active',
+            parentId: data.parentId,
+          });
+          this.fetchGoalTitle(data.goalId);
+          this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
+        }
+
+        const entry = this.liveGoals.get(data.goalId);
+        if (entry) {
+          if (data.message) this.updateActivityHeader(data.message);
+          if (data.message) entry.latestMessage = data.message;
+          if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
+          // Refetch tasks on any progress so we always show current state
+          this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
+          this.scheduleActivityRefresh();
+        }
+        return;
+      }
+
+      if (aspect === 'goalCompleted' || aspect === 'goalFailed') {
+        const data = value as { goalId: string; result?: unknown; error?: string };
+        await this.acceptGoalOutcome(data.goalId, aspect === 'goalCompleted' ? 'completed' : 'failed', data.result, data.error);
+        return;
       }
     });
 
@@ -977,8 +814,7 @@ export class Chat extends Abject {
     // ScrumMaster owns goal-level completion under the Scrum model: each
     // scrum reviews the prior round and decides whether to call completeGoal,
     // plan more tasks, or fail the goal. Chat watches `goalCompleted` /
-    // `goalFailed` (broadcast via the changed handler) like any other observer
-    // — no per-goal completion handler needed here.
+    // `goalFailed` (broadcast via the changed handler) like any other observer.
 
     this.on('taskProgress', async (msg: AbjectMessage) => {
       // Reset pending ticket timeouts on agent progress
@@ -987,15 +823,13 @@ export class Chat extends Abject {
         msg.payload as { ticketId: string; step: number; maxSteps: number; phase: string; action?: string };
       if (!this._currentTicketId) return;
       if (ticketId && ticketId !== this._currentTicketId) return;
-
-      if (!this.activityBubbleLabelId) return;
-      // Reset per-step stream counter on every phase boundary — each new
-      // phase (thinking, observing, acting) is a fresh LLM call window.
+      if (!this.activityActive) return;
+      // Each new phase (thinking, observing, acting) is a fresh LLM call window.
       this.stepStreamChars = 0;
       if (phase === 'thinking') {
         this.updateActivityHeader(`${THINKING_TEXT} (step ${step + 1}/${maxSteps})`);
       } else if (phase === 'observing') {
-        this.updateActivityHeader(`\u25CE Observing\u2026 (step ${step + 1}/${maxSteps})`);
+        this.updateActivityHeader(`◎ Observing… (step ${step + 1}/${maxSteps})`);
       }
     });
 
@@ -1004,9 +838,8 @@ export class Chat extends Abject {
         msg.payload as { ticketId: string; content: string; done: boolean };
       if (!this._currentTicketId) return;
       if (ticketId && ticketId !== this._currentTicketId) return;
-      // Don't render the raw text (it's mid-step reasoning + JSON actions),
-      // but track the volume so the activity bubble can show the user that
-      // the LLM is actively generating output.
+      // The raw text is mid-step reasoning and JSON actions, so it is not
+      // shown; its volume is, so the person can see the model is working.
       this._streamBuffer += content;
       this.stepStreamChars += content.length;
       this.scheduleActivityRefresh();
@@ -1014,8 +847,8 @@ export class Chat extends Abject {
 
     this.on('progress', async (msg: AbjectMessage) => {
       // Reset pending ticket + task completion timeouts on any progress signal.
-      // The progress text itself is now surfaced through the liveGoals tree
-      // (via goalUpdated events), so nothing to render here directly.
+      // The progress text itself is surfaced through the live goal tree (via
+      // goalUpdated events), so nothing to render here directly.
       this.resetPendingTicketTimeouts();
       const { message } = msg.payload as { phase?: string; message?: string };
       if (!this._currentTicketId || !message) return;
@@ -1030,12 +863,9 @@ export class Chat extends Abject {
       // only ever sees the stale failure and re-creates duplicate goals.
       //
       // Chat's work is routing (create a goal vs answer) and composing the
-      // reply from a goal's result — balanced-tier work, and this is the
-      // interactive path the user waits on, so run it on balanced rather than
-      // the top tier. The self-audit re-prompt (runChatTask) is the net for
-      // the confabulation a lighter model could invite. If the configured
-      // balanced model proves too weak here (parse retries, worse routing),
-      // CHAT_THINK_TIER is the one line to move back to 'smart'.
+      // reply from a goal's result: balanced-tier work, on the interactive
+      // path the user waits on. The self-audit re-prompt (runChatTask) is the
+      // net for the confabulation a lighter model could invite.
       return { observation: this.buildGoalStateObservation(), tier: CHAT_THINK_TIER };
     });
 
@@ -1052,45 +882,43 @@ export class Chat extends Abject {
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      const { step, newPhase, action } =
+      const { step, newPhase } =
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
-
-      if (!this.activityBubbleLabelId) return;
+      if (!this.activityActive) return;
       if (newPhase === 'thinking') {
         this.updateActivityStep(step + 1);
       }
-      // 'acting' transitions surface through the liveGoals tree once the
-      // action's goal lifecycle events fire — no flat activity-line needed.
+      // 'acting' transitions surface through the live goal tree once the
+      // action's goal lifecycle events fire.
     });
 
     this.on('agentIntermediateAction', async (msg: AbjectMessage) => {
       const { action } = msg.payload as { taskId: string; action: AgentAction };
-
-      // Handle 'reply' intermediate action — show text as a proper assistant
-      // bubble, then re-prime the activity bubble for the next step.
+      // 'reply': intermediate text from the agent, shown as an assistant
+      // message while the activity view stays up for the next step.
       if (action.action === 'reply') {
         const text = (action.text as string) ?? '';
         if (text) {
           this._streamBuffer = '';
-          await this.removeActivityBubble();
-          await this.appendBubble('assistant', 'Agent', text, true);
-          this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text });
+          const id = uuidv4();
+          this.conversationHistory.push({ id, role: 'assistant', content: text });
+          this.appendMessage('assistant', 'Agent', text, true, id);
           this.schedulePersist();
-          await this.showActivityBubble();
+          this.stepStreamChars = 0;
+          this.scheduleActivityRefresh();
         }
       }
     });
 
     this.on('agentActionResult', async (msg: AbjectMessage) => {
       // Goal-shaped actions surface their success/failure through
-      // goalCompleted / goalFailed events into the liveGoals tree.
-      // Non-goal actions (remember, reply, done) are reflected in the
-      // chat history directly.
+      // goalCompleted / goalFailed events into the live goal tree. Non-goal
+      // actions (remember, reply, done) are reflected in the history directly.
       //
       // One case deserves a visible note: the goal action's wait failed
       // (usually a stall-timer timeout) while the goal itself is still
-      // running. Silently re-planning here is how duplicate goals happen,
-      // and the user has no way to see it — so say it in the thread.
+      // running. Silently re-planning here is how duplicate goals happen, and
+      // the user has no way to see it, so say it in the thread.
       const { action, result } = msg.payload as {
         action?: { action?: string; title?: string };
         result?: { success?: boolean; error?: string };
@@ -1100,10 +928,253 @@ export class Chat extends Abject {
       const entry = goalId ? this.liveGoals.get(goalId) : undefined;
       if (!entry || entry.status !== 'active') return;
       const note = `Lost contact with goal "${entry.title}" (${result.error ?? 'wait failed'}), its last recorded status is active. Progress is unconfirmed; this chat will receive further goal events.`;
-      try {
-        await this.appendBubble('system', 'Chat', note, false);
-      } catch { /* best effort */ }
+      this.appendMessage('system', 'Chat', note, false);
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // The window (a separate view abject, desktop only)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Open the conversation in a ChatWindow, or raise the one already open. The
+   * Factory has no ChatWindow on an instance without a display, so the spawn
+   * fails and this reports false: the conversation is unaffected.
+   */
+  private async openWindow(): Promise<boolean> {
+    if (this.windowId) {
+      try {
+        await this.request(request(this.id, this.windowId, 'raise', {}), 5000);
+        return true;
+      } catch {
+        this.windowId = undefined; // gone; open a fresh one
+      }
+    }
+    this.factoryId = await this.resolveDep('Factory', this.factoryId);
+    if (!this.factoryId) return false;
+    let windowId: AbjectId;
+    try {
+      const spawned = await this.request<SpawnResult>(request(this.id, this.factoryId, 'spawn', {
+        manifest: { name: 'ChatWindow', description: '', version: '1.0.0', requiredCapabilities: [], tags: ['system', 'ui'] },
+        registryHint: (await this.resolveRegistryId()) ?? undefined,
+        parentId: this.id,
+        constructorArgs: {
+          chatId: this.id,
+          conversationId: this.conversationId,
+          title: this.conversationTitle,
+          rect: this.initialRect,
+        },
+      }), 20000);
+      windowId = spawned.objectId;
+    } catch (err) {
+      log.info(`[Chat ${(this.conversationId ?? this.id).slice(0, 8)}] no window: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+    this.windowId = windowId;
+    await this.placeWindowInWorkspace(windowId);
+    try {
+      await this.request(request(this.id, windowId, 'show', {}), 20000);
+    } catch (err) {
+      log.warn(`[Chat] the chat window could not open: ${err instanceof Error ? err.message : String(err)}`);
+      await this.killWindow(windowId);
+      this.windowId = undefined;
+      return false;
+    }
+    this.changed('visibility', true);
+    return true;
+  }
+
+  /**
+   * The desktop shows a window with the workspace of the object that owns
+   * it. The window is ours, in our workspace: say so before it draws, so it
+   * appears there and wears that workspace's theme. Only the desktop keeps
+   * that map, and only a desktop ever spawns a window.
+   */
+  private async placeWindowInWorkspace(windowId: AbjectId): Promise<void> {
+    const registryId = await this.resolveRegistryId();
+    const widgetManagerId = await this.discoverDep('WidgetManager');
+    if (!registryId || !widgetManagerId) return;
+    try {
+      const workspaceId = await this.request<string | null>(request(this.id, registryId, 'getWorkspaceId', {}), 5000);
+      if (workspaceId) {
+        await this.request(request(this.id, widgetManagerId, 'setObjectWorkspace', { objectId: windowId, workspaceId }), 5000);
+      }
+    } catch { /* drawn untagged: visible on every workspace */ }
+  }
+
+  private async closeWindow(): Promise<boolean> {
+    const windowId = this.windowId;
+    if (!windowId) return true;
+    this.windowId = undefined;
+    // Flush any pending history persist before the view goes away.
+    if (this.persistTimer) {
+      this.cancelTimer(this.persistTimer);
+      this.persistTimer = undefined;
+      void this.persistHistory();
+    }
+    try { await this.request(request(this.id, windowId, 'close', {}), 5000); } catch { /* already closed */ }
+    await this.killWindow(windowId);
+    this.changed('visibility', false);
+    return true;
+  }
+
+  private async killWindow(windowId: AbjectId): Promise<void> {
+    if (!this.factoryId) return;
+    try { await this.request(request(this.id, this.factoryId, 'kill', { objectId: windowId }), 5000); } catch { /* already gone */ }
+  }
+
+  /** A one-shot effect on the window (visual only; nothing without one). */
+  private playEffect(effect: string, color?: string): void {
+    if (!this.windowId) return;
+    try { this.send(event(this.id, this.windowId, 'chatEffect', { effect, ...(color ? { color } : {}) })); } catch { /* window gone */ }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Messages, activity and controls: what listeners see
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * A message joins the conversation: announce it to every listener (the
+   * terminal gateway, bridges, the window). Persisting it is the caller's
+   * business; some messages (errors, notes) are shown but never saved.
+   */
+  private appendMessage(role: Exclude<ChatRole, 'activity'>, sender: string, text: string, markdown: boolean, id: string = uuidv4()): void {
+    precondition(typeof text === 'string', 'message text must be a string');
+    this.changed('messageAdded', {
+      conversationId: this.conversationId ?? '',
+      id,
+      role,
+      sender,
+      text,
+      markdown,
+      at: Date.now(),
+    });
+  }
+
+  /** The saved conversation as listeners render it. */
+  private transcriptViews(): ChatMessageView[] {
+    return this.conversationHistory.map((entry) => {
+      const role: ChatRole = entry.role === 'user' ? 'user' : entry.role === 'assistant' ? 'assistant' : 'system';
+      const defaultSender = entry.role === 'user' ? 'You' : entry.role === 'assistant' ? 'Agent' : 'System';
+      return {
+        id: entry.id ?? uuidv4(),
+        role,
+        sender: entry.sender ?? defaultSender,
+        text: entry.content,
+        // Attachment chips use markdown (bold filename) even though they're user-role.
+        markdown: entry.role !== 'user' || !!entry.attachment,
+        at: 0,
+      };
+    });
+  }
+
+  private controls(): ChatControls {
+    return {
+      turnBusy: this.turnPhase === 'busy',
+      goalActive: this._currentGoalId !== undefined,
+      paused: this.goalPaused,
+      clarifying: this.clarificationPending,
+    };
+  }
+
+  /** Tell the window what the composer can do now. */
+  private pushControls(): void {
+    if (!this.windowId) return;
+    try { this.send(event(this.id, this.windowId, 'chatControls', this.controls())); } catch { /* window gone */ }
+  }
+
+  private activitySnapshot(): ChatActivity {
+    const goals: ChatActivityGoal[] = [];
+    for (const [id, g] of this.liveGoals) {
+      goals.push({
+        id, parentId: g.parentId, title: g.title, description: g.description,
+        status: g.status, latestMessage: g.latestMessage, latestAgent: g.latestAgent,
+      });
+    }
+    const tasks: Record<string, ChatActivityTask[]> = {};
+    for (const [goalId, list] of this.liveTasks) tasks[goalId] = list;
+    return { active: this.activityActive, header: this.composeActivityText(), rootId: this._currentGoalId, goals, tasks };
+  }
+
+  /** Tell the window the live activity state now. */
+  private pushActivity(): void {
+    if (!this.windowId) return;
+    try { this.send(event(this.id, this.windowId, 'chatActivity', this.activitySnapshot())); } catch { /* window gone */ }
+  }
+
+  private showActivity(): void {
+    if (this.activityActive) return;
+    this.activityActive = true;
+    this.activityStep = 0;
+    this.activityHeader = THINKING_TEXT;
+    this.stepStreamChars = 0;
+    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); }
+    this.pushActivity();
+  }
+
+  private removeActivity(): void {
+    if (this.activityRefreshTimer) {
+      this.cancelTimer(this.activityRefreshTimer);
+      this.activityRefreshTimer = undefined;
+    }
+    if (!this.activityActive) return;
+    this.activityActive = false;
+    this.activityStep = 0;
+    this.stepStreamChars = 0;
+    this.liveGoals.clear();
+    this.liveTasks.clear();
+    this.pushActivity();
+  }
+
+  private composeActivityText(): string {
+    const baseHeader = this.activityStep > 0
+      ? `${THINKING_TEXT} (step ${this.activityStep}/${MAX_STEPS})`
+      : this.activityHeader;
+    // A streaming hint so the person sees the model is producing output even
+    // when no other progress signal has fired yet (~4 chars/token).
+    return this.stepStreamChars > 0
+      ? `${baseHeader}  ·  ~${Math.max(1, Math.round(this.stepStreamChars / 4))} tok streamed`
+      : baseHeader;
+  }
+
+  private updateActivityHeader(header: string): void {
+    this.activityHeader = header;
+    this.scheduleActivityRefresh();
+  }
+
+  private updateActivityStep(step: number): void {
+    this.activityStep = step;
+    this.scheduleActivityRefresh();
+  }
+
+  /**
+   * Trailing-debounced push: coalesces rapid-fire progress events into one
+   * snapshot. A busy agent run fires dozens of progress events per second.
+   */
+  private scheduleActivityRefresh(): void {
+    if (this.activityRefreshTimer || !this.windowId) return;
+    this.activityRefreshTimer = this.setTimer(() => {
+      this.activityRefreshTimer = undefined;
+      this.pushActivity();
+    }, 120);
+  }
+
+  /**
+   * Emit the goalActivity aspect on busy-state transitions. Busy means either
+   * a turn is running or this conversation owns an active goal (created but
+   * not yet accepted as terminal).
+   */
+  private emitGoalActivity(): void {
+    this.pushControls();
+    const active = this.isGoalActive();
+    if (this.lastGoalActivity === active) return;
+    this.lastGoalActivity = active;
+    this.changed('goalActivity', active ? { active: true, goalId: this._currentGoalId } : { active: false });
+  }
+
+  /** True while a turn is running or this conversation owns an active goal. */
+  private isGoalActive(): boolean {
+    return this.turnPhase === 'busy' || this._currentGoalId !== undefined;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1132,13 +1203,24 @@ export class Chat extends Abject {
     });
   }
 
+  /** Reset all pending ticket timeouts (called on progress events). */
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // Goal subscription (lazy, only while a goal is active)
   // ═══════════════════════════════════════════════════════════════════
 
   /** Subscribe to GoalManager once (idempotent). We never auto-unsubscribe,
    *  so a late outcome after the task returned still delivers; a single active
-   *  conversation subscribing is cheap — the flood came from ALL of them. */
+   *  conversation subscribing is cheap; the flood came from ALL of them. */
   private async ensureGoalSubscription(): Promise<void> {
     if (this._goalSubscribed || !this.goalManagerId) return;
     await this.request(request(this.id, this.goalManagerId, 'addDependent', {}));
@@ -1194,7 +1276,10 @@ export class Chat extends Abject {
       return;
     }
     this.goalPaused = goal.status === 'paused';
-    this.fetchGoalTasks(activeGoalId).then(() => this.scheduleActivityRefresh()).catch(() => { /* window may not exist yet */ });
+    this.activityActive = true;
+    this.activityHeader = this.goalPaused ? 'Goal paused' : 'Waiting for goal progress';
+    this.pushControls();
+    this.fetchGoalTasks(activeGoalId).then(() => this.scheduleActivityRefresh()).catch(() => { /* GoalManager busy */ });
   }
 
   private async acceptGoalOutcome(goalId: string, status: 'completed' | 'failed', result?: unknown, error?: string): Promise<void> {
@@ -1209,36 +1294,32 @@ export class Chat extends Abject {
     const userStopped = this.stopRequestedGoalId === goalId;
     this.stopRequestedGoalId = undefined;
     this._currentGoalId = undefined;
+    this.goalPaused = false;
+    this.clarificationPending = false;
     this.emitGoalActivity();
     await this.persistActiveGoal(undefined);
-    await this.exitGoalControls();
-    await this.removeActivityBubble();
-    await this.deliverLateGoalOutcome({ status, result, error, goalId });
+    this.removeActivity();
+    this.deliverLateGoalOutcome({ status, result, error, goalId });
     // The job lands: a burst on success, a glitch when it fell over (a stop
     // the user asked for is their own doing and plays nothing).
     if (status === 'completed') this.playEffect('burst');
     else if (!userStopped) this.playEffect('glitch');
+    this.checkInvariants();
   }
 
   /**
    * Post a goal outcome that landed after the dispatching chat task already
-   * returned. Without this a late success shows up only as a standalone
-   * Notification window while the conversation's last word is a stale error,
-   * so route it into the chat thread where the user asked.
+   * returned, into the conversation where the user asked.
    */
-  private async deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed'; goalId?: string }): Promise<void> {
+  private deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed'; goalId?: string }): void {
     const text = outcome.status === 'completed'
       ? (typeof outcome.result === 'string' ? outcome.result : JSON.stringify(outcome.result))
       : `The goal did not complete: ${outcome.error ?? 'unknown error'}`;
     if (!text?.trim()) return;
-    try {
-      await this.removeWelcomeState();
-      await this.appendBubble('assistant', 'Agent', text.trim(), true);
-      this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text.trim(), sourceGoalId: outcome.goalId });
-      this.schedulePersist();
-    } catch (err) {
-      log.warn(`[Chat] deliverLateGoalOutcome failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const id = uuidv4();
+    this.conversationHistory.push({ id, role: 'assistant', content: text.trim(), sourceGoalId: outcome.goalId });
+    this.appendMessage('assistant', 'Agent', text.trim(), true, id);
+    this.schedulePersist();
   }
 
   /** Record a finished goal for planning context (newest last, capped at 8). */
@@ -1281,21 +1362,149 @@ export class Chat extends Abject {
     return `Current goal state (authoritative — trust this over earlier step results):\n${lines.join('\n')}`;
   }
 
-  /** Reset all pending ticket timeouts (called on progress events). */
-  private resetPendingTicketTimeouts(): void {
-    for (const [ticketId, entry] of this.pendingTickets) {
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
-      }, entry.timeoutMs);
+  /** Fetch goal title and description from GoalManager when we lazily seed a goal entry. */
+  private async fetchGoalTitle(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      const goal = await this.request<{ id: string; title: string; description?: string; parentId?: string; status: string } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId })
+      );
+      if (goal) {
+        const entry = this.liveGoals.get(goalId);
+        if (entry) {
+          entry.title = goal.title;
+          if (goal.description) entry.description = goal.description;
+          entry.parentId = goal.parentId;
+          this.scheduleActivityRefresh();
+        }
+      }
+    } catch { /* GoalManager may not be ready */ }
+  }
+
+  /** Fetch tasks for a goal from GoalManager and cache them. */
+  private async fetchGoalTasks(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      const tuples = await this.request<Array<{
+        id: string; fields: Record<string, unknown>; claimedBy?: string;
+      }>>(
+        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
+      );
+      const tasks = (tuples ?? []).map(t => ({
+        id: t.id,
+        description: (t.fields?.description as string) ?? '',
+        status: (t.fields?.status as string) ?? 'pending',
+        agentName: (t.fields?.agentName as string) ?? undefined,
+        claimedBy: t.claimedBy,
+        attempts: (t.fields?.attempts as number) ?? 0,
+        maxAttempts: (t.fields?.maxAttempts as number) ?? 1,
+        dependsOn: (t.fields?.dependsOn as string[]) ?? undefined,
+      }));
+      this.liveTasks.set(goalId, tasks);
+    } catch { /* GoalManager may not be ready */ }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Goal controls: pause, resume, stop, notes, clarification
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Pause: freeze the goal (GoalManager stops agents, claims, and scrums).
+   * Messages sent while paused go to the goal as notes; resume continues.
+   */
+  private async pauseGoal(): Promise<boolean> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId || this.goalPaused) return false;
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'pauseGoal', { goalId })
+    ).catch(() => false);
+    if (!ok) { this.playEffect('shake'); return false; }
+    this.goalPaused = true;
+    this.pushControls();
+    this.appendMessage('assistant', 'Agent', 'Paused. Work has stopped. Send a note to steer the goal, then resume to continue or stop to end it.', false);
+    return true;
+  }
+
+  private async resumeGoal(): Promise<boolean> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId || !this.goalPaused) return false;
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
+    ).catch(() => false);
+    if (!ok) { this.playEffect('shake'); return false; }
+    this.goalPaused = false;
+    this.clarificationPending = false;
+    this.pushControls();
+    return true;
+  }
+
+  /**
+   * Stop: hard-stop the goal. GoalManager cancels every task and fails the
+   * goal as "Stopped by user". The terminal event clears the goal state.
+   */
+  private async stopGoal(): Promise<boolean> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId) return false;
+    this.stopRequestedGoalId = goalId;
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'stopGoal', { goalId })
+    ).catch(() => false);
+    if (ok === false) {
+      if (this.stopRequestedGoalId === goalId) this.stopRequestedGoalId = undefined;
+      this.playEffect('shake');
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The scrum master paused the goal to ask the user a question. Show it, and
+   * take the next message as the answer (which resumes the goal).
+   */
+  private async handleClarificationRequested(question: string): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId) return;
+    this.goalPaused = true;
+    this.clarificationPending = true;
+    this.pushControls();
+    this.appendMessage('assistant', 'Agent', question, true);
+  }
+
+  /**
+   * A note during a running or paused goal: show it, keep it in the
+   * conversation history, and queue it on the goal where the scrum master
+   * weighs it. Answering a clarification question resumes the goal.
+   */
+  private async sendInterjection(note: string): Promise<void> {
+    const goalId = this._currentGoalId;
+    if (!goalId || !this.goalManagerId) return;
+    const id = uuidv4();
+    this.conversationHistory.push({ id, role: 'user', content: `[Note to the running goal] ${note}` });
+    this.appendMessage('user', 'You', note, false, id);
+    this.schedulePersist();
+    const ok = await this.request<boolean>(
+      request(this.id, this.goalManagerId, 'appendGoalNote', { goalId, note })
+    ).catch(() => false);
+    if (!ok) {
+      this.appendMessage('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
+      this.playEffect('shake');
+      return;
+    }
+    if (this.clarificationPending && this.goalPaused) {
+      // The note answers the scrum master's question: resume the sprint so
+      // the review scrum reads it.
+      this.clarificationPending = false;
+      const resumed = await this.request<boolean>(
+        request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
+      ).catch(() => false);
+      if (resumed) this.goalPaused = false;
+      this.pushControls();
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════
   // Agent act handler
   // ═══════════════════════════════════════════════════════════════════
-
 
   private async handleAgentAct(action: AgentAction, caller: { id: AbjectId; taskId: string }): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action}`);
@@ -1340,13 +1549,14 @@ export class Chat extends Abject {
             ...(context ? { context } : {}),
           }));
           this._currentGoalId = created.goalId;
+          this.goalPaused = false;
           this.liveGoals.set(created.goalId, { title, description, status: 'active' });
           this.emitGoalActivity();
         }
         const goalId = this._currentGoalId;
         this._goalCreatedThisTurn = true;
         await this.persistActiveGoal(goalId);
-        await this.enterGoalControls();
+        this.showActivity();
         this.updateActivityHeader('Goal submitted — waiting for progress');
         this.activityStep = 0;
         this.stepStreamChars = 0;
@@ -1372,7 +1582,28 @@ export class Chat extends Abject {
   // System prompt
   // ═══════════════════════════════════════════════════════════════════
 
-  private buildSystemPrompt(): string {
+  /**
+   * Whether this instance has a display, asked of InstanceInfo (cached for a
+   * minute). A headless instance has no windows, desktop scene or taskbar, so
+   * the prompt stops offering them. Without InstanceInfo to ask, the answer
+   * stays what it always was: a desktop.
+   */
+  private async hasDisplay(): Promise<boolean> {
+    const now = Date.now();
+    if (this.displayCheck && now - this.displayCheck.at < DISPLAY_CHECK_TTL_MS) return this.displayCheck.display;
+    let display = this.displayCheck?.display ?? true;
+    this.instanceInfoId = await this.resolveDep('InstanceInfo', this.instanceInfoId);
+    if (this.instanceInfoId) {
+      try {
+        const info = await this.request<{ display?: boolean }>(request(this.id, this.instanceInfoId, 'getInfo', {}), 5000);
+        if (typeof info?.display === 'boolean') display = info.display;
+      } catch { this.instanceInfoId = undefined; }
+    }
+    this.displayCheck = { at: now, display };
+    return display;
+  }
+
+  private buildSystemPrompt(desktop: boolean): string {
     const now = new Date();
     const dateLine = now.toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -1390,11 +1621,7 @@ Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("
 
 A \`goal\` action ends this routing turn once GoalManager accepts it. The chat receives progress and the final result through bus events. Do not poll goal status or narrate unobserved progress.
 
-## The desktop is a 3D scene
-
-The desktop is a native 3D scene: every window is a slab in it, and objects can attach real 3D content (meshes, lights, transforms) through their window in addition to drawing 2D content on canvases. 3D objects can also live free-floating in the global scene with no window at all — the right shape when the user asks for a standalone object on the desktop (a pet, a draggable shape, ambient décor) rather than an app UI. Word goals to match: a standalone object should float on the desktop itself, not live in a window. Existing windows — including built-in apps' windows — can be DECORATED by a separate object that finds the window and attaches 3D content to it, so "add X to the Y window" goals should say to decorate the existing window, keeping the original app untouched (never to rebuild or clone the app). When a request involves visuals, describe the desired OUTCOME in the goal and let the builders discover the current rendering capabilities live (they ask the UI objects for up-to-date vocabularies) — do not prescribe rendering implementation details (like "use 2D canvas with projection math") from memory; such recalled how-tos may predate current capabilities.
-
-## Action Format
+${desktop ? DESKTOP_SCENE_PROMPT : ''}## Action Format
 
 Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY the JSON block — no prose before or after it. Put a one-sentence note in the action's \`reasoning\` field if you want it logged; the prose around the block is unread.
 
@@ -1469,7 +1696,7 @@ So:
 
   **Self-contained text rule.** The done text is the user's ONLY view of the result. Do not reference internal artifacts the user can't see — no "see above", "see the prioritized list", "see scratchpad", "see goal X", "see the attached", "as shown earlier". The user has not seen anything earlier; they only see this reply. If the goal result or scratchpad contains a list, table, or detailed data the user asked for, INLINE it directly in the done text. Pull values out of the scratchpad and write them into your reply.
 
-The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
+Replies render as markdown, on the desktop and in the terminal. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
 ## Scheduled and recurring work
 
@@ -1547,10 +1774,10 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
 ## Stop when the work is done
 
-When the user asked for an object, app, widget, bridge, tool, schedule, or agent and the goal finishes successfully, the work is done. The object is registered; the user can discover and open it from the taskbar, AppExplorer, or by asking. On the very next turn, call **done** with:
+When the user asked for an object, app, widget, bridge, tool, schedule, or agent and the goal finishes successfully, the work is done. The object is registered; ${desktop ? 'the user can discover and open it from the taskbar, AppExplorer, or by asking' : 'the user reaches it by asking in this conversation, on a schedule, or through the web gateway'}. On the very next turn, call **done** with:
 - the object's name exactly as registered,
 - a one-line summary of what it does,
-- how to open it (taskbar, AppExplorer, or "ask me to open it").
+- ${desktop ? 'how to open it (taskbar, AppExplorer, or "ask me to open it")' : 'how to use it (ask me to call it, or schedule it)'}.
 
 Treat the user's silence as confirmation. Wait for the user to report a specific issue before revisiting the object — their feedback is the signal to retry or refine.
 
@@ -1563,561 +1790,18 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   // ═══════════════════════════════════════════════════════════════════
-  // Chat-specific logic
+  // Persistence and title
   // ═══════════════════════════════════════════════════════════════════
-
-  async show(): Promise<boolean> {
-    if (this.windowId) {
-      try {
-        await this.request(request(this.id, this.widgetManagerId!, 'raiseWindow', {
-          windowId: this.windowId,
-        }));
-      } catch { /* best effort */ }
-      return true;
-    }
-
-    const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
-    );
-
-    let winW: number;
-    let winH: number;
-    let winX: number;
-    let winY: number;
-    if (this.initialRect) {
-      winW = Math.min(this.initialRect.width, displayInfo.width - 20);
-      winH = Math.min(this.initialRect.height, displayInfo.height - 20);
-      winX = Math.max(10, Math.min(this.initialRect.x, displayInfo.width - winW - 10));
-      winY = Math.max(10, Math.min(this.initialRect.y, displayInfo.height - winH - 10));
-    } else {
-      winW = Math.min(DEFAULT_WIN_W, Math.max(360, displayInfo.width - 40));
-      winH = Math.min(DEFAULT_WIN_H, Math.max(360, displayInfo.height - 40));
-      winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
-      winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
-    }
-    this.currentWindowWidth = winW;
-    this.currentRect = { x: winX, y: winY, width: winW, height: winH };
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: this.formatWindowTitle(this.conversationTitle),
-        rect: { x: winX, y: winY, width: winW, height: winH },
-        zIndex: 200,
-        resizable: true,
-      })
-    );
-
-    // Subscribe to the window for windowResized events.
-    this.send(request(this.id, this.windowId, 'addDependent', {}));
-
-    // Root VBox: message log stacked over composer column.
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: this.theme.tokens.space.md, right: this.theme.tokens.space.lg, bottom: this.theme.tokens.space.md, left: this.theme.tokens.space.lg },
-        spacing: this.theme.tokens.space.md,
-      })
-    );
-
-    // Status strip: a quiet "Ready" while idle, phosphor while the chat is
-    // thinking or a goal is running (the eye sigil sits at its right end).
-    const { widgetIds: [statusStripId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{
-          type: 'label', windowId: this.windowId, text: this.statusStripText(),
-          style: this.statusStripStyle(),
-        }],
-      })
-    );
-    this.statusStripId = statusStripId;
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.statusStripId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: STATUS_STRIP_H },
-    }));
-
-    // Scrollable VBox for message log (expanding, auto-scroll to follow new messages).
-    // A bottom margin keeps the last bubble clear of the composer instead of
-    // sitting flush against it (which clipped the final line).
-    this.messageLogId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        autoScroll: true,
-        margins: { top: 0, right: 0, bottom: this.theme.tokens.space.md, left: 0 },
-        spacing: this.theme.tokens.space.md,
-      })
-    );
-
-    // Composer column: input row on top, hint label under it.
-    this.composerColumnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: this.theme.tokens.space.xs,
-      })
-    );
-
-    // Input row (HBox: TextInput + Send button).
-    this.composerRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.composerColumnId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: this.theme.tokens.space.md,
-      })
-    );
-    this.inputRowId = this.composerRowId;
-
-    // Assemble root: message log (expanding) + composer column (preferred).
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.messageLogId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.composerColumnId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT + this.theme.tokens.space.xs + this.theme.tokens.space.xl } },
-      ],
-    }));
-
-    // Composer widgets: text input, send button (circular glyph), hint label.
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          {
-            type: 'textInput', windowId: this.windowId,
-            placeholder: 'Message the agent\u2026',
-            wordWrap: true, maxLines: 6,
-            // Keep the comfortable empty height as the auto-grow floor so the
-            // composer doesn't shrink the moment the first character is typed.
-            minHeight: INPUT_MIN_HEIGHT,
-            // Markdown render mode: pasted images show inline in the composer
-            // while editing stays plain-text.
-            style: { markdown: true },
-          },
-          {
-            // Secondary: a plain square button beside the input.
-            type: 'button', windowId: this.windowId, text: ATTACH_GLYPH,
-            style: {
-              color: this.theme.textSecondary,
-              fontSize: 18,
-            },
-          },
-          {
-            // The one primary action: a solid red Send block.
-            type: 'button', windowId: this.windowId, text: SEND_GLYPH,
-            style: {
-              background: this.theme.actionBg,
-              color: this.theme.actionText,
-              borderColor: this.theme.actionBorder,
-              fontSize: 18,
-              fontWeight: 'bold',
-            },
-          },
-          {
-            type: 'label', windowId: this.windowId,
-            text: COMPOSER_HINT_DEFAULT,
-            style: {
-              color: this.theme.textMeta,
-              fontSize: 11,
-              wordWrap: false,
-              selectable: false,
-              align: 'right' as const,
-            },
-          },
-        ],
-      })
-    );
-    this.textInputId = widgetIds[0];
-    this.uploadBtnId = widgetIds[1];
-    this.sendBtnId = widgetIds[2];
-    this.composerHintLabelId = widgetIds[3];
-
-    // Add attach button + input + send button to the composer row. The buttons
-    // are fixed-size and bottom-aligned (alignment 'right' = bottom on the HBox
-    // cross-axis) so they stay pinned to the bottom as the input grows taller;
-    // the input expands to fill the row height.
-    await this.request(request(this.id, this.composerRowId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.uploadBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
-        { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
-        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
-      ],
-    }));
-
-    // Add hint label below the input row.
-    await this.request(request(this.id, this.composerColumnId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.composerRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
-        { widgetId: this.composerHintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: this.theme.tokens.space.xl } },
-      ],
-    }));
-
-    // Fire-and-forget: register as dependent of interactive widgets.
-    this.send(request(this.id, this.sendBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.uploadBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.textInputId, 'addDependent', {}));
-
-    this.uiPhase = 'idle';
-    this.emitGoalActivity();
-    await this.syncWorkingIndicators();
-
-    log.info(`[Chat ${(this.conversationId ?? this.id).slice(0, 8)}] show() historyLen=${this.conversationHistory.length} title="${this.conversationTitle ?? ''}"`);
-    if (this.conversationHistory.length === 0) {
-      // Fresh conversation — show the welcome card + suggestion chips.
-      await this.showWelcomeState();
-    } else {
-      // Restored from persistence — re-render each past message as a bubble.
-      await this.renderHistoryBubbles();
-    }
-
-    if (this._currentGoalId) {
-      const paused = this.goalPaused;
-      await this.showActivityBubble();
-      await this.enterGoalControls();
-      this.goalPaused = paused;
-      this.updateActivityHeader(paused ? 'Goal paused' : 'Waiting for goal progress');
-      if (paused && this.sendBtnId) {
-        await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH }));
-        await this.setComposerHint(COMPOSER_HINT_PAUSED);
-      }
-    }
-    this.changed('visibility', true);
-    return true;
-  }
-
-  /**
-   * Re-render `conversationHistory` as bubbles. Called on show() when the
-   * conversation already has persisted messages (rehydrated from Storage).
-   * Bubbles are emitted silently so downstream subscribers do not treat
-   * historical messages as new arrivals.
-   */
-  private async renderHistoryBubbles(): Promise<void> {
-    for (const entry of this.conversationHistory) {
-      const role: BubbleRole =
-        entry.role === 'user' ? 'user' :
-        entry.role === 'assistant' ? 'assistant' : 'system';
-      const defaultSender =
-        entry.role === 'user' ? 'You' :
-        entry.role === 'assistant' ? 'Agent' : 'System';
-      const sender = entry.sender ?? defaultSender;
-      // Attachment chips use markdown (bold filename) even though they're user-role.
-      const markdown = entry.role !== 'user' || !!entry.attachment;
-      await this.appendBubble(role, sender, entry.content, markdown, /* silent */ true);
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Welcome state
-  // ═══════════════════════════════════════════════════════════════════
-
-  private async showWelcomeState(): Promise<void> {
-    if (!this.messageLogId || !this.windowId) return;
-    if (this.welcomeWidgetIds.length > 0) return;
-
-    const tokens = this.theme.tokens;
-    const headingText = sectionHeaderText(this.theme, 'Welcome to Chat');
-    const bodyText = WELCOME_BODY_TEXT;
-
-    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
-
-    const specs: Array<Record<string, unknown>> = [
-      // Spacer above the card for vertical breathing room.
-      {
-        type: 'label', windowId: this.windowId, text: '',
-        style: { color: this.theme.textTertiary, fontSize: 1, wordWrap: false, selectable: false },
-      },
-      // Display-font heading.
-      {
-        type: 'label', windowId: this.windowId, text: headingText,
-        style: {
-          color: this.theme.textHeading,
-          fontSize: 20,
-          fontWeight: 'bold',
-          fontFamily: 'display',
-          wordWrap: false,
-          selectable: false,
-          align: 'center' as const,
-        },
-      },
-      // Body description in a ruled card.
-      {
-        type: 'label', windowId: this.windowId, text: bodyText,
-        style: {
-          color: this.theme.textSecondary,
-          background: this.theme.inputBg,
-          borderColor: this.theme.windowBorder,
-          radius: tokens.radius.lg,
-          fontSize: 13,
-          wordWrap: true,
-          selectable: false,
-          align: 'center' as const,
-        },
-      },
-    ];
-
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs })
-    );
-    const [spacerId, headingId, bodyId] = widgetIds;
-
-    const addCentered = async (id: AbjectId, width: number, height: number) => {
-      await this.request(request(this.id, this.messageLogId!, 'addLayoutChild', {
-        widgetId: id,
-        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width, height },
-        alignment: 'center',
-      }));
-      this.welcomeWidgetIds.push(id);
-      this.messageLabelIds.push(id);
-    };
-
-    await addCentered(spacerId, cardWidth, spacerHeight);
-    await addCentered(headingId, cardWidth, headingHeight);
-    await addCentered(bodyId, cardWidth, bodyHeight);
-  }
-
-  /**
-   * Shared sizing for the welcome card so creation (showWelcomeState) and
-   * resize reflow (updateWelcomeLayout) compute identical geometry.
-   */
-  private welcomeCardLayout(): {
-    cardWidth: number;
-    spacerHeight: number;
-    headingHeight: number;
-    bodyHeight: number;
-  } {
-    const tokens = this.theme.tokens;
-    const cardWidth = Math.min(this.computeBubbleMaxWidth(), 460);
-    const innerWidth = cardWidth - tokens.space.lg * 2;
-    // Use the markdown estimator (paragraph-aware) + padding so the card never clips.
-    const bodyHeight = this.estimateBubbleHeight(WELCOME_BODY_TEXT, innerWidth, true) + tokens.space.xl;
-    return { cardWidth, spacerHeight: tokens.space.xl, headingHeight: 30, bodyHeight };
-  }
-
-  /**
-   * Re-fit the welcome card widgets in place for the current window size.
-   * updateLayoutChild merges the new preferredSize into the existing layout
-   * entry, so the three labels keep their ids and content — no destroy/recreate
-   * cycle, hence no blank frame while replacements render (resize flash).
-   */
-  private async updateWelcomeLayout(): Promise<void> {
-    if (!this.messageLogId || !this.windowId) return;
-    if (this.welcomeWidgetIds.length === 0) return;
-
-    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
-    const heights = [spacerHeight, headingHeight, bodyHeight];
-    const updates: Promise<unknown>[] = [];
-    for (let i = 0; i < this.welcomeWidgetIds.length; i++) {
-      const id = this.welcomeWidgetIds[i];
-      const height = heights[i] ?? bodyHeight;
-      updates.push(
-        this.request(request(this.id, this.messageLogId!, 'updateLayoutChild', {
-          widgetId: id,
-          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-          preferredSize: { width: cardWidth, height },
-          alignment: 'center',
-        }))
-      );
-    }
-    await Promise.all(updates);
-  }
-
-  private async removeWelcomeState(): Promise<void> {
-    if (this.welcomeWidgetIds.length === 0) return;
-    const ids = [...this.welcomeWidgetIds];
-    this.welcomeWidgetIds = [];
-    for (const id of ids) {
-      await this.removeLabel(id);
-    }
-  }
-
-  /** Map a chip button's text back to the full prompt it should send. */
-  private promptForChipText(chipText: string): string | undefined {
-    // Chip labels are rendered with a leading "›  " glyph; match on the label.
-    const chip = DEFAULT_SUGGESTIONS.find(c => chipText === c.label || chipText.endsWith(c.label));
-    return chip?.prompt;
-  }
-
-  /**
-   * Emit the goalActivity aspect on busy-state transitions. Busy means either
-   * a turn is running (uiPhase === 'busy') or this conversation owns an
-   * active goal (created but not yet accepted as terminal). ChatManager
-   * forwards this to ChatBrowser, which forwards it to the taskbar so the
-   * chat icon pulses while work is in flight.
-   */
-  private emitGoalActivity(): void {
-    const active = this.isGoalActive();
-    if (this.lastGoalActivity === active) return;
-    this.lastGoalActivity = active;
-    this.refreshWindowTitle();
-    void this.syncWorkingIndicators();
-    this.changed('goalActivity', active ? { active: true, goalId: this._currentGoalId } : { active: false });
-  }
-
-  // ── Status strip + eye ────────────────────────────────────────────────
-
-  private statusStripText(): string {
-    return this.isGoalActive() ? `\u25C9  ${chromeCase(this.theme, 'Working')}` : chromeCase(this.theme, 'Ready');
-  }
-
-  private statusStripStyle(): Record<string, unknown> {
-    const base = { fontSize: 11, fontFamily: 'display', wordWrap: false, selectable: false };
-    return this.isGoalActive()
-      ? { ...base, ...livingStyle(this.theme, 11), fontWeight: 'bold' }
-      : { ...base, color: this.theme.textMeta, fontWeight: 'normal' };
-  }
-
-  /** Eye position: right end of the status strip, px from the window centre. */
-  private eyePosition(): [number, number, number] {
-    const w = this.currentRect?.width ?? this.currentWindowWidth;
-    const h = this.currentRect?.height ?? DEFAULT_WIN_H;
-    const sp = this.theme.tokens.space;
-    // Content starts 36px below the window top; the strip follows the top margin.
-    return [w / 2 - sp.lg - CHAT_EYE_SIZE / 2 - 4, -h / 2 + 36 + sp.md + STATUS_STRIP_H / 2, 6];
-  }
-
-  /**
-   * Bring the status strip and the eye sigil in line with the busy state.
-   * Runs only on transitions (and once per show); one label update and one
-   * scene batch each, all eye motion is client-side.
-   */
-  private async syncWorkingIndicators(): Promise<void> {
-    if (!this.windowId) return;
-    if (this.statusStripId) {
-      try {
-        this.send(event(this.id, this.statusStripId, 'update', {
-          text: this.statusStripText(), style: this.statusStripStyle(),
-        }));
-      } catch { /* widget gone */ }
-    }
-    const want = this.isGoalActive();
-    if (want === this.eyeShown) return;
-    this.eyeShown = want;
-    // The eye opens with its thinking stream (resting while a goal is
-    // paused); removing the sigil takes the stream with it.
-    this.streamRate = want ? this.wantedStreamRate() : 0;
-    await this.sendEyeOps(want
-      ? [
-        ...eyeSigilOps(CHAT_EYE_PREFIX, this.eyePosition(), CHAT_EYE_SIZE),
-        ...sigilStreamOps(CHAT_EYE_PREFIX, CHAT_EYE_SIZE, this.streamRate),
-      ]
-      : removeSigilOps(CHAT_EYE_PREFIX));
-  }
-
-  /** The stream flows while the eye is open and the work is not paused. */
-  private wantedStreamRate(): number {
-    return this.eyeShown && !this._goalPaused ? CHAT_STREAM_RATE : 0;
-  }
-
-  /** Start or rest the eye's thinking stream on pause/resume transitions. */
-  private async syncThinkingStream(): Promise<void> {
-    if (!this.windowId || !this.eyeShown) return;
-    const rate = this.wantedStreamRate();
-    if (rate === this.streamRate) return;
-    this.streamRate = rate;
-    await this.sendEyeOps([{ op: 'update', id: `${CHAT_EYE_PREFIX}-stream`, params: { rate } }]);
-  }
-
-  /** Play a one-shot slab effect on the chat window (visual only). */
-  private playEffect(effect: string, color?: string): void {
-    if (!this.windowId) return;
-    try {
-      this.playWindowEffect(this.windowId, effect, color);
-    } catch { /* window gone */ }
-  }
-
-  private async sendEyeOps(ops: SceneOp[]): Promise<void> {
-    if (!this.windowId) return;
-    try {
-      await this.request(request(this.id, this.windowId, 'scene', { ops }));
-    } catch (err) {
-      log.warn('Failed to update the chat eye sigil:', err);
-    }
-  }
-
-  async hide(): Promise<boolean> {
-    if (!this.windowId) return true;
-
-    this.uiPhase = 'closed';
-    this.emitGoalActivity();
-
-    // Flush any pending history persist before the window goes away
-    if (this.persistTimer) {
-      this.cancelTimer(this.persistTimer);
-      this.persistTimer = undefined;
-      void this.persistHistory();
-    }
-
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
-
-    this.windowId = undefined;
-    this.rootLayoutId = undefined;
-    this.messageLogId = undefined;
-    this.inputRowId = undefined;
-    this.composerRowId = undefined;
-    this.composerColumnId = undefined;
-    this.composerHintLabelId = undefined;
-    this.textInputId = undefined;
-    this.sendBtnId = undefined;
-    this.statusStripId = undefined;
-    this.eyeShown = false;
-    this.streamRate = 0;
-    this.stopBtnId = undefined;
-    this.goalControlsActive = false;
-    this.messageLabelIds = [];
-    this.messageMetadata.clear();
-    this.bubbleSenderLabels.clear();
-    this.activityBubbleLabelId = undefined;
-    this.activityStep = 0;
-    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); this.collapsedGoals.clear(); }
-    this.welcomeWidgetIds = [];
-    this._streamBuffer = '';
-    if (this.activityRefreshTimer) {
-      this.cancelTimer(this.activityRefreshTimer);
-      this.activityRefreshTimer = undefined;
-    }
-    if (this.reflowTimer) {
-      this.cancelTimer(this.reflowTimer);
-      this.reflowTimer = undefined;
-    }
-    this.changed('visibility', false);
-    return true;
-  }
-
-  // ─── Conversation identity helpers ──────────────────────────────────
-
-  /** True while a turn is running or this conversation owns an active goal. */
-  private isGoalActive(): boolean {
-    return this.uiPhase === 'busy' || this._currentGoalId !== undefined;
-  }
-
-  /**
-   * Window title: the conversation title, plus a trailing dot while
-   * a goal is running (the same mark the taskbar's chat row shows).
-   */
-  private formatWindowTitle(title?: string): string {
-    const t = (title ?? this.conversationTitle ?? 'Chat').trim();
-    const base = t || 'Chat';
-    return this.isGoalActive() ? `${base} \u25CF` : base;
-  }
-
-  /** Push the current title (with or without the busy dot) to the window. */
-  private refreshWindowTitle(): void {
-    if (!this.windowId) return;
-    try {
-      this.send(request(this.id, this.windowId, 'setTitle', { title: this.formatWindowTitle() }));
-    } catch { /* window gone */ }
-  }
 
   private notifyRectChanged(): void {
-    if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
+    if (!this.initialRect || !this.chatManagerId || !this.conversationId) return;
     if (this.rectPersistTimer) return;
     this.rectPersistTimer = this.setTimer(() => {
       this.rectPersistTimer = undefined;
-      if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
+      if (!this.initialRect || !this.chatManagerId || !this.conversationId) return;
       this.send(event(this.id, this.chatManagerId, 'rectChanged', {
         conversationId: this.conversationId,
-        rect: { ...this.currentRect },
+        rect: { ...this.initialRect },
       }));
     }, 250);
   }
@@ -2152,28 +1836,20 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (current && current !== 'New chat') return;
     const cleaned = userText.replace(/\s+/g, ' ').trim();
     if (!cleaned) return;
-    const derived = cleaned.length > 40 ? cleaned.slice(0, 40).trimEnd() + '\u2026' : cleaned;
+    const derived = cleaned.length > 40 ? cleaned.slice(0, 40).trimEnd() + '…' : cleaned;
     this.conversationTitle = derived;
-    if (this.windowId) {
-      try {
-        this.send(request(this.id, this.windowId, 'setTitle', {
-          title: this.formatWindowTitle(derived),
-        }));
-      } catch { /* best effort */ }
-    }
     if (this.chatManagerId) {
       this.send(event(this.id, this.chatManagerId, 'titleChanged', {
         conversationId: this.conversationId,
         title: derived,
       }));
     }
+    this.changed('titleChanged', { conversationId: this.conversationId, title: derived });
   }
 
-  /** Attach button clicked — ask the client to open a native file picker. */
-  private async handleUploadClick(): Promise<void> {
-    if (!this.windowId) return;
-    this.send(request(this.id, this.windowId, 'openFilePicker', { multiple: true }));
-  }
+  // ═══════════════════════════════════════════════════════════════════
+  // Attachments
+  // ═══════════════════════════════════════════════════════════════════
 
   /**
    * Persist an uploaded file to the workspace FileSystem and record it as an
@@ -2182,7 +1858,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    */
   private async handleFileUploaded(name: string, mimeType: string, base64: string): Promise<void> {
     if (!this.fileSystemId) {
-      await this.appendBubble('error', 'Upload', 'No filesystem available to store the file.', false);
+      this.appendMessage('error', 'Upload', 'No filesystem available to store the file.', false);
       this.playEffect('shake');
       return;
     }
@@ -2196,7 +1872,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       );
     } catch (err) {
       log.warn(`[Chat] failed to store upload ${safeName}:`, err);
-      await this.appendBubble('error', 'Upload', `Failed to store "${safeName}".`, false);
+      this.appendMessage('error', 'Upload', `Failed to store "${safeName}".`, false);
       this.playEffect('shake');
       return;
     }
@@ -2205,18 +1881,64 @@ A single successful creation goal is a complete turn. End it with **done**.
       IMAGE_MIME.has(mimeType) ? 'image' :
       mimeType === 'application/pdf' ? 'document' : 'text';
 
-    await this.removeWelcomeState();
-    await this.appendBubble('user', 'You', `${ATTACH_GLYPH} Attached **${safeName}**`, true);
+    const id = uuidv4();
     this.conversationHistory.push({
-      id: uuidv4(),
+      id,
       role: 'user',
       content: `${ATTACH_GLYPH} Attached ${safeName}`,
       sender: 'You',
       attachment: { path, name: safeName, mimeType, kind, injected: false },
     });
+    this.appendMessage('user', 'You', `${ATTACH_GLYPH} Attached **${safeName}**`, true, id);
     this.schedulePersist();
     // Saved: a hand-coloured flash as the attachment lands.
     this.playEffect('flash', '$accent');
+  }
+
+  /**
+   * Images pasted with a message: store the bytes in the workspace FileSystem
+   * (so the LLM gets a vision block from the file path) and show each as an
+   * inline image message. The message carries a `data:` URI directly, since a
+   * view cannot reliably reach the FileSystem to resolve a reference.
+   */
+  private async commitImages(images: ChatImage[]): Promise<void> {
+    for (const img of images) {
+      const safeName = (img.name || 'image').replace(/[/\\]/g, '_');
+      const mimeType = IMAGE_MIME.has(img.mimeType) ? img.mimeType : 'image/png';
+      const dataUri = `data:${mimeType};base64,${img.base64}`;
+
+      // Store the bytes so the LLM receives a vision block read from the path.
+      let path: string | undefined;
+      if (this.fileSystemId) {
+        const convo = this.conversationId ?? this.id;
+        path = `/uploads/${convo}/${Date.now()}-${safeName}`;
+        try {
+          await this.request(
+            request(this.id, this.fileSystemId, 'writeFileBytes', { path, base64: img.base64 }),
+            30000,
+          );
+        } catch (err) {
+          log.warn(`[Chat] failed to store pasted image ${safeName}:`, err);
+          path = undefined;
+        }
+      }
+
+      const id = uuidv4();
+      this.conversationHistory.push({
+        id,
+        role: 'user',
+        content: `![${safeName}](${dataUri})`,
+        sender: 'You',
+        // With a stored path the attachment carries the image to the LLM (as a
+        // vision block, not the inline data URI). Without one, mark it media so
+        // the heavy data URI never enters the LLM context.
+        ...(path
+          ? { attachment: { path, name: safeName, mimeType, kind: 'image' as const, injected: false } }
+          : { media: true }),
+      });
+      this.appendMessage('user', 'You', `![${safeName}](${dataUri})`, true, id);
+    }
+    this.schedulePersist();
   }
 
   /**
@@ -2255,99 +1977,9 @@ A single successful creation goal is a complete turn. End it with **done**.
     }
   }
 
-  private async handleSendClick(): Promise<void> {
-    // While the goal is paused the composer is the interjection channel:
-    // Enter sends a note into the goal instead of starting a new chat task.
-    // A running goal keeps the composer live: typed text queues as an
-    // interjection the scrum master weighs at its next decision point.
-    const interjecting = this.goalControlsActive && !!this._currentGoalId;
-    if ((this.uiPhase !== 'idle' && !interjecting) || !this.textInputId) return;
-
-    const text = await this.request<string>(
-      request(this.id, this.textInputId, 'getValue', {})
-    );
-
-    // Inline image references in the composer (`![](abject://…)`) become
-    // attachments; the remaining typed text is the message. With no text and
-    // no pasted images there is nothing to send.
-    const cleanText = this.stripImageRefs(text ?? '').trim();
-    if (interjecting) {
-      if (!cleanText) return;
-      await this.request(request(this.id, this.textInputId, 'update', { text: '' }));
-      await this.sendInterjection(cleanText);
-      return;
-    }
-    if (!cleanText && this.pendingImages.length === 0) return;
-
-    // Clear input
-    await this.request(
-      request(this.id, this.textInputId, 'update', { text: '' })
-    );
-
-    await this.commitPendingImages();
-    this.triggerSend(cleanText);
-  }
-
-  /** Remove block image markdown lines (`![alt](url)`), leaving the typed text. */
-  private stripImageRefs(text: string): string {
-    return text
-      .split('\n')
-      .filter((line) => !/^\s*!\[[^\]]*\]\([^)]+\)\s*$/.test(line))
-      .join('\n');
-  }
-
-  /**
-   * Commit images pasted into the composer: store the bytes in the workspace
-   * FileSystem (so the LLM gets a vision block from the file path) and show each
-   * as an inline image bubble. The bubble renders a `data:` URI directly, since
-   * bubble widgets can't reliably reach the FileSystem to resolve a reference.
-   */
-  private async commitPendingImages(): Promise<void> {
-    if (this.pendingImages.length === 0) return;
-    const images = this.pendingImages;
-    this.pendingImages = [];
-    await this.removeWelcomeState();
-    for (const img of images) {
-      const safeName = (img.name || 'image').replace(/[/\\]/g, '_');
-      const dataUri = `data:${img.mimeType};base64,${img.base64}`;
-
-      // Store the bytes so the LLM receives a vision block read from the path.
-      let path: string | undefined;
-      if (this.fileSystemId) {
-        const convo = this.conversationId ?? this.id;
-        path = `/uploads/${convo}/${Date.now()}-${safeName}`;
-        try {
-          await this.request(
-            request(this.id, this.fileSystemId, 'writeFileBytes', { path, base64: img.base64 }),
-            30000,
-          );
-        } catch (err) {
-          log.warn(`[Chat] failed to store pasted image ${safeName}:`, err);
-          path = undefined;
-        }
-      }
-
-      await this.appendBubble('user', 'You', `![${safeName}](${dataUri})`, true);
-      this.conversationHistory.push({
-        id: uuidv4(),
-        role: 'user',
-        content: `![${safeName}](${dataUri})`,
-        sender: 'You',
-        // With a stored path the attachment carries the image to the LLM (as a
-        // vision block, not the inline data URI). Without one, mark it media so
-        // the heavy data URI never enters the LLM context.
-        ...(path
-          ? { attachment: { path, name: safeName, mimeType: img.mimeType, kind: 'image' as const, injected: false } }
-          : { media: true }),
-      });
-    }
-    this.schedulePersist();
-  }
-
-  private triggerSend(text: string): void {
-    if (this.uiPhase !== 'idle') return;
-    this.runChatTask(text);
-  }
+  // ═══════════════════════════════════════════════════════════════════
+  // A turn
+  // ═══════════════════════════════════════════════════════════════════
 
   private captureGoalContext(): ConversationContext | undefined {
     this.conversationHistory = identifyMessages(this.conversationId ?? this.id, this.conversationHistory);
@@ -2358,6 +1990,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async runTaskTurn(
     userText: string,
     messages: { role: string; content: string | ContentPart[] }[],
+    desktop: boolean,
   ): Promise<ChatTurn> {
     this._goalCreatedThisTurn = false;
     this._streamBuffer = '';
@@ -2366,7 +1999,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           task: userText,
-          systemPrompt: this.buildSystemPrompt(),
+          systemPrompt: this.buildSystemPrompt(desktop),
           initialMessages: messages,
           goalId: undefined,
           config: { queueName: `chat-${this.id}` },
@@ -2446,20 +2079,20 @@ A single successful creation goal is a complete turn. End it with **done**.
    * think; otherwise (or advising) the verdict rides to that think as a hint.
    */
   private async routeAndRunTurn(
-    userText: string, initialMessages: { role: string; content: string | ContentPart[] }[], newAttachment: boolean,
+    userText: string, initialMessages: { role: string; content: string | ContentPart[] }[], newAttachment: boolean, desktop: boolean,
   ): Promise<ChatTurn> {
     const mode = userText.trim() ? await this.decisionSiteMode('chat.route') : 'off';
-    if (mode === 'off') return this.runTaskTurn(userText, initialMessages);
+    if (mode === 'off') return this.runTaskTurn(userText, initialMessages, desktop);
     const r = await this.decideRoute(userText, newAttachment);
     if (r) log.info(`[decision:${r.outcome.mode}] chat.route: ${r.route}@${r.routeP.toFixed(2)}`);
     if (r && r.outcome.mode === 'act' && r.route === 'goal_self_contained' && r.routeP >= 0.9 && !newAttachment) {
       log.info('[decision:act] chat.route: creating the goal directly');
-      return this.createRoutedGoal(userText);
+      return this.createRoutedGoal(userText, desktop);
     }
     const hinted = r && r.routeP >= 0.8
       ? [...initialMessages, { role: 'user', content: `[Routing hint] A runtime check reads this message as ${ROUTE_HINTS[r.route] ?? r.route} (p=${r.routeP.toFixed(2)}). Decide as usual.` }]
       : initialMessages;
-    return this.runTaskTurn(userText, hinted);
+    return this.runTaskTurn(userText, hinted, desktop);
   }
 
   private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number } | null> {
@@ -2479,16 +2112,16 @@ A single successful creation goal is a complete turn. End it with **done**.
    * the description (the conversation rides along as context, as it does for
    * any goal), and a title cut from the first line.
    */
-  private async createRoutedGoal(userText: string): Promise<ChatTurn> {
+  private async createRoutedGoal(userText: string, desktop: boolean): Promise<ChatTurn> {
     this._goalCreatedThisTurn = false;
     this.turnContext = this.captureGoalContext();
     try {
       const firstLine = userText.split('\n').find(l => l.trim())?.trim() ?? userText.trim();
-      const title = firstLine.length > 80 ? `${firstLine.slice(0, 80).trimEnd()}\u2026` : firstLine;
+      const title = firstLine.length > 80 ? `${firstLine.slice(0, 80).trimEnd()}…` : firstLine;
       const outcome = await this.handleAgentAct({ action: 'goal', title, description: userText.trim() } as AgentAction, { id: this.id, taskId: `route-${uuidv4()}` }) as { success: boolean; error?: string };
       if (!outcome.success) {
         // Fall back to the normal turn: nothing was created.
-        return this.runTaskTurn(userText, this.conversationHistory.filter(e => e.media !== true).slice(-MAX_CONVERSATION_ENTRIES).map(e => ({ role: e.role, content: e.content })));
+        return this.runTaskTurn(userText, this.conversationHistory.filter(e => e.media !== true).slice(-MAX_CONVERSATION_ENTRIES).map(e => ({ role: e.role, content: e.content })), desktop);
       }
       return { success: true, result: '', goalCreated: this._goalCreatedThisTurn };
     } finally {
@@ -2507,33 +2140,25 @@ A single successful creation goal is a complete turn. End it with **done**.
   }
 
   private async runChatTask(userText: string): Promise<void> {
-    if (this.uiPhase === 'closed') return;
-    this.uiPhase = 'busy';
+    if (this.turnPhase !== 'idle') return;
+    this.turnPhase = 'busy';
     this.emitGoalActivity();
-    await this.setInputDisabled(true);
-    // Long-op accent halo on the send button so the user sees the agent is
-    // working even when the activity bubble scrolls off-screen (Doherty).
-    if (this.sendBtnId) {
-      try { this.send(event(this.id, this.sendBtnId, 'update', { busy: true })); } catch { /* widget gone */ }
-    }
-    await this.removeWelcomeState();
 
-    // Show user message as a right-aligned bubble. User input is plain text —
-    // render it without markdown so the wordwrap path honors right alignment
-    // inside the bubble. Skip when empty (e.g. an image-only send, where the
-    // image bubble + attachment were already committed).
+    // The user's message joins the transcript. Skipped when empty (an
+    // image-only send, where the image messages were already committed).
     if (userText) {
-      await this.appendBubble('user', 'You', userText, false);
-      this.conversationHistory.push({ id: uuidv4(), role: 'user', content: userText });
+      const id = uuidv4();
+      this.conversationHistory.push({ id, role: 'user', content: userText });
+      this.appendMessage('user', 'You', userText, false, id);
       this.schedulePersist();
       this.maybeAutoTitle(userText);
     }
 
-    // Show consolidated activity bubble for the run.
-    await this.showActivityBubble();
+    this.showActivity();
 
     try {
-      // Build initial messages: system prompt + conversation history + new user message
+      const desktop = await this.hasDisplay();
+      // Build initial messages: conversation history + new user message.
       const initialMessages: { role: string; content: string | ContentPart[] }[] = [];
       // Filter media-only entries (images/screenshots persisted for re-render
       // but not part of the LLM-visible conversation). Their data URIs would
@@ -2566,7 +2191,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Goal is created on the first `goal` action — Chat creates it via
       // GoalManager.createGoal, ScrumMaster runs the scrum cycle (plan,
       // execute, plan again or declare done), and emits goalCompleted.
-      let turn = await this.routeAndRunTurn(userText, initialMessages, attachmentsInjected);
+      let turn = await this.routeAndRunTurn(userText, initialMessages, attachmentsInjected, desktop);
 
       // Self-audit: a `done` that reports an action or a verified outcome but
       // ran NO goal this turn is ungrounded — the model can't have done or
@@ -2582,26 +2207,27 @@ A single successful creation goal is a complete turn. End it with **done**.
             { role: 'assistant', content: draft },
             { role: 'user', content: this.buildAuditPrompt(draft) },
           ];
-          turn = await this.runTaskTurn(userText, auditMessages);
+          turn = await this.runTaskTurn(userText, auditMessages, desktop);
         }
       }
 
       const result = turn;
 
       // The goal and its controls outlive the short Chat routing task.
-      if (!this._currentGoalId) await this.removeActivityBubble();
+      if (!this._currentGoalId) this.removeActivity();
 
       if (result.success) {
         const text = (result.result as string) ?? '';
         if (text) {
-          await this.appendBubble('assistant', 'Agent', text, true);
-          this.conversationHistory.push({ id: uuidv4(), role: 'assistant', content: text });
+          const id = uuidv4();
+          this.conversationHistory.push({ id, role: 'assistant', content: text });
+          this.appendMessage('assistant', 'Agent', text, true, id);
           this.schedulePersist();
         }
       } else {
         const errorText = (result.error ?? 'Unknown error').slice(0, 200);
         const note = result.maxStepsReached ? ' (step limit reached)' : '';
-        await this.appendBubble('error', 'Error', errorText + note, false);
+        this.appendMessage('error', 'Error', errorText + note, false);
         this.playEffect('glitch');
         await this.notify(
           result.maxStepsReached ? 'Agent stopped: step limit reached' : 'Agent error',
@@ -2610,763 +2236,16 @@ A single successful creation goal is a complete turn. End it with **done**.
       }
     } catch (err) {
       this._currentTicketId = undefined;
-      if (!this._currentGoalId) await this.removeActivityBubble();
+      if (!this._currentGoalId) this.removeActivity();
       const errMsg = err instanceof Error ? err.message : String(err);
-      await this.appendBubble('error', 'Error', errMsg.slice(0, 200), false);
+      this.appendMessage('error', 'Error', errMsg.slice(0, 200), false);
       this.playEffect('glitch');
       await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
-    } finally {
-      if (this.sendBtnId) {
-        try { this.send(event(this.id, this.sendBtnId, 'update', { busy: false })); } catch { /* widget gone */ }
-      }
     }
 
-    this.uiPhase = this.windowId ? 'idle' : 'closed';
+    this.turnPhase = 'idle';
     this.emitGoalActivity();
-    if (this.windowId) await this.setInputDisabled(false);
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Object Resolution
-  // ═══════════════════════════════════════════════════════════════════
-
-  private async resolveObject(name: string): Promise<AbjectId | null> {
-    if (!this.registryId || !name) return null;
-
-    // UUIDs are direct AbjectIds — use as-is
-    if (name.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
-      return name as AbjectId;
-    }
-
-    // Everything else (names like "WebAgent", interface IDs like "abjects:web-agent")
-    // gets resolved via Registry discovery
-    try {
-      const results = await this.request<Array<{ id: AbjectId }>>(
-        request(this.id, this.registryId, 'discover', { name })
-      );
-      return results.length > 0 ? results[0].id : null;
-    } catch {
-      return null;
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Context Refresh
-  // ═══════════════════════════════════════════════════════════════════
-
-
-  // ═══════════════════════════════════════════════════════════════════
-  // UI Helpers
-  // ═══════════════════════════════════════════════════════════════════
-
-  private async setInputDisabled(disabled: boolean): Promise<void> {
-    const style = { disabled };
-    // While goal controls are up, the send button is Pause/Resume and must
-    // stay clickable regardless of the text input's lock state.
-    if (this.sendBtnId && !this.goalControlsActive) {
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { style })); } catch { /* widget gone */ }
-    }
-    if (this.textInputId) {
-      try { await this.request(request(this.id, this.textInputId, 'update', { style })); } catch { /* widget gone */ }
-    }
-  }
-
-  // ── Goal controls (Pause/Resume + Stop) ─────────────────────────────
-
-  private async setComposerHint(text: string): Promise<void> {
-    if (!this.composerHintLabelId) return;
-    try { await this.request(request(this.id, this.composerHintLabelId, 'update', { text })); } catch { /* widget gone */ }
-  }
-
-  /**
-   * A goal just started: the send button becomes Pause and a Stop button
-   * joins the composer row. Torn down by exitGoalControls when the goal
-   * reaches a terminal state.
-   */
-  private async enterGoalControls(): Promise<void> {
-    if (this.goalControlsActive || !this.windowId || !this.sendBtnId || !this.composerRowId) return;
-    this.goalControlsActive = true;
-    this.goalPaused = false;
-    try {
-      await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH, style: { disabled: false } }));
-      const { widgetIds: [stopBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'button', windowId: this.windowId, text: STOP_GLYPH,
-            style: {
-              background: this.theme.destructiveBg,
-              color: this.theme.destructiveText,
-              borderColor: this.theme.destructiveBorder,
-              fontSize: 16,
-            } },
-        ]})
-      );
-      this.stopBtnId = stopBtnId;
-      await this.request(request(this.id, stopBtnId, 'addDependent', {}));
-      await this.request(request(this.id, this.composerRowId, 'addLayoutChild', {
-        widgetId: stopBtnId,
-        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE },
-        alignment: 'right' as const,
-      }));
-      await this.setComposerHint(COMPOSER_HINT_GOAL);
-      // The composer stays live during the goal: typed text queues as an
-      // interjection the scrum master weighs (runChatTask locked the input
-      // for the LLM turn just before the goal spun up).
-      if (this.textInputId) {
-        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: false } })); } catch { /* widget gone */ }
-      }
-    } catch { /* widget gone — controls degrade to plain busy state */ }
-  }
-
-  /** Tear the goal controls down and restore the plain composer. */
-  private async exitGoalControls(): Promise<void> {
-    if (!this.goalControlsActive) return;
-    this.goalControlsActive = false;
-    this.goalPaused = false;
-    this.clarificationPending = false;
-    if (this.sendBtnId) {
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: SEND_GLYPH })); } catch { /* widget gone */ }
-    }
-    if (this.stopBtnId) {
-      const stopBtnId = this.stopBtnId;
-      this.stopBtnId = undefined;
-      if (this.composerRowId) {
-        try { await this.request(request(this.id, this.composerRowId, 'removeLayoutChild', { widgetId: stopBtnId })); } catch { /* widget gone */ }
-      }
-      try { await this.request(request(this.id, stopBtnId, 'destroy', {})); } catch { /* widget gone */ }
-    }
-    await this.setComposerHint(COMPOSER_HINT_DEFAULT);
-  }
-
-  /**
-   * Pause: freeze the goal (GoalManager stops agents, claims, and scrums),
-   * and unlock the composer so the user can interject. Resume reverses it.
-   */
-  private async handlePauseResumeClick(): Promise<void> {
-    const goalId = this._currentGoalId;
-    if (!goalId || !this.goalManagerId || !this.sendBtnId) return;
-
-    if (!this.goalPaused) {
-      const ok = await this.request<boolean>(
-        request(this.id, this.goalManagerId, 'pauseGoal', { goalId })
-      ).catch(() => false);
-      if (!ok) { this.playEffect('shake'); return; }
-      this.goalPaused = true;
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
-      if (this.textInputId) {
-        try { await this.request(request(this.id, this.textInputId, 'update', { style: { disabled: false } })); } catch { /* widget gone */ }
-      }
-      await this.setComposerHint(COMPOSER_HINT_PAUSED);
-      await this.appendBubble('assistant', 'Agent', 'Paused — work has stopped. Type a note to steer the goal, then press ' + RESUME_GLYPH + ' to continue or ' + STOP_GLYPH + ' to stop.', false);
-    } else {
-      const ok = await this.request<boolean>(
-        request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
-      ).catch(() => false);
-      if (!ok) { this.playEffect('shake'); return; }
-      this.goalPaused = false;
-      this.clarificationPending = false;
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
-      // The input stays live: typing during the running goal queues a note.
-      await this.setComposerHint(COMPOSER_HINT_GOAL);
-    }
-  }
-
-  /**
-   * Stop: hard-stop the goal. GoalManager cancels every task and fails the
-   * goal as "Stopped by user". The terminal event tears down the controls.
-   */
-  private async handleStopClick(): Promise<void> {
-    const goalId = this._currentGoalId;
-    if (!goalId || !this.goalManagerId) return;
-    this.stopRequestedGoalId = goalId;
-    const ok = await this.request<boolean>(
-      request(this.id, this.goalManagerId, 'stopGoal', { goalId })
-    ).catch(() => false);
-    if (ok === false) {
-      if (this.stopRequestedGoalId === goalId) this.stopRequestedGoalId = undefined;
-      this.playEffect('shake');
-    }
-  }
-
-  /**
-   * The scrum master paused the goal to ask the user a question. Render it,
-   * switch the composer into answer mode (paused state whose next message
-   * auto-resumes).
-   */
-  private async handleClarificationRequested(question: string): Promise<void> {
-    const goalId = this._currentGoalId;
-    if (!goalId) return;
-    this.goalPaused = true;
-    this.clarificationPending = true;
-    if (this.sendBtnId) {
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { text: RESUME_GLYPH })); } catch { /* widget gone */ }
-    }
-    await this.setComposerHint(COMPOSER_HINT_CLARIFY);
-    await this.appendBubble('assistant', 'Agent', question, true);
-  }
-
-  /**
-   * Interjection during a running or paused goal: show the note as a user
-   * bubble, keep it in the conversation history, and queue it on the goal
-   * where the scrum master weighs it. Answering a clarification question
-   * auto-resumes the goal.
-   */
-  private async sendInterjection(note: string): Promise<void> {
-    const goalId = this._currentGoalId;
-    if (!goalId || !this.goalManagerId) return;
-    await this.appendBubble('user', 'You', note, false);
-    this.conversationHistory.push({ id: uuidv4(), role: 'user', content: `[Note to the running goal] ${note}` });
-    this.schedulePersist();
-    const ok = await this.request<boolean>(
-      request(this.id, this.goalManagerId, 'appendGoalNote', { goalId, note })
-    ).catch(() => false);
-    if (!ok) {
-      await this.appendBubble('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
-      this.playEffect('shake');
-      return;
-    }
-    if (this.clarificationPending && this.goalPaused) {
-      // The note answers the scrum master's question — resume the sprint so
-      // the review scrum reads it.
-      this.clarificationPending = false;
-      const resumed = await this.request<boolean>(
-        request(this.id, this.goalManagerId, 'resumeGoal', { goalId })
-      ).catch(() => false);
-      if (resumed) {
-        this.goalPaused = false;
-        if (this.sendBtnId) {
-          try { await this.request(request(this.id, this.sendBtnId, 'update', { text: PAUSE_GLYPH })); } catch { /* widget gone */ }
-        }
-        await this.setComposerHint(COMPOSER_HINT_GOAL);
-      }
-    }
-  }
-
-  // ── Bubble styling ───────────────────────────────────────────────────
-
-  /**
-   * Flat print blocks: the user's own messages ruled in red (the human
-   * hand), the agent's ruled in bone, errors in red ink, and activity lines
-   * muted with a phosphor rule (the Other at work). Corners follow the
-   * theme radius.
-   */
-  private bubbleStyleForRole(role: BubbleRole): { background: string; color: string; align: BubbleAlign; borderColor?: string } {
-    const t = this.theme;
-    switch (role) {
-      case 'user':
-        return { background: t.inputBg, color: t.textPrimary, align: 'right', borderColor: t.accent };
-      case 'assistant':
-        return { background: t.windowBg, color: t.textPrimary, align: 'left', borderColor: t.windowBorder };
-      case 'system':
-        return { background: t.progressTrack, color: t.textSecondary, align: 'center' };
-      case 'error':
-        return { background: t.inputBg, color: t.statusError, align: 'left', borderColor: t.statusError };
-      case 'activity':
-        return { background: t.windowBg, color: t.textSecondary, align: 'left', borderColor: t.accentSecondary };
-    }
-  }
-
-  /**
-   * Sender line above a bubble: chrome-cased name and time. The user's line
-   * carries a red mark, the agent's a sigil ring; others stay muted.
-   */
-  private senderHeader(role: BubbleRole, sender: string, ts: number): { text: string; color: string; bold: boolean } {
-    const time = this.formatTimestamp(ts);
-    const name = chromeCase(this.theme, sender);
-    switch (role) {
-      case 'user':
-        return { text: `${time}  \u00B7  ${name}  \u25A0`, color: this.theme.accent, bold: true };
-      case 'assistant':
-        return { text: `\u25C9  ${name}  \u00B7  ${time}`, color: this.theme.textSecondary, bold: true };
-      case 'error':
-        return { text: `${name}  \u00B7  ${time}`, color: this.theme.statusError, bold: true };
-      default:
-        return { text: `${name}  \u00B7  ${time}`, color: this.theme.textMeta, bold: false };
-    }
-  }
-
-  private computeAvailableWidth(): number {
-    // Window content area = window width - side margins - scrollbar.
-    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - this.theme.tokens.space.lg * 2 - 8);
-  }
-
-  private computeBubbleMaxWidth(): number {
-    const available = this.computeAvailableWidth();
-    return Math.min(available, Math.max(BUBBLE_MIN_WIDTH, Math.floor(available * BUBBLE_MAX_FRACTION)));
-  }
-
-  private formatTimestamp(ts: number): string {
-    const delta = Date.now() - ts;
-    if (delta < 60_000) return 'now';
-    try {
-      return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-    } catch {
-      return '';
-    }
-  }
-
-  private shouldGroupWithPrevious(role: BubbleRole, sender: string): boolean {
-    const last = this.lastContentMeta();
-    if (!last) return false;
-    return last.role === role && last.sender === sender && (Date.now() - last.ts) < GROUP_WINDOW_MS;
-  }
-
-  /** Returns the metadata for the most recent content label (skipping sender labels). */
-  private lastContentMeta(): MessageMeta | undefined {
-    for (let i = this.messageLabelIds.length - 1; i >= 0; i--) {
-      const meta = this.messageMetadata.get(this.messageLabelIds[i]);
-      if (meta) return meta;
-    }
-    return undefined;
-  }
-
-  private estimateBubbleHeight(text: string, innerWidth: number, markdown: boolean): number {
-    const fontSize = 13;
-    const lineHeight = fontSize + 4;
-    const raw = markdown
-      ? estimateMarkdownHeight(text, innerWidth, fontSize)
-      : Math.max(lineHeight, estimateWrappedLineCount(text, innerWidth, fontSize) * lineHeight);
-    return raw + this.theme.tokens.space.md;
-  }
-
-  /**
-   * Append a styled "chat bubble" message to the log.
-   * Optionally precedes the bubble with a small sender/timestamp label unless
-   * grouping with the previous message (same role+sender within GROUP_WINDOW_MS).
-   */
-  private async appendBubble(
-    role: BubbleRole,
-    sender: string,
-    text: string,
-    markdown = false,
-    silent = false,
-  ): Promise<AbjectId> {
-    if (!this.messageLogId || !this.windowId) return '' as AbjectId;
-
-    // Notify subscribers (bridges, proxies, relays, integrations) that a new
-    // durable message landed in the chat log. Skip the transient 'activity'
-    // role since those bubbles represent in-progress agent status that mutates
-    // continuously and is not part of the user-visible conversation record.
-    // `silent` suppresses the event during history rehydration — those bubbles
-    // are re-renders of past messages, not new arrivals.
-    if (role !== 'activity' && !silent) {
-      this.changed('messageAdded', {
-        conversationId: this.conversationId ?? '',
-        role,
-        sender,
-        text,
-        markdown,
-        at: Date.now(),
-      });
-    }
-
-    const { background, color, align, borderColor } = this.bubbleStyleForRole(role);
-    const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const innerWidth = bubbleMaxWidth - this.theme.tokens.space.xs * 2;
-    const bubbleHeight = this.estimateBubbleHeight(text, innerWidth, markdown);
-
-    // Sender/timestamp mini-label (skipped when grouping).
-    const shouldEmitSender = !!sender && !this.shouldGroupWithPrevious(role, sender);
-    let senderLabelId: AbjectId | undefined;
-    if (shouldEmitSender) {
-      const header = this.senderHeader(role, sender, Date.now());
-      const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', {
-          specs: [
-            {
-              type: 'label', windowId: this.windowId, text: header.text,
-              style: {
-                color: header.color,
-                fontSize: 11,
-                fontFamily: 'display',
-                fontWeight: header.bold ? 'bold' : 'normal',
-                wordWrap: false,
-                selectable: false,
-                align,
-              },
-            },
-          ],
-        })
-      );
-      await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
-        widgetId: headerId,
-        sizePolicy: { vertical: 'fixed', horizontal: align === 'center' ? 'expanding' : 'fixed' },
-        preferredSize: { height: SENDER_LABEL_HEIGHT, width: align === 'center' ? undefined : bubbleMaxWidth },
-        alignment: align,
-      }));
-      this.messageLabelIds.push(headerId);
-      senderLabelId = headerId;
-      // Sender labels have no metadata entry — they are chrome, not content.
-    }
-
-    // contentBlock self-measures and reports its real height via a
-    // `contentHeight` event (handled in the changed router); the estimate
-    // above is only the provisional height for the first frame.
-    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          {
-            type: 'contentBlock', windowId: this.windowId, text,
-            style: {
-              color,
-              fontSize: 13,
-              wordWrap: true,
-              selectable: true,
-              markdown,
-              background,
-              radius: this.theme.tokens.radius.lg,
-              borderColor,
-              align,
-            },
-          },
-        ],
-      })
-    );
-    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
-      widgetId: labelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: bubbleMaxWidth, height: bubbleHeight },
-      alignment: align,
-    }));
-    this.send(request(this.id, labelId, 'addDependent', {}));
-    this.messageLabelIds.push(labelId);
-    this.messageMetadata.set(labelId, { role, sender, ts: Date.now(), text, markdown, align });
-    if (senderLabelId) {
-      this.bubbleSenderLabels.set(labelId, senderLabelId);
-    }
-    return labelId;
-  }
-
-  // ── Activity bubble (consolidated thinking + progress) ───────────────
-
-  private async showActivityBubble(): Promise<void> {
-    if (this.activityBubbleLabelId) return;
-    this.activityStep = 0;
-    this.activityHeader = THINKING_TEXT;
-    this.activityGoalHeight = 0;
-    this.stepStreamChars = 0;
-    if (!this._currentGoalId) { this.liveGoals.clear(); this.liveTasks.clear(); this.collapsedGoals.clear(); }
-    this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
-
-    // Embed the shared goal-progress widget directly beneath the header so the
-    // running goal tree renders identically to the Goals window (word-wrapped,
-    // full text) instead of a separate plain-text tree. It sizes itself via a
-    // `contentHeight` event and grows to fit; the message log scrolls.
-    if (this.messageLogId && this.windowId) {
-      const bubbleMaxWidth = this.computeBubbleMaxWidth();
-      const { widgetIds: [goalWidgetId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', {
-          specs: [{ type: 'goalProgress', windowId: this.windowId, rows: [],
-            style: { background: 'transparent' } }],
-        })
-      );
-      this.activityGoalWidgetId = goalWidgetId;
-      await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
-        widgetId: goalWidgetId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width: bubbleMaxWidth, height: 0 },
-        alignment: 'left',
-      }));
-      this.messageLabelIds.push(goalWidgetId);
-      this.send(request(this.id, goalWidgetId, 'addDependent', {}));
-    }
-  }
-
-  /** Map the live goal snapshot into the shared row model, scoped to the run. */
-  private buildActivityRows() {
-    const goals: GoalNode[] = [];
-    for (const [id, g] of this.liveGoals) {
-      goals.push({
-        id,
-        parentId: g.parentId,
-        title: g.title,
-        description: g.description ?? '',
-        status: g.status,
-        latestMessage: g.latestMessage,
-        latestAgent: g.latestAgent,
-      });
-    }
-    return buildGoalRows({
-      goals,
-      isExpanded: (id) => !this.collapsedGoals.has(id), // open unless folded
-      getTasks: (id) => this.liveTasks.get(id) ?? [],
-      rootId: this._currentGoalId,
-    });
-  }
-
-  /** Fetch goal title and description from GoalManager when we lazily seed a goal entry. */
-  private async fetchGoalTitle(goalId: string): Promise<void> {
-    if (!this.goalManagerId) return;
-    try {
-      const goal = await this.request<{ id: string; title: string; description?: string; parentId?: string; status: string } | null>(
-        request(this.id, this.goalManagerId, 'getGoal', { goalId })
-      );
-      if (goal) {
-        const entry = this.liveGoals.get(goalId);
-        if (entry) {
-          entry.title = goal.title;
-          if (goal.description) entry.description = goal.description;
-          entry.parentId = goal.parentId;
-          this.scheduleActivityRefresh();
-        }
-      }
-    } catch { /* GoalManager may not be ready */ }
-  }
-
-  /** Fetch tasks for a goal from GoalManager and cache them. */
-  private async fetchGoalTasks(goalId: string): Promise<void> {
-    if (!this.goalManagerId) return;
-    try {
-      const tuples = await this.request<Array<{
-        id: string; fields: Record<string, unknown>; claimedBy?: string;
-      }>>(
-        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
-      );
-      const tasks = (tuples ?? []).map(t => ({
-        id: t.id,
-        description: (t.fields?.description as string) ?? '',
-        status: (t.fields?.status as string) ?? 'pending',
-        agentName: (t.fields?.agentName as string) ?? undefined,
-        claimedBy: t.claimedBy,
-        attempts: (t.fields?.attempts as number) ?? 0,
-        maxAttempts: (t.fields?.maxAttempts as number) ?? 1,
-        dependsOn: (t.fields?.dependsOn as string[]) ?? undefined,
-      }));
-      this.liveTasks.set(goalId, tasks);
-    } catch { /* GoalManager may not be ready */ }
-  }
-
-  private composeActivityText(): string {
-    const baseHeader = this.activityStep > 0
-      ? `${THINKING_TEXT} (step ${this.activityStep}/${MAX_STEPS})`
-      : this.activityHeader;
-    // Append a streaming hint so the user sees the LLM is actively producing
-    // output even when no other progress signal has fired yet. Approximate
-    // tokens at ~4 chars/token.
-    const header = this.stepStreamChars > 0
-      ? `${baseHeader}  \u00B7  ~${Math.max(1, Math.round(this.stepStreamChars / 4))} tok streamed`
-      : baseHeader;
-    // The goal tree now renders in an embedded GoalProgressWidget beneath this
-    // header (see showActivityBubble), so the header stays a single line.
-    return header;
-  }
-
-  private updateActivityHeader(header: string): void {
-    this.activityHeader = header;
-    this.scheduleActivityRefresh();
-  }
-
-  private updateActivityStep(step: number): void {
-    this.activityStep = step;
-    this.scheduleActivityRefresh();
-  }
-
-  /**
-   * Trailing-debounced refresh — coalesces rapid-fire progress events into
-   * a single label update / layout reflow cycle. Without this, a busy agent
-   * run can fire 40+ updateLabel+updateLayoutChild round-trips per second
-   * and starve the compositor, making the UI feel frozen.
-   */
-  private scheduleActivityRefresh(): void {
-    if (this.activityRefreshTimer) return;
-    this.activityRefreshTimer = this.setTimer(() => {
-      this.activityRefreshTimer = undefined;
-      this.refreshActivityBubble().catch(() => { /* widget gone */ });
-    }, 120);
-  }
-
-  private async refreshActivityBubble(): Promise<void> {
-    if (!this.activityBubbleLabelId) return;
-    const text = this.composeActivityText();
-    // Keep the cached bubble text in sync (metadata is the durable record).
-    const meta = this.messageMetadata.get(this.activityBubbleLabelId);
-    if (meta) meta.text = text;
-    // The bubble is a contentBlock: it re-measures on the text update and
-    // reports the new height itself, so no estimate/threshold cycle here.
-    await this.updateLabel(this.activityBubbleLabelId, text, this.theme.statusNeutral);
-    // Feed the embedded goal widget the current row model; it reports its own
-    // height back via a `contentHeight` event (handled in the changed router).
-    if (this.activityGoalWidgetId) {
-      const rows = this.buildActivityRows();
-      try {
-        await this.request(request(this.id, this.activityGoalWidgetId, 'update', { rows }));
-      } catch { /* widget may be gone */ }
-    }
-  }
-
-  private async removeActivityBubble(): Promise<void> {
-    if (this.activityRefreshTimer) {
-      this.cancelTimer(this.activityRefreshTimer);
-      this.activityRefreshTimer = undefined;
-    }
-    if (!this.activityBubbleLabelId) return;
-    const id = this.activityBubbleLabelId;
-    const goalWidgetId = this.activityGoalWidgetId;
-    this.activityBubbleLabelId = undefined;
-    this.activityGoalWidgetId = undefined;
-    this.activityGoalHeight = 0;
-    this.activityStep = 0;
-    this.stepStreamChars = 0;
-    this.liveGoals.clear();
-    this.liveTasks.clear();
-    if (goalWidgetId) await this.detachLabel(goalWidgetId);
-    await this.removeLabel(id);
-  }
-
-  private async setLabelHeight(labelId: AbjectId, height: number): Promise<void> {
-    if (!this.messageLogId) return;
-    try {
-      await this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
-        widgetId: labelId,
-        preferredSize: { height },
-      }));
-    } catch { /* layout may be gone */ }
-  }
-
-  // ── Resize reflow ────────────────────────────────────────────────────
-
-  /** Debounce resize-driven reflow so rapid drag events collapse into one pass. */
-  private scheduleReflow(): void {
-    if (this.reflowTimer) return;
-    this.reflowTimer = this.setTimer(() => {
-      this.reflowTimer = undefined;
-      this.reflowAllBubbles().catch(() => { /* window may be gone */ });
-    }, 140);
-  }
-
-  /**
-   * Recompute width+height for every bubble and paired sender header against
-   * the current window width. Also re-render the welcome state so its card
-   * and chips fit the new size. All updates are issued concurrently.
-   */
-  private async reflowAllBubbles(): Promise<void> {
-    if (!this.messageLogId || !this.windowId) return;
-
-    const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const updates: Promise<unknown>[] = [];
-
-    for (const labelId of this.messageLabelIds) {
-      const meta = this.messageMetadata.get(labelId);
-      if (!meta) continue;
-
-      // Width-only update (updateLayoutChild merges preferredSize): the
-      // contentBlock re-wraps at the new width and reports its new height via
-      // contentHeight, which the changed router applies. No estimation.
-      updates.push(
-        this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
-          widgetId: labelId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-          preferredSize: { width: bubbleMaxWidth },
-          alignment: meta.align,
-        })).catch(() => { /* widget gone */ })
-      );
-
-      // If this bubble has a paired sender header, update its width too.
-      const senderId = this.bubbleSenderLabels.get(labelId);
-      if (senderId) {
-        updates.push(
-          this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
-            widgetId: senderId,
-            sizePolicy: { vertical: 'fixed', horizontal: meta.align === 'center' ? 'expanding' : 'fixed' },
-            preferredSize: {
-              height: SENDER_LABEL_HEIGHT,
-              width: meta.align === 'center' ? undefined : bubbleMaxWidth,
-            },
-            alignment: meta.align,
-          })).catch(() => { /* widget gone */ })
-        );
-      }
-    }
-
-    // The embedded goal widget carries no metadata (it is not a text bubble),
-    // so it is skipped above. Push the new width explicitly; it re-wraps and
-    // re-reports its height via `contentHeight`.
-    if (this.activityGoalWidgetId) {
-      updates.push(
-        this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
-          widgetId: this.activityGoalWidgetId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-          preferredSize: { width: bubbleMaxWidth, height: this.activityGoalHeight },
-          alignment: 'left',
-        })).catch(() => { /* widget gone */ })
-      );
-    }
-
-    await Promise.all(updates);
-
-    // The welcome card is sized by hand outside the bubble path, so it is
-    // re-fit here, in place. Destroying and recreating it made the card vanish
-    // from the frame until the replacements finished rendering, a visible
-    // flash on every resize.
-    await this.updateWelcomeLayout();
-  }
-
-
-  private async updateLabel(labelId: AbjectId, text: string, color: string): Promise<void> {
-    if (!labelId) return;
-    try {
-      await this.request(
-        request(this.id, labelId, 'update', {
-          text,
-          style: { color, fontSize: 13, wordWrap: true },
-        })
-      );
-    } catch { /* label may be gone */ }
-  }
-
-  private async removeLabel(labelId: AbjectId): Promise<void> {
-    if (!labelId || !this.messageLogId) return;
-
-    // If this bubble has a paired sender header, remove it too so we don't
-    // leave orphaned "Agent · now" lines floating in the log.
-    const pairedSenderId = this.bubbleSenderLabels.get(labelId);
-    if (pairedSenderId) {
-      this.bubbleSenderLabels.delete(labelId);
-      await this.detachLabel(pairedSenderId);
-    }
-
-    await this.detachLabel(labelId);
-  }
-
-  /** Low-level: remove a single label id from layout + destroy + tracking. */
-  private async detachLabel(labelId: AbjectId): Promise<void> {
-    if (!labelId || !this.messageLogId) return;
-    try {
-      await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
-        widgetId: labelId,
-      }));
-    } catch { /* may already be gone */ }
-    try {
-      await this.request(request(this.id, labelId, 'destroy', {}));
-    } catch { /* already gone */ }
-
-    const idx = this.messageLabelIds.indexOf(labelId);
-    if (idx >= 0) this.messageLabelIds.splice(idx, 1);
-    this.messageMetadata.delete(labelId);
-  }
-
-  private async clearMessageLabels(): Promise<void> {
-    if (!this.messageLogId) return;
-
-    // Clear layout in one request
-    try {
-      await this.request(request(this.id, this.messageLogId, 'clearLayoutChildren', {}));
-    } catch { /* may already be gone */ }
-
-    // Fire-and-forget destroy all labels
-    for (const labelId of this.messageLabelIds) {
-      this.send(request(this.id, labelId, 'destroy', {}));
-    }
-    this.messageLabelIds = [];
-    this.messageMetadata.clear();
-    this.bubbleSenderLabels.clear();
-    this.activityBubbleLabelId = undefined;
-    this.activityStep = 0;
-    this.liveGoals.clear();
-    this.liveTasks.clear();
-    // Welcome widgets (chips + card) live inside the message log and were
-    // just cleared above; drop our tracked ids.
-    this.welcomeWidgetIds = [];
+    this.checkInvariants();
   }
 
   protected override askPrompt(_question: string): string {
@@ -3393,7 +2272,7 @@ Relaying a user's message from another channel (bridge / proxy pattern):
   await call(await dep('Chat'), 'sendMessage', { message: incomingText });
   // The chat log renders this as user input; the agent processes the exact words received.
 
-### Show / hide the Chat window
+### Show / hide the Chat window (on a desktop; show returns false where there is no display)
 
   await call(await dep('Chat'), 'show', {});
   await call(await dep('Chat'), 'hide', {});
@@ -3420,7 +2299,7 @@ Relaying a user's message from another channel (bridge / proxy pattern):
 
 ### Observe messages as they land (bridge / proxy / relay pattern)
 
-Chat emits a \`messageAdded\` event every time a durable bubble is appended to the log. This is the hook for forwarding Chat traffic to an external channel (Telegram, SMS, email, another messaging service). Subscribe via \`addDependent\` and you receive every user message, every assistant reply, every system notification, and every error.
+Chat emits a \`messageAdded\` event every time a message joins the conversation. This is the hook for forwarding Chat traffic to an external channel (Telegram, SMS, email, another messaging service). Subscribe via \`addDependent\` and you receive every user message, every assistant reply, every system notification, and every error.
 
   // In your bridge / proxy / relay object's startup handler:
   await call(await dep('Chat'), 'addDependent', {});
@@ -3438,7 +2317,7 @@ Role meanings:
 - **user**: something the local user typed, or was injected via \`sendMessage\` from a bridge.
 - **assistant**: the agent's reply rendered via \`done\`.
 - **system**: a labeled notification added via \`addNotification\` (machine-authored output).
-- **error**: an error bubble surfaced in the log.
+- **error**: an error surfaced in the conversation.
 
 A full bidirectional bridge combines two sides: subscribe to \`messageAdded\` for outbound forwarding, and call \`Chat.sendMessage\` to inject inbound messages as user input. Use the \`role\` field to avoid echo loops: when relaying an inbound external message via \`sendMessage\`, the resulting \`messageAdded\` event carries \`role: 'user'\` on the next turn; tag your own forwards (e.g. with a per-source Set of recent text hashes) to skip re-forwarding.
 

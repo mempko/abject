@@ -9,13 +9,20 @@
  * works in the compiled output after swapping .ts → .js extensions.
  *
  *   dist-server/
- *     server/index.js
- *     workers/abject-worker-node.js
+ *     server/index.js                    desktop edition
+ *     server/headless.js                 headless edition (no display code)
+ *     workers/abject-worker-node.js      desktop pool worker
+ *     workers/abject-worker-headless.js  headless pool worker
  *     workers/ui-worker-node.js
- *     workers/p2p-worker-node.js
+ *     workers/p2p-worker-node.js         desktop P2P worker (with remote UI pairing)
+ *     workers/p2p-worker-headless.js     headless P2P worker
+ *
+ * The headless bundles are checked after the build: a window, a widget or
+ * the display server reaching them fails the build (scripts/headless-bundle-check.mjs).
  */
 
 import { build } from 'esbuild';
+import { checkHeadlessBundle } from './scripts/headless-bundle-check.mjs';
 import { builtinModules } from 'node:module';
 import { readFileSync } from 'node:fs';
 
@@ -32,6 +39,9 @@ const nodeExternals = [
 const runtimeExternals = [
   'node-datachannel',
   'node-datachannel/polyfill',
+  // Native: loads its platform binary by package name at runtime, which a
+  // bundle cannot follow (the CLI-agent providers' pseudo-terminal).
+  '@lydell/node-pty',
   'ws',
   'playwright',
   // Only the desktop app's main thread imports it (BrowserWindowHost);
@@ -57,9 +67,10 @@ const shared = {
   define: { __ABJECT_VERSION__: JSON.stringify(version) },
 };
 
-await build({
+const serverBuild = await build({
   ...shared,
-  entryPoints: { 'server/index': 'server/index.ts' },
+  metafile: true,
+  entryPoints: { 'server/index': 'server/index.ts', 'server/headless': 'server/headless.ts' },
   outdir: 'dist-server',
   banner: {
     // Shim require() for ESM bundles that import CJS packages at runtime
@@ -70,12 +81,15 @@ await build({
 });
 
 // Workers are separate entry points (they run in worker_threads)
-await build({
+const workerBuild = await build({
   ...shared,
+  metafile: true,
   entryPoints: {
     'workers/abject-worker-node': 'workers/abject-worker-node.ts',
+    'workers/abject-worker-headless': 'workers/abject-worker-headless.ts',
     'workers/ui-worker-node': 'workers/ui-worker-node.ts',
     'workers/p2p-worker-node': 'workers/p2p-worker-node.ts',
+    'workers/p2p-worker-headless': 'workers/p2p-worker-headless.ts',
   },
   outdir: 'dist-server',
   banner: {
@@ -84,5 +98,9 @@ await build({
     js: `import { createRequire as __abjectsCreateRequire } from 'node:module'; const require = __abjectsCreateRequire(import.meta.url);`,
   },
 });
+
+checkHeadlessBundle(serverBuild.metafile, 'dist-server/server/headless.js');
+checkHeadlessBundle(workerBuild.metafile, 'dist-server/workers/abject-worker-headless.js');
+checkHeadlessBundle(workerBuild.metafile, 'dist-server/workers/p2p-worker-headless.js');
 
 console.log('Server build complete → dist-server/');

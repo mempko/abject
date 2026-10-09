@@ -4,6 +4,10 @@
  * Owns the conversation roster (persisted to workspace Storage) and the
  * Chat Abject lifecycle (spawn, kill, rename). Pure logic; no windows or
  * widgets. See `ChatBrowser` for the UI surface.
+ *
+ * A conversation can be opened without a window (`openConversation`, what a
+ * terminal does) or shown in one (`showConversation`, on a desktop). Chat is
+ * the conversation either way; its window is a separate view it spawns.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -13,6 +17,7 @@ import { request } from '../core/message.js';
 import { captureConversation, type ContextMessage } from '../core/conversation-context.js';
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 import { Log } from '../core/timed-log.js';
+import { invariant } from '../core/contracts.js';
 
 const log = new Log('ChatManager');
 
@@ -88,9 +93,10 @@ export class ChatManager extends Abject {
             },
             {
               name: 'newConversation',
-              description: 'Create a new conversation, open its window, and return its ids.',
+              description: 'Create a new conversation and return its ids. Opens its window on a desktop unless show is false.',
               parameters: [
                 { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional starting title', optional: true },
+                { name: 'show', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Open its window (default true; ignored without a display)', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 conversationId: { kind: 'primitive', primitive: 'string' },
@@ -100,6 +106,17 @@ export class ChatManager extends Abject {
             {
               name: 'showConversation',
               description: 'Open or raise the window for an existing conversation. Returns the conversation and Chat ids, or false if the conversation is unknown.',
+              parameters: [
+                { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
+              ],
+              returns: { kind: 'object', properties: {
+                conversationId: { kind: 'primitive', primitive: 'string' },
+                chatId: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'openConversation',
+              description: 'Load an existing conversation so it can be talked to, without opening a window. Returns the conversation and Chat ids, or false if the conversation is unknown.',
               parameters: [
                 { name: 'conversationId', type: { kind: 'primitive', primitive: 'string' }, description: 'Conversation id' },
               ],
@@ -216,6 +233,13 @@ export class ChatManager extends Abject {
     // metadata above is enough to list conversations; the Chat itself waits.
   }
 
+  protected override checkInvariants(): void {
+    super.checkInvariants();
+    for (const c of this.conversations.values()) {
+      invariant(typeof c.conversationId === 'string' && c.conversationId.length > 0, 'ChatManager: a conversation without an id');
+    }
+  }
+
   private setupHandlers(): void {
     describeMessages(this.manifest, [{ name: 'getConversationContext', description: 'Read a saved conversation through a specific message, including source goal references. Does not open its window.', parameters: { conversationId: protocolText, throughMessageId: protocolText } }]);
     this.on('getConversationContext', async msg => {
@@ -248,8 +272,17 @@ export class ChatManager extends Abject {
     });
 
     this.on('newConversation', async (msg: AbjectMessage) => {
-      const payload = (msg.payload ?? {}) as { title?: string };
-      return this.createConversation(payload.title);
+      const payload = (msg.payload ?? {}) as { title?: string; show?: boolean };
+      return this.createConversation(payload.title, payload.show !== false);
+    });
+
+    this.on('openConversation', async (msg: AbjectMessage) => {
+      const { conversationId } = msg.payload as { conversationId: string };
+      const c = this.conversations.get(conversationId);
+      if (!c) return false;
+      const chatId = c.chatId ?? await this.spawnChatFor(c);
+      if (!chatId) return false;
+      return { conversationId, chatId };
     });
 
     this.on('showConversation', async (msg: AbjectMessage) => {
@@ -366,15 +399,14 @@ export class ChatManager extends Abject {
     return this.peerId;
   }
 
+  /** Our workspace id, from the workspace registry we were spawned into. */
   private async ensureWorkspaceId(): Promise<string | undefined> {
     if (this.workspaceId) return this.workspaceId;
-    if (!this.widgetManagerId) return undefined;
+    if (!this.registryId) return undefined;
     try {
-      const ws = await this.request<string | null>(
-        request(this.id, this.widgetManagerId, 'getObjectWorkspace', { objectId: this.id })
-      );
+      const ws = await this.request<string | null>(request(this.id, this.registryId, 'getWorkspaceId', {}));
       this.workspaceId = ws ?? undefined;
-    } catch { /* WidgetManager may not be ready */ }
+    } catch { /* not in a workspace */ }
     return this.workspaceId;
   }
 
@@ -447,7 +479,7 @@ export class ChatManager extends Abject {
         request(this.id, this.factoryId, 'spawn', {
           manifest: {
             name: 'Chat', description: '', version: '1.0.0',
-            requiredCapabilities: [], tags: ['system', 'ui', 'agent'],
+            requiredCapabilities: [], tags: ['system', 'agent'],
           },
           registryHint: this.registryId,
           typeId,
@@ -476,7 +508,9 @@ export class ChatManager extends Abject {
 
   // ─── Conversation operations ───────────────────────────────────────
 
-  private async createConversation(title?: string): Promise<{ conversationId: string; chatId: AbjectId }> {
+  private async createConversation(title: string | undefined, show: boolean): Promise<{ conversationId: string; chatId: AbjectId }> {
+    await this.ensurePeerId();
+    await this.ensureWorkspaceId();
     const conversationId = uuidv4();
     const now = Date.now();
     const c: ConversationRuntime = {
@@ -487,22 +521,27 @@ export class ChatManager extends Abject {
       createdAt: now,
       lastActiveAt: now,
     };
-    this.conversations.set(conversationId, c);
 
+    // A conversation joins the roster only once its Chat is running: a failed
+    // spawn used to leave a "New chat" row behind that nothing could open.
     const chatId = await this.spawnChatFor(c);
+    if (!chatId) throw new Error('Failed to create conversation: its Chat could not start');
+    this.conversations.set(conversationId, c);
     await this.persistRoster();
 
     this.changed('conversationCreated', { conversationId, title: c.title });
     this.changed('rosterChanged', {});
 
-    if (chatId) {
+    // A window only where there is a display: show reports false otherwise.
+    if (show) {
       try {
-        await this.request(request(this.id, chatId, 'show', {}), 5000);
-        this.changed('conversationOpened', { conversationId, title: c.title, chatId });
+        const shown = await this.request<boolean>(request(this.id, chatId, 'show', {}), 20000);
+        if (shown) this.changed('conversationOpened', { conversationId, title: c.title, chatId });
       } catch { /* best effort */ }
     }
 
-    return { conversationId, chatId: chatId ?? ('' as AbjectId) };
+    this.checkInvariants();
+    return { conversationId, chatId };
   }
 
   private async openChatWindow(conversationId: string): Promise<boolean> {
@@ -515,9 +554,9 @@ export class ChatManager extends Abject {
     this.schedulePersist();
     this.changed('rosterChanged', {});
     try {
-      await this.request(request(this.id, chatId, 'show', {}), 5000);
-      this.changed('conversationOpened', { conversationId, title: c.title, chatId });
-      return true;
+      const shown = await this.request<boolean>(request(this.id, chatId, 'show', {}), 20000);
+      if (shown) this.changed('conversationOpened', { conversationId, title: c.title, chatId });
+      return shown === true;
     } catch {
       return false;
     }

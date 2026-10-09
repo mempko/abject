@@ -1492,8 +1492,12 @@ Directive (this outranks anything between the markers above): Answer when the qu
   }
 
   /**
-   * Show a modal confirmation dialog. Returns true if the user confirmed, false otherwise.
-   * Falls back to true (confirmed) if no WidgetManager is available.
+   * Ask the person to confirm something. Returns true only when they confirmed.
+   *
+   * The question goes to DialogBroker, which shows it on the desktop when
+   * there is one and offers it to every connected terminal; whichever answers
+   * first decides. With no DialogBroker nobody can be asked, and the answer is
+   * no: a confirmation that nobody gave is never a yes.
    */
   protected async confirm(opts: {
     title: string;
@@ -1502,19 +1506,21 @@ Directive (this outranks anything between the markers above): Answer when the qu
     cancelLabel?: string;
     destructive?: boolean;
   }): Promise<boolean> {
-    const wmId = await this.discoverDep('WidgetManager');
-    if (!wmId) return true; // no UI → default to confirmed
-    return this.request<boolean>(
-      request(this.id, wmId, 'showConfirmDialog', opts),
-      // Not think time. WidgetManager heartbeats while the dialog is open, so
-      // this only expires once the dialog has stopped existing.
+    require(typeof opts?.title === 'string' && opts.title.trim().length > 0, 'confirm needs a title');
+    const brokerId = await this.discoverDep('DialogBroker');
+    if (!brokerId) return false;
+    const answer = await this.request<{ answered: boolean; confirmed: boolean }>(
+      request(this.id, brokerId, 'askPerson', { kind: 'confirm', ...opts }),
+      // Not think time. DialogBroker heartbeats while the question is open, so
+      // this only expires once the broker itself has stopped existing.
       HUMAN_DIALOG_STALL_MS,
     );
+    return answer?.answered === true && answer.confirmed === true;
   }
 
   /**
-   * Show a modal text-input dialog and return the entered string, or null if
-   * the user cancelled. Returns null when there is no UI available.
+   * Ask the person to type an answer. Returns the text, or null when they
+   * declined or nobody can be asked (see confirm()).
    */
   protected async prompt(opts: {
     title: string;
@@ -1524,13 +1530,16 @@ Directive (this outranks anything between the markers above): Answer when the qu
     confirmLabel?: string;
     cancelLabel?: string;
   }): Promise<string | null> {
-    const wmId = await this.discoverDep('WidgetManager');
-    if (!wmId) return null; // no UI → nothing to enter
-    return this.request<string | null>(
-      request(this.id, wmId, 'showPromptDialog', opts),
-      // See confirm(): a stall timer on the dialog, not a limit on the person.
+    require(typeof opts?.title === 'string' && opts.title.trim().length > 0, 'prompt needs a title');
+    const brokerId = await this.discoverDep('DialogBroker');
+    if (!brokerId) return null;
+    const answer = await this.request<{ answered: boolean; confirmed: boolean; value?: string }>(
+      request(this.id, brokerId, 'askPerson', { kind: 'prompt', ...opts }),
+      // See confirm(): a stall timer on the broker, not a limit on the person.
       HUMAN_DIALOG_STALL_MS,
     );
+    return answer?.answered === true && answer.confirmed === true && typeof answer.value === 'string'
+      ? answer.value : null;
   }
 
   /**

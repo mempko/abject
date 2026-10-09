@@ -20,6 +20,7 @@
 
 import { AbjectId, AbjectManifest, AbjectMessage, DEFAULT_SHARING_POLICY, DiscoveryQuery, InterfaceId, ObjectRegistration, SharingPolicy, TypeId } from '../core/types.js';
 import { require } from '../core/contracts.js';
+import { describeMessages } from '../core/protocol-description.js';
 import { Registry } from './registry.js';
 import { request } from '../core/message.js';
 
@@ -130,12 +131,25 @@ export class WorkspaceRegistry extends Registry {
     'getSource', 'updateSource', 'probe',
   ]);
 
-  constructor() {
+  /**
+   * The workspace this registry belongs to. Every per-workspace object knows
+   * its registry, so asking it is how an object learns its own workspace
+   * without depending on anything that draws windows.
+   */
+  private readonly workspaceId?: string;
+
+  constructor(args?: { workspaceId?: string }) {
     super();
+    require(args?.workspaceId === undefined || (typeof args.workspaceId === 'string' && args.workspaceId.length > 0),
+      'workspaceId must be a non-empty string when given');
+    this.workspaceId = args?.workspaceId;
     this.setupWorkspaceHandlers();
   }
 
   private setupWorkspaceHandlers(): void {
+    describeMessages(this.manifest, [{ name: 'getWorkspaceId', description: 'The id of the workspace this registry belongs to, or null.' }]);
+    this.on('getWorkspaceId', () => this.workspaceId ?? null);
+
     this.on('setFallback', async (msg: AbjectMessage) => {
       const { registryId } = msg.payload as { registryId: AbjectId };
       this.fallbackRegistryId = registryId;

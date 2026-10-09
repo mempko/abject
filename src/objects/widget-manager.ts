@@ -97,6 +97,13 @@ export type { WidgetStyle } from './widgets/widget-types.js';
 
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
+/**
+ * How long a dialog may go without a heartbeat. DialogBroker and the
+ * ModalDialog both beat while the question is up, so this is a stall timer on
+ * the dialog, not a limit on how long the person takes.
+ */
+const MODAL_STALL_MS = 10 * 60 * 1000;
+
 /** Canonical `create({specs})` widget types, kept in sync with the dispatch in createWidgetFromSpec. */
 const VALID_WIDGET_TYPES = [
   'label', 'markdown', 'contentBlock', 'button', 'textInput', 'textArea',
@@ -138,14 +145,12 @@ export class WidgetManager extends Abject {
   private consoleId?: AbjectId;
   private defaultTheme: ThemeData = DEFAULT_THEME;
   /**
-   * Objects allowed to answer dialogs remotely via `respondDialog`.
-   * Registered by bootstrap and then sealed BEFORE workspaces spawn, so no
-   * user abject can ever add itself and auto-grant permissions.
+   * DialogBroker, which owns every question to the person. This object only
+   * draws the confirm and prompt dialogs it is handed and reports the click.
    */
-  private dialogResponders: Set<AbjectId> = new Set();
-  private dialogRespondersSealed = false;
-  /** Open dialog id -> the AbjectId whose `respond` handler resolves it. */
-  private openDialogRoutes: Map<string, AbjectId> = new Map();
+  private dialogBrokerId?: AbjectId;
+  /** Broker dialog id -> the ModalDialog drawing it right now. */
+  private presentedDialogs: Map<string, AbjectId> = new Map();
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   /** Abjects that asked for activeThemeChanged events (see subscribeActiveTheme). */
   private activeThemeSubscribers = new Set<AbjectId>();
@@ -395,45 +400,13 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'showConfirmDialog',
-                description: 'Show a modal confirmation dialog with backdrop overlay. Returns true if confirmed, false if cancelled.',
+                description: 'Ask the person to confirm something. The question goes to DialogBroker, which shows it here as a modal dialog and offers it to connected terminals; the first answer wins. Returns true if confirmed, false otherwise.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog title' },
                   { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog message' },
                   { name: 'confirmLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Confirm button label (default: "Confirm")', optional: true },
                   { name: 'cancelLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Cancel button label (default: "Cancel")', optional: true },
                   { name: 'destructive', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, confirm button uses destructive styling', optional: true },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'announceDialog',
-                description: 'Announce a custom dialog owned by the calling object so remote surfaces (terminal gateways) can mirror it. The caller receives a `respond` message with the user\'s answer.',
-                parameters: [
-                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-unique dialog id, echoed back in respond' },
-                  { name: 'kind', type: { kind: 'primitive', primitive: 'string' }, description: "'confirm', 'prompt', or 'options'" },
-                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog title' },
-                  { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog message' },
-                  { name: 'resource', type: { kind: 'primitive', primitive: 'string' }, description: 'The resource being decided on (e.g. a command line)', optional: true },
-                  { name: 'options', type: { kind: 'array', elementType: { kind: 'reference', reference: 'DialogOption' } }, description: 'Choice list for options dialogs: [{id, label}]', optional: true },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'retractDialog',
-                description: 'Withdraw a previously announced dialog (it was resolved or expired); mirrors dismiss it.',
-                parameters: [
-                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'The announced dialog id' },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'respondDialog',
-                description: 'Answer an open dialog on the user\'s behalf. Restricted: only responders registered and sealed during bootstrap may call this.',
-                parameters: [
-                  { name: 'dialogId', type: { kind: 'primitive', primitive: 'string' }, description: 'The open dialog id' },
-                  { name: 'confirmed', type: { kind: 'primitive', primitive: 'boolean' }, description: 'True to confirm, false to cancel', optional: true },
-                  { name: 'value', type: { kind: 'primitive', primitive: 'string' }, description: 'Entered text for prompt dialogs', optional: true },
-                  { name: 'option', type: { kind: 'primitive', primitive: 'string' }, description: 'Chosen option id for options dialogs', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -691,23 +664,6 @@ export class WidgetManager extends Abject {
                 name: 'widgetEvent',
                 description: 'Widget interaction event (click, change, submit)',
                 payload: { kind: 'reference', reference: 'WMWidgetEventPayload' },
-              },
-              {
-                name: 'dialogOpened',
-                description: 'A modal confirm/prompt dialog appeared. Subscribers may answer on the user\'s behalf by sending `respond` to the dialogId.',
-                payload: { kind: 'object', properties: {
-                  dialogId: { kind: 'primitive', primitive: 'string' },
-                  kind: { kind: 'primitive', primitive: 'string' },
-                  title: { kind: 'primitive', primitive: 'string' },
-                  message: { kind: 'primitive', primitive: 'string' },
-                } },
-              },
-              {
-                name: 'dialogClosed',
-                description: 'A modal dialog was resolved or timed out; mirrors should dismiss it.',
-                payload: { kind: 'object', properties: {
-                  dialogId: { kind: 'primitive', primitive: 'string' },
-                } },
               },
               {
                 name: 'windowMoved',
@@ -1522,100 +1478,50 @@ export class WidgetManager extends Abject {
       return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
     });
 
-    // ── Modal confirmation dialog ──
+    // ── Questions to the person ──
+    // DialogBroker owns every question and who may answer it. These two
+    // methods stay for callers that ask through this object; they forward.
 
-    this.on('showConfirmDialog', (msg: AbjectMessage) => {
-      const { title, message: dialogMessage, confirmLabel, cancelLabel, destructive } = msg.payload as {
-        title: string;
-        message: string;
-        confirmLabel?: string;
-        cancelLabel?: string;
-        destructive?: boolean;
+    this.on('showConfirmDialog', async (msg: AbjectMessage) => {
+      const opts = msg.payload as {
+        title: string; message: string; confirmLabel?: string; cancelLabel?: string; destructive?: boolean;
       };
-
-      // The caller, and everything queued behind it, waits as long as the
-      // person does.
-      const stopBeating = this.awaitingHuman(`confirm: ${title}`);
-      this.spawnModalDialog(title, dialogMessage, { confirmLabel, cancelLabel, destructive })
-        .then(
-          (confirmed) => { stopBeating(); this.sendDeferredReply(msg, confirmed); },
-          () => { stopBeating(); this.sendDeferredReply(msg, false); },
-        );
-
-      return DEFERRED_REPLY;
+      const answer = await this.askBroker({ kind: 'confirm', ...opts });
+      return answer?.answered === true && answer.confirmed === true;
     });
 
-    this.on('showPromptDialog', (msg: AbjectMessage) => {
+    this.on('showPromptDialog', async (msg: AbjectMessage) => {
       const opts = msg.payload as {
         title: string; message: string; defaultValue?: string; placeholder?: string;
         confirmLabel?: string; cancelLabel?: string;
       };
-      const stopBeating = this.awaitingHuman(`prompt: ${opts.title}`);
-      this.spawnPromptDialog(opts).then(
-        (value) => { stopBeating(); this.sendDeferredReply(msg, value); },
-        () => { stopBeating(); this.sendDeferredReply(msg, null); },
-      );
-      return DEFERRED_REPLY;
+      const answer = await this.askBroker({ kind: 'prompt', ...opts });
+      return answer?.answered === true && answer.confirmed === true && typeof answer.value === 'string'
+        ? answer.value : null;
     });
 
-    // ── Custom dialog announcements ──
-    // Objects that build their own dialog windows (permission prompts etc.)
-    // announce them here so mirroring surfaces can render and answer them.
-    // Answers route back to the announcer as a `respond` message.
-
-    this.on('announceDialog', (msg: AbjectMessage) => {
-      const payload = msg.payload as { dialogId?: string };
-      if (!payload.dialogId) return false;
-      this.openDialogRoutes.set(payload.dialogId, msg.routing.from);
-      this.changed('dialogOpened', { respondTo: msg.routing.from, ...payload });
-      return true;
-    });
-
-    this.on('retractDialog', (msg: AbjectMessage) => {
-      const { dialogId } = msg.payload as { dialogId?: string };
-      if (!dialogId) return false;
-      this.openDialogRoutes.delete(dialogId);
-      this.changed('dialogClosed', { dialogId });
-      return true;
-    });
-
-    // ── Dialog responder gate ──
-    // Dialogs (including permission prompts) accept answers ONLY from this
-    // object; this object forwards answers only for senders in the responder
-    // set, which bootstrap registers and SEALS before any workspace — and
-    // therefore any user abject — exists. This is what stops an arbitrary
-    // object from granting itself permissions by answering dialogs.
-
-    this.on('registerDialogResponder', (msg: AbjectMessage) => {
-      if (this.dialogRespondersSealed) {
-        log.warn(`registerDialogResponder rejected (sealed): from=${msg.routing.from}`);
-        throw new Error('Dialog responder registration is sealed');
-      }
-      const { objectId } = msg.payload as { objectId: AbjectId };
-      require(typeof objectId === 'string' && objectId.length > 0, 'objectId required');
-      this.dialogResponders.add(objectId);
-      log.info(`Dialog responder registered: ${objectId.slice(0, 8)}`);
-      return true;
-    });
-
-    this.on('sealDialogResponders', () => {
-      this.dialogRespondersSealed = true;
-      log.info(`Dialog responders sealed (${this.dialogResponders.size} registered)`);
-      return true;
-    });
-
-    this.on('respondDialog', async (msg: AbjectMessage) => {
-      if (!this.dialogResponders.has(msg.routing.from)) {
-        log.warn(`respondDialog DENIED for unauthorized sender ${msg.routing.from.slice(0, 8)}`);
-        throw new Error('Not authorized to answer dialogs');
-      }
-      const { dialogId, confirmed, value, option } = msg.payload as {
-        dialogId: string; confirmed?: boolean; value?: string; option?: string;
+    // DialogBroker hands this object the confirm and prompt dialogs to draw,
+    // one at a time. The click goes back to the broker, which answers the
+    // asker; an answer from a terminal arrives here as dismissDialog.
+    this.on('presentDialog', async (msg: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(msg))) return;
+      const dialog = msg.payload as {
+        dialogId: string; kind: string; title: string; message: string;
+        confirmLabel?: string; cancelLabel?: string; destructive?: boolean;
+        defaultValue?: string; placeholder?: string;
       };
-      const target = this.openDialogRoutes.get(dialogId);
-      if (!target) throw new Error('Unknown or already-resolved dialog');
-      return this.request<boolean>(
-        request(this.id, target, 'respond', { dialogId, confirmed, value, option }), 10000);
+      require(typeof dialog?.dialogId === 'string' && dialog.dialogId.length > 0, 'presentDialog needs a dialogId');
+      void this.presentModal(dialog);
+    });
+
+    this.on('dismissDialog', async (msg: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(msg))) return;
+      const { dialogId } = msg.payload as { dialogId: string };
+      const modalId = this.presentedDialogs.get(dialogId);
+      if (!modalId) return;
+      // Answered elsewhere: close the window without reporting a click.
+      this.presentedDialogs.delete(dialogId);
+      try { this.send(request(this.id, modalId, 'respond', { confirmed: false })); } catch { /* already gone */ }
     });
 
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
@@ -1920,56 +1826,72 @@ export class WidgetManager extends Abject {
     }
   }
 
-  // ── Modal confirmation dialog — spawns an ephemeral ModalDialog Abject ──
+  // ── Questions to the person: DialogBroker plus the ModalDialog that draws them ──
 
-  private async spawnModalDialog(
-    title: string,
-    dialogMessage: string,
-    opts: { confirmLabel?: string; cancelLabel?: string; destructive?: boolean },
-  ): Promise<boolean> {
-    const dialog = new ModalDialog();
-    dialog.setWidgetManagerId(this.id);
-    await dialog.init(this.bus, this.id);
-    // Announce to dependents (e.g. terminal gateways) so remote surfaces can
-    // mirror the dialog and answer it through the respondDialog gate.
-    this.openDialogRoutes.set(dialog.id, dialog.id);
-    this.changed('dialogOpened', {
-      dialogId: dialog.id, kind: 'confirm', title, message: dialogMessage, ...opts,
-    });
+  /** Put a question to DialogBroker on a caller's behalf and wait as long as the person does. */
+  private async askBroker(spec: Record<string, unknown>): Promise<{ answered: boolean; confirmed: boolean; value?: string } | null> {
+    this.dialogBrokerId = await this.resolveDep('DialogBroker', this.dialogBrokerId);
+    if (!this.dialogBrokerId) return null;
     try {
-      return await this.request<boolean>(
-        request(this.id, dialog.id, 'show', {
-          title,
-          message: dialogMessage,
-          ...opts,
-          theme: this.defaultTheme,
-        }),
-        120000,
-      );
-    } finally {
-      this.openDialogRoutes.delete(dialog.id);
-      this.changed('dialogClosed', { dialogId: dialog.id });
+      return await this.request(request(this.id, this.dialogBrokerId, 'askPerson', spec), MODAL_STALL_MS);
+    } catch (err) {
+      this.dialogBrokerId = undefined;
+      log.warn(`DialogBroker ask failed: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
     }
   }
 
-  /** Spawn an ephemeral ModalDialog in text-input mode; resolves to the entered string or null. */
-  private async spawnPromptDialog(opts: {
-    title: string; message: string; defaultValue?: string; placeholder?: string;
-    confirmLabel?: string; cancelLabel?: string;
-  }): Promise<string | null> {
-    const dialog = new ModalDialog();
-    dialog.setWidgetManagerId(this.id);
-    await dialog.init(this.bus, this.id);
-    this.openDialogRoutes.set(dialog.id, dialog.id);
-    this.changed('dialogOpened', { dialogId: dialog.id, kind: 'prompt', ...opts });
+  /** Accept presentDialog/dismissDialog only from the broker itself. */
+  private async fromDialogBroker(msg: AbjectMessage): Promise<boolean> {
+    this.dialogBrokerId = await this.resolveDep('DialogBroker', this.dialogBrokerId);
+    return !!this.dialogBrokerId && msg.routing.from === this.dialogBrokerId;
+  }
+
+  /** Draw one broker dialog and report the click back to the broker. */
+  private async presentModal(dialog: {
+    dialogId: string; kind: string; title: string; message: string;
+    confirmLabel?: string; cancelLabel?: string; destructive?: boolean;
+    defaultValue?: string; placeholder?: string;
+  }): Promise<void> {
+    const modal = new ModalDialog();
+    modal.setWidgetManagerId(this.id);
+    await modal.init(this.bus, this.id);
+    this.presentedDialogs.set(dialog.dialogId, modal.id);
+    let answer: { confirmed: boolean; value?: string };
     try {
-      return await this.request<string | null>(
-        request(this.id, dialog.id, 'showPrompt', { ...opts, theme: this.defaultTheme }),
-        120000,
-      );
-    } finally {
-      this.openDialogRoutes.delete(dialog.id);
-      this.changed('dialogClosed', { dialogId: dialog.id });
+      if (dialog.kind === 'prompt') {
+        const value = await this.request<string | null>(
+          request(this.id, modal.id, 'showPrompt', {
+            title: dialog.title, message: dialog.message,
+            defaultValue: dialog.defaultValue, placeholder: dialog.placeholder,
+            confirmLabel: dialog.confirmLabel, cancelLabel: dialog.cancelLabel,
+            theme: this.defaultTheme,
+          }),
+          MODAL_STALL_MS,
+        );
+        answer = typeof value === 'string' ? { confirmed: true, value } : { confirmed: false };
+      } else {
+        const confirmed = await this.request<boolean>(
+          request(this.id, modal.id, 'show', {
+            title: dialog.title, message: dialog.message,
+            confirmLabel: dialog.confirmLabel, cancelLabel: dialog.cancelLabel, destructive: dialog.destructive,
+            theme: this.defaultTheme,
+          }),
+          MODAL_STALL_MS,
+        );
+        answer = { confirmed: confirmed === true };
+      }
+    } catch {
+      answer = { confirmed: false };
+    }
+    // Dismissed because a terminal answered first: nothing to report.
+    if (!this.presentedDialogs.has(dialog.dialogId)) return;
+    this.presentedDialogs.delete(dialog.dialogId);
+    if (!this.dialogBrokerId) return;
+    try {
+      await this.request(request(this.id, this.dialogBrokerId, 'respond', { dialogId: dialog.dialogId, ...answer }));
+    } catch (err) {
+      log.warn(`could not report the dialog answer: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

@@ -3,7 +3,7 @@
  *
  * A scrum round is a DAG: tasks declare what they depend on, and several can
  * run at once. Four surfaces need to say something about that graph — the
- * GoalBrowser window, Chat's activity bubble, the `commune` terminal client,
+ * GoalBrowser window, the chat window's activity view, the `abject` terminal client,
  * and the scheduler deciding what to start next — and three of them are
  * rendering it for a person.
  *

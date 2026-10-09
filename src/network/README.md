@@ -57,7 +57,7 @@ Node.js WebSocket server wrapper using the `ws` package.
 
 - **`NodeWebSocketServer`**: wraps `ws.WebSocketServer` for server-side use
 - **Methods**: `onConnection()` callback, `broadcast()` to all clients, `close()` for shutdown
-- Used by `server/index.ts` to serve the frontend client connection
+- Used by `server/ui-layer.ts` (desktop edition) to serve the frontend client connection
 
 ### signaling.ts
 

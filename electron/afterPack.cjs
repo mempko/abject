@@ -1,7 +1,12 @@
 /**
- * electron-builder afterPack hook for Linux.
+ * electron-builder afterPack hook.
  *
- * Renames the real Electron binary to .bin and replaces it with a shell
+ * Every platform: writes the launcher of the app's `abject` command into
+ * resources/cli, beside the CLI bundle (extraResources): it runs abject.mjs
+ * on the app's own binary as Node (ELECTRON_RUN_AS_NODE), as the desktop
+ * edition of the command. See electron/cli-command.ts.
+ *
+ * Linux: renames the real Electron binary to .bin and replaces it with a shell
  * wrapper that passes --no-sandbox. This is the only reliable way to
  * disable the Chromium sandbox because the zygote process checks it
  * before any JS executes.
@@ -17,9 +22,47 @@
 const fs = require('fs');
 const path = require('path');
 
-module.exports = async function afterPack({ targets, appOutDir }) {
-  // Only apply to Linux targets
-  if (!targets.find(t => /AppImage|snap|deb|rpm|freebsd|pacman/i.test(t.name))) return;
+/** resources/cli/abject[.cmd]: run the CLI bundle on the app's runtime. */
+function writeCliLauncher(cliDir, platform, binaryFromCli) {
+  if (!fs.existsSync(path.join(cliDir, 'abject.mjs'))) {
+    console.warn('afterPack: no resources/cli/abject.mjs (run pnpm distill); the app ships without the abject command');
+    return;
+  }
+  if (platform === 'win32') {
+    fs.writeFileSync(path.join(cliDir, 'abject.cmd'), [
+      '@echo off',
+      'rem The Abject desktop app\'s abject command: the app\'s runtime, run as Node.',
+      'setlocal',
+      'set ELECTRON_RUN_AS_NODE=1',
+      'set ABJECT_EDITION=desktop',
+      `"%~dp0${binaryFromCli.replace(/\//g, '\\')}" "%~dp0abject.mjs" %*`,
+      '',
+    ].join('\r\n'));
+    return;
+  }
+  fs.writeFileSync(path.join(cliDir, 'abject'), [
+    '#!/bin/sh',
+    "# The Abject desktop app's abject command: the app's runtime, run as Node.",
+    'here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)',
+    `ELECTRON_RUN_AS_NODE=1 ABJECT_EDITION=desktop exec "$here/${binaryFromCli}" "$here/abject.mjs" "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+}
+
+module.exports = async function afterPack({ targets, appOutDir, electronPlatformName, packager }) {
+  const productFilename = packager.appInfo.productFilename;
+  if (electronPlatformName === 'darwin') {
+    writeCliLauncher(path.join(appOutDir, `${productFilename}.app`, 'Contents', 'Resources', 'cli'), 'darwin', `../../MacOS/${productFilename}`);
+    return;
+  }
+  if (electronPlatformName === 'win32') {
+    writeCliLauncher(path.join(appOutDir, 'resources', 'cli'), 'win32', `../../${productFilename}.exe`);
+    return;
+  }
+
+  // The sandbox wrapper is for the Linux package formats; an unpacked
+  // `dir` build keeps the bare binary (and still gets the command).
+  const wrap = !!targets.find(t => /AppImage|snap|deb|rpm|freebsd|pacman/i.test(t.name));
 
   // Remove SUID sandbox helper if present
   const sandbox = path.join(appOutDir, 'chrome-sandbox');
@@ -52,16 +95,28 @@ module.exports = async function afterPack({ targets, appOutDir }) {
     console.warn('afterPack: could not find Electron binary in', appOutDir);
     return;
   }
+  if (!wrap) {
+    writeCliLauncher(path.join(appOutDir, 'resources', 'cli'), 'linux', `../../${execName}`);
+    return;
+  }
 
   const binPath = path.join(appOutDir, execName);
   const renamedPath = path.join(appOutDir, `${execName}.bin`);
 
   fs.renameSync(binPath, renamedPath);
+  // ABJECT_DESKTOP_CLI: run the abject command instead of the app. The
+  // AppImage's script in ~/.local/bin sets it, since the AppImage's mount
+  // path (and so resources/cli) changes on every launch.
   fs.writeFileSync(
     binPath,
-    `#!/bin/bash\n"\${BASH_SOURCE%/*}"/${execName}.bin "$@" --no-sandbox\n`,
+    '#!/bin/bash\n'
+    + 'if [ -n "$ABJECT_DESKTOP_CLI" ]; then\n'
+    + `  ELECTRON_RUN_AS_NODE=1 ABJECT_EDITION=desktop exec "\${BASH_SOURCE%/*}"/${execName}.bin "\${BASH_SOURCE%/*}"/resources/cli/abject.mjs "$@"\n`
+    + 'fi\n'
+    + `"\${BASH_SOURCE%/*}"/${execName}.bin "$@" --no-sandbox\n`,
     { mode: 0o755 },
   );
+  writeCliLauncher(path.join(appOutDir, 'resources', 'cli'), 'linux', `../../${execName}.bin`);
 
   console.log(`afterPack: wrapped ${execName} with --no-sandbox`);
 };

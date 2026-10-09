@@ -144,6 +144,8 @@ function compactLine(value: unknown, max = 220): string {
 class ScrumPlanConflict extends Error {}
 
 export class ScrumMaster extends Abject {
+  /** False on an instance with no display (the headless edition). */
+  private display = true;
   /** Every action the scrum loop dispatches; feeds the per-step reminder. */
   private static readonly ACTIONS = [
     'review_scrum', 'poll_team', 'add_task', 'save_knowledge', 'lookup_knowledge', 'forget_knowledge',
@@ -391,6 +393,7 @@ export class ScrumMaster extends Abject {
     // irrelevant.
     this.llmId = await this.discoverDep('LLM') ?? undefined;
     await this.resolveLocalPeerId();
+    await this.learnDisplay();
 
     // Subscribe to GoalManager events.
     this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
@@ -2007,7 +2010,9 @@ Rules:
 - Figures about checks and tests (how many ran, passed, failed; exit codes) come ONLY from the verification record, and the newest run supersedes every earlier figure, including numbers quoted in older scratchpad prose. When the record is empty, say the work was not verified by a recorded run rather than quoting a number from prose.
 - When a task report lists what it did not verify, could not cover, or left open, carry that forward under a heading "Not verified" so the reader knows the edges of the claim.
 - When the verification record shows that a task asked to change something modified 0 files, say so plainly: the change was already present in the working tree, or nothing was changed by this run. Do not describe it as work done now.
-- When the work created or modified objects, open with how the user reaches the result: a window they can open now, or — for objects with no visual surface — say plainly that nothing appears on screen and they use it by asking in chat; offer building a window as a natural next step.
+- ${this.display
+    ? 'When the work created or modified objects, open with how the user reaches the result: a window they can open now, or — for objects with no visual surface — say plainly that nothing appears on screen and they use it by asking in chat; offer building a window as a natural next step.'
+    : 'When the work created or modified objects, open with how the user reaches the result: by asking in this conversation, on a schedule, or through the web gateway. This instance has no display, so nothing opens in a window.'}
 - Markdown formatting is fine and encouraged.
 - If the scratchpad is empty or the goal couldn't be resolved, say so plainly.
 - Do not include action JSON or any meta-commentary about the scrum process.
@@ -2943,6 +2948,19 @@ Rules:
   // System prompt — teaches the LLM the action vocabulary
   // ═══════════════════════════════════════════════════════════════════
 
+  /**
+   * Whether this instance has a display, from InstanceInfo. The planner and
+   * the final report talk about windows only where there are windows.
+   */
+  private async learnDisplay(): Promise<void> {
+    const infoId = await this.discoverDep('InstanceInfo');
+    if (!infoId) return;
+    try {
+      const info = await this.request<{ display?: boolean }>(request(this.id, infoId, 'getInfo', {}), 5000);
+      if (typeof info?.display === 'boolean') this.display = info.display;
+    } catch { /* keep the default: a display */ }
+  }
+
   private buildSystemPrompt(): string {
     return `Permission and environment blockers must be grounded in capability responses. Worker explanations are hypotheses until supported. A provider's native sandbox does not describe Abject access. Ask the capability owner or inspect existing permission receipts before declaring access impossible; distinguish policy denial, unavailable owner/provider, and an unverified explanation. Preserve this distinction in the goal report.
 
@@ -3050,7 +3068,9 @@ When to INCLUDE synthesis inline:
 - The user asked a question the data alone doesn't answer cleanly
 - The synthesis is short (1–2 sentences) and you've already composed it during your reasoning
 
-Either way, the synthesis (whether yours or auto-generated) is the user's ONLY view. Inline data from scratchpad. Don't say "see above" — there is no above. And "deployed" is invisible to the user unless something appears on screen: when the round shipped objects without a window, make sure the synthesis says so plainly and points at the chat/message path for using them (a \`hint\` like "headless — usable via chat only, offer a window" is enough).
+Either way, the synthesis (whether yours or auto-generated) is the user's ONLY view. Inline data from scratchpad. Don't say "see above" — there is no above. ${this.display
+    ? 'And "deployed" is invisible to the user unless something appears on screen: when the round shipped objects without a window, make sure the synthesis says so plainly and points at the chat/message path for using them (a \`hint\` like "headless — usable via chat only, offer a window" is enough).'
+    : 'And "deployed" is invisible to the user: this instance has no display, so the synthesis says how to use what shipped (asking in chat, a schedule, the web gateway).'}
 
 Calling \`complete_goal\` after \`add_task\` cleanly abandons the staged batch (nothing was committed yet).
 
@@ -3177,17 +3197,21 @@ For those goals, put the research and the implementation in SEPARATE ROUNDS:
 
 Prefer the two-round split even when the research looks quick. The one case for chaining research and implementation in a single round is when the implementation is genuinely ONE indivisible task no matter what the research turns up — then there was no concurrency to exploit and the chain costs nothing.
 
-## Composing UI work: Model and View
+${this.display ? `## Composing UI work: Model and View
 
 UI objects follow Model-View in the original Smalltalk sense (the view both displays and handles interaction; a controller, when present, only selects the kind of view of a model). For a small app one builder authors both halves as separated sections of a single object, which is one \`add_task\` to the creation agent. For a COMPLEX, stateful UI prefer splitting it into two cooperating Abjects: a model object (domain data plus rules plus Design by Contract, exposing domain operations and a getState/changed surface, no UI) and a view object (window/canvas plus interaction that observes the model). Plan that as two \`add_task\` calls, model first, then the view with \`dependsOn\` the model and \`consumes\` its id, so the view is wired to the live model. Describe the OUTCOME and the split, and let the builder choose the rendering vocabulary at build time. The controller role is usually already played by an existing system object (the launcher/window host), so do not plan a separate controller unless the goal genuinely needs multiple coordinated views of one model.
 
-## Trust poll replies; let runtime decide
+` : `## No display here
+
+This instance is headless: it has no display, so nothing it builds can open a window, draw, or be screenshotted. Plan objects whose value reaches the person through messages (replies in the conversation, notifications, scheduled work, data they can ask for) or pages served through the web gateway. When a goal asks for a visual UI, plan the model and its operations, and have the synthesis say there is no display to show a window on.
+
+`}## Trust poll replies; let runtime decide
 
 When a poll reply confirms an agent owns a tool (browser automation, MCP server, skill, API), trust the reply and plan the task. Real runtime failures arrive in \`failed[]\` on the next scrum, with a concrete error you can replan against — that is your evidence loop. Phrases like "site X blocks bots", "site Y rate-limits aggressively", "the API has restrictive scopes" are training-data guesses; keep them out of task descriptions AND syntheses. The way to find out how an external service reacts is to actually attempt the task and read the real failure.
 
 Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.
 
-The same discipline applies to the PLATFORM's own capabilities (rendering, UI, storage). The platform evolves past your training data and past saved lessons — the desktop, for example, is a native 3D scene where windows can host real meshes and lights, alongside 2D canvases. Task descriptions state the OUTCOME ("a visibly rotating 3D cube in a window") and direct the builder to the live vocabularies (builders ask the UI objects for current capabilities at build time). Hedges like "X may not be supported" and implementation prescriptions like "use 2D canvas with manual projection math" are training-data guesses — leave them out and let the builder's live discovery decide the approach.`;
+The same discipline applies to the PLATFORM's own capabilities (${this.display ? 'rendering, UI, storage' : 'storage, scheduling, the web gateway'}). The platform evolves past your training data and past saved lessons${this.display ? ' — the desktop, for example, is a native 3D scene where windows can host real meshes and lights, alongside 2D canvases' : ''}. Task descriptions state the OUTCOME ("a visibly rotating 3D cube in a window") and direct the builder to the live vocabularies (builders ask the UI objects for current capabilities at build time). Hedges like "X may not be supported" and implementation prescriptions like "use 2D canvas with manual projection math" are training-data guesses — leave them out and let the builder's live discovery decide the approach.`;
   }
 }
 

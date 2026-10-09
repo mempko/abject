@@ -266,7 +266,7 @@ HealthMonitor (every 5s):
 ### 4.5 WASM Object Execution Flow
 
 ```
-Boot (server/index.ts):
+Boot (server/boot.ts):
   ingestAllExtensions(factory) →
     native/ (bundled) then $ABJECTS_DATA_DIR/extensions/ (user, wins collisions)
     module bytes → content-addressed store (wasm:sha256:<hex>)

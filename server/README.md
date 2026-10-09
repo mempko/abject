@@ -39,11 +39,35 @@ Server-side runtime for Abjects. All object logic runs on Node.js and the browse
 └─────────────────────────────────────────────────────────┘
 ```
 
+## Editions
+
+The same bootstrap runs in two editions:
+
+- **Desktop** (`index.ts`, what `pnpm awaken` and the Electron app run):
+  `boot.ts` plus the display layer in `ui-layer.ts`, as drawn above.
+- **Headless** (`headless.ts`, `pnpm awaken:headless`, and the `abject`
+  command's backend): `boot.ts` alone. No BackendUI, UIServer, WidgetManager
+  or windows; WS_PORT answers only the health endpoint, and people reach it
+  through the CLI gateway (`cli-server.ts`) with the `abject` command. Its
+  bundles are checked for display code at build time
+  (`scripts/headless-bundle-check.mjs`).
+
+Questions to the person (`confirm`, `prompt`, permission prompts) go to
+`DialogBroker`, which shows them on whatever surfaces exist: windows on the
+desktop (WidgetManager, GlobalSettings) and every connected terminal
+(CliServer). On the headless edition the terminals are the only surface, and
+an asker waits until someone answers. Each running backend writes
+`instance.json` into its data directory (pid, edition, ports, an owner token
+for local terminals); `instance-file.ts` owns that file, and `data-dir.ts` the
+per-OS default data directory both editions and the `abject` command share.
+
 ## Files
 
-### index.ts
+### boot.ts, index.ts, headless.ts, ui-layer.ts
 
-Main entry point. Bootstraps the entire Abjects system on Node.js.
+`boot.ts` bootstraps the entire Abjects system on Node.js; `index.ts` and
+`headless.ts` call it with each edition's worker entries, the desktop's with
+the `UiLayer` from `ui-layer.ts`.
 
 - Polyfills WebRTC APIs (`RTCPeerConnection`, `RTCDataChannel`, etc.) via `node-datachannel`
 - Creates `Runtime` with optional worker thread pool (auto-detects CPU cores)
@@ -54,15 +78,16 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
   package with `replaces` overrides its built-in type
 - Spawns system objects in dependency order via request-reply to Factory
 - Installs `PeerRouter` as message interceptor for P2P routing
-- Starts `NodeWebSocketServer` on port 7719
-- Graceful shutdown via signal handlers (`SIGINT`, `SIGTERM`)
+- Desktop: starts `NodeWebSocketServer` on port 7719 (ui-layer.ts); headless: a plain health endpoint there
+- Graceful shutdown via signal handlers (`SIGINT`, `SIGTERM`, and `SIGHUP` off Windows), or the CLI gateway's `shutdown` (`abject stop`)
 
 **Environment variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WS_PORT` | `7719` | WebSocket port for frontend connection |
-| `DATA_DIR` | `.abjects` | Storage directory for persisted state |
+| `ABJECTS_DATA_DIR` | `.abjects` (installs: the OS per-user directory) | Storage directory for persisted state |
+| `CLI_PORT` / `CLI_BIND` | `WS_PORT+4` / `127.0.0.1` | CLI gateway port and address (`abject`) |
 | `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
 | `OPENAI_API_KEY` | - | OpenAI API key |
 | `ABJECTS_WORKER_COUNT` | CPU cores | Worker thread pool size |
@@ -76,10 +101,11 @@ uptime, Node, platform, worker count) and `GET /version`. Abjects read the
 same from the `InstanceInfo` object. The compiled server (`pnpm bind`) has its
 version built in.
 
-**Running headless.** `pnpm incarnate:server` packages the compiled server,
-its workers, the bundled packages and its runtime dependencies as a tarball
-with a launcher (`bin/abject-server`, which checks for Node 22.5+) and a
-systemd unit; see `deploy/README.md`.
+**Running headless.** `pnpm incarnate:headless` packages the headless
+edition as one directory: the `abject` binary (Node with the command line
+built in, `scripts/sea-bootstrap.cjs`), the headless server and its workers,
+the bundled packages and the native modules. `abject serve` runs it in the
+foreground for a service manager; see `deploy/README.md`.
 | `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated); pinned, not changeable at runtime |
 | `ABJECTS_PEER_ADMISSION` | `open` | `allowlist` pins allowlist mode: only allowed peers may connect |
 | `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |

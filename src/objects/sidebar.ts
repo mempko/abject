@@ -22,10 +22,8 @@ import { Capabilities } from '../core/capability.js';
 
 const SIDEBAR_INTERFACE: InterfaceId = 'abjects:sidebar';
 
-/** Dock width: 120px rows + root margins, with room for the section scrollbar. */
-export const SIDEBAR_WIDTH = 168;
-/** Compact dock width: icon-only rows + root margins. */
-export const SIDEBAR_COMPACT_WIDTH = 56;
+import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from '../core/dock-layout.js';
+export { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH };
 
 export interface SidebarSections {
   windowId: AbjectId;

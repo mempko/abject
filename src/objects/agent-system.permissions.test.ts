@@ -14,6 +14,9 @@ import { ExternalCreator } from './external-creator.js';
 import { JobManager } from './job-manager.js';
 import { AgentAbject } from './agent-abject.js';
 
+/** DialogBroker's reply to `askPerson`: the person picked this option. */
+const answer = (option: string) => ({ answered: true, confirmed: true, option });
+
 class Endpoint extends Abject {
   constructor(name: string) { super({ manifest: { name, version: '1', description: 'Permission fixture',
     interface: { id: name, name, description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
@@ -149,9 +152,9 @@ test('filesystem symlinks cannot escape through reads or new-file parents', asyn
 test('remembered directory grants cover children for the same caller and operation', async () => {
   const f = await fixture();
   try {
-    const settings = await f.add(new Endpoint('GlobalSettings'));
+    const settings = await f.add(new Endpoint('DialogBroker'));
     let prompts = 0;
-    settings.on('showPermissionPrompt', () => ({ decision: ++prompts === 1 ? 'accept_always' : 'deny' }));
+    settings.on('askPerson', () => answer(++prompts === 1 ? 'accept_always' : 'deny'));
     const file = path.join(f.outside, 'fixture.txt'); await fs.writeFile(file, 'fixture');
     assert.equal((await f.client.call(f.host.id, 'grantPath', { path: f.outside })).granted, true);
     assert.equal((await f.client.call(f.host.id, 'readFile', { path: file })).content, 'fixture');
@@ -166,9 +169,9 @@ test('remembered directory grants cover children for the same caller and operati
 test('a project class rule granted from a shell prompt covers filesystem writes without asking', async () => {
   const f = await fixture();
   try {
-    const settings = await f.add(new Endpoint('GlobalSettings'));
+    const settings = await f.add(new Endpoint('DialogBroker'));
     let prompts = 0;
-    settings.on('showPermissionPrompt', () => { prompts++; return { decision: 'deny' }; });
+    settings.on('askPerson', () => { prompts++; return answer('deny'); });
     f.project.autonomy = 'read';
     f.broker.rules.push({ kind: 'class', caller: 'Client', effect: 'write', scope: { kind: 'project', name: 'fixture' }, allow: true });
     const file = path.join(f.projectRoot, 'ruled.txt');
@@ -185,9 +188,9 @@ test('a project class rule granted from a shell prompt covers filesystem writes 
 test('a filesystem prompt inside a project offers the project-wide grant and remembers it', async () => {
   const f = await fixture();
   try {
-    const settings = await f.add(new Endpoint('GlobalSettings'));
+    const settings = await f.add(new Endpoint('DialogBroker'));
     const seen: any[] = [];
-    settings.on('showPermissionPrompt', msg => { seen.push(msg.payload); return { decision: 'accept_class' }; });
+    settings.on('askPerson', msg => { seen.push(msg.payload); return answer('accept_class'); });
     f.project.autonomy = 'read';
     const first = path.join(f.projectRoot, 'first.txt'), second = path.join(f.projectRoot, 'nested', 'second.txt');
     await fs.mkdir(path.dirname(second));
@@ -201,7 +204,7 @@ test('a filesystem prompt inside a project offers the project-wide grant and rem
     assert.equal(await fs.readFile(second, 'utf8'), 'two');
     const rule = f.broker.rules.find((r: any) => r.kind === 'class' && r.caller === 'Client' && r.effect === 'write');
     assert.deepEqual(rule?.scope, { kind: 'project', name: 'fixture' });
-    settings.on('showPermissionPrompt', msg => { seen.push(msg.payload); return { decision: 'deny' }; });
+    settings.on('askPerson', msg => { seen.push(msg.payload); return answer('deny'); });
     const outside = path.join(f.outside, 'elsewhere.txt');
     await assert.rejects(f.client.call(f.host.id, 'writeFile', { path: outside, content: 'no', taskId: 'task' }));
     assert.equal(seen.length, 2, 'the project grant says nothing about paths outside it');

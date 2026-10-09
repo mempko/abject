@@ -67,6 +67,9 @@ export function minAutonomy(a: AutonomyLevel, b: AutonomyLevel): AutonomyLevel {
 /**
  * Objects whose word is taken for a change to trust or autonomy.
  *
+ * The terminal gateway (CliServer) speaks for the person at a terminal the same
+ * way the project window speaks for them on a desktop.
+ *
  * Everything else may register a project, but registers it untrusted and at
  * `ask`.
  *
@@ -76,7 +79,7 @@ export function minAutonomy(a: AutonomyLevel, b: AutonomyLevel): AutonomyLevel {
  * the Factory at spawn and puts user objects in their own `user/` namespace, so
  * it cannot be claimed at all.
  */
-const TRUST_AUTHORITIES = ['ExternalProjectBrowser', 'GlobalSettings', 'PermissionBroker'];
+const TRUST_AUTHORITIES = ['ExternalProjectBrowser', 'GlobalSettings', 'PermissionBroker', 'CliServer'];
 
 export interface ExternalProject {
   /** Short handle used everywhere else ("abjects", "novel"). */

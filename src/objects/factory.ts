@@ -672,11 +672,13 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
           },
           registryId: effectiveRegistryId,
           parentId: parentId ?? this.id,
+          typeId: existingReg?.typeId,
         });
       } else {
         await this._workerPool.spawnInWorker(objectId, constructorName, {
           registryId: effectiveRegistryId,
           parentId: parentId ?? this.id,
+          typeId: existingReg?.typeId,
         });
       }
       this.workerSpawned.set(objectId, constructorName);
@@ -1011,6 +1013,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         constructorArgs: req.constructorArgs,
         registryId: req.registryHint ?? this._factoryRegistryId,
         parentId: req.parentId ?? this.id,
+        typeId: req.typeId,
       });
     } catch (err) {
       log.error(`Failed to spawn ${req.manifest.name} (${objectId.slice(0, 8)}) in worker:`, err);
@@ -1081,6 +1084,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       },
       registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,
+      typeId: req.typeId,
     });
 
     this.workerSpawned.set(objectId, 'ScriptableAbject');
@@ -1168,6 +1172,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       },
       registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,
+      typeId: req.typeId,
     });
 
     this.workerSpawned.set(objectId, WASM_ABJECT_CONSTRUCTOR);
@@ -1234,6 +1239,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       constructorArgs: spec,
       registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,
+      typeId: req.typeId,
     });
 
     this.workerSpawned.set(objectId, 'Organism');

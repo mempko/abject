@@ -14,10 +14,11 @@
   "scripts": {
     "conjure": "pnpm install",
     "awaken": "tsx --watch server/index.ts",
+    "awaken:headless": "tsx --watch server/headless.ts",
     "scry": "vite --config vite.client.config.ts",
     "divine": "VITE_DEFAULT_MODE=p2p VITE_CLIENT_PORT=5180 vite --config vite.client.config.ts",
     "whisper": "tsx server/signaling-server.ts",
-    "commune": "tsx cli/commune.ts",
+    "abject": "tsx cli/abject.ts",
     "awaken2": "ABJECTS_DATA_DIR=.abjects2 WS_PORT=7721 VITE_CLIENT_PORT=5175 tsx --watch server/index.ts",
     "scry2": "VITE_WS_PORT=7721 VITE_CLIENT_PORT=5175 vite --config vite.client.config.ts",
     "awaken3": "ABJECTS_DATA_DIR=.abjects3 WS_PORT=7727 VITE_CLIENT_PORT=5176 tsx --watch server/index.ts",
@@ -30,12 +31,12 @@
     "distill": "node build-cli.mjs",
     "etch": "vite build --config vite.client.config.ts",
     "etch:p2p": "VITE_DEFAULT_MODE=p2p vite build --config vite.client.config.ts",
-    "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch",
+    "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch && pnpm distill",
     "incarnate:linux": "pnpm incarnate && electron-builder --linux --publish never",
     "incarnate:win": "pnpm incarnate && electron-builder --win --publish never",
     "incarnate:mac": "pnpm incarnate && electron-builder --mac --publish never",
     "incarnate:all": "pnpm incarnate:linux && pnpm incarnate:win && pnpm incarnate:mac",
-    "incarnate:server": "node scripts/package-server.mjs",
+    "incarnate:headless": "node scripts/package-headless.mjs",
     "release": "node release.mjs",
     "typecheck": "tsc --noEmit",
     "test:agents": "node --import tsx --test --test-isolation=none src/objects/agent-system.*.test.ts",
@@ -58,6 +59,14 @@
     "uuid": "^9.0.0",
     "ws": "^8.18.0",
     "yaml": "^2.8.3"
+  },
+  "optionalDependencies": {
+    "@lydell/node-pty-darwin-arm64": "1.2.0-beta.15",
+    "@lydell/node-pty-darwin-x64": "1.2.0-beta.15",
+    "@lydell/node-pty-linux-arm64": "1.2.0-beta.15",
+    "@lydell/node-pty-linux-x64": "1.2.0-beta.15",
+    "@lydell/node-pty-win32-arm64": "1.2.0-beta.15",
+    "@lydell/node-pty-win32-x64": "1.2.0-beta.15"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

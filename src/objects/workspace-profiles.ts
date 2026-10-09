@@ -27,7 +27,9 @@ import * as path from 'node:path';
 
 /** Infrastructure objects — spawned when a workspace comes up (no UI). */
 export const INFRA_OBJECTS = [
-  'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
+  // NotificationCenter keeps the workspace's notification history and announces
+  // each one (a terminal shows them); it draws a toast only where there is a desktop.
+  'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme', 'NotificationCenter',
   'GoalManager', 'JobManager', 'TaskSession', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   // ExternalProjectRegistry precedes ExternalCreator: the agent resolves it at init.
   'ExternalProjectRegistry', 'ExternalCreator', 'ObjectCreator',
@@ -43,7 +45,7 @@ export const UI_OBJECTS = [
   // Taskbar resolves its optional browsers at init, so every object it offers a
   // row for has to be spawned before it.
   'AbjectEditor', 'PeersViewer', 'Taskbar',
-  'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
+  'CommandPalette', 'WindowSwitcher', 'DataBrowser',
 ] as const;
 
 /** All per-workspace objects in dependency order. */

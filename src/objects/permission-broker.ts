@@ -11,12 +11,19 @@
  * This object supplies both. It sits between the capability objects
  * (ShellExecutor, HostFileSystem, HttpClient, StreamClient) and the dialog,
  * holds the permissions authority on all of them, and answers in one of three
- * ways: allow silently, refuse, or forward to GlobalSettings to ask a question
- * that now names a program, an effect, and a project.
+ * ways: allow silently, refuse, or ask the person a question that names a
+ * program, an effect, and a project. The question goes to DialogBroker, which
+ * shows it on the desktop when there is one and offers it to every terminal,
+ * and the wait lasts as long as the person takes.
+ *
+ * What happens to a question nobody has answered by policy is the prompt mode,
+ * a global setting: ask (the default), allow it once without asking, or deny
+ * it without asking. Rules, protected paths and deny decisions apply first in
+ * every mode, and a dangerous command is asked about even in allow mode.
  *
  * The split matters. Capability objects stay capabilities with no opinion about
- * projects; GlobalSettings stays a settings window that owns the dialog; policy
- * lives here and nowhere else.
+ * projects; DialogBroker owns the question and who may answer it; policy lives
+ * here and nowhere else.
  *
  * Two axes decide an auto-approval, and the smaller one wins:
  *
@@ -60,13 +67,22 @@ export const PERMISSION_BROKER_ID = 'abjects:permission-broker' as AbjectId;
 const STORAGE_KEY_RULES = 'permission-broker:rules';
 
 /**
- * How long to wait on the dialog with no sign of life from it.
+ * How long to wait on DialogBroker with no sign of life from it.
  *
- * Not a limit on the person. GlobalSettings heartbeats for as long as the
- * question is on screen, and every beat resets this, so reaching it means the
- * dialog is gone rather than that the user is slow.
+ * Not a limit on the person. The broker heartbeats for as long as the question
+ * is open, and every beat resets this, so a question waits indefinitely; this
+ * fires only if the broker itself has gone.
  */
 const PROMPT_WAIT_MS = 30 * 60 * 1000;
+
+/**
+ * What happens to a request no rule or autonomy level decides.
+ *   ask   put it to the person and wait for the answer (default)
+ *   allow allow it once without asking; dangerous commands still ask
+ *   deny  deny it without asking
+ */
+export type PromptMode = 'ask' | 'allow' | 'deny';
+export const PROMPT_MODES: readonly PromptMode[] = ['ask', 'allow', 'deny'];
 
 /** How long a "for this task" grant survives without being renewed. */
 const SESSION_GRANT_MS = 30 * 60 * 1000;
@@ -193,8 +209,10 @@ export function ceilingFor(mode: WorkspaceAccessMode): AutonomyLevel {
 
 export class PermissionBroker extends Abject {
   private storageId?: AbjectId;
-  private settingsId?: AbjectId;
+  private dialogBrokerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
+  /** What an undecided request gets; pushed by the settings authority. */
+  private promptMode: PromptMode = 'ask';
 
   /** The one object allowed to push capability settings through us. */
   private settingsAuthorityId?: AbjectId;
@@ -204,10 +222,6 @@ export class PermissionBroker extends Abject {
   private decisions: DecisionRecord[] = [];
   /** Auto-approvals taken per caller, against DEFAULT_BUDGET. */
   private autoCount = new Map<string, number>();
-
-  /** Requests waiting on the dialog, oldest first. */
-  private promptQueue: Array<() => void> = [];
-  private promptBusy = false;
 
   /** Cached workspace facts; short-lived because access mode is user-editable. */
   private wsCache?: { at: number; rows: WorkspaceRow[] };
@@ -314,6 +328,20 @@ export class PermissionBroker extends Abject {
               returns: { kind: 'object', properties: { cleared: { kind: 'primitive', primitive: 'number' } } },
             },
             {
+              name: 'getPromptMode',
+              description: 'What a request no rule decides gets: ask (wait for the person), allow (once, without asking; dangerous commands still ask) or deny.',
+              parameters: [],
+              returns: { kind: 'primitive', primitive: 'string' },
+            },
+            {
+              name: 'setPromptMode',
+              description: 'Change the prompt mode. Restricted to the settings authority; the person changes it in Settings or from the terminal.',
+              parameters: [
+                { name: 'mode', type: { kind: 'primitive', primitive: 'string' }, description: 'ask | allow | deny' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
               name: 'applyToCapability',
               description:
                 'Forward a settings change to a capability object. Restricted to the settings authority, ' +
@@ -390,6 +418,20 @@ export class PermissionBroker extends Abject {
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
+    });
+
+    this.on('getPromptMode', () => this.promptMode);
+
+    this.on('setPromptMode', async (msg: AbjectMessage) => {
+      if (!this.settingsAuthorityId || msg.routing.from !== this.settingsAuthorityId) {
+        return { success: false, error: 'Unauthorized' };
+      }
+      const { mode } = (msg.payload ?? {}) as { mode?: string };
+      contractRequire(PROMPT_MODES.includes(mode as PromptMode), `mode must be one of ${PROMPT_MODES.join(', ')}`);
+      if (this.promptMode !== mode) log.info(`prompt mode: ${this.promptMode} -> ${mode}`);
+      this.promptMode = mode as PromptMode;
+      this.checkInvariants();
+      return { success: true };
     });
 
     this.on('requestPermission', (msg: AbjectMessage) => {
@@ -1020,11 +1062,12 @@ export class PermissionBroker extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   /**
-   * Put the question to the user, one at a time.
+   * Put the question to the person, or answer it by the prompt mode.
    *
-   * Requests queue rather than being refused. The old dialog answered a second
-   * concurrent request with `deny` so it would not have to stack windows, which
-   * meant two agents working at once silently failed one of them.
+   * Questions no longer queue here. Every open question sits in DialogBroker
+   * at once, so a terminal can list them all and answer any; the desktop shows
+   * them one at a time. The old dialog answered a second concurrent request
+   * with `deny`, which silently failed one of two agents working at once.
    */
   private async ask(
     req: PermissionRequest,
@@ -1034,34 +1077,35 @@ export class PermissionBroker extends Abject {
     project?: ExternalProject,
     effective?: AutonomyLevel,
   ): Promise<Outcome> {
-    await this.enterPromptQueue();
-    try {
-      // Logged before the dialog rather than after the answer, so a prompt
-      // nobody is at the keyboard for still says what it is waiting on. The
-      // reason used to exist only on screen, which left a repeated prompt with
-      // no trace in the log at all.
-      log.info(`asking ${ctx.name} about ${req.type}: `
-        + `${redactCommand(req.resource).slice(0, 160)} (${why})`);
-      const decision = await this.showPrompt(req, ctx, analysis, why, project);
-      await this.applyDecision(decision, req, ctx, analysis, project);
-      this.record(req, ctx, decision, true, why, project, effective);
-      // A prompt is a check-in, so the loop guard starts again.
-      this.autoCount.set(ctx.name, 0);
-      return { decision, asked: true, restrictEnv: false };
-    } finally {
-      this.leavePromptQueue();
+    const unattended = this.unattendedDecision(analysis);
+    if (unattended) {
+      this.record(req, ctx, unattended, false, `${why}; prompt mode ${this.promptMode}`, project, effective);
+      // Nobody saw this command: an allow runs without the host's credentials.
+      return { decision: unattended, asked: false, restrictEnv: unattended === 'accept_once' };
     }
+    // Logged before the question rather than after the answer, so a prompt
+    // nobody is at the keyboard for still says what it is waiting on.
+    log.info(`asking ${ctx.name} about ${req.type}: `
+      + `${redactCommand(req.resource).slice(0, 160)} (${why})`);
+    const decision = await this.showPrompt(req, ctx, analysis, why, project);
+    await this.applyDecision(decision, req, ctx, analysis, project);
+    this.record(req, ctx, decision, true, why, project, effective);
+    // A prompt is a check-in, so the loop guard starts again.
+    this.autoCount.set(ctx.name, 0);
+    return { decision, asked: true, restrictEnv: false };
   }
 
-  private async enterPromptQueue(): Promise<void> {
-    if (!this.promptBusy) { this.promptBusy = true; return; }
-    await new Promise<void>(resolve => this.promptQueue.push(resolve));
-  }
-
-  private leavePromptQueue(): void {
-    const next = this.promptQueue.shift();
-    if (next) next();
-    else this.promptBusy = false;
+  /**
+   * The answer the prompt mode gives without asking, or undefined to ask.
+   * Allow mode still asks about a dangerous or unreadable command: those are
+   * exactly the ones a person should see.
+   */
+  private unattendedDecision(analysis: CommandAnalysis | undefined): PermissionDecision | undefined {
+    if (this.promptMode === 'deny') return 'deny';
+    if (this.promptMode === 'allow' && !(analysis && (analysis.effect === 'dangerous' || analysis.opaque))) {
+      return 'accept_once';
+    }
+    return undefined;
   }
 
   private async showPrompt(
@@ -1071,9 +1115,6 @@ export class PermissionBroker extends Abject {
     why: string,
     project?: ExternalProject,
   ): Promise<PermissionDecision> {
-    const settingsId = await this.settings();
-    if (!settingsId) throw new Error('Permission dialog is unavailable');
-
     const groups = this.optionsFor(req, ctx, analysis, project);
     const detail = analysis
       ? (() => {
@@ -1090,27 +1131,38 @@ export class PermissionBroker extends Abject {
       })()
       : [`Asking because   ${why}`];
 
+    const answer = await this.askPerson({
+      kind: 'options',
+      topic: 'permission',
+      title: req.type === 'shell' ? 'Shell Permission'
+        : req.type === 'domain' ? 'Network Permission' : 'Filesystem Permission',
+      message: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : req.type === 'directory' ? `${req.operation ?? 'read'} files` : 'access'}`
+        + (project ? ` in ${project.name}` : ''),
+      resource: redactCommand(req.resource),
+      detail,
+      groups,
+      // Rides along so the broker's heartbeat names the task and reaches
+      // every caller serving it, not just the ones with nothing else open.
+      taskId: req.taskId,
+    });
+    const offered = groups.flatMap(g => g.options.map(o => o.id));
+    if (!answer.answered || !answer.confirmed || !answer.option || !offered.includes(answer.option)) return 'deny';
+    return answer.option as PermissionDecision;
+  }
+
+  /**
+   * Ask DialogBroker and wait for as long as the person takes. With no broker
+   * nobody can be asked, which is a refusal, never a yes.
+   */
+  private async askPerson(spec: Record<string, unknown>): Promise<{ answered: boolean; confirmed: boolean; option?: string }> {
+    this.dialogBrokerId = await this.resolveDep('DialogBroker', this.dialogBrokerId);
+    if (!this.dialogBrokerId) throw new Error('Permission dialog is unavailable');
     try {
-      const reply = await this.request<{ decision: string }>(
-        request(this.id, settingsId, 'showPermissionPrompt', {
-          type: req.type,
-          title: req.type === 'shell' ? 'Shell Permission'
-            : req.type === 'domain' ? 'Network Permission' : 'Filesystem Permission',
-          description: `${ctx.name} wants to ${req.type === 'shell' ? 'run a command' : req.type === 'directory' ? `${req.operation ?? 'read'} files` : 'access'}`
-            + (project ? ` in ${project.name}` : ''),
-          resource: redactCommand(req.resource),
-          detail,
-          groups,
-          skillName: req.skillName,
-          // Rides along so the dialog's heartbeat names the task and reaches
-          // every caller serving it, not just the ones with nothing else open.
-          taskId: req.taskId,
-        }),
-        PROMPT_WAIT_MS,
-      );
-      return (reply?.decision as PermissionDecision) ?? 'deny';
+      return await this.request<{ answered: boolean; confirmed: boolean; option?: string }>(
+        request(this.id, this.dialogBrokerId, 'askPerson', spec), PROMPT_WAIT_MS);
     } catch (err) {
-      log.warn(`prompt failed or timed out: ${err instanceof Error ? err.message : String(err)}`);
+      this.dialogBrokerId = undefined;
+      log.warn(`prompt failed: ${err instanceof Error ? err.message : String(err)}`);
       throw new Error(`Permission dialog unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -1438,30 +1490,28 @@ export class PermissionBroker extends Abject {
     return this.projectFor(ctx, name);
   }
 
-  /** A bus caller can propose a rule, but only the permission dialog can approve it. */
+  /**
+   * A bus caller can propose a rule, but only the person can approve it. The
+   * prompt mode never answers this one in the caller's favour: allow mode
+   * still asks, and deny mode refuses.
+   */
   private async authorizeRuleChange(operation: 'Add' | 'Replace' | 'Remove', rule: Rule, previous?: Rule): Promise<boolean> {
-    await this.enterPromptQueue();
+    if (this.promptMode === 'deny') return false;
     try {
-      const settingsId = await this.settings();
-      if (!settingsId) return false;
-      const reply = await this.request<{ decision: string }>(request(this.id, settingsId, 'showPermissionPrompt', {
-        type: 'permission_rule', title: `${operation} permission rule?`,
-        description: `This changes standing permissions for ${rule.caller === '*' ? 'all callers' : rule.caller}.`,
+      const answer = await this.askPerson({
+        kind: 'options',
+        topic: 'permission',
+        title: `${operation} permission rule?`,
+        message: `This changes standing permissions for ${rule.caller === '*' ? 'all callers' : rule.caller}.`,
         resource: describeRule(rule),
         detail: previous ? [`Replaces: ${describeRule(previous)}`] : [],
         groups: [{ label: 'Standing permission', options: [
           { id: 'approve_rule_change', label: `${operation} rule`, tone: 'bad' },
           { id: 'deny', label: 'Cancel', tone: 'default' },
         ] }],
-      }), PROMPT_WAIT_MS);
-      return reply?.decision === 'approve_rule_change';
+      });
+      return answer.answered && answer.confirmed && answer.option === 'approve_rule_change';
     } catch { return false; }
-    finally { this.leavePromptQueue(); }
-  }
-
-  private async settings(): Promise<AbjectId | undefined> {
-    this.settingsId = await this.resolveDep('GlobalSettings', this.settingsId) ?? undefined;
-    return this.settingsId;
   }
 
   protected override askPrompt(question: string): string {
@@ -1472,7 +1522,7 @@ export class PermissionBroker extends Abject {
       '- the external project\'s autonomy level (ask / read / edit / full)',
       '- the calling workspace\'s access mode: local keeps the level, private caps at edit, public caps at ask',
       '',
-      `Standing rules: ${this.rules.length}. Session grants: ${this.sessionGrants.length}.`,
+      `Standing rules: ${this.rules.length}. Session grants: ${this.sessionGrants.length}. Prompt mode: ${this.promptMode}.`,
       `Recent decisions: ${this.decisions.length} (see listDecisions).`,
       '',
       'Levels are set by the user through the project browser. Nothing an object sends here raises one.',
@@ -1483,6 +1533,7 @@ export class PermissionBroker extends Abject {
 
   protected override checkInvariants(): void {
     super.checkInvariants();
+    invariant(PROMPT_MODES.includes(this.promptMode), 'PermissionBroker: unknown prompt mode');
     for (const r of this.rules) {
       invariant(typeof r.caller === 'string' && r.caller.length > 0, 'a rule must name a caller');
       invariant(r.kind === 'exact' || r.scope.kind !== 'path' || r.scope.root.length > 0,

@@ -41,12 +41,8 @@ class HeadlessChat extends Chat {
     super();
     const chat = this as any;
     chat.goalManagerId = goals;
-    chat.enterGoalControls = async () => { chat.goalControlsActive = true; };
-    chat.exitGoalControls = async () => { chat.goalControlsActive = false; };
     chat.scheduleActivityRefresh = () => {};
-    chat.removeWelcomeState = async () => {};
-    chat.removeActivityBubble = async () => {};
-    chat.appendBubble = async (_role: string, _sender: string, text: string) => { this.bubbles.push(text); };
+    chat.appendMessage = (_role: string, _sender: string, text: string) => { this.bubbles.push(text); };
     chat.schedulePersist = () => {};
   }
   protected override async onInit(): Promise<void> {}
@@ -80,7 +76,7 @@ for (const status of ['completed', 'failed'] as const) {
       assert.equal(reply.status, 'completed');
       assert.equal(reply.result.success, true);
       assert.equal((f.chat as any)._currentGoalId, 'goal-root');
-      assert.equal((f.chat as any).goalControlsActive, true);
+      assert.equal((f.chat as any).controls().goalActive, true);
       const next = await f.client.call(f.jobs.id, 'submitJob', { queue: 'chat-task', description: 'next job', code: 'return 42;' });
       assert.equal(next.result, 42, 'the goal must not hold the queue while agents work');
       f.goals.update(f.chat.id, 'goalCreated', { goalId: 'child', parentId: 'goal-root', title: 'Inspect changes' });
@@ -88,7 +84,7 @@ for (const status of ['completed', 'failed'] as const) {
       f.stranger.update(f.chat.id, 'goalCompleted', { goalId: 'goal-root', result: 'Forged success' });
       await delay(20);
       assert.equal(f.chat.bubbles.length, 0, 'child results and forged outcomes cannot finish the root goal');
-      assert.equal((f.chat as any).goalControlsActive, true);
+      assert.equal((f.chat as any).controls().goalActive, true);
       f.goals.update(f.chat.id, status === 'completed' ? 'goalCompleted' : 'goalFailed', {
         goalId: 'goal-root', result: 'Created verified commits', error: 'Dispatch failed',
       });
@@ -96,7 +92,7 @@ for (const status of ['completed', 'failed'] as const) {
       assert.equal(f.chat.bubbles.length, 1);
       assert.match(f.chat.bubbles[0], status === 'completed' ? /Created verified commits/ : /Dispatch failed/);
       assert.equal((f.chat as any)._currentGoalId, undefined);
-      assert.equal((f.chat as any).goalControlsActive, false);
+      assert.equal((f.chat as any).controls().goalActive, false);
       f.goals.update(f.chat.id, 'goalCompleted', { goalId: 'goal-root', result: 'duplicate' });
       await delay(20);
       assert.equal(f.chat.bubbles.length, 1);
@@ -113,7 +109,7 @@ test('Chat reconciles completion that beats the goal creation reply and reuses a
     await f.handoff();
     assert.equal(f.goals.creates, 1);
     assert.deepEqual(f.chat.bubbles, ['Created verified commits']);
-    assert.equal((f.chat as any).goalControlsActive, false);
+    assert.equal((f.chat as any).controls().goalActive, false);
   } finally { await f.stop(); }
 });
 
@@ -128,7 +124,7 @@ test('the Chat runtime stops after the goal handoff without making status-pollin
     await (f.chat as any).request(request(f.chat.id, f.runtime.id, 'registerAgent', {
       name: 'Chat', config: { skipFirstObservation: true, terminalActions: { goal: { type: 'success', execute: true } } },
     }));
-    const result = await (f.chat as any).runTaskTurn('Review and commit changes', []);
+    const result = await (f.chat as any).runTaskTurn('Review and commit changes', [], true);
     assert.equal(result.success, true);
     assert.equal(result.goalCreated, true);
     assert.equal(thinks, 1);
@@ -171,10 +167,10 @@ test('closing the chat window preserves the tracked goal and its later result', 
   const f = await fixture();
   try {
     await f.handoff();
-    (f.chat as any).windowId = 'fixture-window';
-    (f.chat as any).widgetManagerId = f.client.id;
-    f.client.on('destroyWindowAbject', () => true);
-    await f.chat.hide();
+    (f.chat as any).windowId = f.client.id;
+    f.client.on('close', () => true);
+    await (f.chat as any).closeWindow();
+    assert.equal((f.chat as any).windowId, undefined);
     assert.equal((f.chat as any)._currentGoalId, 'goal-root');
     f.goals.update(f.chat.id, 'goalCompleted', { goalId: 'goal-root', result: 'Created verified commits' });
     await delay(20);

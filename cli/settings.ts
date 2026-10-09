@@ -1,5 +1,5 @@
 /**
- * Settings for commune: reading, showing and changing the global settings
+ * Settings for the `abject` command: reading, showing and changing the global settings
  * (SettingsManager, through CliServer) and the per-workspace ones, by path.
  *
  * A path names a field: `<section>.<field>` for global settings, where the
@@ -10,7 +10,7 @@
  * and the plain REPL.
  */
 
-import type { CommuneClient } from './client.js';
+import type { AbjectClient } from './client.js';
 import type { Line } from './tui.js';
 import type { SettingField } from '../src/objects/settings-manager.js';
 
@@ -30,7 +30,7 @@ export interface WorkspaceSettings {
   appearance: { active: string; presets: Array<{ id: string; name: string }> } | null;
 }
 
-/** The workspace fields commune edits, in the same shape as the global schema. */
+/** The workspace fields the `abject` command edits, in the same shape as the global schema. */
 export function workspaceSchema(ws: WorkspaceSettings): SettingsSectionSchema[] {
   const sections = [
     {
@@ -291,7 +291,7 @@ export interface SettingsSnapshot {
   workspace?: { id: string; name: string; schema: SettingsSectionSchema[]; values: GlobalValues };
 }
 
-export async function loadSettings(client: CommuneClient, workspace?: { id: string; name: string }): Promise<SettingsSnapshot> {
+export async function loadSettings(client: AbjectClient, workspace?: { id: string; name: string }): Promise<SettingsSnapshot> {
   const [schema, values] = await Promise.all([
     client.request<SettingsSectionSchema[]>('getSettingsSchema'),
     client.request<GlobalValues>('getSettings'),
@@ -341,7 +341,7 @@ export function sectionLines(section: SettingsSectionSchema, values: Record<stri
  * `workspace` is the workspace the terminal is pointed at, for /wget and /wset.
  */
 export async function runSettingsCommand(
-  client: CommuneClient, cmd: string, args: string[], workspace?: { id: string; name: string },
+  client: AbjectClient, cmd: string, args: string[], workspace?: { id: string; name: string },
 ): Promise<Line[]> {
   const arg = args.join(' ').trim();
   const ok = (text: string): Line[] => [{ text, color: 'green' }];

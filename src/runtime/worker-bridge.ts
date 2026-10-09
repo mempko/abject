@@ -6,7 +6,7 @@
  * the worker, and relays outbound messages from the worker back to the bus.
  */
 
-import { AbjectMessage, AbjectId } from '../core/types.js';
+import { AbjectMessage, AbjectId, TypeId } from '../core/types.js';
 import { error as errorMessage } from '../core/message.js';
 import type { MessageBus } from './message-bus.js';
 import { Log } from '../core/timed-log.js';
@@ -38,6 +38,8 @@ export interface WorkerInboundMessage {
   constructorArgs?: unknown;
   registryId?: AbjectId;
   parentId?: AbjectId;
+  /** spawn: the durable type identity, so worker-hosted objects carry it like main-thread ones. */
+  typeId?: TypeId;
   message?: AbjectMessage;
   workerIndex?: number;
   port?: unknown;  // MessagePort (transferred)
@@ -255,6 +257,7 @@ export class WorkerBridge {
     constructorArgs?: unknown;
     registryId?: AbjectId;
     parentId?: AbjectId;
+    typeId?: TypeId;
   }): Promise<void> {
     return new Promise((resolve, reject) => {
       this.pendingSpawns.set(objectId, { resolve, reject });
@@ -265,6 +268,7 @@ export class WorkerBridge {
         constructorArgs: options?.constructorArgs,
         registryId: options?.registryId,
         parentId: options?.parentId,
+        typeId: options?.typeId,
       };
       this.worker.postMessage(msg);
     });

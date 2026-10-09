@@ -1,21 +1,17 @@
 /**
- * commune -- terminal client for the Abjects CLI gateway (CliServer, :7723).
+ * The `abject` command's conversation views: the tabbed full-screen TUI
+ * (Alt-key navigation, tmux-safe) and a line-oriented REPL for dumb
+ * terminals and pipes. Both talk to a backend through the CLI gateway, on the
+ * desktop and the headless editions alike.
  *
- *   pnpm commune              tabbed TUI (Alt-key navigation, tmux-safe)
- *   pnpm commune --plain      line-oriented REPL (dumb terminals, pipes)
- *   pnpm commune --url ws://host:7723
- *
- * Auth mirrors the browser client: when the server has ABJECTS_AUTH_USER /
- * ABJECTS_AUTH_PASSWORD set, commune prompts (or uses those same env vars)
- * and caches the 7-day session token in ~/.config/abjects/commune.json.
+ * Questions to the person (permission prompts, confirmations) arrive here
+ * from DialogBroker: each takes over the input line in turn, `/questions`
+ * lists every open one, and they wait for an answer as long as it takes.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 import * as readline from 'node:readline';
 import {
-  CommuneClient, Credentials, PushedEvent, WorkspaceRow, ConversationRow, MessageEvent, DialogInfo, GoalTask,
+  AbjectClient, PushedEvent, WorkspaceRow, ConversationRow, MessageEvent, DialogInfo, GoalTask,
 } from './client.js';
 import { Screen, parseKeys, Key, Line, LineColor, TabInfo } from './tui.js';
 import { renderMarkdown, stripAnsi } from './markdown.js';
@@ -25,6 +21,9 @@ import {
   buildUpdate, editText, formatValue, isSettingsCommand, loadSettings, readField, resolvePath,
   runSettingsCommand, settingsErrorText,
 } from './settings.js';
+import { makeCredentialProvider } from './connect.js';
+import { saveToken } from './config.js';
+import type { BackendTarget } from './locate.js';
 // Shared with the windowed surfaces so the terminal and the desktop cannot
 // drift into disagreeing about the shape of one round.
 import { orderTopologically, blockedOn, indexById } from '../src/core/task-graph.js';
@@ -47,101 +46,18 @@ function helpLines(p: string): string[] {
     '  /ws new <name>    create a workspace',
     `  /quit             exit             (also ${P} d, or double Ctrl+C)`,
     `anything else is sent to the active chat. ${P} c opens the chat picker,`,
-    `${P} ${P} jumps to line start. Set COMMUNE_PREFIX=ctrl+x (etc.) to change the prefix.`,
+    `${P} ${P} jumps to line start. Set ABJECT_PREFIX=ctrl+x (etc.) to change the prefix.`,
     'desktop dialogs appear here too: y/n or Enter/Esc answers them, and prompts',
     'type into the input line. Toasts show briefly in the top bar.',
     ...SETTINGS_HELP,
   ];
 }
 
-/** Parse COMMUNE_PREFIX ("ctrl+a", "C-x", "^b") down to its letter; default 'a'. */
+/** Parse ABJECT_PREFIX ("ctrl+a", "C-x", "^b") down to its letter; default 'a'. */
 function parsePrefixKey(spec?: string): string {
   const m = /(?:ctrl\+|c-|\^)?([a-z])$/i.exec((spec ?? '').trim());
   const ch = m ? m[1].toLowerCase() : 'a';
   return ch === 'c' ? 'a' : ch; // Ctrl+C is reserved for quit
-}
-
-// ── Config / token cache ───────────────────────────────────────────────
-
-const CONFIG_PATH = path.join(os.homedir(), '.config', 'abjects', 'commune.json');
-
-interface CommuneConfig { tokens: Record<string, string> }
-
-function loadConfig(): CommuneConfig {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    return { tokens: parsed.tokens ?? {} };
-  } catch {
-    return { tokens: {} };
-  }
-}
-
-function saveToken(url: string, token: string): void {
-  const config = loadConfig();
-  config.tokens[url] = token;
-  try {
-    fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
-  } catch { /* cache is best-effort */ }
-}
-
-// ── Plain-terminal prompts (used before the TUI takes the screen) ──────
-
-function promptLine(question: string, mask: boolean): Promise<string> {
-  return new Promise((resolve) => {
-    process.stdout.write(question);
-    const wasRaw = process.stdin.isRaw;
-    process.stdin.setRawMode?.(true);
-    process.stdin.resume();
-    let value = '';
-    const onData = (buf: Buffer) => {
-      for (const ch of buf.toString('utf8')) {
-        if (ch === '\r' || ch === '\n') {
-          process.stdin.off('data', onData);
-          if (!wasRaw) process.stdin.setRawMode?.(false);
-          process.stdout.write('\n');
-          resolve(value);
-          return;
-        }
-        if (ch === '\x03') {
-          process.stdout.write('\n');
-          process.exit(1);
-        }
-        if (ch === '\x7f' || ch === '\b') {
-          if (value.length > 0) {
-            value = value.slice(0, -1);
-            if (!mask) process.stdout.write('\b \b');
-          }
-          continue;
-        }
-        if (ch >= ' ') {
-          value += ch;
-          process.stdout.write(mask ? '*' : ch);
-        }
-      }
-    };
-    process.stdin.on('data', onData);
-  });
-}
-
-function makeCredentialProvider(url: string): (attempt: number, error?: string) => Promise<Credentials | null> {
-  return async (attempt, error) => {
-    if (attempt === 0) {
-      const cached = loadConfig().tokens[url];
-      if (cached) return { token: cached };
-    }
-    const envUser = process.env.ABJECTS_AUTH_USER;
-    const envPass = process.env.ABJECTS_AUTH_PASSWORD;
-    if (envUser && envPass && attempt <= 1) {
-      return { username: envUser, password: envPass };
-    }
-    if (!process.stdin.isTTY) return null;
-    if (attempt >= 4) return null;
-    if (error && attempt > 1) process.stdout.write(`${error}\n`);
-    const username = await promptLine('username: ', false);
-    const password = await promptLine('password: ', true);
-    return { username, password };
-  };
 }
 
 // ── Shared formatting ──────────────────────────────────────────────────
@@ -262,7 +178,7 @@ type Mode =
 const MAX_TAB_LINES = 2000;
 
 class TuiApp {
-  private client: CommuneClient;
+  private client: AbjectClient;
   private screen = new Screen();
   private tabs: Tab[] = [];
   private active = 0;
@@ -279,7 +195,7 @@ class TuiApp {
   private url: string;
   private wsNames = new Map<string, string>();
   private pendingOpens = new Set<string>();
-  private prefixKey = parsePrefixKey(process.env.COMMUNE_PREFIX);
+  private prefixKey = parsePrefixKey(process.env.ABJECT_PREFIX ?? process.env.COMMUNE_PREFIX);
   private prefixArmed = false;
   private prefixTimer?: ReturnType<typeof setTimeout>;
   private dialogQueue: DialogInfo[] = [];
@@ -288,12 +204,16 @@ class TuiApp {
   private currentToast?: string;
   private toastTimer?: ReturnType<typeof setTimeout>;
 
-  constructor(url: string) {
-    this.url = url;
-    this.client = new CommuneClient({
-      url,
-      getCredentials: makeCredentialProvider(url),
-      onToken: (token) => saveToken(url, token),
+  /** Printed after the screen is restored, on the way out. */
+  private readonly farewell?: string;
+
+  constructor(target: BackendTarget, opts: { farewell?: string } = {}) {
+    this.url = target.url;
+    this.farewell = opts.farewell;
+    this.client = new AbjectClient({
+      url: target.url,
+      getCredentials: makeCredentialProvider(target),
+      onToken: (token) => saveToken(target.url, token),
       onEvent: (event) => this.handleEvent(event),
       onClose: (reason) => this.handleDisconnect(reason),
     });
@@ -322,6 +242,7 @@ class TuiApp {
       else await this.openTab(active);
     }
     this.active = 0;
+    await this.replayDialogs();
 
     this.screen.enter();
     process.stdin.on('data', (buf: Buffer) => {
@@ -336,7 +257,23 @@ class TuiApp {
     this.quitting = true;
     this.screen.exit();
     this.client.close();
+    if (this.farewell) process.stdout.write(`${this.farewell}\n`);
     process.exit(0);
+  }
+
+  /**
+   * Questions that opened before this terminal connected (or while it was
+   * away) are still waiting: queue them so they are answered here.
+   */
+  private async replayDialogs(): Promise<void> {
+    try {
+      const open = await this.client.listDialogs();
+      for (const dialog of open) {
+        if (this.dialogQueue.some(d => d.dialogId === dialog.dialogId)) continue;
+        this.dialogQueue.push(dialog);
+      }
+      if (this.dialogQueue.length > 0) this.activateDialog();
+    } catch { /* an older backend without the op */ }
   }
 
   // ── Tabs ─────────────────────────────────────────────────────────────
@@ -627,6 +564,7 @@ class TuiApp {
           for (const tab of this.tabs) {
             try { await this.client.openChat(tab.workspaceId, tab.conversationId); } catch { /* retried on send */ }
           }
+          await this.replayDialogs();
           this.connected = true;
           this.setStatus('');
           this.note('reconnected', 'green');
@@ -776,13 +714,25 @@ class TuiApp {
       { text: `── ${dialog.title} ──`, color: dialog.destructive ? 'red' : 'yellow' },
       ...dialog.message.split('\n').map(t => ({ text: t, color: 'normal' as LineColor })),
     ];
+    if (dialog.askedBy && dialog.topic !== 'permission') {
+      lines.push({ text: `asked by ${dialog.askedBy}`, color: 'dim' });
+    }
     if (dialog.resource) {
       lines.push({ text: `  ${dialog.resource}`, color: 'yellow' });
     }
+    for (const detail of dialog.detail ?? []) {
+      lines.push({ text: `  ${detail}`, color: 'dim' });
+    }
     lines.push({ text: '', color: 'normal' });
     if (dialog.kind === 'options' && dialog.options) {
+      let group: string | undefined;
       dialog.options.forEach((option, i) => {
-        lines.push({ text: ` [${i + 1}] ${option.label}`, color: 'normal' });
+        if (option.group && option.group !== group) {
+          group = option.group;
+          lines.push({ text: ` ${group}`, color: 'dim' });
+        }
+        const color: LineColor = option.tone === 'bad' ? 'red' : option.tone === 'good' ? 'green' : 'normal';
+        lines.push({ text: `   [${i + 1}] ${option.label}`, color });
       });
       lines.push({ text: 'press a number to choose, Esc denies', color: 'dim' });
     } else {
@@ -793,7 +743,7 @@ class TuiApp {
         : { text: `[y/Enter] ${confirmLabel}   [n/Esc] ${cancelLabel}`, color: 'dim' });
     }
     if (this.dialogQueue.length > 1) {
-      lines.push({ text: `(${this.dialogQueue.length - 1} more waiting)`, color: 'dim' });
+      lines.push({ text: `(${this.dialogQueue.length - 1} more waiting; /questions lists them)`, color: 'dim' });
     }
     return lines;
   }
@@ -825,6 +775,30 @@ class TuiApp {
     // Prompt: the input line is the dialog's text field.
     if (key.type === 'enter') { respond(true, this.input); return; }
     if (this.applyEditKey(key)) this.render();
+  }
+
+  /**
+   * Answer one open question by text: an option number for an options
+   * dialog, yes/no for a confirmation, the text itself for a prompt.
+   */
+  private async answerDialog(dialog: DialogInfo, choice: string): Promise<void> {
+    const no = /^(n|no|deny|cancel)$/i.test(choice);
+    if (dialog.kind === 'options') {
+      const option = dialog.options?.[parseInt(choice, 10) - 1];
+      if (no) await this.client.respondDialog(dialog.dialogId, false);
+      else if (option) await this.client.respondDialog(dialog.dialogId, true, undefined, option.id);
+      else { this.note('pick an option number, or no', 'yellow'); return; }
+    } else if (dialog.kind === 'confirm') {
+      await this.client.respondDialog(dialog.dialogId, !no && /^(y|yes|ok|)$/i.test(choice));
+    } else {
+      await this.client.respondDialog(dialog.dialogId, !no, no ? undefined : choice);
+    }
+    const index = this.dialogQueue.findIndex(d => d.dialogId === dialog.dialogId);
+    if (index >= 0) {
+      this.dialogQueue.splice(index, 1);
+      if (index === 0) this.deactivateDialog();
+    }
+    this.note(`answered: ${dialog.title}`, 'green');
   }
 
   // ── Keys ─────────────────────────────────────────────────────────────
@@ -1171,6 +1145,62 @@ class TuiApp {
         case 'settings':
           await this.openSettings();
           break;
+        case 'questions': {
+          const open = await this.client.listDialogs();
+          if (tab) {
+            this.appendTo(tab, open.length === 0
+              ? [{ text: 'no questions are waiting', color: 'dim' }]
+              : [{ text: 'waiting on you:', color: 'bold' }, ...open.map((d, i) => ({
+                text: `  ${i + 1}: ${d.title}${d.resource ? ` — ${d.resource.slice(0, 80)}` : ''}`,
+                color: 'yellow' as LineColor,
+              }))]);
+          }
+          // Anything missed while away joins the queue that takes the input line.
+          await this.replayDialogs();
+          break;
+        }
+        case 'answer': {
+          const open = await this.client.listDialogs();
+          const n = parseInt(rest[0] ?? '', 10);
+          const dialog = open[n - 1];
+          if (!dialog) { this.note('no such question (try /questions)', 'yellow'); break; }
+          const choice = rest.slice(1).join(' ').trim();
+          await this.answerDialog(dialog, choice);
+          break;
+        }
+        case 'mode': {
+          if (!arg) {
+            const values = await this.client.request<{ mode: string }>('getSettings', { section: 'permissions' });
+            this.note(`permission prompts: ${values.mode} (ask | allow | deny)`, 'normal');
+            break;
+          }
+          if (!['ask', 'allow', 'deny'].includes(arg)) { this.note('mode is one of ask, allow, deny', 'yellow'); break; }
+          await this.client.request('setSettings', { section: 'permissions', values: { mode: arg } }, 60_000);
+          this.note(`permission prompts: ${arg}`, 'green');
+          break;
+        }
+        case 'projects': {
+          if (!tab) break;
+          const projects = await this.client.listProjects(tab.workspaceId);
+          this.appendTo(tab, projects.length === 0
+            ? [{ text: 'no external projects in this workspace', color: 'dim' }]
+            : projects.map(p => ({ text: `  ${p.name}  ${p.trusted ? `trusted, ${p.autonomy}` : 'untrusted'}  ${p.root}`, color: 'normal' as LineColor })));
+          break;
+        }
+        case 'trust': {
+          if (!tab || !rest[0]) { this.note('usage: /trust <project> [ask|read|edit|full], or /trust <project> off', 'yellow'); break; }
+          const name = rest[0];
+          const level = rest[1];
+          if (level === 'off') {
+            await this.client.setProjectTrusted(tab.workspaceId, name, false);
+            this.note(`${name} is no longer trusted`, 'green');
+            break;
+          }
+          await this.client.setProjectTrusted(tab.workspaceId, name, true);
+          if (level) await this.client.setProjectAutonomy(tab.workspaceId, name, level);
+          this.note(`${name} is trusted${level ? ` at ${level}` : ''}`, 'green');
+          break;
+        }
         case 'quit':
         case 'exit':
           this.quit();
@@ -1422,7 +1452,8 @@ class TuiApp {
 
 // ── Plain REPL (dumb terminals, pipes, debugging) ──────────────────────
 
-async function runPlain(url: string): Promise<void> {
+/** The line-oriented REPL: one conversation at a time, every event as a line. */
+export async function runPlain(target: BackendTarget): Promise<void> {
   let workspace: WorkspaceRow | null = null;
   let conversationId: string | null = null;
   let pendingDialog: DialogInfo | null = null;
@@ -1441,10 +1472,10 @@ async function runPlain(url: string): Promise<void> {
     process.stdout.write(codes[line.color] + line.text + '\x1b[0m\n');
   };
 
-  const client = new CommuneClient({
-    url,
-    getCredentials: makeCredentialProvider(url),
-    onToken: (token) => saveToken(url, token),
+  const client = new AbjectClient({
+    url: target.url,
+    getCredentials: makeCredentialProvider(target),
+    onToken: (token) => saveToken(target.url, token),
     onEvent: (event) => {
       if (event.event === 'message' && event.conversationId === conversationId) {
         const data = event.data as unknown as MessageEvent;
@@ -1497,6 +1528,11 @@ async function runPlain(url: string): Promise<void> {
   const workspaces = await client.listWorkspaces();
   if (workspaces.length === 0) throw new Error('No workspaces available');
   workspace = workspaces.find(w => w.active) ?? workspaces[0];
+  // Questions already waiting: the latest becomes the one /yes and /no answer.
+  for (const dialog of await client.listDialogs().catch(() => [] as DialogInfo[])) {
+    pendingDialog = dialog;
+    print({ text: `[dialog] ${dialog.title}: ${dialog.message}`, color: 'yellow' });
+  }
 
   const openLatestOrNew = async (): Promise<void> => {
     const chats = await client.listChats(workspace!.id);
@@ -1612,32 +1648,8 @@ async function runPlain(url: string): Promise<void> {
 
 // ── Entry ──────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log('usage: commune [--plain] [--url ws://host:port]');
-    console.log('  (from a source checkout: pnpm commune)');
-    console.log('Requires a running Abject desktop app or backend on this machine.');
-    console.log('env: CLI_PORT, COMMUNE_URL, ABJECTS_AUTH_USER, ABJECTS_AUTH_PASSWORD');
-    return;
-  }
-  const urlFlag = args.indexOf('--url');
-  const url = urlFlag >= 0 && args[urlFlag + 1]
-    ? args[urlFlag + 1]
-    : process.env.COMMUNE_URL ?? `ws://127.0.0.1:${process.env.CLI_PORT ?? '7723'}`;
-
-  const plain = args.includes('--plain') || !process.stdout.isTTY || !process.stdin.isTTY;
-
-  if (plain) {
-    await runPlain(url);
-  } else {
-    const app = new TuiApp(url);
-    await app.run();
-  }
+/** The full-screen tabbed TUI. Runs until the person quits (which exits the process). */
+export async function runTui(target: BackendTarget, opts: { farewell?: string } = {}): Promise<void> {
+  const app = new TuiApp(target, opts);
+  await app.run();
 }
-
-main().catch((err) => {
-  process.stdout.write('\x1b[?25h\x1b[?1049l');
-  console.error(String(err instanceof Error ? err.message : err));
-  process.exit(1);
-});

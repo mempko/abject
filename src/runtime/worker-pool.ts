@@ -6,7 +6,7 @@
  * of Abject instances.
  */
 
-import { AbjectId } from '../core/types.js';
+import { AbjectId, TypeId } from '../core/types.js';
 import { require, invariant } from '../core/contracts.js';
 import { WorkerBridge } from './worker-bridge.js';
 import type { WorkerLike, WorkerHeapSample } from './worker-bridge.js';
@@ -243,6 +243,7 @@ export class WorkerPool {
     constructorArgs?: unknown;
     registryId?: AbjectId;
     parentId?: AbjectId;
+    typeId?: TypeId;
   }): Promise<void> {
     require(this.started, 'WorkerPool not started');
 

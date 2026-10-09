@@ -151,6 +151,8 @@ export class ScriptableAbject extends Abject {
   private _data: Record<string, unknown>;
   private activeUserCalls = 0;
   private activating = false;
+  /** Whether a `show` call (by message) left the object on screen; `hide` clears it. */
+  private _showing = false;
   private sourceHandlers?: Record<string, unknown>;
   private _userMethods: Set<string> = new Set();
   private _userProps: Set<string> = new Set();
@@ -324,12 +326,18 @@ export class ScriptableAbject extends Abject {
     if (loading) return loading.then(() => this.invokeUserHandler(handler, msg));
     if (this.activating) throw new Error('Source activation in progress; retry against the committed revision');
     this.activeUserCalls++;
+    const method = msg.routing.method;
+    const lifecycle = method === 'show' || method === 'hide';
     try {
       const result = handler(msg);
       // Sandboxed Promises belong to another realm; instanceof Promise misses them.
       if (result != null && typeof (result as { then?: unknown }).then === 'function') {
-        return Promise.resolve(result).finally(() => { this.activeUserCalls--; });
+        return Promise.resolve(result).then((value) => {
+          if (lifecycle) this._showing = method === 'show';
+          return value;
+        }).finally(() => { this.activeUserCalls--; });
       }
+      if (lifecycle) this._showing = method === 'show';
       this.activeUserCalls--;
       return result;
     } catch (err) {
@@ -541,19 +549,28 @@ export class ScriptableAbject extends Abject {
         catch (err) { return { success: false, error: err instanceof Error ? err.message : String(err) }; }
         const previousSource = this._source;
         const previousData = structuredClone(this._data);
+        // Only an object that was on screen comes back on screen. Re-showing
+        // one that was not opened a window nobody asked for, and failed the
+        // update outright on an instance with no display. The old hide still
+        // runs either way: it is how the old lifecycle lets go of what it holds.
+        const wasShowing = this._showing;
+        const reshow = async (): Promise<void> => {
+          if (!wasShowing) return;
+          await (this.sourceHandlers?.show as MessageHandlerFn | undefined)?.(msg);
+        };
         const currentHide = this.sourceHandlers?.hide as MessageHandlerFn | undefined;
         try { if (currentHide) await currentHide(msg); }
         catch (err) {
           this._data = previousData;
           let rollbackError: string | undefined;
-          try { const restored = this.applySource(previousSource); if (!restored.success) throw new Error(restored.error); await (this.sourceHandlers?.show as MessageHandlerFn | undefined)?.(msg); } catch (restore) { rollbackError = String(restore); }
+          try { const restored = this.applySource(previousSource); if (!restored.success) throw new Error(restored.error); await reshow(); } catch (restore) { rollbackError = String(restore); }
           return { success: false, error: `Previous lifecycle could not deactivate: ${String(err)}`, rolledBack: !rollbackError, rollbackError };
         }
         const result = this.applySource(source, prepared);
         if (!result.success) { this._data = previousData; return result; }
 
         const newShow = this.sourceHandlers?.show as MessageHandlerFn | undefined;
-        if (newShow) {
+        if (newShow && wasShowing) {
           try { await newShow(msg); }
           catch (err) {
             let rollbackError: string | undefined;
@@ -562,7 +579,7 @@ export class ScriptableAbject extends Abject {
               this._data = previousData;
               const restored = this.applySource(previousSource);
               if (!restored.success) throw new Error(restored.error);
-              await (this.sourceHandlers?.show as MessageHandlerFn | undefined)?.(msg);
+              await reshow();
             } catch (restore) { rollbackError = String(restore); }
             return { success: false, error: `Activation failed: ${String(err)}`, rolledBack: !rollbackError, rollbackError };
           }
@@ -611,6 +628,7 @@ export class ScriptableAbject extends Abject {
       const hideFn = (this as Record<string, unknown>)['hide'];
       if (typeof hideFn === 'function') {
         await (hideFn as MessageHandlerFn)(msg);
+        this._showing = false;
       }
     });
   }

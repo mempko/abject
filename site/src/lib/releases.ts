@@ -34,9 +34,23 @@ export interface PlatformAssets {
   macArmZip?: ReleaseAsset;
   macX64Dmg?: ReleaseAsset;
   macX64Zip?: ReleaseAsset;
-  communeLinux?: ReleaseAsset;
-  communeWin?: ReleaseAsset;
-  communeMac?: ReleaseAsset;
+  /** The headless edition: the `abject` command and its backend, no window. */
+  headlessLinux?: ReleaseAsset;
+  headlessLinuxArm?: ReleaseAsset;
+  headlessMacArm?: ReleaseAsset;
+  headlessMacX64?: ReleaseAsset;
+  headlessWin?: ReleaseAsset;
+}
+
+/** The headless edition's archive names for a version: abject-<v>-<os>-<arch>. */
+export function headlessArchiveNames(version: string): string[] {
+  return [
+    `abject-${version}-linux-x64.tar.gz`,
+    `abject-${version}-linux-arm64.tar.gz`,
+    `abject-${version}-mac-arm64.tar.gz`,
+    `abject-${version}-mac-x64.tar.gz`,
+    `abject-${version}-win-x64.zip`,
+  ];
 }
 
 async function fromGitHubApi(): Promise<ReleaseInfo | null> {
@@ -95,8 +109,8 @@ async function fromManifests(): Promise<ReleaseInfo | null> {
   if (!first) return null;
   const version = first.version;
   const assets = [linux, mac, win].flatMap((m) => m?.files ?? []);
-  // commune binaries ship with every release from 0.8.34 on, with fixed names.
-  for (const name of ['abject-commune-linux-x64', 'abject-commune-win-x64.exe', 'abject-commune-mac-arm64']) {
+  // The headless edition ships with every release from 0.16.0 on, named by version.
+  for (const name of headlessArchiveNames(version)) {
     assets.push({ name, url: `${REPO_URL}/releases/download/v${version}/${name}`, size: 0 });
   }
   return { version, date: first.date, assets, pageUrl: `${REPO_URL}/releases/tag/v${version}` };
@@ -114,18 +128,22 @@ export function latestRelease(): Promise<ReleaseInfo> {
 
 export function platformAssets(info: ReleaseInfo): PlatformAssets {
   const find = (pred: (n: string) => boolean) => info.assets.find((a) => pred(a.name));
+  // abject-<version>-<os>-<arch>.tar.gz|zip; the desktop builds are named Abject-…
+  const isHeadless = (n: string) => /^abject-\d[^-]*(-[^-]+)*-(linux|mac|win)-(x64|arm64)\.(tar\.gz|zip)$/.test(n);
   const isMacZip = (n: string) => n.endsWith('-mac.zip') || (n.endsWith('.zip') && /mac/i.test(n));
   return {
     linuxAppImage: find((n) => n.endsWith('.AppImage')),
     linuxDeb: find((n) => n.endsWith('.deb')),
-    winExe: find((n) => n.endsWith('.exe') && !n.startsWith('abject-commune')),
+    winExe: find((n) => n.endsWith('.exe')),
     macArmDmg: find((n) => n.endsWith('.dmg') && /arm64/.test(n)),
     macX64Dmg: find((n) => n.endsWith('.dmg') && !/arm64/.test(n)),
-    macArmZip: find((n) => isMacZip(n) && /arm64/.test(n)),
-    macX64Zip: find((n) => isMacZip(n) && !/arm64/.test(n)),
-    communeLinux: find((n) => n === 'abject-commune-linux-x64'),
-    communeWin: find((n) => n === 'abject-commune-win-x64.exe'),
-    communeMac: find((n) => n === 'abject-commune-mac-arm64'),
+    macArmZip: find((n) => isMacZip(n) && !isHeadless(n) && /arm64/.test(n)),
+    macX64Zip: find((n) => isMacZip(n) && !isHeadless(n) && !/arm64/.test(n)),
+    headlessLinux: find((n) => isHeadless(n) && n.endsWith('-linux-x64.tar.gz')),
+    headlessLinuxArm: find((n) => isHeadless(n) && n.endsWith('-linux-arm64.tar.gz')),
+    headlessMacArm: find((n) => isHeadless(n) && n.endsWith('-mac-arm64.tar.gz')),
+    headlessMacX64: find((n) => isHeadless(n) && n.endsWith('-mac-x64.tar.gz')),
+    headlessWin: find((n) => isHeadless(n) && n.endsWith('-win-x64.zip')),
   };
 }
 

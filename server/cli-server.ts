@@ -1,5 +1,5 @@
 /**
- * CliServer -- WebSocket gateway for terminal clients (`pnpm commune`).
+ * CliServer -- WebSocket gateway for terminal clients (the `abject` command).
  *
  * Listens on its own port (CLI_PORT, default 7723) and speaks a small JSON
  * protocol tailored for chat operations, mirroring how BackendUI serves the
@@ -7,6 +7,10 @@
  * so a single connection can drive conversations in any number of workspaces
  * at once. Auth shares the browser client's gate: same AuthConfig, same
  * SessionStore, so one login token works on both.
+ *
+ * Questions to the person (confirmations, permission prompts) come from
+ * DialogBroker, which registers this object as a responder at boot: every
+ * terminal is told of each question, can list the open ones, and can answer.
  *
  * Wire protocol (JSON text frames):
  *   client -> server  { id, op, ...params }
@@ -51,8 +55,19 @@ interface ChatSub {
 
 export interface CliServerArgs {
   port: number;
+  /**
+   * Interface to listen on: loopback unless set (CLI_BIND). A container
+   * publishing the gateway binds 0.0.0.0, and then wants a login.
+   */
+  bind?: string;
   authConfig: AuthConfig;
   sessions: SessionStore;
+  /** Stop this backend (`abject stop`): the same way out as SIGTERM. */
+  requestShutdown?: () => void;
+}
+
+function isLoopback(host: string): boolean {
+  return host === 'localhost' || host === '::1' || host.startsWith('127.');
 }
 
 /** Goal aspects forwarded to terminal clients as progress lines. */
@@ -63,15 +78,32 @@ const GOAL_ASPECTS = [
   'goalInterjection', 'goalClarificationRequested',
 ] as const;
 
+/**
+ * A dialog as terminals receive it: the broker's open dialog, with an options
+ * dialog's grouped answers also flattened into `options` for clients that list
+ * them in one column.
+ */
+function dialogView(payload: unknown): Record<string, unknown> {
+  const d = (payload ?? {}) as Record<string, unknown> & {
+    groups?: Array<{ label: string; options: Array<{ id: string; label: string; tone?: string }> }>;
+  };
+  const options = Array.isArray(d.groups)
+    ? d.groups.flatMap(g => g.options.map(o => ({ id: o.id, label: o.label, group: g.label, tone: o.tone })))
+    : undefined;
+  return { ...d, ...(options ? { options } : {}) };
+}
+
 export class CliServer extends Abject {
   private wsServer: NodeWebSocketServer | null = null;
   private port: number;
+  private readonly bind: string;
   private readonly authConfig: AuthConfig;
   private readonly sessions: SessionStore;
+  private readonly requestShutdown?: () => void;
 
   private clients: Set<CliSession> = new Set();
   private workspaceManagerId?: AbjectId;
-  private widgetManagerId?: AbjectId;
+  private dialogBrokerId?: AbjectId;
   private depsByWorkspace: Map<string, WorkspaceDeps> = new Map();
   /** Watch key -> shared Chat subscription (subscribed while any session watches). */
   private chatSubs: Map<string, ChatSub> = new Map();
@@ -123,9 +155,12 @@ export class CliServer extends Abject {
     });
 
     contractRequire(args.port > 0, 'port must be positive');
+    contractRequire(args.bind === undefined || args.bind.trim().length > 0, 'CliServer: bind must name an interface');
     this.port = args.port;
+    this.bind = args.bind?.trim() || '127.0.0.1';
     this.authConfig = args.authConfig;
     this.sessions = args.sessions;
+    this.requestShutdown = args.requestShutdown;
     this.setupHandlers();
   }
 
@@ -178,15 +213,15 @@ export class CliServer extends Abject {
       });
     }
 
-    // Modal dialogs from the global WidgetManager: broadcast so any terminal
-    // can answer (the first respond wins; the rest see dialogClosed).
-    this.on('dialogOpened', (msg: AbjectMessage) => {
-      if (msg.routing.from !== this.widgetManagerId) return;
-      this.broadcast({ event: 'dialog', workspaceId: '', data: msg.payload });
+    // Questions from DialogBroker: broadcast so any terminal can answer (the
+    // first answer wins, on a desktop or here; the rest see dialogClosed).
+    this.on('dialogOpened', async (msg: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(msg))) return;
+      this.broadcast({ event: 'dialog', workspaceId: '', data: dialogView(msg.payload) });
     });
 
-    this.on('dialogClosed', (msg: AbjectMessage) => {
-      if (msg.routing.from !== this.widgetManagerId) return;
+    this.on('dialogClosed', async (msg: AbjectMessage) => {
+      if (!(await this.fromDialogBroker(msg))) return;
       this.broadcast({ event: 'dialogClosed', workspaceId: '', data: msg.payload });
     });
 
@@ -218,32 +253,32 @@ export class CliServer extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    // Mirror modal dialogs: WidgetManager announces dialogOpened/dialogClosed
-    // to its dependents.
-    try {
-      this.widgetManagerId = await this.requireDep('WidgetManager');
-      this.send(request(this.id, this.widgetManagerId, 'addDependent', {}));
-    } catch { /* dialogs just won't mirror */ }
+    // Questions to the person reach us from DialogBroker once the bootstrap
+    // registers this object as a responder; nothing to subscribe to here.
+    this.dialogBrokerId = await this.discoverDep('DialogBroker') ?? undefined;
 
     // Settings changes, so an open settings view repaints whoever made them.
-    try {
-      const settingsManagerId = await this.requireDep('SettingsManager');
+    const settingsManagerId = await this.discoverDep('SettingsManager');
+    if (settingsManagerId) {
       this.globalDeps.set('SettingsManager', settingsManagerId);
       this.send(request(this.id, settingsManagerId, 'addDependent', {}));
-    } catch { /* settings views refresh on their own reads */ }
+    }
 
     this.wsServer = new NodeWebSocketServer({
       port: this.port,
-      host: '127.0.0.1',
+      host: this.bind,
       perMessageDeflate: false,
-      // No browser client speaks this protocol; commune and scripts send no
+      // No browser client speaks this protocol; the `abject` command and scripts send no
       // Origin. A web page has no business here: it could send to agents and
       // answer their permission dialogs (respondDialog).
       allowOrigin: refuseAllOrigins,
     });
     this.wsServer.onConnection((ws) => this.handleConnection(ws));
     await this.wsServer.ready();
-    log.info(`CLI gateway listening on 127.0.0.1:${this.port} (auth ${this.authConfig.enabled ? 'enabled' : 'disabled'})`);
+    log.info(`CLI gateway listening on ${this.bind}:${this.port} (auth ${this.authConfig.enabled ? 'enabled' : 'disabled'})`);
+    if (!isLoopback(this.bind) && !this.authConfig.enabled) {
+      log.warn(`CLI gateway is reachable beyond this machine (${this.bind}) with no login: set one (abject setup, or ABJECTS_AUTH_USER/ABJECTS_AUTH_PASSWORD)`);
+    }
   }
 
   protected override async onStop(): Promise<void> {
@@ -396,17 +431,40 @@ export class CliServer extends Abject {
       case 'goalStatus':
         return this.opGoalStatus(this.str(params, 'workspaceId'), this.str(params, 'goalId'));
       case 'respondDialog': {
-        // Routed through WidgetManager's respondDialog gate: dialogs refuse
-        // direct respond messages, and the gate only accepts boot-registered
-        // responders (this object).
-        if (!this.widgetManagerId) throw new Error('Dialog gateway unavailable');
+        // DialogBroker takes answers only from the surfaces registered at
+        // boot, this object among them.
         const dialogId = this.str(params, 'dialogId');
         const confirmed = params.confirmed === true;
         const value = typeof params.value === 'string' ? params.value : undefined;
         const option = typeof params.option === 'string' ? params.option : undefined;
-        return this.request<boolean>(
-          request(this.id, this.widgetManagerId, 'respondDialog', { dialogId, confirmed, value, option }), 15000);
+        return this.depRequest<boolean>('DialogBroker', 'respond', { dialogId, confirmed, value, option }, 15000);
       }
+      case 'listDialogs': {
+        const open = await this.depRequest<unknown[]>('DialogBroker', 'listOpen', {});
+        return (open ?? []).map(dialogView);
+      }
+
+      // ── This instance ────────────────────────────────────────────────
+      case 'instanceInfo': return this.depRequest('InstanceInfo', 'getInfo', {});
+      case 'shutdown': {
+        // Every terminal client here got past the gate (or none is required),
+        // and could already do far more than stop the backend.
+        contractRequire(!!this.requestShutdown, 'This backend cannot be stopped from a terminal');
+        log.info('Shutdown requested by a terminal client');
+        // After the reply goes out, so the client hears that it worked.
+        setTimeout(() => this.requestShutdown!(), 100);
+        return true;
+      }
+      case 'isConfigured': return this.settingsRequest('isConfigured', {});
+
+      // ── External projects (trust and autonomy are the person's call) ──
+      case 'listProjects': return this.projectRequest(this.str(params, 'workspaceId'), 'listProjects', {});
+      case 'setProjectTrusted': return this.projectRequest(this.str(params, 'workspaceId'), 'setTrusted', {
+        name: this.str(params, 'name'), trusted: params.trusted === true,
+      });
+      case 'setProjectAutonomy': return this.projectRequest(this.str(params, 'workspaceId'), 'setAutonomy', {
+        name: this.str(params, 'name'), autonomy: this.str(params, 'autonomy'),
+      });
 
       // ── Settings ──────────────────────────────────────────────────────
       // Global settings go to SettingsManager, which takes changes from this
@@ -621,7 +679,8 @@ export class CliServer extends Abject {
 
   /**
    * The conversation roster with an `open` flag marking chats whose window is
-   * currently on the desktop — terminal clients open a tab per open chat.
+   * currently on a desktop (always false without one): terminal clients open
+   * a tab per open chat.
    */
   private async opListChats(workspaceId: string): Promise<unknown> {
     const roster = await this.fetchRoster(workspaceId);
@@ -644,22 +703,17 @@ export class CliServer extends Abject {
     conversationId?: string,
     title?: string,
   ): Promise<{ conversationId: string; chatId: string }> {
+    // A terminal talks to the conversation; it opens no window on any
+    // desktop that happens to be attached to the same instance.
     let opened: { conversationId: string; chatId: string };
     if (conversationId) {
-      // A chat whose window is already on the desktop is attached as-is —
-      // re-showing it would raise the window on every CLI connect.
-      const row = (await this.fetchRoster(workspaceId)).find(r => r.conversationId === conversationId);
-      if (row?.chatId && await this.chatVisible(row.chatId)) {
-        opened = { conversationId, chatId: row.chatId };
-      } else {
-        const result = await this.chatManagerRequest<{ conversationId: string; chatId: string } | false>(
-          workspaceId, 'showConversation', { conversationId }, 20000);
-        if (!result || !result.chatId) throw new Error(`Conversation not found or failed to open: ${conversationId}`);
-        opened = result;
-      }
+      const result = await this.chatManagerRequest<{ conversationId: string; chatId: string } | false>(
+        workspaceId, 'openConversation', { conversationId }, 20000);
+      if (!result || !result.chatId) throw new Error(`Conversation not found or failed to open: ${conversationId}`);
+      opened = result;
     } else {
       opened = await this.chatManagerRequest<{ conversationId: string; chatId: string }>(
-        workspaceId, 'newConversation', { title }, 20000);
+        workspaceId, 'newConversation', { title, show: false }, 20000);
       if (!opened.chatId) throw new Error('Failed to create conversation');
     }
 
@@ -692,6 +746,10 @@ export class CliServer extends Abject {
     workspaceId: string,
     conversationId: string,
   ): Promise<boolean> {
+    // Through the conversation when it is loaded, so its own record of the
+    // goal (paused, stopping) stays true for every view of it.
+    const sub = this.chatSubs.get(this.watchKey(workspaceId, conversationId));
+    if (sub) return this.request<boolean>(request(this.id, sub.chatId, op, {}), 15000);
     const goalId = await this.chatManagerRequest<string | null>(
       workspaceId, 'getActiveGoal', { conversationId });
     if (!goalId) throw new Error('No active goal for this conversation');
@@ -733,6 +791,23 @@ export class CliServer extends Abject {
     };
   }
 
+  /** Accept dialog events only from DialogBroker itself. */
+  private async fromDialogBroker(msg: AbjectMessage): Promise<boolean> {
+    this.dialogBrokerId = await this.resolveDep('DialogBroker', this.dialogBrokerId);
+    return !!this.dialogBrokerId && msg.routing.from === this.dialogBrokerId;
+  }
+
+  /** A request to a workspace's ExternalProjectRegistry. */
+  private async projectRequest(workspaceId: string, method: string, payload: unknown): Promise<unknown> {
+    const deps = await this.resolveWorkspaceDeps(workspaceId);
+    const registryId = await this.discoverInRegistry(deps.registryId, 'ExternalProjectRegistry');
+    if (!registryId) throw new Error('This workspace has no external projects');
+    const result = await this.request<unknown>(request(this.id, registryId, method, payload));
+    const failed = result as { success?: boolean; error?: string } | null;
+    if (failed && failed.success === false) throw new Error(failed.error ?? `${method} was refused`);
+    return result;
+  }
+
   // ── Workspace dependency resolution ──────────────────────────────────
 
   private async resolveWorkspaceManager(): Promise<AbjectId> {
@@ -749,7 +824,10 @@ export class CliServer extends Abject {
 
   private async resolveWorkspaceDeps(workspaceId: string): Promise<WorkspaceDeps> {
     const cached = this.depsByWorkspace.get(workspaceId);
-    if (cached) return cached;
+    if (cached) {
+      void this.ensureNotifications(workspaceId, cached.registryId);
+      return cached;
+    }
 
     const detailed = await this.wsmRequest<Array<{ workspaceId: string; registryId: AbjectId }>>(
       'listWorkspacesDetailed', {});
@@ -766,14 +844,23 @@ export class CliServer extends Abject {
     // Roster events keep terminal chat lists live without polling.
     this.send(request(this.id, chatManagerId, 'addDependent', {}));
 
-    // Toasts: NotificationCenter is a UI object that only exists in
-    // workspaces that have been active at least once — subscribe when present.
-    const notificationCenterId = await this.discoverInRegistry(entry.registryId, 'NotificationCenter');
-    if (notificationCenterId) {
-      this.notificationCenterToWorkspace.set(notificationCenterId, workspaceId);
-      this.send(request(this.id, notificationCenterId, 'addDependent', {}));
-    }
+    await this.ensureNotifications(workspaceId, entry.registryId);
     return deps;
+  }
+
+  /**
+   * Subscribe to a workspace's NotificationCenter so its notifications reach
+   * terminals. Checked again on later use, so one that respawned (a new id) or
+   * came up late is picked up rather than missed for the life of the gateway.
+   */
+  private async ensureNotifications(workspaceId: string, registryId: AbjectId): Promise<void> {
+    const id = await this.discoverInRegistry(registryId, 'NotificationCenter').catch(() => null);
+    if (!id || this.notificationCenterToWorkspace.has(id)) return;
+    for (const [known, ws] of this.notificationCenterToWorkspace) {
+      if (ws === workspaceId) this.notificationCenterToWorkspace.delete(known);
+    }
+    this.notificationCenterToWorkspace.set(id, workspaceId);
+    this.send(request(this.id, id, 'addDependent', {}));
   }
 
   private async discoverInRegistry(registryId: AbjectId, name: string): Promise<AbjectId | null> {

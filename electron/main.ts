@@ -8,12 +8,15 @@
  * WebSocket, and localStorage).
  */
 
-import { app, BrowserWindow, Menu, shell } from 'electron';
+import { app, BrowserWindow, dialog, Menu, shell } from 'electron';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { defaultDataDir } from '../server/data-dir.js';
+import { liveInstance } from '../server/instance-file.js';
+import { stopBackend } from '../cli/backend.js';
+import { installCliCommand } from './cli-command.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -44,7 +47,8 @@ for (const stream of [process.stdout, process.stderr]) {
 // contends for the database and cannot bind its port, so its window opens and
 // then sits there looking hung. Handing focus to the window that already exists
 // is both what the user meant and the only outcome that leaves the data intact.
-if (!app.requestSingleInstanceLock()) {
+const holdsInstanceLock = app.requestSingleInstanceLock();
+if (!holdsInstanceLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -66,16 +70,10 @@ if (!app.requestSingleInstanceLock()) {
   app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 }
 
-// Use OS-standard data directory unless explicitly overridden
+// Use the OS-standard data directory unless explicitly overridden: the same
+// one the `abject` command uses, so the app and the terminal share workspaces.
 if (!process.env.ABJECTS_DATA_DIR) {
-  const home = os.homedir();
-  if (process.platform === 'darwin') {
-    process.env.ABJECTS_DATA_DIR = path.join(home, 'Library', 'Application Support', 'abject');
-  } else if (process.platform === 'win32') {
-    process.env.ABJECTS_DATA_DIR = path.join(process.env.APPDATA ?? path.join(home, 'AppData', 'Roaming'), 'abject');
-  } else {
-    process.env.ABJECTS_DATA_DIR = path.join(home, '.config', 'abject');
-  }
+  process.env.ABJECTS_DATA_DIR = defaultDataDir();
 }
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
@@ -90,6 +88,43 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.json': 'application/json',
 };
+
+/**
+ * Another backend already holding this data directory, before ours starts.
+ *
+ * The headless edition (`abject` in a terminal, or started at login) keeps
+ * running after its terminal closes, so it is often still there when the
+ * app opens. Two backends cannot share one data directory, so the person
+ * chooses: stop that one and open the app (its agents resume from saved
+ * state here), or quit. Returns false when the app should not start.
+ */
+async function claimDataDir(dataDir: string): Promise<boolean> {
+  const other = await liveInstance(dataDir);
+  if (!other) return true;
+  if (other.edition !== 'headless') {
+    await dialog.showMessageBox({
+      type: 'error',
+      title: 'Abject',
+      message: 'Another Abject is using this data',
+      detail: `Abject ${other.version} (pid ${other.pid}) is running on ${dataDir}. Close it, then open the app again.`,
+    });
+    return false;
+  }
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    title: 'Abject',
+    buttons: ['Stop it and open Abject', 'Quit'],
+    defaultId: 0,
+    cancelId: 1,
+    message: 'Abject is already running in the background',
+    detail: `The terminal edition (pid ${other.pid}) is using ${dataDir}, and only one Abject can use it at a time. `
+      + 'Stopping it pauses what its agents are doing; they pick up again here. '
+      + 'The abject command connects to the app while it is open.',
+  });
+  if (response !== 0) return false;
+  await stopBackend(dataDir);
+  return !(await liveInstance(dataDir));
+}
 
 let mainWindow: BrowserWindow | null = null;
 let clientServer: http.Server | null = null;
@@ -258,6 +293,10 @@ app.on('will-quit', () => {
 app.setName('Abject');
 
 app.whenReady().then(async () => {
+  // A second launch is quitting (above); 'ready' can still fire on its way out,
+  // and it must not start a backend first.
+  if (!holdsInstanceLock) return;
+
   // Set up application menu
   const menu = Menu.buildFromTemplate([
     { role: 'fileMenu' },
@@ -276,11 +315,28 @@ app.whenReady().then(async () => {
         ...(app.isPackaged ? [{
           label: 'Check for Updates…',
           click: () => { app.emit('abjects:check-for-updates'); },
+        }, {
+          // The app's own copy of the `abject` command (resources/cli).
+          label: 'Install the abject Command…',
+          click: () => {
+            const result = installCliCommand();
+            void dialog.showMessageBox({
+              type: result.ok ? 'info' : 'warning',
+              title: 'abject command',
+              message: result.ok ? 'The abject command is ready' : 'The abject command was not installed',
+              detail: result.message,
+            });
+          },
         }] : []),
       ],
     },
   ]);
   Menu.setApplicationMenu(menu);
+
+  if (!(await claimDataDir(process.env.ABJECTS_DATA_DIR!))) {
+    app.exit(0);
+    return;
+  }
 
   // Start the client HTTP server
   const port = await startClientServer();

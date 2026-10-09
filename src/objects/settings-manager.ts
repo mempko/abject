@@ -4,8 +4,8 @@
  * Owns what the Settings window edits: model credentials and tier routing,
  * tier presets, the login that guards the UI and CLI sockets, and the
  * permissions the capability objects enforce. It loads them from global
- * Storage at boot, applies them (LLM `configure`, UIServer `updateAuth`,
- * capability permissions through PermissionBroker), validates and persists
+ * Storage at boot, applies them (LLM `configure`, AuthGate `updateAuth`,
+ * capability permissions and the prompt mode through PermissionBroker), validates and persists
  * every change, and announces it with a `settingsChanged` aspect.
  *
  * The Settings window (GlobalSettings) and the terminal client (through
@@ -27,6 +27,7 @@ import { LLMProviderDescription, servesChat } from '../llm/provider.js';
 import { LATEST_MODEL, aliasLadders, freezeModel, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import type { DecisionGates } from '../core/decision-sites.js';
 import { parsePrivateHost } from './capabilities/address-policy.js';
+import { PROMPT_MODES, type PromptMode } from './permission-broker.js';
 
 const log = new Log('SettingsManager');
 
@@ -87,6 +88,7 @@ export interface ShellSettings {
 }
 export interface WebSettings { enabled: boolean; allowedDomains: string[]; deniedDomains: string[]; privateHosts: string[] }
 export interface ObjectsSettings { capabilityEnforcement: CapabilityEnforcementMode }
+export interface PermissionsSettings { mode: PromptMode }
 
 export interface SettingsBySection {
   ai: AiSettings;
@@ -95,9 +97,10 @@ export interface SettingsBySection {
   shell: ShellSettings;
   web: WebSettings;
   objects: ObjectsSettings;
+  permissions: PermissionsSettings;
 }
 export type SettingsSectionId = keyof SettingsBySection;
-export const SETTINGS_SECTIONS: SettingsSectionId[] = ['ai', 'auth', 'filesystem', 'shell', 'web', 'objects'];
+export const SETTINGS_SECTIONS: SettingsSectionId[] = ['ai', 'auth', 'filesystem', 'shell', 'web', 'objects', 'permissions'];
 
 /** One field of the schema clients render settings from. */
 export interface SettingField {
@@ -135,6 +138,7 @@ const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
 const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
 const STORAGE_KEY_WEB_PRIVATE_HOSTS = 'global-settings:webPrivateHosts';
 const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
+const STORAGE_KEY_PROMPT_MODE = 'global-settings:permissionPromptMode';
 const STORAGE_KEY_OBJECT_PERM_NAMES = 'global-settings:objectPermNames';
 const objectPermKey = (objectName: string): string => `global-settings:objectPerms:${objectName}`;
 const STORAGE_KEY_SKILL_PERM_NAMES = 'global-settings:skillPermNames';
@@ -198,7 +202,8 @@ const emptyAux = (): Record<AuxRowKey, ModelRef | null> => ({ vision: null, fall
 export class SettingsManager extends Abject {
   private llmId?: AbjectId;
   private storageId?: AbjectId;
-  private uiServerId?: AbjectId;
+  /** Applies the login to every socket that checks it (UI, terminal, HTTP gateway). */
+  private authGateId?: AbjectId;
 
   private providerDescriptions: LLMProviderDescription[] = [];
   private providerDescById = new Map<string, LLMProviderDescription>();
@@ -223,6 +228,7 @@ export class SettingsManager extends Abject {
   private skillGrants = new Map<string, string[]>();
   private web: WebSettings = { enabled: true, allowedDomains: [], deniedDomains: [], privateHosts: [] };
   private capabilityEnforcement: CapabilityEnforcementMode = 'warn';
+  private promptMode: PromptMode = 'ask';
 
   private permissionBrokerId?: AbjectId;
   private authorityClaimed = false;
@@ -233,7 +239,7 @@ export class SettingsManager extends Abject {
         name: 'SettingsManager',
         description:
           'The global settings as data: model credentials and tier routing, tier presets, the UI and CLI login, and the permissions ' +
-          '(filesystem, shell, web, capability enforcement). Ask it for the schema and the current values; secrets show only as set or not set.',
+          '(filesystem, shell, web, capability enforcement, what happens to a request no rule decides). Ask it for the schema and the current values; secrets show only as set or not set.',
         version: '1.0.0',
         interface: {
           id: 'abjects:settings-manager' as InterfaceId,
@@ -242,7 +248,7 @@ export class SettingsManager extends Abject {
           methods: [
             { name: 'getSettingsSchema', description: 'Every settings section and its fields (key, label, type, options).', parameters: [], returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SettingsSectionSchema' } } },
             {
-              name: 'getSettings', description: 'Current values of one section (ai, auth, filesystem, shell, web, objects), or of every section when none is named. Secrets read as { set }.',
+              name: 'getSettings', description: 'Current values of one section (ai, auth, filesystem, shell, web, objects, permissions), or of every section when none is named. Secrets read as { set }.',
               parameters: [{ name: 'section', type: { kind: 'primitive', primitive: 'string' }, description: 'Section id', optional: true }],
               returns: { kind: 'reference', reference: 'SettingsBySection[section]' },
             },
@@ -285,7 +291,7 @@ export class SettingsManager extends Abject {
   protected override async onInit(): Promise<void> {
     this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
-    this.uiServerId = await this.requireDep('UIServer');
+    this.authGateId = await this.requireDep('AuthGate');
     await this.loadProviderDescriptions();
     await this.loadAi();
     this.savedPresets = await this.loadSavedPresets();
@@ -302,6 +308,7 @@ export class SettingsManager extends Abject {
     super.checkInvariants();
     invariant(DECISION_GATES.includes(this.decisionGates), 'SettingsManager: unknown decision gates');
     invariant(ENFORCEMENT_MODES.includes(this.capabilityEnforcement), 'SettingsManager: unknown enforcement mode');
+    invariant(PROMPT_MODES.includes(this.promptMode), 'SettingsManager: unknown permission prompt mode');
     invariant(!this.auth.enabled || (this.auth.username !== '' && this.auth.password !== ''), 'SettingsManager: login enabled without credentials');
   }
 
@@ -524,6 +531,8 @@ export class SettingsManager extends Abject {
         return { enabled: this.web.enabled, allowedDomains: [...this.web.allowedDomains], deniedDomains: [...this.web.deniedDomains], privateHosts: [...this.web.privateHosts] } as SettingsBySection[S];
       case 'objects':
         return { capabilityEnforcement: this.capabilityEnforcement } as SettingsBySection[S];
+      case 'permissions':
+        return { mode: this.promptMode } as SettingsBySection[S];
     }
     throw new Error(`Unknown section ${String(section)}`);
   }
@@ -594,6 +603,13 @@ export class SettingsManager extends Abject {
         id: 'objects', label: 'Objects', description: 'Capability checks on scriptable objects.',
         fields: [{ key: 'capabilityEnforcement', label: 'Capability enforcement', type: 'enum', options: ENFORCEMENT_MODES }],
       },
+      {
+        id: 'permissions', label: 'Permissions', description: 'What happens to a request no rule, grant or project autonomy decides.',
+        fields: [{
+          key: 'mode', label: 'Permission prompts', type: 'enum', options: [...PROMPT_MODES],
+          description: 'ask: wait for you to answer, on the desktop or in the terminal. allow: allow it once without asking (dangerous commands still ask). deny: deny it without asking.',
+        }],
+      },
     ];
   }
 
@@ -607,6 +623,7 @@ export class SettingsManager extends Abject {
       case 'auth': await this.setAuth(values); break;
       case 'filesystem': case 'shell': case 'web': await this.setPermissions(section, values); break;
       case 'objects': await this.setObjects(values); break;
+      case 'permissions': await this.setPromptMode(values); break;
     }
     this.checkInvariants();
     this.changed('settingsChanged', { section });
@@ -730,7 +747,7 @@ export class SettingsManager extends Abject {
     await this.store('set', STORAGE_KEY_AUTH_USER, next.username);
     await this.store('set', STORAGE_KEY_AUTH_PASS, next.password);
     // Clears the sessions and signs browser clients out; terminals log in on their next connection.
-    if (this.uiServerId) await this.request(request(this.id, this.uiServerId, 'updateAuth', { ...next }));
+    if (this.authGateId) await this.request(request(this.id, this.authGateId, 'updateAuth', { ...next }));
     log.info(`Auth settings saved (enabled=${next.enabled})`);
   }
 
@@ -780,6 +797,24 @@ export class SettingsManager extends Abject {
     this.capabilityEnforcement = values.capabilityEnforcement as CapabilityEnforcementMode;
     await this.store('set', STORAGE_KEY_CAP_ENFORCEMENT, this.capabilityEnforcement);
     this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
+  }
+
+  private async setPromptMode(values: Record<string, unknown>): Promise<void> {
+    this.knownKeys(values, ['mode'], 'permissions');
+    if (values.mode === undefined) return;
+    precondition(PROMPT_MODES.includes(values.mode as PromptMode), `mode must be one of ${PROMPT_MODES.join(', ')}`);
+    this.promptMode = values.mode as PromptMode;
+    await this.store('set', STORAGE_KEY_PROMPT_MODE, this.promptMode);
+    await this.applyPromptMode();
+  }
+
+  /** Push the prompt mode to PermissionBroker, which holds it as policy. */
+  private async applyPromptMode(): Promise<void> {
+    await this.claimAuthority();
+    if (!this.permissionBrokerId) return;
+    const r = await this.request<{ success?: boolean; error?: string }>(
+      request(this.id, this.permissionBrokerId, 'setPromptMode', { mode: this.promptMode }));
+    if (r && r.success === false) throw new Error(r.error ?? 'PermissionBroker refused the prompt mode');
   }
 
   // ===========================================================================
@@ -976,7 +1011,7 @@ export class SettingsManager extends Abject {
       password: (await this.fetch<string>(STORAGE_KEY_AUTH_PASS)) ?? '',
     };
     if (this.auth.enabled && (!this.auth.username || !this.auth.password)) this.auth.enabled = false;
-    if (this.uiServerId) await this.request(request(this.id, this.uiServerId, 'updateAuth', { ...this.auth }));
+    if (this.authGateId) await this.request(request(this.id, this.authGateId, 'updateAuth', { ...this.auth }));
     log.info(`Applied saved auth config (enabled=${this.auth.enabled})`);
   }
 
@@ -986,6 +1021,11 @@ export class SettingsManager extends Abject {
 
   private async loadAndApplyPermissions(): Promise<void> {
     await this.claimAuthority();
+    const promptMode = await this.fetch<string>(STORAGE_KEY_PROMPT_MODE);
+    if (PROMPT_MODES.includes(promptMode as PromptMode)) {
+      this.promptMode = promptMode as PromptMode;
+      try { await this.applyPromptMode(); } catch (e) { log.warn(`Failed to apply the permission prompt mode: ${e instanceof Error ? e.message : String(e)}`); }
+    }
     const capMode = await this.fetch<string>(STORAGE_KEY_CAP_ENFORCEMENT);
     if (ENFORCEMENT_MODES.includes(capMode as CapabilityEnforcementMode)) this.capabilityEnforcement = capMode as CapabilityEnforcementMode;
     this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
@@ -1171,7 +1211,7 @@ export class SettingsManager extends Abject {
 The global settings as data. The Settings window and the terminal client edit them through this object.
 
 ### Read
-- getSettingsSchema(): sections (ai, auth, filesystem, shell, web, objects) and their fields.
+- getSettingsSchema(): sections (ai, auth, filesystem, shell, web, objects, permissions) and their fields.
 - getSettings({ section? }): current values; secrets read as { set: true|false }.
 - listPresets(), listModels({ provider }), isConfigured(), getCapabilityEnforcement().
 

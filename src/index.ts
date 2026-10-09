@@ -57,6 +57,7 @@ export { GoalObserver, GOAL_OBSERVER_ID } from './objects/goal-observer.js';
 export { TaskReviewer, TASK_REVIEWER_ID } from './objects/task-reviewer.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
 export { ChatManager, CHAT_MANAGER_ID } from './objects/chat-manager.js';
+export { ChatWindow, CHAT_WINDOW_ID } from './objects/chat-window.js';
 export { ChatBrowser, CHAT_BROWSER_ID } from './objects/chat-browser.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
 export { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './objects/wasm-abject.js';
@@ -94,6 +95,8 @@ export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-sw
 export { Sidebar, SIDEBAR_ID, SIDEBAR_WIDTH } from './objects/sidebar.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 export { SettingsManager, SETTINGS_MANAGER_ID } from './objects/settings-manager.js';
+export { DialogBroker, DIALOG_BROKER_ID, DIALOG_KINDS } from './objects/dialog-broker.js';
+export type { DialogKind, DialogOption, DialogGroup, DialogSpec, OpenDialog, DialogAnswer } from './objects/dialog-broker.js';
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
 export { ProcessExplorer, PROCESS_EXPLORER_ID } from './objects/process-explorer.js';

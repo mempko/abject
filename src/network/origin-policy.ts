@@ -12,7 +12,7 @@
  * the Host header is not enough: a page that rebinds its own DNS name to
  * 127.0.0.1 is same-origin by that test.
  *
- * Clients that are not browsers (commune, scripts, health probes) send no
+ * Clients that are not browsers (the `abject` command, scripts, health probes) send no
  * Origin and are not judged here. They are local processes; keeping other
  * local users out is a job for authentication, not for this check.
  */

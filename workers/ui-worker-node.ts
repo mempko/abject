@@ -91,19 +91,6 @@ port.on('message', async (data: { type: string; [key: string]: unknown }) => {
       break;
     }
 
-    case 'set-auth-gate': {
-      // Auth config is managed on the main thread; BackendUI just gets the reference
-      // For the worker, auth-gate updates come as explicit messages
-      if (backendUI) {
-        const typed = data as unknown as {
-          authConfig: import('../server/auth.js').AuthConfig;
-          sessionStore: import('../server/auth.js').SessionStore;
-        };
-        backendUI.setAuthGate(typed.authConfig, typed.sessionStore);
-      }
-      break;
-    }
-
     case 'shutdown': {
       log.info('Shutdown requested — stopping BackendUI...');
       try {

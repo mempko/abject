@@ -47,7 +47,7 @@ const v = rel.version || 'x.y.z';
             <li class="key"><a href="#mind">Pick a model</a></li>
             <li><a href="#first-abject">Your first abject</a></li>
             <li><a href="#phone">Your phone</a></li>
-            <li><a href="#commune">The terminal client</a></li>
+            <li><a href="#command-line">The command line</a></li>
             <li><a href="#data">Where things live</a></li>
             <li><a href="#network">What it talks to</a></li>
             <li><a href="#updating">Updating and uninstalling</a></li>
@@ -233,20 +233,35 @@ const v = rel.version || 'x.y.z';
       </section>
 
       <!-- 07: big type, the command's name carries the section -->
-      <section id="commune" class="sec">
-        <SectionHead num="07" title="The terminal client" />
-        <div class="commune">
+      <section id="command-line" class="sec">
+        <SectionHead num="07" title="The command line" />
+        <div class="cli">
           <p class="stat" aria-hidden="true">
-            <span class="big">commune</span>
-            <span class="cap">ws://127.0.0.1:7723</span>
+            <span class="big">abject</span>
+            <span class="cap">abject.world/install.sh</span>
           </p>
           <div class="prose">
             <p>
-              <strong>commune</strong> is a terminal view of your chats, goals, and permission
-              prompts, one tab each. It is a single executable with nothing to install. It needs
-              the desktop app running, because that is what it talks to. Download
-              it from the <a href="/#downloads">download section</a>, mark it executable on Linux
-              and macOS, and run it. It looks for the app at <code>ws://127.0.0.1:7723</code>.
+              <strong>abject</strong> is Abject in a terminal: your chats, goals, and permission
+              prompts, one tab each. It runs where the desktop app can't, on a server, over SSH,
+              on a machine with no screen. Install it with one line,
+              <code>curl -fsSL https://abject.world/install.sh | sh</code> on Linux and macOS or
+              <code>irm https://abject.world/install.ps1 | iex</code> in PowerShell, then run
+              <code>abject</code>.
+            </p>
+            <p>
+              The first run walks you through setup (a model, and what agents may do without
+              asking) and starts the backend in the background. Quitting the chat leaves it
+              running, so goals keep going. <code>abject stop</code> stops it, and
+              <code>abject service install</code> starts it whenever you log in. On a machine
+              where the desktop app is open, <code>abject</code> talks to the app instead; both
+              use the same data directory, so it is the same workspaces either way.
+            </p>
+            <p>
+              Questions from agents wait for you. Answer them in the chat, or from any shell
+              with <code>abject questions</code> and <code>abject answer</code>. On a machine
+              nobody watches, <code>abject mode allow</code> or <code>abject mode deny</code>
+              answers for you. <code>abject help</code> lists the rest.
             </p>
           </div>
         </div>
@@ -299,6 +314,10 @@ const v = rel.version || 'x.y.z';
               one; the data directory is untouched and your workspaces come back as they were.
               The <a href="/changelog">changelog</a> says what changed.
             </p>
+            <p>
+              The command line updates itself: <code>abject update</code> fetches the newest
+              release, checks it, and restarts the backend on it.
+            </p>
           </div>
           <span class="rule" aria-hidden="true"></span>
           <div>
@@ -306,7 +325,9 @@ const v = rel.version || 'x.y.z';
             <p>
               To uninstall, remove the app the usual way for your platform (delete the AppImage,
               <code>apt remove abjects</code>, the Windows uninstaller, or drag it out of
-              Applications) and, if you want no trace, delete the data directory above.
+              Applications) and, if you want no trace, delete the data directory above. For the
+              command line, run <code>abject stop</code> and <code>abject service uninstall</code>,
+              then delete <code>~/.abject</code> (<code>%LOCALAPPDATA%\abject</code> on Windows).
             </p>
           </div>
         </div>
@@ -328,7 +349,7 @@ const v = rel.version || 'x.y.z';
           </div>
           <div class="faq-item">
             <dt>"Port 7719 already in use."</dt>
-            <dd>Another copy is running, or something else took the port. Set <code>WS_PORT</code> to a free port before launching; the terminal client's port moves with it (it is always <code>WS_PORT</code> plus four).</dd>
+            <dd>Another copy is running, or something else took the port. Set <code>WS_PORT</code> to a free port before launching; the command line's port moves with it (it is always <code>WS_PORT</code> plus four).</dd>
           </div>
           <div class="faq-item">
             <dt>Ollama is running but not offered.</dt>
@@ -734,15 +755,15 @@ const v = rel.version || 'x.y.z';
   .after-split { margin-top: 2rem; }
 
   /* ── 06: the command's name, set huge ── */
-  .commune {
+  .cli {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
     gap: 2.5rem;
     align-items: center;
   }
 
-  .commune .stat { margin: 0; }
-  .commune .big { font-size: clamp(3.5rem, 7.5vw, 7rem); letter-spacing: 0; }
+  .cli .stat { margin: 0; }
+  .cli .big { font-size: clamp(3.5rem, 7.5vw, 7rem); letter-spacing: 0; }
 
   /* ── 07: path columns between heavy rules ── */
   .paths {
@@ -846,7 +867,7 @@ const v = rel.version || 'x.y.z';
     .needs { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-areas: 'desk desk' 'mind mind' 'disk acct'; }
     .platforms { grid-template-columns: minmax(0, 1fr); }
     .platform + .platform { padding-left: 0; margin-left: 0; border-left: none; margin-top: 1.4rem; padding-top: 2rem; border-top: 1px solid var(--rule-mid); }
-    .commune { grid-template-columns: minmax(0, 1fr); gap: 1.2rem; }
+    .cli { grid-template-columns: minmax(0, 1fr); gap: 1.2rem; }
   }
 
   @media (max-width: 640px) {

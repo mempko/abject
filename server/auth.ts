@@ -18,6 +18,11 @@ export interface AuthConfig {
   enabled: boolean;
   username: string;
   password: string;
+  /**
+   * This instance's owner token (see server/instance-file.ts). A local client
+   * that can read the data directory presents it instead of the login.
+   */
+  ownerToken?: string;
 }
 
 /**
@@ -112,8 +117,9 @@ export type AuthResult = 'authenticated' | 'rejected' | 'timeout';
 /**
  * Run the auth handshake on a raw WebSocket connection.
  *
- * Sends `authRequired`, then waits for the client to send either
- * `{ type: 'auth', token }` or `{ type: 'auth', username, password }`.
+ * Sends `authRequired`, then waits for the client to send
+ * `{ type: 'auth', token }`, `{ type: 'auth', username, password }`, or
+ * `{ type: 'auth', ownerToken }` (a local client of this instance).
  * Returns a promise that resolves when auth succeeds, fails, or times out.
  * On success, resolves with the session token.
  */
@@ -146,6 +152,18 @@ export function authenticateConnection(
 
         if (msg.type !== 'auth') {
           // Silently drop non-auth messages during handshake
+          return;
+        }
+
+        // The owner token: a local client that can read the data directory.
+        if (msg.ownerToken && typeof msg.ownerToken === 'string') {
+          if (config.ownerToken && safeEqual(msg.ownerToken, config.ownerToken)) {
+            cleanup();
+            ws.send(JSON.stringify({ type: 'authResult', success: true }));
+            resolve({ result: 'authenticated' });
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'authResult', success: false, error: 'Invalid owner token' }));
           return;
         }
 

@@ -410,6 +410,13 @@ export class ObjectCreator extends Abject {
    */
   private visionCapable: boolean | undefined;
   private visionCheckedAt = 0;
+  /**
+   * Whether this instance has a display (InstanceInfo). A headless instance
+   * draws no windows, so there is nothing to screenshot and no visual check to
+   * require; undefined (not yet known) keeps the desktop behaviour.
+   */
+  private displayAvailable: boolean | undefined;
+  private displayCheckedAt = 0;
   private static readonly VISION_TTL_MS = 60_000;
   /** Reverse index: AgentAbject's ticketId → our taskId, for taskResult lookup. */
   private taskIdByTicket = new Map<string, string>();
@@ -509,9 +516,10 @@ export class ObjectCreator extends Abject {
   protected override async onInit(): Promise<void> {
     this.llmId = await this.requireDep('LLM');
     this.registryId = await this.requireDep('Registry');
-    // Prime the vision check so the (synchronous) prompt builder has an
-    // answer by the time the first task starts.
+    // Prime the vision and display checks so the (synchronous) prompt
+    // builder has answers by the time the first task starts.
     void this.refreshVisionCapability();
+    void this.refreshDisplay();
     this.factoryId = await this.requireDep('Factory');
     this.systemRegistryId = (await this.discoverDep('SystemRegistry')) ?? undefined;
     this.abjectStoreId = (await this.discoverDep('AbjectStore')) ?? undefined;
@@ -573,6 +581,20 @@ export class ObjectCreator extends Abject {
       this.visionCapable = vm !== null;
     } catch { /* keep previous answer */ }
     return this.visionCapable;
+  }
+
+  /** Ask InstanceInfo whether this instance has a display (same TTL as vision). */
+  private async refreshDisplay(): Promise<boolean | undefined> {
+    const now = Date.now();
+    if (now - this.displayCheckedAt < ObjectCreator.VISION_TTL_MS) return this.displayAvailable;
+    this.displayCheckedAt = now;
+    try {
+      const infoId = await this.discoverDep('InstanceInfo');
+      if (!infoId) return this.displayAvailable;
+      const info = await this.sendRequest<{ display?: boolean }>(infoId, 'getInfo', {}, 5000);
+      if (typeof info?.display === 'boolean') this.displayAvailable = info.display;
+    } catch { /* keep previous answer */ }
+    return this.displayAvailable;
   }
 
   protected override askPrompt(_question: string): string {
@@ -3592,7 +3614,10 @@ ${source}
       if (!extra) return { accepted: false, reason: 'Task state is unavailable' };
       const gate = this.gateVerdict(extra.state);
       const target = extra.state.spawnedObjectId ?? extra.state.targetObjectId;
-      const visualAvailable = await this.refreshVisionCapability();
+      const visionAvailable = await this.refreshVisionCapability();
+      // A visual check needs a model that can see and a display to capture.
+      const noDisplay = (await this.refreshDisplay()) === false;
+      const visualAvailable = noDisplay ? false : visionAvailable;
       const authorsUI = extra.state.kind !== 'investigate' && !!extra.state.draftSource && extra.state.draftManifest?.requiredCapabilities?.some(c => c.capability === Capabilities.UI_SURFACE);
       if (gate.ok && authorsUI && visualAvailable === true && !extra.state.visualSinceDeploy) return { accepted: false, reason: 'Capture and inspect this application through Screenshot.captureWindow after the last deployment; unrelated windows cannot verify it' };
       if (gate.ok && target && extra.state.draftSource) {
@@ -3603,7 +3628,7 @@ ${source}
         const saved = await this.sendRequest<{source:string}|null>(this.abjectStoreId,'getDurableSnapshot',{objectId:target},10000);
         if (live!==extra.state.lastDeployedSource || saved?.source!==live) return {accepted:false,reason:'Live and durable source revisions do not match the verified deployment; reconcile before completion'};
       }
-      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, target, source: extra.state.lastDeployedSource, visualInspection: extra.state.visualSinceDeploy ? 'captured-for-review' : visualAvailable === false ? 'unavailable' : 'not-recorded', note: gate.note } };
+      return { accepted: gate.ok, reason: gate.reason, evidence: { taskId, target, source: extra.state.lastDeployedSource, visualInspection: extra.state.visualSinceDeploy ? 'captured-for-review' : noDisplay ? 'no-display' : visualAvailable === false ? 'unavailable' : 'not-recorded', note: gate.note } };
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
@@ -4327,7 +4352,8 @@ ${source}
     const relevantMembers = state.memberRelevance?.key === this.relevanceKey(state)
       ? state.memberRelevance.relevant.map(r => r.name) : [];
     const membersRead = this.membersRead(state);
-    const authorsUI = ObjectCreator.authorsUI(state);
+    // Without a display there is no window to capture, so the advice never asks for one.
+    const authorsUI = ObjectCreator.authorsUI(state) && this.displayAvailable !== false;
     const outcome = await this.askDecision(site, {
       goal: state.goal.slice(0, 600),
       kind: state.kind,
@@ -5038,9 +5064,10 @@ ${source}
   // ── System prompt ─────────────────────────────────────────────────────
 
   private buildSystemPrompt(): string {
-    // Keep the cached vision answer fresh for the next build; this call is
-    // TTL-gated and non-blocking (the current build uses the cached value).
+    // Keep the cached vision and display answers fresh for the next build;
+    // these calls are TTL-gated and non-blocking (this build uses the cache).
     void this.refreshVisionCapability();
+    void this.refreshDisplay();
     return `You are ObjectCreator, a code-writing agent inside the Abjects distributed message-passing system. You create new Abjects, modify existing ones, and answer diagnostic questions about Abjects.
 
 # The system
@@ -5151,7 +5178,7 @@ Investigation:
 
 Deployment (use the local actions — they read your staged drafts and run the proper multi-message sequence):
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
-- Update an existing object: \`{ "action": "deploy_update" }\` after \`edit_source\`. If the loop started as a modify, the target source is preloaded and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
+- Update an existing object: \`{ "action": "deploy_update" }\` after \`edit_source\`. If the loop started as a modify, the target source is preloaded and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps the source.** An object whose window was open is hidden and shown again under the new source, so new \`show()\` wiring takes effect; an object that was closed stays closed until something shows it. Objects that keep widgets alive across \`hide()\` (an idempotent \`show()\`) keep their OLD widgets: for those, make \`hide()\` destroy what \`show()\` builds, or tell the user to close and re-open the window.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
 
 Organism composition:
@@ -5240,7 +5267,9 @@ A model that lives in the object stays available once this task ends: the object
 
    Judge the whole rendered image against the goal ("does this look like what the user asked for?"), not against a checklist item you have the power to satisfy by hand. For rendering-specific rules (what makes a 3D scene read as 3D, what a layout needs), ask the UI object that renders it — its \`ask\` answer carries the live rules, and they change as the renderer does.
 
-   ${this.visionCapable === false
+   ${this.displayAvailable === false
+    ? `**This instance has no display (the headless edition).** Nothing here draws windows, so there is no window to open, screenshot, or inspect, and the window and widget services are absent from the registry. Build objects whose value reaches the person through messages: replies in the conversation, notifications, scheduled work, data they can ask for, or pages served through the web gateway. Verify through behavior: \`getState\`, method calls and their results. When a goal asks for a visual UI, build the model and its methods so they work here, and say in your final result that this instance has no display to show a window on.`
+    : this.visionCapable === false
     ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
     : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It works wherever the window is, including a workspace other than the one the user is looking at, so capture the window where it lives. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. For a 3D scene, judge the DEPTH: near objects must look bigger than far ones, and a scene where everything is the same apparent size is flat, not 3D, however "3D" the geometry is. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
 

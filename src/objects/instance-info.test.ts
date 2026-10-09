@@ -28,7 +28,7 @@ class Probe extends Abject {
 
 test('InstanceInfo tells abjects the running version and whether boot has finished', async () => {
   let ready = false;
-  const source = { version: '9.9.9', startedAt: Date.now() - 5000, workerCount: 3, ready: () => ready };
+  const source = { version: '9.9.9', startedAt: Date.now() - 5000, workerCount: 3, edition: 'desktop' as const, ready: () => ready };
   const rt = new Runtime();
   await rt.start();
   try {
@@ -51,7 +51,7 @@ test('InstanceInfo tells abjects the running version and whether boot has finish
 
 test('the UI port answers health checks from the same report: 503 while booting, 200 once ready', async () => {
   let ready = false;
-  const source = { version: '9.9.9', startedAt: Date.now(), workerCount: 0, ready: () => ready };
+  const source = { version: '9.9.9', startedAt: Date.now(), workerCount: 0, edition: 'headless' as const, ready: () => ready };
   const server = new NodeWebSocketServer({
     port: 0, host: '127.0.0.1', heartbeatMs: 0,
     onHttpRequest: (req, res) => {

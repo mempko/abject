@@ -84,7 +84,6 @@ export function slugify(name: string, fallback: string): string {
 
 export class WebExposure extends Abject {
   private storageId?: AbjectId;
-  private widgetManagerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
   private registryId?: AbjectId;
   private gatewayId?: AbjectId;
@@ -188,7 +187,6 @@ export class WebExposure extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.storageId = await this.discoverDep('Storage') ?? undefined;
-    this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
     this.registryId = await this.discoverDep('Registry') ?? undefined;
     if (this.storageId) {
@@ -198,8 +196,8 @@ export class WebExposure extends Abject {
       } catch { /* first run */ }
     }
     // Push at boot so a workspace enabled in a previous session is served
-    // again. Our workspace id is assigned after spawn (WidgetManager tags us),
-    // so retry until it lands, in the background — onInit must not stall.
+    // again. The workspace's name is listed only once WorkspaceManager has the
+    // workspace, so retry until it lands, in the background: onInit must not stall.
     void this.pushWhenReady();
   }
 
@@ -213,11 +211,15 @@ export class WebExposure extends Abject {
   }
 
   private async ensureWorkspaceId(): Promise<string | undefined> {
-    if (!this.workspaceId && this.widgetManagerId) {
-      try {
-        const wsId = await this.request<string | null>(request(this.id, this.widgetManagerId, 'getObjectWorkspace', { objectId: this.id }));
-        if (wsId) this.workspaceId = wsId;
-      } catch { /* not tagged yet */ }
+    if (!this.workspaceId) {
+      // The workspace registry we were spawned into knows its workspace.
+      const ownRegistry = await this.resolveRegistryId();
+      if (ownRegistry) {
+        try {
+          const wsId = await this.request<string | null>(request(this.id, ownRegistry, 'getWorkspaceId', {}));
+          if (wsId) this.workspaceId = wsId;
+        } catch { /* not in a workspace */ }
+      }
     }
     if (this.workspaceId && !this.workspaceName && this.workspaceManagerId) {
       try {

@@ -144,7 +144,9 @@ Interface: abjects:modal-dialog`;
 
   private setupHandlers(): void {
     this.on('show', (msg: AbjectMessage) => {
-      this.handleShow(msg).then(
+      // The caller waits as long as the person does: beat while the dialog is up.
+      const stopBeating = this.awaitingHuman('confirm dialog');
+      this.handleShow(msg).finally(stopBeating).then(
         async (confirmed) => {
           if (confirmed === true) await this.confirmFlash();
           await this.destroyWindows();
@@ -162,7 +164,8 @@ Interface: abjects:modal-dialog`;
 
     this.on('showPrompt', (msg: AbjectMessage) => {
       this.promptMode = true;
-      this.handleShow(msg).then(
+      const stopBeating = this.awaitingHuman('prompt dialog');
+      this.handleShow(msg).finally(stopBeating).then(
         async (result) => {
           if (typeof result === 'string') await this.confirmFlash();
           await this.destroyWindows();
@@ -202,10 +205,10 @@ Interface: abjects:modal-dialog`;
       this.pendingResolve?.(this.cancelResult());
     });
 
-    // Remote answer, relayed exclusively by WidgetManager's respondDialog
-    // gate (which enforces the boot-sealed responder allowlist). Direct
-    // respond messages from anything else are refused — otherwise any object
-    // could auto-accept dialogs.
+    // Closing on WidgetManager's word: the question was answered elsewhere
+    // (DialogBroker took a terminal's answer), so the window goes away.
+    // Anything else sending respond is refused: only the object that drew
+    // this dialog may close it.
     this.on('respond', async (msg: AbjectMessage) => {
       if (msg.routing.from !== this.widgetManagerId) return false;
       const { confirmed, value } = msg.payload as { confirmed: boolean; value?: string };

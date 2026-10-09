@@ -1,8 +1,10 @@
 /**
- * CommuneClient -- WebSocket client for the CliServer gateway.
+ * AbjectClient -- the `abject` command's WebSocket client for the CliServer
+ * gateway, the same gateway on the desktop and the headless editions.
  *
- * Handles the shared auth handshake (authRequired / authNotRequired, token
- * resume, username+password login) and the JSON op protocol:
+ * Handles the shared auth handshake (authRequired / authNotRequired, the
+ * local owner token, token resume, username+password login) and the JSON op
+ * protocol:
  *   -> { id, op, ...params }
  *   <- { id, ok, result | error }
  *   <- { event, workspaceId, conversationId?, data }   (pushed)
@@ -51,6 +53,9 @@ export interface PushedEvent {
 export interface DialogOption {
   id: string;
   label: string;
+  /** For permission prompts: the scope the option grants (this request, a project, anywhere). */
+  group?: string;
+  tone?: string;
 }
 
 export interface DialogInfo {
@@ -67,6 +72,36 @@ export interface DialogInfo {
   resource?: string;
   /** Choice list for options dialogs. */
   options?: DialogOption[];
+  /** What the question is about ('permission', 'confirm', ...). */
+  topic?: string;
+  /** Analysis lines shown under the resource (permission prompts). */
+  detail?: string[];
+  /** The object that asked, when known. */
+  askedBy?: string;
+  openedAt?: number;
+}
+
+/** InstanceInfo.getInfo, as the gateway returns it. */
+export interface InstanceSummary {
+  version: string;
+  ready: boolean;
+  startedAt: number;
+  uptimeSec: number;
+  node: string;
+  platform: string;
+  arch: string;
+  workerCount: number;
+  edition: 'desktop' | 'headless';
+  display: boolean;
+}
+
+/** An external project registered in a workspace. */
+export interface ProjectRow {
+  name: string;
+  root: string;
+  description?: string;
+  trusted: boolean;
+  autonomy: string;
 }
 
 export interface GoalTask {
@@ -87,9 +122,13 @@ export interface GoalStatus {
   tasks: GoalTask[];
 }
 
-export type Credentials = { token: string } | { username: string; password: string };
+/**
+ * How the client proves who it is: the local owner token (read from the
+ * instance's instance.json), a cached session token, or a login.
+ */
+export type Credentials = { ownerToken: string } | { token: string } | { username: string; password: string };
 
-export interface CommuneClientOptions {
+export interface AbjectClientOptions {
   url: string;
   /**
    * Called when the server requires auth. `attempt` starts at 0 (use the
@@ -109,16 +148,16 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
-export class CommuneClient {
+export class AbjectClient {
   private ws: WebSocket | null = null;
-  private readonly opts: CommuneClientOptions;
+  private readonly opts: AbjectClientOptions;
   private pending: Map<number, Pending> = new Map();
   private nextId = 1;
   private ready = false;
   private closed = false;
   private authAttempt = 0;
 
-  constructor(opts: CommuneClientOptions) {
+  constructor(opts: AbjectClientOptions) {
     this.opts = opts;
   }
 
@@ -307,6 +346,38 @@ export class CommuneClient {
     if (value !== undefined) params.value = value;
     if (option !== undefined) params.option = option;
     return this.request('respondDialog', params);
+  }
+
+  /** Every question waiting on the person, oldest first (permission prompts, confirmations). */
+  listDialogs(): Promise<DialogInfo[]> {
+    return this.request('listDialogs');
+  }
+
+  /** The backend's version, edition, readiness and whether it has a display. */
+  instanceInfo(): Promise<InstanceSummary> {
+    return this.request('instanceInfo');
+  }
+
+  /** True once a model credential or tier is set. */
+  isConfigured(): Promise<boolean> {
+    return this.request('isConfigured');
+  }
+
+  /** Stop the backend this client is connected to. */
+  shutdown(): Promise<boolean> {
+    return this.request('shutdown');
+  }
+
+  listProjects(workspaceId: string): Promise<ProjectRow[]> {
+    return this.request('listProjects', { workspaceId });
+  }
+
+  setProjectTrusted(workspaceId: string, name: string, trusted: boolean): Promise<unknown> {
+    return this.request('setProjectTrusted', { workspaceId, name, trusted });
+  }
+
+  setProjectAutonomy(workspaceId: string, name: string, autonomy: string): Promise<unknown> {
+    return this.request('setProjectAutonomy', { workspaceId, name, autonomy });
   }
 
   get isReady(): boolean {

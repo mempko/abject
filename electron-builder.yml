@@ -20,6 +20,10 @@ files:
   - dist-server/**/*
   - dist-client/**/*
   - node_modules/node-datachannel/**/*
+  # The pseudo-terminal for the CLI-agent providers. External to the server
+  # bundle: it loads its platform package (@lydell/node-pty-<os>-<arch>) by
+  # name at runtime.
+  - node_modules/@lydell/**/*
   - node_modules/ws/**/*
   - node_modules/uuid/**/*
   - node_modules/ajv/**/*
@@ -38,6 +42,10 @@ extraResources:
       - "**/*.wasm"
       # Package docs, including the ask guide a package names in abject.json.
       - "**/*.md"
+  # The `abject` command, run on the app's own binary as Node by the launcher
+  # electron/afterPack.cjs writes beside it (see electron/cli-command.ts).
+  - from: dist-cli/abject.mjs
+    to: cli/abject.mjs
 
 # Workers and native .node binaries must be unpacked from asar
 # (worker_threads and dlopen cannot load from inside asar archives)
@@ -45,6 +53,8 @@ asarUnpack:
   - dist-server/workers/**/*
   - node_modules/node-datachannel/**/*.node
   - node_modules/node-datachannel/**/prebuilds/**/*
+  # node-pty's addon, and on macOS its spawn-helper executable
+  - node_modules/@lydell/**/*
 
 linux:
   target:

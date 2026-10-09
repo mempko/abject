@@ -30,11 +30,11 @@ test('built-in profiles: default is today\'s full set, service has no agents and
 });
 
 test('a configured profile: AbjectStore added, dependency order, UI split out, requirements enforced', () => {
-  const ok = buildProfile('org', 'One organization', ['WebExposure', 'SharedState', 'NotificationCenter']);
+  const ok = buildProfile('org', 'One organization', ['WebExposure', 'Settings', 'SharedState', 'NotificationCenter']);
   assert.ok('profile' in ok);
-  assert.deepEqual([...ok.profile.objects], ['AbjectStore', 'SharedState', 'WebExposure'],
+  assert.deepEqual([...ok.profile.objects], ['AbjectStore', 'SharedState', 'NotificationCenter', 'WebExposure'],
     'AbjectStore is always there, and the order is the spawn order');
-  assert.deepEqual([...ok.profile.ui], ['NotificationCenter']);
+  assert.deepEqual([...ok.profile.ui], ['Settings']);
 
   const missing = buildProfile('broken', '', ['Taskbar']);
   assert.ok('error' in missing);

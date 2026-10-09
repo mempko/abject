@@ -429,7 +429,8 @@ export class AbjectStore extends Abject {
       catch (err) { log.warn(`could not subscribe to Registry: ${err instanceof Error ? err.message : String(err)}`); }
     }
 
-    // Discover WidgetManager so we can tag spawned objects with our workspace
+    // On a desktop, WidgetManager is told which workspace each object belongs
+    // to so its windows show with that workspace. A headless instance has none.
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
 
     // Load existing snapshots from Storage
@@ -457,22 +458,19 @@ export class AbjectStore extends Abject {
   }
 
   /**
-   * Lazily discover our workspace ID from WidgetManager.
-   * Called at use-time (not init-time) because WorkspaceManager assigns
-   * our workspace after our init completes.
+   * Our workspace id, from the workspace registry we were spawned into. It is
+   * what user typeIds (`{peer}/{workspace}/user/{Name}`) are made of, so it
+   * must not depend on anything that draws windows.
    */
   private async ensureWorkspaceId(): Promise<string | undefined> {
     if (this.workspaceId) return this.workspaceId;
-    if (!this.widgetManagerId) return undefined;
+    const registryId = await this.resolveRegistryId();
+    if (!registryId) return undefined;
     try {
-      const ws = await this.request<string | null>(
-        request(this.id, this.widgetManagerId, 'getObjectWorkspace', {
-          objectId: this.id,
-        })
-      );
+      const ws = await this.request<string | null>(request(this.id, registryId, 'getWorkspaceId', {}));
       this.workspaceId = ws ?? undefined;
     } catch {
-      // WidgetManager may not be ready
+      // The global registry has no workspace; neither do we.
     }
     return this.workspaceId;
   }

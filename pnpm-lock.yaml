@@ -90,6 +90,25 @@ importers:
       vite:
         specifier: ^5.0.0
         version: 5.4.21(@types/node@25.2.2)
+    optionalDependencies:
+      '@lydell/node-pty-darwin-arm64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
+      '@lydell/node-pty-darwin-x64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
+      '@lydell/node-pty-linux-arm64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
+      '@lydell/node-pty-linux-x64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
+      '@lydell/node-pty-win32-arm64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
+      '@lydell/node-pty-win32-x64':
+        specifier: 1.2.0-beta.15
+        version: 1.2.0-beta.15
 
 packages:
 

@@ -5,7 +5,7 @@
  * Communication with the main thread is via structured clone messages.
  */
 
-import { AbjectId } from '../src/core/types.js';
+import { AbjectId, TypeId } from '../src/core/types.js';
 import { Abject } from '../src/core/abject.js';
 import { WorkerBus } from '../src/runtime/worker-bus.js';
 import type { WorkerInboundMessage } from '../src/runtime/worker-bridge.js';
@@ -105,6 +105,7 @@ async function spawnObject(
   constructorArgs?: unknown,
   registryId?: AbjectId,
   parentId?: AbjectId,
+  typeId?: TypeId,
 ): Promise<void> {
   const factory = constructors.get(constructorName);
   if (!factory) {
@@ -119,6 +120,7 @@ async function spawnObject(
   try {
     const obj = factory(constructorArgs);
     obj.setId(objectId);
+    if (typeId) obj.setTypeId(typeId);
 
     // Pre-seed registry hint so the object can discover dependencies
     if (registryId) {
@@ -165,8 +167,8 @@ self.onmessage = async (event: MessageEvent<WorkerInboundMessage>) => {
 
   switch (type) {
     case 'spawn': {
-      const { objectId, constructorName, constructorArgs, registryId, parentId } = event.data;
-      await spawnObject(objectId!, constructorName!, constructorArgs, registryId, parentId);
+      const { objectId, constructorName, constructorArgs, registryId, parentId, typeId } = event.data;
+      await spawnObject(objectId!, constructorName!, constructorArgs, registryId, parentId, typeId);
       break;
     }
 

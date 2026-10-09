@@ -1,0 +1,25 @@
+{
+    "version": "{{version}}",
+    "description": "Distributed object system where agents work through messages between objects (headless edition, the abject command)",
+    "homepage": "https://abject.world",
+    "license": "{{license}}",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/mempko/abject/releases/download/v{{version}}/abject-{{version}}-win-x64.zip",
+            "hash": "{{sha256_win_x64}}",
+            "extract_dir": "abject-{{version}}-win-x64"
+        }
+    },
+    "bin": "abject.exe",
+    "notes": "Run `abject` to set up and start chatting. The backend keeps running in the background; `abject stop` stops it. Update with `scoop update abject`.",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/mempko/abject/releases/download/v$version/abject-$version-win-x64.zip",
+                "hash": { "url": "$url.sha256" },
+                "extract_dir": "abject-$version-win-x64"
+            }
+        }
+    }
+}

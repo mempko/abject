@@ -18,7 +18,7 @@ Main source directory for the Abjects system. All TypeScript modules organized b
 
 ## Entry Point
 
-`index.ts` is the public API re-export barrel. It re-exports all types, objects, and utilities from the various modules. The system bootstrap lives in `server/index.ts`.
+`index.ts` is the public API re-export barrel. It re-exports all types, objects, and utilities from the various modules. The system bootstrap lives in `server/boot.ts` (both editions), with the desktop's display layer in `server/ui-layer.ts`.
 
 ## Import Convention
 

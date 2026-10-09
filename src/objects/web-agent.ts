@@ -88,6 +88,8 @@ interface ObservedPage {
 // ─── WebAgent ───────────────────────────────────────────────────────
 
 export class WebAgent extends Abject {
+  /** False on an instance with no display (the headless edition): no live page takeover. */
+  private display = true;
   private webBrowserId?: AbjectId;
   private httpClientId?: AbjectId;
   private consoleId?: AbjectId;
@@ -259,7 +261,7 @@ export class WebAgent extends Abject {
 
 ### What I Handle
 I am the agent for tasks that require a REAL WEB BROWSER with interactive navigation.
-I open a browser, navigate to URLs, and use an LLM-driven loop to complete web tasks. The browser engine runs headless, but the user is never locked out: a live viewer window on their desktop shows my pages, and I can hand them direct control of a page at any point (their real mouse and keyboard are replayed into it).
+I open a browser, navigate to URLs, and use an LLM-driven loop to complete web tasks. The browser engine runs headless, and on a desktop the user is never locked out: a live viewer window shows my pages, and I can hand them direct control of a page at any point (their real mouse and keyboard are replayed into it).
 
 Examples of tasks I handle well:
 - Filling out forms, clicking buttons, navigating multi-page workflows
@@ -272,7 +274,7 @@ Examples of tasks I handle well:
 - Opening a site and handing the user live control so they can click around themselves
 
 ### Interactive browsing with the user — YES, I support it
-When the user wants to see a live page or drive it themselves ("open X and let me click around", "let me log in myself", "show me the site so I can poke at it"), the answer is YES. My \`request_human\` action opens a live viewer window on the user's desktop, focused on my page, with a prompt to take control. While they are in control, their mouse movements, clicks, scrolling, typing, and pastes are replayed into the real page as trusted input; the view refreshes continuously. When they hand back, I continue the task with whatever they did (logins, cookies, navigation) intact.
+When the user wants to see a live page or drive it themselves ("open X and let me click around", "let me log in myself", "show me the site so I can poke at it"), the answer is YES on an instance with a display. My \`request_human\` action opens a live viewer window on the user's desktop, focused on my page, with a prompt to take control. While they are in control, their mouse movements, clicks, scrolling, typing, and pastes are replayed into the real page as trusted input; the view refreshes continuously. When they hand back, I continue the task with whatever they did (logins, cookies, navigation) intact.
 
 Concrete task shape for "open <url> and let the user click around":
   runTask({ task: 'Navigate to <url>, then use request_human with wait: "takeover" to hand the user live control of the page so they can explore. As soon as they take control, finish with done and keepPageOpen: true — do not wait for them to hand back.', options: { startUrl: '<url>', keepPageOpen: true } })
@@ -490,6 +492,7 @@ Set keepPageOpen: false to explicitly close the page when done.
   }
 
   protected override async onInit(): Promise<void> {
+    await this.learnDisplay();
     this.webBrowserId = await this.requireDep('WebBrowser');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
     this.agentAbjectId = await this.requireDep('AgentAbject');
@@ -2069,6 +2072,20 @@ Set keepPageOpen: false to explicitly close the page when done.
 ${taskText}`;
   }
 
+  /**
+   * Whether this instance has a display, from InstanceInfo. Handing a live
+   * page to the person needs a viewer window, so the prompt offers it only
+   * where there is one.
+   */
+  private async learnDisplay(): Promise<void> {
+    const infoId = await this.discoverDep('InstanceInfo');
+    if (!infoId) return;
+    try {
+      const info = await this.request<{ display?: boolean }>(request(this.id, infoId, 'getInfo', {}), 5000);
+      if (typeof info?.display === 'boolean') this.display = info.display;
+    } catch { /* keep the default: a display */ }
+  }
+
   private buildSystemPrompt(): string {
     return `You are WebAgent, an autonomous browser agent with vision. You see each page two ways: an accessibility tree (the ARIA snapshot), where each interactive element has a ref like [ref=e5], and, when a vision model is configured, a screenshot of the visible part of the page. You act through refs, or through a real mouse and keyboard aimed at the screenshot.
 
@@ -2163,7 +2180,7 @@ Whatever sits below the visible area is outside the screenshot: scroll, and the 
   For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
   For APIs or plain-text endpoints, use fetch: { "action": "extract", "script": "fetch('https://api.example.com/data').then(r => r.json())" }
 
-### Human handoff (live takeover)
+${this.display ? `### Human handoff (live takeover)
 - request_human: Open a live viewer on the user's desktop and ask them to take control of your page. Their real mouse and keyboard are replayed into the page as trusted input. Two modes via "wait":
   1. wait: "handback" (default) — for a step only a human can complete: interactive verification challenges ("verify you are human" checkboxes, image puzzles), on-page consent screens, or a login they prefer to do themselves. The action returns when the user hands control back; then re-observe the page and retry the blocked step ONCE before deciding the outcome.
      { "action": "request_human", "reason": "Complete the human-verification checkbox, then hand control back" }
@@ -2172,7 +2189,10 @@ Whatever sits below the visible area is outside the screenshot: scroll, and the 
   The reason is shown to the user next to the live page; write it as a short, concrete instruction. Your page and profile stay intact — whatever the user completes (cookies, session, navigation) persists. If no human is available, the action fails and you should fall back to "fail" with a reason as described below.
   Note on anti-bot challenges: a headless browser fails Cloudflare Turnstile and similar checks even when a human clicks them. For that reason, a handback request_human automatically upgrades the page to a real (headful) browser and re-navigates to the current URL before handing over, so the human's click actually passes. This upgrade happens on the browser-check page (before you fill any form), so prefer calling request_human the moment such a check appears rather than after filling fields you'd lose to the reload.
 
-### Scrum escalation
+` : `### Human handoff
+- request_human is unavailable here: this instance has no display, so nobody can take over a live page. When a step only a human can complete blocks you (a verification challenge, a login the user wants to do themselves, an on-page approval), end with "fail" whose reason names exactly what the user needs to do, or what to send you (credentials, a code). Pass keepPageOpen: true when the page should survive until they answer.
+
+`}### Scrum escalation
 If the browser task is too broad, belongs to another specialist, or needs multiple independent work streams, do not split it yourself. Use fail with a concise reason and, when useful, a proposed split. ScrumMaster will review the failure and plan the next scrum with the team.
 
 ### Scratchpad (data handoff to downstream tasks)
@@ -2211,10 +2231,10 @@ If you land on a sign-in or "session expired" page and the task expects you to b
 
 For 2FA / OTP / device-approval mid-flow with no code supplied, call "fail" with reason \`otp_required: ask the user for the code, then re-run with the same profile\`. Pass \`keepPageOpen: true\` so the page survives until the user supplies the code.
 
-If a human-verification challenge blocks you (a "verify you are human" checkbox, an image puzzle, a browser check that fails when you interact with it), use \`request_human\` — the user completes it live in your own page and profile, then you continue.
+${this.display ? 'If a human-verification challenge blocks you (a "verify you are human" checkbox, an image puzzle, a browser check that fails when you interact with it), use \`request_human\` — the user completes it live in your own page and profile, then you continue.' : 'If a human-verification challenge blocks you (a "verify you are human" checkbox, an image puzzle, a browser check that fails when you interact with it), end with "fail" naming the challenge and the site: this instance has no display for the user to complete it on.'}
 
 ## What the User Sees
-The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself. When the user should interact with the live page — because a step needs a human (verification challenge, on-screen approval) or because the task asks to let them browse it themselves — use \`request_human\`: it opens a live view where the user CAN click and type in your page, and returns when they finish. When the missing piece is information rather than interaction (credentials, OTP codes), end with a "fail" whose reason names exactly what to ask the user for.
+The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself. ${this.display ? 'When the user should interact with the live page — because a step needs a human (verification challenge, on-screen approval) or because the task asks to let them browse it themselves — use \`request_human\`: it opens a live view where the user CAN click and type in your page, and returns when they finish. ' : ''}When the missing piece is information rather than interaction (credentials, OTP codes), end with a "fail" whose reason names exactly what to ask the user for.
 
 ## Rules
 1. Target elements by "ref" when the snapshot has them (the ref, e.g. "e5", comes from [ref=eN] annotations); aim the pointer at the screenshot for what the snapshot cannot name.

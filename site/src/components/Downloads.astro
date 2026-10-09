@@ -13,7 +13,7 @@ const { num = '05', head = true } = Astro.props;
 const rel = await latestRelease();
 const pa = platformAssets(rel);
 const version = rel.version;
-const hasCommune = !!(pa.communeLinux || pa.communeWin || pa.communeMac);
+const hasHeadless = !!(pa.headlessLinux || pa.headlessLinuxArm || pa.headlessMacArm || pa.headlessMacX64 || pa.headlessWin);
 
 const size = (a?: { size: number }) => fmtSize(a?.size);
 const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
@@ -102,30 +102,34 @@ const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
       </span>
     </p>
 
-    <div class:list={['dl-companions', { split: hasCommune }]}>
-      {hasCommune && (
-        <div class="dl-companion" data-companion="commune">
+    <div class:list={['dl-companions', { split: hasHeadless }]}>
+      {hasHeadless && (
+        <div class="dl-companion" data-companion="abject">
           <p class="side-label dl-companion-head">
-            <span class="dl-companion-title">commune, the terminal client</span>
-            <span class="tag brass dl-companion-tag">companion</span>
+            <span class="dl-companion-title">abject, the command line</span>
+            <span class="tag brass dl-companion-tag">no screen needed</span>
           </p>
           <p class="dl-companion-desc">
-            Your chats, goals and permission prompts in the terminal, in tabs. It's a
-            single file with nothing to install. It connects to the desktop app, so the
-            app has to be running.<sup>†</sup>
+            The same agents in a terminal: on a server, over SSH, or on a machine with no
+            screen. It starts its own backend in the background, and the backend keeps
+            working after you quit. When the desktop app is open, it talks to that instead.<sup>†</sup>
           </p>
+          <pre class="dl-install"><code>curl -fsSL https://abject.world/install.sh | sh</code></pre>
+          <pre class="dl-install"><code>irm https://abject.world/install.ps1 | iex</code><span class="dl-install-os">Windows</span></pre>
           <div class="dl-companion-links">
-            {pa.communeLinux && <a href={pa.communeLinux.url} rel="noopener">Linux (x64)</a>}
-            {pa.communeWin && <a href={pa.communeWin.url} rel="noopener">Windows (x64)</a>}
-            {pa.communeMac && <a href={pa.communeMac.url} rel="noopener">macOS (Apple&nbsp;Silicon)</a>}
+            {pa.headlessLinux && <a href={pa.headlessLinux.url} rel="noopener">Linux (x64)</a>}
+            {pa.headlessLinuxArm && <a href={pa.headlessLinuxArm.url} rel="noopener">Linux (ARM64)</a>}
+            {pa.headlessMacArm && <a href={pa.headlessMacArm.url} rel="noopener">macOS (Apple&nbsp;Silicon)</a>}
+            {pa.headlessMacX64 && <a href={pa.headlessMacX64.url} rel="noopener">macOS (Intel)</a>}
+            {pa.headlessWin && <a href={pa.headlessWin.url} rel="noopener">Windows (x64)</a>}
           </div>
           <p class="dl-companion-foot">
-            † It's only a view. All the abjects live in the desktop app.
+            † The desktop app comes with the command too, so one command works with either.
           </p>
         </div>
       )}
 
-      {hasCommune && <div class="rule" aria-hidden="true"></div>}
+      {hasHeadless && <div class="rule" aria-hidden="true"></div>}
 
       <div class="dl-companion" data-companion="phone">
         <p class="side-label dl-companion-head">
@@ -406,6 +410,29 @@ const href = (a?: { url: string }) => a?.url ?? LATEST_URL;
   }
 
   .dl-companion-links a:hover { text-decoration-color: var(--red); }
+
+  .dl-install {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0 0 0.6rem;
+    padding: 0.55rem 0.8rem;
+    border: 1px solid var(--rule);
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--bone-heading);
+  }
+
+  .dl-install:last-of-type { margin-bottom: 0.9rem; }
+
+  .dl-install-os {
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--bone-meta);
+  }
 
   .dl-companion-foot {
     margin-top: 1rem;

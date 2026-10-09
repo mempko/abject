@@ -10,11 +10,22 @@ Abjects is an LLM-mediated distributed object system where objects communicate v
 
 ```bash
 pnpm conjure                      # Gather dependencies
-pnpm awaken                       # Awaken the backend (ws://localhost:7719)
+pnpm awaken                       # Awaken the backend, desktop edition (ws://localhost:7719)
+pnpm awaken:headless              # Awaken the headless edition: no display, no WidgetManager
 pnpm scry                         # Scry into the abyss (http://localhost:5174)
 pnpm whisper                      # Start P2P signaling server (:7720)
-pnpm incarnate:server             # Package the headless server + systemd unit (deploy/README.md)
+pnpm abject                       # The `abject` command line: chat TUI, setup, start/stop, questions
+pnpm incarnate                    # Build the desktop app's bundles (then incarnate:linux|win|mac)
+pnpm incarnate:headless           # Package the headless edition: one dir, `abject` binary + lib/
 ```
+
+Two editions share one bootstrap. **Desktop** (`server/index.ts`, also what
+the Electron app imports) is `server/boot.ts` plus the display layer in
+`server/ui-layer.ts`. **Headless** (`server/headless.ts`) is `boot.ts` alone,
+with its own worker entries and bundles; `build-server.mjs` checks that those
+bundles carry no display code (`scripts/headless-bundle-check.mjs`). Each
+running backend writes `instance.json` (pid, edition, ports, owner token) into
+its data directory; that is how the `abject` command finds it.
 
 ## Project Structure
 
@@ -30,8 +41,16 @@ src/
   network/              # Transport abstraction, WebSocket, MockTransport
   sandbox/              # Packages (WASM + script): discovery, packages.json, ingest; WASM ABI, instance, module store
   ui/                   # App shell, Canvas Compositor
+server/
+  boot.ts               # The bootstrap both editions run: core registrations, spawns, shutdown
+  ui-layer.ts           # The desktop's display layer (UIServer, WidgetManager, windows, UI worker)
+  index.ts, headless.ts # Edition entries
 workers/
-  abject-worker-node.ts # worker_threads entry point for the shared Abject pool
+  core-constructors.ts  # Constructors every pool worker knows (both editions)
+  ui-constructors.ts    # Constructors only the desktop's pool worker adds
+  abject-worker-node.ts, abject-worker-headless.ts  # Pool worker entries per edition
+cli/                    # The `abject` command: TUI, setup, start/stop/serve, service, update, doctor
+electron/               # Desktop app main process; ships the `abject` command in resources/cli
 native/                 # Bundled WASM system packages (committed main.wasm, e.g. C++ KnowledgeBase)
 sdk/cpp/                # C++ SDK for writing WASM abjects
 sdk/script/             # TypeScript types for script packages
@@ -110,7 +129,8 @@ Every system service follows this pattern:
 
 ### New Global Object
 
-Global objects are singletons spawned once during bootstrap in `server/index.ts`.
+Global objects are singletons spawned once during bootstrap in `server/boot.ts`
+(or, for objects that need a display, in `server/ui-layer.ts`).
 
 1. Create file in appropriate directory
 2. Extend `Abject` with full manifest (include complete `InterfaceDeclaration` with method params, returns, descriptions)
@@ -119,7 +139,8 @@ Global objects are singletons spawned once during bootstrap in `server/index.ts`
 5. Override `checkInvariants()` calling `super.checkInvariants()` first
 6. Export well-known ID constant
 7. Add to `src/index.ts` exports
-8. Register its constructor and spawn it in `server/index.ts` `main()`
+8. Register its constructor and spawn it in `server/boot.ts` `bootServer()`; one that draws
+   windows goes in `server/ui-layer.ts` instead, so the headless edition never loads it
 
 ### New Per-Workspace Object
 
@@ -127,15 +148,23 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 
 1. Create file in `src/objects/`
 2. Extend `Abject` with full manifest, handlers, contracts, well-known ID (same as global)
-3. Register constructor in **`server/index.ts`**: `runtime.objectFactory.registerConstructor('Name', () => new MyAbject())`
-4. Register constructor in **`workers/abject-worker-node.ts`**: import + `constructors.set('Name', () => new MyAbject())`
-5. (Optional) Mark worker-eligible in `server/index.ts` `workerEligible` array if it should run in a worker thread
+3. Register constructor on the main thread in **`server/boot.ts`**: `runtime.objectFactory.registerConstructor('Name', () => new MyAbject())`
+   (a UI Abject: `registerConstructors()` in **`server/ui-layer.ts`**)
+4. Register constructor for the pool workers in **`workers/core-constructors.ts`**: import + `map.set('Name', () => new MyAbject())`
+   (a UI Abject: **`workers/ui-constructors.ts`**)
+5. (Optional) Mark worker-eligible in the `workerEligible` array in `server/boot.ts` (UI: `server/ui-layer.ts`) if it should run in a worker thread
 6. Add to spawn list in **`src/objects/workspace-manager.ts`**:
    - `INFRA_OBJECTS` — non-UI Abjects (always spawned, including for inactive workspaces)
    - `UI_OBJECTS` — Abjects with show/hide windows (only spawned for active workspaces)
 7. Export from `src/index.ts`
 
-**CRITICAL**: Forgetting the `workers/abject-worker-node.ts` registration causes silent spawn failures when workers are enabled. Always register in both places.
+**CRITICAL**: Forgetting the worker registration (`workers/core-constructors.ts` or `workers/ui-constructors.ts`) causes silent spawn failures when workers are enabled. Always register in both places.
+
+A non-UI Abject must not import UI modules (widgets, `sidebar.ts`, WidgetManager): the
+headless bundle check fails the build. To learn whether there is a display, ask
+`InstanceInfo` (`getInfo` reports `edition` and `display`); to ask the person something,
+use `this.confirm()` / `this.prompt()`, which go to `DialogBroker` and reach whoever
+answers (a window on the desktop, the `abject` command in a terminal).
 
 ### New Capability Object
 
@@ -208,7 +237,7 @@ enforcement) are owned by `SettingsManager` (`src/objects/settings-manager.ts`):
 it persists them, validates writes, applies them to LLM, UIServer and the
 capability objects, and emits `settingsChanged`. `GlobalSettings` is only its
 window, and `CliServer` exposes the same `getSettingsSchema` / `getSettings` /
-`setSettings` to `commune`. Add a field to the section's type, `schema()`
+`setSettings` to the `abject` command. Add a field to the section's type, `schema()`
 and the section's setter in SettingsManager; then show it in the window. Only
 GlobalSettings and CliServer may write, and only GlobalSettings may read secrets.
 
@@ -239,21 +268,24 @@ A built-in provider (compiled into the server):
 - **Compositor**: Needs a real `HTMLCanvasElement`
 - **Sequence numbers**: Per-sender, tracked in module-level state in `message.ts`; use `resetSequence()` in tests
 - **Import extensions**: Always use `.js` in imports even though source files are `.ts`
-- **Bootstrap**: Global system objects must be registered and spawned in `server/index.ts`.
-- **Worker constructors**: Per-workspace Abjects must have their constructors registered in BOTH `server/index.ts` AND `workers/abject-worker-node.ts`. Missing the worker registration causes silent spawn failures.
+- **Bootstrap**: Global system objects must be registered and spawned in `server/boot.ts` (display objects: `server/ui-layer.ts`).
+- **Worker constructors**: Per-workspace Abjects must have their constructors registered in BOTH `server/boot.ts` (or `ui-layer.ts`) AND `workers/core-constructors.ts` (or `ui-constructors.ts`). Missing the worker registration causes silent spawn failures.
+- **Headless edition**: there is no WidgetManager, WindowManager or UIServer in its registry. Code that looks them up must work when they are absent.
 
 ## Bootstrap Order
 
-Bootstrap happens in `server/index.ts`:
+Bootstrap happens in `server/boot.ts` `bootServer()`, with the desktop's `UiLayer`
+(`server/ui-layer.ts`) called at fixed points:
 
-1. `App` creates Canvas, Compositor, UIServer, Runtime
-2. `Runtime.start()` creates MessageBus, initializes Registry and Factory on the bus
-3. `main()` spawns: LLMObject, HttpClient, Storage, Timer, Clipboard, Console, FileSystem
-4. `main()` spawns: ProxyGenerator, Negotiator, HealthMonitor, ObjectCreator
-5. `main()` spawns: Workspaces, P2P, and remaining system objects
+1. `Runtime.start()` creates MessageBus, initializes Registry and Factory on the bus (desktop: the display server registers first)
+2. Spawns: LLMObject, HttpClient, Storage, Timer, Clipboard, Console, FileSystem
+3. Spawns: ProxyGenerator, Negotiator, HealthMonitor, ObjectCreator
+4. Spawns: DialogBroker (desktop: its presenters, then CliServer as responder, then sealed), SettingsManager, AuthGate
+5. Spawns: Workspaces, P2P, and remaining system objects (desktop: the windows over them)
+6. Writes `instance.json`; removes it first thing at shutdown
 
-When adding a new global system object, register its constructor and spawn it in `server/index.ts`.
-Per-workspace objects are spawned by `WorkspaceManager` — add them to `INFRA_OBJECTS` or `UI_OBJECTS` in `workspace-manager.ts`, and register their constructors in both `server/index.ts` and `workers/abject-worker-node.ts`.
+When adding a new global system object, register its constructor and spawn it in `server/boot.ts`.
+Per-workspace objects are spawned by `WorkspaceManager` — add them to `INFRA_OBJECTS` or `UI_OBJECTS` in `workspace-manager.ts`, and register their constructors in both `server/boot.ts` and `workers/core-constructors.ts` (UI: `server/ui-layer.ts` and `workers/ui-constructors.ts`).
 
 ## Dependencies
 

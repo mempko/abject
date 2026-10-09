@@ -6,6 +6,10 @@
  * reading files or the environment, which the script sandbox cannot do. The
  * same answer backs the local health endpoint (GET /healthz on the UI port),
  * so the two never disagree.
+ *
+ * It also says whether this instance has a display. A desktop build draws
+ * windows; a headless build has none, and agents that would otherwise offer a
+ * window, a screenshot or the desktop scene ask here first.
  */
 
 import { AbjectMessage, InterfaceId } from '../core/types.js';
@@ -17,6 +21,8 @@ export interface InstanceInfoSource {
   startedAt: number;
   /** Pool workers (0: everything on the main thread). */
   workerCount: number;
+  /** Which build is running: the desktop (with a display) or the headless server. */
+  edition: 'desktop' | 'headless';
   /** True once boot has finished and the instance serves. */
   ready(): boolean;
 }
@@ -30,6 +36,9 @@ export interface InstanceInfoReport {
   platform: string;
   arch: string;
   workerCount: number;
+  edition: 'desktop' | 'headless';
+  /** True when this instance can show windows (the desktop edition). */
+  display: boolean;
 }
 
 export function instanceReport(source: InstanceInfoSource): InstanceInfoReport {
@@ -42,6 +51,8 @@ export function instanceReport(source: InstanceInfoSource): InstanceInfoReport {
     platform: process.platform,
     arch: process.arch,
     workerCount: source.workerCount,
+    edition: source.edition,
+    display: source.edition === 'desktop',
   };
 }
 
@@ -51,8 +62,8 @@ export class InstanceInfo extends Abject {
       manifest: {
         name: 'InstanceInfo',
         description:
-          'This instance\'s running version, whether it has finished booting, uptime, Node version, platform, and worker count. ' +
-          'Ask it for the version an abject should report.',
+          'This instance\'s running version, whether it has finished booting, uptime, Node version, platform, worker count, ' +
+          'and whether it has a display (desktop) or none (headless). Ask it for the version an abject should report.',
         version: '1.0.0',
         interface: {
           id: 'abjects:instance-info' as InterfaceId,
@@ -61,7 +72,7 @@ export class InstanceInfo extends Abject {
           methods: [
             {
               name: 'getInfo',
-              description: 'Returns { version, ready, startedAt, uptimeSec, node, platform, arch, workerCount }.',
+              description: 'Returns { version, ready, startedAt, uptimeSec, node, platform, arch, workerCount, edition, display }. display is false on a headless instance: no windows, screenshots or desktop scene exist there.',
               parameters: [],
               returns: { kind: 'object', properties: {} },
             },
