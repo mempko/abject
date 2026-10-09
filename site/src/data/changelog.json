@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.15.0",
+    "date": "2026-10-09",
+    "title": "Native Knowledge and a Living Pattern Language",
+    "summary": "Your workspace's knowledge now lives in a native WebAssembly KnowledgeBase, and goal reviews now read the pattern language stored there. Lessons that keep coming back turn into full patterns on their own, so the system learns from the kinds of work you actually do.",
+    "highlights": [
+      "The KnowledgeBase is now a native C++ WebAssembly package that ships with the app and loads at every boot. The old TypeScript version is gone. It is marked as required, so the app stops at startup if the KnowledgeBase is missing instead of running without its memory.",
+      "Goal reviews now see your workspace's pattern language next to the record of what happened: the patterns that matched the work, patterns that are referenced but not yet written, and candidate lessons shown beside the matching patterns. Each section has a size limit so the goal itself always has room.",
+      "Recurring lessons become patterns automatically: when a review sees work that repeats an earlier candidate lesson, the reviewer promotes that lesson to a full pattern instead of waiting for someone to do it by hand.",
+      "Plans can say which patterns they intend to use, and those choices are now recorded in the KnowledgeBase. Reviews show which of those patterns have recorded applications and which do not.",
+      "Pattern weaving can now start from patterns already in use and follow their links, can be limited by scope, and records a 'no effect' verdict alongside helpful, harmful and inconclusive.",
+      "WebAssembly packages can include an ask guide: a usage guide in markdown, plus the model tier for answers, that is added to the abject's ask prompt so others can learn how to work with it. `pnpm forge` installs the guide with the module. Packages can also be marked required."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.14.9",
     "date": "2026-10-07",
     "title": "Stalled Goals Wake Up Again",
