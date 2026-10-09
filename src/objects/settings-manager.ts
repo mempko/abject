@@ -165,7 +165,7 @@ const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 const DECISION_GATES: DecisionGates[] = ['on', 'off'];
 const ENFORCEMENT_MODES: CapabilityEnforcementMode[] = ['off', 'warn', 'enforce'];
 
-/** Who may change settings: the Settings window and the terminal client's gateway. */
+/** Who may change settings by name: the Settings window and the terminal client's gateway. */
 const WRITERS = ['GlobalSettings', 'CliServer'] as const;
 /** Who may read secrets back. */
 const SECRET_READERS = ['GlobalSettings'] as const;
@@ -247,7 +247,7 @@ export class SettingsManager extends Abject {
               returns: { kind: 'reference', reference: 'SettingsBySection[section]' },
             },
             {
-              name: 'setSettings', description: 'Change some fields of one section. Validates the result, persists it and applies it. Taken from the Settings window and the terminal client only.',
+              name: 'setSettings', description: 'Change some fields of one section. Validates the result, persists it and applies it. Taken from the Settings window, the terminal client, and abjects inside a local workspace only.',
               parameters: [
                 { name: 'section', type: { kind: 'primitive', primitive: 'string' }, description: 'Section id' },
                 { name: 'values', type: { kind: 'object', properties: {} }, description: 'The fields to change; lists replace the whole list' },
@@ -319,7 +319,7 @@ export class SettingsManager extends Abject {
     });
 
     this.on('setSettings', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { section, values } = (msg.payload ?? {}) as { section?: string; values?: Record<string, unknown> };
       precondition(SETTINGS_SECTIONS.includes(section as SettingsSectionId), `Unknown settings section: ${section}. Sections: ${SETTINGS_SECTIONS.join(', ')}`);
       precondition(!!values && typeof values === 'object' && !Array.isArray(values), 'values must be an object of the fields to change');
@@ -336,7 +336,7 @@ export class SettingsManager extends Abject {
     });
 
     this.on('applyPreset', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { name } = (msg.payload ?? {}) as { name?: string };
       precondition(typeof name === 'string' && name.trim() !== '', 'name must be a preset name');
       await this.refreshKeyedCatalogs();
@@ -357,7 +357,7 @@ export class SettingsManager extends Abject {
     });
 
     this.on('savePreset', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { name, preset } = (msg.payload ?? {}) as { name?: string; preset?: TierPreset };
       precondition(typeof name === 'string' && name.trim() !== '', 'Give the preset a name first.');
       const source: TierPreset = preset ?? {
@@ -383,7 +383,7 @@ export class SettingsManager extends Abject {
     });
 
     this.on('deletePreset', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { name } = (msg.payload ?? {}) as { name?: string };
       precondition(typeof name === 'string' && !!this.savedPresets[name], 'Only saved presets can be deleted (built-ins stay).');
       delete this.savedPresets[name!];
@@ -409,7 +409,7 @@ export class SettingsManager extends Abject {
     // Prompt answers that change a rule: the Settings window raises the
     // prompts, and records an "always" answer here.
     this.on('setObjectCommandRule', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { objectName, commandName, rule } = (msg.payload ?? {}) as { objectName?: string; commandName?: string; rule?: string };
       precondition(typeof objectName === 'string' && objectName.trim() !== '', 'objectName must be a non-empty string');
       precondition(typeof commandName === 'string' && /^[^\s/\\]+$/.test(commandName), 'commandName must be a program name (no spaces or path separators)');
@@ -424,7 +424,7 @@ export class SettingsManager extends Abject {
     });
 
     this.on('addSkillGrant', async (msg: AbjectMessage) => {
-      await this.admit(msg, WRITERS);
+      await this.admit(msg, WRITERS, { allowLocalWorkspace: true });
       const { skillName, command } = (msg.payload ?? {}) as { skillName?: string; command?: string };
       precondition(typeof skillName === 'string' && skillName.trim() !== '', 'skillName must be a non-empty string');
       precondition(typeof command === 'string' && command.trim() !== '', 'command must be a non-empty string');
@@ -438,14 +438,48 @@ export class SettingsManager extends Abject {
   /**
    * Changes come from the Settings window and the terminal client's gateway,
    * both system objects (a user object calling itself one of them carries a
-   * namespaced typeId and is refused). Changing settings is the person's
-   * call, so agents and user objects read them but do not write them.
+   * namespaced typeId and is refused). Writes additionally admit abjects and
+   * agents running inside a LOCAL workspace this peer hosts: the person
+   * created that workspace and everything in it, so its abjects may change
+   * settings. Shared and public workspaces are refused, as are joined
+   * mirrors of remote workspaces (they keep accessMode 'local', so the
+   * joined flag decides, not the mode). Secret reads stay name-gated: no
+   * workspace abject may read credentials back.
    */
-  private async admit(msg: AbjectMessage, allowed: readonly string[]): Promise<void> {
+  private async admit(
+    msg: AbjectMessage,
+    allowed: readonly string[],
+    opts: { allowLocalWorkspace?: boolean } = {},
+  ): Promise<void> {
     const identity = await this.resolveCallerIdentity(msg.routing.from);
     const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-    precondition(!!identity && allowed.includes(identity.name) && typeSegments <= 3,
-      `SettingsManager takes this request from ${allowed.join(' or ')} only`);
+    if (identity && allowed.includes(identity.name) && typeSegments <= 3) return;
+    if (opts.allowLocalWorkspace && identity && (await this.callerInLocalWorkspace(msg.routing.from))) return;
+    precondition(
+      false,
+      `SettingsManager takes this request from ${allowed.join(' or ')}` +
+        (opts.allowLocalWorkspace ? ', or an abject in a local workspace' : '') + ' only',
+    );
+  }
+
+  /**
+   * True when the caller is registered inside a workspace this peer hosts in
+   * local mode, per WorkspaceManager's registry-backed lookup. Any lookup
+   * failure denies: without a trustworthy workspace answer there is no
+   * allowance.
+   */
+  private async callerInLocalWorkspace(callerId: AbjectId): Promise<boolean> {
+    const wmId = await this.discoverDep('WorkspaceManager');
+    if (!wmId) return false;
+    try {
+      const ws = await this.request<{ accessMode: string; joined?: boolean } | null>(
+        request(this.id, wmId, 'findWorkspaceForObject', { objectId: callerId }),
+        5000,
+      );
+      return !!ws && ws.accessMode === 'local' && ws.joined !== true;
+    } catch {
+      return false;
+    }
   }
 
   private isConfigured(): boolean {
