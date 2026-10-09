@@ -99,17 +99,21 @@ struct Pattern {
     section("Applies-to", applies_to);
     for (const Note& n : notes) section(n.heading.c_str(), n.body);
     if (learning.is_object()) {
-      std::set<std::string> helpful, harmful;
-      for (const auto& application : learning["applications"]) {
-        if (!application.is_object()) continue;
-        const auto goal = application.find("goalId"), verdict = application.find("verdict");
-        if (goal == application.end() || !goal->is_string() || verdict == application.end()) continue;
-        if (*verdict == "helpful") helpful.insert(goal->get<std::string>());
-        if (*verdict == "harmful") harmful.insert(goal->get<std::string>());
+      std::set<std::string> helpful, no_effect, harmful;
+      if (learning.contains("applications") && learning["applications"].is_array()) {
+        for (const auto& application : learning["applications"]) {
+          if (!application.is_object()) continue;
+          const auto goal = application.find("goalId"), verdict = application.find("verdict");
+          if (goal == application.end() || !goal->is_string() || verdict == application.end()) continue;
+          if (*verdict == "helpful") helpful.insert(goal->get<std::string>());
+          if (*verdict == "no_effect") no_effect.insert(goal->get<std::string>());
+          if (*verdict == "harmful") harmful.insert(goal->get<std::string>());
+        }
       }
-      section("Recorded evidence", "Revision " + learning["revision"].dump() + "; helpful in " +
-        std::to_string(helpful.size()) + " distinct goals; counterexamples in " + std::to_string(harmful.size()) +
-        " goals. " + (helpful.size() < 2 ? "Candidate: recurrence is not established." : "Recurrence recorded; applicability still depends on context."));
+      section("Recorded evidence", "Revision " + (learning.contains("revision") ? learning["revision"].dump() : std::string("1")) + "; helpful in " +
+        std::to_string(helpful.size()) + " distinct goals; no effect in " + std::to_string(no_effect.size()) +
+        "; counterexamples in " + std::to_string(harmful.size()) + " goals. " +
+        (helpful.size() < 2 ? "Candidate: recurrence is not established." : "Recurrence recorded; applicability still depends on context."));
     }
     if (!links.empty()) {
       out += "\n\n## Links";

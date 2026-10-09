@@ -30,7 +30,7 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 import { readPattern, readStructured, renderPatternText } from '../core/pattern.js';
-import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
+import type { KnowledgeEntry, KnowledgeType } from '../core/knowledge.js';
 import type { ListItem } from './widgets/list-widget.js';
 
 const log = new Log('KnowledgeBrowser');

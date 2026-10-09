@@ -12,7 +12,6 @@ import { PermissionBroker } from './permission-broker.js';
 import { GoalManager } from './goal-manager.js';
 import { ScrumMaster } from './scrum-master.js';
 import { TupleSpace } from './tuple-space.js';
-import { KnowledgeBase } from './knowledge-base.js';
 import { TaskReviewer } from './task-reviewer.js';
 import { RunningProcess } from './capabilities/running-process.js';
 import { ShellExecutor } from './capabilities/shell-executor.js';
@@ -47,7 +46,6 @@ class MemoryStore extends Endpoint {
 }
 class HeadlessBroker extends PermissionBroker { protected override async onInit(): Promise<void> {} }
 class HeadlessScrum extends ScrumMaster { protected override async onInit(): Promise<void> {} }
-class HeadlessKnowledge extends KnowledgeBase { protected override async onInit(): Promise<void> {} }
 class HeadlessReviewer extends TaskReviewer { protected override async onInit(): Promise<void> {} }
 
 async function fixture() {
@@ -164,7 +162,7 @@ test('replanning waits for retained work and preserves backlog membership on rep
 const pattern = JSON.stringify({ format: 1, name: 'VERIFY RESTORATION', context: 'persistent settings',
   forces: 'live success can conceal failed restoration', therefore: 'restore before acceptance', evidence: 'candidate', links: [] });
 
-for (const implementation of ['typescript', 'wasm'] as const) {
+for (const implementation of ['wasm'] as const) {
   test(`${implementation} KnowledgeBase supports the learning protocol through the bus`, async () => {
     const f = await fixture();
     const oldData = process.env.ABJECTS_DATA_DIR;
@@ -188,12 +186,7 @@ for (const implementation of ['typescript', 'wasm'] as const) {
         tags: ['pattern'], origin: 'agent', createdBy: 'fixture', createdAt: 1, updatedAt: 1, accessCount: 0, lastAccessedAt: 0 };
       storage.values.set(':knowledge-base:entry:legacy-pattern', legacy);
       storage.values.set(':knowledge-base:entry:structured-legacy', { ...legacy, id: 'structured-legacy', title: 'STRUCTURED LEGACY', content: pattern });
-      const kb = await f.add(source ? new WasmAbject({ manifest, source }) : new HeadlessKnowledge());
-      if (!source) {
-        (kb as any).entries.set(legacy.id, { ...legacy });
-        (kb as any).entries.set('structured-legacy', { ...legacy, id: 'structured-legacy', content: pattern });
-        await (kb as any).healPatterns();
-      }
+      const kb = await f.add(new WasmAbject({ manifest, source: source! }));
       for (const legacyId of ['legacy-pattern', 'structured-legacy']) {
         let selected: any;
         for (let tries = 0; tries < 50; tries++) {
@@ -207,7 +200,8 @@ for (const implementation of ['typescript', 'wasm'] as const) {
         const receipt = await caller.call(kb.id, 'beginPatternApplication', begin);
         assert.equal(receipt.success, true, JSON.stringify(receipt));
         assert.equal((await caller.call(kb.id, 'beginPatternApplication', begin)).duplicate, true);
-        assert.equal((await caller.call(kb.id, 'beginPatternApplication', { ...begin, context: 'conflicting intent' })).success, false);
+        // A second reason under the same identity is the same application used again: it joins the record.
+        assert.equal((await caller.call(kb.id, 'beginPatternApplication', { ...begin, context: 'second use in the same episode' })).success, true);
         // Updating after selection and before feedback must not relabel the episode.
         for (let revision = 2; revision <= 22; revision++) {
           assert.equal((await caller.call(kb.id, 'update', { id: legacyId, content: pattern, expectedRevision: revision })).success, true);
@@ -223,6 +217,7 @@ for (const implementation of ['typescript', 'wasm'] as const) {
         assert.equal(history.revision, 23); assert.equal(history.history.length, 20);
         assert.equal(history.applications.length, 1); assert.equal(history.applications[0].patternRevision, 1);
         assert.equal(history.applications[0].declaredContext, begin.context); assert.equal(history.applications[0].verdict, 'harmful');
+        assert.deepEqual(history.applications[0].declarations.map((d: any) => d.context), [begin.context, 'second use in the same episode']);
         await caller.call(kb.id, 'archive', { id: legacyId });
       }
       const reviewer: any = await f.add(new HeadlessReviewer());
@@ -248,7 +243,7 @@ for (const implementation of ['typescript', 'wasm'] as const) {
       assert.equal(JSON.parse(history.history[0].content).learning, undefined, 'history contains independent body snapshots');
       const found = await caller.call(kb.id, 'get', { id });
       assert.equal(found.usefulCount, 1); assert.deepEqual(found.pattern.learning, history);
-      assert.match(found.content, /helpful in 1 distinct goals; counterexamples in 1 goals/);
+      assert.match(found.content, /helpful in 1 distinct goals; no effect in 0; counterexamples in 1 goals/);
       for (let i = 0; i < 105; i++) await caller.call(kb.id, 'remember', { title: `persistent settings fact ${i}`, content: 'persistent settings', type: 'fact' });
       assert.equal((await caller.call(kb.id, 'weave', { query: 'persistent settings', limit: 1 })).patterns[0].id, id);
       if (source) {

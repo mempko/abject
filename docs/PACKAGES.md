@@ -49,6 +49,8 @@ A package is a directory with an `abject.json`:
 | `source` | Script packages: the built JavaScript (`main.js` after `pnpm forge`). A `.js` entry needs none |
 | `wasm`, `abi`, `build` | WASM packages: see `docs/WASM_ABI.md` |
 | `settings` | Optional. Settings the package needs, shown as a form in the Packages tab (below) |
+| `ask` | Optional, WASM packages. `{ "guide": "<markdown file>", "tier": "fast" \| "balanced" \| "smart" }`: the usage guide appended to the abject's `ask` prompt and the tier it answers at. The host answers `ask` itself, so a module supplies its guidance here. `pnpm forge` installs the guide file with the module |
+| `required` | Optional. `true` for a package the system cannot run without (a bundled native package with no built-in fallback): it stays enabled whatever `packages.json` says, the Packages tab refuses to disable it, and boot stops with an error when it fails to load |
 
 The manifest's `name` must equal the type name (`replaces`, or the package
 name) so Registry discovery finds the object.

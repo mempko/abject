@@ -46,17 +46,6 @@ export interface KnowledgeLearning {
   disputes: Array<{ explanation: string; scope: string; effectId: string }>;
   scope?: string;
 }
-export function knowledgeRef(entry: { id: string; updatedAt: number; learning?: KnowledgeLearning }): string {
-  return JSON.stringify([entry.id, entry.updatedAt, entry.learning?.revision ?? 0]);
-}
-export function preservesLearning(local?: KnowledgeLearning, remote?: KnowledgeLearning): boolean {
-  return !local || (!!remote && remote.revision >= local.revision && local.history.every(h => remote.history.some(r => r.effectId === h.effectId && canonical(r) === canonical(h))));
-}
-/** Scope is an explicit identity, never inferred from overlapping query words. */
-export function applicable(entry: { archived: boolean; learning?: KnowledgeLearning }, scope?: string): boolean {
-  return !entry.archived && (!scope || !entry.learning?.scope || entry.learning.scope === scope)
-    && !entry.learning?.supersessions.some(s => !s.scope || s.scope === scope);
-}
 /** A replacement changed in this decision must still be at the acknowledged revision. */
 export function replacementEffect(decision: LearningDecision, effect: LearningEffect): LearningEffect | undefined {
   return decision.effects.filter(e => e !== effect && e.input.id === effect.input.replacementId
@@ -76,7 +65,7 @@ export function validateLearningEffect(decision: LearningDecision, effect: Learn
   if (typeof p.id !== 'string' || !p.id) return 'Knowledge target is missing';
   if (p.action === 'record_pattern_application') {
     if (typeof p.applicationRef !== 'string' || !p.applicationRef) return 'Unresolved application reference';
-    if (!['helpful','harmful','inconclusive'].includes(String(p.verdict))) return 'Invalid pattern usefulness verdict';
+    if (!['helpful','no_effect','harmful','inconclusive'].includes(String(p.verdict))) return 'Invalid pattern usefulness verdict';
     if (p.outcome === 'unknown' && p.verdict !== 'inconclusive') return 'Unobserved application effects remain inconclusive';
   } else if (p.action === 'save_entry') {
     if (typeof p.title !== 'string' || !p.title.trim() || typeof p.content !== 'string' || !p.content.trim()) return 'New knowledge needs title and content';

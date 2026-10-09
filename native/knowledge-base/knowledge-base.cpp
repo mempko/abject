@@ -1,7 +1,8 @@
-// KnowledgeBase (C++/WASM) - native replacement for the TypeScript
-// KnowledgeBase system object.
+// KnowledgeBase (C++/WASM) - the workspace knowledge store. It took over
+// from a TypeScript implementation that no longer exists; its message
+// vocabulary for TypeScript callers is src/core/knowledge.ts.
 //
-// Same message surface and semantics: remember (dedup by normalized
+// Message surface: remember (dedup by normalized
 // title+type, optional origin provenance), recall (BM25 full-text,
 // title-boosted, snippets + scores, previews mode), weave (pattern
 // selection by context match plus link expansion), match
@@ -10,7 +11,7 @@
 // SharedState, and periodic distillation (stale entries are archived, not
 // deleted; only the archive itself is bounded by hard deletes).
 //
-// Differences from the TS version, by design of the WASM environment:
+// Design notes, shaped by the WASM environment:
 // - Persistence goes through the workspace Storage abject by message passing
 //   instead of a direct SQLite file: one key per entry
 //   ('knowledge-base:entry:<id>'), so a write serializes one entry, never
@@ -22,14 +23,24 @@
 //   literals (the documented agent usage). Full regex is unavailable:
 //   std::regex reports invalid patterns by exception, and exceptions do not
 //   exist in this build, so patterns with other metacharacters degrade to
-//   literal substring matching - the same fallback the TS version applies
-//   to invalid regexes.
+//   literal substring matching.
 // - Distillation runs on load and is throttled to once per 30 minutes,
-//   piggybacked on remember/update instead of a wall-clock timer.
+//   piggybacked on remember/update instead of a wall-clock timer: its
+//   thresholds are days long, and a store nobody writes to has nothing new
+//   to distill. Sync publishing is throttled too; a flush the throttle
+//   deferred asks the Timer capability for one wakeup (timerFired), so the
+//   change still reaches peers when nothing else touches the store. An idle
+//   store sets no timers.
+// - The legacy whole-array key is imported only into an empty store. The TS
+//   version re-imported missing ids once per install, guarded by a marker in
+//   its own SQLite file; without that marker a re-import would bring back
+//   entries forgotten since the migration.
 
 #include <abject/abject.hpp>
 
 #include <algorithm>
+#include <cstdio>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -53,8 +64,12 @@ static constexpr size_t MAX_ARCHIVED = 2000;
 static constexpr int64_t STALE_NEVER_ACCESSED_DAYS = 7;
 static constexpr int64_t STALE_INACTIVE_DAYS = 30;
 static constexpr int64_t ARCHIVED_PURGE_DAYS = 180;
+/// Declarations kept on one application; repeats past this add nothing new.
+static constexpr size_t MAX_DECLARATIONS = 20;
+/// Recent no_effect/harmful applications returned with a woven pattern.
+static constexpr size_t MAX_COUNTEREXAMPLES = 3;
 
-// ── Entry model (JSON shape identical to the TS KnowledgeEntry) ─────────
+// ── Entry model (JSON shape of KnowledgeEntry in src/core/knowledge.ts) ─
 
 static bool valid_origin(const std::string& o) {
   return o == "user" || o == "agent" || o == "reviewer" || o == "scrum";
@@ -146,9 +161,11 @@ struct Entry {
     }
     if (learning.is_object()) {
       std::string notices;
+      const auto scope_of = [](const json& d) { const auto sc = str_or(d, "scope", ""); return sc.empty() ? std::string("all scopes") : sc; };
+      const auto list = [this](const char* key) { return learning.contains(key) && learning[key].is_array() ? learning[key] : json::array(); };
+      for (const auto& d : list("disputes")) notices += "DISPUTED (" + scope_of(d) + "): " + str_or(d, "explanation", "") + "\n";
+      for (const auto& d : list("supersessions")) notices += "SUPERSEDED (" + scope_of(d) + "): use " + str_or(d, "replacementId", "") + "\n";
       if (!str_or(learning, "scope", "").empty()) notices += "Applies only in scope: " + str_or(learning, "scope", "") + "\n";
-      for (const auto& d : learning.value("disputes", json::array())) notices += "DISPUTED (" + str_or(d, "scope", "") + "): " + str_or(d, "explanation", "") + "\n";
-      for (const auto& d : learning.value("supersessions", json::array())) notices += "SUPERSEDED (" + str_or(d, "scope", "") + "): use " + str_or(d, "replacementId", "") + "\n";
       if (!notices.empty()) j["content"] = notices + j["content"].get<std::string>();
     }
     return j;
@@ -175,10 +192,10 @@ struct Entry {
   static Entry from_json(const json& j) {
     Entry e;
     if (j.contains("learning") && j["learning"].is_object()) e.learning = j["learning"];
-    e.id = j.value("id", std::string());
-    e.title = j.value("title", std::string());
-    e.content = j.value("content", std::string());
-    e.type = j.value("type", std::string("fact"));
+    e.id = str_or(j, "id", "");
+    e.title = str_or(j, "title", "");
+    e.content = str_or(j, "content", "");
+    e.type = str_or(j, "type", "fact");
     if (j.contains("tags") && j["tags"].is_array()) {
       for (const auto& t : j["tags"]) {
         if (t.is_string()) e.tags.push_back(t.get<std::string>());
@@ -200,6 +217,12 @@ struct Entry {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// What following a pattern did, judged after the fact. no_effect: it was
+/// followed and the state it promises did not come about or did not matter.
+static bool valid_feedback_verdict(const std::string& v) {
+  return v == "helpful" || v == "no_effect" || v == "harmful" || v == "inconclusive";
+}
 
 static bool valid_type(const std::string& t) {
   return t == "learned" || t == "fact" || t == "insight" || t == "reference" || t == "pattern";
@@ -238,10 +261,22 @@ static std::string normalize_title(const std::string& title) {
   return out;
 }
 
-static bool contains_ci(const std::string& haystack, const std::string& needle_lower) {
-  if (needle_lower.empty()) return false;
-  const std::string h = kb::to_lower_ascii(haystack);
-  return h.find(needle_lower) != std::string::npos;
+static bool contains_ci(const std::string& haystack, const std::string& needle_folded) {
+  if (needle_folded.empty()) return false;
+  return kb::fold_text(haystack).find(needle_folded) != std::string::npos;
+}
+
+/// A pattern's other names, as its Aliases section lists them.
+static std::vector<std::string> pattern_aliases(const std::string& content, const std::string& title) {
+  std::vector<std::string> out;
+  const auto p = kbpat::read(content, title);
+  if (!p) return out;
+  std::string cur;
+  for (char c : p->aliases + ",") {
+    if (c == ',' || c == ';' || c == '\n') { if (!kbpat::trim(cur).empty()) out.push_back(kbpat::trim(cur)); cur.clear(); }
+    else cur += c;
+  }
+  return out;
 }
 
 /// Regex metacharacters other than '|' mean the pattern is not a plain
@@ -287,7 +322,7 @@ class KnowledgeBase final : public Object {
         "generative pattern-language entries with Context/Forces/Therefore "
         "sections and links to related patterns). Knowledge "
         "persists across restarts and syncs across peers.",
-        "3.6.0", "abjects:knowledge-base");
+        "3.7.0", "abjects:knowledge-base");
 
     m.method("applyLearningDecision", "Apply an authenticated journaled correction with a durable idempotent receipt")
         .param("goalId", "string", "Evidence owner goal").param("decisionId", "string", "Durable decision")
@@ -316,12 +351,17 @@ class KnowledgeBase final : public Object {
         .returns("array");
     m.method("weave",
              "Select pattern entries (type 'pattern') whose contexts match "
-             "the query (BM25-ranked), then follow their links "
-             "references to pull in linked patterns. Returns { patterns, "
-             "dangling }: each pattern carries via ('matched' or "
-             "'linked-from: NAME'); dangling lists link names that resolve "
-             "to no pattern yet.")
-        .param("query", "string", "Goal or task description to match pattern contexts against")
+             "the query (BM25-ranked), then follow their links to pull in "
+             "linked patterns, best-supported links first. Pass `from` with "
+             "the ids of patterns a plan already follows to get what their "
+             "links lead to next. Returns { patterns, dangling, broken }: "
+             "each pattern carries via ('matched', or 'linked-from: NAME' "
+             "with how many goals used the two together), linkedFrom (the "
+             "patterns that link to it) and counterexamples (its recent "
+             "no_effect/harmful applications); dangling lists link names no "
+             "pattern holds yet, broken lists links to archived patterns.")
+        .param("query", "string", "Goal or task description to match pattern contexts against", true)
+        .param("from", "array", "Ids of patterns already in use, to expand their links", true)
         .param("limit", "number", "Max directly matched patterns (default 5)", true)
         .param("scope", "string", "Explicit applicability scope", true)
         .param("hops", "number", "Link-expansion depth (default 1, max 2)", true)
@@ -373,10 +413,11 @@ class KnowledgeBase final : public Object {
     m.method("beginPatternApplication", "Capture an application before execution using an opaque selection receipt")
         .param("id", "string", "Pattern ID").param("patternRef", "string", "Selection receipt")
         .param("applicationId", "string", "Stable episode identity").param("goalId", "string", "Goal ID")
-        .param("context", "string", "Reason for applying").returns("object");
+        .param("context", "string", "Reason for applying")
+        .param("scope", "string", "Where it is applied (plan revision, task, step)", true).returns("object");
     m.method("assessPatternApplication", "Attach feedback to a captured application without supplying a revision")
         .param("id", "string", "Pattern ID").param("applicationRef", "string", "Application receipt")
-        .param("goalId", "string", "Goal ID").param("verdict", "string", "helpful, harmful, inconclusive")
+        .param("goalId", "string", "Goal ID").param("verdict", "string", "helpful, no_effect, harmful, inconclusive")
         .param("evidence", "string", "Observed evidence").returns("object");
     m.method("recordPatternApplication", "Record contextual application evidence with an idempotent identity")
         .param("id", "string", "Pattern entry ID")
@@ -404,7 +445,7 @@ class KnowledgeBase final : public Object {
 
     // Load persisted entries from the workspace Storage abject (one key per
     // entry). Reads that arrive before the load completes see an empty
-    // store, mirroring the TS version's deferred SQLite open.
+    // store until the load finishes.
     request("@Storage", "keys", json::object(), [this](const Result& res) {
       std::vector<std::string> entry_keys;
       if (res.ok && res.payload.is_array()) {
@@ -431,9 +472,9 @@ class KnowledgeBase final : public Object {
     // just mean no sync, never a broken store).
     object_id_ = info.object_id;
 
-    // Peer identity for provenance and for breaking equal timestamps. Same
-    // source and same fallback as the TS KnowledgeBase, so both sides stamp
-    // ids drawn from ONE identity space -- a peerId tie-break across two
+    // Peer identity for provenance and for breaking equal timestamps. Every
+    // peer stamps ids drawn from ONE identity space (Identity's peerId, the
+    // object id until it resolves) -- a peerId tie-break across two
     // different id spaces would compare incomparable values.
     request("@Identity", "getIdentity", json::object(), [this](const Result& r) {
       if (r.ok && r.payload.is_object()) {
@@ -476,6 +517,8 @@ class KnowledgeBase final : public Object {
   int64_t last_distill_ms_ = 0;
   int64_t last_sync_ms_ = 0;
   bool sync_pending_ = false;
+  /// A one-shot Timer wakeup is on its way for a flush the throttle deferred.
+  bool sync_wakeup_armed_ = false;
   size_t pending_loads_ = 0;
 
   // ── Loading ────────────────────────────────────────────────────────────
@@ -585,7 +628,7 @@ class KnowledgeBase final : public Object {
         reject("Unresolved application reference"); return;
       }
       const auto verdict = str_or(payload, "verdict", ""), evidence = str_or(payload, "evidence", "");
-      if ((verdict != "helpful" && verdict != "harmful" && verdict != "inconclusive") || kbpat::trim(evidence).empty()) {
+      if (!valid_feedback_verdict(verdict) || kbpat::trim(evidence).empty()) {
         reject("Invalid feedback verdict or evidence"); return;
       }
       if ((*old)["verdict"] != "applied") {
@@ -596,21 +639,40 @@ class KnowledgeBase final : public Object {
       (*old)["verdict"] = verdict; (*old)["evidence"] = evidence;
     } else {
       const auto context = str_or(payload, "context", "");
+      const auto scope = str_or(payload, "scope", "");
       const auto receipt = json::parse(str_or(payload, "patternRef", ""), nullptr, false);
       if (kbpat::trim(context).empty() || !receipt.is_array() || receipt.size() != 2 || receipt[0] != id || !receipt[1].is_number_integer() || receipt[1] < 1) {
         reject("Unknown pattern selection; retrieve the pattern before applying it"); return;
       }
-      if (old != applications.end()) {
-        if ((*old)["patternRevision"] == receipt[1] && str_or(*old, "goalId", "") == goal && str_or(*old, "declaredContext", "") == context)
-          req.reply({{"success", true}, {"duplicate", true}, {"applicationRef", ref}});
-        else reject("Conflicting application identity");
-        return;
-      }
+      // A retry of a declaration already on record is answered first: it must
+      // still resolve after the selected revision has aged out of history.
       bool known = receipt[1] == pattern->learning["revision"];
       for (const auto& h : pattern->learning["history"]) if (h["revision"] == receipt[1]) known = true;
-      if (!known) { reject("Selected pattern revision is no longer available"); return; }
-      applications.push_back({{"id", ref}, {"goalId", goal}, {"context", context}, {"declaredContext", context},
-        {"verdict", "applied"}, {"evidence", "Declared before execution; effect not yet assessed"}, {"patternRevision", receipt[1]}, {"at", now_ms()}});
+      const json declaration = {{"context", context}, {"scope", scope}, {"patternRevision", receipt[1]}, {"at", now_ms()}};
+      if (old != applications.end()) {
+        if (str_or(*old, "goalId", "") != goal) { reject("Conflicting application identity"); return; }
+        // The same pattern applied again within one task or one plan is the
+        // same application, used once more: the declaration joins its record
+        // as evidence of how it was used, and the one verdict covers them all.
+        json& declarations = (*old)["declarations"];
+        if (!declarations.is_array()) {
+          declarations = json::array();
+          declarations.push_back({{"context", str_or(*old, "declaredContext", "")}, {"scope", ""}, {"patternRevision", (*old)["patternRevision"]}, {"at", int_or(*old, "at", 0)}});
+        }
+        for (const auto& d : declarations) {
+          if (str_or(d, "context", "") == context && str_or(d, "scope", "") == scope) {
+            req.reply({{"success", true}, {"duplicate", true}, {"applicationRef", ref}}); return;
+          }
+        }
+        if (!known) { reject("Selected pattern revision is no longer available"); return; }
+        if (declarations.size() >= MAX_DECLARATIONS) { req.reply({{"success", true}, {"duplicate", true}, {"applicationRef", ref}}); return; }
+        declarations.push_back(declaration);
+      } else {
+        if (!known) { reject("Selected pattern revision is no longer available"); return; }
+        applications.push_back({{"id", ref}, {"goalId", goal}, {"context", context}, {"declaredContext", context},
+          {"verdict", "applied"}, {"evidence", "Declared before execution; effect not yet assessed"}, {"patternRevision", receipt[1]},
+          {"declarations", json::array({declaration})}, {"at", now_ms()}});
+      }
     }
     Entry& e = it->second;
     e.content = pattern->to_json().dump();
@@ -636,7 +698,7 @@ class KnowledgeBase final : public Object {
       }
     }
     const auto verdict = str_or(application, "verdict", "");
-    if (verdict != "applied" && verdict != "helpful" && verdict != "harmful" && verdict != "inconclusive") {
+    if (verdict != "applied" && !valid_feedback_verdict(verdict)) {
       req.error("CONTRACT_VIOLATION", "Invalid application verdict"); return;
     }
     if (!pattern->learning.is_object()) pattern->learning = initial_learning();
@@ -725,27 +787,38 @@ class KnowledgeBase final : public Object {
               Entry& e = it->second;
 
               const json& prev = res.payload;
-              if (!res.ok || !prev.is_object() || !prev.contains("content") ||
-                  !prev["content"].is_string()) {
-                log(LogLevel::Warn, "Pattern \"" + e.title +
-                                        "\" was flattened and no snapshot still holds it");
-                return;
-              }
-              auto p = kbpat::read(prev["content"].get<std::string>(), e.title);
-              if (!p || kbpat::is_flattened(*p)) {
-                log(LogLevel::Warn, "Pattern \"" + e.title +
+              if (res.ok && prev.is_object() && restore_pattern_from(id, prev)) return;
+              // The per-entry key may postdate the damage; the legacy array's
+              // earlier snapshot can still hold the pattern whole.
+              request("@Storage", "getPrevious", {{"key", LEGACY_STORAGE_KEY}}, [this, id](const Result& legacy) {
+                auto still = entries_.find(id);
+                if (still == entries_.end()) return;
+                if (legacy.ok && legacy.payload.is_array()) {
+                  for (const auto& j : legacy.payload) {
+                    if (j.is_object() && str_or(j, "id", "") == id && restore_pattern_from(id, j)) return;
+                  }
+                }
+                log(LogLevel::Warn, "Pattern \"" + still->second.title +
                                         "\" was flattened before every surviving snapshot");
-                return;
-              }
-              if (!p->learning.is_object()) p->learning = initial_learning();
-              e.content = p->to_json().dump();
-              e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
-              index_.add(e.id, e.title, p->search_text(), e.tags);
-              save_entry(e);
-              changed("entryUpdated", e.to_presented_json());
-              log(LogLevel::Info,
-                  "Restored flattened pattern \"" + e.title + "\" from an earlier snapshot");
+              });
             });
+  }
+
+  /// Write back an earlier copy of a pattern when that copy is whole.
+  bool restore_pattern_from(const std::string& id, const json& snapshot) {
+    auto it = entries_.find(id);
+    if (it == entries_.end() || !snapshot.contains("content") || !snapshot["content"].is_string()) return false;
+    Entry& e = it->second;
+    auto p = kbpat::read(snapshot["content"].get<std::string>(), e.title);
+    if (!p || kbpat::is_flattened(*p)) return false;
+    if (!p->learning.is_object()) p->learning = initial_learning();
+    e.content = p->to_json().dump();
+    e.updated_at = std::max(static_cast<int64_t>(now_ms()), e.updated_at + 1);
+    index_.add(e.id, e.title, p->search_text(), e.tags);
+    save_entry(e);
+    changed("entryUpdated", e.to_presented_json());
+    log(LogLevel::Info, "Restored flattened pattern \"" + e.title + "\" from an earlier snapshot");
+    return true;
   }
 
   // ── Handlers ───────────────────────────────────────────────────────────
@@ -773,9 +846,14 @@ class KnowledgeBase final : public Object {
       if (str_or(effect, "state", "") != "proposed") { reject("Effect is not awaiting application"); return; }
       if (r.payload.contains("validationError") && r.payload["validationError"].is_string()) { reject(r.payload["validationError"].get<std::string>()); return; }
       const bool creating = action == "save_entry";
-      if (creating ? it != entries_.end() : it == entries_.end()) { reject("Knowledge target missing or conflicting"); return; }
-      if (!creating && action != "record_pattern_application" && it->second.knowledge_ref() != str_or(input, "knowledgeRef", "")) { reject("Selected knowledge version changed"); return; }
-      if (!creating && it->second.origin == "user" && action != "dispute_entry" && action != "confirm_entry" && action != "record_pattern_application") { reject("User-authored knowledge is protected; record a supported dispute instead"); return; }
+      if (creating && it != entries_.end()) { reject("Target already exists"); return; }
+      if (!creating && it == entries_.end()) { reject("Knowledge target unavailable"); return; }
+      if (!creating && action != "record_pattern_application" && it->second.knowledge_ref() != str_or(input, "knowledgeRef", "")) {
+        reply_to(correlation, {{"success", false}, {"retryable", false}, {"conflict", true}, {"currentRef", it->second.knowledge_ref()}, {"error", "Selected knowledge version changed"}}); return;
+      }
+      if (!creating && it->second.origin == "user" && action != "dispute_entry" && action != "confirm_entry" && action != "record_pattern_application") {
+        reply_to(correlation, {{"success", false}, {"retryable", false}, {"protected", true}, {"error", "User-authored knowledge is protected; record a supported dispute instead"}}); return;
+      }
       const std::string scope = str_or(input, "scope", "");
       if (action == "archive_entry" && !scope.empty()) { reject("Scoped retirement requires supersede_entry and an applicable replacement"); return; }
       json replacement_snapshot;
@@ -799,13 +877,16 @@ class KnowledgeBase final : public Object {
       const int64_t now = std::max(static_cast<int64_t>(now_ms()), next.updated_at + 1);
       if (creating) { next.id = id; next.title = str_or(input,"title",""); next.content = str_or(input,"content",""); next.type = str_or(input,"type","learned"); next.origin = "reviewer"; next.created_by = object_id_; next.created_at = now; next.creator_peer_id = self_peer_id(); }
       if (creating || action == "update_entry") {
-        if (input.contains("title")) next.title = input["title"].get<std::string>();
-        if (input.contains("content")) {
+        if (input.contains("title") && input["title"].is_string()) next.title = clip_utf8(input["title"].get<std::string>(), 200);
+        if (input.contains("content") && input["content"].is_string()) {
           auto content = input["content"].get<std::string>();
           if (next.type == "pattern") { auto revised = revise_pattern(next.title, content, creating ? "" : next.content); if (!revised) { reject("Invalid pattern content"); return; } next.content = *revised; }
           else next.content = content;
         }
-        if (input.contains("tags")) next.tags = input["tags"].get<std::vector<std::string>>();
+        if (input.contains("tags") && input["tags"].is_array()) {
+          next.tags.clear();
+          for (const auto& t : input["tags"]) if (t.is_string()) next.tags.push_back(t.get<std::string>());
+        }
       }
       if (!next.learning.is_object()) next.learning = {{"revision",0},{"history",json::array()},{"disputes",json::array()},{"supersessions",json::array()}};
       if (action == "record_pattern_application") {
@@ -834,7 +915,19 @@ class KnowledgeBase final : public Object {
         if (!saved.ok || saved.payload == false || (saved.payload.is_object() && saved.payload.contains("success") && !bool_or(saved.payload,"success",false))) {
           reply_to(correlation, {{"success",false},{"retryable",true},{"error","Knowledge persistence rejected"}}); return;
         }
-        entries_[next.id] = next; index_.add(next.id,next.title,index_text(next),next.tags);
+        // Reads and usefulness credit that landed while the write was in
+        // flight belong to the live entry; the revision must not erase them.
+        Entry merged = next;
+        auto live = entries_.find(next.id);
+        if (live != entries_.end()) {
+          merged.access_count = std::max(merged.access_count, live->second.access_count);
+          merged.last_accessed_at = std::max(merged.last_accessed_at, live->second.last_accessed_at);
+          merged.useful_count = std::max(merged.useful_count, live->second.useful_count);
+          merged.last_useful_at = std::max(merged.last_useful_at, live->second.last_useful_at);
+        }
+        const bool counters_moved = merged.access_count != next.access_count || merged.useful_count != next.useful_count;
+        entries_[next.id] = merged; index_.add(next.id,next.title,index_text(next),next.tags);
+        if (counters_moved) persist_entry(entries_[next.id]);
         mark_dirty(next.id); request_sync(); changed(creating ? "entryAdded" : "entryUpdated",next.to_json());
         reply_to(correlation, {{"success",true},{"receipt",receipt}});
       });
@@ -853,12 +946,17 @@ class KnowledgeBase final : public Object {
         ? kbpat::read(it->second.content, it->second.title) : std::optional<kbpat::Pattern>();
       req.reply(pattern ? pattern->learning : json());
     });
+    on("timerFired", [this](Request& req) {
+      const json& p = req.payload();
+      const std::string kind = p.contains("data") && p["data"].is_object() ? str_or(p["data"], "kind", "") : "";
+      if (kind == "sync") { sync_wakeup_armed_ = false; flush_sync(static_cast<int64_t>(now_ms())); }
+    });
     on("recall", [this](Request& req) { handle_recall(req); });
     on("weave", [this](Request& req) { handle_weave(req); });
     on("match", [this](Request& req) { handle_match(req); });
 
     on("get", [this](Request& req) {
-      const std::string id = req.payload().value("id", std::string());
+      const std::string id = str_or(req.payload(), "id", "");
       auto it = entries_.find(id);
       if (it == entries_.end()) { req.reply(nullptr); return; }
       touch(it->second);
@@ -869,7 +967,7 @@ class KnowledgeBase final : public Object {
 
     on("forget", [this](Request& req) {
       if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
-      const std::string id = req.payload().value("id", std::string());
+      const std::string id = str_or(req.payload(), "id", "");
       auto it = entries_.find(id);
       if (it == entries_.end()) { req.reply({{"success", false}, {"error", "No entry with id \"" + id + "\""}}); return; }
       // Forgetting is two-step. The first forget archives: the entry leaves
@@ -902,8 +1000,8 @@ class KnowledgeBase final : public Object {
 
     on("list", [this](Request& req) {
       const json& p = req.payload();
-      const std::string type = p.value("type", std::string());
-      const size_t max = std::min<int64_t>(p.value("limit", static_cast<int64_t>(50)), 200);
+      const std::string type = str_or(p, "type", "");
+      const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 50), 1, 200));
       const bool include_archived = bool_or(p, "includeArchived", false);
 
       std::vector<const Entry*> results = filtered_by_recency(type, {}, include_archived);
@@ -973,7 +1071,7 @@ class KnowledgeBase final : public Object {
     on("archive", [this](Request& req) {
       if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
       const json& p = req.payload();
-      const std::string id = p.value("id", std::string());
+      const std::string id = str_or(p, "id", "");
       if (id.empty()) { req.error("CONTRACT_VIOLATION", "id must not be empty"); return; }
       auto it = entries_.find(id);
       if (it == entries_.end()) {
@@ -998,10 +1096,10 @@ class KnowledgeBase final : public Object {
     // event and the merge below had never once run.
     on("changed", [this](Request& req) {
       const json& p = req.payload();
-      if (p.value("aspect", std::string()) != "stateChanged") return;
-      const json change = p.value("value", json::object());
-      if (change.value("name", std::string()) != SYNC_NAMESPACE) return;
-      const std::string key = change.value("key", std::string());
+      if (str_or(p, "aspect", "") != "stateChanged") return;
+      const json change = p.contains("value") && p["value"].is_object() ? p["value"] : json::object();
+      if (str_or(change, "name", "") != SYNC_NAMESPACE) return;
+      const std::string key = str_or(change, "key", "");
       if (key.empty()) return;
       const json remote = change.contains("value") ? change["value"] : json();
 
@@ -1030,9 +1128,9 @@ class KnowledgeBase final : public Object {
 
   void handle_remember(Request& req) {
     const json& p = req.payload();
-    const std::string title = p.value("title", std::string());
-    const std::string content = p.value("content", std::string());
-    const std::string type = p.value("type", std::string());
+    const std::string title = str_or(p, "title", "");
+    const std::string content = str_or(p, "content", "");
+    const std::string type = str_or(p, "type", "");
     if (title.empty()) { req.error("CONTRACT_VIOLATION", "title must not be empty"); return; }
     if (content.empty()) { req.error("CONTRACT_VIOLATION", "content must not be empty"); return; }
     if (!valid_type(type)) { req.error("CONTRACT_VIOLATION", "Invalid knowledge type: " + type); return; }
@@ -1073,7 +1171,7 @@ class KnowledgeBase final : public Object {
       if (busy_learning(req, existing->id)) return;
       if (existing->learning.is_object() && (existing->archived || !existing->learning.value("supersessions",json::array()).empty())) { req.reply({{"success",false},{"error","Retired knowledge requires an explicit revision"},{"id",existing->id}}); return; }
       existing->content = type == "pattern" ? *revise_pattern(title, content, existing->content) : body;
-      if (p.contains("tags")) existing->tags = tags;
+      if (p.contains("tags") && p["tags"].is_array()) existing->tags = tags;
       existing->archived = false;
       existing->updated_at = std::max(now, existing->updated_at + 1);
       index_.add(existing->id, existing->title, index_text(*existing), existing->tags);
@@ -1093,6 +1191,7 @@ class KnowledgeBase final : public Object {
     e.tags = std::move(tags);
     e.origin = std::move(origin);
     e.created_by = req.from();
+    e.creator_peer_id = self_peer_id();
     e.created_at = now;
     e.updated_at = std::max(now, e.updated_at + 1);
     e.access_count = 0;
@@ -1115,10 +1214,10 @@ class KnowledgeBase final : public Object {
   void handle_recall(Request& req) {
     const json& p = req.payload();
     const std::string scope = str_or(p,"scope","");
-    const std::string query = p.value("query", std::string());
-    const std::string type = p.value("type", std::string());
-    const bool previews = p.value("previews", false);
-    const size_t max = std::min<int64_t>(p.value("limit", static_cast<int64_t>(10)), 50);
+    const std::string query = str_or(p, "query", "");
+    const std::string type = str_or(p, "type", "");
+    const bool previews = bool_or(p, "previews", false);
+    const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 10), 1, 50));
 
     std::vector<std::string> tag_filter;
     if (p.contains("tags") && p["tags"].is_array()) {
@@ -1141,19 +1240,22 @@ class KnowledgeBase final : public Object {
         if (!e.applicable(scope)) continue;
         if (!type.empty() && e.type != type) continue;
         if (!tag_filter.empty() && !has_any_tag(e, tag_filter)) continue;
-        rows.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true});
+        const std::string shown = e.type == "pattern" ? e.to_presented_json()["content"].get<std::string>() : e.content;
+        rows.push_back({&e, kb::make_snippet(shown, query_terms), hit.score, true});
         if (rows.size() >= max) break;
       }
     } else {
       for (const Entry* e : filtered_by_recency(type, tag_filter, false)) {
         if (!e->applicable(scope)) continue;
-        rows.push_back({e, clip_utf8(e->content, 160), 0, false});
+        // Patterns are stored as JSON; the snippet shows the prose a reader sees.
+        const std::string shown = e->type == "pattern" ? e->to_presented_json()["content"].get<std::string>() : e->content;
+        rows.push_back({e, clip_utf8(shown, 160), 0, false});
         if (rows.size() >= max) break;
       }
     }
 
     // Bump access counts on returned entries (each bump persists only that
-    // entry, like the TS version's per-row UPDATE).
+    // entry).
     const int64_t now = static_cast<int64_t>(now_ms());
     for (auto& row : rows) {
       Entry& live = entries_[row.entry->id];
@@ -1183,80 +1285,166 @@ class KnowledgeBase final : public Object {
     req.reply(std::move(out));
   }
 
+  /// The goals in which a pattern has a recorded application, of any verdict.
+  static std::set<std::string> application_goals(const Entry& e) {
+    std::set<std::string> goals;
+    const auto pattern = kbpat::read(e.content, e.title);
+    if (!pattern || !pattern->learning.is_object() || !pattern->learning["applications"].is_array()) return goals;
+    for (const auto& a : pattern->learning["applications"]) {
+      const auto goal = str_or(a, "goalId", "");
+      if (!goal.empty()) goals.insert(goal);
+    }
+    return goals;
+  }
+
+  /// The pattern's most recent applications that did not help: the evidence
+  /// a reader should weigh before following it again.
+  static json recent_counterexamples(const Entry& e) {
+    json out = json::array();
+    const auto pattern = kbpat::read(e.content, e.title);
+    if (!pattern || !pattern->learning.is_object() || !pattern->learning["applications"].is_array()) return out;
+    std::vector<json> misses;
+    for (const auto& a : pattern->learning["applications"]) {
+      const auto verdict = str_or(a, "verdict", "");
+      if (verdict == "no_effect" || verdict == "harmful") misses.push_back(a);
+    }
+    std::sort(misses.begin(), misses.end(), [](const json& a, const json& b) { return int_or(a, "at", 0) > int_or(b, "at", 0); });
+    for (const auto& a : misses) {
+      if (out.size() >= MAX_COUNTEREXAMPLES) break;
+      out.push_back({{"goalId", str_or(a, "goalId", "")}, {"verdict", str_or(a, "verdict", "")},
+                     {"evidence", clip_utf8(str_or(a, "evidence", ""), 300)}, {"at", int_or(a, "at", 0)}});
+    }
+    return out;
+  }
+
+  static std::string fixed2(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.2f", v);
+    return buf;
+  }
+
   void handle_weave(Request& req) {
     const json& p = req.payload();
     const std::string scope = str_or(p,"scope","");
     const std::string query = str_or(p, "query", "");
-    if (query.empty()) { req.error("CONTRACT_VIOLATION", "query must not be empty"); return; }
+    // `from`: patterns a plan already follows. Their links say what the
+    // language expects next, so a re-plan can grow from where the goal is.
+    std::vector<std::string> from_ids;
+    if (p.contains("from") && p["from"].is_array()) {
+      for (const auto& v : p["from"]) if (v.is_string() && from_ids.size() < 20) from_ids.push_back(v.get<std::string>());
+    }
+    if (query.empty() && from_ids.empty()) { req.error("CONTRACT_VIOLATION", "query or from must not be empty"); return; }
     const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 5), 1, 20));
     const int64_t max_hops = std::clamp<int64_t>(int_or(p, "hops", 1), 0, 2);
 
-    struct Woven { Entry* entry; std::string snippet; double score; bool scored; std::string via; };
+    struct Woven { Entry* entry; std::string snippet; double score; bool scored; std::string via; bool seed; };
     std::vector<Woven> selected;
     std::set<std::string> seen;
 
     const std::vector<std::string> query_terms = kb::tokenize(query);
-    // Filter by entry type before capping candidates; facts cannot crowd patterns out.
-    for (const auto& hit : index_.search(query, entries_.size())) {
-      auto it = entries_.find(hit.id);
-      if (it == entries_.end()) continue;
-      Entry& e = it->second;
-      if (!e.applicable(scope) || e.type != "pattern") continue;
-      selected.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true, "matched"});
-      if (selected.size() >= 100) break;
-    }
-    for (auto& row : selected) {
-      std::set<std::string> helpful, harmful;
-      const auto pattern = kbpat::read(row.entry->content, row.entry->title);
-      if (pattern && pattern->learning.is_object()) {
-        for (const auto& application : pattern->learning["applications"]) {
-          if (!application.is_object()) continue;
-          size_t matches = 0;
-          for (const auto& word : kb::tokenize(str_or(application, "context", ""))) {
-            if (word.size() >= 3 && std::find(query_terms.begin(), query_terms.end(), word) != query_terms.end()) matches++;
-          }
-          if (matches < 2) continue;
-          const auto verdict = str_or(application, "verdict", ""), goal = str_or(application, "goalId", "");
-          if (verdict == "helpful") helpful.insert(goal);
-          if (verdict == "harmful") harmful.insert(goal);
-        }
+    if (!query_terms.empty()) {
+      // Filter by entry type before capping candidates; facts cannot crowd patterns out.
+      for (const auto& hit : index_.search(query, entries_.size())) {
+        auto it = entries_.find(hit.id);
+        if (it == entries_.end()) continue;
+        Entry& e = it->second;
+        if (!e.applicable(scope) || e.type != "pattern") continue;
+        const std::string shown = e.to_presented_json()["content"].get<std::string>();
+        selected.push_back({&e, kb::make_snippet(shown, query_terms), hit.score, true, "matched", false});
+        if (selected.size() >= 100) break;
       }
-      const double weight = std::clamp(1.0 + helpful.size() * 0.1 - harmful.size() * 0.2, 0.5, 1.5);
-      row.score *= weight;
-      row.via = "matched; contextual evidence weight=" + std::to_string(weight);
+      // Recorded outcomes in contexts like this one move a pattern up or
+      // down: helpful raises it, no effect lowers it a little, harmful more.
+      for (auto& row : selected) {
+        std::set<std::string> helpful, no_effect, harmful;
+        const auto pattern = kbpat::read(row.entry->content, row.entry->title);
+        if (pattern && pattern->learning.is_object() && pattern->learning["applications"].is_array()) {
+          for (const auto& application : pattern->learning["applications"]) {
+            if (!application.is_object()) continue;
+            size_t matches = 0;
+            for (const auto& word : kb::tokenize(str_or(application, "context", ""))) {
+              if (word.size() >= 3 && std::find(query_terms.begin(), query_terms.end(), word) != query_terms.end()) matches++;
+            }
+            if (matches < 2) continue;
+            const auto verdict = str_or(application, "verdict", ""), goal = str_or(application, "goalId", "");
+            if (verdict == "helpful") helpful.insert(goal);
+            if (verdict == "no_effect") no_effect.insert(goal);
+            if (verdict == "harmful") harmful.insert(goal);
+          }
+        }
+        const double weight = std::clamp(1.0 + helpful.size() * 0.1 - no_effect.size() * 0.1 - harmful.size() * 0.2, 0.5, 1.5);
+        row.score *= weight;
+        row.via = "matched; contextual evidence weight=" + fixed2(weight);
+      }
+      std::stable_sort(selected.begin(), selected.end(), [](const Woven& a, const Woven& b) { return a.score > b.score; });
+      if (selected.size() > max) selected.resize(max);
     }
-    std::stable_sort(selected.begin(), selected.end(), [](const Woven& a, const Woven& b) { return a.score > b.score; });
-    if (selected.size() > max) selected.resize(max);
-    for (const auto& row : selected) {
-      const auto& e = *row.entry;
-      seen.insert(e.id);
+    for (const auto& row : selected) seen.insert(row.entry->id);
+    for (const auto& id : from_ids) {
+      Entry* e = find_pattern_by_name(id);
+      if (!e || !e->applicable(scope) || seen.count(e->id)) continue;
+      seen.insert(e->id);
+      selected.push_back({e, "", 0, false, "in the current plan", true});
     }
 
-    // Breadth-first link expansion: a matched pattern pulls in the patterns
+    // Breadth-first link expansion: a selected pattern pulls in the patterns
     // its links name, so the language's structure (not just keyword
-    // overlap) shapes the selection. Total output is capped so a densely
-    // linked language can't flood the prompt.
+    // overlap) shapes the selection. A source's links go out best-supported
+    // first: those whose two patterns have been used together in the most
+    // goals. Output is capped so a densely linked language can't flood the
+    // prompt; patterns passed in `from` are not returned again.
     const size_t total_cap = max * 3;
+    auto returned = [&]() { size_t n = 0; for (const auto& w : selected) if (!w.seed) n++; return n; };
     std::set<std::string> dangling;
+    std::map<std::string, std::string> broken;
     size_t frontier_begin = 0;
     for (int64_t hop = 0; hop < max_hops && frontier_begin < selected.size(); hop++) {
       const size_t frontier_end = selected.size();
       for (size_t i = frontier_begin; i < frontier_end; i++) {
-        for (const auto& name : parse_pattern_links(selected[i].entry->content, selected[i].entry->title)) {
+        const Woven source = selected[i];
+        const auto source_goals = application_goals(*source.entry);
+        std::vector<std::pair<Entry*, size_t>> linked_rows;
+        for (const auto& name : parse_pattern_links(source.entry->content, source.entry->title)) {
           Entry* linked = find_pattern_by_name(name);
-          if (!linked || !linked->applicable(scope)) { dangling.insert(name); continue; }
-          if (seen.count(linked->id) || selected.size() >= total_cap) continue;
+          if (!linked || !linked->applicable(scope)) {
+            if (Entry* gone = find_pattern_by_name(name, true)) broken[name] = gone->id;
+            else dangling.insert(name);
+            continue;
+          }
+          if (seen.count(linked->id)) continue;
+          size_t together = 0;
+          for (const auto& g : application_goals(*linked)) together += source_goals.count(g);
+          linked_rows.push_back({linked, together});
+        }
+        std::stable_sort(linked_rows.begin(), linked_rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (const auto& [linked, together] : linked_rows) {
+          if (seen.count(linked->id) || returned() >= total_cap) continue;
           seen.insert(linked->id);
-          selected.push_back({linked, "", 0, false, "linked-from: " + selected[i].entry->title});
+          std::string via = "linked-from: " + source.entry->title;
+          if (together > 0) via += "; used together in " + std::to_string(together) + (together == 1 ? " goal" : " goals");
+          if (source.seed) via += " (in the current plan)";
+          selected.push_back({linked, "", 0, false, via, false});
         }
       }
       frontier_begin = frontier_end;
+    }
+
+    // Inbound links of every returned pattern: which patterns lead here.
+    std::map<std::string, json> linked_from;
+    for (const auto& w : selected) if (!w.seed) linked_from[w.entry->id] = json::array();
+    for (auto& [_, e] : entries_) {
+      if (e.type != "pattern" || !e.applicable(scope)) continue;
+      for (const auto& name : parse_pattern_links(e.content, e.title)) {
+        Entry* target = find_pattern_by_name(name);
+        if (target && target->id != e.id && linked_from.count(target->id)) linked_from[target->id].push_back(e.title);
+      }
     }
 
     // Bump access counts so patterns participate in staleness signals.
     const int64_t now = static_cast<int64_t>(now_ms());
     json patterns = json::array();
     for (const auto& w : selected) {
+      if (w.seed) continue;
       w.entry->access_count++;
       w.entry->last_accessed_at = now;
       persist_entry(*w.entry);
@@ -1266,24 +1454,29 @@ class KnowledgeBase final : public Object {
         full["score"] = w.score;
       }
       full["via"] = w.via;
+      full["linkedFrom"] = linked_from[w.entry->id];
+      full["counterexamples"] = recent_counterexamples(*w.entry);
       patterns.push_back(std::move(full));
     }
     flush_sync(now);
 
     json dangling_out = json::array();
     for (const auto& name : dangling) dangling_out.push_back(name);
-    log(LogLevel::Info, "Weave \"" + clip_utf8(query, 60) + "\" => " +
+    json broken_out = json::array();
+    for (const auto& [name, id] : broken) broken_out.push_back({{"name", name}, {"archivedId", id}});
+    log(LogLevel::Info, "Weave \"" + clip_utf8(query.empty() ? std::string("(from plan)") : query, 60) + "\" => " +
                             std::to_string(patterns.size()) + " patterns (" +
-                            std::to_string(dangling_out.size()) + " dangling links)");
-    req.reply({{"patterns", std::move(patterns)}, {"dangling", std::move(dangling_out)}});
+                            std::to_string(dangling_out.size()) + " dangling, " +
+                            std::to_string(broken_out.size()) + " broken links)");
+    req.reply({{"patterns", std::move(patterns)}, {"dangling", std::move(dangling_out)}, {"broken", std::move(broken_out)}});
   }
 
   void handle_match(Request& req) {
     const json& p = req.payload();
     const std::string scope = str_or(p,"scope","");
-    const std::string pattern = p.value("pattern", std::string());
+    const std::string pattern = str_or(p, "pattern", "");
     if (pattern.empty()) { req.error("CONTRACT_VIOLATION", "pattern must not be empty"); return; }
-    const size_t max = std::min<int64_t>(p.value("limit", static_cast<int64_t>(10)), 50);
+    const size_t max = static_cast<size_t>(std::clamp<int64_t>(int_or(p, "limit", 10), 1, 50));
 
     // 'A|B' alternations of literals; anything with other regex
     // metacharacters degrades to one literal (see file header).
@@ -1294,12 +1487,12 @@ class KnowledgeBase final : public Object {
         const size_t bar = pattern.find('|', start);
         const std::string piece =
             pattern.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
-        if (!piece.empty()) needles.push_back(kb::to_lower_ascii(piece));
+        if (!piece.empty()) needles.push_back(kb::fold_text(piece));
         if (bar == std::string::npos) break;
         start = bar + 1;
       }
     }
-    if (needles.empty()) needles.push_back(kb::to_lower_ascii(pattern));
+    if (needles.empty()) needles.push_back(kb::fold_text(pattern));
 
     auto matches = [&](const Entry& e) {
       for (const auto& n : needles) {
@@ -1337,13 +1530,14 @@ class KnowledgeBase final : public Object {
   void handle_update(Request& req) {
     if (busy_learning(req, str_or(req.payload(), "id", ""))) return;
     const json& p = req.payload();
-    const std::string id = p.value("id", std::string());
+    const std::string id = str_or(p, "id", "");
     if (id.empty()) { req.error("CONTRACT_VIOLATION", "id must not be empty"); return; }
 
     // Accept fields flat or nested under `updates` (both caller shapes exist).
-    const json updates = p.value("updates", json::object());
+    // A flat field that is null counts as absent, so the nested one applies.
+    const json updates = p.contains("updates") && p["updates"].is_object() ? p["updates"] : json::object();
     auto pick = [&](const char* key) -> json {
-      if (p.contains(key)) return p[key];
+      if (p.contains(key) && !p[key].is_null()) return p[key];
       if (updates.contains(key)) return updates[key];
       return json();
     };
@@ -1356,18 +1550,20 @@ class KnowledgeBase final : public Object {
       req.reply({{"success", false}, {"error", "No entry with id \"" + id + "\""}});
       return;
     }
+    Entry& e = it->second;
+    const auto old_pattern = e.type == "pattern" ? kbpat::read(e.content, e.title) : std::optional<kbpat::Pattern>();
+    const int64_t revision = e.type == "pattern"
+      ? (old_pattern && old_pattern->learning.is_object() ? int_or(old_pattern->learning, "revision", 1) : 1) : e.updated_at;
+    if (p.contains("expectedRevision") && !p["expectedRevision"].is_null() && p["expectedRevision"] != json(revision)) {
+      req.reply({{"success", false}, {"conflict", true}, {"revision", revision}, {"error", "Knowledge changed; read it and reconcile before updating"}}); return;
+    }
     if (content.is_null() && title.is_null() && tags.is_null()) {
       req.reply({{"success", false},
                  {"error", "No updatable fields provided (expected content, title, and/or tags)"}});
       return;
     }
-
-    Entry& e = it->second;
-    const auto old_pattern = e.type == "pattern" ? kbpat::read(e.content, e.title) : std::optional<kbpat::Pattern>();
-    const int64_t revision = e.type == "pattern"
-      ? (old_pattern && old_pattern->learning.is_object() ? old_pattern->learning["revision"].get<int64_t>() : 1) : e.updated_at;
-    if (p.contains("expectedRevision") && p["expectedRevision"] != json(revision)) {
-      req.reply({{"success", false}, {"conflict", true}, {"revision", revision}, {"error", "Knowledge changed; read it and reconcile before updating"}}); return;
+    if ((!content.is_null() && !content.is_string()) || (!title.is_null() && !title.is_string()) || (!tags.is_null() && !tags.is_array())) {
+      req.error("CONTRACT_VIOLATION", "content and title must be strings and tags an array"); return;
     }
     if (content.is_string()) {
       const auto body = e.type == "pattern" ? revise_pattern(title.is_string() ? title.get<std::string>() : e.title, content.get<std::string>(), e.content)
@@ -1434,11 +1630,24 @@ class KnowledgeBase final : public Object {
     return nullptr;
   }
 
-  /// Resolve a link name to an active pattern entry by normalized title.
-  Entry* find_pattern_by_name(const std::string& name) {
-    const std::string norm = normalize_title(name);
+  /// Resolve a link name to a pattern entry: an id (bare or 'id:'-prefixed),
+  /// a normalized title, or one of the pattern's aliases. A merge records the
+  /// absorbed pattern's name as an alias of the survivor, so links written
+  /// against the old name keep resolving. Active patterns by default; the
+  /// archived ones answer whether a dangling link is broken or unwritten.
+  Entry* find_pattern_by_name(const std::string& name, bool archived = false) {
+    const std::string raw = kbpat::trim(name);
+    const std::string id = raw.rfind("id:", 0) == 0 ? kbpat::trim(raw.substr(3)) : raw;
+    auto direct = entries_.find(id);
+    if (direct != entries_.end() && direct->second.type == "pattern" && direct->second.archived == archived) return &direct->second;
+    const std::string norm = normalize_title(raw);
+    if (norm.empty()) return nullptr;
     for (auto& [_, e] : entries_) {
-      if (e.type == "pattern" && !e.archived && normalize_title(e.title) == norm) return &e;
+      if (e.type == "pattern" && e.archived == archived && normalize_title(e.title) == norm) return &e;
+    }
+    for (auto& [_, e] : entries_) {
+      if (e.type != "pattern" || e.archived != archived) continue;
+      for (const auto& alias : pattern_aliases(e.content, e.title)) if (normalize_title(alias) == norm) return &e;
     }
     return nullptr;
   }
@@ -1469,8 +1678,7 @@ class KnowledgeBase final : public Object {
     request("@Storage", "delete", {{"key", ENTRY_KEY_PREFIX + id}}, [](const Result&) {});
   }
 
-  /// This peer's id, falling back to the object id before Identity resolves
-  /// -- the same rule the TS KnowledgeBase applies.
+  /// This peer's id, falling back to the object id before Identity resolves.
   std::string self_peer_id() const {
     return local_peer_id_.empty() ? object_id_ : local_peer_id_;
   }
@@ -1522,7 +1730,18 @@ class KnowledgeBase final : public Object {
       for (const auto& [id, _] : entries_) pending_sync_ids_.insert(id);
       sync_pending_ = true;
     }
-    if (!sync_pending_ || now - last_sync_ms_ < SYNC_THROTTLE_MS) return;
+    if (!sync_pending_) return;
+    if (now - last_sync_ms_ < SYNC_THROTTLE_MS) {
+      // Deferred by the throttle: ask the Timer to wake us when it lifts, so
+      // the change goes out even if nothing else touches the store.
+      if (!sync_wakeup_armed_) {
+        sync_wakeup_armed_ = true;
+        request("@Timer", "setTimeout",
+                {{"delayMs", SYNC_THROTTLE_MS - (now - last_sync_ms_) + 10}, {"data", {{"kind", "sync"}}}},
+                [this](const Result& r) { if (!r.ok) sync_wakeup_armed_ = false; });
+      }
+      return;
+    }
     sync_pending_ = false;
     last_sync_ms_ = now;
 
@@ -1577,7 +1796,7 @@ class KnowledgeBase final : public Object {
     if (id.empty() || !raw.is_object()) return false;
     if (!raw.contains("updatedAt") || !raw["updatedAt"].is_number()) return false;
     const int64_t remote_stamp = raw["updatedAt"].get<int64_t>();
-    const std::string remote_peer = raw.value("peerId", std::string());
+    const std::string remote_peer = str_or(raw, "peerId", "");
 
     bool have_local_stamp = false;
     int64_t local_stamp = 0;
@@ -1596,7 +1815,7 @@ class KnowledgeBase final : public Object {
       if (remote_stamp == local_stamp && remote_peer <= self_peer_id()) return false;
     }
 
-    if (raw.value("deleted", false)) {
+    if (bool_or(raw, "deleted", false)) {
       tombstones_[id] = remote_stamp;
       if (local == entries_.end()) return false;
       index_.remove(id);
@@ -1616,11 +1835,12 @@ class KnowledgeBase final : public Object {
     if (re.creator_peer_id.empty()) re.creator_peer_id = remote_peer;
 
     tombstones_.erase(id);
-    if (entries_.count(id)) index_.remove(id);
+    const bool is_new = !entries_.count(id);
+    if (!is_new) index_.remove(id);
     index_.add(re.id, re.title, index_text(re), re.tags);
     entries_[id] = std::move(re);
     persist_entry(entries_[id]);
-    changed("entryUpdated", entries_[id].to_json());
+    changed(is_new ? "entryAdded" : "entryUpdated", entries_[id].to_json());
     return true;
   }
 
@@ -1663,11 +1883,12 @@ class KnowledgeBase final : public Object {
       if (pending_learning_.count(re.id) || (it != entries_.end() && !it->second.preserves_learning(re.learning))) continue;
       if (it == entries_.end() || re.updated_at > it->second.updated_at) {
         const std::string rid = re.id;
-        if (it != entries_.end()) index_.remove(rid);
+        const bool is_new = it == entries_.end();
+        if (!is_new) index_.remove(rid);
         index_.add(re.id, re.title, index_text(re), re.tags);
         entries_[rid] = std::move(re);
         persist_entry(entries_[rid]);
-        changed("entryUpdated", entries_[rid].to_json());
+        changed(is_new ? "entryAdded" : "entryUpdated", entries_[rid].to_json());
         merged++;
       }
     }
@@ -1723,19 +1944,20 @@ class KnowledgeBase final : public Object {
     size_t archived_count = 0;
     for (auto& [_, e] : entries_) {
       if (e.archived || is_protected(e)) continue;
-      const int64_t age_days = (now - e.created_at) / DAY_MS;
-      const int64_t last_access_days =
-          e.last_accessed_at > 0 ? (now - e.last_accessed_at) / DAY_MS : age_days;
+      // Ages compare in milliseconds: dividing into whole days first moved
+      // every threshold one day later than it says.
+      const int64_t age_ms = now - e.created_at;
+      const int64_t idle_ms = e.last_accessed_at > 0 ? now - e.last_accessed_at : age_ms;
 
       // Archive 'learned' entries never surfaced after 7 days
-      if (e.type == "learned" && e.access_count == 0 && age_days > STALE_NEVER_ACCESSED_DAYS) {
+      if (e.type == "learned" && e.access_count == 0 && age_ms > STALE_NEVER_ACCESSED_DAYS * DAY_MS) {
         archive_entry(e, "never accessed in 7d");
         archived_count++;
         continue;
       }
       // Archive 'learned' or 'reference' entries inactive for 30 days
       if ((e.type == "learned" || e.type == "reference") &&
-          last_access_days > STALE_INACTIVE_DAYS) {
+          idle_ms > STALE_INACTIVE_DAYS * DAY_MS) {
         archive_entry(e, "inactive 30d");
         archived_count++;
       }
@@ -1777,9 +1999,8 @@ class KnowledgeBase final : public Object {
     });
     std::vector<std::string> purge_ids;
     for (const Entry* e : archived) {
-      const int64_t archived_days = (now - e->updated_at) / DAY_MS;
       const bool over_cap = archived.size() - purge_ids.size() > MAX_ARCHIVED;
-      if (archived_days > ARCHIVED_PURGE_DAYS || over_cap) purge_ids.push_back(e->id);
+      if (now - e->updated_at > ARCHIVED_PURGE_DAYS * DAY_MS || over_cap) purge_ids.push_back(e->id);
     }
     for (const auto& id : purge_ids) {
       log(LogLevel::Info, "Distill: purging archived \"" + entries_[id].title + "\"");

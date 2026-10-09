@@ -14,7 +14,7 @@ import { ExternalProjectRegistry } from './external-project-registry.js';
 import { AgentAbject } from './agent-abject.js';
 import { GoalManager } from './goal-manager.js';
 import { TaskReviewer } from './task-reviewer.js';
-import { KnowledgeBase } from './knowledge-base.js';
+import { nativeKnowledgeBase } from './agent-system.native-knowledge.js';
 import { ScrumMaster } from './scrum-master.js';
 
 class Endpoint extends Abject {
@@ -27,7 +27,6 @@ class Endpoint extends Abject {
 }
 class Creator extends ExternalCreator { protected override async onInit(): Promise<void> {} }
 class Projects extends ExternalProjectRegistry { protected override async onInit(): Promise<void> {} }
-class Knowledge extends KnowledgeBase { protected override async onInit(): Promise<void> {} }
 class Runtime extends AgentAbject { protected override async onInit(): Promise<void> {} }
 class Reviewer extends TaskReviewer { protected override async onInit(): Promise<void> {} }
 class Scrum extends ScrumMaster { protected override async onInit(): Promise<void> {} }
@@ -253,7 +252,7 @@ test('review prioritizes stale task claims over profiles and corrects knowledge 
   const f = await fixture();
   try {
     const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
-    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(await nativeKnowledgeBase()), goals = await f.add(new GoalManager());
     const reviewer: any = await f.add(new Reviewer());
     reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
     const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Review repository', description: 'Commit changes' });
@@ -404,7 +403,7 @@ test('runtime actions retain complete observations and automatic pattern provena
   const f = await fixture();
   try {
     const runtime: any = await f.add(new Runtime()), caller = await f.add(new Endpoint('Worker'));
-    const goals = await f.add(new GoalManager()), kb = await f.add(new Knowledge());
+    const goals = await f.add(new GoalManager()), kb = await f.add(await nativeKnowledgeBase());
     runtime.goalManagerId = goals.id;
     const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Read retained evidence', description: 'Review a large diff' });
     const { id } = await caller.call(kb.id, 'remember', { type: 'pattern', title: 'READ WHOLE DIFF', content: 'Read every diff section before deciding.' });
@@ -533,7 +532,7 @@ test('runtime captures application receipts before acting and reviewer settles p
   const f = await fixture();
   try {
     const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
-    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge());
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(await nativeKnowledgeBase());
     const runtime: any = await f.add(new Runtime()), reviewer: any = await f.add(new Reviewer());
     const goals = await f.add(new GoalManager());
     runtime.goalManagerId = goals.id; reviewer.goalManagerId = goals.id;
@@ -649,7 +648,7 @@ test('one review completion records predictions and applications via their owner
   const f = await fixture();
   try {
     const storage = new Endpoint('Storage'); storage.on('set', () => true); storage.on('get', () => null); storage.on('keys', () => []); await f.add(storage);
-    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(new Knowledge()), goals = await f.add(new GoalManager());
+    const caller = await f.add(new Endpoint('AgentAbject')), kb = await f.add(await nativeKnowledgeBase()), goals = await f.add(new GoalManager());
     const reviewer: any = await f.add(new Reviewer()); reviewer.agentAbjectId = caller.id; reviewer.knowledgeBaseId = kb.id; reviewer.goalManagerId = goals.id;
     const { goalId } = await caller.call(goals.id, 'createGoal', { title: 'Inspect diffs', description: 'Review all changed code' });
     const { id } = await caller.call(kb.id, 'remember', { title: 'FULL DIFF', type: 'pattern', content: JSON.stringify({ format: 1, name: 'FULL DIFF', context: 'code review', forces: 'previews omit code', therefore: 'read retained pages', evidence: 'candidate', links: [] }) });

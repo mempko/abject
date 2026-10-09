@@ -379,8 +379,11 @@ export class Packages extends Abject {
   async setEnabled(name: string, enabled: boolean): Promise<{ success: boolean; restartRequired?: boolean; error?: string }> {
     precondition(typeof name === 'string' && name !== '', 'name must not be empty');
     precondition(typeof enabled === 'boolean', 'enabled must be a boolean');
-    const known = (await this.resolved(readPackageConfig())).some(r => r.pkg?.name === name);
-    if (!known) return { success: false, error: `No package named '${name}' was found in the package directories.` };
+    const found = (await this.resolved(readPackageConfig())).filter(r => r.pkg?.name === name);
+    if (!found.length) return { success: false, error: `No package named '${name}' was found in the package directories.` };
+    if (!enabled && found.some(r => r.pkg?.required)) {
+      return { success: false, error: `'${name}' is required: the system has no other implementation of what it provides, so it stays enabled.` };
+    }
 
     await this.updateConfig(cfg => {
       const disabled = new Set(cfg.disabled);

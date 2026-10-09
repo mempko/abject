@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { KnowledgeBase } from './knowledge-base.js';
+import { Abject } from '../core/abject.js';
+import { request } from '../core/message.js';
+import { MessageBus } from '../runtime/message-bus.js';
+import { nativeKnowledgeBase, nativeKnowledgeSettled } from './agent-system.native-knowledge.js';
 import { GoalManager } from './goal-manager.js';
 import { TaskReviewer } from './task-reviewer.js';
 import { makePattern, serializePattern, readPattern } from '../core/pattern.js';
@@ -9,35 +12,52 @@ function pattern(name = 'VERIFY RESTORATION'): string {
   const result = makePattern({ name, context: 'persistent settings', forces: 'live success can conceal failed restoration', therefore: 'restore a candidate before acceptance', evidence: 'candidate', links: [] });
   assert(result.ok); return serializePattern(result.pattern);
 }
-function kb(): any { const k: any = new KnowledgeBase(); k.changed = () => {}; return k; }
+class Caller extends Abject {
+  constructor() { super({ manifest: { name: 'Caller', version: '1', description: 'Learning fixture', interface: { id: 'test:caller', name: 'Caller', description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
+  call(to: string, method: string, payload: unknown): Promise<any> { return this.request(request(this.id, to, method, payload), 10000); }
+}
+/** The shipped KnowledgeBase on its own bus, called the way any abject calls it. */
+async function kb(): Promise<{ call(method: string, payload: unknown): Promise<any>; stop(): Promise<void> }> {
+  const bus = new MessageBus(), caller = new Caller(), k = await nativeKnowledgeBase();
+  await caller.init(bus); await k.init(bus); await nativeKnowledgeSettled();
+  return { call: (method, payload) => caller.call(k.id, method, payload), stop: async () => { await k.stop(); await caller.stop(); } };
+}
 function send(k: any, method: string, payload: unknown): Promise<any> { return k.handlers.get(method)({ routing: { from: 'reviewer' }, payload }); }
 
 test('weave searches patterns before applying its candidate pool cap', async () => {
-  const k = kb();
-  for (let i = 0; i < 120; i++) await send(k, 'remember', { title: `persistent settings fact ${i}`, content: 'persistent settings', type: 'fact' });
-  const saved = await send(k, 'remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
-  const woven = await send(k, 'weave', { query: 'persistent settings', limit: 1 });
-  assert.equal(woven.patterns[0].id, saved.id);
+  const k = await kb();
+  try {
+    for (let i = 0; i < 120; i++) await k.call('remember', { title: `persistent settings fact ${i}`, content: 'persistent settings', type: 'fact' });
+    const saved = await k.call('remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
+    const woven = await k.call('weave', { query: 'persistent settings', limit: 1 });
+    assert.equal(woven.patterns[0].id, saved.id);
+  } finally { await k.stop(); }
 });
 test('pattern edits preserve history and reject stale revisions', async () => {
-  const k = kb(), saved = await send(k, 'remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
-  assert.equal((await send(k, 'update', { id: saved.id, content: pattern(), expectedRevision: 1 })).success, true);
-  assert.equal((await send(k, 'update', { id: saved.id, content: pattern(), expectedRevision: 1 })).conflict, true);
-  const history = await send(k, 'patternHistory', { id: saved.id });
-  assert.equal(history.revision, 2); assert.equal(history.history.length, 1);
-  assert.equal(readPattern(history.history[0].content)?.context, 'persistent settings');
+  const k = await kb();
+  try {
+    const saved = await k.call('remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
+    assert.equal((await k.call('update', { id: saved.id, content: pattern(), expectedRevision: 1 })).success, true);
+    assert.equal((await k.call('update', { id: saved.id, content: pattern(), expectedRevision: 1 })).conflict, true);
+    const history = await k.call('patternHistory', { id: saved.id });
+    assert.equal(history.revision, 2); assert.equal(history.history.length, 1);
+    assert.equal(readPattern(history.history[0].content)?.context, 'persistent settings');
+  } finally { await k.stop(); }
 });
 test('pattern feedback deduplicates episodes and preserves counterexamples', async () => {
-  const k = kb(), saved = await send(k, 'remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
-  const application = { id: 'episode-a', goalId: 'goal-a', context: 'settings', verdict: 'helpful', evidence: 'restored value equals saved value', patternRevision: 1 };
-  await send(k, 'recordPatternApplication', { id: saved.id, application });
-  await send(k, 'recordPatternApplication', { id: saved.id, application });
-  await send(k, 'recordPatternApplication', { id: saved.id, application: { ...application, id: 'episode-b', goalId: 'goal-b', verdict: 'harmful', evidence: 'test used a production restore target' } });
-  await send(k, 'markUseful', { ids: [saved.id], operationId: 'review-a' });
-  await send(k, 'markUseful', { ids: [saved.id], operationId: 'review-a' });
-  const found = await send(k, 'get', { id: saved.id });
-  assert.equal(found.usefulCount, 1); assert.equal(found.pattern.learning.applications.length, 2);
-  assert.match(found.content, /helpful in 1 distinct goals; counterexamples in 1 goals/);
+  const k = await kb();
+  try {
+    const saved = await k.call('remember', { title: 'VERIFY RESTORATION', content: pattern(), type: 'pattern' });
+    const application = { id: 'episode-a', goalId: 'goal-a', context: 'settings', verdict: 'helpful', evidence: 'restored value equals saved value', patternRevision: 1 };
+    await k.call('recordPatternApplication', { id: saved.id, application });
+    await k.call('recordPatternApplication', { id: saved.id, application });
+    await k.call('recordPatternApplication', { id: saved.id, application: { ...application, id: 'episode-b', goalId: 'goal-b', verdict: 'harmful', evidence: 'test used a production restore target' } });
+    await k.call('markUseful', { ids: [saved.id], operationId: 'review-a' });
+    await k.call('markUseful', { ids: [saved.id], operationId: 'review-a' });
+    const found = await k.call('get', { id: saved.id });
+    assert.equal(found.usefulCount, 1); assert.equal(found.pattern.learning.applications.length, 2);
+    assert.match(found.content, /helpful in 1 distinct goals; no effect in 0; counterexamples in 1 goals/);
+  } finally { await k.stop(); }
 });
 test('legacy action failures are not described as proven prediction misses', () => {
   const r: any = new TaskReviewer();

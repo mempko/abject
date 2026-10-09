@@ -87,6 +87,18 @@ export interface ExtensionPackage {
   profiles?: string[];
   /** wasm runtime: the ABI version the module speaks. */
   abi?: number;
+  /**
+   * How the abject answers `ask`: a usage guide appended to the generic
+   * prompt, and the tier it answers at. A WASM module cannot override the
+   * host's ask handling, so its package says it here.
+   */
+  ask?: PackageAskGuidance;
+  /**
+   * A package the system cannot run without (a bundled native package with no
+   * built-in fallback). It stays enabled whatever packages.json says, and boot
+   * stops with an error when it fails to load.
+   */
+  required?: boolean;
   /** wasm runtime: the compiled module. */
   wasmPath?: string;
   /** script runtime: the JavaScript handler-map source. */
@@ -144,6 +156,39 @@ interface PackageMeta {
   manifest?: unknown;
   settings?: unknown;
   profiles?: unknown;
+  ask?: unknown;
+  required?: unknown;
+}
+
+/** A package's guidance for answering `ask` (see ExtensionPackage.ask). */
+export interface PackageAskGuidance {
+  /** Markdown appended to the ask prompt. */
+  guide?: string;
+  tier?: 'smart' | 'balanced' | 'fast';
+}
+
+/**
+ * Read `ask: { guide: "<file relative to the package>", tier }` from
+ * abject.json. The guide is read here, once, so the text travels with the
+ * package registration rather than every spawn reading the disk.
+ */
+async function readAskGuidance(pkgDir: string, raw: unknown): Promise<PackageAskGuidance | undefined> {
+  if (raw === undefined) return undefined;
+  require(!!raw && typeof raw === 'object' && !Array.isArray(raw), 'abject.json: ask must be an object');
+  const { guide, tier } = raw as { guide?: unknown; tier?: unknown };
+  require(guide === undefined || (typeof guide === 'string' && guide.length > 0), 'abject.json: ask.guide must be a file path');
+  require(tier === undefined || tier === 'smart' || tier === 'balanced' || tier === 'fast', "abject.json: ask.tier must be 'smart', 'balanced' or 'fast'");
+  // The guide only improves how the abject answers `ask`; a missing file
+  // costs the guide, never the package.
+  let text: string | undefined;
+  if (typeof guide === 'string') {
+    try {
+      text = (await fs.readFile(path.resolve(pkgDir, guide), 'utf-8')).trim();
+    } catch (err) {
+      log.warn(`package in ${pkgDir}: ask guide '${guide}' unreadable (${err instanceof Error ? err.message : String(err)}); answering ask without it`);
+    }
+  }
+  return { ...(text ? { guide: text } : {}), ...(tier ? { tier: tier as PackageAskGuidance['tier'] } : {}) };
 }
 
 const PROFILE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -232,6 +277,8 @@ export async function readPackage(pkgDir: string): Promise<ExtensionPackage> {
   );
   const settings = parseSettingSpecs(meta.settings);
   const profiles = parseProfiles(meta.profiles, meta.scope as PackageScope);
+  require(meta.required === undefined || typeof meta.required === 'boolean', 'abject.json: required must be true or false');
+  const ask = await readAskGuidance(pkgDir, meta.ask);
 
   const base = {
     dir: pkgDir,
@@ -243,6 +290,8 @@ export async function readPackage(pkgDir: string): Promise<ExtensionPackage> {
     manifest: manifest as AbjectManifest,
     settings,
     ...(profiles ? { profiles } : {}),
+    ...(ask ? { ask } : {}),
+    ...(meta.required ? { required: true } : {}),
   };
 
   if (runtime === 'wasm') {
@@ -396,7 +445,7 @@ export function resolvePackages(discovered: DiscoveredPackage[], config: Package
       continue;
     }
     const typeName = d.pkg.replaces ?? d.pkg.name;
-    if (disabled.has(d.pkg.name)) {
+    if (disabled.has(d.pkg.name) && !d.pkg.required) {
       out.push({ ...d, typeName, status: 'disabled' });
       continue;
     }
@@ -446,6 +495,7 @@ async function registerPackage(factory: Factory, pkg: ExtensionPackage): Promise
       runtime: 'wasm', manifest: packageManifest(pkg), source, scope: pkg.scope,
       package: { name: pkg.name, version: pkg.version },
       ...(pkg.profiles ? { profiles: pkg.profiles } : {}),
+      ...(pkg.ask ? { ask: pkg.ask } : {}),
     });
     return;
   }
@@ -499,7 +549,9 @@ export async function ingestAllExtensions(
         (pkg.replaces ? ` (replaces built-in ${pkg.replaces})` : ''),
       );
     } catch (err) {
-      log.warn(`failed to ingest package '${pkg.name}': ${err instanceof Error ? err.message : err}`);
+      const reason = err instanceof Error ? err.message : String(err);
+      if (pkg.required) throw new Error(`required package '${pkg.name}' (${r.dir}) failed to load: ${reason}`);
+      log.warn(`failed to ingest package '${pkg.name}': ${reason}`);
     }
   }
 

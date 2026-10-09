@@ -184,6 +184,21 @@ function fingerprint(value: unknown): string {
   return `${text.length}:${(h >>> 0).toString(36)}`;
 }
 
+/**
+ * Which belief a missed prediction traced back to, as the reviewer read it:
+ * the model's own prior, a knowledge entry or a pattern it rested on, the
+ * link between two patterns, or a world that changed under it. Kept with the
+ * assessment so the learning it drives can be followed back to its cause.
+ */
+export type PredictionAttribution = { source: 'prior' | 'entry' | 'pattern' | 'link' | 'world'; id?: string; note?: string };
+
+function attributionOf(raw: unknown): PredictionAttribution | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const { source, id, note } = raw as { source?: unknown; id?: unknown; note?: unknown };
+  if (source !== 'prior' && source !== 'entry' && source !== 'pattern' && source !== 'link' && source !== 'world') return undefined;
+  return { source, ...(typeof id === 'string' && id ? { id: id.slice(0, 300) } : {}), ...(typeof note === 'string' && note.trim() ? { note: note.trim().slice(0, 500) } : {}) };
+}
+
 export class GoalManager extends Abject {
   private goals: Map<GoalId, Goal> = new Map();
   private goalOrder: GoalId[] = [];
@@ -2014,7 +2029,9 @@ reviews results and either plans another round or completes/fails the goal.
         }
         if (previous && (p.expectedRevision !== (previous.revision ?? 1) || !p.evidenceRefs?.length)) return { success: false, conflict: true, error: 'Assessment differs; explicitly revise the current assessment with evidence references', assessment: previous };
         if (p.evidenceRefs?.some(ref => !/^learning\/(task|observation|assessment)\//.test(ref) || !(ref in goal.scratchpad))) return { success: false, error: 'Assessment evidence reference unavailable' };
+        const attribution = attributionOf((msg.payload as { attribution?: unknown }).attribution);
         const assessment = { taskId, step, verdict, explanation, origin: 'reviewer', at: Date.now(), revision: (previous?.revision ?? (previous ? 1 : 0)) + 1,
+          ...(attribution ? { attribution } : {}),
           evidenceRefs: p.evidenceRefs ?? [], history: previous ? [...(previous.history ?? []), { ...previous, history: undefined }] : [] };
         goal.scratchpad[key] = assessment;
         const reconsiderations: LearningDecision[] = [];

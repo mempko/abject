@@ -151,9 +151,10 @@ as first-class objects. The host/guest contract is `docs/WASM_ABI.md`; the
 C++ SDK is `sdk/cpp/` (see its README). Working example: `examples/echo-cpp`
 (full ABI surface, user-loadable via forge). Bundled system packages live in
 `native/` (committed with their built `main.wasm`, ingested at every boot,
-shipped in the desktop app via extraResources); `native/knowledge-base`
-replaces the built-in KnowledgeBase. Rebuild bundled packages with
-`pnpm smelt` after changing their sources.
+shipped in the desktop app via extraResources); `native/knowledge-base` is
+the KnowledgeBase (there is no TypeScript one; its message vocabulary lives in
+`src/core/knowledge.ts`), marked `required` so boot stops without it. Rebuild
+bundled packages with `pnpm smelt` after changing their sources.
 
 1. Write the object against `sdk/cpp/include/abject/abject.hpp` (`Object`
    subclass + `ABJECT_OBJECT(Class)` in one translation unit)

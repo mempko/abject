@@ -41,6 +41,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { require as precondition, requireNonEmpty, invariant } from '../core/contracts.js';
 import { makePattern, readPattern, serializePattern, PATTERN_FIELDS } from '../core/pattern.js';
+import { planPatternTrail, type PlanPatternUse, type RecordedPlan } from '../core/plan-patterns.js';
 import type { AgentAction, PredictionRecord } from './agent-abject.js';
 import { verificationRecordOf, renderVerificationRecord, type VerificationRecordEntry } from './scrum-master.js';
 import { learningFingerprint, validateLearningEffect, type LearningDecision, type LearningEffect } from '../core/learning.js';
@@ -77,6 +78,10 @@ const GOAL_TRANSCRIPT_BUDGET = 40000;
  */
 const EXECUTION_RECORD_CAP = 4000;
 const PATTERN_LANGUAGE_BUDGET = 6000;
+/** Predictions that missed, with what they rested on: where the learning is. */
+const SURPRISES_BUDGET = 4000;
+/** The patterns this goal used, plan- and task-level, with their evidence. */
+const PATTERN_APPLICATIONS_BUDGET = 4000;
 /** Patterns matched directly by the weave (links add up to twice as many). */
 const WOVEN_PATTERN_LIMIT = 4;
 /** Candidate-pattern lessons shown beside the woven patterns. */
@@ -106,6 +111,8 @@ const MAX_FILLED_APPLICATIONS = 12;
 const PRIVACY_GENERIC_MIN_P = 0.5;
 /** reviewer.dedupe (act): a relation this sure turns a new entry away. */
 const DEDUPE_ACT_P = 0.85;
+/** Entries one review confirms from held predictions that cited them. */
+const MAX_CONFIRMATIONS = 8;
 /** reviewer.dedupe: a relation this sure to a candidate-pattern lesson counts as its recurrence. */
 const RECURRENCE_MIN_P = 0.5;
 
@@ -192,6 +199,12 @@ interface ReviewTaskExtra {
   completionIssues?: string[];
   /** New lessons that repeat a candidate-pattern lesson: the recurrence that promotes a candidate. */
   recurrences?: Array<{ title: string; candidateId: string; candidateTitle: string }>;
+  /** Patterns the goal's plan declared: their applications are recorded per goal. */
+  planPatternIds?: string[];
+  goalOutcome?: 'completed' | 'failed';
+  evidenceTaskIds?: string[];
+  /** Entries this review has already confirmed from held predictions that cited them. */
+  confirmedEntries?: string[];
   /** Set once the goal's summary-fidelity verdict is on record. */
   summaryFidelityRecorded?: boolean;
   /** Decision-model judgments made at launch; priors in the dossier, automated records when a site acts. */
@@ -209,12 +222,61 @@ interface ReviewTaskExtra {
   goalId?: string;
 }
 
+/** A knowledge entry as the KnowledgeBase presents it to the dossier. */
+interface ShownEntry {
+  id: string;
+  title: string;
+  type?: string;
+  tags?: string[];
+  content?: string;
+  knowledgeRef?: string;
+  pattern?: {
+    links?: string[];
+    therefore?: string;
+    resultingContext?: string;
+    aliases?: string;
+    learning?: { applications?: Array<{ id: string; verdict: string; goalId?: string }> };
+  };
+}
+
+/**
+ * A new pattern names the existing patterns that should lead to it in
+ * `linkedFrom`; each becomes an update_pattern adding the link, journaled with
+ * the save so the pattern joins the language connected instead of as an island.
+ */
+function withInboundLinks(effects: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const effect of effects) {
+    out.push(effect);
+    const e = effect as Record<string, unknown> | null;
+    if (!e || e.action !== 'save_pattern' || !Array.isArray(e.linkedFrom)) continue;
+    // Only the name is needed here; Evidence may still come from the shared statement.
+    const built = makePattern({ ...e, evidence: typeof e.evidence === 'string' && e.evidence.trim() ? e.evidence : 'pending' });
+    if (!built.ok) continue;
+    for (const id of e.linkedFrom.filter((x): x is string => typeof x === 'string').slice(0, 6)) {
+      out.push({ action: 'update_pattern', id, addLinks: [built.pattern.name] });
+    }
+  }
+  return out;
+}
+
+/** Lowercase alphanumerics: how link names compare. */
+function linkKey(name: string): string {
+  return name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
 /** What the dossier is built around, beyond the evidence records. */
 interface ReviewBriefing {
   /** The reviewed work in its own words (goal title and description, or the task): what recall and the weave match against. */
   focus?: string;
   /** ScrumMaster's account of how the goal ran: the ore patterns are mined from. */
   executionRecord?: string;
+  /** The goal's recorded plan revisions, with the patterns each declared. */
+  plans?: RecordedPlan[];
+  /** How the goal ended: what plan-level pattern applications are judged against. */
+  outcome?: 'completed' | 'failed';
+  /** Tasks whose records are on the goal's evidence ledger (learning/task/<id>). */
+  evidenceTaskIds?: string[];
 }
 
 interface PendingGoalReview {
@@ -336,6 +398,10 @@ const PATTERN_CRITERIA = {
   helpful: criterion('Following the pattern\'s Therefore is what made this step or the goal go better.', {
     notFor: 'A step that went well for reasons unrelated to the pattern, or where the pattern was only mentioned (inconclusive).',
     examples: ['The pattern said to gather data before judging; the gathered data exposed the real cause and the fix held.'],
+  }),
+  no_effect: criterion('The pattern was followed, and the state its Therefore and Resulting context promise did not come about or made no difference here.', {
+    notFor: 'Following it caused a failure or a detour (harmful), or the effect cannot be told apart from other causes (inconclusive).',
+    examples: ['The pattern said to stage research before acting; the round staged it, and the plan that followed was the same one the first message already implied.'],
   }),
   harmful: criterion('Following the Therefore contributed to a failure or a wasted detour.', {
     notFor: 'A failure with an unrelated cause, such as an outage (inconclusive).',
@@ -466,6 +532,15 @@ function dedupeQuestions(count: number): Record<string, DecisionQuestion> {
 }
 
 /** Text clipped for a decision state or an explanation. */
+/**
+ * A step the agent stated an expectation for, with an observed outcome: the
+ * only steps whose assessment means anything. A step without an expectation
+ * has nothing to compare, so the review neither lists nor assesses it.
+ */
+function isPredicted(p: PredictionRecord): boolean {
+  return !!p.expect?.trim() && p.outcome !== 'unknown';
+}
+
 function clipText(value: unknown, max: number): string {
   const text = typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value) ?? '';
   return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text;
@@ -809,6 +884,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   /** Every proposal is durable before lookup/validation. Both action forms use this path. */
   private async proposeLearning(taskId: string, effects: unknown[], context: Record<string, unknown>): Promise<LearningDecision> {
     const extra = this.taskExtras.get(taskId)!;
+    effects = withInboundLinks(effects);
     context = { ...context, scope: context.scope ?? extra.knowledgeScope };
     if (!extra.goalId || !this.goalManagerId) throw new Error('Episode-linked learning requires a goal');
     const r = await this.request<{ success: boolean; decision: LearningDecision }>(request(this.id, this.goalManagerId, 'recordLearningDecision', {
@@ -821,10 +897,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     for (const effect of decision.effects) {
       if (!effect.attempts && effect.input.action === 'record_pattern_application' && effect.input.application) {
         const app = effect.input.application as Record<string, unknown>;
-        const episodes = (extra.records ?? []).flatMap(r => (r.predictions ?? []).flatMap(p => (p.patterns ?? [])
-          .filter(a => a.id === effect.input.id && (app.taskId === undefined || app.taskId === r.taskId && app.step === p.step))
-          .map(a => ({ taskId: r.taskId, step: p.step, outcome: p.outcome, applicationRef: a.applicationRef }))));
-        if (episodes.length === 1) decision = await this.changeEffect(decision, effect, { prepare: { ...episodes[0], verdict: app.verdict, evidence: app.evidence } });
+        const bound = this.bindApplication(extra, String(effect.input.id), app);
+        if (bound) decision = await this.changeEffect(decision, effect, { prepare: { ...bound, verdict: app.verdict, evidence: app.evidence } });
       }
       const ref = extra.knowledgeRefs?.[String(effect.input.id)];
       if (!effect.attempts && !effect.input.knowledgeRef && ref) decision = await this.changeEffect(decision, effect, { prepare: { knowledgeRef: ref } });
@@ -839,6 +913,28 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     for (const e of decision.effects) if (e.state === 'applied' && e.input.action === 'record_pattern_application') (extra.applicationAssessments ??= {})[`${e.input.taskId}:${e.input.step}:${e.input.id}`] = String(e.input.verdict);
     extra.decisions = [...(extra.decisions ?? []).filter(d => d.id !== decision.id), decision];
     return decision;
+  }
+
+  /**
+   * Which recorded application a verdict is about. Without a taskId it is
+   * the plan's use of the pattern, when the goal's plan declared it; with a
+   * taskId (and optionally a step) it is that task's own use, one application
+   * however many of its steps cited the pattern. Undefined when ambiguous or
+   * unrecorded; the journal then asks for a repair naming what is missing.
+   */
+  private bindApplication(extra: ReviewTaskExtra, patternId: string, app: Record<string, unknown>): Record<string, unknown> | undefined {
+    const taskGiven = typeof app.taskId === 'string' && app.taskId !== '';
+    if (!taskGiven && extra.goalId && extra.planPatternIds?.includes(patternId)) {
+      return { applicationRef: `${extra.goalId}:${patternId}`, outcome: extra.goalOutcome === 'failed' ? 'failure' : 'success' };
+    }
+    const episodes = (extra.records ?? []).flatMap(r => (r.predictions ?? []).flatMap(p => (p.patterns ?? [])
+      .filter(a => a.id === patternId && !!a.applicationRef && (!taskGiven || (app.taskId === r.taskId && (app.step === undefined || app.step === p.step))))
+      .map(a => ({ taskId: r.taskId, step: p.step, outcome: p.outcome, applicationRef: a.applicationRef! }))));
+    const refs = [...new Set(episodes.map(e => e.applicationRef))];
+    if (refs.length !== 1) return undefined;
+    const outcomes = episodes.map(e => e.outcome);
+    const outcome = outcomes.includes('failure') ? 'failure' : outcomes.every(o => o === 'unknown') ? 'unknown' : 'success';
+    return { taskId: episodes[0].taskId, step: episodes[0].step, outcome, applicationRef: refs[0] };
   }
 
   private async applyDecision(initial: LearningDecision, extra?: ReviewTaskExtra): Promise<LearningDecision> {
@@ -983,7 +1079,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       }
       if (extra?.goalId && this.goalManagerId && (action.action === 'learn' || ['save_entry','update_entry','archive_entry','supersede_entry','dispute_entry','narrow_entry','confirm_entry','no_change','save_pattern','update_pattern','record_pattern_application'].includes(action.action))) {
         const app = action.application as Record<string, unknown> | undefined;
-        const context = action.action === 'learn' ? (action.context ?? {}) as Record<string, unknown> : { evidence: action.evidence ?? app?.evidence, evidenceRefs: action.evidenceRefs ?? (app?.taskId ? [`learning/task/${app.taskId}`] : undefined), assessmentRefs: app?.taskId && app.step ? [`learning/assessment/${app.taskId}:${app.step}`] : undefined, scope: action.scope };
+        // A plan-level application rests on the whole goal's task records.
+        const planWide = action.action === 'record_pattern_application' && !app?.taskId && extra.evidenceTaskIds?.length
+          ? extra.evidenceTaskIds.map(id => `learning/task/${id}`) : undefined;
+        const context = action.action === 'learn' ? (action.context ?? {}) as Record<string, unknown> : { evidence: action.evidence ?? app?.evidence, evidenceRefs: action.evidenceRefs ?? (app?.taskId ? [`learning/task/${app.taskId}`] : planWide), assessmentRefs: app?.taskId && app.step ? [`learning/assessment/${app.taskId}:${app.step}`] : undefined, scope: action.scope };
         const decision = await this.proposeLearning(taskId, action.action === 'learn' && Array.isArray(action.effects) ? action.effects : [action], context);
         result = { success: decision.effects.every(e => e.state === 'applied'), data: decision, error: decision.effects.find(e => e.state !== 'applied')?.error };
       } else result = await this.handleAct(taskId, action);
@@ -1102,6 +1201,9 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }
     if (typeof batch.unresolvedReason === 'string' && batch.unresolvedReason.trim()) extra.completionIssues.push(batch.unresolvedReason.trim());
     await this.recordSummaryFidelity(extra, batch.summaryFidelity);
+    // Assessments recorded so far confirm what they rested on, on every pass,
+    // so a review that ends before its correction keeps them.
+    if (!extra.cancelled && extra.kind === 'review') await this.confirmCitedKnowledge(taskId, extra);
     let missing = this.missingAssessments(extra);
     // Judged episodes still missing an assessment are recorded from the
     // decision model's verdicts instead of an extra model turn: confident
@@ -1117,20 +1219,20 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const fidelityMissing = extra.kind === 'review' && !!extra.goalId && !extra.summaryFidelityRecorded && batch.summaryFidelity === undefined;
     // A lesson that repeats a candidate-pattern lesson is the recurrence the
     // pattern language waits for; the one correction offers the promotion.
-    const promoted = (extra.updates ?? []).some(u => u.action.action === 'save_pattern' && u.status === 'saved')
-      || (extra.decisions ?? []).some(d => d.effects.some(e => e.state === 'applied' && e.input.type === 'pattern'));
+    // A candidate is handled once it is archived: promotion writes the pattern
+    // and archives the candidate it absorbs.
     const archived = new Set([
       ...(extra.updates ?? []).filter(u => u.action.action === 'archive_entry').map(u => String(u.action.id)),
       ...(extra.decisions ?? []).flatMap(d => d.effects).filter(e => e.input.action === 'archive_entry').map(e => String(e.input.id)),
     ]);
-    const recurrences = promoted ? [] : (extra.recurrences ?? []).filter(r => !archived.has(r.candidateId));
+    const recurrences = (extra.recurrences ?? []).filter(r => !archived.has(r.candidateId));
     extra.recurrences = [];
     if (!extra.cancelled && extra.kind === 'review' && (missing.length || fidelityMissing || recurrences.length) && !extra.completionIssues.length && !extra.completionCorrectionSent) {
       extra.completionCorrectionSent = true;
       const parts: string[] = [];
       if (recurrences.length) {
         const seen = recurrences.map(r => `- "${clipText(r.title, 120)}" repeats candidate-pattern lesson ${r.candidateId} ("${clipText(r.candidateTitle, 120)}")`).join('\n');
-        parts.push(`This work repeats a shape already recorded as a candidate pattern:\n${seen}\nA candidate seen again is ready to join the pattern language. In your next done, promote it in result.knowledgeUpdates with {action:"save_pattern", name, context, forces, therefore, evidence (name both episodes), links}, then {action:"archive_entry", id:"<candidate id>"} for each candidate the pattern absorbs. When on reflection the shapes differ, resend the lesson as save_entry with force: true instead. Send only these updates, together with anything else this correction asks for.`);
+        parts.push(`This work repeats a shape already recorded as a candidate pattern:\n${seen}\nA candidate seen again is ready to join the pattern language. In your next done, promote it in result.knowledgeUpdates with {action:"save_pattern", name, context, forces, therefore, evidence (name both episodes), links}, then {action:"archive_entry", id:"<candidate id>"} for each candidate the pattern absorbs; if this review already wrote that pattern, the archive alone completes it. When on reflection the shapes differ, resend the lesson as save_entry with force: true instead, or leave the candidate for a later recurrence. Send only these updates, together with anything else this correction asks for.`);
       }
       if (missing.length) {
         const budget = Math.max(0, Math.floor(12000 / missing.length) - 160);
@@ -1152,10 +1254,48 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     return { accepted: true, result: report, evidence: report };
   }
 
+  /**
+   * A prediction that held while resting on a knowledge entry is evidence the
+   * entry describes the world, so it is recorded as a confirmation through the
+   * learning journal, bound to the version the agent was shown. An entry that
+   * has changed since is left alone: the confirmation would be about a claim
+   * it no longer makes. Patterns are judged through their applications.
+   */
+  private async confirmCitedKnowledge(taskId: string, extra: ReviewTaskExtra): Promise<void> {
+    if (!extra.goalId || !this.goalManagerId) return;
+    const kb = await this.getKbId();
+    if (!kb) return;
+    const cited = new Map<string, { knowledgeRef: string; refs: string[]; expects: string[] }>();
+    for (const r of extra.records ?? []) for (const p of r.predictions ?? []) {
+      if (extra.assessments?.[`${r.taskId}:${p.step}`]?.verdict !== 'supported') continue;
+      for (const b of p.basis ?? []) {
+        if (!b.knowledgeRef || extra.confirmedEntries?.includes(b.id)) continue;
+        const c = cited.get(b.id) ?? { knowledgeRef: b.knowledgeRef, refs: [], expects: [] };
+        if (c.knowledgeRef !== b.knowledgeRef) continue;
+        c.refs.push(`learning/assessment/${r.taskId}:${p.step}`);
+        c.expects.push(clipText(p.expect, 120));
+        cited.set(b.id, c);
+      }
+    }
+    const effects: Array<Record<string, unknown> & { evidenceRefs: string[] }> = [];
+    for (const [id, c] of [...cited].slice(0, MAX_CONFIRMATIONS)) {
+      const current = await this.request<{ knowledgeRef?: string; type?: string } | null>(request(this.id, kb, 'get', { id })).catch(() => null);
+      if (!current || current.type === 'pattern' || current.knowledgeRef !== c.knowledgeRef) continue;
+      effects.push({ action: 'confirm_entry', id, knowledgeRef: c.knowledgeRef,
+        evidence: `Predictions resting on this entry held: ${c.expects.slice(0, 3).join(' | ')}`, evidenceRefs: [...new Set(c.refs)] });
+    }
+    if (!effects.length) return;
+    (extra.confirmedEntries ??= []).push(...effects.map(e => String(e.id)));
+    try {
+      await this.proposeLearning(taskId, effects, { evidence: 'Held predictions that cited these entries',
+        assessmentRefs: [...new Set(effects.flatMap(e => e.evidenceRefs))] });
+    } catch (err) { log.warn(`confirmations of cited knowledge not journaled: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+
   /** Observed episodes with a stated prediction and no assessment yet; GoalManager keeps the rest unresolved. */
   private missingAssessments(extra: ReviewTaskExtra): Array<{ taskId: string; p: PredictionRecord }> {
     return (extra.records ?? []).flatMap(r => (r.predictions ?? [])
-      .filter(p => p.expect?.trim() && p.outcome !== 'unknown' && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
+      .filter(p => isPredicted(p) && !extra.assessments?.[`${r.taskId}:${p.step}`]).map(p => ({ taskId: r.taskId, p })));
   }
 
   private learningReport(extra?: ReviewTaskExtra, interrupted = false) {
@@ -1482,7 +1622,10 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       material,
       goalTaskIds,   // durable records retain evidence after transcript release
       review.goalId, all, { worth, judgments },
-      { focus: [goal?.title, goal?.description?.slice(0, 1500)].filter(Boolean).join('\n') || undefined, executionRecord },
+      { focus: [goal?.title, goal?.description?.slice(0, 1500)].filter(Boolean).join('\n') || undefined, executionRecord,
+        plans: Array.isArray(goal?.scratchpad?.['learning/plans']) ? goal!.scratchpad!['learning/plans'] as RecordedPlan[] : [],
+        outcome: review.outcome,
+        evidenceTaskIds: Object.keys(goal?.scratchpad ?? {}).filter(k => k.startsWith('learning/task/')).map(k => k.slice('learning/task/'.length)) },
     );
   }
 
@@ -1804,14 +1947,18 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if (!judged || judged.mode !== 'act' || !extra.goalId || !this.goalManagerId || extra.cancelled) return;
     const effects: Array<Record<string, unknown>> = [];
     const refs = new Set<string>();
+    // Steps that cited the same pattern in one task share one application;
+    // its first judged step speaks for it, so no two verdicts collide.
+    const filled = new Set<string>();
     for (const r of extra.records ?? []) for (const p of r.predictions ?? []) for (const a of p.patterns ?? []) {
       const key = `${r.taskId}:${p.step}:${a.id}`;
       const j = judged.byApplication[key];
-      if (!j || !a.applicationRef || extra.applicationAssessments?.[key]) continue;
+      if (!j || !a.applicationRef || extra.applicationAssessments?.[key] || filled.has(a.applicationRef)) continue;
       if (!j.deterministic && j.p < AUTO_PATTERN_MIN_P) continue;
+      filled.add(a.applicationRef);
       const evidence = j.deterministic
         ? 'Automated assessment (rule): the step\'s outcome was not observed, so the effect of following the pattern stays inconclusive.'
-        : `Automated assessment (${provenance(j)}): ${j.choice} (helpful ${fmtP(j.probabilities.helpful ?? 0)}, harmful ${fmtP(j.probabilities.harmful ?? 0)}, inconclusive ${fmtP(j.probabilities.inconclusive ?? 0)}).`;
+        : `Automated assessment (${provenance(j)}): ${j.choice} (helpful ${fmtP(j.probabilities.helpful ?? 0)}, no effect ${fmtP(j.probabilities.no_effect ?? 0)}, harmful ${fmtP(j.probabilities.harmful ?? 0)}, inconclusive ${fmtP(j.probabilities.inconclusive ?? 0)}).`;
       effects.push({ action: 'record_pattern_application', id: a.id, application: { taskId: r.taskId, step: p.step, context: clipText(a.why, 300), verdict: j.choice, evidence } });
       refs.add(`learning/task/${r.taskId}`);
     }
@@ -1982,7 +2129,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * prediction are explicit unknowns rather than implied confirmations.
    */
   private formatPredictions(record: TranscriptResponse): string {
-    const predictions = [...(record.predictions ?? [])].sort((a, b) => Number(b.verdict === 'contradicted') - Number(a.verdict === 'contradicted'));
+    const predictions = (record.predictions ?? []).filter(p => isPredicted(p) || p.patterns?.length)
+      .sort((a, b) => Number(b.verdict === 'contradicted') - Number(a.verdict === 'contradicted'));
     if (predictions.length === 0) return '';
     const lines = predictions.map(p => {
       const verdict = p.verdict ?? 'unresolved (legacy action outcome is not a prediction verdict)';
@@ -2007,7 +2155,8 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   /** Budget the whole dossier; full records remain addressable through this receiver. */
-  private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string, briefing: ReviewBriefing = {}): Promise<string> {
+  private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string,
+    briefing: ReviewBriefing & { goalId?: string } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = []): Promise<string> {
     const pieces: string[] = [];
     const executionRecord = briefing.executionRecord?.trim();
     let remaining = GOAL_TRANSCRIPT_BUDGET;
@@ -2018,7 +2167,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       pieces.push(part); remaining -= part.length + 2;
     };
     append(`Learning dossier: ${records.length} task records. Task success is not prediction accuracy. Missing predictions are unknown, not confirmations.\nUse read_evidence with taskId and optional step for observations, key for learning/plans or learning/observation/<operationId>, or offset/length for complete material.`, 1000);
-    append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; scopes=${JSON.stringify(r.knowledgeScopes ?? (r.knowledgeScope ? [r.knowledgeScope] : []))}; observation steps=[${(r.predictions ?? []).map(p => p.step).join(',')}]. Every listed step needs an assessment or an explicit evidence gap.`).join('\n'), 6000);
+    append(records.map(r => `${r.taskId}: ${r.agentName}, outcome=${r.phase}; scopes=${JSON.stringify(r.knowledgeScopes ?? (r.knowledgeScope ? [r.knowledgeScope] : []))}; predicted steps=[${(r.predictions ?? []).filter(isPredicted).map(p => p.step).join(',')}]. Every listed step needs an assessment or an explicit evidence gap; steps without a stated expectation are not assessed.`).join('\n'), 6000);
     // Owner-provided completion evidence includes checks that ran before the
     // first model action. They can disprove recalled claims about capabilities.
     const outcomeBudget = Math.floor(3600 / Math.max(1, records.length));
@@ -2030,15 +2179,16 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     }).join('\n'), 4200);
     // Index surprises across ALL tasks, including tasks omitted from transcript excerpts.
     const predictions = records.flatMap(r => (r.predictions ?? []).map(p => ({ r, p })));
-    append('Declared pattern applications (seeing a pattern does not establish its usefulness):\n' + predictions.flatMap(({ r, p }) =>
-      (p.patterns ?? []).map(pattern => `${r.taskId} step ${p.step}: ${pattern.id}; ${pattern.why ?? ''}`)).join('\n'), 2500);
     predictions.sort((a, b) => Number(b.p.verdict === 'contradicted') - Number(a.p.verdict === 'contradicted'));
-    const rowBudget = Math.floor(15500 / Math.max(1, predictions.length));
+    const predicted = predictions.filter(({ p }) => isPredicted(p));
+    const rowBudget = Math.floor(15500 / Math.max(1, predicted.length));
     const detailsBudget = Math.max(0, rowBudget - 180);
-    append(`Prediction/feedback index (${predictions.length} observations; excerpts are not complete evidence):\n` + predictions.map(({ r, p }) =>
-      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}; expected=${(p.expect || '(missing)').slice(0, detailsBudget / 2)}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, detailsBudget / 2)}`).join('\n'), 16000);
+    append(`Prediction/feedback index (${predicted.length} predictions; excerpts are not complete evidence):\n` + predicted.map(({ r, p }) =>
+      `${r.taskId} step ${p.step}: operation=${p.outcome}, status comparison=${p.verdict ?? 'unresolved'}, agent's reading=${p.selfAssessment?.verdict ?? 'not given'}; expected=${(p.expect || '(missing)').slice(0, detailsBudget / 2)}; actual excerpt=${(typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)').slice(0, detailsBudget / 2)}`).join('\n'), 16000);
     // Decision-model priors (advise/act) sit beside the index they annotate.
     if (priors) append(priors, 3500);
+    const surprises = this.renderSurprises(records);
+    if (surprises) append(surprises, SURPRISES_BUDGET);
     if (executionRecord) {
       append(`Execution record (ScrumMaster's account of how the goal actually ran, the ore patterns are mined from${executionRecord.length > EXECUTION_RECORD_CAP ? '; read_evidence with key scrum/plan returns it in full' : ''}):\n${executionRecord}`, EXECUTION_RECORD_CAP);
     }
@@ -2047,6 +2197,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const focus = briefing.focus?.trim() || task;
     if (kb) {
       append(await this.renderPatternLanguage(kb, focus, this.reviewScope(records), knowledgeRefs), PATTERN_LANGUAGE_BUDGET);
+      const trail = planPatternTrail(briefing.plans ?? []);
       const recalled = await this.request<Array<{ id: string; title: string; snippet?: string }>>(request(this.id, kb, 'recall', { query: focus, limit: 6, previews: true, scope: this.reviewScope(records) })).catch(() => []);
       const injected = records.flatMap(r => (r.injectedKnowledge ?? []).map(k => ({ ...k, taskId: r.taskId })));
       // Relevant claims and declared applications precede always-injected
@@ -2059,7 +2210,13 @@ My work is internal maintenance of this workspace's memory. When invited to cont
         ...injected.filter(k => k.source !== 'profile').map(k => k.id),
         ...injected.map(k => k.id),
       ])].slice(0, 12);
-      const entries = await Promise.all(ids.map(id => this.request(request(this.id, kb, 'get', { id })).catch(() => null)));
+      // One read per entry serves both the applications and reconciliation.
+      const applied = [...new Set([...trail.keys(), ...predictions.flatMap(({ p }) => (p.patterns ?? []).map(d => d.id))])].slice(0, 12);
+      const fetchIds = [...new Set([...ids, ...applied])];
+      const fetched = new Map(await Promise.all(fetchIds.map(async id => [id, await this.request<ShownEntry | null>(request(this.id, kb, 'get', { id })).catch(() => null)] as const)));
+      const entries = ids.map(id => fetched.get(id) ?? null);
+      const applications = this.renderPatternApplications(trail, records, fetched, briefing.goalId, recurrences, knowledgeRefs);
+      if (applications) append(applications, PATTERN_APPLICATIONS_BUDGET);
       append('Knowledge reconciliation: use explicit parent evidenceRefs such as learning/task/<taskId>, learning/observation/<taskId>:<step>, learning/assessment/<taskId>:<step>. Put shared evidence and evidenceRefs alongside knowledgeUpdates in done.result; archive items inherit this shared context. Effects can update_entry, archive_entry (global only), supersede_entry (replacementId, optional scope), dispute_entry, narrow_entry (scope), confirm_entry, save_entry, save_pattern, update_pattern, or no_change. A single learn action uses {context:{evidence,evidenceRefs,scope},effects:[...]}. Connect interpretation to the affected claim; no_change and uncertainty are valid. Compare historical claims with observed actions and completion evidence. Correct obsolete claims even when the task succeeded and no pattern was applied. Injection does not prove usefulness. Excerpts are bounded; use recall by id before replacing a partially shown entry.', 600);
       const perEntry = Math.floor(8400 / Math.max(1, ids.length));
       for (let i = 0; i < ids.length; i++) {
@@ -2087,16 +2244,17 @@ My work is internal maintenance of this workspace's memory. When invited to cont
    * sit beside the patterns rather than waiting on a recall of their own.
    */
   private async renderPatternLanguage(kb: AbjectId, focus: string, scope: string | undefined, knowledgeRefs: Record<string, string>): Promise<string> {
-    type Shown = { id: string; title: string; type?: string; content?: string; snippet?: string; via?: string; knowledgeRef?: string;
+    type Shown = { id: string; title: string; type?: string; tags?: string[]; content?: string; snippet?: string; via?: string; knowledgeRef?: string;
+      linkedFrom?: string[]; counterexamples?: Array<{ verdict: string; evidence: string }>;
       pattern?: { context?: string; therefore?: string; evidence?: string; links?: string[] } };
     const [woven, recalled] = await Promise.all([
-      this.request<{ patterns?: Shown[]; dangling?: string[] }>(
+      this.request<{ patterns?: Shown[]; dangling?: string[]; broken?: Array<{ name: string; archivedId: string }> }>(
         request(this.id, kb, 'weave', { query: focus, limit: WOVEN_PATTERN_LIMIT, hops: 1, scope }), 10000).catch(() => null),
       this.request<Shown[]>(
         request(this.id, kb, 'recall', { query: focus, tags: ['candidate-pattern'], limit: CANDIDATE_LESSON_LIMIT, previews: true, scope }), 10000).catch(() => []),
     ]);
     const patterns = (woven?.patterns ?? []).filter(p => p?.id);
-    const candidates = (Array.isArray(recalled) ? recalled : []).filter(c => c?.id && c.type !== 'pattern');
+    const candidates = (Array.isArray(recalled) ? recalled : []).filter(c => c?.id && c.type !== 'pattern' && c.tags?.includes('candidate-pattern'));
     // Shown versions are the ones an update or archive in this review binds to.
     for (const e of [...patterns, ...candidates]) if (e.knowledgeRef && !knowledgeRefs[e.id]) knowledgeRefs[e.id] = e.knowledgeRef;
 
@@ -2104,20 +2262,133 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     const perCandidate = Math.max(160, Math.floor(PATTERN_LANGUAGE_BUDGET * 0.25 / Math.max(1, candidates.length)) - 120);
     const describe = (p: Shown): string => {
       const s = p.pattern;
-      if (!s?.context) return clipText((p.content ?? p.snippet ?? '').replace(/\s+/g, ' '), perPattern);
+      const signals = `${p.linkedFrom?.length ? ` Linked from: ${p.linkedFrom.join(', ')}.` : ''}`
+        + `${p.counterexamples?.length ? ` Recent counterexamples: ${p.counterexamples.map(c => `${c.verdict}: ${clipText(c.evidence, 140)}`).join(' | ')}` : ''}`;
+      if (!s?.context) return clipText((p.content ?? p.snippet ?? '').replace(/\s+/g, ' '), perPattern) + signals;
       const body = `Context: ${s.context} Therefore: ${s.therefore ?? ''} Evidence: ${s.evidence ?? ''}`.replace(/\s+/g, ' ');
-      return `${clipText(body, perPattern)}${s.links?.length ? ` Links: ${s.links.join(', ')}` : ''}`;
+      return `${clipText(body, perPattern)}${s.links?.length ? ` Links: ${s.links.join(', ')}` : ''}${signals}`;
     };
     const lines = ['Pattern language for this work (woven on the work\'s own description; a listed pattern is recorded knowledge, and only the episodes show whether it was applied):'];
     lines.push(patterns.length
       ? patterns.map(p => `- ${p.title} [id=${p.id}; ${p.via ?? 'matched'}]\n  ${describe(p)}`).join('\n')
       : '- No written pattern matches this work yet.');
     if (woven?.dangling?.length) lines.push(`Unwritten patterns (named by links, no entry yet): ${woven.dangling.slice(0, 12).join(', ')}`);
+    if (woven?.broken?.length) lines.push(`Broken links (they name an archived pattern; retarget them with update_pattern, or restore the pattern if it still holds): ${woven.broken.slice(0, 8).map(b => `${b.name} (archived ${b.archivedId})`).join(', ')}`);
     lines.push(candidates.length
       ? `Candidate-pattern lessons matching this work (each a shape seen once before):\n${candidates.map(c => `- ${c.title} [id=${c.id}]: ${clipText((c.snippet ?? c.content ?? '').replace(/\s+/g, ' '), perCandidate)}`).join('\n')}`
       : 'No candidate-pattern lessons match this work yet.');
     lines.push('Weigh this work against the language (step 4 of How to review): update_pattern a pattern whose context it shared; promote a candidate it repeats with save_pattern, then archive_entry the candidate; write an unwritten pattern whose territory it covers; tag a new lesson whose shape could govern other goals \'candidate-pattern\'. These ride in done.result.knowledgeUpdates like any correction.');
     return lines.join('\n');
+  }
+
+  /**
+   * Predictions that missed, with what they rested on. A miss means a belief
+   * was wrong: the model's own prior, an entry or pattern it cited, the link
+   * that led to a pattern, or a world that changed under it. Shown with the
+   * agent's own reading, given while the whole result was in view.
+   */
+  private renderSurprises(records: TranscriptResponse[]): string {
+    const rows: string[] = [];
+    for (const r of records) {
+      const shown = new Map((r.injectedKnowledge ?? []).map(k => [k.id, k.title]));
+      for (const p of r.predictions ?? []) {
+        if (!isPredicted(p)) continue;
+        const reading = p.selfAssessment?.verdict;
+        const missed = reading === 'missed' || reading === 'unclear' || p.verdict === 'contradicted' || p.decisionVerdict?.verdict === 'contradicted';
+        if (!missed) continue;
+        const basis = (p.basis ?? []).map(b => `${shown.get(b.id) ?? b.id} [id=${b.id}]${b.why ? ` ("${clipText(b.why, 100)}")` : ''}`);
+        const patterns = (p.patterns ?? []).map(d => `${shown.get(d.id) ?? d.id} [id=${d.id}]`);
+        const actual = typeof p.actual === 'string' ? p.actual : JSON.stringify(p.actual) ?? '(no observation)';
+        rows.push(`- ${r.taskId} step ${p.step} (${r.agentName}): expected "${clipText(p.expect, 240)}"; actual ${clipText(actual, 300)}`
+          + `\n  agent's reading: ${reading ?? 'not given'}${p.selfAssessment?.learned ? `; learned: "${clipText(p.selfAssessment.learned, 200)}"` : ''}`
+          + `${p.verdict === 'contradicted' ? '; operation status contradicted' : ''}${p.decisionVerdict?.verdict === 'contradicted' ? `; decision model: contradicted (p=${fmtP(p.decisionVerdict.confidence)})` : ''}`
+          + `\n  rested on: ${basis.length ? basis.join(', ') : 'nothing cited'}${patterns.length ? `; patterns: ${patterns.join(', ')}` : ''}`
+          + `${shown.size ? `; shown to the agent: ${[...shown.values()].slice(0, 5).map(t => clipText(t, 60)).join('; ')}` : ''}`);
+      }
+    }
+    if (!rows.length) return '';
+    return `Surprises (${rows.length}): predictions that missed or that the agent could not call. For each, name in assess_prediction's attribution which belief failed (prior, entry, pattern, link or world) and act on it: an entry it rested on gets corrected or narrowed, a pattern gets the counterexample, a wrong prior becomes a lesson stating what holds.\n${rows.join('\n')}`;
+  }
+
+  /**
+   * The patterns this goal used and the evidence for each: the plan's course
+   * with them (declared, kept, dropped and why), the tasks they governed and
+   * what the predictions in those tasks did, the agents that applied them
+   * themselves, and the links among the patterns used together. Candidate
+   * lessons the plan applied are recurrences, ready for promotion.
+   */
+  private renderPatternApplications(trail: Map<string, PlanPatternUse>, records: TranscriptResponse[], fetched: Map<string, ShownEntry | null>,
+    goalId: string | undefined, recurrences: NonNullable<ReviewTaskExtra['recurrences']>, knowledgeRefs: Record<string, string>): string {
+    const agentUses = new Map<string, Array<{ taskId: string; agent: string; steps: number[]; why: string }>>();
+    for (const r of records) for (const p of r.predictions ?? []) for (const d of p.patterns ?? []) {
+      const list = agentUses.get(d.id) ?? [];
+      let use = list.find(u => u.taskId === r.taskId);
+      if (!use) { use = { taskId: r.taskId, agent: r.agentName, steps: [], why: d.why ?? '' }; list.push(use); }
+      use.steps.push(p.step);
+      agentUses.set(d.id, list);
+    }
+    const ids = [...new Set([...trail.keys(), ...agentUses.keys()])];
+    if (!ids.length) return '';
+    const lines: string[] = [];
+    const candidates: string[] = [];
+    const used: Array<{ id: string; title: string; links: string[]; names: string[] }> = [];
+    for (const id of ids) {
+      const entry = fetched.get(id);
+      if (entry && entry.type !== 'pattern') {
+        if (entry.tags?.includes('candidate-pattern') && trail.has(id)) {
+          candidates.push(`- ${entry.title} [id=${id}]`);
+          if (!recurrences.some(r => r.candidateId === id)) recurrences.push({ title: "the goal's plan applied it", candidateId: id, candidateTitle: entry.title });
+          if (entry.knowledgeRef && !knowledgeRefs[id]) knowledgeRefs[id] = entry.knowledgeRef;
+        }
+        continue;
+      }
+      const title = entry?.title ?? id;
+      const pattern = entry?.pattern;
+      used.push({ id, title, links: pattern?.links ?? [], names: [title, ...(pattern?.aliases ?? '').split(/[,;\n]/)].map(n => linkKey(n)).filter(Boolean) });
+      if (entry?.knowledgeRef && !knowledgeRefs[id]) knowledgeRefs[id] = entry.knowledgeRef;
+      const out = [`- ${title} [id=${id}]`];
+      const plan = trail.get(id);
+      let governed = records;
+      if (plan) {
+        const course = plan.declared.map(d => `r${d.revision} ${d.wholePlan ? 'plan-wide' : `tasks ${d.tasks.map(t => t.name ?? clipText(t.description ?? '?', 40)).join(', ')}`}${d.why ? ` ("${clipText(d.why, 120)}")` : ''}`);
+        const drops = plan.dropped.map(x => `dropped at r${x.revision}${x.change || x.reason ? `: ${clipText(x.change ?? x.reason ?? '', 160)}` : ''}`);
+        out.push(`  plan: declared ${course.join('; ')}${drops.length ? `; ${drops.join('; ')}` : ''}`);
+        if (!plan.declared.some(d => d.wholePlan)) {
+          const descriptions = new Set(plan.declared.flatMap(d => d.tasks.map(t => t.description)).filter(Boolean));
+          governed = records.filter(r => descriptions.has(r.task));
+        }
+      }
+      const expected = pattern?.resultingContext?.trim() || pattern?.therefore?.trim();
+      if (expected) out.push(`  following it should bring about: ${clipText(expected, 280)}`);
+      for (const u of agentUses.get(id) ?? []) out.push(`  applied by ${u.agent} in ${u.taskId} at steps ${u.steps.join(', ')}${u.why ? ` ("${clipText(u.why, 120)}")` : ''}`);
+      if (!plan) governed = records.filter(r => (agentUses.get(id) ?? []).some(u => u.taskId === r.taskId));
+      const tally = { held: 0, missed: 0, unclear: 0, unread: 0 };
+      const misses: string[] = [];
+      for (const r of governed) for (const p of r.predictions ?? []) {
+        if (!isPredicted(p)) continue;
+        const reading = p.selfAssessment?.verdict ?? (p.verdict === 'contradicted' ? 'missed' : undefined);
+        if (reading === 'held') tally.held++;
+        else if (reading === 'missed') { tally.missed++; if (misses.length < 2) misses.push(`${r.taskId} step ${p.step}: expected "${clipText(p.expect, 100)}"${p.selfAssessment?.learned ? `; learned "${clipText(p.selfAssessment.learned, 100)}"` : ''}`); }
+        else if (reading === 'unclear') tally.unclear++;
+        else tally.unread++;
+      }
+      if (governed.length) out.push(`  predictions in the tasks it governed: ${tally.held} held, ${tally.missed} missed, ${tally.unclear} unclear, ${tally.unread} not read by the agent${misses.length ? `; misses: ${misses.join(' | ')}` : ''}`);
+      const recorded = (pattern?.learning?.applications ?? []).filter(a => (goalId && a.id === `${goalId}:${id}`) || records.some(r => a.id.startsWith(`${r.taskId}:`)));
+      out.push(`  recorded applications: ${recorded.length ? recorded.map(a => `${a.id === `${goalId}:${id}` ? 'plan' : a.id.split(':')[0]} (${a.verdict})`).join(', ') : 'none captured'}`);
+      lines.push(out.join('\n'));
+    }
+    if (used.length > 1) {
+      const pairs: string[] = [];
+      for (let i = 0; i < used.length; i++) for (let j = i + 1; j < used.length; j++) {
+        const [a, b] = [used[i], used[j]];
+        const ab = a.links.some(l => b.names.includes(linkKey(l))), ba = b.links.some(l => a.names.includes(linkKey(l)));
+        pairs.push(`${a.title} ${ab && ba ? '<->' : ab ? '->' : ba ? '<-' : '+'} ${b.title}${ab || ba ? '' : ' (no link)'}`);
+      }
+      lines.push(`Used together in this goal: ${pairs.slice(0, 12).join('; ')}. Patterns used together that both helped are evidence for a link between them (update_pattern addLinks, and the first one's Resulting context); a link whose second pattern did not fit after the first is evidence against it.`);
+    }
+    if (candidates.length) lines.push(`Candidate lessons this goal's plan applied (a candidate used again is ready for the pattern language: promote it with save_pattern and archive the candidate):\n${candidates.join('\n')}`);
+    if (!lines.length) return '';
+    return `Pattern applications in this goal (judge each in done.result.applications with helpful, no_effect, harmful or inconclusive; give taskId for an agent's own use and leave it out for the plan's):\n${lines.join('\n')}`;
   }
 
   private reviewScope(records: TranscriptResponse[]): string | undefined {
@@ -2131,10 +2402,15 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     this.inFlight = { ticketId: taskId, startedAt: Date.now() };
     const knowledgeScope = this.reviewScope(records);
     this.taskExtras.set(taskId, { kind: 'review', reviewedTaskIds, goalId, records, fullMaterial: material, knowledgeScope,
-      ...(decisions.judgments ? { judgments: decisions.judgments } : {}) });
+      ...(decisions.judgments ? { judgments: decisions.judgments } : {}),
+      planPatternIds: [...planPatternTrail(briefing.plans ?? []).keys()],
+      ...(briefing.outcome ? { goalOutcome: briefing.outcome } : {}),
+      evidenceTaskIds: briefing.evidenceTaskIds ?? [] });
     const refs: Record<string, string> = {};
-    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), briefing);
+    const recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [];
+    const dossier = await this.buildLearningDossier(task, material, records, refs, this.renderPriors(decisions.worth, decisions.judgments), { ...briefing, goalId }, recurrences);
     this.taskExtras.get(taskId)!.knowledgeRefs = refs;
+    if (recurrences.length) (this.taskExtras.get(taskId)!.recurrences ??= []).push(...recurrences);
     try {
       const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
@@ -2154,17 +2430,34 @@ My work is internal maintenance of this workspace's memory. When invited to cont
   }
 
   private async startCuration(): Promise<boolean> {
-    type Entry = { id: string; title: string; type: string; tags: string[]; origin: string; usefulCount: number; archived: boolean; content: string };
-    const all = await this.request<Entry[]>(
-      request(this.id, this.knowledgeBaseId!, 'list', { limit: 200 }),
-      10000,
-    ).catch(() => [] as Entry[]);
+    type Entry = { id: string; title: string; type: string; tags: string[]; origin: string; usefulCount: number; archived: boolean; content: string;
+      pattern?: { links?: string[]; aliases?: string; learning?: { applications?: Array<{ verdict: string; goalId?: string }> } } };
+    const [all, patterns] = await Promise.all([
+      this.request<Entry[]>(request(this.id, this.knowledgeBaseId!, 'list', { limit: 200 }), 10000).catch(() => [] as Entry[]),
+      this.request<Entry[]>(request(this.id, this.knowledgeBaseId!, 'list', { type: 'pattern', limit: 200, includeArchived: true }), 10000).catch(() => [] as Entry[]),
+    ]);
+    // The language as a graph: each pattern's record, its links (unwritten
+    // or pointing at an archived pattern), what links to it, and islands.
+    const names = (e: Entry) => [e.title, ...(e.pattern?.aliases ?? '').split(/[,;\n]/)].map(linkKey).filter(Boolean);
+    const resolve = (name: string, archived: boolean) => patterns.find(e => e.archived === archived && names(e).includes(linkKey(name)));
+    const inbound = new Map<string, string[]>();
+    for (const e of patterns) if (!e.archived) for (const l of e.pattern?.links ?? []) {
+      const target = resolve(l, false);
+      if (target && target.id !== e.id) inbound.set(target.id, [...(inbound.get(target.id) ?? []), e.title]);
+    }
+    const language = (e: Entry): string => {
+      if (e.type !== 'pattern') return '';
+      const goals = (verdict: string) => new Set((e.pattern?.learning?.applications ?? []).filter(a => a.verdict === verdict).map(a => a.goalId)).size;
+      const links = (e.pattern?.links ?? []).map(l => resolve(l, false) ? l : resolve(l, true) ? `${l} (broken: archived)` : `${l} (unwritten)`);
+      const from = inbound.get(e.id) ?? [];
+      return `\n  language: record helpful ${goals('helpful')}, no effect ${goals('no_effect')}, harmful ${goals('harmful')} goals; links -> ${links.join(', ') || 'none'}; linked from: ${from.join(', ') || 'none'}${!links.length && !from.length ? '; ISLAND' : ''}`;
+    };
 
     const curatable = all.filter(e => (e.origin === 'agent' || e.origin === 'reviewer') && !e.archived);
     if (curatable.length === 0) return false;
 
     const listing = curatable
-      .map(e => `- ${e.id} [${e.type}] useful:${e.usefulCount} tags:${e.tags.join(',') || '-'}\n  ${e.title}: ${e.content.slice(0, 220)}`)
+      .map(e => `- ${e.id} [${e.type}] useful:${e.usefulCount} tags:${e.tags.join(',') || '-'}\n  ${e.title}: ${e.content.slice(0, 220)}${language(e)}`)
       .join('\n');
 
     try {
@@ -2209,6 +2502,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
           if (!extra.records?.some(r => r.taskId === action.taskId && r.predictions?.some(p => p.step === action.step))) throw new Error('Assessment is outside this review evidence');
           const decision = await this.request<{ success: boolean; error?: string; assessment?: { verdict: string; explanation?: string } }>(request(this.id, this.goalManagerId, 'recordPredictionAssessment', {
             goalId: extra.goalId, taskId: action.taskId, step: action.step, verdict: action.verdict, explanation: action.explanation, expectedRevision: action.expectedRevision, evidenceRefs: action.evidenceRefs,
+            ...(action.attribution ? { attribution: action.attribution } : {}),
           }), 5000);
           if (!decision.success) throw new Error(decision.error ?? 'Assessment rejected');
           if (decision.assessment) (extra.assessments ??= {})[`${action.taskId}:${action.step}`] = decision.assessment;
@@ -2459,7 +2753,13 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       10000,
     );
     if (!res?.id) throw new Error('KnowledgeBase did not acknowledge the saved pattern');
-    return `Saved pattern "${built.pattern.name}" (${res.id})`;
+    const inbound = Array.isArray(action.linkedFrom) ? (action.linkedFrom as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 6) : [];
+    const unlinked: string[] = [];
+    for (const id of inbound) {
+      try { await this.updatePattern({ action: 'update_pattern', id, addLinks: [built.pattern.name] }); }
+      catch (err) { unlinked.push(`${id}: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+    return `Saved pattern "${built.pattern.name}" (${res.id})${inbound.length ? `; linked from ${inbound.length - unlinked.length} of ${inbound.length}` : ''}${unlinked.length ? ` (not linked: ${unlinked.join('; ')})` : ''}`;
   }
 
   /**
@@ -2527,12 +2827,14 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     precondition(!!title && !!content, 'merge_entries requires "title" and "content"');
     precondition(Array.isArray(absorbedIds) && absorbedIds.length >= 2, 'merge_entries requires "absorbedIds" naming at least 2 entries');
 
+    const absorbedPatterns: string[] = [];
     for (const id of absorbedIds) {
-      const entry = await this.request<{ origin?: string; archived?: boolean } | null>(
+      const entry = await this.request<{ origin?: string; archived?: boolean; type?: string; title?: string } | null>(
         request(this.id, this.knowledgeBaseId!, 'get', { id }),
         10000,
       ).catch(() => null);
       if (!entry) throw new Error(`merge aborted: absorbed id "${id}" does not exist (nothing was changed)`);
+      if (entry.type === 'pattern' && entry.title) absorbedPatterns.push(entry.title);
       const origin = entry.origin ?? 'agent';
       if (origin !== 'agent' && origin !== 'reviewer') {
         throw new Error(`merge aborted: "${id}" is ${origin}-authored, only agent/reviewer entries merge (nothing was changed)`);
@@ -2559,7 +2861,26 @@ My work is internal maintenance of this workspace's memory. When invited to cont
       } catch (err) { failures.push(`${id}: ${err instanceof Error ? err.message : String(err)}`); }
     }
     if (failures.length) throw new Error(`Merged content saved as ${umbrellaId}; pending archives: ${failures.join('; ')}`);
-    return `Merged ${absorbedIds.length} entries into "${title}" (${umbrellaId}); absorbed entries archived`;
+    const aliased = (action.type === 'pattern' && absorbedPatterns.length) ? await this.keepAbsorbedNames(umbrellaId, absorbedPatterns) : '';
+    return `Merged ${absorbedIds.length} entries into "${title}" (${umbrellaId}); absorbed entries archived${aliased}`;
+  }
+
+  /**
+   * A merged pattern keeps the names of the patterns it absorbed as aliases,
+   * so links written against those names still resolve to it.
+   */
+  private async keepAbsorbedNames(id: string, absorbed: string[]): Promise<string> {
+    try {
+      const entry = await this.request<{ title: string; pattern?: import('../core/pattern.js').PatternBody } | null>(request(this.id, this.knowledgeBaseId!, 'get', { id }), 10000);
+      if (!entry?.pattern) return '';
+      const existing = (entry.pattern.aliases ?? '').split(/[,;\n]/).map(a => a.trim()).filter(Boolean);
+      const add = absorbed.filter(n => linkKey(n) !== linkKey(entry.title) && !existing.some(a => linkKey(a) === linkKey(n)));
+      if (!add.length) return '';
+      await this.updatePattern({ action: 'update_pattern', id, aliases: [...existing, ...add].join(', ') });
+      return `; kept ${add.length} absorbed name(s) as aliases`;
+    } catch (err) {
+      return `; absorbed names not kept as aliases (${err instanceof Error ? err.message : String(err)})`;
+    }
   }
 
   /**
@@ -2659,14 +2980,14 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | Action | Fields | Purpose |
 |--------|--------|---------|
 | mark_useful | ids | Credit the injected entries that genuinely influenced the work |
-| assess_prediction | taskId, step, verdict, explanation | Record supported/contradicted/unresolved semantic assessment with an evidence-grounded explanation, separately from observations |
+| assess_prediction | taskId, step, verdict, explanation, attribution? | Record supported/contradicted/unresolved semantic assessment with an evidence-grounded explanation, separately from observations; for a miss, attribution {source: prior\|entry\|pattern\|link\|world, id?, note?} names the belief that failed |
 | read_evidence | taskId?, step?, key?, context?, messageId?, sourceGoalId?, offset?, length? | Retrieve complete task evidence or a prediction/observation pair; context:true reads the reviewed goal's linked conversation/proposal through GoalManager, separately from taskId/step |
 | recall_knowledge | query | Check what the knowledge base already holds before saving |
 | save_entry | title, content, type?, tags? | Save one durable lesson (type: 'learned'\|'fact'\|'insight'\|'reference') |
 | update_entry | id, content?, title?, tags? | Refresh an existing entry instead of near-duplicating it |
 | forget_entry | id | Remove an entry this transcript proves wrong |
-| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
-| save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Add a pattern to the workspace's pattern language |
+| record_pattern_application | id, application | Record context, verdict (helpful/no_effect/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
+| save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, linkedFrom?, tags? | Add a pattern to the workspace's pattern language; linkedFrom lists the ids of existing patterns that should lead to it |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Strengthen an existing pattern; only the sections you supply change |
 | author_skill | name, description, instructions | Package a reusable multi-step procedure as a skill |
 | done | result: {assessments, applications, knowledgeUpdates?, summary?, unresolvedReason?} | Submit assessments, knowledge corrections and pattern-language updates together (knowledgeUpdates carries save_entry, save_pattern, update_pattern and the dispositions below); receiver messages record them without a separate LLM turn per item |
@@ -2683,16 +3004,20 @@ A retained full output and an inline preview are different deliveries. A short p
 
 ## Completion example
 After inspecting the evidence, submit assessments directly in the final result:
-{"action":"done","result":{"assessments":[{"taskId":"<observed task>","step":1,"verdict":"contradicted","explanation":"Expected no test suite, but the owner verification ran 198 tests successfully."}],"applications":[{"id":"<applied pattern>","application":{"taskId":"<observed task>","step":1,"context":"Inspecting changes","verdict":"inconclusive","evidence":"Whether the agent used this pattern is recorded; its benefit remains uncertain."}}],"summary":"One prediction contradicted; no generalization beyond the observed project inputs."}}
-Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. You may omit applications when none were declared. Existing knowledge corrections can share the completion: knowledgeUpdates:[{action:"update_entry",id:"<existing entry>",title:"<accurate title>",content:"<corrected scoped claim and evidence>",evidence:"<observed task/step or owner verification result>"}]. archive_entry is also supported for obsolete duplicates, and pattern-language updates share the completion the same way. New lessons and all existing learning actions remain available individually. Rejected corrections remain visible as partial learning; do not loop to force acceptance.
+{"action":"done","result":{"assessments":[{"taskId":"<observed task>","step":1,"verdict":"contradicted","explanation":"Expected no test suite, but the owner verification ran 198 tests successfully.","attribution":{"source":"entry","id":"<the entry the prediction cited>","note":"The entry said the repository has no tests"}}],"applications":[{"id":"<pattern the plan followed>","application":{"context":"The plan staged research before acting","verdict":"no_effect","evidence":"The staged research returned what the request already stated; the plan after it was the one the first message implied."}},{"id":"<pattern an agent applied>","application":{"taskId":"<observed task>","context":"Inspecting changes","verdict":"inconclusive","evidence":"Whether the agent used this pattern is recorded; its benefit remains uncertain."}}],"summary":"One prediction contradicted by a stale entry; the plan's pattern had no effect here."}}
+Use real task/step identities from the dossier. Cover the recorded predictions, including supported expectations, contradictions, and unresolved claims with specific evidence gaps. Use read_evidence for missing context; hidden payload bodies and an agent's assertion that it reviewed them are not evidence of inspection. Never infer that every prediction held just because every command exited zero. Pattern applications require recorded provenance; seeing an injected pattern does not prove it was used. An application without taskId is the plan's use of the pattern, judged against the goal; with taskId it is that task's own use, whatever steps cited it. You may omit applications when none were declared. Held predictions that cited an entry are recorded as confirmations of it automatically. Existing knowledge corrections can share the completion: knowledgeUpdates:[{action:"update_entry",id:"<existing entry>",title:"<accurate title>",content:"<corrected scoped claim and evidence>",evidence:"<observed task/step or owner verification result>"}]. archive_entry is also supported for obsolete duplicates, and pattern-language updates share the completion the same way. New lessons and all existing learning actions remain available individually. Rejected corrections remain visible as partial learning; do not loop to force acceptance.
 
 ## How to review
 1. **Evaluate predictions first.** Compare the expected claim with the actual result, and include the assessment in the completion batch. Then consider knowledge usefulness. Compare the injected knowledge list against the transcript: entries that demonstrably helped the outcome get one mark_useful call with their ids; mere retrieval or use is not benefit. When none were used, omit usefulness credit; still assess the recorded predictions.
 2. **Mine the prediction misses.** A prediction ledger, when present, lists what each agent expected before acting beside what actually happened. A divergence marks the exact moment a working belief about this system turned out to be wrong, which makes it the most reliable lesson source in the whole record: trust it ahead of anything an agent narrated about its own performance. Runtime verdicts compare declared operation status; they do not assess the free-text expectation. A failed action can be the expected result. Legacy missed flags are not proof. Distinguish an invalid pattern from incorrect application, changed conditions, and an execution defect. Preserve competing explanations and scope any revision to the evidence. Distinguish uncertainty from contradiction; for the rest, judge the expectation against the actual result yourself, since an agent can succeed at an action and still have expected the wrong thing. Save the corrected belief, phrased as what actually holds and what to do with it, rather than the incident that revealed it. Record semantic assessments with assess_prediction. Successful actions alone do not establish that predictions held.
+
+   The dossier's Surprises section gathers the misses with what each prediction rested on (the entries and patterns it cited) and the agent's own reading, given while the full result was in view; audit that reading against the evidence rather than adopting it. For each miss, name the belief that failed in the assessment's attribution and update that belief: the model's own prior (save what actually holds as a lesson), an entry it rested on (correct, narrow or dispute that entry), a pattern it followed (a counterexample on the application), the link that led from one pattern to the next (see Weave the pattern language), or a world that changed under it (record the change; the belief may still hold).
 3. **Distill sparingly.** New reusable lessons are optional. A routine task can finish with no new lesson after recording its prediction assessments; an empty learning update list does not replace those assessments. Save a lesson only when it will help a later task in the applicable project or environment: a capability that was hard to locate, an approach that beat the obvious one (with the reason), a constraint that was invisible up front, or a user fact the task confirmed (tag user facts "profile").
 
    **Save what is true, not the route that was taken.** An entry that tells a future task which steps to run for a kind of question — look here, then check that — freezes one attempt's path as though it described the world, and the next task follows it rather than working out its own. The risk runs opposite to confidence: a task that answered the wrong question without friction yields the tidiest-looking procedure for answering it wrongly again, and writing that down is how a single wrong turn becomes the route everyone takes. Before saving steps, check the transcript against what was actually asked — a fulfilled prediction only shows the agent did what it predicted, not that the user's question was answered, so an entry resting on assessments alone rests on nothing. Record what a thing is, what it exposes, and what its output means; leave the steps to the task.
 4. **Weave the pattern language.** The dossier's Pattern language section is the weave for this work: the patterns whose context matches it, the links no pattern answers yet, and the 'candidate-pattern' lessons that match it; recall_knowledge with other terms from the goal finds more. Read it against the execution record and transcripts, and act where they meet: update_pattern a pattern whose context this work shared (sharpen its Forces, refresh its Evidence, addLinks); promote a candidate this work repeats with save_pattern and archive the candidate it absorbs; write an unwritten pattern whose territory this work covers; and tag a new lesson 'candidate-pattern' when its shape (a recurring context, forces in tension, a resolution) could govern other goals. A review where nothing meets the language records nothing here; a recurrence is the moment the language grows. Grow the pattern language, below, says how to write one.
+
+   The Pattern applications section lists every pattern this goal used: the plan's use (declared, kept and dropped across re-plans, with the tasks it governed and how their predictions went) and each agent's own use. Judge each one: helpful when following it made the work go better, no_effect when it was followed and the state it promises did not come about or did not matter, harmful when following it caused a failure or a detour, inconclusive when its effect cannot be separated from other causes. A pattern a re-plan dropped asks which happened: it failed in this context (a counterexample; sharpen its Forces or narrow its Context) or the context moved on (no judgment against it). Patterns used together that both helped are evidence for a link between them; a link whose second pattern did not fit after the first is evidence against that link.
 5. **Reconcile existing knowledge with the world.** Compare the claims injected into agents with current observations, including owner-reported checks that ran before the first model action. A successful task can disprove old claims such as a command, test suite, or capability being unavailable. This matters even when no pattern was declared. Correct the existing entry's title AND content, preserving scope, observation date, and evidence; archive obsolete duplicates rather than adding a competing correction alongside them. Do not erase unrelated valid content. Fetch the full entry with recall by id before replacing an excerpt. Current entries may already be corrected: compare them with the historical claim and leave accurate revisions alone. Missing or ambiguous evidence means uncertainty, not an automatic rewrite. Prefetched entries satisfy recall only for the material shown.
 6. **Preserve evidence without overstating conclusions.** Expected failures, transient outages, and recoveries can test the world model. Record relevant contextual evidence and competing explanations in pattern applications. Do not turn a single timeout into a permanent claim that a capability is broken; keep uncertainty explicit and propose discriminating observations when the cause is unknown.
 7. **Procedures become skills.** When the transcript shows a reusable multi-step procedure that took real effort to get right (3+ steps, especially after retries), author_skill it. Skills are shared beyond this workspace, so keep them fully generic: the procedure, its steps, its pitfalls. Every personal or workspace-specific detail (names, addresses, accounts, file paths) belongs in save_entry, never in a skill.
@@ -2702,11 +3027,11 @@ Use real task/step identities from the dossier. Cover the recorded predictions, 
 The workspace's memory includes a generative pattern language in the Alexander/Coplien tradition: write patterns the way Christopher Alexander and James Coplien do, where each pattern names a recurring context, lays out forces genuinely in tension, and resolves them, and the patterns link into a language that generates good solutions piecemeal. The anatomy of an entry of type 'pattern' is Context (when the pattern applies), Forces (the tensions that make the naive approach fail), Therefore (the resolution of those forces, not a mere tip), optional Contract (checkable obligations), optional Program (a worked example), Resulting context (what holds afterwards, and which patterns apply next), Evidence (how proven it is, Alexander's confidence stars in prose), and Links to related patterns. Goal reviews carry the goal's execution record near the top of the dossier; that record is your ore for pattern mining.
 
 - **Weave before writing.** The dossier's Pattern language section surfaces the existing patterns and 'candidate-pattern'-tagged lessons that match this work; recall_knowledge with further context terms surfaces more. When an existing pattern's context covers this goal, update_pattern it: refine its Forces with what this goal revealed, refresh its Evidence line (for example "proven in 3 goals"), and addLinks to related patterns.
-- **Record applications.** For patterns actually used, record_pattern_application with the observed context, evidence, taskId, step, and a verdict. Distinguish following a pattern from benefiting; include counterexamples and competing causes.
+- **Record applications.** For patterns actually used, record_pattern_application with the observed context, evidence and a verdict (helpful, no_effect, harmful or inconclusive), with taskId for an agent's own use and without it for the plan's. Distinguish following a pattern from benefiting; include counterexamples and competing causes.
 - **Patterns are earned.** A shape seen once becomes a save_entry lesson tagged 'candidate-pattern'. Promote it with save_pattern when the shape recurs, which is the moment the dossier shows a candidate this work repeats, and archive the candidate it absorbs. Each pattern rests on a recurrence, and a language grown on recurrences stays trustworthy.
 - **Generalize.** A pattern names a recurring CONTEXT, never this goal: keep goal titles and agent names out. Name patterns as short capitalized noun phrases (like DATA THEN JUDGMENT), and let the name be evocative enough to use in conversation.
 - **Failed goals teach too.** When a followed pattern contributed to failure, record the counterexample and refine its Context or Forces. Consider alternative causes: a transient outage does not refute a design pattern. Preserve inconclusive cases as uncertain.
-- **Link the language.** Patterns gain power from their links. When a new pattern completes, refines, or sets up another, name it in links; a link to a pattern nobody has written yet marks work for a future review.
+- **Link the language.** Patterns gain power from their links, and the links are learned from use like everything else. When a new pattern completes, refines, or sets up another, name it in links, and name in linkedFrom the patterns that lead to it, so it joins the language connected rather than as an island. When patterns used together in a goal both helped, add the link they share (update_pattern addLinks) and let the first one's Resulting context say what comes next; when a linked pattern did not fit after its predecessor, the link itself is the belief that failed. A link to a pattern nobody has written yet marks work for a future review; a broken link (one naming an archived pattern) gets retargeted. When you narrow a pattern's Context, read its linkedFrom: patterns that lead to it may now lead somewhere else.
 
 The knowledge base is a world model. Compare predictions made before actions with feedback from the world. A successful task can contain false predictions; an expected rejection can support a narrow operation expectation. Runtime verdicts compare operation status only, not the meaning of a free-text prediction. Use assess_prediction to record material semantic confirmations, contradictions, or unresolved expectations with an evidence-grounded explanation. Review semantic agreement from the evidence, preserve uncertainty, and distinguish observations from agent explanations. Missing predictions remain unknown.
 
@@ -2730,7 +3055,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 | recall_knowledge | query | Inspect entries on a topic more closely |
 | merge_entries | title, content, type?, tags?, absorbedIds | Replace 2+ narrow near-duplicates with one umbrella entry; the absorbed entries are archived (restorable) |
 | update_entry | id, content?, title?, tags? | Sharpen a single entry's wording or tags |
-| record_pattern_application | id, application | Record context, verdict (applied/helpful/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
+| record_pattern_application | id, application | Record context, verdict (helpful/no_effect/harmful/inconclusive), evidence, and taskId/step for this goal; the runtime resolves the applied version; repeated delivery is deduplicated |
 | save_pattern | name, context, forces, therefore, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, links?, tags? | Write a pattern (e.g. promote ripe candidate-pattern lessons, or fulfill a dangling link) |
 | update_pattern | id, context?, forces?, therefore?, evidence?, aliases?, problem?, contract?, program?, resultingContext?, consequences?, appliesTo?, addLinks? | Revise a pattern's sections or extend its links |
 | archive_entry | id | Archive an entry that is stale or too narrow to help future tasks |
@@ -2741,7 +3066,7 @@ Respond with ONE JSON action object inside \`\`\`json fenced code markers. Outpu
 - **Merge by topic, keep the substance.** When several entries cover one theme (e.g. three lessons about the same tool), write one umbrella entry that preserves every distinct fact, and list ALL of their ids in absorbedIds. The merge is fail-closed: it applies only when every absorbed id checks out, so list them precisely.
 - **Archive, keep delete for falsehoods.** archive_entry hides an entry but keeps it restorable in the browser; forget_entry is only for entries that are wrong.
 - **Entries with useful counts have proven themselves**: prefer merging them INTO umbrellas over archiving them away.
-- **Garden the pattern language.** Entries of type 'pattern' are Alexander/Coplien-style patterns: Context/Forces/Therefore anatomy with links to related patterns, forming a generative language rather than a list of tips. Merge patterns whose contexts have converged into one (merge_entries, then update_pattern the survivor's links); update_pattern one whose context has drifted or split; repair links that name a retitled pattern; and when a dangling link's territory is covered by ripe candidate-pattern lessons, write the missing pattern with save_pattern. Lessons from separate goals that record one recurring shape, tagged or not, are a pattern waiting to be written: write it with save_pattern (its Evidence names the goals behind it) and archive the lessons it absorbs. A connected language beats a bag of isolated aphorisms.
+- **Garden the pattern language.** Entries of type 'pattern' are Alexander/Coplien-style patterns: Context/Forces/Therefore anatomy with links to related patterns, forming a generative language rather than a list of tips. Merge patterns whose contexts have converged into one (merge_entries, then update_pattern the survivor's links); update_pattern one whose context has drifted or split; repair links that name a retitled pattern; and when a dangling link's territory is covered by ripe candidate-pattern lessons, write the missing pattern with save_pattern. Lessons from separate goals that record one recurring shape, tagged or not, are a pattern waiting to be written: write it with save_pattern (its Evidence names the goals behind it) and archive the lessons it absorbs. Each pattern's language line shows its record and its place in the graph: connect an ISLAND to the patterns it belongs with or question whether it is a pattern at all, retarget a broken link, and narrow or retire a pattern whose record is mostly no effect or harmful. A connected language beats a bag of isolated aphorisms.
 - **A light pass is a good pass.** When the store is already tidy, finish early with done; changing little is the expected outcome.
 
 The knowledge base is a world model. Compare predictions made before actions with feedback from the world. A successful task can contain false predictions; an expected rejection can support a narrow operation expectation. Runtime verdicts compare operation status only, not the meaning of a free-text prediction. Use assess_prediction to record material semantic confirmations, contradictions, or unresolved expectations with an evidence-grounded explanation. Review semantic agreement from the evidence, preserve uncertainty, and distinguish observations from agent explanations. Missing predictions remain unknown.

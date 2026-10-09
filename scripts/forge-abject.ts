@@ -69,6 +69,8 @@ interface ForgeMeta {
   scope?: string;
   replaces?: string;
   build?: string;
+  ask?: { guide?: string; tier?: string };
+  required?: boolean;
 }
 
 function fail(message: string): never {
@@ -172,6 +174,8 @@ async function main(): Promise<void> {
           ...(meta.build ? { build: meta.build } : {}),
           ...(meta.settings !== undefined ? { settings: meta.settings } : {}),
           ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
+          ...(meta.ask !== undefined ? { ask: meta.ask } : {}),
+          ...(meta.required !== undefined ? { required: meta.required } : {}),
           manifest,
         },
         null,
@@ -187,6 +191,12 @@ async function main(): Promise<void> {
   const installDir = path.join(dest, meta.name!);
   await fs.mkdir(installDir, { recursive: true });
   await fs.copyFile(wasmPath, path.join(installDir, 'main.wasm'));
+  // The ask guide is read from the package directory at ingest, so it ships
+  // next to the module under the same relative name.
+  if (meta.ask?.guide) {
+    await fs.mkdir(path.dirname(path.join(installDir, meta.ask.guide)), { recursive: true });
+    await fs.copyFile(path.join(pkgDir, meta.ask.guide), path.join(installDir, meta.ask.guide));
+  }
   await fs.writeFile(
     path.join(installDir, 'abject.json'),
     JSON.stringify(
@@ -198,7 +208,9 @@ async function main(): Promise<void> {
         scope,
         ...(meta.replaces ? { replaces: meta.replaces } : {}),
         ...(meta.settings !== undefined ? { settings: meta.settings } : {}),
-          ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
+        ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
+        ...(meta.ask !== undefined ? { ask: meta.ask } : {}),
+        ...(meta.required !== undefined ? { required: meta.required } : {}),
         manifest,
       },
       null,

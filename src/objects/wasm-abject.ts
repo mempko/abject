@@ -48,12 +48,23 @@ export const WASM_ABJECT_CONSTRUCTOR = 'WasmAbject';
  *  since timed out). */
 const PENDING_INBOUND_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * How a WASM abject answers `ask`. The guest never sees ask (the host answers
+ * it from the manifest), so its package supplies the usage guide and tier.
+ */
+export interface WasmAskGuidance {
+  /** Markdown appended to the generic ask prompt. */
+  guide?: string;
+  tier?: 'smart' | 'balanced' | 'fast';
+}
+
 export interface WasmAbjectArgs {
   manifest: AbjectManifest;
   /** wasm source ref: `wasm:sha256:<hex>` resolved via the module store. */
   source: string;
   owner?: AbjectId;
   data?: Record<string, unknown>;
+  ask?: WasmAskGuidance;
 }
 
 /**
@@ -82,10 +93,17 @@ export function mergeWasmManifest(manifest: AbjectManifest): AbjectManifest {
   };
 }
 
+/** True when a request failed because its recipient no longer exists. */
+function isRecipientGone(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /RECIPIENT_NOT_FOUND|is not registered/.test(message);
+}
+
 export class WasmAbject extends Abject {
   /** wasm source ref — persisted in Registry/AbjectStore like JS source. */
   readonly source: string;
   readonly owner: AbjectId;
+  private readonly askGuidance?: WasmAskGuidance;
 
   private instance?: WasmInstance;
   private _data?: Record<string, unknown>;
@@ -107,10 +125,29 @@ export class WasmAbject extends Abject {
     this.source = args.source;
     this.owner = args.owner ?? ('' as AbjectId);
     this._data = args.data;
+    this.askGuidance = args.ask;
+
+    // A recipient this object addressed by name is gone: forget its cached
+    // id so the next request resolves the name afresh. The guest still
+    // receives the notice.
+    this.on('recipientGone', (msg: AbjectMessage) => {
+      const gone = (msg.payload as { recipient?: string } | undefined)?.recipient;
+      for (const [name, id] of this.targetCache) if (id === gone) this.targetCache.delete(name);
+      return this.dispatchToGuest(msg);
+    });
 
     // Everything not handled by the base class (describe/ping/ask/dependents)
     // goes to the guest.
     this.on('*', (msg: AbjectMessage) => this.dispatchToGuest(msg));
+  }
+
+  protected override askPrompt(question: string): string {
+    const base = super.askPrompt(question);
+    return this.askGuidance?.guide ? `${base}\n\n${this.askGuidance.guide}` : base;
+  }
+
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return this.askGuidance?.tier ?? super.askTier();
   }
 
   /** Current durable data (guest snapshot when available). Mirrors
@@ -280,11 +317,21 @@ export class WasmAbject extends Abject {
       let message = '';
 
       try {
-        const target = await this.resolveTarget(env.to);
-        payload = await this.request(
-          request(this.id, target, env.method, env.payload ?? {}),
+        const send = async () => this.request(
+          request(this.id, await this.resolveTarget(env.to), env.method, env.payload ?? {}),
           env.timeoutMs ?? 30000,
         );
+        try {
+          payload = await send();
+        } catch (err) {
+          // A named target can be respawned under a new id (a restart, a
+          // worker recovery); the cached id then points at nobody. Resolve
+          // the name again and retry once rather than failing every later
+          // request to it.
+          if (!env.to.startsWith('@') || !isRecipientGone(err)) throw err;
+          this.targetCache.delete(env.to.slice(1));
+          payload = await send();
+        }
         ok = true;
       } catch (err) {
         message = err instanceof Error ? err.message : String(err);

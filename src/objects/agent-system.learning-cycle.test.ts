@@ -5,7 +5,7 @@ import { MessageBus } from '../runtime/message-bus.js';
 import { request } from '../core/message.js';
 import type { AbjectId } from '../core/types.js';
 import { GoalManager } from './goal-manager.js';
-import { KnowledgeBase } from './knowledge-base.js';
+import { nativeKnowledgeBase, nativeKnowledgeSettled } from './agent-system.native-knowledge.js';
 import { ScrumMaster } from './scrum-master.js';
 import { TaskReviewer } from './task-reviewer.js';
 
@@ -25,15 +25,14 @@ class FixtureEndpoint extends Abject {
   protected override async handleAsk(question:string):Promise<string>{this.questions.push(question);return 'Use restoreThenVerify: live state does not prove persistence';}
   call(id:AbjectId,method:string,payload:unknown={}):Promise<any>{return this.request(request(this.id,id,method,payload),10000);}
 }
-class MemoryKnowledge extends KnowledgeBase {protected override async onInit():Promise<void>{}}
 class FixtureScrum extends ScrumMaster {constructor(private dependencies:{runtime:AbjectId;goals:AbjectId;knowledge:AbjectId}){super();}protected override async onInit():Promise<void>{Object.assign(this,{agentAbjectId:this.dependencies.runtime,goalManagerId:this.dependencies.goals,knowledgeBaseId:this.dependencies.knowledge});}}
 
 test('scripted learning episode carries a surprise through Scrum, retrospective and a later plan using messages',async()=>{
   const bus=new MessageBus(),runtime=new FixtureEndpoint('AgentAbject'),storage=new FixtureEndpoint('Storage'),checker=new FixtureEndpoint('Checker');
-  const goals=new GoalManager(),knowledge=new MemoryKnowledge();runtime.checker=checker.id;
+  const goals=new GoalManager(),knowledge=await nativeKnowledgeBase();runtime.checker=checker.id;
   const deps:Record<string,AbjectId>={AgentAbject:runtime.id,Storage:storage.id,GoalManager:goals.id,KnowledgeBase:knowledge.id};
   for(const object of [runtime,storage,checker,goals,knowledge]) (object as any).discoverDep=async(name:string)=>deps[name]??null;
-  await runtime.init(bus);await storage.init(bus);await checker.init(bus);await knowledge.init(bus);await goals.init(bus);
+  await runtime.init(bus);await storage.init(bus);await checker.init(bus);await knowledge.init(bus);await nativeKnowledgeSettled();await goals.init(bus);
   const scrum=new FixtureScrum({runtime:runtime.id,goals:goals.id,knowledge:knowledge.id}),reviewer=new TaskReviewer();
   deps.TaskReviewer = reviewer.id;
   (reviewer as any).discoverDep=async(name:string)=>deps[name]??null;

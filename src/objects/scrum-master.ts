@@ -53,6 +53,7 @@ import {
 import { looksLikeUngroundedClaim, looksLikeBareAcknowledgement } from '../core/claims.js';
 import { resultKindQuestions, interjectionQuestions, roundOutcomeQuestions, DEFERRABLE_NOTES, criterion, instruction } from '../core/decision-questions.js';
 import { choiceOf, noulOf, scoreOf, topLevel, type DecisionQuestion } from '../llm/decision.js';
+import { declaredPatterns, planPatternIds } from '../core/plan-patterns.js';
 
 const log = new Log('ScrumMaster');
 
@@ -68,7 +69,31 @@ interface TeamContribution {
 }
 
 /** A task staged by `add_task`, awaiting commit by `dispatch_scrum`. */
+/** A woven pattern as the planner sees it, with its learning signals. */
+interface WovenForPlanning {
+  id: string;
+  title: string;
+  content: string;
+  via?: string;
+  /** Patterns whose links lead here. */
+  linkedFrom?: string[];
+  /** Recent applications where following it did not help. */
+  counterexamples?: Array<{ verdict: string; evidence: string }>;
+}
+
+/** The dispatch data a task carries to its agent, or nothing when it has none. */
+function taskData(target?: string, patterns?: Array<{ id: string; why: string }>): Record<string, unknown> | undefined {
+  if (!target && !patterns?.length) return undefined;
+  return { ...(target ? { target } : {}), ...(patterns?.length ? { patterns } : {}) };
+}
+
 interface StagedTask {
+  /**
+   * Patterns this task follows, by the planner's choice, with why. They ride
+   * to the executing agent with the task and are recorded as this goal's
+   * applications of those patterns.
+   */
+  patterns?: Array<{ id: string; why: string }>;
   /**
    * Planner-chosen name, when it gave one. Edges read far better as names than
    * as positions, and an off-by-one index produces a valid graph of the wrong
@@ -214,7 +239,14 @@ export class ScrumMaster extends Abject {
     priority: number;
     /** Concrete target object, threaded to executeTask when finally enqueued. */
     target?: string;
+    /** Patterns the plan assigned to the task, delivered with it. */
+    patterns?: Array<{ id: string; why: string }>;
   }>();
+  /**
+   * Selection receipts (patternRef) of the patterns each goal's planning was
+   * shown, so a plan's declaration records the version the planner read.
+   */
+  private patternReceipts = new Map<string, Map<string, string>>();
 
   /**
    * Per-OTA-task accumulators for the current scrum. Tasks staged via
@@ -1356,7 +1388,7 @@ export class ScrumMaster extends Abject {
     const knowledgeScope = await this.knowledgeScopeForGoal(goalId);
     const [recalled, applicablePatterns] = await Promise.all([
       this.recallKnowledge(goal.description, 5, knowledgeScope),
-      this.weavePatterns(evolvingContext, 3, knowledgeScope),
+      this.weavePatterns(evolvingContext, 3, knowledgeScope, planPatternIds(planHistory.at(-1)?.plan), goalId),
     ]);
     const relevantKnowledge = recalled.filter(e => e.type !== 'pattern');
 
@@ -1496,24 +1528,72 @@ export class ScrumMaster extends Abject {
     query: string,
     limit = 3,
     scope?: string,
-  ): Promise<Array<{ id: string; title: string; content: string; via?: string }>> {
+    from: string[] = [],
+    goalId?: string,
+  ): Promise<WovenForPlanning[]> {
     const kbId = await this.getKnowledgeBaseId();
     if (!kbId) return [];
     try {
-      const woven = await this.request<{ patterns?: Array<{ id: string; title: string; content: string; via?: string }> } | null>(
-        request(this.id, kbId, 'weave', { query, limit, scope }),
+      const woven = await this.request<{ patterns?: Array<{ id: string; title: string; content: string; via?: string; patternRef?: string;
+        linkedFrom?: string[]; counterexamples?: Array<{ verdict: string; evidence: string }> }> } | null>(
+        request(this.id, kbId, 'weave', { query, limit, scope, ...(from.length ? { from } : {}) }),
         5000,
       );
       if (!woven || !Array.isArray(woven.patterns)) return [];
+      if (goalId) this.rememberPatternReceipts(goalId, woven.patterns);
       return woven.patterns.map(p => ({
         id: p.id,
         title: p.title,
         content: (p.content ?? '').slice(0, 3000),
         via: p.via,
+        ...(p.linkedFrom?.length ? { linkedFrom: p.linkedFrom } : {}),
+        ...(p.counterexamples?.length ? { counterexamples: p.counterexamples.map(c => ({ verdict: c.verdict, evidence: c.evidence })) } : {}),
       }));
     } catch (err) {
       log.warn(`weavePatterns failed: ${err instanceof Error ? err.message : String(err)}`);
       return [];
+    }
+  }
+
+  private rememberPatternReceipts(goalId: string, patterns: Array<{ id: string; patternRef?: string }>): void {
+    const receipts = this.patternReceipts.get(goalId) ?? new Map<string, string>();
+    for (const p of patterns) if (p.patternRef) receipts.set(p.id, p.patternRef);
+    this.patternReceipts.delete(goalId);
+    this.patternReceipts.set(goalId, receipts);
+    while (this.patternReceipts.size > 100) this.patternReceipts.delete(this.patternReceipts.keys().next().value!);
+  }
+
+  /**
+   * Record a plan revision's pattern choices as this goal's applications of
+   * those patterns: one application per goal and pattern, each revision and
+   * each task it governs adding a declaration. The post-goal reviewer judges
+   * each application against what the goal actually did. Candidate lessons
+   * and unknown ids are left out; the reviewer reads those from the plan.
+   */
+  private async capturePlanApplications(goalId: string, revision: number, planPatterns: Array<{ id: string; why: string }>, staged: StagedTask[]): Promise<void> {
+    const declarations = [
+      ...planPatterns.map(p => ({ ...p, scope: `plan r${revision}` })),
+      ...staged.flatMap((t, i) => (t.patterns ?? []).map(p => ({ ...p, scope: `plan r${revision} task ${t.name ?? `#${i}`}` }))),
+    ];
+    if (!declarations.length) return;
+    const kbId = await this.getKnowledgeBaseId();
+    if (!kbId) return;
+    const receipts = this.patternReceipts.get(goalId);
+    for (const d of declarations) {
+      try {
+        let patternRef = receipts?.get(d.id);
+        if (!patternRef) {
+          const entry = await this.request<{ type?: string; patternRef?: string } | null>(request(this.id, kbId, 'get', { id: d.id }), 5000).catch(() => null);
+          if (entry?.type !== 'pattern' || !entry.patternRef) continue;
+          patternRef = entry.patternRef;
+        }
+        const r = await this.request<{ success: boolean; error?: string }>(request(this.id, kbId, 'beginPatternApplication', {
+          id: d.id, patternRef, applicationId: `${goalId}:${d.id}`, goalId, context: d.why || 'Chosen by the plan', scope: d.scope,
+        }), 5000);
+        if (!r.success) log.warn(`plan pattern ${d.id.slice(0, 8)} of goal ${goalId.slice(0, 8)} not recorded: ${r.error}`);
+      } catch (err) {
+        log.warn(`plan pattern ${d.id.slice(0, 8)} of goal ${goalId.slice(0, 8)} not recorded: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -1609,6 +1689,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     const target = (action.target ?? action.objectId ?? action.objectName) as string | undefined;
     const maxSteps = typeof action.maxSteps === 'number' && Number.isFinite(action.maxSteps) ? Math.round(action.maxSteps) : undefined;
     const profile = typeof action.profile === 'string' && action.profile.trim() ? action.profile.trim() : undefined;
+    const patterns = declaredPatterns(action.patterns);
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
@@ -1688,6 +1769,7 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       target,
       maxSteps,
       profile,
+      ...(patterns.length ? { patterns } : {}),
     };
     if ((consumes?.length ?? 0) > 0 || (produces?.length ?? 0) > 0) {
       let existingKeys = new Set<string>();
@@ -2659,6 +2741,7 @@ Rules:
       if (recorded.conflict) throw new ScrumPlanConflict(`Plan changed during planning (observed ${expectedRevision}, current ${recorded.revision}); refresh the Scrum observation and restage the work`);
       throw new Error(recorded.error ?? 'Plan could not be recorded');
     }
+    await this.capturePlanApplications(goalId, recorded.revision ?? expectedRevision + 1, declaredPatterns(decision.patterns), inflight.staged);
 
     const { scrumNumber } = await this.request<{ scrumNumber: number }>(
       request(this.id, this.goalManagerId, 'startNextScrum', { goalId, operationId: otaTaskId, preserveTaskIds: decision.keepTaskIds ?? [] }),
@@ -2681,7 +2764,7 @@ Rules:
       const addResult = await this.request<{ taskId?: string; error?: string }>(
         request(this.id, this.goalManagerId, 'addTask', {
           goalId, operationId: `${otaTaskId}:task:${taskIds.length}`,
-          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, ...(s.profile ? { profile: s.profile } : {}), priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
+          data: { planOperationId: otaTaskId, target: s.target, maxSteps: s.maxSteps, ...(s.profile ? { profile: s.profile } : {}), ...(s.patterns ? { patterns: s.patterns } : {}), priority: weights.get(String(taskIds.length)) ?? 0, assignedAgentName: s.assignedAgentName },
           description: s.description,
           dependsOn: depIds.length > 0 ? depIds : undefined,
           produces: s.produces,
@@ -2720,6 +2803,7 @@ Rules:
           blockers: new Set(blockerSets[i]),
           priority: weights.get(String(i)) ?? 0,
           target: inflight.staged[i].target,
+          patterns: inflight.staged[i].patterns,
         });
         log.info(`dispatch: task ${taskIds[i].slice(0, 8)} deferred on ${blockerSets[i].length} dep(s): ${blockerSets[i].map(d => d.slice(0, 8)).join(', ')}`);
       }
@@ -2737,7 +2821,7 @@ Rules:
             goalId,
             dispatchTupleId: taskIds[i],
             priority: weights.get(String(i)) ?? 0,
-            data: staged.target ? { target: staged.target } : undefined,
+            data: taskData(staged.target, staged.patterns),
           }),
         );
       }
@@ -2795,10 +2879,10 @@ Rules:
           }
           const waiting = blockers.filter(id => byId.get(id)?.fields.status !== 'done');
           if (waiting.length) {
-            this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target });
+            this.pendingDeps.set(tuple.id, { goalId: goal.id, agentId: agent.agentId, description: tuple.fields.description, blockers: new Set(waiting), priority: data.priority ?? 0, target: data.target, patterns: declaredPatterns(data.patterns) });
             continue;
           }
-          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: data.target ? { target: data.target } : undefined }));
+          await this.request(request(this.id, this.agentAbjectId, 'enqueueTask', { agentId: agent.agentId, taskId: tuple.id, dispatchTupleId: tuple.id, goalId: goal.id, task: tuple.fields.description, priority: data.priority ?? 0, data: taskData(data.target, declaredPatterns(data.patterns)) }));
           this.recoveredEnqueues.add(tuple.id);
           this.pendingDeps.delete(tuple.id);
         }
@@ -2808,13 +2892,13 @@ Rules:
 
   private async unblockDependents(completedTaskId: string): Promise<void> {
     if (!this.agentAbjectId) return;
-    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string; priority: number }> = [];
+    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string; patterns?: Array<{ id: string; why: string }>; priority: number }> = [];
     for (const [pendingId, info] of this.pendingDeps) {
       if (!info.blockers.has(completedTaskId)) continue;
       info.blockers.delete(completedTaskId);
       if (info.blockers.size === 0) {
         this.pendingDeps.delete(pendingId);
-        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target, priority: info.priority });
+        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target, patterns: info.patterns, priority: info.priority });
       }
     }
     for (const t of newlyReady) {
@@ -2827,7 +2911,7 @@ Rules:
           goalId: t.goalId,
           dispatchTupleId: t.taskId,
           priority: t.priority,
-          data: t.target ? { target: t.target } : undefined,
+          data: taskData(t.target, t.patterns),
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -2886,7 +2970,7 @@ Some scrum tasks are **interjection checks** (the task description says so): the
 
 ## Your first action
 
-The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. Compare observations with the assumptions in recentPlans. State what changed in your understanding, ask affected collaborators for interpretation, and plan a small discriminating experiment when uncertain. The runtime manages plan revision numbers automatically. dispatch_scrum should include reasoning, assumptions, patterns (ids/revisions and why they fit), expectedObservations, keepTaskIds (unaffected work to preserve), and change (what stays or changes). Never repeat a failed approach without new evidence. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
+The goal's full state is handed to you up front, in the opening observation — the goal description, completed tasks (with the scratchpad keys they wrote), failed tasks (with errors), the full scratchpad, the team roster with capability summaries, \`quickDispatchAvailable\`, and any relevant cached knowledge. Read it, then act directly. Compare observations with the assumptions in recentPlans. State what changed in your understanding, ask affected collaborators for interpretation, and plan a small discriminating experiment when uncertain. The runtime manages plan revision numbers automatically. dispatch_scrum should include reasoning, assumptions, patterns ([{id, why}] for the patterns the whole plan follows; a pattern that governs particular tasks goes on those tasks' add_task instead), expectedObservations, keepTaskIds (unaffected work to preserve), and change (what stays or changes, including any pattern the plan adopts or drops, and why). Never repeat a failed approach without new evidence. You do NOT need to call \`review_scrum\` first; it's available only as a mid-scrum refresh if you take an action and want to re-read state afterward.
 
 ## Action vocabulary
 
@@ -2901,7 +2985,7 @@ No parameters. Returns the same snapshot you were already given in the opening o
   "team": [{ "name": "<AgentName>", "description": "<what it does>" }, ...],
   "quickDispatchAvailable": true,
   "relevantKnowledge": [{ "id", "title", "type", "tags", "content" }, ...],
-  "applicablePatterns": [{ "id", "title", "content", "via" }, ...]
+  "applicablePatterns": [{ "id", "title", "content", "via", "linkedFrom"?, "counterexamples"? }, ...]
 }
 \`\`\`
 
@@ -2917,7 +3001,7 @@ For a follow-up approving prior work, delegate the remaining execution against t
 
 For proposal work, ask the producer to retain reusable execution details in the goal scratchpad as well as the user-facing answer. Use produces for a chosen key when helpful. For follow-ups, consumes names only keys already present in THIS goal (including imported keys returned by read_context), never a source goal's unimported keys; the worker can instead retrieve the linked source directly.
 
-\`applicablePatterns\` (present when the workspace's pattern language has matches) holds Alexander/Coplien-style patterns whose Context sections fit this goal, plus patterns they link to (\`via\` says how each arrived). A pattern is a proven shape for how this kind of goal gets done, its Forces resolved by its Therefore: its Therefore/Contract sections often dictate task decomposition and ordering directly (for example "fetch tasks first, then compute tasks, then presentation tasks"). When a pattern's context genuinely holds, plan the scrum's tasks to follow it and say so in the task descriptions so executing agents apply it too.
+\`applicablePatterns\` (present when the workspace's pattern language has matches) holds Alexander/Coplien-style patterns whose Context sections fit this goal, plus patterns they link to (\`via\` says how each arrived; \`linkedFrom\` names the patterns that lead to it; \`counterexamples\`, when present, are recent uses where following it did not help, worth weighing before you choose it). On a re-plan the language also grows from the patterns your plan already follows: an entry \`linked-from: X (in the current plan)\` is what X's links say comes next. A pattern is a proven shape for how this kind of goal gets done, its Forces resolved by its Therefore: its Therefore/Contract sections often dictate task decomposition and ordering directly (for example "fetch tasks first, then compute tasks, then presentation tasks"). When a pattern's context genuinely holds, plan the scrum's tasks to follow it: name it in \`patterns\` on each add_task it governs (the executing agent receives it with your reason) or in dispatch_scrum's \`patterns\` when it shapes the whole plan. A goal often follows several patterns, each over different tasks. Those choices are this goal's record of which patterns it used, and the post-goal review judges each one against what happened, so name the ones you actually follow. Re-planning keeps, drops or adopts patterns as the work reveals more; say which in \`change\`, since a pattern dropped because it did not fit is evidence too.
 
 ### \`poll_team({ members?: string[], question?: string })\`
 Asks selected team members via the ask protocol. **This is how you learn what each agent can actually do** — the default question asks each agent to enumerate its current tools/skills/MCP capabilities AND propose a concrete task. Use whenever:
@@ -2934,11 +3018,12 @@ Restrict via \`members\` when you can narrow the candidate set to a couple of pl
 
 Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the agent's full reply naming its capabilities and proposed contribution. PASS / empty replies are filtered out.
 
-### \`add_task({ id?, description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
+### \`add_task({ id?, description, assignedAgentName, target?, dependsOn?, produces?, consumes?, patterns? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong. **Carry the goal's key requirement phrases through VERBATIM** (quote them): a paraphrase softens the requirement into something weaker that an agent can satisfy with an imitation — "use 3D graphics" rewritten as "a 3D presentation" invites a flat perspective drawing; "delete the old entries" rewritten as "clean up" invites archiving. Outcome wording is yours; the requirement words stay the user's.
 - \`assignedAgentName\`: must match a \`name\` in the \`team\` roster (from the goal state in your opening observation).
+- \`patterns\`: OPTIONAL \`[{ id, why }]\`: the patterns from \`applicablePatterns\` this task follows, with how each shapes it. The executing agent receives them with your reason, and they become this goal's recorded use of those patterns.
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: names (from \`id\`) or indices of THIS scrum's prior add_task calls. This is the shape of the round, so decide it deliberately for every task rather than letting it default. Pass \`[]\` when a task needs nothing from the others — those all start at once, including several on the SAME agent, since each agent runs multiple tasks concurrently. List indices when a task genuinely needs an earlier one's result (usually paired with \`consumes\` on what it \`produces\`); those wait until it lands. Omitting it means sequential-on-the-previous, which is right only when the work really is a chain — a round of independent tasks left to default runs one at a time for no reason. And when a task would depend not on data another staged task writes but on knowledge nobody has yet — \"research X, then build whatever X implies\" — that is not a dependency to encode here: end the round at the research and plan the build next scrum (see **Research-first goals**).
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.

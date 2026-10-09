@@ -1,11 +1,16 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
   "replaces": "KnowledgeBase",
   "build": "bash ../../sdk/cpp/build.sh knowledge-base.cpp -o main.wasm",
+  "ask": {
+    "guide": "ask-guide.md",
+    "tier": "balanced"
+  },
+  "required": true,
   "manifest": {
     "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, lessons learned, and patterns, then retrieve them four ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), get (fetch one full entry by id), and weave (select patterns whose contexts match a goal, plus their linked patterns). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources), 'pattern' (Alexander/Coplien-style generative pattern-language entries with Context/Forces/Therefore sections and links to related patterns). Knowledge persists across restarts and syncs across peers.",
     "interface": {
@@ -186,15 +191,24 @@
           }
         },
         {
-          "description": "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their links references to pull in linked patterns. Returns { patterns, dangling }: each pattern carries via ('matched' or 'linked-from: NAME'); dangling lists link names that resolve to no pattern yet.",
+          "description": "Select pattern entries (type 'pattern') whose contexts match the query (BM25-ranked), then follow their links to pull in linked patterns, best-supported links first. Pass `from` with the ids of patterns a plan already follows to get what their links lead to next. Returns { patterns, dangling, broken }: each pattern carries via ('matched', or 'linked-from: NAME' with how many goals used the two together), linkedFrom (the patterns that link to it) and counterexamples (its recent no_effect/harmful applications); dangling lists link names no pattern holds yet, broken lists links to archived patterns.",
           "name": "weave",
           "parameters": [
             {
               "description": "Goal or task description to match pattern contexts against",
               "name": "query",
+              "optional": true,
               "type": {
                 "kind": "primitive",
                 "primitive": "string"
+              }
+            },
+            {
+              "description": "Ids of patterns already in use, to expand their links",
+              "name": "from",
+              "optional": true,
+              "type": {
+                "kind": "array"
               }
             },
             {
@@ -477,6 +491,15 @@
                 "kind": "primitive",
                 "primitive": "string"
               }
+            },
+            {
+              "description": "Where it is applied (plan revision, task, step)",
+              "name": "scope",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
             }
           ],
           "returns": {
@@ -513,7 +536,7 @@
               }
             },
             {
-              "description": "helpful, harmful, inconclusive",
+              "description": "helpful, no_effect, harmful, inconclusive",
               "name": "verdict",
               "type": {
                 "kind": "primitive",
@@ -614,6 +637,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.6.0"
+    "version": "3.7.0"
   }
 }

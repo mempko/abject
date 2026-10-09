@@ -23,7 +23,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
-import { PROFILE_TAG } from './knowledge-base.js';
+import { PROFILE_TAG } from '../core/knowledge.js';
 import type { ContentPart } from '../llm/provider.js';
 import { truncateText, conversationTextChars, enforceConversationCharBudget, isContextOverflowError, promptTokensOf, anchoredConversationChars } from '../llm/provider.js';
 import type { ContextAnchor } from '../llm/provider.js';
@@ -54,6 +54,10 @@ export interface AgentAction {
   expect?: string;
   /** Optional machine-checkable expectation, separate from domain success. */
   expectOutcome?: 'success' | 'failure';
+  /** The agent's reading of its previous prediction, now that the result is in view. */
+  lastPrediction?: { verdict?: string; learned?: string };
+  /** Knowledge entries this action's expectation rests on, by id, with why. */
+  basis?: Array<{ id: string; why: string }>;
   [key: string]: unknown;
 }
 
@@ -224,6 +228,18 @@ export interface PredictionRecord {
    */
   decisionVerdict?: { verdict: string; confidence: number; probabilities: Record<string, number>; emulated: boolean };
   patterns?: Array<{ id: string; revision?: number; applicationRef?: string; provenanceError?: string; why: string }>;
+  /**
+   * Knowledge entries the prediction rested on, as the agent cited them, with
+   * the version it was shown when that is known. A miss points at these first;
+   * a held prediction confirms them.
+   */
+  basis?: Array<{ id: string; why: string; knowledgeRef?: string }>;
+  /**
+   * The agent's own reading of this prediction, given with its next action
+   * while the whole result was still in view. The reviewer audits it rather
+   * than reconstructing the comparison from excerpts.
+   */
+  selfAssessment?: { verdict: 'held' | 'missed' | 'unclear'; learned?: string; at: number };
   /** True when the action failed, which contradicts any expectation of it working. */
   missed?: boolean;
   /** Short rendering of the actual result, so the reviewer sees both sides. */
@@ -491,6 +507,12 @@ interface TaskEntry {
   injectedKnowledge?: Array<{ id: string; title: string; source?: 'profile' | 'relevant' | 'pattern'; content?: string; knowledgeRef?: string }>;
   /** Receipts for pattern content actually delivered, never model-authored. */
   patternSelections?: Record<string, string>;
+  /**
+   * Patterns the goal's plan assigned to this task, with the planner's reason.
+   * They reach the prompt beside the woven ones, so the agent applies them
+   * knowingly and its declarations carry a selection receipt.
+   */
+  assignedPatterns?: Array<{ id: string; why: string }>;
   /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
   knownTagsLine?: string;
   /**
@@ -835,6 +857,14 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
     actions: override.actions ?? base.actions,
     fallbackActionName: override.fallbackActionName ?? base.fallbackActionName,
   };
+}
+
+/** A plan's pattern assignment for one task, as dispatch data carries it. */
+function assignedPatternsOf(raw: unknown): Array<{ id: string; why: string }> | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out = raw.filter((p): p is { id: string; why?: unknown } => !!p && typeof p === 'object' && typeof (p as { id?: unknown }).id === 'string')
+    .slice(0, 6).map(p => ({ id: p.id, why: typeof p.why === 'string' ? p.why.slice(0, 500) : '' }));
+  return out.length ? out : undefined;
 }
 
 export class AgentAbject extends Abject {
@@ -1875,6 +1905,7 @@ The registered object must implement these handlers to participate in the agent 
         responseSchema,
         goalId,
         dispatchTupleId: this.delegations.has(taskId) ? undefined : dispatchTupleId,
+        assignedPatterns: assignedPatternsOf(queued?.data?.patterns),
       };
 
       this.taskEntries.set(taskId, entry);
@@ -3232,6 +3263,7 @@ The registered object must implement these handlers to participate in the agent 
                 }
                 task.lastResult = undefined;
                 task.action = entry.pendingActions.shift();
+                await this.recordSelfAssessment(entry);
                 log.info(`[${agentName}] Step ${task.step + 1} — draining batched action: ${task.action?.action} (${entry.pendingActions.length} left)`);
 
                 // A terminal is allowed as the LAST batched action, so a plan
@@ -3277,6 +3309,7 @@ The registered object must implement these handlers to participate in the agent 
               break;
             }
             task.action = thinkResult.data as AgentAction;
+            await this.recordSelfAssessment(entry);
 
             // ── Reparse sentinels from parseAction ──
             // _reparse: unparseable LLM output, correction message already pushed — loop back into thinking.
@@ -4835,7 +4868,7 @@ When an observation or a result is too big to sit in the conversation, you get a
 **The reader is for locating and inspecting**, when you want a specific thing rather than all of them: \`grep\` to jump to it, \`outline\` to see the structure when you are unsure what to search for, \`offset\`/\`length\` to read a region in order. A grep that reports further matches it did not show is telling you the question was an all-of-them question; switch to code rather than paging on.
 
 The preview often answers the question on its own — when it does, just act.`, true);
-    add('prediction', '\n\n## Prediction\nAny action may carry an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. The real result comes back beside it, so a wrong prediction becomes visible immediately instead of quietly surviving as a wrong assumption. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"), and when it misses, say what you learned before choosing the next action. Predictions are recorded before execution; observations are recorded afterwards. For consequential actions include patterns: [{id, why}] for patterns you actually apply. The runtime tracks the version automatically; do not supply revision numbers. Merely seeing a pattern is not using it. Operation success does not establish that your free-text prediction was correct. Predictions you state are kept for Scrum replanning and retrospective learning. For consequential actions and experiments, include expect; optionally add expectOutcome: "success" or "failure" for the operation outcome. Expected rejection can support a prediction. Free-text agreement remains uncertain until assessed. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
+    add('prediction', '\n\n## Prediction\nEvery action carries an `"expect"` field: one line naming the observable outcome you expect, written before the action runs. Comparing what you expected with what happened is how this system learns, so predict routine steps too. State what you actually believe will happen, in terms the result can contradict ("the list comes back with the three saved items", "the window shows the chart"). The expectation comes from what you know: your own understanding, the knowledge and patterns in this prompt, and what earlier steps showed.\n\nThe real result comes back beside your expectation. On your next action, add `"lastPrediction": {"verdict": "held" | "missed" | "unclear", "learned": "one line"}`: your honest reading of the previous expectation against that result, and on a miss, what you now believe instead. Operation success alone does not make a free-text prediction hold, and an expected rejection can. Optionally add `"expectOutcome": "success" | "failure"` for the operation outcome itself.\n\nWhen an expectation rests on a knowledge entry shown to you, cite it: `"basis": [{"id": "<entry id>", "why": "what it told you"}]`. When you apply a pattern, declare it: `"patterns": [{"id": "<pattern id>", "why": "how its Therefore shapes this action"}]`; seeing a pattern is different from using it. The runtime tracks versions, so leave revision numbers out. Predictions, your readings of them and their citations are kept for Scrum replanning and retrospective learning. Use replan to explain material discoveries and ask relevant collaborators what should change.', true);
 
     // Per-task addendum from the caller (task hints, the browsing goal): the
     // reason `systemPrompt` can stay identical across an agent's tasks.
@@ -4864,7 +4897,7 @@ The preview often answers the question on its own — when it does, just act.`, 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } } };
+        type KEntry = { id: string; title: string; type: string; content: string; archived?: boolean; origin?: string; usefulCount?: number; updatedAt?: number; knowledgeRef?: string; patternRef?: string; pattern?: { learning?: { revision?: number } }; counterexamples?: Array<{ verdict: string; evidence: string }> };
         const [profileAll, matched, tagList, woven] = await Promise.all([
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50, scope: entry.config.knowledgeScope }),
@@ -4904,7 +4937,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         const profile: KEntry[] = [];
         let budget = AgentAbject.PROFILE_BLOCK_CHAR_BUDGET;
         for (const e of ranked) {
-          const line = `- **${e.title}**: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+          const line = `- **${e.title}** [id=${e.id}]: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
           if (line.length > budget) break;
           budget -= line.length;
           profile.push(e);
@@ -4913,7 +4946,7 @@ The preview often answers the question on its own — when it does, just act.`, 
         if (profile.length > 0) {
           let block = '\n\n## About the User\nDurable facts about the user. Apply them without asking the user to repeat them.\n';
           for (const e of profile) {
-            block += `- **${e.title}**: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+            block += `- **${e.title}** [id=${e.id}]: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
           }
           const omitted = (profileAll?.length ?? 0) - profile.length;
           if (omitted > 0) {
@@ -4923,7 +4956,14 @@ The preview often answers the question on its own — when it does, just act.`, 
         }
 
         let patterns = (woven?.patterns ?? []).filter(e => e.id);
-        const patternIds = new Set(patterns.map(e => e.id));
+        // Patterns the plan assigned to this task join the woven ones, marked
+        // with the planner's reason; the plan's choice stands over keyword match.
+        const assigned = (await Promise.all((entry.assignedPatterns ?? []).map(async a => {
+          const found = patterns.find(e => e.id === a.id) ?? await this.request<(KEntry & { via?: string }) | null>(
+            request(this.id, knowledgeBaseId, 'get', { id: a.id }), 5000).catch(() => null);
+          return found?.type === 'pattern' && !found.archived ? { ...found, via: `assigned by the plan: ${a.why}` } : undefined;
+        }))).filter((e): e is KEntry & { via: string } => !!e);
+        const patternIds = new Set([...patterns, ...assigned].map(e => e.id));
 
         const profileTitles = new Set((profile ?? []).map(e => e.title));
         let relevant = (matched ?? [])
@@ -4931,19 +4971,22 @@ The preview often answers the question on its own — when it does, just act.`, 
         // Keyword recall ranks by words, not by use to this task: a decision
         // model may drop entries it judges irrelevant (site agent.knowledge).
         ({ relevant, patterns } = await this.filterRecalledKnowledge(entry, relevant, patterns));
+        patterns = [...assigned, ...patterns.filter(e => !assigned.some(a => a.id === e.id))];
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nHistorical claims from previous agents follow. For mutable facts such as scripts, branches, or current capabilities, consult the owning Abject and prefer current observations. Where an entry says which object or agent handles a kind of work, read it as a record of what happened once, not as a rule: capabilities move as skills and tools are installed, and the agent that wrote the note is often the one it names. Decide that question from the live roster and by asking. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
-            kb += `- **${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
+            kb += `- **${e.title}** (${e.type}; id=${e.id}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
           add('knowledge', kb, false);
         }
 
         if (patterns.length > 0) {
-          let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern. Apply the patterns whose context holds for this task.\n';
+          let block = '\n\n## Patterns\nThis workspace\'s generative pattern language (Alexander/Coplien-style): proven shapes for how work here gets done. Each pattern\'s Context section says when it applies, its Forces say what goes wrong naively, and its Therefore resolves them; patterns marked "linked-from" arrived through the Links of a matched pattern, and patterns marked "assigned by the plan" are the ones the goal\'s plan chose for this task. Apply the patterns whose context holds for this task, and declare each one on the actions it shapes.\n';
           for (const e of patterns) {
             const via = e.via && e.via !== 'matched' ? ` (${e.via})` : '';
             block += `\n### PATTERN: ${e.title}${via} [id=${e.id}]\n${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PATTERN_ENTRY_CHAR_CAP))}\n`;
+            // Recent uses where following it did not help: weigh them before applying it.
+            if (e.counterexamples?.length) block += `Recent counterexamples: ${e.counterexamples.map(c => `${c.verdict}: ${sanitizeInjectedFact(c.evidence.slice(0, 200))}`).join(' | ')}\n`;
           }
           add('patterns', block, false);
         }
@@ -5634,6 +5677,50 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private static readonly MAX_EXPECT_CHARS = 300;
 
   /**
+   * Knowledge a prediction cites as its basis, kept to entries this task was
+   * shown or retrieved, each with the version it saw when that is on record.
+   * Model-supplied references to anything else are dropped rather than
+   * trusted, the same rule pattern declarations follow.
+   */
+  private citedBasis(entry: TaskEntry, raw: unknown): NonNullable<PredictionRecord['basis']> {
+    if (!Array.isArray(raw)) return [];
+    const shown = new Map((entry.injectedKnowledge ?? []).map(k => [k.id, k.knowledgeRef]));
+    const out: NonNullable<PredictionRecord['basis']> = [];
+    for (const b of raw.slice(0, 8)) {
+      if (!b || typeof b !== 'object' || typeof (b as { id?: unknown }).id !== 'string') continue;
+      const { id, why } = b as { id: string; why?: unknown };
+      if (out.some(o => o.id === id) || !(shown.has(id) || entry.patternSelections?.[id])) continue;
+      out.push({ id, why: typeof why === 'string' ? why.slice(0, 500) : '', ...(shown.get(id) ? { knowledgeRef: shown.get(id) } : {}) });
+    }
+    return out;
+  }
+
+  /**
+   * The agent's verdict on its previous prediction, carried on the action it
+   * chose after seeing the result. It is attached to that prediction and put
+   * on the goal's evidence ledger, where Scrum replanning and the post-goal
+   * reviewer both read it. Once per prediction; later restatements are kept
+   * out so the first reading, made with the result in view, stands.
+   */
+  private async recordSelfAssessment(entry: TaskEntry): Promise<void> {
+    const raw = entry.state.action?.lastPrediction;
+    if (!raw || typeof raw !== 'object') return;
+    const verdict = (raw as { verdict?: unknown }).verdict;
+    if (verdict !== 'held' && verdict !== 'missed' && verdict !== 'unclear') return;
+    const last = entry.predictions?.at(-1);
+    if (!last || !last.expect?.trim() || last.selfAssessment) return;
+    const learned = typeof (raw as { learned?: unknown }).learned === 'string' ? ((raw as { learned: string }).learned).trim().slice(0, 500) : undefined;
+    last.selfAssessment = { verdict, ...(learned ? { learned } : {}), at: Date.now() };
+    const goalId = entry.goalId ?? entry.incomingGoalId;
+    if (goalId && this.goalManagerId) {
+      await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
+        goalId, operationId: `${entry.state.id}:${last.step}:self`,
+        observation: { taskId: entry.state.id, kind: 'self-assessment', step: last.step, expect: last.expect, ...last.selfAssessment },
+      })).catch(() => undefined);
+    }
+  }
+
+  /**
    * Preserve the original claim before domain, runtime, or intermediate
    * actions execute. recordPrediction pairs it with the resulting observation;
    * a missing expectation remains unresolved even when the operation succeeds.
@@ -5657,19 +5744,22 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         const kbId = await this.discoverDep('KnowledgeBase');
         if (!kbId) throw new Error('KnowledgeBase unavailable');
         const result = await this.request<{ success: boolean; applicationRef?: string; error?: string }>(request(this.id, kbId, 'beginPatternApplication', {
-          id: p.id, patternRef: receipt, applicationId: `${task.id}:${task.step + 1}:${p.id}`,
-          goalId, context: applied.why,
+          // One application per task and pattern: a later step citing the same
+          // pattern adds a declaration to it rather than opening another.
+          id: p.id, patternRef: receipt, applicationId: `${task.id}:${p.id}`,
+          goalId, context: applied.why, scope: `task ${task.id} step ${task.step + 1}`,
         }), 5000);
         if (!result.success || !result.applicationRef) throw new Error(result.error ?? 'Application receipt unavailable');
         applied.applicationRef = result.applicationRef;
       } catch (err) { applied.provenanceError = err instanceof Error ? err.message : String(err); }
     }
     action.patterns = applications;
+    action.basis = this.citedBasis(entry, action.basis);
     if (goalId && this.goalManagerId) await this.request(request(this.id, this.goalManagerId, 'recordObservation', {
       goalId, operationId: `${task.id}:${task.step + 1}:prediction`,
       observation: { taskId: task.id, kind: 'prediction', step: task.step + 1, action: task.action?.action,
         expect: task.action?.expect ?? null, expectOutcome: task.action?.expectOutcome ?? null,
-        patterns: action.patterns ?? [], execution: task.execution, predictedAt: entry.pendingPrediction.at },
+        patterns: action.patterns ?? [], basis: action.basis, execution: task.execution, predictedAt: entry.pendingPrediction.at },
     }));
   }
 
@@ -5694,6 +5784,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       step: task.step + 1, action: String(task.action?.action ?? 'unknown'),
       expect: expect.slice(0, AgentAbject.MAX_EXPECT_CHARS), outcome, verdict,
       predictedAt: predicted?.at, observedAt: Date.now(), verdictScope: 'operation-status', semanticVerdict: 'unresolved', patterns,
+      ...(predicted && Array.isArray(predicted.action.basis) && predicted.action.basis.length ? { basis: predicted.action.basis as NonNullable<PredictionRecord['basis']> } : {}),
       ...(verdict === 'contradicted' ? { missed: true } : {}),
       actual: actual.slice(0, 2000), actualRef: stored,
     });

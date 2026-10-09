@@ -47,7 +47,6 @@ import { JobManager } from '../src/objects/job-manager.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { GoalManager } from '../src/objects/goal-manager.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
-import { KnowledgeBase } from '../src/objects/knowledge-base.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
 import { FileManager } from '../src/objects/file-manager.js';
 import { FileViewer } from '../src/objects/file-viewer.js';
@@ -631,7 +630,6 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('GoalManager', () => new GoalManager());
   runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
-  runtime.objectFactory.registerConstructor('KnowledgeBase', () => new KnowledgeBase());
   runtime.objectFactory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
   runtime.objectFactory.registerConstructor('FileManager', () => new FileManager());
   runtime.objectFactory.registerConstructor('FileViewer', () => new FileViewer());
@@ -755,7 +753,7 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
       'TupleSpace', 'SharedState',
       'GoalManager', 'GoalBrowser', 'GoalObserver', 'TaskSession', 'AgentEvaluation', 'TaskReviewer',
       'JobManager', 'JobBrowser',
-      'KnowledgeBase', 'KnowledgeBrowser',
+      'KnowledgeBrowser',
       'FileManager', 'FileViewer',
       'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent', 'ExternalProjectRegistry', 'ExternalCreator', 'ExternalProjectBrowser',
@@ -801,6 +799,12 @@ runtime.objectFactory.registerConstructor('AgentEvaluation', () => new AgentEval
   const wasmExtensions = await ingestAllExtensions(runtime.objectFactory);
   if (wasmExtensions.length > 0) {
     log.timed(`packages ingested (${wasmExtensions.map(e => `${e.typeName}:${e.runtime}`).join(', ')})`);
+  }
+  // The KnowledgeBase exists only as the bundled native package; without it
+  // every workspace would run with no memory, so a missing one stops boot.
+  if (!runtime.objectFactory.listPackageTypes().some(t => t.name === 'KnowledgeBase')) {
+    throw new Error('The native KnowledgeBase package (native/knowledge-base) was not found or did not load. ' +
+      'It ships with the app; reinstall, or run pnpm smelt in a source checkout.');
   }
 
   // Spawn Supervisor early so it can supervise other objects

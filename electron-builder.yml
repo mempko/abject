@@ -36,6 +36,8 @@ extraResources:
     filter:
       - "**/abject.json"
       - "**/*.wasm"
+      # Package docs, including the ask guide a package names in abject.json.
+      - "**/*.md"
 
 # Workers and native .node binaries must be unpacked from asar
 # (worker_threads and dlopen cannot load from inside asar archives)

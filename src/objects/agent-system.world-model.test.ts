@@ -11,7 +11,6 @@ import { GoalManager } from './goal-manager.js';
 import { AgentAbject } from './agent-abject.js';
 import { TaskSession } from './task-session.js';
 import { TaskReviewer } from './task-reviewer.js';
-import { KnowledgeBase } from './knowledge-base.js';
 import { WasmAbject } from './wasm-abject.js';
 import { storeWasmModule } from '../sandbox/wasm-module-store.js';
 import { extractWasmManifest } from '../sandbox/wasm-instance.js';
@@ -26,7 +25,6 @@ class Reviewer extends TaskReviewer {
   call(to: string, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id,to,method,payload),10000); }
 }
 class Runtime extends AgentAbject { protected override async onInit() {} }
-class MemoryKnowledge extends KnowledgeBase { protected override async onInit() {} }
 class Store extends Endpoint {
   values = new Map<string,unknown>(); failKnowledge = false; failJournal = false;
   constructor(name: string) {
@@ -39,7 +37,7 @@ class Store extends Endpoint {
     for(const method of ['create','subscribe','unsubscribe']) this.on(method,()=>true);
   }
 }
-async function fixture(native = false) {
+async function fixture() {
   const bus=new MessageBus(), registry=new Registry(), objects:Abject[]=[registry]; await registry.init(bus);
   const dir=await mkdtemp(path.join(tmpdir(),'abject-world-model-')), previous=process.env.ABJECTS_DATA_DIR; process.env.ABJECTS_DATA_DIR=dir;
   async function add<T extends Abject>(o:T) { o.setRegistryHint(registry.id); await o.init(bus); registry.registerObject(o.id,o.manifest); objects.push(o); return o; }
@@ -49,12 +47,11 @@ async function fixture(native = false) {
   let goals=await add(new GoalManager());
   let reviewer=await add(new Reviewer()); Object.assign(reviewer,{agentAbjectId:runtime.id,goalManagerId:goals.id});
   let source:string|undefined, manifest:any;
-  if(native) { const bytes=await readFile(new URL('../../native/knowledge-base/main.wasm',import.meta.url)); source=await storeWasmModule(bytes); manifest=await extractWasmManifest(bytes); }
+  { const bytes=await readFile(new URL('../../native/knowledge-base/main.wasm',import.meta.url)); source=await storeWasmModule(bytes); manifest=await extractWasmManifest(bytes); }
   let kb:Abject;
   async function loadKnowledge() {
-    kb=await add(source?new WasmAbject({manifest,source}):new MemoryKnowledge());
+    kb=await add(new WasmAbject({manifest,source:source!}));
     Object.assign(reviewer,{knowledgeBaseId:kb.id});
-    if(!source) for(const [key,value] of storage.values) if(key.startsWith(':knowledge-base:entry:')) (kb as any).entries.set(key.slice(':knowledge-base:entry:'.length),structuredClone(value));
     // Wait for native owner startup, without asking it to mutate anything.
     await new Promise(resolve=>setTimeout(resolve,30)); return kb;
   }
@@ -63,7 +60,7 @@ async function fixture(native = false) {
   const record={taskId:'worker',goalId,task:'Verify repo',phase:'completed',agentName:'Verifier',steps:1,transcript:'Owner reports tests passed',injectedKnowledge:[],result:{project:'abject',revision:'fixture-inputs',tests:198,passed:198,exitCode:0},predictions:[{step:1,expect:'Repository has no working tests',actual:'198/198 passed, exit 0',outcome:'success',verdict:'supported'}]};
   await runtime.call(goals.id,'recordTaskEvidence',{goalId,taskId:'worker',record});
   (reviewer as any).taskExtras.set('review',{kind:'review',goalId,records:[record],knowledgeRefs:{}});
-  async function seed(title:string,content:string,origin='agent') { const {id}=await runtime.call(kb.id,'remember',{title,content,type:'fact',origin}); const entry=await runtime.call(kb.id,'get',{id}); (reviewer as any).taskExtras.get('review').knowledgeRefs[id]=entry.knowledgeRef; if(!native) await runtime.call(storage.id,'set',{key:`knowledge-base:entry:${id}`,value:entry}); return entry; }
+  async function seed(title:string,content:string,origin='agent') { const {id}=await runtime.call(kb.id,'remember',{title,content,type:'fact',origin}); const entry=await runtime.call(kb.id,'get',{id}); (reviewer as any).taskExtras.get('review').knowledgeRefs[id]=entry.knowledgeRef; return entry; }
   async function decision(effects:unknown[], context:any={evidence:'Owner verification on abject fixture-inputs passed 198 tests',evidenceRefs:['learning/task/worker']}) {
     return (await reviewer.call(goals.id,'recordLearningDecision',{goalId,reviewTaskId:'review',operationId:crypto.randomUUID(),context,effects})).decision;
   }
@@ -73,9 +70,9 @@ async function fixture(native = false) {
     stop:async()=>{for(const o of objects.reverse())await o.stop(); if(previous===undefined)delete process.env.ABJECTS_DATA_DIR;else process.env.ABJECTS_DATA_DIR=previous;await rm(dir,{recursive:true,force:true});}};
 }
 
-for(const native of [false,true]) {
+for(const native of [true]) {
   test(`${native ? 'native' : 'typescript'}: supersession requires a reconciled replacement and preserves its selected claim`, async () => {
-    const f = await fixture(native);
+    const f = await fixture();
     try {
       const old = await f.seed('No test runner', 'No test runner exists');
       const replacement = await f.seed('Corrected tests', 'There are standalone tests but no package test script');
@@ -97,7 +94,7 @@ for(const native of [false,true]) {
   });
   const implementation=native?'wasm':'typescript';
   test(`${implementation}: a correction bundle inherits explicit evidence, survives lost ack/restart, and changes subsequent recall`,async()=>{
-    const f=await fixture(native);
+    const f=await fixture();
     try {
       const old1=await f.seed('Abject tests absent','Abject has no tests'),old2=await f.seed('Abject fallback advice','Run ad hoc checks because no test script exists'),current=await f.seed('Abject verification','Partially corrected');
       const d=await f.decision([
@@ -125,7 +122,7 @@ for(const native of [false,true]) {
     }finally{await f.stop();}
   });
   test(`${implementation}: pattern feedback retains the applied revision and is durable across replay`,async()=>{
-    const f=await fixture(native);
+    const f=await fixture();
     try {
       const {id}=await f.runtime.call(f.kb.id,'remember',{title:'VERIFY RESTORATION',type:'pattern',content:'Context: persistent settings\nForces: live state can conceal loss\nTherefore: restore and compare\nEvidence: candidate'});
       const selected=await f.runtime.call(f.kb.id,'get',{id});
@@ -143,7 +140,7 @@ for(const native of [false,true]) {
     }finally{await f.stop();}
   });
   test(`${implementation}: persistence failure, concurrent revisions, protected disputes and stale peer writes remain truthful`,async()=>{
-    const f=await fixture(native);
+    const f=await fixture();
     try {
       const claim=await f.seed('Claim','Old content');
       const a=await f.decision([{action:'update_entry',id:claim.id,knowledgeRef:claim.knowledgeRef,content:'Corrected content'}]);
@@ -157,12 +154,8 @@ for(const native of [false,true]) {
       const dispute=await f.decision([{action:'dispute_entry',id:user.id,knowledgeRef:user.knowledgeRef,evidence:'Conflicting observation; general applicability is uncertain',scope:'project:abject'}]); assert.equal((await f.apply(dispute)).success,true);
       assert.match((await f.runtime.call(f.kb.id,'recall',{query:'Protected',previews:true}))[0].snippet,/DISPUTED/);
       const live=await f.runtime.call(f.kb.id,'get',{id:claim.id});
-      if(!native) {
-        assert.equal((f.kb as any).applyRemoteEntry(claim.id,{entry:{...claim,updatedAt:live.updatedAt+100000},updatedAt:live.updatedAt+100000,peerId:'stale'}),false);
-      } else {
-        // Same SharedState subscription message consumed by the native owner.
-        await f.runtime.call(f.kb.id,'changed',{aspect:'stateChanged',value:{name:'knowledge-base',key:`entry:${claim.id}`,value:{entry:{...claim,updatedAt:live.updatedAt+100000},updatedAt:live.updatedAt+100000,peerId:'stale'}}});
-      }
+      // Same SharedState subscription message consumed by the native owner.
+      await f.runtime.call(f.kb.id,'changed',{aspect:'stateChanged',value:{name:'knowledge-base',key:`entry:${claim.id}`,value:{entry:{...claim,updatedAt:live.updatedAt+100000},updatedAt:live.updatedAt+100000,peerId:'stale'}}});
       assert.equal((await f.runtime.call(f.kb.id,'get',{id:claim.id})).learning.revision,1);
     }finally{await f.stop();}
   });

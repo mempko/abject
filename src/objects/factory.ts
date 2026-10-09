@@ -25,7 +25,7 @@ import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
 import { ScriptableAbject, mergeScriptableManifest } from './scriptable-abject.js';
 import { Organism, buildOrganismManifest } from './organism.js';
 import type { OrganismSpec } from './organism.js';
-import { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './wasm-abject.js';
+import { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR, type WasmAskGuidance } from './wasm-abject.js';
 import {
   isWasmSourceRef,
   storeWasmModule,
@@ -57,6 +57,8 @@ export interface PackageTypeRegistration {
   package?: { name: string; version: string };
   /** Workspace scope: the workspace profiles it joins; none means `default`. */
   profiles?: string[];
+  /** wasm: the package's guide and tier for answering `ask`. */
+  ask?: WasmAskGuidance;
 }
 
 /**
@@ -391,6 +393,16 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     log.info(`package type '${name}' registered (${registration.runtime}, ${registration.scope})`);
   }
 
+  /**
+   * The ask guidance of the package a wasm spawn comes from, matched by type
+   * name and module so a restored or respawned instance answers the same way
+   * and an unrelated module that borrows the name does not.
+   */
+  private wasmAskFor(req: { manifest: AbjectManifest; source?: string }): { ask?: WasmAskGuidance } {
+    const t = this.packageTypes.get(req.manifest.name);
+    return t?.runtime === 'wasm' && t.ask && t.source === req.source ? { ask: t.ask } : {};
+  }
+
   /** Installed package types, e.g. for WorkspaceManager to spawn
    *  workspace-scoped packages alongside the built-in per-workspace set. */
   listPackageTypes(): Array<{
@@ -656,6 +668,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
             source: existingReg.source,
             owner: existingReg.owner ?? '',
             data: existingReg.data,
+            ...(isWasm ? this.wasmAskFor(existingReg) : {}),
           },
           registryId: effectiveRegistryId,
           parentId: parentId ?? this.id,
@@ -849,6 +862,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         source: req.source!,
         owner: req.owner,
         data: req.data,
+        ...this.wasmAskFor(req),
       });
     } else if (factory) {
       // Use registered factory function
@@ -1150,6 +1164,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         source: req.source,
         owner: req.owner ?? '',
         data: req.data,
+        ...this.wasmAskFor(req),
       },
       registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,

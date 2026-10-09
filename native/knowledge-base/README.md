@@ -1,12 +1,13 @@
 # KnowledgeBase (C++/WASM)
 
-A native replacement for the TypeScript `KnowledgeBase` system object,
-written in C++ against `sdk/cpp` and compiled to WebAssembly. It is a
-**bundled system package**: the committed `main.wasm` is ingested at every
-boot (with `replaces: "KnowledgeBase"`), so it transparently takes over
-every workspace's knowledge store: the WorkspaceManager spawns
-`KnowledgeBase` by name as always, and the Factory resolves the name to this
-module. The desktop app ships it under `resources/native`.
+The workspace KnowledgeBase, written in C++ against `sdk/cpp` and compiled
+to WebAssembly. It is a **bundled, required system package**: the committed
+`main.wasm` is ingested at every boot under the type name `KnowledgeBase`
+(`replaces: "KnowledgeBase"`), the WorkspaceManager spawns it by that name
+for every workspace, and boot stops with an error if it fails to load, since
+there is no TypeScript implementation to fall back on. Its message
+vocabulary for TypeScript callers lives in `src/core/knowledge.ts`. The
+desktop app ships it under `resources/native`.
 
 After changing the sources, rebuild the committed module (requires the WASI
 SDK at `~/tools/wasi-sdk` or `$WASI_SDK`):
@@ -17,18 +18,19 @@ pnpm smelt   # forge --build-only: recompile, validate, re-embed the manifest
 
 ## What it demonstrates
 
-- A compiled-language abject replacing a built-in system object with zero
-  changes anywhere else: same manifest surface (`remember`, `recall`,
-  `match`, `get`, `forget`, `update`, `list`, `markUseful`, `archive`),
-  same events, same discovery.
+- A compiled-language abject as a core system object: it took over from the
+  TypeScript KnowledgeBase with the same manifest surface (`remember`,
+  `recall`, `match`, `get`, `forget`, `update`, `list`, `markUseful`,
+  `archive`, `weave` and the learning protocol), the same events and the
+  same discovery, and is now the only implementation.
 - All capability access by message passing: persistence goes through the
   workspace `Storage` abject (one key per entry), cross-peer sync through
   `SharedState`, exactly like every other object. No filesystem, no SQLite.
 - A hand-written field-weighted BM25 inverted index (`bm25.hpp`) with the
-  same 10/1/5 title/content/tags weighting the TS version tuned FTS5 to,
+  same 10/1/5 title/content/tags weighting the former TS version tuned FTS5 to,
   including FTS5-style `[bracketed]` snippets.
 
-## Benchmark (vs TS KnowledgeBase with node:sqlite FTS5)
+## Benchmark (vs the former TS KnowledgeBase with node:sqlite FTS5)
 
 End-to-end request latency through the bus, previews recall with limit 10,
 medians over 200 queries:
@@ -46,15 +48,28 @@ the in-process bus passes payloads by reference while the module must
 serialize 50 full entries to JSON; operations returning small results
 (recall previews, match) come out far ahead because the compute dominates.
 
-## Behavioral differences from the TS version
+## Behavior notes
 
 - `match` supports case-insensitive literals and `A|B` alternations (the
   documented agent usage); other regex metacharacters degrade the pattern to
-  a literal substring, the same fallback TS applies to invalid regexes.
-  (Exceptions don't exist in this build, and `std::regex` reports invalid
-  patterns only by throwing.)
-- Distillation runs on load and is throttled to every 30 minutes piggybacked
-  on writes, instead of a wall-clock interval timer.
-- The LLM `ask` answer comes from the host's default handler over this
-  module's (deliberately rich) manifest description, rather than a custom
-  store-summary prompt.
+  a literal substring. (Exceptions don't exist in this build, and
+  `std::regex` reports invalid patterns only by throwing.)
+- Tokenizing reads UTF-8: letters of every script stay inside their word,
+  typographic punctuation and `_` separate words, and case folds for Latin,
+  Greek and Cyrillic.
+- Distillation runs on load and at most every 30 minutes, piggybacked on
+  writes. Sync publishing is throttled to every 2 s; a flush the throttle
+  deferred asks the Timer capability for one wakeup (`timerFired`), so an
+  idle store still publishes its last change and otherwise sets no timers.
+- The legacy whole-array key is imported only into an empty store; a
+  re-import would bring back entries forgotten since the migration.
+- `ask` is answered by the host over the manifest plus `ask-guide.md`
+  (declared under `ask` in `abject.json`), at the balanced tier.
+- Pattern learning: a repeated `beginPatternApplication` under the same
+  identity adds a declaration to that application instead of conflicting;
+  verdicts are `helpful`, `no_effect`, `harmful` and `inconclusive`; `weave`
+  accepts `from` (patterns already in use, to expand their links), orders
+  link expansion by how often the two patterns were used together, and
+  returns each pattern's `linkedFrom` and recent `counterexamples`, plus
+  `broken` links that name an archived pattern. Link names resolve by id
+  (`id:` prefix allowed), title, or alias.

@@ -40,7 +40,10 @@ export interface PatternApplication {
   id: string;
   goalId: string;
   context: string;
-  verdict: 'applied' | 'helpful' | 'harmful' | 'inconclusive';
+  /** 'applied': declared, not yet judged. no_effect: followed, and the state it promises did not come about or did not matter. */
+  verdict: 'applied' | 'helpful' | 'no_effect' | 'harmful' | 'inconclusive';
+  /** Each time the application was declared: the reason, where (plan revision, task, step), and the revision followed. */
+  declarations?: Array<{ context: string; scope?: string; patternRevision: number; at: number }>;
   evidence: string;
   patternRevision: number;
   /** Immutable pre-action reason, retained when feedback is attached. */
@@ -261,13 +264,15 @@ export function renderPatternText(pattern: PatternBody): string {
   for (const note of pattern.notes ?? []) {
     blocks.push(`## ${note.heading}\n${note.body}`);
   }
+  // Same order and wording as the KnowledgeBase's own rendering
+  // (native/knowledge-base/pattern.hpp), so a pattern reads alike everywhere.
+  if (pattern.learning) {
+    const goals = (verdict: PatternApplication['verdict']) => new Set(pattern.learning!.applications.filter(a => a.verdict === verdict).map(a => a.goalId)).size;
+    const helpful = goals('helpful');
+    blocks.push(`## Recorded evidence\nRevision ${pattern.learning.revision}; helpful in ${helpful} distinct goals; no effect in ${goals('no_effect')}; counterexamples in ${goals('harmful')} goals. ${helpful < 2 ? 'Candidate: recurrence is not established.' : 'Recurrence recorded; applicability still depends on context.'}`);
+  }
   if (pattern.links.length > 0) {
     blocks.push(`## Links\n${pattern.links.map(l => `-> ${l}`).join('\n')}`);
-  }
-  if (pattern.learning) {
-    const helpful = new Set(pattern.learning.applications.filter(a => a.verdict === 'helpful').map(a => a.goalId)).size;
-    const harmful = new Set(pattern.learning.applications.filter(a => a.verdict === 'harmful').map(a => a.goalId)).size;
-    blocks.push(`## Recorded evidence\nRevision ${pattern.learning.revision}; helpful in ${helpful} distinct goals; counterexamples in ${harmful} goals. ${helpful < 2 ? 'Candidate: recurrence is not established.' : 'Recurrence recorded; applicability still depends on context.'}`);
   }
   const rendered = blocks.join('\n\n');
   ensure(rendered.length > 0, 'a rendered pattern is never empty');

@@ -70,7 +70,7 @@ export { WASM_ABI_VERSION, validateWasmModule } from './sandbox/wasm-abi.js';
 export type {
   OutboundEnvelope, InboundEnvelope, WasmInitInfo, WasmAbjectExports,
 } from './sandbox/wasm-abi.js';
-export { KnowledgeBase, KNOWLEDGE_BASE_ID } from './objects/knowledge-base.js';
+export { KNOWLEDGE_BASE_ID, PROFILE_TAG, type KnowledgeEntry, type KnowledgeType, type KnowledgeOrigin } from './core/knowledge.js';
 export { KnowledgeBrowser, KNOWLEDGE_BROWSER_ID } from './objects/knowledge-browser.js';
 export { FileManager, FILE_MANAGER_ID } from './objects/file-manager.js';
 export { FileViewer, FILE_VIEWER_ID } from './objects/file-viewer.js';
