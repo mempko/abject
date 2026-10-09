@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.15.1",
+    "date": "2026-10-09",
+    "title": "Your Own Workspace Can Change Its Settings",
+    "summary": "Abjects and agents in a workspace you host locally can now change global settings for you, so asking an agent to switch models or adjust a permission no longer sends you to the Settings window. Shared, public, and joined workspaces still can't change settings, and only the Settings window can read saved credentials back.",
+    "highlights": [
+      "Abjects and agents in a local workspace hosted on your own machine can now change global settings: AI tiers and keys, presets, permissions, and the other sections the Settings window covers. Before this, only the Settings window and the commune terminal client could make these changes.",
+      "Agents in a local workspace can apply, save, and delete model presets and record command rules and skill grants; this lets a request like \"switch to the cheaper preset\" finish in one step.",
+      "Shared and public workspaces still can't write settings, and neither can a local copy of a workspace you joined from another peer. If the system can't confirm that the caller's workspace is one you host locally, it refuses the change.",
+      "Reading secrets back (API keys and other credentials) is still limited to the Settings window; no workspace abject can read them."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.15.0",
     "date": "2026-10-09",
     "title": "Native Knowledge and a Living Pattern Language",
