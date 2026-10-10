@@ -1,5 +1,28 @@
 [
   {
+    "version": "0.15.2",
+    "date": "2026-10-10",
+    "title": "A Headless Edition and the abject Command",
+    "summary": "Abject now runs without a desktop, on a server, in a container or as a background service, and you can manage and talk to it from the new `abject` command in your terminal. Under the hood, an object's trust now depends on how it was built, which closes a way for user code to pass itself off as part of the system.",
+    "highlights": [
+      "New headless edition: the same backend runs with no display, so you can run Abject on a server, in Docker, or as a system service. A build check confirms that no display code gets into the headless bundle.",
+      "The `abject` command is now a full CLI. It has a chat interface in the terminal plus setup, doctor, locate, connect, service and update subcommands, and the desktop app includes it.",
+      "New ways to install: a Dockerfile, Homebrew, Scoop and Winget manifests, one-line install scripts for Linux, macOS and Windows on abject.world, and a single-binary package of the headless edition.",
+      "Questions from your objects (confirmations and prompts) now reach you wherever you are: in a window on the desktop, or in the terminal through the `abject` command.",
+      "Each running backend writes a small instance file (process, edition, ports, owner token) to its data directory. The `abject` command uses it to find and connect to the backend, and AuthGate checks every connection.",
+      "Trust now comes from how an object was built. Only objects compiled into the server are treated as built in. Scripts, WASM packages, proxies and remote objects can no longer claim system privileges by copying a name or ID pattern.",
+      "Spawning, killing, cloning and registering objects, plus writes to saved object data, now follow that rule, so user code works only with its own objects and its own registry entries.",
+      "The old manifest capability system is gone; PermissionBroker remains what decides access to files, the shell and the network. Manifests saved before this release still load, because outdated capability entries are now ignored.",
+      "Negotiated proxies between objects now hold wherever the two objects run (main thread, the same worker or different workers), and self-healing still keeps track of how well each proxy is working.",
+      "Every directory in the source tree has a README, and the architecture, CLAUDE.md and philosophy docs have been rewritten to match the current code."
+    ],
+    "fixes": [
+      "Closed a hole where a user-written object could take a system object's name or typeId pattern and gain privileged access to the Factory, Registry, Supervisor or saved object data.",
+      "The app updater, browser window host and external project registry used guesswork based on names and IDs to decide whom to trust; they now use the same built-in check as everything else.",
+      "Per-workspace objects are now registered on both the main thread and the worker threads, so they no longer fail to start in a worker without any error."
+    ]
+  },
+  {
     "version": "0.15.1",
     "date": "2026-10-09",
     "title": "Your Own Workspace Can Change Its Settings",
