@@ -9,7 +9,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { require as precondition } from '../../core/contracts.js';
 import { runBounded } from '../../core/bounded.js';
 import { request as createRequest, event as createEvent } from '../../core/message.js';
@@ -270,10 +269,6 @@ export class SharedState extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.SHARED_STATE,
-        ],
         tags: ['system', 'capability', 'shared-state'],
       },
     });

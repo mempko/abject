@@ -113,7 +113,7 @@ class RuntimeFixture extends AgentAbject { protected override async onInit(): Pr
 class Caller extends Abject {
   results: any[] = []; checks = 0;
   constructor() {
-    super({ manifest: { name: 'FixtureAgent', version: '1', description: 'scripted agent', interface: { id: 'abjects:fixture', name: 'Fixture', description: 'test', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } });
+    super({ manifest: { name: 'FixtureAgent', version: '1', description: 'scripted agent', interface: { id: 'abjects:fixture', name: 'Fixture', description: 'test', methods: [] } } });
     this.on('candidateComplete', () => ({ accepted: ++this.checks > 1, reason: 'exercise the candidate first' }));
     this.on('taskResult', (m: AbjectMessage) => { this.results.push(m.payload); });
   }

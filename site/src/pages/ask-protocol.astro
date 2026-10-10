@@ -25,9 +25,9 @@ const messageEnvelope = `AbjectMessage {
 }`;
 
 const manifestStructure = `AbjectManifest {
-  name:                 string
-  description:          string
-  version:              string
+  name:        string
+  description: string
+  version:     string
   interface: {
     id:          InterfaceId
     name:        string
@@ -40,9 +40,7 @@ const manifestStructure = `AbjectManifest {
     }]
     events:  [{ name, description, payload }]
   }
-  requiredCapabilities: CapabilityRequest[]
-  providedCapabilities: CapabilityId[]?
-  tags:                 string[]
+  tags:        string[]
 }`;
 
 /*
@@ -51,7 +49,7 @@ const manifestStructure = `AbjectManifest {
  * structure's own name in heading ink. Escapes everything it emits.
  */
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const TOKEN = /("[^"]*")|\b(string|number|AbjectId|InterfaceId|CapabilityRequest|CapabilityId|AbjectMessage|AbjectManifest)\b/g;
+const TOKEN = /("[^"]*")|\b(string|number|AbjectId|InterfaceId|AbjectMessage|AbjectManifest)\b/g;
 function highlight(src: string): string {
   return src
     .split('\n')
@@ -137,7 +135,7 @@ function highlight(src: string): string {
           <div class="primitive-notes">
             <p>
                 The caller sends a question in plain English. The abject consults an LLM, giving it the
-                question, its manifest (name, description, interfaces, capabilities), and even its own
+                question, its manifest (name, description, interface), and even its own
                 code, and answers the question the caller asked.
               </p>
             <p class="primitive-punch">
@@ -297,8 +295,8 @@ function highlight(src: string): string {
           </figure>
 
           <p>
-            The manifest lists what the object is, the methods it handles, the events it sends, and the
-            capabilities it needs and provides. The function <code>formatManifestAsDescription()</code>
+            The manifest lists what the object is, the methods it handles, and the events it sends.
+            The function <code>formatManifestAsDescription()</code>
             turns it into plain English, and that becomes the LLM's context when the object answers a
             question.
           </p>

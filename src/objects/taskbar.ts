@@ -10,7 +10,6 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject } from '../core/abject.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { event, request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { chromeCase } from '../core/theme-data.js';
 import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
@@ -112,10 +111,6 @@ export class Taskbar extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display taskbar', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

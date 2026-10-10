@@ -30,7 +30,7 @@
  *   1. **Project autonomy** — how much the directory on disk is trusted, set by
  *      the user per external project (`ask`, `read`, `edit`, `full`).
  *   2. **Workspace access mode** — how reachable the calling object is. A local
- *      workspace keeps the project's level; a private one is capped at `edit`;
+ *      workspace keeps the project's level; a shared one is capped at `edit`;
  *      a public one is capped at `ask`, because an exposed object there is an
  *      entry point for any peer and a stranger's message must never end in a
  *      host command nobody saw.
@@ -355,8 +355,6 @@ export class PermissionBroker extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'security', 'permissions'],
       },
     });

@@ -134,8 +134,6 @@ export class ObjectCatalog extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'core'],
       },
     });

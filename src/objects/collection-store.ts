@@ -1,7 +1,10 @@
 /**
  * CollectionStore - structured, queryable, shared data for a workspace.
  *
- * Backed by SQLite (node:sqlite) at ~/.abject/ws-<id>/collections.db.
+ * Backed by SQLite (node:sqlite) at $ABJECTS_DATA_DIR/ws-<id>/collections.db,
+ * beside the workspace's storage.db and files (see data-dir-layout.ts); a
+ * store whose workspace never resolves uses $ABJECTS_DATA_DIR/collections.db.
+ * A database left under ~/.abject by an older build moves there on first open.
  * Collections are real tables: schema-declared fields become typed columns,
  * everything else lands in a JSON `extra` column. Writes go through
  * insert/update/remove so change events fire (recordInserted/recordUpdated/
@@ -13,7 +16,6 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,8 +29,15 @@ import {
 } from '../core/contracts.js';
 import { request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { workspaceDataDir, legacyHomeDataDir, moveLegacyData } from './data-dir-layout.js';
 
 const log = new Log('COLLECTION-STORE');
+
+/** The database's file name, in a workspace's data directory or at the top of the instance's. */
+const DB_FILE = 'collections.db';
+
+/** Files SQLite keeps beside a database in WAL mode; they move with it. */
+const SQLITE_COMPANIONS = ['-wal', '-shm'] as const;
 
 const COLLECTION_STORE_INTERFACE = 'abjects:collection-store' as InterfaceId;
 
@@ -218,8 +227,6 @@ export class CollectionStore extends Abject {
             { name: 'recordRemoved', description: 'A record was removed', payload: { kind: 'object', properties: { collection: { kind: 'primitive', primitive: 'string' }, id: { kind: 'primitive', primitive: 'string' } } } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'data'],
       },
     });
@@ -297,11 +304,12 @@ export class CollectionStore extends Abject {
 
   private openDb(): DatabaseSync {
     if (this.db) return this.db;
-    const dir = this.workspaceId
-      ? path.join(os.homedir(), '.abject', `ws-${this.workspaceId}`)
-      : path.join(os.homedir(), '.abject', 'global');
+    const dir = workspaceDataDir(this.workspaceId);
+    const dbPath = path.join(dir, DB_FILE);
+    moveLegacyData(path.join(legacyHomeDataDir(this.workspaceId, 'global'), DB_FILE), dbPath,
+      'collections database', log, SQLITE_COMPANIONS);
     fs.mkdirSync(dir, { recursive: true });
-    this.dbPath = path.join(dir, 'collections.db');
+    this.dbPath = dbPath;
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec(`CREATE TABLE IF NOT EXISTS _collections (

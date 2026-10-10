@@ -23,7 +23,7 @@ export class AgentEvaluation extends Abject {
   private storageId?: AbjectId;
   constructor() {
     super({ manifest: { name: 'AgentEvaluation', version: '1.0.0', description: 'Repeatable agent reliability, continuation, and longitudinal learning evaluation. Ask for the driver and independent verifier protocols.',
-      interface: { id: 'abjects:agent-evaluation', name: 'AgentEvaluation', description: 'Evidence-backed agent evaluation', methods: [] }, requiredCapabilities: [], providedCapabilities: [], tags: ['system','agent','evaluation'] } });
+      interface: { id: 'abjects:agent-evaluation', name: 'AgentEvaluation', description: 'Evidence-backed agent evaluation', methods: [] }, tags: ['system','agent','evaluation'] } });
     describeMessages(this.manifest, [
       { name:'listCases', description:'Read the acceptance catalog, including continuation and proposal reuse scenarios.', parameters:{} },
       { name:'run', description:'Start a comparison using driverId, verifierId, optional caseIds, conditions (fresh/frozen/learning), repetitions and seed. Driver and verifier must be distinct Abjects. Returns a run id.', parameters:{ driverId:protocolText, verifierId:protocolText, options:protocolObject } },

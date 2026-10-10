@@ -44,7 +44,6 @@ import { Abject, isTemporaryAskResponse } from '../core/abject.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { safeStringify } from '../core/format.js';
 import {
@@ -370,10 +369,6 @@ export class ScrumMaster extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'Scrum decisions', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'scrum'],
       },
     });

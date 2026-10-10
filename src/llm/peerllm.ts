@@ -127,12 +127,3 @@ export class PeerLLMProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createPeerLLMProvider(): PeerLLMProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).PEERLLM_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new PeerLLMProvider({ apiKey });
-}

@@ -10,7 +10,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import type { AgentAction, AgentActionResult } from './agent-abject.js';
 import { bulkAwareResult, resultEcho, LARGE_PAYLOAD_CHARS } from './agent-abject.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
@@ -173,11 +172,6 @@ export class SkillAgent extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.SHELL_EXECUTE, reason: 'Run shell commands for skill execution', required: true },
-          { capability: Capabilities.LLM_QUERY, reason: 'LLM planning', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'agent', 'skill'],
       },
     });

@@ -10,13 +10,13 @@ import { MessageBus } from '../runtime/message-bus.js';
 import { request } from '../core/message.js';
 import type { AbjectId } from '../core/types.js';
 class Client extends Abject {
-  constructor(){super({manifest:{name:'EffectsClient',version:'1',description:'test',interface:{id:'effects-client',name:'Client',description:'test',methods:[]},requiredCapabilities:[],providedCapabilities:[]}});}
+  constructor(){super({manifest:{name:'EffectsClient',version:'1',description:'test',interface:{id:'effects-client',name:'Client',description:'test',methods:[]}}});}
   call(id:AbjectId,method:string,payload:unknown={}):Promise<any>{return this.request(request(this.id,id,method,payload),15000);}
 }
 class SnapshotStore extends Abject {
   saved:any;
   constructor(){
-    super({manifest:{name:'AbjectStore',version:'1',description:'message storage fixture',interface:{id:'snapshot-store',name:'Store',description:'fixture',methods:[]},requiredCapabilities:[],providedCapabilities:[]}});
+    super({manifest:{name:'AbjectStore',version:'1',description:'message storage fixture',interface:{id:'snapshot-store',name:'Store',description:'fixture',methods:[]}}});
     this.on('save',msg=>{this.saved=structuredClone(msg.payload);return {success:true};});
     this.on('getDurableSnapshot',()=>structuredClone(this.saved));
   }
@@ -46,7 +46,7 @@ test('project snapshots include untracked and generated files and flag incomplet
 test('failed source activation restores working source and internal data',async()=>{
   const bus=new MessageBus(),client=new Client();await client.init(bus);
   const source='({ show(){this.data.visible=true;}, hide(){this.data.visible=false;}, increment(){return ++this.data.count;} })';
-  const object=new ScriptableAbject({name:'Counter',version:'1',description:'counter',interface:{id:'counter',name:'Counter',description:'counter',methods:[]},requiredCapabilities:[],providedCapabilities:[]},source,client.id,{count:2});
+  const object=new ScriptableAbject({name:'Counter',version:'1',description:'counter',interface:{id:'counter',name:'Counter',description:'counter',methods:[]}},source,client.id,{count:2});
   await object.init(bus);
   try {
     await client.call(object.id,'show');
@@ -61,7 +61,7 @@ test('failed source activation restores working source and internal data',async(
 test('a failing old hide handler leaves the previous source usable and restores data',async()=>{
   const bus=new MessageBus(),client=new Client();await client.init(bus);
   const source='({ show(){this.data.visible=true;}, hide(){this.data.count=99;throw new Error("hide failed");}, increment(){return ++this.data.count;} })';
-  const object=new ScriptableAbject({name:'OldLifecycle',version:'1',description:'counter',interface:{id:'old-lifecycle',name:'Counter',description:'counter',methods:[]},requiredCapabilities:[],providedCapabilities:[]},source,client.id,{count:2});
+  const object=new ScriptableAbject({name:'OldLifecycle',version:'1',description:'counter',interface:{id:'old-lifecycle',name:'Counter',description:'counter',methods:[]}},source,client.id,{count:2});
   await object.init(bus);
   try {
     const result=await client.call(object.id,'updateSource',{expectedSource:source,source:'({ show(){this.data.count=100;} })'});
@@ -74,7 +74,7 @@ test('a failing old hide handler leaves the previous source usable and restores 
 test('application persistence includes exercised data and restores a usable application',async()=>{
   const bus=new MessageBus(),client=new Client(),store=new SnapshotStore();
   await client.init(bus);await store.init(bus);
-  const manifest={name:'SavedCounter',version:'1',description:'counter',interface:{id:'saved-counter',name:'Counter',description:'counter',methods:[]},requiredCapabilities:[],providedCapabilities:[]};
+  const manifest={name:'SavedCounter',version:'1',description:'counter',interface:{id:'saved-counter',name:'Counter',description:'counter',methods:[]}};
   const source='({ increment(){return ++this.data.count;} })';
   const object=new ScriptableAbject(manifest,source,client.id,{count:2});
   (object as any).discoverDep=async(name:string)=>name==='AbjectStore'?store.id:null;

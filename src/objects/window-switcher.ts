@@ -57,8 +57,6 @@ export class WindowSwitcherAbject extends Abject {
             { name: 'toggle', description: 'Toggle the switcher open/closed.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'switcher'],
       },
     });

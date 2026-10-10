@@ -1,6 +1,6 @@
 /**
  * The `abject` command's conversation views: the tabbed full-screen TUI
- * (Alt-key navigation, tmux-safe) and a line-oriented REPL for dumb
+ * (prefix-chord navigation, Ctrl+A by default, see ABJECT_PREFIX) and a line-oriented REPL for dumb
  * terminals and pipes. Both talk to a backend through the CLI gateway, on the
  * desktop and the headless editions alike.
  *

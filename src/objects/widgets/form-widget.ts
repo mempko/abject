@@ -84,8 +84,6 @@ export class FormWidget extends VBoxLayout {
       description: 'Schema-driven form: labeled inputs, validation, and a submit button from one spec',
       version: '1.0.0',
       interface: LAYOUT_INTERFACE_DECL,
-      requiredCapabilities: [],
-      providedCapabilities: [],
       tags: ['widget', 'form'],
     };
 

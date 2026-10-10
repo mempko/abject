@@ -28,12 +28,18 @@
  * - a package with `replaces` overrides the built-in constructor of that
  *   name (every spawn of the name resolves to the package), and
  * - packages without `replaces` become spawnable types: 'system' scope is
- *   spawned once at boot by server/index.ts, 'workspace' scope is spawned
+ *   spawned once at boot by server/boot.ts, 'workspace' scope is spawned
  *   per workspace by the WorkspaceManager.
  *
- * Both runtimes may be either scope. A system-scope script package abject
- * keeps its data with the Packages service (there is no AbjectStore at
- * system scope); a workspace-scope one in its workspace's AbjectStore.
+ * Both runtimes may be either scope, and both spawn with the owner
+ * `package:<name>`. A system-scope package abject keeps its data (a
+ * script's saveData, a WASM module's persist) with the Packages service
+ * (there is no AbjectStore at system scope); a workspace-scope one in its
+ * workspace's AbjectStore.
+ *
+ * A package marked `required` that cannot be loaded (its abject.json fails
+ * validation, or it fails to register) stops boot unless another copy
+ * provides its type.
  */
 
 import * as fs from 'node:fs/promises';
@@ -358,6 +364,35 @@ export interface DiscoveredPackage {
   /** Undefined when the package could not be read; see `error`. */
   pkg?: ExtensionPackage;
   error?: string;
+  /**
+   * For a package that could not be read but whose abject.json parsed: what
+   * it says about itself, so a `required` one stops boot instead of being
+   * skipped. An abject.json that does not parse cannot say it is required.
+   */
+  declared?: DeclaredPackage;
+}
+
+/** The identity an unreadable package's abject.json still declares. */
+export interface DeclaredPackage {
+  name: string;
+  /** `replaces`, or the name: the type the package would provide. */
+  typeName: string;
+  required: boolean;
+}
+
+/** Read what an abject.json declares without validating the package. */
+async function peekPackage(pkgDir: string): Promise<DeclaredPackage | undefined> {
+  let meta: unknown;
+  try {
+    meta = JSON.parse(await fs.readFile(path.join(pkgDir, 'abject.json'), 'utf-8'));
+  } catch {
+    return undefined;
+  }
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined;
+  const m = meta as PackageMeta;
+  const name = typeof m.name === 'string' && m.name !== '' ? m.name : path.basename(pkgDir);
+  const typeName = typeof m.replaces === 'string' && m.replaces !== '' ? m.replaces : name;
+  return { name, typeName, required: m.required === true };
 }
 
 const hasMeta = (dir: string): boolean => {
@@ -376,7 +411,11 @@ export async function discoverPackages(roots: PackageRoot[]): Promise<Discovered
     try {
       found.push({ dir, origin, pkg: await readPackage(dir) });
     } catch (err) {
-      found.push({ dir, origin, error: err instanceof Error ? err.message : String(err) });
+      const declared = await peekPackage(dir);
+      found.push({
+        dir, origin, error: err instanceof Error ? err.message : String(err),
+        ...(declared ? { declared } : {}),
+      });
     }
   };
   for (const root of roots) {
@@ -493,6 +532,7 @@ async function registerPackage(factory: Factory, pkg: ExtensionPackage): Promise
     const source = await storeWasmModule(bytes);
     factory.registerPackageType(typeName, {
       runtime: 'wasm', manifest: packageManifest(pkg), source, scope: pkg.scope,
+      owner: packageOwner(pkg.name),
       package: { name: pkg.name, version: pkg.version },
       ...(pkg.profiles ? { profiles: pkg.profiles } : {}),
       ...(pkg.ask ? { ask: pkg.ask } : {}),
@@ -513,6 +553,11 @@ async function registerPackage(factory: Factory, pkg: ExtensionPackage): Promise
  * Ingest every enabled package and register its type with the Factory. Call
  * during bootstrap, after constructors are registered and before anything
  * spawns, so a package with `replaces` wins the first spawn of its name.
+ *
+ * Throws when a `required` package cannot be loaded and no other copy
+ * provides its type: one whose abject.json says `required: true` but that
+ * fails validation, or that fails to register, or whose newer copy failed.
+ * Any other package that cannot load is skipped with a warning.
  */
 export async function ingestAllExtensions(
   factory: Factory,
@@ -520,13 +565,29 @@ export async function ingestAllExtensions(
 ): Promise<IngestedExtension[]> {
   const resolved = resolvePackages(await discoverPackages(packageRoots(config)), config);
   const ingested: IngestedExtension[] = [];
+  // Types the instance cannot run without (the first required package
+  // claiming each), what stopped each copy of a type, and what loaded.
+  const requiredTypes = new Map<string, { name: string; dir: string }>();
+  const failures = new Map<string, string[]>();
+  const provided = new Set<string>();
+  const noteFailure = (typeName: string, why: string): void => {
+    failures.set(typeName, [...(failures.get(typeName) ?? []), why]);
+  };
+  const noteRequired = (typeName: string, name: string, dir: string): void => {
+    if (!requiredTypes.has(typeName)) requiredTypes.set(typeName, { name, dir });
+  };
 
   for (const r of resolved) {
     if (r.status === 'invalid') {
       log.warn(`skipping package in ${r.dir}: ${r.error}`);
+      if (r.declared) {
+        noteFailure(r.declared.typeName, `${r.dir} is invalid: ${r.error}`);
+        if (r.declared.required) noteRequired(r.declared.typeName, r.declared.name, r.dir);
+      }
       continue;
     }
     const pkg = r.pkg!;
+    if (pkg.required) noteRequired(r.typeName!, pkg.name, r.dir);
     if (r.status === 'disabled') {
       log.info(`package '${pkg.name}' v${pkg.version} is disabled (packages.json)`);
       continue;
@@ -536,10 +597,12 @@ export async function ingestAllExtensions(
         `skipping '${pkg.name}' v${pkg.version} in ${r.dir}: type '${r.typeName}' is provided by ` +
         `v${r.shadowedBy!.version} in ${r.shadowedBy!.dir}. Remove the stale package to silence this warning.`,
       );
+      noteFailure(r.typeName!, `v${pkg.version} in ${r.dir} gave way to v${r.shadowedBy!.version} in ${r.shadowedBy!.dir}`);
       continue;
     }
     try {
       await registerPackage(factory, pkg);
+      provided.add(r.typeName!);
       ingested.push({
         typeName: r.typeName!, packageName: pkg.name, runtime: pkg.runtime,
         scope: pkg.scope, replaces: pkg.replaces, version: pkg.version,
@@ -550,9 +613,20 @@ export async function ingestAllExtensions(
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      if (pkg.required) throw new Error(`required package '${pkg.name}' (${r.dir}) failed to load: ${reason}`);
+      noteFailure(r.typeName!, `v${pkg.version} in ${r.dir} failed to load: ${reason}`);
       log.warn(`failed to ingest package '${pkg.name}': ${reason}`);
     }
+  }
+
+  // A required type nothing provides stops boot. One whose broken copy is
+  // covered by another that loaded only costs the warning above.
+  const missing = [...requiredTypes].filter(([typeName]) => !provided.has(typeName));
+  if (missing.length > 0) {
+    throw new Error(missing.map(([typeName, p]) =>
+      `required package '${p.name}' (${p.dir}) did not load, and the instance cannot run without ` +
+      `its type '${typeName}': ${(failures.get(typeName) ?? ['no copy of it loaded']).join('; ')}. ` +
+      'Repair or reinstall the package.',
+    ).join('\n'));
   }
 
   return ingested;

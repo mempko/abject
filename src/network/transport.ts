@@ -3,8 +3,7 @@
  */
 
 import { AbjectMessage } from '../core/types.js';
-import { require } from '../core/contracts.js';
-import { serialize, deserialize } from '../core/message.js';
+import { deserialize } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Transport');
@@ -135,107 +134,5 @@ export abstract class Transport {
   protected handleError(error: Error): void {
     this.setState('error');
     this.events.onError?.(error);
-  }
-}
-
-/**
- * Transport registry for managing multiple connections.
- */
-export class TransportRegistry {
-  private transports: Map<string, Transport> = new Map();
-
-  /**
-   * Register a transport.
-   */
-  register(id: string, transport: Transport): void {
-    require(id !== '', 'id must not be empty');
-    this.transports.set(id, transport);
-  }
-
-  /**
-   * Unregister a transport.
-   */
-  unregister(id: string): void {
-    const transport = this.transports.get(id);
-    if (transport) {
-      transport.disconnect().catch(console.error);
-      this.transports.delete(id);
-    }
-  }
-
-  /**
-   * Get a transport by ID.
-   */
-  get(id: string): Transport | undefined {
-    return this.transports.get(id);
-  }
-
-  /**
-   * Get all transports.
-   */
-  getAll(): Transport[] {
-    return Array.from(this.transports.values());
-  }
-
-  /**
-   * Get all connected transports.
-   */
-  getConnected(): Transport[] {
-    return Array.from(this.transports.values()).filter((t) => t.isConnected);
-  }
-
-  /**
-   * Disconnect all transports.
-   */
-  async disconnectAll(): Promise<void> {
-    const promises = Array.from(this.transports.values()).map((t) =>
-      t.disconnect()
-    );
-    await Promise.all(promises);
-  }
-}
-
-/**
- * Mock transport for testing.
- */
-export class MockTransport extends Transport {
-  private peer?: MockTransport;
-  private connected = false;
-
-  async connect(_endpoint: string): Promise<void> {
-    this.setState('connecting');
-    // Simulate connection delay
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    this.connected = true;
-    this.handleConnect();
-  }
-
-  async disconnect(): Promise<void> {
-    this.connected = false;
-    this.handleDisconnect();
-  }
-
-  async send(message: AbjectMessage): Promise<void> {
-    require(this.connected, 'Not connected');
-
-    // Send to peer if connected
-    if (this.peer?.connected) {
-      const data = serialize(message);
-      // Simulate network delay
-      setTimeout(() => {
-        this.peer!.handleMessage(data);
-      }, 1);
-    }
-  }
-
-  /**
-   * Connect two mock transports together.
-   */
-  static pair(): [MockTransport, MockTransport] {
-    const a = new MockTransport();
-    const b = new MockTransport();
-    a.peer = b;
-    b.peer = a;
-    return [a, b];
   }
 }

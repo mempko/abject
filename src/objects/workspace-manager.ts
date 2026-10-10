@@ -3,7 +3,7 @@
  *
  * Each workspace is an isolated collection of abjects with its own registry,
  * storage, taskbar, chat, settings, theme, and user-created objects.
- * A workspace switcher in the taskbar lets users move between them.
+ * The Spaces section of the sidebar dock (WorkspaceSwitcher) moves between them.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -521,8 +521,6 @@ export class WorkspaceManager extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'core'],
       },
     });
@@ -1792,7 +1790,7 @@ export class WorkspaceManager extends Abject {
         result = await this.request<SpawnResult>(
           request(this.id, this.factoryId!, 'spawn', {
             manifest: { name: objName, description: '', version: '1.0.0',
-              requiredCapabilities: [], tags: ['system'] },
+              tags: ['system'] },
             registryHint: ws.registryId,
             typeId,
           })
@@ -1854,7 +1852,7 @@ export class WorkspaceManager extends Abject {
     const wsRegResult = await this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'WorkspaceRegistry', description: `Workspace registry for '${name}'`,
-          version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
+          version: '1.0.0', tags: ['system'] },
         skipGlobalRegistry: true,
         typeId: wsRegistryTypeId,
         constructorArgs: { workspaceId },
@@ -1882,7 +1880,7 @@ export class WorkspaceManager extends Abject {
         manifest: { name: 'Registry', description: `Workspace registry for '${name}'`,
           version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
           description: 'Object registration and discovery', methods: [] },
-          requiredCapabilities: [], tags: ['system', 'core'] },
+          tags: ['system', 'core'] },
       })
     );
 
@@ -1897,7 +1895,7 @@ export class WorkspaceManager extends Abject {
           version: '1.0.0',
           interface: { id: 'abjects:registry' as InterfaceId, name: 'Registry',
             description: 'Object registration and discovery', methods: [] },
-          requiredCapabilities: [], tags: ['system', 'core'],
+          tags: ['system', 'core'],
         },
       })
     );
@@ -1910,7 +1908,7 @@ export class WorkspaceManager extends Abject {
         manifest: { name: `WorkspaceRegistry:${name}`, description: `Workspace registry for '${name}'`,
           version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
           description: 'Object registration and discovery', methods: [] },
-          requiredCapabilities: [], tags: ['system', 'workspace'] },
+          tags: ['system', 'workspace'] },
       })
     );
 
@@ -1919,7 +1917,7 @@ export class WorkspaceManager extends Abject {
     const wsStorageResult = await this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'Storage', description: `Workspace storage for '${name}'`,
-          version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
+          version: '1.0.0', tags: ['system'] },
         registryHint: wsRegistryId,
         constructorArgs: { dbName: `abjects-storage-${workspaceId}` },
         typeId: wsStorageTypeId,
@@ -1928,14 +1926,14 @@ export class WorkspaceManager extends Abject {
     const wsStorageId = wsStorageResult.objectId;
     log.timed('registry + storage ready');
 
-    // 2b. Spawn workspace-scoped FileSystem (on-disk, rooted at ~/.abject/ws-<id>/files).
+    // 2b. Spawn workspace-scoped FileSystem (on-disk, under the instance's data directory).
     // workspaceId is carried in constructorArgs so the instance roots itself even
     // when placed in a worker thread. Not in INFRA_OBJECTS — spawned explicitly here.
     const wsFileSystemTypeId = this.computeTypeId(workspaceId, 'FileSystem');
     const wsFileSystemResult = await this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'FileSystem', description: `Workspace filesystem for '${name}'`,
-          version: '2.0.0', requiredCapabilities: [], tags: ['system'] },
+          version: '2.0.0', tags: ['system'] },
         registryHint: wsRegistryId,
         constructorArgs: { workspaceId },
         typeId: wsFileSystemTypeId,
@@ -1972,10 +1970,12 @@ export class WorkspaceManager extends Abject {
     // objectsToSpawn under the built-in's name (the Factory resolves the
     // override), so only genuinely new type names are appended here.
     let extensionNames: string[] = [];
-    // Script package types: their saved data comes back from this
-    // workspace's AbjectStore (which never restores them itself), and the
-    // ones tagged 'autostart' get a `startup` call once spawned.
-    const scriptPackages = new Map<string, { autostart: boolean }>();
+    // Package types, either runtime: their saved data (a script abject's
+    // saveData, a WASM abject's persist) comes back from this workspace's
+    // AbjectStore, which never restores them itself, and the ones tagged
+    // 'autostart' get a `startup` call once spawned, as system-scope
+    // packages do at boot.
+    const packageTypeInfo = new Map<string, { autostart: boolean }>();
     try {
       const packageTypes = await this.request<Array<{ name: string; scope: string; runtime: string; tags?: string[]; profiles?: string[] }>>(
         request(this.id, this.factoryId!, 'listPackageTypes', {})
@@ -1985,15 +1985,15 @@ export class WorkspaceManager extends Abject {
         .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name) && packageInProfile(profile.name, t.profiles))
         .map((t) => t.name);
       for (const t of packageTypes) {
-        if (t.runtime === 'script') scriptPackages.set(t.name, { autostart: !!t.tags?.includes('autostart') });
+        packageTypeInfo.set(t.name, { autostart: !!t.tags?.includes('autostart') });
       }
     } catch { /* Factory without package support */ }
 
     for (const objName of [...objectsToSpawn, ...extensionNames]) {
       const typeId = this.computeTypeId(workspaceId, objName);
-      const scriptPackage = scriptPackages.get(objName);
+      const packageType = packageTypeInfo.get(objName);
       let data: Record<string, unknown> | undefined;
-      if (scriptPackage && abjectStoreId) {
+      if (packageType && abjectStoreId) {
         try {
           data = await this.request<Record<string, unknown> | null>(
             request(this.id, abjectStoreId, 'getPackageData', { name: objName })
@@ -2005,7 +2005,7 @@ export class WorkspaceManager extends Abject {
         result = await this.request<SpawnResult>(
           request(this.id, this.factoryId!, 'spawn', {
             manifest: { name: objName, description: '', version: '1.0.0',
-              requiredCapabilities: [], tags: ['system'] },
+              tags: ['system'] },
             registryHint: wsRegistryId,
             typeId,
             ...(data ? { data } : {}),
@@ -2060,10 +2060,10 @@ export class WorkspaceManager extends Abject {
         } catch { /* WidgetManager may not be ready */ }
       }
 
-      // A script package tagged 'autostart' is started the way AbjectStore
-      // starts restored user objects with that tag. Fire and forget: a slow
-      // or failing startup must not hold up the rest of the workspace.
-      if (scriptPackage?.autostart) {
+      // A package tagged 'autostart' is started the way AbjectStore starts
+      // restored user objects with that tag. Fire and forget: a slow or
+      // failing startup must not hold up the rest of the workspace.
+      if (packageType?.autostart) {
         this.request(request(this.id, objId, 'startup', {}), 10000)
           .catch((err) => wsLog.warn(`startup of package '${objName}' failed: ${err instanceof Error ? err.message : String(err)}`));
       }

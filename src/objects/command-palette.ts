@@ -99,8 +99,6 @@ export class CommandPaletteAbject extends Abject {
             { name: 'toggle', description: 'Toggle the palette open/closed.',               parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'palette'],
       },
     });

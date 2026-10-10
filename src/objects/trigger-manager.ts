@@ -161,8 +161,6 @@ export class TriggerManager extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'watcher', 'triggers'],
       },
     });

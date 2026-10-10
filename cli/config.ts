@@ -1,6 +1,6 @@
 /**
  * The `abject` command's own settings: login tokens it cached per backend
- * URL, the data directory it was pointed at, and whether guided setup ran.
+ * URL, and the data directory setup pointed it at.
  *
  * Kept apart from the instance's data directory (the backend owns that), in
  * the OS's per-user config location. Tokens from the old `commune` client are

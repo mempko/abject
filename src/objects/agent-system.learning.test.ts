@@ -13,7 +13,7 @@ function pattern(name = 'VERIFY RESTORATION'): string {
   assert(result.ok); return serializePattern(result.pattern);
 }
 class Caller extends Abject {
-  constructor() { super({ manifest: { name: 'Caller', version: '1', description: 'Learning fixture', interface: { id: 'test:caller', name: 'Caller', description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
+  constructor() { super({ manifest: { name: 'Caller', version: '1', description: 'Learning fixture', interface: { id: 'test:caller', name: 'Caller', description: 'fixture', methods: [] } } }); }
   call(to: string, method: string, payload: unknown): Promise<any> { return this.request(request(this.id, to, method, payload), 10000); }
 }
 /** The shipped KnowledgeBase on its own bus, called the way any abject calls it. */

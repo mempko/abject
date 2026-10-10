@@ -1,19 +1,21 @@
 /**
  * hack-victim.ts — Victim server for P2P security audit.
  *
- * Boots a full Abjects instance, creates 3 workspaces with different access modes,
- * stores a secret flag in the local workspace, connects to signaling, and waits.
+ * Boots a full Abjects instance, creates 3 workspaces with different access modes
+ * (public, shared with an empty whitelist, local), stores a secret flag in the
+ * global Storage, connects to signaling, and waits.
  */
 
 import { bootAbjectsCore } from './hack-bootstrap.js';
 import type { AbjectId } from '../src/core/types.js';
 
-const SIGNALING_URL = 'ws://localhost:7730';
+// Set by security-audit.ts, which pins this instance to its signaling server.
+const SIGNALING_URL = process.env.ABJECTS_SIGNALING_URLS!;
 const SECRET_FLAG = 'SECRET_FLAG{p2p_audit_2026}';
 
 async function main(): Promise<void> {
   console.log('[VICTIM] Booting...');
-  const boot = await bootAbjectsCore({ dataDir: '.abjects-hack-victim', signalingUrl: SIGNALING_URL });
+  const boot = await bootAbjectsCore();
   const { bootstrapRequest, workspaceManagerId, peerRegistryId, storageId, peerId } = boot;
 
   console.log(`[VICTIM] PeerId: ${peerId.slice(0, 16)}...`);
@@ -33,12 +35,12 @@ async function main(): Promise<void> {
     workspaceId: publicWsId, accessMode: 'public',
   });
 
-  // Create Private Zone workspace (whitelist = [] → nobody allowed)
+  // Create Private Zone workspace: shared, with an empty whitelist, so nobody is allowed
   const { workspaceId: privateWsId } = await bootstrapRequest<{ workspaceId: string }>(
     workspaceManagerId, 'createWorkspace', { name: 'Private Zone' },
   );
   await bootstrapRequest(workspaceManagerId, 'setAccessMode', {
-    workspaceId: privateWsId, accessMode: 'private',
+    workspaceId: privateWsId, accessMode: 'shared',
   });
   // Whitelist is empty by default — nobody can access
 
@@ -91,7 +93,7 @@ async function main(): Promise<void> {
   process.on('message', (msg: { type: string }) => {
     if (msg.type === 'shutdown') {
       console.log('[VICTIM] Shutting down...');
-      boot.runtime.stop().then(() => process.exit(0));
+      void boot.shutdown();
     }
   });
 }

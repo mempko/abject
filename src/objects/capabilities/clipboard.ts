@@ -4,7 +4,6 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { request } from '../../core/message.js';
 
 const CLIPBOARD_INTERFACE = 'abjects:clipboard';
@@ -91,11 +90,6 @@ export class Clipboard extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.CLIPBOARD_READ,
-          Capabilities.CLIPBOARD_WRITE,
-        ],
         tags: ['system', 'capability', 'clipboard'],
       },
     });

@@ -431,8 +431,6 @@ export class GraphWidget extends WidgetAbject {
           },
         ],
       },
-      requiredCapabilities: [],
-      providedCapabilities: [],
       tags: ['widget', 'nodeGraph', 'graph', '3d'],
     };
 

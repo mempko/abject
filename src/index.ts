@@ -6,7 +6,9 @@
 
 // Export public API
 export { Runtime, getRuntime } from './runtime/runtime.js';
-export { MessageBus, HealthInterceptor } from './runtime/message-bus.js';
+export { MessageBus } from './runtime/message-bus.js';
+export { ProxyRouteTable } from './runtime/proxy-routes.js';
+export type { ProxyRoute } from './runtime/proxy-routes.js';
 export type { MessageBusLike } from './runtime/message-bus.js';
 export { Mailbox } from './runtime/mailbox.js';
 export { WorkerBus } from './runtime/worker-bus.js';
@@ -101,6 +103,13 @@ export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
 export { ProcessExplorer, PROCESS_EXPLORER_ID } from './objects/process-explorer.js';
 export { HeapMonitor, HEAP_MONITOR_ID } from './objects/heap-monitor.js';
+export { InstanceInfo, INSTANCE_INFO_ID, instanceReport } from './objects/instance-info.js';
+export type { InstanceInfoSource, InstanceInfoReport } from './objects/instance-info.js';
+// Safe to re-export: this barrel is in no bundle (client, server, headless or
+// Electron), and AppUpdater loads electron and electron-updater only by
+// dynamic import inside the packaged app.
+export { AppUpdater, APP_UPDATER_ID, CHECK_FOR_UPDATES_EVENT } from './objects/app-updater.js';
+export type { UpdateState, InstallKind, UpdateStatus } from './objects/app-updater.js';
 export { LLMMonitor, LLM_MONITOR_ID } from './objects/llm-monitor.js';
 export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
 export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';
@@ -263,7 +272,6 @@ export type {
 // Export core types
 export * from './core/types.js';
 export * from './core/message.js';
-export * from './core/capability.js';
 export * from './core/contracts.js';
 export * from './core/pattern.js';
 export { validateCode, runSandboxed, compileSandboxed, SANDBOX_BUILTINS, SANDBOX_BUILTIN_NAMES, BLOCKED_CODE_PATTERNS } from './core/sandbox.js';
@@ -310,7 +318,6 @@ export { lookupPricing, estimateCostUsd } from './llm/pricing.js';
 // Export network
 export { Transport } from './network/transport.js';
 export type { TransportConfig } from './network/transport.js';
-export { WebSocketTransport } from './network/websocket.js';
 export { SignalingClient } from './network/signaling.js';
 export type { SignalingRelay } from './network/signaling.js';
 export { PeerTransport } from './network/peer-transport.js';

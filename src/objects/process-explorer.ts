@@ -16,7 +16,6 @@ import { Abject } from '../core/abject.js';
 import { chromeCase, type ThemeData } from '../core/theme-data.js';
 import { emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { ensure, invariant } from '../core/contracts.js';
 
@@ -174,10 +173,6 @@ export class ProcessExplorer extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display process explorer window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

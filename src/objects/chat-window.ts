@@ -16,7 +16,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { Capabilities } from '../core/capability.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { buildGoalRows, type GoalNode } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
@@ -193,10 +192,6 @@ export class ChatWindow extends Abject {
             { name: 'close', description: 'Close the window.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display the chat window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

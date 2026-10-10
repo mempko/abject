@@ -136,8 +136,6 @@ export class BrowserWindowHost extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'browser'],
       },
     });

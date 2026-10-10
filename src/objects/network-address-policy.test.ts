@@ -264,8 +264,6 @@ function manifestFor(name: string): AbjectManifest {
     description: `${name} test object`,
     version: '1.0.0',
     interface: { id: `abjects:test:${name.toLowerCase()}` as InterfaceId, name, description: name, methods: [] },
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
   } as unknown as AbjectManifest;
 }

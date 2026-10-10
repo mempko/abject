@@ -13,6 +13,7 @@ import { Mailbox } from './mailbox.js';
 import type { WorkerPool } from './worker-pool.js';
 import type { WorkerBridge } from './worker-bridge.js';
 import { Log } from '../core/timed-log.js';
+import { ProxyRouteTable, type ProxyRoute } from './proxy-routes.js';
 
 const log = new Log('MessageBus');
 
@@ -45,6 +46,8 @@ export class MessageBus implements MessageBusLike {
   private mailboxes: Map<AbjectId, Mailbox> = new Map();
   private subscriptions: Subscription[] = [];
   private interceptors: MessageInterceptor[] = [];
+  /** Negotiated proxy routes; this bus owns them and copies them to every pool worker. */
+  private proxyRoutes = new ProxyRouteTable();
   private messageCount = 0;
   private _running = false;
 
@@ -158,6 +161,19 @@ export class MessageBus implements MessageBusLike {
    * All messages (including replies) are delivered via the recipient's mailbox.
    */
   send(message: AbjectMessage): void {
+    this.dispatch(message, true);
+  }
+
+  /**
+   * A message a pool worker sent on: its own bus already applied the proxy
+   * routes (and counted the proxy's answer), so only the interceptors and
+   * delivery remain.
+   */
+  relayFromPoolWorker(message: AbjectMessage): void {
+    this.dispatch(message, false);
+  }
+
+  private dispatch(message: AbjectMessage, applyProxyRoutes: boolean): void {
     // Run interceptors synchronously
     for (const interceptor of this.interceptors) {
       const result = interceptor.intercept(message);
@@ -167,6 +183,12 @@ export class MessageBus implements MessageBusLike {
       if (result !== 'pass') {
         message = result;
       }
+    }
+
+    if (applyProxyRoutes && this.proxyRoutes.size > 0) {
+      const routed = this.proxyRoutes.apply(message);
+      message = routed.message;
+      if (routed.report) this.dispatch(routed.report, false);
     }
 
     const recipient = message.routing.to;
@@ -286,7 +308,8 @@ export class MessageBus implements MessageBusLike {
   }
 
   /**
-   * Subscribe to all messages (for monitoring, debugging).
+   * Subscribe to undeliverable messages: a subscriber registered as `'*'` or
+   * `'undeliverable'` is told about each message no recipient took.
    */
   subscribe(objectId: AbjectId, handler: MessageHandler): string {
     requireNonEmpty(objectId, 'objectId');
@@ -334,6 +357,7 @@ export class MessageBus implements MessageBusLike {
     this.mailboxes.clear();
     this.subscriptions = [];
     this.interceptors = [];
+    this.proxyRoutes = new ProxyRouteTable();
     this.workerObjects.clear();
     this.dedicatedBridges.clear();
     this._undeliverableHandler = undefined;
@@ -372,12 +396,31 @@ export class MessageBus implements MessageBusLike {
     // isRegistered checks immediately.
     for (const id of this.mailboxes.keys()) pool.broadcastLiveness(id, true);
     for (const id of this.workerObjects) pool.broadcastLiveness(id, true);
+    for (const route of this.proxyRoutes.all()) pool.broadcastProxyRoute(route);
   }
 
   /** Replay the whole liveness picture into one bridge (a replacement worker starts blank). */
   announceLivenessTo(bridge: { sendLiveness(objectId: AbjectId, alive: boolean): void }): void {
     for (const id of this.mailboxes.keys()) bridge.sendLiveness(id, true);
     for (const id of this.workerObjects) bridge.sendLiveness(id, true);
+  }
+
+  // ── Proxy routes (see proxy-routes.ts) ─────────────────────────────────
+
+  /** Route a negotiated connection through its proxy, here and in every pool worker. */
+  setProxyRoute(route: ProxyRoute): void {
+    this.proxyRoutes.set(route);
+    this._workerPool?.broadcastProxyRoute(route);
+  }
+
+  removeProxyRoute(agreementId: string): void {
+    this.proxyRoutes.remove(agreementId);
+    this._workerPool?.broadcastProxyUnroute(agreementId);
+  }
+
+  /** Replay every route into one bridge (a replacement worker starts blank). */
+  announceProxyRoutesTo(bridge: { sendProxyRoute(route: ProxyRoute): void }): void {
+    for (const route of this.proxyRoutes.all()) bridge.sendProxyRoute(route);
   }
 
   /**
@@ -513,104 +556,3 @@ export class LoggingInterceptor implements MessageInterceptor {
   }
 }
 
-/**
- * Proxy interceptor that routes messages through a proxy.
- */
-export class ProxyInterceptor implements MessageInterceptor {
-  constructor(
-    private readonly sourceId: AbjectId,
-    private readonly targetId: AbjectId,
-    private readonly proxyId: AbjectId
-  ) {}
-
-  intercept(message: AbjectMessage): 'pass' | AbjectMessage {
-    // Route messages between source and target through proxy
-    if (
-      message.routing.from === this.sourceId &&
-      message.routing.to === this.targetId
-    ) {
-      return {
-        ...message,
-        routing: {
-          ...message.routing,
-          to: this.proxyId,
-        },
-      };
-    }
-    if (
-      message.routing.from === this.targetId &&
-      message.routing.to === this.sourceId
-    ) {
-      return {
-        ...message,
-        routing: {
-          ...message.routing,
-          to: this.proxyId,
-        },
-      };
-    }
-    return 'pass';
-  }
-}
-
-/**
- * Health interceptor that passively watches for error messages on tracked connections
- * and reports them to the HealthMonitor via message passing.
- */
-export class HealthInterceptor implements MessageInterceptor {
-  private trackedPairs: Map<string, string> = new Map(); // "from-to" → agreementId
-
-  constructor(
-    private readonly healthMonitorId: AbjectId,
-    private readonly bus: MessageBus
-  ) {}
-
-  /**
-   * Track a connection pair for health monitoring.
-   */
-  track(sourceId: AbjectId, targetId: AbjectId, agreementId: string): void {
-    this.trackedPairs.set(`${sourceId}-${targetId}`, agreementId);
-    this.trackedPairs.set(`${targetId}-${sourceId}`, agreementId);
-  }
-
-  /**
-   * Stop tracking a connection pair.
-   */
-  untrack(sourceId: AbjectId, targetId: AbjectId): void {
-    this.trackedPairs.delete(`${sourceId}-${targetId}`);
-    this.trackedPairs.delete(`${targetId}-${sourceId}`);
-  }
-
-  intercept(message: AbjectMessage): 'pass' {
-    const pairKey = `${message.routing.from}-${message.routing.to}`;
-    const agreementId = this.trackedPairs.get(pairKey);
-
-    if (agreementId) {
-      // Self-report: sender is the HealthMonitor itself, since this is its
-      // own observation of the bus. Avoids a forged 'health-interceptor' id
-      // that isn't registered anywhere.
-      if (message.header.type === 'error') {
-        const errorPayload = message.payload as AbjectError;
-        this.bus.send(
-          createRequest(
-            this.healthMonitorId,
-            this.healthMonitorId,
-            'recordError',
-            { agreementId, error: errorPayload }
-          )
-        );
-      } else if (message.header.type === 'reply') {
-        this.bus.send(
-          createRequest(
-            this.healthMonitorId,
-            this.healthMonitorId,
-            'recordSuccess',
-            { agreementId }
-          )
-        );
-      }
-    }
-
-    return 'pass';
-  }
-}

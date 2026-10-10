@@ -119,8 +119,6 @@ export class OAuthHelper extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'auth', 'oauth'],
       },
     });

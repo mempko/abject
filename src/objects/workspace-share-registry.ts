@@ -296,8 +296,6 @@ export class WorkspaceShareRegistry extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'peer'],
       },
     });

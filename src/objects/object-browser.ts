@@ -26,7 +26,6 @@ import {
   sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle,
 } from './ui-kit.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { invariant } from '../core/contracts.js';
 
@@ -194,10 +193,6 @@ export class ObjectBrowser extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display browser window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

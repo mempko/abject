@@ -651,8 +651,6 @@ export class TaskReviewer extends Abject {
             { name: 'reviewCompleted', description: 'A post-task review finished', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'knowledge', 'agent'],
       },
     });

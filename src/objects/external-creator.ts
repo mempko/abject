@@ -35,7 +35,6 @@ import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, type MessageHandlerFn } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import type { AgentAction, AgentActionResult } from './agent-abject.js';
 import { bulkAwareResult, resultEcho } from './agent-abject.js';
@@ -324,10 +323,6 @@ export class ExternalCreator extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'Drives the authoring loop', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'agent', 'external', 'files'],
       },
     });

@@ -1,7 +1,10 @@
 import { describeMessages, protocolText } from '../core/protocol-description.js';
 /**
- * AbjectStore - persists user-created scriptable abject snapshots to Storage
- * and restores them on startup.
+ * AbjectStore - persists user-created abject snapshots (script and WASM:
+ * the `source` is handler-map JavaScript or a `wasm:sha256:` module ref) to
+ * Storage and restores them on startup. Also keeps installed packages' data
+ * in this workspace under `package/<TypeName>`, which WorkspaceManager hands
+ * back when it spawns the package; those are never restored as user objects.
  */
 
 import {
@@ -79,7 +82,8 @@ function isRestorableSnapshot(snap: AbjectSnapshot): boolean {
 }
 
 /**
- * Persists and restores user-created scriptable abjects.
+ * Persists and restores user-created source-backed abjects (script or WASM),
+ * and keeps installed packages' data for this workspace.
  */
 export class AbjectStore extends Abject {
   private storageId?: AbjectId;
@@ -223,8 +227,6 @@ export class AbjectStore extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'persistence'],
       },
     });

@@ -22,8 +22,7 @@ class HeadlessProjects extends ExternalProjectRegistry { protected override asyn
 class Client extends Abject {
   constructor() {
     super({ manifest: { name: 'Client', version: '1', description: 'Snapshot test',
-      interface: { id: 'snapshot-client', name: 'Client', description: 'fixture', methods: [] },
-      requiredCapabilities: [], providedCapabilities: [] } });
+      interface: { id: 'snapshot-client', name: 'Client', description: 'fixture', methods: [] } } });
   }
   call(to: AbjectId, method: string, payload: unknown): Promise<any> {
     return this.request(request(this.id, to, method, payload), 5000);

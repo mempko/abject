@@ -2,8 +2,9 @@
  * HostFileSystem capability object -- provides real filesystem access.
  *
  * This is the Abjects equivalent of Claude Code's Read, Write, Edit, Glob,
- * and Grep tools. Unlike the virtual in-memory FileSystem, this operates on
- * the actual host filesystem.
+ * and Grep tools. FileSystem is a per-workspace virtual tree persisted under
+ * the data directory, whose paths never reach the host's; this operates on
+ * the host's real files.
  */
 
 import { describeMessages, protocolText, protocolNumber, protocolObject } from '../../core/protocol-description.js';
@@ -18,7 +19,6 @@ import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY, type MessageHandlerFn } from '../../core/abject.js';
 import { error as errorMsg, request } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import {
   truncateHead, continuationNotice, formatSize,
@@ -255,8 +255,6 @@ export class HostFileSystem extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.HOSTFS_READ, Capabilities.HOSTFS_WRITE],
         tags: ['system', 'capability', 'filesystem'],
       },
     });

@@ -13,9 +13,8 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { event, request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
-import { require as contractRequire } from '../core/contracts.js';
+import { require as contractRequire, ensure } from '../core/contracts.js';
 import { chromeCase, shapeOf } from '../core/theme-data.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import { LLMProviderDescription, servesChat } from '../llm/provider.js';
@@ -243,6 +242,8 @@ export class GlobalSettings extends Abject {
    */
   private lastOwnSave?: { section: string; at: number };
   private windowId?: AbjectId;
+  /** The window being built, which a second show joins (see show). */
+  private showInFlight?: Promise<boolean>;
   private rootLayoutId?: AbjectId;
 
   // Provider dropdown + single credential panel
@@ -441,9 +442,6 @@ export class GlobalSettings extends Abject {
   /** Private and internal hosts HttpClient and StreamClient may reach
    *  (address-policy.ts). Empty: every private address is refused. */
   private webPrivateHosts: string[] = [];
-  /** Bus-level capability enforcement for scriptable objects. */
-  private capabilityEnforcement: 'off' | 'warn' | 'enforce' = 'warn';
-  private capEnforceSelectId?: AbjectId;
   /** What a request no rule decides gets: ask, allow once, or deny (PermissionBroker's prompt mode). */
   private promptMode: 'ask' | 'allow' | 'deny' = 'ask';
   private promptModeSelectId?: AbjectId;
@@ -491,12 +489,6 @@ export class GlobalSettings extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display settings window', required: true },
-          { capability: Capabilities.STORAGE_READ, reason: 'Load saved settings', required: false },
-          { capability: Capabilities.STORAGE_WRITE, reason: 'Save settings', required: false },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'settings'],
       },
     });
@@ -510,7 +502,7 @@ export class GlobalSettings extends Abject {
 Interface: abjects:global-settings
 
 GlobalSettings is the Settings window: tabs for AI (model keys, tier routing, presets), Auth (a login for the UI and CLI),
-Permissions (filesystem, shell, web, capability enforcement), Skills & MCP, Packages, and Updates in the packaged app.
+Permissions (filesystem, shell, web, and what happens to a request no rule decides), Skills & MCP, Packages, and Updates in the packaged app.
 The settings themselves live in SettingsManager, which this window loads from and saves through; ask SettingsManager to read them.
 
 ### Show or hide the window
@@ -590,7 +582,6 @@ The settings themselves live in SettingsManager, which this window loads from an
     this.webAllowedDomains = [...m.web.allowedDomains];
     this.webDeniedDomains = [...m.web.deniedDomains];
     this.webPrivateHosts = [...m.web.privateHosts];
-    this.capabilityEnforcement = m.objects.capabilityEnforcement;
     this.promptMode = m.permissions.mode;
     await this.loadPresetList();
   }
@@ -981,16 +972,6 @@ The settings themselves live in SettingsManager, which this window loads from an
         }
         return;
       }
-      // Capability enforcement mode select: takes effect at once.
-      if (fromId === this.capEnforceSelectId && aspect === 'change') {
-        const mode = value as string;
-        if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
-          this.capabilityEnforcement = mode;
-          const error = await this.saveSection('objects', { capabilityEnforcement: mode });
-          if (error) await this.rejectWith(error);
-        }
-        return;
-      }
       // Web: add allowed domain
       if (fromId === this.webAddBtnId && aspect === 'click') {
         const val = await this.request<string>(request(this.id, this.webDomainInputId!, 'getValue', {}));
@@ -1076,9 +1057,23 @@ The settings themselves live in SettingsManager, which this window loads from an
 
   /**
    * Show the global settings window.
+   *
+   * One window at a time. Building it waits on the provider and model lists,
+   * which take seconds while the LLM is still fetching catalogs at startup,
+   * so a second click (or a second sender) arrives mid-build. It joins the
+   * build in progress: two builds made two windows, and the one this object
+   * stopped tracking stayed on screen with every tab and button dead.
    */
   async show(): Promise<boolean> {
-    if (this.windowId) return true;
+    if (this.windowId && !this.showInFlight) return true;
+    this.showInFlight ??= this.openWindow().finally(() => { this.showInFlight = undefined; });
+    const shown = await this.showInFlight;
+    ensure(!shown || this.windowId !== undefined, 'GlobalSettings: a shown window has an id');
+    return shown;
+  }
+
+  private async openWindow(): Promise<boolean> {
+    contractRequire(this.windowId === undefined, 'GlobalSettings: one settings window at a time');
 
     // Providers other abjects register (LLM registerProvider) arrive after
     // boot, so re-read the list each time the window opens.
@@ -1271,7 +1266,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     const cId = this.skillsContainerId!;
 
     const card = await this.sectionCard(cId, 'Skills & MCP',
-      'Skills teach agents new abilities (SKILL.md files in ~/.abject/skills/); MCP servers connect external tools and services. Manage what is installed, or browse the catalog to add more.', 34);
+      'Skills teach agents new abilities (SKILL.md files in the skills folder of the data directory); MCP servers connect external tools and services. Manage what is installed, or browse the catalog to add more.', 34);
 
     const skillRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -2661,6 +2656,9 @@ The settings themselves live in SettingsManager, which this window loads from an
    * Hide the global settings window.
    */
   async hide(): Promise<boolean> {
+    // A close that lands while the window is still being built closes the
+    // finished window rather than racing the build.
+    if (this.showInFlight) await this.showInFlight.catch(() => false);
     if (!this.windowId) return true;
 
     await this.request(
@@ -2746,7 +2744,6 @@ The settings themselves live in SettingsManager, which this window loads from an
     this.webPrivateAddBtnId = undefined;
     this.webPrivateListId = undefined;
     this.webPrivateRemoveBtnId = undefined;
-    this.capEnforceSelectId = undefined;
     this.promptModeSelectId = undefined;
     this.permsSaveBtnId = undefined;
     this.packagesContainerId = undefined;
@@ -2925,8 +2922,13 @@ The settings themselves live in SettingsManager, which this window loads from an
     const own = this.lastOwnSave;
     if (own && (own.section === section || section === 'presets') && Date.now() - own.at < 5000) return;
     if (section === 'presets') {
+      // Presets follow the provider list (SettingsManager announces a
+      // provider registering or leaving this way), so the AI tab's provider
+      // dropdowns are refreshed with them.
+      await this.loadProviderDescriptions();
       await this.loadPresetList();
       await this.refreshPresetOptions();
+      await this.showAiSettings();
       return;
     }
     await this.loadFromManager();
@@ -2970,7 +2972,6 @@ The settings themselves live in SettingsManager, which this window loads from an
     await set(this.fsReadOnlyCheckboxId, { checked: this.fsReadOnly });
     await set(this.shellEnabledCheckboxId, { checked: this.shellEnabled });
     await set(this.webEnabledCheckboxId, { checked: this.webEnabled });
-    await set(this.capEnforceSelectId, { selectedIndex: Math.max(0, ['off', 'warn', 'enforce'].indexOf(this.capabilityEnforcement)) });
     await set(this.promptModeSelectId, { selectedIndex: Math.max(0, PROMPT_MODE_OPTIONS.indexOf(this.promptMode)) });
   }
 
@@ -4016,7 +4017,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     const { widgetIds: [permTabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'tabBar', windowId: this.windowId,
-          tabs: ['Filesystem', 'Shell', 'Web', 'Objects'],
+          tabs: ['Filesystem', 'Shell', 'Web'],
           closable: false,
           selectedIndex: 0 },
       ]})
@@ -4034,7 +4035,7 @@ The settings themselves live in SettingsManager, which this window loads from an
     // without you, and gives you the way back.
     const autoCard = await this.sectionCard(cId, 'Autonomy',
       'External projects can be set to run some commands without prompting you, capped by each '
-      + 'workspace\'s access mode (private allows at most edit; public always asks). '
+      + 'workspace\'s access mode (shared allows at most edit; public always asks). '
       + 'Levels are set per project in the Projects window.', 48, true);
 
     const { widgetIds: [autoStatusId, wheelBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -4264,46 +4265,8 @@ The settings themselves live in SettingsManager, which this window loads from an
       this.webPrivateRemoveBtnId = ed.removeBtnId;
     }
 
-    // ── Objects card (capability enforcement) ──
-    const objectsCard = await this.sectionCard(cId, 'Objects',
-      'Created objects declare the capabilities they need. Choose how strictly those declarations are enforced: off runs no checks, warn logs undeclared use, enforce blocks it.', 34, true);
-
-    const capRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: objectsCard,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, objectsCard, 'addLayoutChild', {
-      widgetId: capRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-    const capModes = ['off', 'warn', 'enforce'];
-    const { widgetIds: [capLabelId, capEnfSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Enforcement',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'select', windowId: this.windowId, options: capModes,
-          selectedIndex: Math.max(0, capModes.indexOf(this.capabilityEnforcement)) },
-      ]})
-    );
-    this.capEnforceSelectId = capEnfSelectId;
-    await this.request(request(this.id, this.capEnforceSelectId, 'addDependent', {}));
-    await this.request(request(this.id, capRowId, 'addLayoutChild', {
-      widgetId: capLabelId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 100, height: 30 },
-    }));
-    await this.request(request(this.id, capRowId, 'addLayoutChild', {
-      widgetId: this.capEnforceSelectId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 160, height: 30 },
-    }));
-
     // Only the selected category's card is visible.
-    this.permCategoryCardIds = [fsCard, shellCard, webCard, objectsCard];
+    this.permCategoryCardIds = [fsCard, shellCard, webCard];
     await this.switchPermCategory(0);
 
     // ── Save button (always visible, below the active card) ──
@@ -4464,7 +4427,6 @@ The settings themselves live in SettingsManager, which this window loads from an
         objectRules: Object.fromEntries(this.objectPermissions),
       }],
       ['web', { enabled: this.webEnabled, allowedDomains: this.webAllowedDomains, deniedDomains: this.webDeniedDomains, privateHosts: this.webPrivateHosts }],
-      ['objects', { capabilityEnforcement: this.capabilityEnforcement }],
     ];
     for (const [section, values] of sections) {
       const error = await this.saveSection(section, values);

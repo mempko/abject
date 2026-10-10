@@ -1,7 +1,9 @@
 # Workspace profiles
 
 A workspace profile decides which built-in objects, and which packages, a
-workspace gets. A workspace keeps the profile it was created with.
+workspace gets. A workspace keeps the profile it was created with. The lists
+and rules live in `src/objects/workspace-profiles.ts`; WorkspaceManager
+applies them.
 
 Without profiles every workspace got the same set: the agents, object
 creation, the desktop UI, and every workspace-scope package. That is right for
@@ -20,9 +22,26 @@ exposure and should not carry agents that write and run code.
 Every workspace also gets its registry, Storage and FileSystem, whatever the
 profile.
 
+The built-in per-workspace objects come in two lists. Infrastructure objects
+(`INFRA_OBJECTS`: storage, sharing, notifications, the agents, object
+creation, the knowledge base, web exposure and so on) are spawned when a
+workspace comes up, whether or not it is the active one. UI objects
+(`UI_OBJECTS`: the workspace's windows and taskbar) are spawned the first time
+the workspace is shown.
+
+## Desktop and headless
+
+On the headless edition (`server/headless.ts`) there is no display, so a
+workspace brings up its infrastructure objects and none of its UI objects,
+whatever its profile lists. Profiles keep their UI lists, so the same data
+directory opens with its windows again under the desktop edition.
+NotificationCenter is infrastructure: it keeps a workspace's notification
+history and announces each one (a terminal shows them) with or without a
+display, and draws a toast only where there is a desktop.
+
 ## Defining a profile
 
-`$ABJECTS_DATA_DIR/profiles.json`:
+`$ABJECTS_DATA_DIR/profiles.json`, beside `packages.json`:
 
 ```json
 {
@@ -35,6 +54,8 @@ profile.
 }
 ```
 
+- A profile name is lowercase letters, digits, `-` and `_`, starting with a
+  letter or digit, up to 64 characters.
 - `objects` lists built-in per-workspace objects by name (the full list is
   the `default` profile's, from `listProfiles`). `AbjectStore` is always
   added: it is how a workspace persists its objects and package data.
@@ -60,8 +81,9 @@ A workspace-scope package names the profiles it joins in its `abject.json`:
 ```
 
 A package that names none joins `default` only, as before. To join `default`
-as well, list it. System-scope packages run once per instance and take no
-profiles.
+as well, list it. `profiles`, when present, must be a non-empty list of
+profile names. System-scope packages run once per instance and take no
+profiles: a system-scope package that lists some is refused.
 
 ## Creating a workspace with a profile
 
@@ -72,12 +94,15 @@ await this.call(this.dep('WorkspaceManager'), 'createWorkspace', { name: 'Acme',
 await this.call(this.dep('WorkspaceManager'), 'listProfiles', {});
 ```
 
-Or through the CLI gateway (`ws://127.0.0.1:<WS_PORT+4>`):
+Or through the terminal gateway that the `abject` command talks to
+(`ws://127.0.0.1:<CLI_PORT>`, default `WS_PORT+4`, so 7723):
 
 ```json
 { "id": 1, "op": "createWorkspace", "name": "Acme", "profile": "org" }
 { "id": 2, "op": "listProfiles" }
 ```
+
+The `abject` chat's `/ws new <name>` creates a `default` workspace.
 
 `listWorkspaces` reports each workspace's profile. Workspaces created before
 profiles existed are `default`.

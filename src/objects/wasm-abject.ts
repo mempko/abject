@@ -17,6 +17,19 @@
  *   flow through the normal pending-reply machinery, then delivered back to
  *   the guest as `result` envelopes. Targets may be '@Name' for Registry
  *   discovery (cached).
+ *
+ * Durable data (`persist`) goes where a ScriptableAbject's saveData goes, so
+ * it outlives a backend restart and comes back as `data` in abject_init:
+ * - an abject from an installed package (owner `package:<name>`) in a
+ *   workspace: that workspace's AbjectStore, under `package/<Type>`
+ *   (WorkspaceManager hands it back at the next spawn);
+ * - one at system scope (no AbjectStore there): the Packages service, read
+ *   before the guest is initialized;
+ * - any other WASM abject: its workspace's AbjectStore, as a user object
+ *   snapshot that the store restores at boot.
+ * Saves are coalesced (at most one in flight, one queued, a second apart),
+ * and every save also keeps the Registry registration current for respawn
+ * and clone.
  */
 
 import {
@@ -30,6 +43,7 @@ import { require, requireNonEmpty, invariant } from '../core/contracts.js';
 import { request, event, error, isRequest } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
 import { Log } from '../core/timed-log.js';
+import { isPackageOwner } from '../core/packages.js';
 import { WasmInstance } from '../sandbox/wasm-instance.js';
 import { loadWasmModule, isWasmSourceRef } from '../sandbox/wasm-module-store.js';
 import {
@@ -47,6 +61,14 @@ export const WASM_ABJECT_CONSTRUCTOR = 'WasmAbject';
 /** Deferred inbound requests older than this are dropped (callers have long
  *  since timed out). */
 const PENDING_INBOUND_TTL_MS = 10 * 60 * 1000;
+
+/** Durable saves start at most this often; persists in between coalesce
+ *  into the next one (same spacing as ScriptableAbject.saveData). */
+const SAVE_MIN_INTERVAL_MS = 1000;
+
+/** How long a system-scope package abject keeps asking Packages for its
+ *  saved data before it starts the guest without it. */
+const PACKAGE_DATA_WAIT_MS = 30 * 1000;
 
 /**
  * How a WASM abject answers `ask`. The guest never sees ask (the host answers
@@ -105,8 +127,27 @@ export class WasmAbject extends Abject {
   readonly owner: AbjectId;
   private readonly askGuidance?: WasmAskGuidance;
 
+  /** The guest, set once abject_init has run. */
   private instance?: WasmInstance;
+  /** A system-scope package's guest, instantiated and waiting for its data. */
+  private pendingInstance?: WasmInstance;
+  /** Why the guest could not be started after onInit, when it could not. */
+  private startFailure?: string;
   private _data?: Record<string, unknown>;
+
+  /** The AbjectStore that keeps this abject's durable data (workspace). */
+  private storeId?: AbjectId;
+  /** Set for a package abject at system scope: Packages keeps its data. */
+  private packagesId?: AbjectId;
+  /** Whether Packages' copy has been read. Until it has, nothing is written
+   *  there, so a fresh guest's state can never replace the saved data. */
+  private packageDataLoaded = false;
+
+  // Coalesced persist state: one save in flight, one queued.
+  private saveDirty = false;
+  private saveInFlight = false;
+  private saveTimer?: ReturnType<typeof setTimeout>;
+  private lastSaveStart = 0;
 
   /** Inbound requests awaiting a deferred guest reply. */
   private pendingInbound: Map<MessageId, { msg: AbjectMessage; at: number }> = new Map();
@@ -156,45 +197,134 @@ export class WasmAbject extends Abject {
     return this.instance?.snapshot() ?? this._data;
   }
 
+  /** Whether this abject came from an installed package. */
+  private get fromPackage(): boolean {
+    return isPackageOwner(this.owner);
+  }
+
   protected override async onInit(): Promise<void> {
     const bytes = await loadWasmModule(this.source);
 
-    this.instance = await WasmInstance.create(bytes, {
+    const instance = await WasmInstance.create(bytes, {
       objectId: this.id,
-      capabilities: this.capabilities,
       onLog: (level, message) => this.hostLog(level, message),
     });
 
     // The module self-describes; a drifted install manifest is a packaging
     // bug worth surfacing, but the spawn-time manifest stays authoritative
     // for this instance (the Registry already has it).
-    const declared = this.instance.manifest();
+    const declared = instance.manifest();
     if (declared.name !== this.manifest.name) {
       log.warn(`module declares name '${declared.name}' but was spawned as '${this.manifest.name}' (${this.source.slice(0, 30)}...)`);
     }
 
-    const startup = this.instance.init({
+    // A package abject keeps its data where its scope does: a workspace has
+    // an AbjectStore, the system level has none, so there Packages keeps it.
+    // (The same split as ScriptableAbject.) Messages that arrive meanwhile
+    // wait in the early queue: the guest is not started yet.
+    if (this.fromPackage) {
+      this.storeId = await this.discoverDep('AbjectStore') ?? undefined;
+      if (!this.storeId) this.packagesId = await this.discoverDep('Packages') ?? undefined;
+    }
+
+    if (this.packagesId) {
+      // Packages answers only an abject it finds registered as the
+      // package's own, and the Factory registers this one after onInit
+      // returns, so the guest starts once that data has been read.
+      this.pendingInstance = instance;
+      void this.startWithPackageData();
+    } else {
+      this.startGuest(instance);
+    }
+
+    this.checkInvariants();
+  }
+
+  /** Run abject_init with the current data, then drain the early queue. */
+  private startGuest(instance: WasmInstance): void {
+    const startup = instance.init({
       objectId: this.id,
       typeId: this.typeId,
       name: this.manifest.name,
       data: this._data,
       now: Date.now(),
     });
+    this.instance = instance;
     this.processEnvelopes(startup);
 
     // Drain messages that raced instantiation.
     const queued = this.earlyQueue;
     this.earlyQueue = [];
     for (const msg of queued) {
-      this.completeDeferred(msg, this.instance.handle({ kind: 'message', message: msg }));
+      this.completeDeferred(msg, instance.handle({ kind: 'message', message: msg }));
+    }
+  }
+
+  /**
+   * A system-scope package abject: read the data Packages keeps for it, then
+   * start the guest with it. The first asks can come before the Factory has
+   * registered this object, which Packages refuses, so it asks again with a
+   * growing delay. If no answer comes within PACKAGE_DATA_WAIT_MS the guest
+   * starts with the data it was spawned with (a respawn's Registry copy), and
+   * its persists are not written to Packages this run, so the stored data is
+   * never replaced by state that did not start from it.
+   */
+  private async startWithPackageData(): Promise<void> {
+    const packagesId = this.packagesId!;
+    const deadline = Date.now() + PACKAGE_DATA_WAIT_MS;
+    let lastError = '';
+    for (let delay = 25; this.pendingInstance; delay = Math.min(delay * 2, 2000)) {
+      try {
+        const stored = await this.request<Record<string, unknown> | null>(
+          request(this.id, packagesId, 'getPackageData', {}));
+        if (stored && typeof stored === 'object' && !Array.isArray(stored)) this._data = stored;
+        this.packageDataLoaded = true;
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
 
+    const instance = this.pendingInstance;
+    if (!instance) return; // stopped while waiting
+    this.pendingInstance = undefined;
+    if (!this.packageDataLoaded) {
+      log.warn(`[${this.manifest.name}] could not read its saved package data (${lastError}); ` +
+        'starting without it, and its persists stay in memory this run');
+    }
+
+    try {
+      this.startGuest(instance);
+    } catch (err) {
+      // The spawn already succeeded, so there is nobody to throw to: fail
+      // what is waiting and everything that arrives later.
+      this.startFailure = err instanceof Error ? err.message : String(err);
+      log.error(`[${this.manifest.name}] guest failed to start: ${this.startFailure}`);
+      const queued = this.earlyQueue;
+      this.earlyQueue = [];
+      for (const msg of queued) {
+        if (!isRequest(msg)) continue;
+        try { this.send(error(msg, 'START_FAILED', this.startFailure)); } catch { /* stopped */ }
+      }
+    }
     this.checkInvariants();
   }
 
   protected override async onStop(): Promise<void> {
+    // Write a queued persist before the guest goes away. Status is already
+    // 'stopped', so request() is refused and no reply could come back: the
+    // save goes out as a fire-and-forget event (as ScriptableAbject does).
+    if (this.saveDirty || this.saveTimer !== undefined) {
+      this.cancelTimer(this.saveTimer);
+      this.saveTimer = undefined;
+      this.saveDirty = false;
+      try { this.finalSave(); } catch { /* best effort at shutdown */ }
+    }
     // Drop the instance; pending callers are rejected by base stop().
     this.instance = undefined;
+    this.pendingInstance = undefined;
     this.pendingInbound.clear();
     this.earlyQueue = [];
   }
@@ -203,6 +333,11 @@ export class WasmAbject extends Abject {
 
   private dispatchToGuest(msg: AbjectMessage): unknown {
     this.prunePendingInbound();
+
+    if (this.startFailure) {
+      if (!isRequest(msg)) return undefined;
+      throw new Error(`START_FAILED: ${this.startFailure}`);
+    }
 
     if (!this.instance) {
       // Module still instantiating — park the message and reply when ready.
@@ -379,14 +514,108 @@ export class WasmAbject extends Abject {
     return id;
   }
 
-  /** Snapshot guest data and upsert it into our Registry registration so
-   *  respawn/restore/clone see it. */
+  // ── Durable data (persist) ─────────────────────────────────────────────
+
+  /**
+   * A guest `persist`. Coalesced: at most one save is in flight and one is
+   * queued, and saves start at least SAVE_MIN_INTERVAL_MS apart. A guest may
+   * persist on every message; without coalescing each one would be a
+   * snapshot across the WASM boundary plus a full AbjectStore write. The
+   * snapshot is taken when the save starts, so it holds every change the
+   * coalesced persists asked for.
+   */
   private persistData(): void {
     if (!this.instance) return;
+    this.saveDirty = true;
+    this.scheduleSave();
+  }
 
-    const snapshot = this.instance.snapshot();
-    if (snapshot !== undefined) this._data = snapshot;
+  private scheduleSave(): void {
+    if (this.saveTimer !== undefined || this.saveInFlight) return;
+    const wait = Math.max(0, SAVE_MIN_INTERVAL_MS - (Date.now() - this.lastSaveStart));
+    this.saveTimer = this.setTimer(() => this.flushSave(), wait);
+  }
 
+  private async flushSave(): Promise<void> {
+    this.saveTimer = undefined;
+    if (!this.saveDirty || !this.instance) return;
+    this.saveDirty = false;
+    this.saveInFlight = true;
+    this.lastSaveStart = Date.now();
+    try {
+      await this.saveNow();
+    } catch (err) {
+      log.warn(`[${this.manifest.name}] persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.saveInFlight = false;
+    }
+    // A persist that arrived during the save is waiting for the next one.
+    if (this.saveDirty && this.instance) this.scheduleSave();
+  }
+
+  /** Snapshot the guest and write the data where this abject keeps it. */
+  private async saveNow(): Promise<void> {
+    const snapshot = this.instance?.snapshot();
+    if (snapshot === undefined) return; // the guest keeps no durable data
+    this._data = snapshot;
+
+    if (this.packagesId) {
+      // System scope: Packages keeps the durable copy; the Registry's is
+      // what a supervised restart starts from.
+      this.upsertRegistration();
+      if (!this.packageDataLoaded) return; // see startWithPackageData
+      await this.request(request(this.id, this.packagesId, 'savePackageData', { data: snapshot }));
+      return;
+    }
+
+    this.storeId ??= await this.discoverDep('AbjectStore') ?? undefined;
+    if (!this.storeId) {
+      // No AbjectStore where this abject lives (a non-package abject at
+      // system scope): the Registry copy is all there is.
+      this.upsertRegistration();
+      return;
+    }
+    try {
+      // The store records the data (a package abject's under
+      // `package/<Type>`, anything else as a user snapshot) and updates the
+      // Registry registration with it.
+      await this.request(request(this.id, this.storeId, 'save', this.storePayload(snapshot)));
+    } catch (err) {
+      // The cached id may be stale (the store respawned): find it again
+      // next time, and keep the Registry copy current meanwhile.
+      this.storeId = undefined;
+      this.upsertRegistration();
+      throw err;
+    }
+  }
+
+  /** The last save, at stop: fire-and-forget, since no reply can come back. */
+  private finalSave(): void {
+    const snapshot = this.instance?.snapshot();
+    if (snapshot === undefined) return;
+    this._data = snapshot;
+    if (this.packagesId) {
+      if (this.packageDataLoaded) {
+        this.send(event(this.id, this.packagesId, 'savePackageData', { data: snapshot }));
+      }
+    } else if (this.storeId) {
+      this.send(event(this.id, this.storeId, 'save', this.storePayload(snapshot)));
+    }
+  }
+
+  private storePayload(data: Record<string, unknown>): Record<string, unknown> {
+    return {
+      objectId: this.id,
+      manifest: this.manifest,
+      source: this.source,
+      owner: this.owner,
+      data,
+    };
+  }
+
+  /** Upsert our Registry registration with the current data so respawn,
+   *  restore and clone see it. */
+  private upsertRegistration(): void {
     const regId = this.getRegistryId();
     if (!regId) return;
 
@@ -402,7 +631,7 @@ export class WasmAbject extends Abject {
           ...(this._data !== undefined ? { data: this._data } : {}),
         }),
       );
-    } catch { /* bus unavailable — persist is best effort */ }
+    } catch { /* bus unavailable: the Registry copy is best effort */ }
   }
 
   private hostLog(level: number, message: string): void {
@@ -430,5 +659,7 @@ export class WasmAbject extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
     invariant(isWasmSourceRef(this.source), 'source must remain a wasm ref');
+    invariant(!(this.instance && this.pendingInstance), 'a guest is either started or waiting, never both');
+    invariant(!this.packagesId || this.fromPackage, 'only a package abject keeps its data with Packages');
   }
 }

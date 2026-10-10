@@ -7,7 +7,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
 
@@ -79,10 +78,6 @@ export class FileViewer extends Abject {
             { name: 'getState', description: 'Get window visibility', parameters: [], returns: { kind: 'object', properties: { visible: { kind: 'primitive', primitive: 'boolean' } } } },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display file preview window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

@@ -2,9 +2,10 @@
  * Minimal hand-rolled ANSI terminal UI for the `abject` command: alternate screen with a
  * scrollable message area, a tmux-style tab bar, and an editable input line.
  *
- * Deliberately avoids every key chord tmux or screen intercepts: navigation
- * is Alt-based (terminals forward Alt as ESC-prefixed sequences, which tmux
- * passes through untouched), with slash commands as the universal fallback.
+ * Navigation is a prefix chord (Ctrl+A by default, like tmux; GNU screen
+ * users set ABJECT_PREFIX to another letter), with Alt keys (ESC-prefixed
+ * sequences) as a fallback where the terminal emulator leaves them alone,
+ * and slash commands for everything.
  */
 
 // ── Key parsing ────────────────────────────────────────────────────────

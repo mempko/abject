@@ -173,8 +173,6 @@ export class MCPRegistryClient extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'mcp', 'registry'],
       },
     });

@@ -2,9 +2,11 @@
 
 ## Project Overview
 
-Abjects is an LLM-mediated distributed object system where objects communicate via message passing, negotiate protocols using an LLM, and self-heal when communication breaks down. Everything in the system is an object (Abject) - including the Registry, Factory, LLM service, and UI server.
+Abjects is an LLM-mediated distributed object system where objects communicate via message passing, negotiate protocols using an LLM, and self-heal when communication breaks down. Everything in the system is an object (Abject): the Registry, Factory, LLM service, and UI server included.
 
-**Tech Stack**: TypeScript, Vite, WASM (sandboxed objects), Canvas (X11-style UI)
+**Tech Stack**: TypeScript on Node (worker threads), WASM and script packages (sandboxed objects), an X11-style display server driving a Canvas/WebGL browser client, Electron for the desktop app, Vite and esbuild for bundles.
+
+Every directory has a `README.md` describing what is in it and how it fits together; read the one for the area you are changing before changing it, and keep it current when you change the code.
 
 ## Build & Run Commands
 
@@ -17,6 +19,10 @@ pnpm whisper                      # Start P2P signaling server (:7720)
 pnpm abject                       # The `abject` command line: chat TUI, setup, start/stop, questions
 pnpm incarnate                    # Build the desktop app's bundles (then incarnate:linux|win|mac)
 pnpm incarnate:headless           # Package the headless edition: one dir, `abject` binary + lib/
+pnpm forge <dir>                  # Build, check and install a package (WASM or script) into .abjects/extensions
+pnpm smelt                        # Rebuild the bundled native KnowledgeBase (native/knowledge-base)
+pnpm typecheck                    # tsc --noEmit
+pnpm test                         # The existing node:test suite (src/**/*.test.ts, client/*.test.ts)
 ```
 
 Two editions share one bootstrap. **Desktop** (`server/index.ts`, also what
@@ -33,14 +39,17 @@ its data directory; that is how the `abject` command finds it.
 src/
   index.ts              # Public API re-export barrel
   core/                 # Types, contracts, message builders, base Abject class, capabilities
-  runtime/              # Runtime orchestrator, MessageBus, Mailbox, Supervisor
-  objects/              # System objects: Registry, Factory, LLMObject, ObjectCreator, ProxyGenerator, UIServer
-  objects/capabilities/ # Capability objects: HttpClient, Storage, Timer, Clipboard, Console, FileSystem
+  runtime/              # Runtime orchestrator, MessageBus, Mailbox, Supervisor, worker pool
+  objects/              # System, per-workspace and agent objects: Registry, Factory, LLMObject, ObjectCreator, ...
+  objects/capabilities/ # Capability objects: HttpClient, Storage, Timer, Clipboard, Console, FileSystem, Shell, ...
+  objects/widgets/      # Window and widget toolkit (desktop edition only)
   protocol/             # Negotiator, Agreement management, HealthMonitor
-  llm/                  # LLM provider interface and implementations (Anthropic, OpenAI, Ollama)
-  network/              # Transport abstraction, WebSocket, MockTransport
+  llm/                  # LLM provider interface and providers (API, CLI-agent, abject-backed), tier routing
+  network/              # Transports, WebSocket, wire codec, signaling, peer transport and routing
   sandbox/              # Packages (WASM + script): discovery, packages.json, ingest; WASM ABI, instance, module store
-  ui/                   # App shell, Canvas Compositor
+  ui/                   # Compositor and the WebGL desktop (ui/gl)
+  evaluation/           # Agent evaluation cases
+client/                 # The thin browser client: renderer, input, wire protocol
 server/
   boot.ts               # The bootstrap both editions run: core registrations, spawns, shutdown
   ui-layer.ts           # The desktop's display layer (UIServer, WidgetManager, windows, UI worker)
@@ -56,6 +65,9 @@ sdk/cpp/                # C++ SDK for writing WASM abjects
 sdk/script/             # TypeScript types for script packages
 examples/               # User-loadable abject packages, WASM and script (pnpm forge)
 docs/                   # PACKAGES.md, WASM_ABI.md and other specs
+scripts/                # Build and packaging scripts (forge, package-headless, SEA bootstrap, bundle check)
+deploy/, packaging/     # Running the headless edition as a service; package-manager manifests
+site/                   # abject.world (Astro, its own package)
 ```
 
 ## Key Conventions
@@ -83,9 +95,7 @@ Every system service follows this pattern:
          name: 'MyObject',
          description: 'What it does',
          version: '1.0.0',
-         interfaces: [{ id: 'abjects:my-object' as InterfaceId, name: '...', description: '...', methods: [...] }],
-         requiredCapabilities: [],
-         providedCapabilities: [...],
+         interface: { id: 'abjects:my-object' as InterfaceId, name: '...', description: '...', methods: [...] },
          tags: ['system'],
        },
      });
@@ -108,7 +118,6 @@ Every system service follows this pattern:
 
 - **Interface IDs**: `'abjects:module-name'` (e.g., `'abjects:registry'`, `'abjects:http'`)
 - **Well-known IDs**: `UPPER_SNAKE_CASE` with `_ID` suffix (e.g., `REGISTRY_ID`, `FACTORY_ID`)
-- **Capability IDs**: `'abjects:category:action'` (e.g., `'abjects:storage:read'`)
 - **Tags**: lowercase strings in arrays (e.g., `['system', 'core']`, `['capability', 'http']`)
 
 ### TypeScript
@@ -153,9 +162,9 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 4. Register constructor for the pool workers in **`workers/core-constructors.ts`**: import + `map.set('Name', () => new MyAbject())`
    (a UI Abject: **`workers/ui-constructors.ts`**)
 5. (Optional) Mark worker-eligible in the `workerEligible` array in `server/boot.ts` (UI: `server/ui-layer.ts`) if it should run in a worker thread
-6. Add to spawn list in **`src/objects/workspace-manager.ts`**:
-   - `INFRA_OBJECTS` — non-UI Abjects (always spawned, including for inactive workspaces)
-   - `UI_OBJECTS` — Abjects with show/hide windows (only spawned for active workspaces)
+6. Add to spawn list in **`src/objects/workspace-profiles.ts`** (WorkspaceManager spawns from it; `WORKSPACE_OBJECT_REQUIRES` lists dependencies):
+   - `INFRA_OBJECTS`: non-UI Abjects (always spawned, including for inactive workspaces)
+   - `UI_OBJECTS`: Abjects with show/hide windows (only spawned for active workspaces)
 7. Export from `src/index.ts`
 
 **CRITICAL**: Forgetting the worker registration (`workers/core-constructors.ts` or `workers/ui-constructors.ts`) causes silent spawn failures when workers are enabled. Always register in both places.
@@ -168,10 +177,17 @@ answers (a window on the desktop, the `abject` command in a terminal).
 
 ### New Capability Object
 
-1. Create in `src/objects/capabilities/`
-2. Define capability ID constants in `src/core/capability.ts`
-3. Set `providedCapabilities` in manifest, tag with `['capability', '<name>']`
-4. Follow existing patterns (see `http-client.ts` for domain allow/deny, `storage.ts` for IndexedDB)
+A capability object is the one Abject that owns a resource outside the object
+system (files, the shell, the network, a device). Generated code has no access
+of its own, so its only way to that resource is a message to this object, and
+this object decides.
+
+1. Create in `src/objects/capabilities/`, tag with `['capability', '<name>']`
+2. If it acts on the host or the network on another object's behalf, ask
+   PermissionBroker (`requestPermission`) before acting, as `shell-executor.ts`
+   and `host-filesystem.ts` do; settings it enforces come from SettingsManager
+3. Follow existing patterns (see `http-client.ts` for domain allow/deny and
+   private-host refusal, `storage.ts` for the SQLite-backed store)
 
 ### New WASM Abject (other languages)
 
@@ -196,7 +212,7 @@ bundled packages with `pnpm smelt` after changing their sources.
 3. `pnpm forge <dir>` compiles, validates the ABI, extracts the module's
    manifest, and installs into `.abjects/extensions/`; the server ingests
    extensions at boot
-4. No constructor registration is needed anywhere — WASM objects spawn
+4. No constructor registration is needed anywhere: WASM objects spawn
    through the generic `WasmAbject` host (already registered on main +
    worker) and are referenced by content hash (`wasm:sha256:...`) riding the
    normal `source` field, so persistence/clone/respawn work unchanged
@@ -239,7 +255,7 @@ capability objects, and emits `settingsChanged`. `GlobalSettings` is only its
 window, and `CliServer` exposes the same `getSettingsSchema` / `getSettings` /
 `setSettings` to the `abject` command. Add a field to the section's type, `schema()`
 and the section's setter in SettingsManager; then show it in the window. Only
-GlobalSettings and CliServer may write, and only GlobalSettings may read secrets.
+GlobalSettings, CliServer and abjects in a local workspace this machine hosts may write (shared and public workspaces may not), and only GlobalSettings may read secrets.
 
 ### New LLM Provider
 
@@ -263,7 +279,7 @@ A built-in provider (compiled into the server):
 ## Common Pitfalls
 
 - **Object initialization**: All objects must be `init(bus)` before use; `factory.spawnInstance()` handles this
-- **Mailbox bounds**: Default max queue size is 1000; sending to a full mailbox throws `ContractViolation`
+- **Mailbox bounds**: Default max queue size is 1000; a message sent to a full mailbox is dropped (counted in `droppedFull`, logged with a throttled warning), so a flooded object loses messages rather than failing the sender
 - **API keys**: Set via `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` environment variables
 - **Compositor**: Needs a real `HTMLCanvasElement`
 - **Sequence numbers**: Per-sender, tracked in module-level state in `message.ts`; use `resetSequence()` in tests
@@ -285,7 +301,7 @@ Bootstrap happens in `server/boot.ts` `bootServer()`, with the desktop's `UiLaye
 6. Writes `instance.json`; removes it first thing at shutdown
 
 When adding a new global system object, register its constructor and spawn it in `server/boot.ts`.
-Per-workspace objects are spawned by `WorkspaceManager` — add them to `INFRA_OBJECTS` or `UI_OBJECTS` in `workspace-manager.ts`, and register their constructors in both `server/boot.ts` and `workers/core-constructors.ts` (UI: `server/ui-layer.ts` and `workers/ui-constructors.ts`).
+Per-workspace objects are spawned by `WorkspaceManager`: add them to `INFRA_OBJECTS` or `UI_OBJECTS` in `src/objects/workspace-profiles.ts`, and register their constructors in both `server/boot.ts` and `workers/core-constructors.ts` (UI: `server/ui-layer.ts` and `workers/ui-constructors.ts`).
 
 ## Dependencies
 

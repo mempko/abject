@@ -27,7 +27,7 @@ import {
   runCliIdle,
   runCliIdleStreaming,
 } from './cli-process.js';
-import { PtySessionPool, sessionSandboxDir } from './pty-session.js';
+import { PtySessionPool, removeSandboxDir, sessionSandboxDir } from './pty-session.js';
 import { claudeDialect } from './pty-dialects.js';
 import {
   discoverModels,
@@ -353,25 +353,33 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       let usage: LLMCompletionResult['usage'];
       let cliError: string | undefined;
 
-      const { code, stdout, stderr } = await runCliIdleStreaming(
-        this.bin, argv,
-        // Run somewhere empty, matching the terminal transport. Claude Code
-        // injects the working directory and its git status into the default
-        // system prompt, so running here would put the user's repo state
-        // into every request: wasted tokens, and context an agent asked for
-        // a JSON action has no business seeing.
-        { idleTimeoutMs: this.idleTimeoutMs, stdin, cwd: sessionSandboxDir() },
-        (line) => {
-          const err = extractStreamError(line);
-          if (err) cliError = err;
-          const delta = extractStreamDelta(line);
-          if (delta) text += delta;
-          const final = extractStreamResultText(line);
-          if (final) resultText = final;
-          const u = extractStreamUsage(line);
-          if (u) usage = u;
-        },
-      );
+      // Run somewhere empty, matching the terminal transport. Claude Code
+      // injects the working directory and its git status into the default
+      // system prompt, so running here would put the user's repo state
+      // into every request: wasted tokens, and context an agent asked for
+      // a JSON action has no business seeing. The directory is this call's
+      // alone and goes away with it.
+      const cwd = sessionSandboxDir();
+      let run: Awaited<ReturnType<typeof runCliIdleStreaming>>;
+      try {
+        run = await runCliIdleStreaming(
+          this.bin, argv,
+          { idleTimeoutMs: this.idleTimeoutMs, stdin, cwd },
+          (line) => {
+            const err = extractStreamError(line);
+            if (err) cliError = err;
+            const delta = extractStreamDelta(line);
+            if (delta) text += delta;
+            const final = extractStreamResultText(line);
+            if (final) resultText = final;
+            const u = extractStreamUsage(line);
+            if (u) usage = u;
+          },
+        );
+      } finally {
+        removeSandboxDir(cwd);
+      }
+      const { code, stdout, stderr } = run;
 
       if (code !== 0) {
         throw new Error(formatCliError(this.bin, code, stderr, stdout, argv, cliError));

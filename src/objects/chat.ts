@@ -23,7 +23,6 @@ import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from
 import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
@@ -475,10 +474,6 @@ export class Chat extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'Query LLM for responses', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'agent'],
       },
     });
@@ -955,7 +950,7 @@ export class Chat extends Abject {
     let windowId: AbjectId;
     try {
       const spawned = await this.request<SpawnResult>(request(this.id, this.factoryId, 'spawn', {
-        manifest: { name: 'ChatWindow', description: '', version: '1.0.0', requiredCapabilities: [], tags: ['system', 'ui'] },
+        manifest: { name: 'ChatWindow', description: '', version: '1.0.0', tags: ['system', 'ui'] },
         registryHint: (await this.resolveRegistryId()) ?? undefined,
         parentId: this.id,
         constructorArgs: {

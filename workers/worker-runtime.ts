@@ -179,6 +179,16 @@ export function runAbjectWorker(constructors: Map<string, ObjectFactory>): void 
         break;
       }
 
+      case 'proxy:route': {
+        if (data.route) workerBus.setProxyRoute(data.route);
+        break;
+      }
+
+      case 'proxy:unroute': {
+        if (data.agreementId) workerBus.removeProxyRoute(data.agreementId);
+        break;
+      }
+
       case 'children:signal': {
         // Shutdown, first step: every child process this worker started, now,
         // whatever later happens to the objects that own them.

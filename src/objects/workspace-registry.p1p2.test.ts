@@ -38,8 +38,6 @@ function mkManifest(name: string, description: string, sharing?: string): Abject
         { name: 'echo', description: 'Echo', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
       ],
     },
-    requiredCapabilities: [],
-    providedCapabilities: [`abjects:test:${name.toLowerCase()}`],
     tags: ['test'],
     ...(sharing ? { sharing } : {}),
   } as unknown as AbjectManifest;

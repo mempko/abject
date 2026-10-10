@@ -194,8 +194,6 @@ export abstract class LayoutAbject extends WidgetAbject {
       description: `${layoutType === 'vbox' ? 'Vertical' : 'Horizontal'} layout container`,
       version: '1.0.0',
       interface: LAYOUT_INTERFACE_DECL,
-      requiredCapabilities: [],
-      providedCapabilities: [],
       tags: ['widget', 'layout'],
     };
 

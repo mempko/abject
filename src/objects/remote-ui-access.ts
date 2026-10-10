@@ -204,8 +204,6 @@ export class RemoteUIAccess extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'remote-ui'],
       },
     });

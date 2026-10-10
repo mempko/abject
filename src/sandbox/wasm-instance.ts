@@ -1,7 +1,7 @@
 /**
  * Low-level wrapper around one instantiated WASM abject module.
  *
- * Owns the WebAssembly.Instance, the capability-gated host imports, and a
+ * Owns the WebAssembly.Instance, the host imports (emit, log, time), and a
  * minimal WASI shim (no filesystem, no sockets) so C/C++ standard libraries
  * link and run. WasmAbject drives this class; nothing else should.
  *
@@ -13,7 +13,6 @@
 
 import { AbjectManifest } from '../core/types.js';
 import { require } from '../core/contracts.js';
-import { CapabilitySet, Capabilities, getDefaultCapabilities } from '../core/capability.js';
 import {
   WASM_ABI_VERSION,
   WasmAbjectExports,
@@ -29,7 +28,6 @@ import {
 
 export interface WasmHostContext {
   objectId: string;
-  capabilities: CapabilitySet;
   onLog: (level: number, message: string) => void;
 }
 
@@ -176,15 +174,11 @@ export class WasmInstance {
   }
 
   private buildImports(memory: () => WebAssembly.Memory): WebAssembly.Imports {
-    const { capabilities, onLog } = this.ctx;
+    const { onLog } = this.ctx;
 
     return {
       abjects: {
         emit: (ptr: number, len: number): void => {
-          require(
-            capabilities.has(Capabilities.SEND_MESSAGE),
-            'SEND_MESSAGE capability required',
-          );
           let parsed: unknown;
           try {
             parsed = JSON.parse(readGuestString(memory(), ptr, len));
@@ -200,12 +194,10 @@ export class WasmInstance {
         },
 
         log: (level: number, ptr: number, len: number): void => {
-          require(capabilities.has(Capabilities.LOG), 'LOG capability required');
           onLog(level, readGuestString(memory(), ptr, len));
         },
 
         time_ms: (): number => {
-          require(capabilities.has(Capabilities.TIME), 'TIME capability required');
           return Date.now();
         },
       },
@@ -334,7 +326,6 @@ export async function extractWasmManifest(bytes: Uint8Array): Promise<AbjectMani
   const objectId = 'wasm:manifest-extraction';
   const instance = await WasmInstance.create(bytes, {
     objectId,
-    capabilities: new CapabilitySet(getDefaultCapabilities(objectId)),
     onLog: () => { /* discard */ },
   });
   return instance.manifest();

@@ -27,7 +27,7 @@ const faq = [
   },
   {
     q: 'Is it safe to let this thing touch my machine?',
-    a: 'Abjects can only reach what you allow. Files, the shell, the network and the clipboard are capabilities an abject has to be granted. Without one it cannot use it, no matter how politely it asks, and the first request for anything new stops at a prompt and waits for you. Generated code runs in a locked-down interpreter in worker threads, with no direct access to the filesystem, the network or the process. Everything lives on your machine. The horror is thematic. The containment is real.',
+    a: 'Abjects can only reach what you allow. Generated code runs in a locked-down interpreter in worker threads, with no access of its own to the filesystem, the network or the process. To touch anything outside, an abject has to ask the object that owns it, and a command, or a file outside the folders you allowed, stops at a prompt and waits for you. Everything lives on your machine. The horror is thematic. The containment is real.',
   },
   {
     q: 'What does it cost?',

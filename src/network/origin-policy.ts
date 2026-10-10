@@ -3,8 +3,9 @@
  *
  * Browsers put the page's origin on every WebSocket handshake, and a page can
  * neither change nor drop it. The UI socket (WS_PORT) and the CLI gateway bind
- * loopback and, unless ABJECTS_AUTH_USER/PASSWORD are set, authenticate
- * nothing, so without this check any site open in any browser on the machine
+ * loopback (the CLI gateway unless CLI_BIND says otherwise) and, unless a
+ * login is set (ABJECTS_AUTH_USER/PASSWORD or one saved in Settings),
+ * authenticate nothing, so without this check any site open in any browser on the machine
  * could connect to them and drive the desktop: send chat messages to agents,
  * answer the permission dialogs those agents raise.
  *

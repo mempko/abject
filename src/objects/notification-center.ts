@@ -262,8 +262,6 @@ export class NotificationCenter extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'notifications'],
       },
     });

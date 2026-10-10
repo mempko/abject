@@ -63,7 +63,6 @@ export interface TierPreset {
 /** A secret as readers see it; `value` only for the Settings window (or a value that is not secret). */
 export interface SecretValue { set: boolean; value?: string }
 
-export type CapabilityEnforcementMode = 'off' | 'warn' | 'enforce';
 export interface ObjectCommandRules { allow: string[]; deny: string[] }
 
 export interface AiSettings {
@@ -87,7 +86,6 @@ export interface ShellSettings {
   skillGrants: Record<string, string[]>;
 }
 export interface WebSettings { enabled: boolean; allowedDomains: string[]; deniedDomains: string[]; privateHosts: string[] }
-export interface ObjectsSettings { capabilityEnforcement: CapabilityEnforcementMode }
 export interface PermissionsSettings { mode: PromptMode }
 
 export interface SettingsBySection {
@@ -96,11 +94,10 @@ export interface SettingsBySection {
   filesystem: FilesystemSettings;
   shell: ShellSettings;
   web: WebSettings;
-  objects: ObjectsSettings;
   permissions: PermissionsSettings;
 }
 export type SettingsSectionId = keyof SettingsBySection;
-export const SETTINGS_SECTIONS: SettingsSectionId[] = ['ai', 'auth', 'filesystem', 'shell', 'web', 'objects', 'permissions'];
+export const SETTINGS_SECTIONS: SettingsSectionId[] = ['ai', 'auth', 'filesystem', 'shell', 'web', 'permissions'];
 
 /** One field of the schema clients render settings from. */
 export interface SettingField {
@@ -137,7 +134,6 @@ const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
 const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
 const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
 const STORAGE_KEY_WEB_PRIVATE_HOSTS = 'global-settings:webPrivateHosts';
-const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
 const STORAGE_KEY_PROMPT_MODE = 'global-settings:permissionPromptMode';
 const STORAGE_KEY_OBJECT_PERM_NAMES = 'global-settings:objectPermNames';
 const objectPermKey = (objectName: string): string => `global-settings:objectPerms:${objectName}`;
@@ -167,7 +163,6 @@ const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
 const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 
 const DECISION_GATES: DecisionGates[] = ['on', 'off'];
-const ENFORCEMENT_MODES: CapabilityEnforcementMode[] = ['off', 'warn', 'enforce'];
 
 /** Who may change settings by name: the Settings window and the terminal client's gateway. */
 const WRITERS = ['GlobalSettings', 'CliServer'] as const;
@@ -205,8 +200,16 @@ export class SettingsManager extends Abject {
   /** Applies the login to every socket that checks it (UI, terminal, HTTP gateway). */
   private authGateId?: AbjectId;
 
+  /**
+   * What the LLM object describes: the built-in providers, then those other
+   * abjects registered. Reloaded whenever the LLM object announces
+   * `providersChanged`, so a provider registered after boot can be routed.
+   */
   private providerDescriptions: LLMProviderDescription[] = [];
   private providerDescById = new Map<string, LLMProviderDescription>();
+  /** Reloads issued and the newest one applied: an older answer never replaces a newer one. */
+  private providerLoadsIssued = 0;
+  private providerLoadApplied = 0;
   /** Live model lists by provider; a provider's description seeds it. */
   private modelCatalog = new Map<string, ModelInfo[]>();
 
@@ -227,7 +230,6 @@ export class SettingsManager extends Abject {
   private objectRules = new Map<string, ObjectCommandRules>();
   private skillGrants = new Map<string, string[]>();
   private web: WebSettings = { enabled: true, allowedDomains: [], deniedDomains: [], privateHosts: [] };
-  private capabilityEnforcement: CapabilityEnforcementMode = 'warn';
   private promptMode: PromptMode = 'ask';
 
   private permissionBrokerId?: AbjectId;
@@ -239,7 +241,7 @@ export class SettingsManager extends Abject {
         name: 'SettingsManager',
         description:
           'The global settings as data: model credentials and tier routing, tier presets, the UI and CLI login, and the permissions ' +
-          '(filesystem, shell, web, capability enforcement, what happens to a request no rule decides). Ask it for the schema and the current values; secrets show only as set or not set.',
+          '(filesystem, shell, web, what happens to a request no rule decides). Ask it for the schema and the current values; secrets show only as set or not set.',
         version: '1.0.0',
         interface: {
           id: 'abjects:settings-manager' as InterfaceId,
@@ -263,7 +265,7 @@ export class SettingsManager extends Abject {
             { name: 'listPresets', description: 'Tier presets: saved ones first, then the built-ins derived from each provider.', parameters: [], returns: { kind: 'array', elementType: { kind: 'reference', reference: '{ name, builtin, preset }' } } },
             { name: 'applyPreset', description: 'Route the tiers (and single-model rows) as a preset says, then save.', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' }], returns: { kind: 'reference', reference: 'AiSettings' } },
             {
-              name: 'savePreset', description: 'Save a preset under a name: the given routing, or the current one. "Latest" and moving aliases are frozen to the model they point at today.',
+              name: 'savePreset', description: 'Save a preset under a name: the given routing, or the current one. "Latest" is saved as the model it resolves to today; any other model id, a moving alias included, is saved as given.',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' },
                 { name: 'preset', type: { kind: 'reference', reference: 'TierPreset' }, description: 'Routing to save; omit for the current routing', optional: true },
@@ -273,15 +275,11 @@ export class SettingsManager extends Abject {
             { name: 'deletePreset', description: 'Delete a saved preset (built-ins stay).', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Preset name' }], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'listModels', description: 'Models one provider offers (its live catalog when reachable).', parameters: [{ name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider id' }], returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ModelInfo' } } },
             { name: 'isConfigured', description: 'True once any model credential or tier is set.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
-            { name: 'getCapabilityEnforcement', description: 'Bus-level capability enforcement for scriptable objects: off, warn or enforce.', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
           ],
           events: [
-            { name: 'settingsChanged', description: 'A section changed (changed aspect, value: { section }).', payload: { kind: 'object', properties: { section: { kind: 'primitive', primitive: 'string' } } } },
-            { name: 'capabilityEnforcementChanged', description: 'The capability enforcement mode changed (changed aspect, value: the mode).', payload: { kind: 'primitive', primitive: 'string' } },
+            { name: 'settingsChanged', description: 'A section changed (changed aspect, value: { section }). Section "presets" also announces a provider registered or withdrawn by another abject, which changes the built-in presets and the provider options in the schema.', payload: { kind: 'object', properties: { section: { kind: 'primitive', primitive: 'string' } } } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'settings'],
       },
     });
@@ -292,6 +290,14 @@ export class SettingsManager extends Abject {
     this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
     this.authGateId = await this.requireDep('AuthGate');
+    // Abjects register providers with the LLM object after boot and may
+    // withdraw them; follow its providersChanged announcements. Subscribed
+    // before the first load, so a change in between is not missed.
+    try {
+      await this.request(request(this.id, this.llmId, 'addDependent', {}));
+    } catch (err) {
+      log.warn(`Could not follow LLM provider changes: ${err instanceof Error ? err.message : String(err)}`);
+    }
     await this.loadProviderDescriptions();
     await this.loadAi();
     this.savedPresets = await this.loadSavedPresets();
@@ -304,12 +310,19 @@ export class SettingsManager extends Abject {
     this.checkInvariants();
   }
 
+  protected override async onStop(): Promise<void> {
+    // Sent, not awaited: a stopping object takes no replies.
+    if (this.llmId) {
+      try { this.send(request(this.id, this.llmId, 'removeDependent', {})); } catch { /* LLM gone */ }
+    }
+  }
+
   protected override checkInvariants(): void {
     super.checkInvariants();
     invariant(DECISION_GATES.includes(this.decisionGates), 'SettingsManager: unknown decision gates');
-    invariant(ENFORCEMENT_MODES.includes(this.capabilityEnforcement), 'SettingsManager: unknown enforcement mode');
     invariant(PROMPT_MODES.includes(this.promptMode), 'SettingsManager: unknown permission prompt mode');
     invariant(!this.auth.enabled || (this.auth.username !== '' && this.auth.password !== ''), 'SettingsManager: login enabled without credentials');
+    invariant(this.providerDescById.size === new Set(this.providerDescriptions.map(d => d.id)).size, 'SettingsManager: provider index out of step with the descriptions');
   }
 
   private setupHandlers(): void {
@@ -349,6 +362,10 @@ export class SettingsManager extends Abject {
       await this.refreshKeyedCatalogs();
       const preset = this.savedPresets[name!] ?? this.builtinPresets().find(b => b.name === name)?.preset;
       precondition(!!preset, `No preset named "${name}"`);
+      await this.knowProviders([
+        ...Object.values(preset!.routing).map(r => r?.provider),
+        preset!.vision?.provider, preset!.fallback?.provider, preset!.decision?.provider,
+      ]);
       const update: Record<string, unknown> = { tiers: { ...emptyTiers(), ...preset!.routing } };
       update.vision = preset!.vision ?? null;
       if (preset!.fallback !== undefined) update.fallback = preset!.fallback;
@@ -373,8 +390,11 @@ export class SettingsManager extends Abject {
       };
       precondition(!!source.routing && Object.keys(source.routing).length > 0, 'Configure at least one tier before saving a preset.');
       await this.refreshKeyedCatalogs();
-      // A saved preset is frozen: "Latest" and moving aliases become the
-      // concrete model they point at today, so the preset never drifts.
+      // A saved preset pins "Latest" to the model it resolves to today, so
+      // that tier never drifts. Every other model id is kept as chosen,
+      // including a catalog's own moving alias (OpenRouter's
+      // `~vendor/line-latest`): catalogs do not say which release an alias
+      // points at, so it stays an alias.
       const routing: TierPreset['routing'] = {};
       for (const tier of TIER_NAMES) {
         const route = source.routing[tier];
@@ -401,6 +421,7 @@ export class SettingsManager extends Abject {
 
     this.on('listModels', async (msg: AbjectMessage) => {
       const { provider } = (msg.payload ?? {}) as { provider?: string };
+      if (typeof provider === 'string') await this.knowProviders([provider]);
       precondition(typeof provider === 'string' && this.providerDescById.has(provider), `Unknown provider: ${provider}`);
       await this.refreshCatalog(provider!);
       const desc = this.providerDescById.get(provider!)!;
@@ -411,7 +432,19 @@ export class SettingsManager extends Abject {
 
     this.on('isConfigured', () => this.isConfigured());
 
-    this.on('getCapabilityEnforcement', () => this.capabilityEnforcement);
+    // The LLM object announces a provider another abject registered, updated
+    // or withdrew. Reload the descriptions: the schema's provider options,
+    // what tier writes accept, and the built-in presets all come from them.
+    this.on('providersChanged', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.llmId) return;
+      const { name } = (msg.payload ?? {}) as { name?: unknown };
+      // Its models may have changed with it: the next read refetches.
+      if (typeof name === 'string') this.modelCatalog.delete(name);
+      await this.loadProviderDescriptions();
+      this.checkInvariants();
+      // Built-in presets follow the providers; clients showing the schema reload it on this.
+      this.changed('settingsChanged', { section: 'presets' });
+    });
 
     // Prompt answers that change a rule: the Settings window raises the
     // prompts, and records an "always" answer here.
@@ -529,8 +562,6 @@ export class SettingsManager extends Abject {
         } as SettingsBySection[S];
       case 'web':
         return { enabled: this.web.enabled, allowedDomains: [...this.web.allowedDomains], deniedDomains: [...this.web.deniedDomains], privateHosts: [...this.web.privateHosts] } as SettingsBySection[S];
-      case 'objects':
-        return { capabilityEnforcement: this.capabilityEnforcement } as SettingsBySection[S];
       case 'permissions':
         return { mode: this.promptMode } as SettingsBySection[S];
     }
@@ -600,10 +631,6 @@ export class SettingsManager extends Abject {
         ],
       },
       {
-        id: 'objects', label: 'Objects', description: 'Capability checks on scriptable objects.',
-        fields: [{ key: 'capabilityEnforcement', label: 'Capability enforcement', type: 'enum', options: ENFORCEMENT_MODES }],
-      },
-      {
         id: 'permissions', label: 'Permissions', description: 'What happens to a request no rule, grant or project autonomy decides.',
         fields: [{
           key: 'mode', label: 'Permission prompts', type: 'enum', options: [...PROMPT_MODES],
@@ -622,7 +649,6 @@ export class SettingsManager extends Abject {
       case 'ai': await this.setAi(values); break;
       case 'auth': await this.setAuth(values); break;
       case 'filesystem': case 'shell': case 'web': await this.setPermissions(section, values); break;
-      case 'objects': await this.setObjects(values); break;
       case 'permissions': await this.setPromptMode(values); break;
     }
     this.checkInvariants();
@@ -634,10 +660,17 @@ export class SettingsManager extends Abject {
     precondition(unknown.length === 0, `Unknown ${section} setting${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}`);
   }
 
-  private checkModelRef(value: unknown, what: string, providers: string[]): ModelRef & { effort?: string } {
+  /**
+   * A route's provider must be one the LLM object describes now, or the one
+   * the row already routes to: an abject-backed provider is away until it
+   * registers (at startup, or after being withdrawn), and its saved route
+   * stays acceptable meanwhile, so a save that keeps it still goes through.
+   */
+  private checkModelRef(value: unknown, what: string, providers: string[], current?: ModelRef | null): ModelRef & { effort?: string } {
     precondition(!!value && typeof value === 'object', `${what} must be { provider, model } or null`);
     const v = value as { provider?: unknown; model?: unknown; effort?: unknown };
-    precondition(typeof v.provider === 'string' && providers.includes(v.provider), `${what}: unknown provider ${String(v.provider)}. Providers: ${providers.join(', ')}`);
+    precondition(typeof v.provider === 'string' && (providers.includes(v.provider) || v.provider === current?.provider),
+      `${what}: unknown provider ${String(v.provider)}. Providers: ${providers.join(', ')}`);
     precondition(typeof v.model === 'string' && v.model.trim() !== '', `${what}: model must be a non-empty string`);
     precondition(v.effort === undefined || v.effort === null || typeof v.effort === 'string', `${what}: effort must be a string`);
     return { provider: v.provider as string, model: (v.model as string).trim(), ...(typeof v.effort === 'string' && v.effort ? { effort: v.effort } : {}) };
@@ -645,6 +678,13 @@ export class SettingsManager extends Abject {
 
   private async setAi(values: Record<string, unknown>): Promise<void> {
     this.knownKeys(values, ['credentials', 'tiers', 'vision', 'fallback', 'decision', 'decisionGates', 'cacheKeepalive'], 'AI');
+    const providerOf = (ref: unknown): string | undefined =>
+      ref && typeof ref === 'object' ? (ref as { provider?: unknown }).provider as string | undefined : undefined;
+    await this.knowProviders([
+      ...(values.credentials && typeof values.credentials === 'object' ? Object.keys(values.credentials) : []),
+      ...(values.tiers && typeof values.tiers === 'object' ? Object.values(values.tiers as Record<string, unknown>).map(providerOf) : []),
+      ...AUX_ROW_KEYS.map(key => providerOf(values[key])),
+    ]);
     const chatProviders = this.providerDescriptions.filter(servesChat).map(d => d.id);
     const credentials = { ...this.credentials };
     if (values.credentials !== undefined) {
@@ -663,14 +703,14 @@ export class SettingsManager extends Abject {
       precondition(!!values.tiers && typeof values.tiers === 'object', 'tiers must map tier name to { provider, model, effort? } or null');
       for (const [tier, route] of Object.entries(values.tiers as Record<string, unknown>)) {
         precondition(TIER_NAMES.includes(tier as ModelTierName), `Unknown tier: ${tier}. Tiers: ${TIER_NAMES.join(', ')}`);
-        tiers[tier as ModelTierName] = route === null ? null : this.checkModelRef(route, `tiers.${tier}`, chatProviders);
+        tiers[tier as ModelTierName] = route === null ? null : this.checkModelRef(route, `tiers.${tier}`, chatProviders, this.tiers[tier as ModelTierName]);
       }
     }
     const aux = { ...this.aux };
     for (const key of AUX_ROW_KEYS) {
       if (values[key] === undefined) continue;
       const providers = AUX_ROWS[key].decision ? this.providerDescriptions.map(d => d.id) : chatProviders;
-      const ref = values[key] === null ? null : this.checkModelRef(values[key], key, providers);
+      const ref = values[key] === null ? null : this.checkModelRef(values[key], key, providers, this.aux[key]);
       aux[key] = ref ? { provider: ref.provider, model: ref.model } : null;
     }
     let decisionGates = this.decisionGates;
@@ -789,16 +829,6 @@ export class SettingsManager extends Abject {
     await this.propagatePermissions();
   }
 
-  private async setObjects(values: Record<string, unknown>): Promise<void> {
-    this.knownKeys(values, ['capabilityEnforcement'], 'objects');
-    if (values.capabilityEnforcement === undefined) return;
-    precondition(ENFORCEMENT_MODES.includes(values.capabilityEnforcement as CapabilityEnforcementMode),
-      `capabilityEnforcement must be one of ${ENFORCEMENT_MODES.join(', ')}`);
-    this.capabilityEnforcement = values.capabilityEnforcement as CapabilityEnforcementMode;
-    await this.store('set', STORAGE_KEY_CAP_ENFORCEMENT, this.capabilityEnforcement);
-    this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
-  }
-
   private async setPromptMode(values: Record<string, unknown>): Promise<void> {
     this.knownKeys(values, ['mode'], 'permissions');
     if (values.mode === undefined) return;
@@ -821,14 +851,36 @@ export class SettingsManager extends Abject {
   // AI: load, persist, apply
   // ===========================================================================
 
+  /**
+   * Ask the LLM object for its provider descriptions. A failed reload keeps
+   * the list already held, and an answer older than one already applied is
+   * dropped (reloads can overlap when providers change in quick succession).
+   */
   private async loadProviderDescriptions(): Promise<void> {
+    precondition(!!this.llmId, 'SettingsManager: provider descriptions come from the LLM object');
+    const load = ++this.providerLoadsIssued;
+    let descriptions: LLMProviderDescription[];
     try {
-      this.providerDescriptions = await this.request<LLMProviderDescription[]>(request(this.id, this.llmId!, 'listProviderDescriptions', {}));
+      descriptions = await this.request<LLMProviderDescription[]>(request(this.id, this.llmId!, 'listProviderDescriptions', {}));
     } catch (err) {
       log.warn(`Failed to load provider descriptions: ${err instanceof Error ? err.message : String(err)}`);
-      this.providerDescriptions = [];
+      return;
     }
-    this.providerDescById = new Map(this.providerDescriptions.map(d => [d.id, d]));
+    if (!Array.isArray(descriptions) || load < this.providerLoadApplied) return;
+    this.providerLoadApplied = load;
+    this.providerDescriptions = descriptions;
+    this.providerDescById = new Map(descriptions.map(d => [d.id, d]));
+  }
+
+  /**
+   * Reload the descriptions when a write names a provider not yet known. A
+   * provider registered by another abject is announced by an event, and a
+   * write naming it can arrive before that event is handled.
+   */
+  private async knowProviders(names: ReadonlyArray<string | undefined>): Promise<void> {
+    if (names.some(n => typeof n === 'string' && n !== '' && !this.providerDescById.has(n))) {
+      await this.loadProviderDescriptions();
+    }
   }
 
   private async loadAi(): Promise<void> {
@@ -1026,9 +1078,6 @@ export class SettingsManager extends Abject {
       this.promptMode = promptMode as PromptMode;
       try { await this.applyPromptMode(); } catch (e) { log.warn(`Failed to apply the permission prompt mode: ${e instanceof Error ? e.message : String(e)}`); }
     }
-    const capMode = await this.fetch<string>(STORAGE_KEY_CAP_ENFORCEMENT);
-    if (ENFORCEMENT_MODES.includes(capMode as CapabilityEnforcementMode)) this.capabilityEnforcement = capMode as CapabilityEnforcementMode;
-    this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
 
     // Per-object rules and skill grants are written on their own, apart from
     // the rest of the permission set, so they load whether or not it was saved.
@@ -1211,16 +1260,16 @@ export class SettingsManager extends Abject {
 The global settings as data. The Settings window and the terminal client edit them through this object.
 
 ### Read
-- getSettingsSchema(): sections (ai, auth, filesystem, shell, web, objects, permissions) and their fields.
+- getSettingsSchema(): sections (ai, auth, filesystem, shell, web, permissions) and their fields.
 - getSettings({ section? }): current values; secrets read as { set: true|false }.
-- listPresets(), listModels({ provider }), isConfigured(), getCapabilityEnforcement().
+- listPresets(), listModels({ provider }), isConfigured().
 
 ### Change
-setSettings, applyPreset, savePreset and deletePreset are taken from the Settings window and the terminal client only:
+setSettings, applyPreset, savePreset and deletePreset are taken from the Settings window, the terminal client, and objects in a local workspace this machine hosts (never from shared or public workspaces):
 changing settings is the person's call. To change something, open the Settings window (GlobalSettings.show) or ask the user.
 
 ### Events
-- settingsChanged { section } after every change; capabilityEnforcementChanged with the mode.`;
+- settingsChanged { section } after every change.`;
   }
 }
 

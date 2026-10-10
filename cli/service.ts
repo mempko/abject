@@ -17,7 +17,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { require as contractRequire } from '../src/core/contracts.js';
 import { cliEdition } from './locate.js';
-import { logFilePath, stopBackend } from './backend.js';
+import { logFilePath, restartOwner, stopBackend } from './backend.js';
 
 const UNIT_NAME = 'abject.service';
 const AGENT_LABEL = 'world.abject.headless';
@@ -76,9 +76,14 @@ const xml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;'
 
 export async function installService(dataDir: string): Promise<string> {
   const command = launcherCommand();
-  // The service manager owns the backend from now on; one already running
-  // in the background would hold the data directory.
-  await stopBackend(dataDir);
+  // The service manager owns the backend from now on. One this command
+  // started in the background is handed over; one something else runs is
+  // left alone, and the service waits until it is stopped there.
+  const owner = await restartOwner(dataDir);
+  if (owner.running && !owner.ours) {
+    throw new Error(`Abject is already running on ${dataDir} (pid ${owner.record.pid}), started by something else. Stop it first (${owner.hint.replace(/^restart/, 'stop')}), then install the service.`);
+  }
+  if (owner.running) await stopBackend(dataDir);
 
   if (process.platform === 'linux') {
     const unit = `[Unit]

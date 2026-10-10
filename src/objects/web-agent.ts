@@ -9,7 +9,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
 import type { AgentAction, AgentActionResult, ObserveReply } from './agent-abject.js';
 import { LARGE_PAYLOAD_CHARS } from './agent-abject.js';
@@ -238,11 +237,6 @@ export class WebAgent extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.WEB_BROWSE, reason: 'Control browser pages', required: true },
-          { capability: Capabilities.LLM_QUERY, reason: 'LLM planning', required: true },
-        ],
-        providedCapabilities: [Capabilities.WEB_AGENT],
         tags: ['system', 'agent', 'web', 'automation'],
       },
     });

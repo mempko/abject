@@ -632,7 +632,6 @@
       "name": "KnowledgeBase"
     },
     "name": "KnowledgeBase",
-    "requiredCapabilities": [],
     "tags": [
       "system",
       "knowledge"

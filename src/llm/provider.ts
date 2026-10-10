@@ -2,7 +2,7 @@
  * LLM provider interface - provider-agnostic abstraction.
  */
 
-import { require, requireNonEmpty } from '../core/contracts.js';
+import { require } from '../core/contracts.js';
 import type { ExecutionProvenance, ProviderExecution, PromptGuidance } from './execution-context.js';
 
 /**
@@ -771,78 +771,6 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
     return headers;
   }
-}
-
-/**
- * LLM provider registry.
- */
-export class LLMProviderRegistry {
-  private providers: Map<string, LLMProvider> = new Map();
-  private defaultProvider?: string;
-
-  /**
-   * Register a provider.
-   */
-  register(provider: LLMProvider): void {
-    requireNonEmpty(provider.name, 'provider.name');
-    this.providers.set(provider.name, provider);
-
-    // First provider becomes default
-    if (!this.defaultProvider) {
-      this.defaultProvider = provider.name;
-    }
-  }
-
-  /**
-   * Get a provider by name.
-   */
-  get(name: string): LLMProvider | undefined {
-    return this.providers.get(name);
-  }
-
-  /**
-   * Get the default provider.
-   */
-  getDefault(): LLMProvider | undefined {
-    if (!this.defaultProvider) {
-      return undefined;
-    }
-    return this.providers.get(this.defaultProvider);
-  }
-
-  /**
-   * Set the default provider.
-   */
-  setDefault(name: string): void {
-    require(this.providers.has(name), `Provider '${name}' not registered`);
-    this.defaultProvider = name;
-  }
-
-  /**
-   * Get all provider names.
-   */
-  list(): string[] {
-    return Array.from(this.providers.keys());
-  }
-
-  /**
-   * Find an available provider.
-   */
-  async findAvailable(): Promise<LLMProvider | undefined> {
-    for (const provider of this.providers.values()) {
-      if (await provider.isAvailable()) {
-        return provider;
-      }
-    }
-    return undefined;
-  }
-}
-
-// Global provider registry
-const globalRegistry = new LLMProviderRegistry();
-
-export function getProviderRegistry(): LLMProviderRegistry {
-  return globalRegistry;
 }
 
 /**

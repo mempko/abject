@@ -1,59 +1,81 @@
 # examples/ - Loadable Abject Packages
 
-Example abject packages you can build and load into your workspaces: WASM
-modules written in other languages (C++ via `sdk/cpp`), and script abjects
-written in TypeScript or JavaScript (`sdk/script`). Each example is a package:
-an `abject.json` describing it plus its sources. `docs/PACKAGES.md` covers the
-format and where packages load from.
+Example packages to build and load into an instance: WASM modules written in
+C++ (`sdk/cpp`) and script abjects written in TypeScript or JavaScript
+(`sdk/script`). Each subdirectory is one package: an `abject.json` describing
+it plus its sources. None of them is loaded unless you load it. Bundled
+system packages, which load on every boot, live in `native/` instead.
 
-Install one:
+## Examples
+
+| Package | Runtime | Shows | Build step | Edition |
+|---|---|---|---|---|
+| [echo-cpp](echo-cpp/README.md) | WASM (C++) | The whole ABI in a small object: sync replies, `changed`, `@Name` requests with deferred replies, `snapshot`/`persist` | WASI SDK | desktop and headless |
+| [tally-ts](tally-ts/README.md) | script (TypeScript) | Typed handlers, durable `this.data`, package settings | `pnpm forge` (TypeScript) | desktop and headless |
+| [openai-compatible-provider](openai-compatible-provider/README.md) | script (TypeScript) | An abject-backed LLM provider: `registerProvider`, `providerComplete`, settings, `HttpClient` | `pnpm forge` (TypeScript) | desktop and headless |
+| [scene-showcase](scene-showcase/README.md) | script (JavaScript) | The 3D scene vocabulary: materials, looks, particles, a desktop companion, a window on a world node | none | desktop only (it opens windows) |
+
+All four are workspace scope and name no `profiles`, so they join the
+`default` workspace profile only (`docs/WORKSPACE_PROFILES.md`).
+
+## Loading one
+
+Install a copy into the data directory's `extensions/`:
 
 ```bash
-pnpm forge examples/echo-cpp   # build + validate + install the package
-pnpm forge examples/tally-ts   # same for a TypeScript script package
+pnpm forge examples/echo-cpp   # build + validate + install
+pnpm forge examples/tally-ts   # compile the TypeScript, check it, install
 pnpm awaken                    # packages load at boot
 ```
 
-Or load a package straight from its directory without installing it: add the
-directory in Settings → Packages, or set `ABJECTS_PACKAGE_DIRS` (a script
-package with a TypeScript entry needs `pnpm forge <dir> --build-only` first).
+`pnpm forge` installs into `$ABJECTS_DATA_DIR/extensions/` (`.abjects/` in a
+source checkout). For an installed desktop app or `abject` command, whose data
+lives in the OS data directory, set `ABJECTS_DATA_DIR` or pass
+`--dest <data-dir>/extensions`.
 
-Workspace-scoped packages spawn in every workspace alongside the built-in
-objects; discover them by name like any other abject. Disable one in Settings →
-Packages, or uninstall it by deleting its directory from `.abjects/extensions/`,
-and restart.
+Or load a package straight from its directory, without installing it: add the
+directory in Settings → Packages, or name it in `ABJECTS_PACKAGE_DIRS`
+(`:`-separated, `;` on Windows). A TypeScript entry has to be built in place
+first:
 
-Building WASM examples requires the [WASI SDK](https://github.com/WebAssembly/wasi-sdk)
-(default location `~/tools/wasi-sdk`, override with `WASI_SDK`).
+```bash
+pnpm forge examples/tally-ts --build-only   # writes main.js and points abject.json at it
+ABJECTS_PACKAGE_DIRS=$PWD/examples/tally-ts pnpm awaken
+```
 
-## WASM examples
+Packages load at boot, so restart after installing. Disable one in Settings →
+Packages (or `/package disable <name>` in the `abject` command), or uninstall
+it by deleting its directory under `extensions/`, and restart.
 
-- **echo-cpp**: the full ABI surface in the smallest useful object: sync
-  replies, `changed` events to dependents, guest-initiated requests with
-  `@Name` discovery and deferred replies (`relay`), and durable state via
-  snapshot/persist (`count` survives restarts).
+Building the WASM example needs the [WASI SDK](https://github.com/WebAssembly/wasi-sdk)
+(default `~/tools/wasi-sdk`, override with `WASI_SDK`). The script examples
+need nothing beyond the repo's own dependencies.
 
-## Script examples
+## Files
 
-- **openai-compatible-provider**: an LLM provider for any OpenAI-compatible
-  chat endpoint, written in TypeScript. It registers with the LLM object on
-  startup (`docs/LLM_PROVIDERS.md`), so its models appear in Settings → AI.
-  Its endpoint, key and models are package settings. A local or internal
-  endpoint must also be listed under Private hosts in Settings → Permissions
-  (for example `localhost:1234`); `HttpClient` refuses private addresses
-  otherwise.
-- **tally-ts**: a script package written in TypeScript. Typed handlers
-  (`sdk/script/abject.d.ts`), durable `this.data`, and settings declared in
-  `abject.json` that the Packages tab renders as a form and the object reads
-  with `Packages.getSettings`.
-- **scene-showcase**: a tour of the 3D scene vocabulary. Material presets under
-  a studio look, a neon arcade with bloom and GPU particles, an extruded gold
-  title with an orbit camera, a draggable desktop companion with a trail, and a
-  guide panel window riding a turning world node. A plain JavaScript package
-  that loads with no build step; it can also be loaded through AbjectStore as a
-  user object (its README says how).
+- **echo-cpp/**, **tally-ts/**, **openai-compatible-provider/**,
+  **scene-showcase/**: the packages.
+- **.gitignore**: keeps build output out of git: `*.wasm`, and the `main.js`
+  that `--build-only` writes for the two TypeScript packages.
 
-Bundled system packages (like the C++ KnowledgeBase) live in `native/`, not
-here; those ship with the app and load automatically. See `docs/WASM_ABI.md`
-for the WASM contract, `sdk/cpp/README.md` for the C++ programming model and
-`sdk/script/README.md` for script packages.
+## Gotchas
+
+- Packages from these directories are read-only in the app (package abjects
+  are owned by `package:<name>`). Clone one to get an editable copy, or
+  change the source here and reinstall.
+- Two copies of one type name: the one found later wins when its version is
+  the same or newer, and an older one is skipped with a warning. Package
+  directories (`ABJECTS_PACKAGE_DIRS`, Settings → Packages) come after
+  `extensions/`, so bump `version` or remove the stale copy when both exist.
+- Package data survives a backend restart in both runtimes: a WASM module's
+  `persist` and a script's `saveData()` are kept under `package/<Type>` in the
+  workspace's AbjectStore (with `Packages` for a system-scope package) and
+  handed back at the next spawn.
+
+## Related
+
+- [../docs/PACKAGES.md](../docs/PACKAGES.md): package format, load order, settings
+- [../docs/WASM_ABI.md](../docs/WASM_ABI.md): the WASM contract
+- [../docs/LLM_PROVIDERS.md](../docs/LLM_PROVIDERS.md): abject-backed LLM providers
+- [../sdk/README.md](../sdk/README.md): the C++ and script SDKs
+- [../native/README.md](../native/README.md): bundled system packages

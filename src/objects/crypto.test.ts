@@ -16,7 +16,7 @@ class Probe extends Abject {
   constructor() {
     super({ manifest: { name: 'Probe', description: 'p', version: '1.0.0',
       interface: { id: 'test:probe' as InterfaceId, name: 'Probe', description: 'p', methods: [] },
-      requiredCapabilities: [], providedCapabilities: [], tags: [] } as unknown as AbjectManifest });
+      tags: [] } as unknown as AbjectManifest });
   }
   ask<T>(to: AbjectId, method: string, payload: unknown = {}): Promise<T> {
     return this.request<T>(request(this.id, to, method, payload));

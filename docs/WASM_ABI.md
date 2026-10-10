@@ -54,9 +54,10 @@ _initialize()                       WASI reactor initializer; called once
 
 Returns the module's own `AbjectManifest` (same JSON shape TypeScript abjects
 declare: `name`, `description`, `version`, `interface` with typed `methods`
-and `events`, `requiredCapabilities`, `tags`). The module self-describes; the
+and `events`, `tags`). The module self-describes; the
 `abjects:introspect` protocol (`describe`) is answered by the host from this
-manifest.
+manifest. The host adds the introspect methods to the manifest and tags it
+`wasm`.
 
 ### abject_init
 
@@ -83,6 +84,13 @@ The single entry point for everything that happens after init. Input is one
 **inbound envelope**; the return is `0` or a buffer holding a JSON array of
 outbound envelopes.
 
+The host answers some messages itself and never passes them in: `describe`,
+`ping`, `ask`, `addDependent`, `removeDependent`, `progress`, `getRegistry`
+and `getResultContract`. Every other request and event goes to the guest,
+including `recipientGone` (the bus's notice that an object this one addressed
+no longer exists). Messages that arrive while the module is still
+instantiating are queued and delivered after `abject_init`.
+
 ## Envelopes
 
 ### Inbound (host to guest)
@@ -104,7 +112,8 @@ Completion of a guest-initiated `request` envelope.
 
 Outbound envelopes may be returned from `abject_init`/`abject_handle` or
 emitted mid-call via the `abjects.emit` import; both are processed
-identically, in order.
+identically, in order: the envelopes emitted during a call first, then the
+array it returns.
 
 ```json
 { "kind": "reply", "correlationId": "<inbound messageId>", "payload": <any> }
@@ -113,12 +122,13 @@ Reply to an inbound request. May be returned from the same `abject_handle`
 call (synchronous reply) or from a later one (deferred reply, e.g. after a
 `result` arrives). If a request's `abject_handle` returns no reply/error for
 it, the host holds the request open until a later envelope resolves it or the
-caller times out.
+caller times out. A held request is forgotten after 10 minutes.
 
 ```json
 { "kind": "error", "correlationId": "<inbound messageId>", "code": "SOME_CODE", "message": "..." }
 ```
-Error reply to an inbound request.
+Error reply to an inbound request: the caller's request fails with that code
+and message.
 
 ```json
 { "kind": "request", "id": "<guest-chosen id>", "to": "<target>", "method": "...", "payload": <any>, "timeoutMs": 30000 }
@@ -128,10 +138,17 @@ delivers a `result` envelope with the same `id`. `to` is an `AbjectId`, a
 well-known id, or `"@Name"` to discover a dependency by manifest name via the
 Registry (resolution is cached). `timeoutMs` is optional (default 30000).
 
+A failed request comes back as a `result` with `ok: false`. Its `code` is the
+code of an error message shaped `CODE: message`, otherwise `REQUEST_FAILED`;
+a `"@Name"` the Registry does not know fails with `TARGET_NOT_FOUND`. When the
+object a cached `"@Name"` pointed at is gone (respawned under a new id), the
+host resolves the name again and retries once.
+
 ```json
 { "kind": "event", "to": "<target>", "method": "...", "payload": <any> }
 ```
-Fire-and-forget event. Same `to` resolution as `request`.
+Fire-and-forget event. Same `to` resolution as `request`; an event whose
+target cannot be resolved is dropped with a warning in the log.
 
 ```json
 { "kind": "changed", "aspect": "...", "value": <any> }
@@ -142,11 +159,29 @@ Notify dependents (Smalltalk `changed:` protocol). The host tracks
 ```json
 { "kind": "persist" }
 ```
-Ask the host to call `abject_snapshot()` and upsert the returned data into the
-object's Registry registration. That durable data comes back through
-`abject_init`'s `data` on respawn/restore/clone. Objects with large or
-frequently-changing state should prefer the workspace `Storage` abject (via
-`request` envelopes) and use `persist` sparingly.
+Ask the host to call `abject_snapshot()` and save the returned data, the way a
+script abject's `saveData` is saved, so it survives a backend restart. It comes
+back through `abject_init`'s `data` when the object is spawned again: after a
+restart, a Supervisor respawn, or as the start of a clone. Where it is kept
+depends on where the object came from:
+
+- an abject from an installed package, in a workspace: that workspace's
+  AbjectStore, under `package/<TypeName>`; WorkspaceManager hands it back at
+  the next spawn;
+- an abject from a `"scope": "system"` package: the `Packages` service, in
+  the global Storage; the host reads it before calling `abject_init`;
+- any other WASM abject (spawned through the Factory with `source`, `code`
+  or `codeBase64`): its workspace's AbjectStore, as a user object snapshot
+  that the store restores at boot. With no AbjectStore (spawned at system
+  scope) the data lives only in the Registry and does not survive a restart.
+
+Saves are coalesced: at most one is in flight and one queued, a second apart,
+and the snapshot is taken when the save starts, so a guest may persist after
+every change. A persist still waiting when the object stops is written then.
+Every save also updates the object's Registry registration. Each save copies
+the whole snapshot across the boundary and rewrites a stored record, so keep
+it small; large or frequently-changing state belongs in the workspace
+`Storage` abject (via `request` envelopes), one key per record.
 
 ```json
 { "kind": "log", "level": "debug" | "info" | "warn" | "error", "message": "..." }
@@ -163,24 +198,28 @@ log(level: i32, ptr: i32, len: i32) 0=debug 1=info 2=warn 3=error
 time_ms() -> f64                    wall-clock milliseconds since epoch
 ```
 
-`emit` and `log` are gated by the object's capability set
+`emit`, `log` and `time_ms` are gated by the object's capability set
 (`abjects:send` / `abjects:log` / `abjects:time`), which every abject holds by
 default; grants can be restricted at spawn time.
 
 Module `wasi_snapshot_preview1`: the host provides a minimal, capability-safe
-shim so C/C++ standard libraries link and run: `fd_write` (routed to the log),
-`clock_time_get`, `random_get`, `environ_*`/`args_*` (empty), `proc_exit`
-(traps), and no filesystem or socket access. Modules should be compiled as
-WASI *reactors* (`-mexec-model=reactor`).
+shim so C/C++ standard libraries link and run: `fd_write` (stdout to the info
+log, stderr to the error log), `clock_time_get`, `random_get`,
+`environ_*`/`args_*` (empty), `proc_exit` (traps), `sched_yield`, and stubs
+for `fd_close`, `fd_seek`, `fd_fdstat_get` and `poll_oneoff`. There is no
+filesystem or socket access. Modules should be compiled as WASI *reactors*
+(`-mexec-model=reactor`; `sdk/cpp/build.sh` does this).
 
-Module `env`: `abort(msgPtr, filePtr, line, col)` is provided for
-AssemblyScript-style runtimes.
+Module `env`: `abort(msgPtr, filePtr, line, col)` and `seed()` are provided
+for AssemblyScript-style runtimes.
 
 ## How a module becomes an object in the system
 
 The compiled module is stored content-addressed at
-`$ABJECTS_DATA_DIR/wasm/<sha256>.wasm` (default `.abjects/wasm/`) and referred
-to everywhere by the **wasm source ref** string:
+`$ABJECTS_DATA_DIR/wasm/<sha256>.wasm` (the instance's data directory:
+`.abjects` in a source checkout, the OS data directory in an installed build;
+see `docs/PACKAGES.md`) and referred to everywhere by the **wasm source ref**
+string:
 
 ```
 wasm:sha256:<hex digest>
@@ -192,26 +231,33 @@ Supervisor `respawn` all work unchanged.
 
 Ways to spawn:
 
-- `Factory.spawn({ manifest, source: "wasm:sha256:..." })` — module already in
-  the store.
-- `Factory.spawn({ manifest, code })` / `{ manifest, codeBase64 }` — raw module
+- `Factory.spawn({ manifest, source: "wasm:sha256:..." })`: the module is
+  already in the store.
+- `Factory.spawn({ manifest, code })` / `{ manifest, codeBase64 }`: raw module
   bytes; the Factory hashes and stores them, then proceeds as above.
-- **Installed extensions** (`.abjects/extensions/<name>/`, see `abject.json`
-  below) are ingested at boot. A package with `"scope": "system"` is spawned
-  once as a global system object; `"scope": "workspace"` is spawned per
-  workspace by the WorkspaceManager. A package with `"replaces": "<Name>"`
-  registers as a **wasm type override** in the Factory: any spawn of that name
-  resolves to the WASM implementation instead of the built-in constructor,
-  which is how a C++ object transparently replaces a TypeScript one.
+- **Installed extensions** (`$ABJECTS_DATA_DIR/extensions/<name>/`, see
+  `abject.json` below) are ingested at boot. A package with
+  `"scope": "system"` is spawned once as a global system object;
+  `"scope": "workspace"` is spawned per workspace by the WorkspaceManager, in
+  the workspaces whose profile it joins (`docs/WORKSPACE_PROFILES.md`). A
+  package with `"replaces": "<Name>"` registers as a **type override** in the
+  Factory: any spawn of that name resolves to the WASM implementation instead
+  of a built-in constructor. A replaced type needs no built-in at all: the
+  KnowledgeBase exists only as `native/knowledge-base`
+  (`"replaces": "KnowledgeBase"`).
 - **Bundled native system packages** (`native/<name>/` in the repo, shipped
   as `resources/native` in the desktop app) use the same package format and
   are ingested before user extensions on every boot, so they need no install
-  step; a user-installed extension with the same type name overrides the
-  bundled one. Rebuild them in place with `pnpm smelt`
-  (`forge --build-only`), which re-embeds the extracted manifest into the
-  package's `abject.json`.
+  step. A user-installed extension with the same type name overrides the
+  bundled one when its version is the same or newer. Rebuild a bundled package
+  in place with `pnpm forge native/<name> --build-only`, which re-embeds the
+  extracted manifest into the package's `abject.json`; `pnpm smelt` does this
+  for `native/knowledge-base`.
 
-## Package format (`.abject` directory)
+Packages (WASM and script), where they load from, `packages.json` and package
+settings are described in `docs/PACKAGES.md`.
+
+## Package format
 
 ```
 my-object/
@@ -228,14 +274,25 @@ my-object/
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace" | "system",
-  "replaces": "KnowledgeBase",
+  "replaces": "SomeType",
+  "build": "bash ../../sdk/cpp/build.sh my-object.cpp -o main.wasm",
+  "ask": { "guide": "ask-guide.md", "tier": "balanced" },
   "manifest": { <AbjectManifest, extracted from the module by `pnpm forge`> }
 }
 ```
 
-`pnpm forge <dir>` compiles (when the package has sources), validates the
-module's exports and ABI version, extracts the manifest, and installs the
-package into `.abjects/extensions/`.
+`replaces`, `build` and `ask` are optional; `docs/PACKAGES.md` lists every
+field (`settings`, `profiles`, `required` too). `ask` exists for WASM
+packages: the host answers `ask` for the module, so the package supplies the
+usage guide appended to the prompt and the tier it answers at.
+
+`pnpm forge <dir>` runs the `build` command (the C++ SDK's `build.sh` needs the
+WASI SDK, default `~/tools/wasi-sdk`, override with `WASI_SDK`), validates the
+module's exports and ABI version, extracts the manifest, checks that its name
+equals the type name (`replaces`, or the package name), and installs the
+package into `$ABJECTS_DATA_DIR/extensions/`. `--build-only` writes the
+manifest into the package's own `abject.json` instead, for a package loaded
+straight from its directory.
 
 ## Versioning
 

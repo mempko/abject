@@ -1,9 +1,11 @@
 /**
  * Optional WebSocket authentication & session management.
  *
- * Enabled only when both ABJECTS_AUTH_USER and ABJECTS_AUTH_PASSWORD
- * environment variables are set. When enabled, incoming WebSocket
- * connections must authenticate before any messages reach BackendUI.
+ * Enabled when a login is set: ABJECTS_AUTH_USER and ABJECTS_AUTH_PASSWORD
+ * at boot, or a login saved in Settings (AuthGate applies it to the live
+ * config). When enabled, incoming connections must authenticate before any
+ * messages reach BackendUI, the CLI gateway or the web gateway; a local
+ * terminal holding the owner token from instance.json gets in without it.
  */
 
 import crypto from 'node:crypto';
@@ -26,8 +28,9 @@ export interface AuthConfig {
 }
 
 /**
- * Load auth config from environment variables.
- * Auth is enabled only when both ABJECTS_AUTH_USER and ABJECTS_AUTH_PASSWORD are set.
+ * Load the boot-time auth config from environment variables: enabled when
+ * both ABJECTS_AUTH_USER and ABJECTS_AUTH_PASSWORD are set. A login saved in
+ * Settings replaces it once SettingsManager hands it to AuthGate.
  */
 export function loadAuthConfig(): AuthConfig {
   const username = process.env.ABJECTS_AUTH_USER ?? '';

@@ -153,8 +153,6 @@ export class Scheduler extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'scheduling'],
       },
     });

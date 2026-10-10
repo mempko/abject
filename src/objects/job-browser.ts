@@ -8,7 +8,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import type { ListItem } from './widgets/list-widget.js';
@@ -87,10 +86,6 @@ export class JobBrowser extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display job browser window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

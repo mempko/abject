@@ -1,12 +1,13 @@
 /**
- * PtySession / PtySessionPool - drive an interactive CLI agent (claude,
- * codex) inside a real pseudo-terminal and reuse the warm process across
- * requests.
+ * PtySession / PtySessionPool - drive an interactive CLI agent inside a real
+ * pseudo-terminal and reuse the warm process across requests. The only
+ * dialect today is `claude` (`pty-dialects.ts`); codex runs one-shot
+ * `codex exec` instead (`codex-cli.ts`).
  *
- * Why: the CLI providers used to spawn a fresh process per request, paying
- * the binary's whole boot cost every time (measured: ~0.74s for `claude`,
- * ~1.1s for `codex`). Keeping one process alive and resetting its context
- * between requests removes that cost. A pseudo-terminal is what lets the
+ * Why: a CLI provider that spawns a fresh process per request pays the
+ * binary's whole boot cost every time (measured: ~0.74s for `claude`).
+ * Keeping one process alive and resetting its context between requests
+ * removes that cost. A pseudo-terminal is what lets the
  * binary run its normal interactive session: it sees a TTY, starts its full
  * UI, and accepts keystrokes exactly as it would from a terminal emulator.
  *
@@ -37,9 +38,9 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rm, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { require as requires, ensure, invariant, requirePositive } from '../core/contracts.js';
 import { trackChild, untrackIfGone } from '../runtime/child-processes.js';
 
@@ -301,6 +302,11 @@ export class PtySession {
   private readonly turnTimeoutMs: number;
   private readonly startupTimeoutMs: number;
   private readonly cwd?: string;
+  /**
+   * The sandbox directory this session created for itself, when no `cwd`
+   * was given. Owned by the session and removed by {@link dispose}.
+   */
+  private ownedDir?: string;
 
   constructor(
     private readonly dialect: PtyDialect,
@@ -352,20 +358,23 @@ export class PtySession {
     this.term = term;
 
     const env = this.dialect.env({ ...process.env });
+    // Each session gets its own empty directory unless told otherwise, and
+    // removes it again in dispose().
+    if (this.cwd === undefined) this.ownedDir = sessionSandboxDir();
     let proc: PtyProcess;
     try {
       proc = ptyModule!.spawn(this.dialect.bin, [...this.dialect.argv], {
         name: 'xterm-256color',
         cols: this.dialect.cols,
         rows: this.dialect.rows,
-        // Each session gets its own empty directory unless told otherwise.
-        cwd: this.cwd ?? sessionSandboxDir(),
+        cwd: this.cwd ?? this.ownedDir,
         env,
       });
     } catch (err) {
       this.state = 'dead';
       this.term?.dispose();
       this.term = undefined;
+      this.releaseOwnedDir();
       throw new Error(
         `${this.dialect.id}: failed to spawn '${this.dialect.bin}' in a pty: ` +
         `${err instanceof Error ? err.message : String(err)}`,
@@ -497,7 +506,7 @@ export class PtySession {
     await this.settle();
   }
 
-  /** Kill the child and release the screen. */
+  /** Kill the child, release the screen, and remove the session's directory. */
   dispose(): void {
     if (this.proc) {
       try { this.proc.kill(); } catch { /* already gone */ }
@@ -508,7 +517,14 @@ export class PtySession {
       try { this.term.dispose(); } catch { /* nothing to release */ }
       this.term = undefined;
     }
+    this.releaseOwnedDir();
     this.state = 'dead';
+  }
+
+  private releaseOwnedDir(): void {
+    if (this.ownedDir === undefined) return;
+    removeSandboxDir(this.ownedDir);
+    this.ownedDir = undefined;
   }
 
   // ── Internals ────────────────────────────────────────────────────────
@@ -988,35 +1004,96 @@ export function scrubAgentEnv(base: NodeJS.ProcessEnv, prefixes: readonly string
 }
 
 /**
- * An empty directory to run CLI sessions in, created on first use.
+ * A fresh, empty directory to run one CLI process in.
  *
- * Not every CLI can be made toolless. Codex in particular keeps filesystem
- * reads and command execution no matter which flags are set (verified: with
- * a read-only sandbox, no MCP, approvals off, and `unified_exec` disabled,
- * it still read a file and returned its contents). Starting the session
- * somewhere empty means that residual capability has nothing of the user's
- * to reach, and it also keeps the working directory's own project files
- * from being pulled into a request.
+ * Not every CLI can be made toolless (agy, for one, still runs commands and
+ * writes files under the user's allow-rules). Starting the process somewhere
+ * empty means that residual capability has nothing of the user's to reach,
+ * and it keeps the server's own working directory, which for a dev checkout
+ * is the user's project, out of the request: Claude Code injects its working
+ * directory and git status into the system prompt.
  *
- * Shared across sessions because it holds nothing; it exists to be boring.
+ * One directory per caller, not one shared by all of them. These CLIs keep
+ * per-directory state (thread stores, session records), and two live
+ * processes pointed at the same directory interfere: observed as one of them
+ * exiting on its own with code 0, intermittently and with no message.
+ *
+ * The caller owns the directory and gives it back with
+ * {@link removeSandboxDir} when its process is done: a {@link PtySession}
+ * on dispose, a one-shot call when it returns. Directories left behind by a
+ * process that died without cleaning up are removed by the first call in
+ * the next process (see {@link sweepDeadSandboxes}).
+ *
+ * Laid out as `$TMPDIR/abjects-cli-sessions/s<pid>-<suffix>`. The suffix is
+ * random (mkdtemp) rather than a counter because worker threads share the
+ * pid but not this module's state, so a counter would hand two threads the
+ * same directory.
  */
-let sandboxCounter = 0;
+const SANDBOX_DIR_NAME = 'abjects-cli-sessions';
+const SANDBOX_ENTRY = /^s(\d+)-/;
+let sweptDeadSandboxes = false;
+
+function sandboxRoot(): string {
+  return join(tmpdir(), SANDBOX_DIR_NAME);
+}
 
 export function sessionSandboxDir(): string {
-  // A directory per session, not one shared by all of them. These CLIs keep
-  // per-directory state (thread stores, session records), and two live
-  // sessions pointed at the same directory interfere: observed as one of
-  // them exiting on its own with code 0, intermittently and with no message.
-  sandboxCounter++;
-  const dir = join(tmpdir(), 'abjects-cli-sessions', `s${process.pid}-${sandboxCounter}`);
-  mkdirSync(dir, { recursive: true });
-  // Codex refuses to start outside a trusted directory, and treats any git
-  // work tree as trusted ("Not inside a trusted directory and
-  // --skip-git-repo-check was not specified", then exit 0). An empty repo
-  // is the least invasive way to satisfy that. Best effort: if git is
-  // missing the session simply fails to start, with codex's own message.
+  const root = sandboxRoot();
+  mkdirSync(root, { recursive: true });
+  if (!sweptDeadSandboxes) {
+    sweptDeadSandboxes = true;
+    sweepDeadSandboxes(root);
+  }
+  const dir = mkdtempSync(join(root, `s${process.pid}-`));
+  // An empty git repo, kept from when codex ran here: codex refuses to start
+  // outside a git work tree ("Not inside a trusted directory and
+  // --skip-git-repo-check was not specified", then exit 0). It now runs
+  // `codex exec --skip-git-repo-check` in its own scratch directory, and the
+  // CLIs that use this one start either way. Best effort: without git the
+  // directory simply stays plain.
   try {
     execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
   } catch { /* no git, or already initialised */ }
+  ensure(dirname(dir) === root, 'sandbox directory lives under the sandbox root');
   return dir;
+}
+
+/**
+ * Remove a directory made by {@link sessionSandboxDir}. Asynchronous and
+ * best effort: a process that was just killed can still be writing as it
+ * exits, and anything missed is swept once this process is gone.
+ */
+export function removeSandboxDir(dir: string): void {
+  requires(
+    dirname(dir) === sandboxRoot() && SANDBOX_ENTRY.test(basename(dir)),
+    `not a CLI sandbox directory: ${dir}`,
+  );
+  rm(dir, { recursive: true, force: true, maxRetries: 3 }, () => { /* anything missed is swept later */ });
+}
+
+/**
+ * Remove sandbox directories whose owning process is gone. A directory whose
+ * pid is alive is left alone, whoever it belongs to (a reused pid only delays
+ * cleanup until that process exits too).
+ */
+function sweepDeadSandboxes(root: string): void {
+  let entries: string[];
+  try { entries = readdirSync(root); } catch { return; }
+  for (const name of entries) {
+    const m = SANDBOX_ENTRY.exec(name);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (pid === process.pid || processAlive(pid)) continue;
+    try { rmSync(join(root, name), { recursive: true, force: true }); } catch { /* not ours to remove */ }
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to someone else.
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
 }

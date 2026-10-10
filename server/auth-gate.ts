@@ -70,8 +70,6 @@ export class AuthGate extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'security'],
       },
     });

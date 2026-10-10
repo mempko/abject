@@ -1,8 +1,17 @@
 /**
  * Protocol Negotiator - handles connection flow and proxy insertion.
  *
- * Uses message passing internally — no direct object references.
- * Spawns real ScriptableAbject proxies via Factory.
+ * Connecting two objects whose interfaces differ spawns a proxy (a real
+ * ScriptableAbject, written by ProxyGenerator) and installs a proxy route on
+ * the main bus, which copies it to every pool worker (src/runtime/
+ * proxy-routes.ts): traffic between the two then goes through the proxy
+ * wherever they run, and neither object knows. The Negotiator runs on the
+ * main thread for that reason; everything else it does is message passing.
+ *
+ * A connection heals itself two ways: HealthMonitor counts the proxy's
+ * answers and asks for `renegotiate` when too many are errors, and either
+ * end announcing `sourceUpdated` (it is a dependent of both) regenerates the
+ * proxy against the new interface.
  */
 
 import {
@@ -20,7 +29,7 @@ import { Log } from '../core/timed-log.js';
 const log = new Log('NEGOTIATOR');
 import { IntrospectResult } from '../core/introspect.js';
 import { GeneratedProxy } from '../objects/proxy-generator.js';
-import { ProxyInterceptor, MessageBus } from '../runtime/message-bus.js';
+import { MessageBus } from '../runtime/message-bus.js';
 
 const NEGOTIATOR_INTERFACE = 'abjects:negotiator';
 
@@ -39,7 +48,6 @@ export interface ConnectionResult {
 interface ActiveConnection {
   agreement: ProtocolAgreement;
   proxyId?: AbjectId;
-  interceptor?: ProxyInterceptor;
   sourceId: AbjectId;
   targetId: AbjectId;
 }
@@ -127,7 +135,6 @@ export class Negotiator extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
         tags: ['system', 'protocol'],
       },
     });
@@ -157,8 +164,9 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
     { agreementId: 'the-agreement-id', errorContext: 'method not found' });
 
 ### When to use
-- After creating an object that depends on others (ObjectCreator does this automatically)
-- When you want two independently-created objects to talk to each other
+- When you want two independently-created objects to talk to each other and
+  their interfaces differ: the source keeps calling the target as it always
+  did, and the proxy translates in between
 - When a connection fails and needs repair
 
 ### Events
@@ -185,7 +193,8 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       return this.renegotiate(agreementId, errorContext);
     });
 
-    // Listen for sourceUpdated events from ScriptableAbjects (Step 5)
+    // Either end of a connection announces a source change to its
+    // dependents; the Negotiator became one when it connected them.
     this.on('sourceUpdated', async (msg: AbjectMessage) => {
       const changedId = msg.routing.from;
       await this.handleSourceUpdated(changedId);
@@ -193,6 +202,8 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
   }
 
   protected override async onInit(): Promise<void> {
+    require(this.bus instanceof MessageBus,
+      'Negotiator runs on the main thread: it installs proxy routes on the main bus');
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.requireDep('Factory');
     this.proxyGeneratorId = await this.requireDep('ProxyGenerator');
@@ -258,35 +269,20 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
 
         agreement = generated.agreement;
         agreement.proxyId = proxyId;
-
-        // Install proxy interceptor (requires main-thread MessageBus)
-        if (this.bus && proxyId && this.bus instanceof MessageBus) {
-          const interceptor = new ProxyInterceptor(sourceId, targetId, proxyId);
-          (this.bus as MessageBus).addInterceptor(interceptor);
-          this.connections.set(agreement.agreementId, {
-            agreement,
-            proxyId,
-            interceptor,
-            sourceId,
-            targetId,
-          });
-        }
       }
 
-      // Store connection (may overwrite if already set above with interceptor)
-      if (!this.connections.has(agreement.agreementId)) {
-        this.connections.set(agreement.agreementId, {
-          agreement,
-          proxyId,
-          sourceId,
-          targetId,
-        });
+      this.connections.set(agreement.agreementId, { agreement, proxyId, sourceId, targetId });
+
+      // HealthMonitor (lazily discovered: it spawns after us) tracks the
+      // connection and receives the proxy's answers through the route.
+      this.healthMonitorId = await this.resolveDep('HealthMonitor', this.healthMonitorId);
+      if (proxyId) this.installRoute(agreement.agreementId, sourceId, targetId, proxyId);
+
+      // Hear about source changes at either end.
+      for (const id of [sourceId, targetId]) {
+        this.request(request(this.id, id, 'addDependent', {})).catch(() => { /* gone already */ });
       }
 
-      // Notify HealthMonitor to track this connection (lazily discovered)
-      if (!this.healthMonitorId) {
-        this.healthMonitorId = await this.discoverDep('HealthMonitor') ?? undefined;
-      }
       if (this.healthMonitorId && agreement.agreementId) {
         this.request(
           request(this.id, this.healthMonitorId, 'trackConnection', {
@@ -305,8 +301,19 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
+      for (const id of [sourceId, targetId]) {
+        this.send(event(this.id, id, 'connectionFailed', errorMsg));
+      }
       return { success: false, error: errorMsg };
     }
+  }
+
+  /** Route the connection through its proxy on every bus (src/runtime/proxy-routes.ts). */
+  private installRoute(agreementId: string, sourceId: AbjectId, targetId: AbjectId, proxyId: AbjectId): void {
+    (this.bus as MessageBus).setProxyRoute({
+      agreementId, sourceId, targetId, proxyId,
+      ...(this.healthMonitorId ? { healthMonitorId: this.healthMonitorId } : {}),
+    });
   }
 
   /**
@@ -318,9 +325,10 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       return false;
     }
 
-    // Remove interceptor (requires main-thread MessageBus)
-    if (connection.interceptor && this.bus instanceof MessageBus) {
-      (this.bus as MessageBus).removeInterceptor(connection.interceptor);
+    if (connection.proxyId) (this.bus as MessageBus).removeProxyRoute(agreementId);
+    for (const id of [connection.sourceId, connection.targetId]) {
+      if (this.isStillConnected(id, agreementId)) continue;
+      this.request(request(this.id, id, 'removeDependent', {})).catch(() => { /* gone already */ });
     }
 
     // Kill proxy via Factory message passing
@@ -376,19 +384,9 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       connection.agreement = regenerated.agreement;
       connection.agreement.proxyId = proxyId;
 
-      // Update interceptor (requires main-thread MessageBus)
-      if (this.bus instanceof MessageBus) {
-        if (connection.interceptor) {
-          (this.bus as MessageBus).removeInterceptor(connection.interceptor);
-        }
-        const interceptor = new ProxyInterceptor(
-          connection.sourceId,
-          connection.targetId,
-          proxyId
-        );
-        (this.bus as MessageBus).addInterceptor(interceptor);
-        connection.interceptor = interceptor;
-      }
+      // Point the route at the new proxy (replaces the old one everywhere).
+      this.healthMonitorId = await this.resolveDep('HealthMonitor', this.healthMonitorId);
+      this.installRoute(agreementId, connection.sourceId, connection.targetId, proxyId);
 
       return {
         success: true,
@@ -405,8 +403,17 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
    * Handle a sourceUpdated event — regenerate proxies for affected connections.
    */
   private async handleSourceUpdated(changedId: AbjectId): Promise<void> {
-    for (const [agreementId, connection] of this.connections) {
-      if (connection.sourceId === changedId || connection.targetId === changedId) {
+    for (const [agreementId, connection] of [...this.connections]) {
+      if (connection.sourceId !== changedId && connection.targetId !== changedId) continue;
+      if (!connection.proxyId) {
+        // A direct connection: it needs a proxy only if the interfaces no
+        // longer match, and connecting afresh decides that.
+        log.info(`Source updated for ${changedId}; rechecking direct connection ${agreementId}`);
+        await this.disconnect(agreementId);
+        await this.connect(connection.sourceId, connection.targetId);
+        continue;
+      }
+      {
         log.info(`Source updated for ${changedId}, regenerating proxy for ${agreementId}`);
         // Re-introspect the changed object to learn its new interface
         const result = await this.introspect(changedId);
@@ -416,6 +423,14 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
         await this.renegotiate(agreementId, errorContext);
       }
     }
+  }
+
+  /** Whether an object is an end of some connection other than this one. */
+  private isStillConnected(id: AbjectId, exceptAgreementId: string): boolean {
+    for (const [agreementId, c] of this.connections) {
+      if (agreementId !== exceptAgreementId && (c.sourceId === id || c.targetId === id)) return true;
+    }
+    return false;
   }
 
   /**

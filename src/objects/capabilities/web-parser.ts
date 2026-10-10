@@ -7,7 +7,6 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
 
 const log = new Log('WebParser');
@@ -152,8 +151,6 @@ export class WebParser extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.WEB_PARSE],
         tags: ['system', 'capability', 'web', 'parser'],
       },
     });

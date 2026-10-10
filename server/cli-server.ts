@@ -148,8 +148,6 @@ export class CliServer extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system'],
       },
     });

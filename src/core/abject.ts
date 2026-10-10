@@ -14,13 +14,11 @@ import {
   AbjectState,
   AbjectStatus,
   AbjectError,
-  CapabilityGrant,
 } from './types.js';
 import { require, invariant, requireNonEmpty } from './contracts.js';
 import { reply, error, errorFromException, event, request, isRequest, isReply, isError } from './message.js';
 import { Mailbox } from '../runtime/mailbox.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
-import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
@@ -64,7 +62,6 @@ export type MessageHandlerFn = (
 
 export interface AbjectOptions {
   manifest: AbjectManifest;
-  capabilities?: CapabilityGrant[];
   initialState?: unknown;
   /**
    * Adopt an explicit AbjectId instead of minting a fresh one — for an object
@@ -85,7 +82,6 @@ export abstract class Abject {
   readonly id: AbjectId;
   private _typeId?: TypeId;
   readonly manifest: AbjectManifest;
-  readonly capabilities: CapabilitySet;
 
   protected state: unknown;
   protected _status: AbjectState = 'initializing';
@@ -154,13 +150,22 @@ export abstract class Abject {
     requireNonEmpty(options.manifest.name, 'manifest.name');
 
     this.id = options.id ?? uuidv4();
+    // Manifests saved or written before October 2026 (persisted objects,
+    // package manifests, a model's habit) may still carry the retired
+    // capability declarations; they mean nothing, so they stop here.
+    const legacy = options.manifest as AbjectManifest & { requiredCapabilities?: unknown; providedCapabilities?: unknown };
+    let declared: AbjectManifest = options.manifest;
+    if ('requiredCapabilities' in legacy || 'providedCapabilities' in legacy) {
+      const { requiredCapabilities: _required, providedCapabilities: _provided, ...rest } = legacy;
+      declared = rest;
+    }
     // Merge introspect methods and events into the single interface
-    const iface = options.manifest.interface;
+    const iface = declared.interface;
     const hasDescribe = iface.methods.some(m => m.name === 'describe');
     this.manifest = hasDescribe
-      ? options.manifest
+      ? declared
       : {
-          ...options.manifest,
+          ...declared,
           interface: {
             ...iface,
             methods: [...iface.methods, ...INTROSPECT_METHODS],
@@ -170,13 +175,6 @@ export abstract class Abject {
     this.state = options.initialState;
     this.startedAt = Date.now();
     this.lastActivity = this.startedAt;
-
-    // Setup capabilities
-    const grants = [
-      ...getDefaultCapabilities(this.id),
-      ...(options.capabilities ?? []),
-    ];
-    this.capabilities = new CapabilitySet(grants);
   }
 
   /**
@@ -729,7 +727,7 @@ export abstract class Abject {
   /** Build the contextual Ask prompt. Default: manifest description. */
   protected askPrompt(_question: string): string {
     return `## System Model
-This is a message-passing object system called Abjects. Every object (Abject) has a mailbox, a manifest declaring its capabilities, and an ask handler for answering questions about itself. Objects communicate exclusively by sending messages to each other. The Registry knows about all objects in the system. Objects discover each other by asking the Registry, learn what other objects can do by sending them ask messages, then send messages to accomplish tasks. Every object is autonomous and processes messages from its mailbox sequentially.
+This is a message-passing object system called Abjects. Every object (Abject) has a mailbox, a manifest describing its interface (methods and events), and an ask handler for answering questions about itself. Objects communicate exclusively by sending messages to each other. The Registry knows about all objects in the system. Objects discover each other by asking the Registry, learn what other objects can do by sending them ask messages, then send messages to accomplish tasks. Every object is autonomous and processes messages from its mailbox sequentially.
 
 ## About This Object
 ${formatManifestAsDescription(this.manifest)}
@@ -1783,10 +1781,8 @@ export class SimpleAbject extends Abject {
         description,
         version: '1.0.0',
         interface: { id: 'abjects:simple' as InterfaceId, name: 'Simple', description, methods: [] },
-        requiredCapabilities: [],
         ...options.manifest,
       },
-      capabilities: options.capabilities,
       initialState: options.initialState,
     });
 

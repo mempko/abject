@@ -1257,8 +1257,6 @@ export class AgentAbject extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'agent', 'core'],
       },
     });

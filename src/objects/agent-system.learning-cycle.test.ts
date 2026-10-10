@@ -13,7 +13,7 @@ class FixtureEndpoint extends Abject {
   private values=new Map<string,unknown>();
   review?:any; goalId?:string; checker?:AbjectId; questions:string[]=[];
   constructor(name:string){
-    super({manifest:{name,version:'1',description:'Deterministic fixture endpoint',interface:{id:`fixture-${name}`,name,description:'fixture',methods:[]},requiredCapabilities:[],providedCapabilities:[]}});
+    super({manifest:{name,version:'1',description:'Deterministic fixture endpoint',interface:{id:`fixture-${name}`,name,description:'fixture',methods:[]}}});
     this.on('set',msg=>{const p=msg.payload as any;this.values.set(p.key,structuredClone(p.value));return true;});
     this.on('get',msg=>structuredClone(this.values.get((msg.payload as any).key)??null));
     this.on('registerAgent',()=>true);this.on('releaseTask',()=>true);this.on('listTasks',()=>[]);

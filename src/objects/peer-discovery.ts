@@ -104,8 +104,6 @@ export class PeerDiscoveryObject extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'peer'],
       },
     });

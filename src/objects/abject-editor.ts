@@ -14,7 +14,6 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import {
   parseHandlerMap,
   reassembleHandlerMap,
@@ -107,10 +106,6 @@ export class AbjectEditor extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display editor window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

@@ -13,7 +13,8 @@ Your objects, your messages, your peers. P2P by default.
 ## 2. All communication is secure.
 
 End-to-end encryption is not optional. Every peer has a cryptographic
-identity. Every channel is encrypted. Trust is verified, not assumed.
+identity. Every channel between peers is encrypted. Trust is verified, not
+assumed.
 
 ## 3. Everything is an object.
 
@@ -29,9 +30,12 @@ connection. Break the translator; it regenerates. Nothing stays broken.
 
 ## 5. Untrusted code runs in a sandbox.
 
-WASM sandboxes with capability-gated imports. Objects cannot see or
-touch anything they haven't been explicitly granted access to.
-Security through containment, not trust.
+Objects the system writes run in a script sandbox with no file, network
+or process access of their own. Code in other languages runs as WASM, which
+can do nothing but send messages, log, and read the clock. Everything an
+object does is a message to a capability object, and the ones that touch
+your machine follow rules you set or ask you. Security through containment,
+not trust.
 
 ## 6. Make writing decentralized software easier than centralized software.
 
@@ -45,7 +49,9 @@ can be introspected, cloned, composed, and reshared.
 
 ## 8. Work out of the box.
 
-Three commands. One system. No configuration required to start creating.
+One line to install, one command to start. Bring a model (an API key, a
+local model, or a coding CLI you already use); everything else has a
+default.
 
 ## 9. Have fun.
 

@@ -14,7 +14,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { require, invariant } from '../../core/contracts.js';
 import { request } from '../../core/message.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -178,8 +177,6 @@ export class AudioOutput extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.AUDIO_PLAY],
         tags: ['system', 'capability', 'audio'],
       },
     });

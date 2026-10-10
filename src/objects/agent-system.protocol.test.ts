@@ -10,7 +10,7 @@ import { TupleSpace } from './tuple-space.js';
 class Endpoint extends Abject {
   calls=0; private timers:Array<ReturnType<typeof setTimeout>>=[];
   constructor(name:string,runtime?:AbjectId,jobs?:AbjectId){
-    super({manifest:{name,version:'1',description:'test',interface:{id:`test-${name}`,name,description:'test',methods:[]},requiredCapabilities:[],providedCapabilities:[]}});
+    super({manifest:{name,version:'1',description:'test',interface:{id:`test-${name}`,name,description:'test',methods:[]}}});
     this.on('agentAct',async msg=>{await this.requireTaskRuntime(msg,runtime);this.calls++;return {success:true};});
     (this as any).discoverDep=async(name:string)=>name==='JobManager'?jobs:null;
     this.on('wait',msg=>{

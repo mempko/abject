@@ -349,8 +349,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'peer'],
       },
     });

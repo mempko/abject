@@ -29,7 +29,7 @@ function manifestFor(name: string): AbjectManifest {
   return {
     name, description: name, version: '1.0.0',
     interface: { id: `test:${name.toLowerCase()}`, name, description: name, methods: [] },
-    requiredCapabilities: [], providedCapabilities: [], tags: ['test'],
+    tags: ['test'],
   } as unknown as AbjectManifest;
 }
 

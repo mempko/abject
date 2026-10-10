@@ -455,17 +455,3 @@ export class OllamaProvider extends BaseLLMProvider {
     return { ...this.tierModels };
   }
 }
-
-/**
- * Create an Ollama provider with auto-detection.
- */
-export async function createOllamaProvider(): Promise<OllamaProvider | undefined> {
-  const provider = new OllamaProvider();
-
-  if (await provider.isAvailable()) {
-    return provider;
-  }
-
-  log.warn('Local Ollama not available');
-  return undefined;
-}

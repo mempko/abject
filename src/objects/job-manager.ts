@@ -137,8 +137,6 @@ export class JobManager extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'core'],
       },
     });

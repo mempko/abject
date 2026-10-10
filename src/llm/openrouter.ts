@@ -257,23 +257,3 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
     };
   }
 }
-
-export function createOpenRouterProvider(): OpenRouterProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).OPENROUTER_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  // Optional routing preferences as a JSON string, e.g.
-  // OPENROUTER_PROVIDER_PREFERENCES='{"allow_fallbacks":true,"sort":"latency"}'
-  let providerPreferences: Record<string, unknown> | undefined;
-  const prefsJson = (globalThis as Record<string, unknown>).OPENROUTER_PROVIDER_PREFERENCES as string | undefined;
-  if (prefsJson) {
-    try {
-      providerPreferences = JSON.parse(prefsJson) as Record<string, unknown>;
-    } catch {
-      log.warn('OPENROUTER_PROVIDER_PREFERENCES is not valid JSON — ignoring');
-    }
-  }
-  return new OpenRouterProvider({ apiKey, providerPreferences });
-}

@@ -12,8 +12,10 @@
  * window, a screenshot or the desktop scene ask here first.
  */
 
-import { AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+
+export const INSTANCE_INFO_ID = 'abjects:instance-info' as AbjectId;
 
 export interface InstanceInfoSource {
   /** The Abject release this instance runs. */
@@ -78,8 +80,6 @@ export class InstanceInfo extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system'],
       },
     });

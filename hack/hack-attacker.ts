@@ -7,10 +7,11 @@
 
 import { bootAbjectsCore } from './hack-bootstrap.js';
 import { SignalingClient } from '../src/network/signaling.js';
-import type { AbjectId } from '../src/core/types.js';
+import type { AbjectId, AbjectMessage } from '../src/core/types.js';
 import * as message from '../src/core/message.js';
 
-const SIGNALING_URL = 'ws://localhost:7730';
+// Set by security-audit.ts, which pins this instance to its signaling server.
+const SIGNALING_URL = process.env.ABJECTS_SIGNALING_URLS!;
 
 interface AttackResult {
   id: string;
@@ -48,8 +49,8 @@ async function main(): Promise<void> {
   });
 
   console.log('[ATTACKER] Booting...');
-  const boot = await bootAbjectsCore({ dataDir: '.abjects-hack-attacker', signalingUrl: SIGNALING_URL });
-  const { bootstrapRequest, peerRegistryId, peerId, peerRouterObj, bus } = boot;
+  const boot = await bootAbjectsCore();
+  const { bootstrapRequest, peerRegistryId, peerId, bus } = boot;
 
   console.log(`[ATTACKER] PeerId: ${peerId.slice(0, 16)}...`);
 
@@ -112,7 +113,7 @@ async function main(): Promise<void> {
 
   // Get victim's public keys via signaling
   console.log('[ATTACKER] Finding victim keys via signaling...');
-  let victimKeys: { publicSigningKey: string; publicExchangeKey: string; name: string } | null = null;
+  let victimKeys = null as { publicSigningKey: string; publicExchangeKey: string; name: string } | null;
 
   try {
     const sigClient = new SignalingClient();
@@ -158,8 +159,12 @@ async function main(): Promise<void> {
 
   // Wait for P2P connection to establish
   console.log('[ATTACKER] Waiting for P2P connection...');
+  // Long enough to ride out one failed offer: the probes above briefly bump
+  // this instance off signaling, so the first attempt can hit the transport's
+  // 20s connection timeout before a retry succeeds.
+  const CONNECT_ATTEMPTS = 40;
   let connected = false;
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < CONNECT_ATTEMPTS; i++) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     const state = await bootstrapRequest<string>(
       peerRegistryId, 'getContactState', { peerId: victimInfo.peerId },
@@ -169,7 +174,7 @@ async function main(): Promise<void> {
       console.log('[ATTACKER] P2P connection established!');
       break;
     }
-    console.log(`[ATTACKER] Connection state: ${state} (attempt ${i + 1}/20)`);
+    console.log(`[ATTACKER] Connection state: ${state} (attempt ${i + 1}/${CONNECT_ATTEMPTS})`);
   }
 
   if (!connected) {
@@ -246,7 +251,7 @@ async function main(): Promise<void> {
       attackPending.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject, timer,
       });
-      bus.send(msg).catch(reject);
+      try { bus.send(msg); } catch (err) { reject(err as Error); }
     });
   }
 
@@ -471,7 +476,7 @@ async function main(): Promise<void> {
             reject: (e) => { clearTimeout(timer); reject(e); },
             timer,
           });
-          bus.send(spoofedMsg).catch(reject);
+          try { bus.send(spoofedMsg); } catch (err) { reject(err as Error); }
         });
         result = 'Spoofed message was processed!';
         status = 'VULN';
@@ -502,7 +507,7 @@ async function main(): Promise<void> {
 
     try {
       // Craft a fake reply message addressed to the victim's storage
-      const fakeReply: import('../src/core/types.js').AbjectMessage = {
+      const fakeReply: AbjectMessage = {
         header: {
           messageId: 'fake-reply-001',
           correlationId: 'fake-original-001',
@@ -519,7 +524,7 @@ async function main(): Promise<void> {
         protocol: { version: '1.0.0' },
       };
 
-      await bus.send(fakeReply);
+      bus.send(fakeReply);
       // If it went through, the reply would be injected into the victim's bus
       result = 'Reply message sent (may have been routed)';
       status = 'INFO'; // Hard to tell if it actually reached the target
@@ -725,7 +730,7 @@ async function main(): Promise<void> {
   process.on('message', (msg: { type: string }) => {
     if (msg.type === 'shutdown') {
       console.log('[ATTACKER] Shutting down...');
-      boot.runtime.stop().then(() => process.exit(0));
+      void boot.shutdown();
     }
   });
 }

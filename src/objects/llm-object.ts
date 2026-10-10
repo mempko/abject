@@ -9,14 +9,12 @@ import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
-import { Capabilities } from '../core/capability.js';
 import * as msg from '../core/message.js';
 import { event } from '../core/message.js';
 import {
   LLMProvider,
   LLMProviderDescription,
   FetchDelegate,
-  FetchResult,
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
@@ -196,7 +194,6 @@ import { GeminiProvider } from '../llm/google-gemini.js';
 import { KimiProvider } from '../llm/kimi.js';
 import { MetaProvider } from '../llm/meta.js';
 import { MiniMaxProvider } from '../llm/minimax.js';
-import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
 
 const log = new Log('LLM');
 
@@ -567,7 +564,6 @@ export class LLMObject extends Abject {
   private tierFallbacks: TierFallbacks = {};
   /** Optional vision substitute for image-bearing steps on text-only tiers. */
   private visionFallback?: TierConfig;
-  private httpClientId?: AbjectId;
 
   // ── Decisions ─────────────────────────────────────────────────────
   /** Decision-only providers (TypeSafe). Chat providers that also decide are found in `providers`. */
@@ -1100,8 +1096,6 @@ export class LLMObject extends Abject {
               { name: 'providersChanged', description: 'A provider implemented by another abject was registered, updated or withdrawn; payload { name, registered }', payload: { kind: 'object', properties: {} } },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.LLM_QUERY],
         tags: ['system', 'llm', 'ai'],
       },
     });
@@ -1790,7 +1784,6 @@ export class LLMObject extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
     if (this.storageId) {
       // Order matters: the retention policy decides what the ledger load is
@@ -1828,48 +1821,6 @@ export class LLMObject extends Abject {
   }
 
   /**
-   * Create a FetchDelegate that routes HTTP requests through the HttpClient abject.
-   */
-  private createFetchDelegate(): FetchDelegate {
-    const self = this;
-    return async (url: string, init: RequestInit, options?: { timeout?: number }): Promise<FetchResult> => {
-      require(self.httpClientId !== undefined, 'httpClientId not set');
-
-      const timeout = options?.timeout ?? 300000;
-
-      // Resolve relative URLs (e.g. /api/anthropic/v1/messages) to absolute
-      const resolvedUrl = url.startsWith('/') && typeof window !== 'undefined'
-        ? new URL(url, window.location.origin).href
-        : url;
-
-      const httpRequest: HttpRequest = {
-        method: (init.method as HttpRequest['method']) ?? 'GET',
-        url: resolvedUrl,
-        headers: init.headers as Record<string, string> | undefined,
-        body: init.body as string | undefined,
-        timeout,
-      };
-
-      const requestMsg = msg.request(
-        self.id,
-        self.httpClientId!,
-        'request',
-        httpRequest
-      );
-
-      const response = await self.request<HttpResponse>(requestMsg, timeout + 5000);
-
-      return {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-        body: response.body,
-        ok: response.ok,
-      };
-    };
-  }
-
-  /**
    * Configure providers and tier routing.
    * All providers with valid credentials are registered simultaneously.
    */
@@ -1883,7 +1834,14 @@ export class LLMObject extends Abject {
     decisionRoute?: DecisionRoute | null;
     decisionPolicy?: Partial<DecisionPolicy>;
   }): Promise<void> {
-    const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
+    // Built-in providers call the endpoints the person configured in Settings
+    // > AI directly, the way streaming and Ollama always have. HttpClient's
+    // web rules (enabled, allowed and denied domains, private hosts) govern
+    // what abjects may reach; applying them to the system's own model calls
+    // made a domain allow-list break non-streaming calls while streaming
+    // calls to the same provider went through. Abject-backed providers are
+    // abjects, so their calls still go through HttpClient.
+    const fetchFn: FetchDelegate | undefined = undefined;
     const credentials = config.credentials ?? {};
 
     // Decision-only providers, registered when a key is present.

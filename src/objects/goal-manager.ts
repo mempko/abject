@@ -1114,8 +1114,6 @@ export class GoalManager extends Abject {
             { name: 'goalReadyForCompletion', description: 'All tasks of a goal reached terminal state. Sent once to the goal\'s creator so they can decide whether to completeGoal, replan, failGoal, or add follow-up tasks. Goal stays active until the creator acts on it.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, creatorAgentId: { kind: 'primitive', primitive: 'string' }, doneTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, failedTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } } } } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'core'],
       },
     });

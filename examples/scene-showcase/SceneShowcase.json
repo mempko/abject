@@ -173,10 +173,6 @@
         }
       ]
     },
-    "requiredCapabilities": [],
-    "providedCapabilities": [
-      "abjects:demo:scene-showcase"
-    ],
     "tags": [
       "demo",
       "3d",

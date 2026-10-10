@@ -238,8 +238,6 @@ export class CanvasWidget extends WidgetAbject {
             },
           ],
         },
-      requiredCapabilities: [],
-      providedCapabilities: [],
       tags: ['widget', 'canvas'],
     };
 

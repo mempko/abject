@@ -907,18 +907,3 @@ export class OpenAIProvider extends BaseLLMProvider {
     };
   }
 }
-
-/**
- * Create an OpenAI provider from environment.
- */
-export function createOpenAIProvider(): OpenAIProvider | undefined {
-  const apiKey =
-    (globalThis as Record<string, unknown>).OPENAI_API_KEY as string | undefined;
-
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-
-  return new OpenAIProvider({ apiKey });
-}

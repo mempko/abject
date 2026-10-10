@@ -22,7 +22,6 @@ import { domainFailure, type ResultContract } from '../core/result-contract.js';
 import { encodeAgentState } from '../core/agent-session-codec.js';
 import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, ObjectSummary, SpawnRequest, SpawnResult } from '../core/types.js';
 import { Abject, DEFERRED_REPLY, isTemporaryAskResponse } from '../core/abject.js';
-import { Capabilities } from '../core/capability.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject, SOURCE_DECLARED_DESCRIPTION } from './scriptable-abject.js';
@@ -504,8 +503,6 @@ export class ObjectCreator extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'creation'],
       },
     });
@@ -708,13 +705,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return {
         ok: false,
         summary: 'draft_manifest: missing manifest',
-        error: `No manifest object found in the action (got fields: ${got}). Pass it as the \`manifest\` field: {"action":"draft_manifest","manifest":{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], tags: [] },"usedObjects":[...]}`,
+        error: `No manifest object found in the action (got fields: ${got}). Pass it as the \`manifest\` field: {"action":"draft_manifest","manifest":{ name, description, version, icon, interface: { id, name, description, methods, events? }, tags: [] },"usedObjects":[...]}`,
       };
     }
     normalizeDraftManifest(manifest);
     if (!manifest.name || !manifest.interface) {
       const missing = [!manifest.name && 'name', !manifest.interface && 'interface'].filter(Boolean).join(' and ');
-      return { ok: false, summary: 'draft_manifest: malformed', error: `manifest is missing ${missing}. Required shape: { name, description, version, interface: { id, name, description, methods, events? }, requiredCapabilities: [], tags: [] }` };
+      return { ok: false, summary: 'draft_manifest: malformed', error: `manifest is missing ${missing}. Required shape: { name, description, version, interface: { id, name, description, methods, events? }, tags: [] }` };
     }
     state.draftManifest = manifest;
     const usedObjects = this.actionField(action, ['usedObjects', 'dependencies', 'deps']);
@@ -2900,7 +2897,7 @@ ${source}
   private draftManifestSystemPrompt(): string {
     return [
       'You are drafting an AbjectManifest in JSON. Output ONE ```json code block, nothing else.',
-      'Required shape: { manifest: { name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }, usedObjects: string[] }.',
+      'Required shape: { manifest: { name, description, version, icon, interface: { id, name, description, methods, events? }, tags: [] }, usedObjects: string[] }.',
       'Each method has { name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns }.',
       'Set `icon` to a single emoji that best represents the object, shown next to its name in launchers (e.g. weather → 🌤, notes → 📝, a game → 🎮, a chart → 📊). Pick something distinctive and relevant.',
       'Use the provided usage guides verbatim — do not invent method names on dependencies.',
@@ -3618,7 +3615,7 @@ ${source}
       // A visual check needs a model that can see and a display to capture.
       const noDisplay = (await this.refreshDisplay()) === false;
       const visualAvailable = noDisplay ? false : visionAvailable;
-      const authorsUI = extra.state.kind !== 'investigate' && !!extra.state.draftSource && extra.state.draftManifest?.requiredCapabilities?.some(c => c.capability === Capabilities.UI_SURFACE);
+      const authorsUI = extra.state.kind !== 'investigate' && !!extra.state.draftSource && ObjectCreator.authorsUI(extra.state);
       if (gate.ok && authorsUI && visualAvailable === true && !extra.state.visualSinceDeploy) return { accepted: false, reason: 'Capture and inspect this application through Screenshot.captureWindow after the last deployment; unrelated windows cannot verify it' };
       if (gate.ok && target && extra.state.draftSource) {
         if (!this.abjectStoreId) return {accepted:false,reason:'Durable snapshot service unavailable'};
@@ -4126,9 +4123,8 @@ ${source}
     return state.targetObjectId ?? 'staged-draft';
   }
 
-  /** Whether the loop's object (as drafted, or as a UI surface in its source) has a window. */
+  /** Whether the loop's object has a window: its source creates one or talks to WidgetManager. */
   private static authorsUI(state: LoopState): boolean {
-    if (state.draftManifest?.requiredCapabilities?.some(c => c.capability === Capabilities.UI_SURFACE)) return true;
     return /\bcreateWindow\b|WidgetManager/.test(state.draftSource ?? state.targetSource ?? '');
   }
 
@@ -5112,7 +5108,7 @@ Your local actions are the supported way to create and modify Abjects: they carr
 
 - \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, make the whole change with \`edit_source\`, then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`clone_object({objectId?, targetName?, newName, description?, withData?})\` — clone an EXISTING source-backed object into a NEW one ENTIRELY server-side: resolves the original, copies its manifest + source renamed to \`newName\`, spawns it with you as owner in this workspace's registry, persists it, and adopts the clone as this loop's modify target. No source passes through your context, so this is THE way to build "a new object based on that one" (a shorter variant of an existing deck, a themed copy of an app) even when the original is far too large to draft. Then inspect with \`read_draft\`, change with \`edit_source\`, ship with \`deploy_update\`. \`withData: true\` also deep-copies the original's data (default: the clone starts with fresh data). For authoring from scratch, use \`draft_source\` + \`deploy_spawn\` instead.
-- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
+- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, use \`edit_source\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
 - \`edit_source({edits, more?})\` — **the way to change an existing object.** Apply a whole change-set in ONE action: \`edits\` is an array applied in order, where each entry is
   - \`{ op: "replace", name, body }\` — swap the entire top-level member \`name\` for \`body\` (the FULL member text including its signature, e.g. \`"openMap(msg) { … }"\`). Addressed by name through the object literal's structure: no SEARCH text to match, whitespace-proof, unaffected by file size.

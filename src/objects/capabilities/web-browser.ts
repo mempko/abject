@@ -19,7 +19,6 @@ import { AbjectId, AbjectMessage, MethodDeclaration } from '../../core/types.js'
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, request } from '../../core/message.js';
 import { require as requireContract } from '../../core/contracts.js';
-import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -1024,8 +1023,6 @@ export class WebBrowser extends Abject {
             description: 'Headless browser operations — one-shot and stateful page API',
             methods: [...ONE_SHOT_METHODS, ...STATEFUL_METHODS, ...PROFILE_METHODS],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.WEB_BROWSE],
         tags: ['system', 'capability', 'web', 'browser'],
       },
     });

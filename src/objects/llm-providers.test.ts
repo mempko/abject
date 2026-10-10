@@ -35,8 +35,6 @@ function manifestFor(name: string, methods: string[] = []): AbjectManifest {
       description: name,
       methods: methods.map(m => ({ name: m, description: m, parameters: [] })),
     },
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
   } as unknown as AbjectManifest;
 }
@@ -188,7 +186,7 @@ test('a package provider streams, and every workspace\'s copy of it backs one na
       source: GATEWAY_SOURCE, owner: packageOwner('gateway-pkg'),
     });
     const spawnIn = async (ws: string) => (await factory.spawn({
-      manifest: { name: 'Gateway', description: '', version: '1.0.0', requiredCapabilities: [], tags: [] } as unknown as AbjectManifest,
+      manifest: { name: 'Gateway', description: '', version: '1.0.0', tags: [] } as unknown as AbjectManifest,
       typeId: `peer/${ws}/Gateway` as TypeId,
     })).objectId;
     const a = await spawnIn('ws1');
@@ -267,7 +265,7 @@ test('the OpenAI-compatible example registers from its settings, maps calls to t
     await rt.objectFactory.spawnInstance(new Packages());
     assert.deepEqual((await ingestAllExtensions(rt.objectFactory)).map(e => e.typeName), ['OpenAICompatible']);
     const provider = (await rt.objectFactory.spawn({
-      manifest: { name: 'OpenAICompatible', description: '', version: '1.0.0', requiredCapabilities: [], tags: [] } as unknown as AbjectManifest,
+      manifest: { name: 'OpenAICompatible', description: '', version: '1.0.0', tags: [] } as unknown as AbjectManifest,
       typeId: 'peer/ws/OpenAICompatible' as TypeId,
     })).objectId;
 

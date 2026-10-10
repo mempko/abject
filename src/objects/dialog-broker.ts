@@ -190,8 +190,6 @@ export class DialogBroker extends Abject {
             { name: 'dialogClosed', description: 'Sent to responders when a dialog closes (payload: { dialogId, answered }).', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'security'],
       },
     });

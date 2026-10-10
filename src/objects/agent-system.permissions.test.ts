@@ -19,7 +19,7 @@ const answer = (option: string) => ({ answered: true, confirmed: true, option })
 
 class Endpoint extends Abject {
   constructor(name: string) { super({ manifest: { name, version: '1', description: 'Permission fixture',
-    interface: { id: name, name, description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
+    interface: { id: name, name, description: 'fixture', methods: [] } } }); }
   public override on(method: string, handler: MessageHandlerFn) { super.on(method, handler); }
   call(to: string, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id, to, method, payload), 5000); }
 }

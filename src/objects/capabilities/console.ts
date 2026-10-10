@@ -12,7 +12,6 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { request } from '../../core/message.js';
 
 const CONSOLE_INTERFACE = 'abjects:console';
@@ -137,8 +136,6 @@ export class Console extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.CONSOLE],
         tags: ['system', 'capability', 'console', 'debug'],
       },
     });

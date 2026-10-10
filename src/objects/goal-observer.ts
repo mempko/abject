@@ -107,8 +107,6 @@ export class GoalObserver extends Abject {
             }}},
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'core', 'monitoring'],
       },
     });

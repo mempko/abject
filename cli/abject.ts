@@ -27,14 +27,14 @@ import { cliDataDir, cliEdition, dataDirInUse, findBackend, type BackendTarget }
 import { confirmLine, connectClient } from './connect.js';
 import { runTui, runPlain } from './chat-ui.js';
 import {
-  canServe, logFilePath, serve, showLogs, startInBackground, stopBackend, waitForBackend,
+  canServe, logFilePath, restartOwner, serve, showLogs, startInBackground, stopBackend, waitForBackend,
 } from './backend.js';
 import { runLocalSetup, runRemoteSetup } from './setup.js';
 import { installService, serviceStatus, uninstallService } from './service.js';
 import { cliVersion, restartBackend, runUpdate } from './update.js';
 import { runDoctor } from './doctor.js';
 import { liveInstance, readInstance } from '../server/instance-file.js';
-import { isSettingsCommand, runSettingsCommand, settingsErrorText } from './settings.js';
+import { SETTINGS_HELP, isSettingsCommand, runSettingsCommand, settingsErrorText } from './settings.js';
 import { stripAnsi } from './markdown.js';
 import type { DialogInfo } from './client.js';
 
@@ -128,6 +128,23 @@ async function ensureBackend(dataDir: string, url: string | undefined, startIfMi
   }
 }
 
+/**
+ * After setup downloaded the browser: restart a backend this command started
+ * so it finds it, or say how to restart one something else runs. True when
+ * it restarted.
+ */
+async function restartAfterSetup(dataDir: string): Promise<boolean> {
+  const owner = await restartOwner(dataDir);
+  if (!owner.running) return false;
+  if (!owner.ours) {
+    say(`Restart the backend so it finds the browser: ${owner.hint}.`);
+    return false;
+  }
+  say('Restarting the backend to pick up the browser…');
+  await restartBackend(dataDir);
+  return true;
+}
+
 /** Open the chat, offering setup first on an instance with no model. */
 async function chat(args: Args, dataDir: string): Promise<void> {
   const interactive = !!process.stdin.isTTY && !!process.stdout.isTTY && !args.plain;
@@ -145,11 +162,7 @@ async function chat(args: Args, dataDir: string): Promise<void> {
     if (!configured && await confirmLine('No AI model is set up yet. Run guided setup now?', true)) {
       const { restart } = await runRemoteSetup(client, dataDir);
       client.close();
-      if (restart && target.instance?.edition === 'headless') {
-        say('Restarting the backend to pick up the browser…');
-        await restartBackend(dataDir);
-        target = (await findBackend(dataDir)) ?? target;
-      }
+      if (restart && await restartAfterSetup(dataDir)) target = (await findBackend(dataDir)) ?? target;
     } else {
       client.close();
     }
@@ -262,10 +275,17 @@ async function mode(dataDir: string, url: string | undefined, value?: string): P
 /** `abject settings <cmd> ...`: the TUI's settings commands from the shell. */
 async function settings(dataDir: string, url: string | undefined, rest: string[]): Promise<void> {
   const [cmd = 'help', ...args] = rest;
+  if (cmd === 'help') {
+    say('usage: abject settings <command> [args]: the chat\'s settings commands, without the slash');
+    for (const line of SETTINGS_HELP.slice(1)) {
+      if (!line.trimStart().startsWith('/settings ')) say(line.replace(/(^|[\s,(])\/(?=[a-z])/g, '$1').replace('add remove', 'add, remove'));
+    }
+    return;
+  }
+  if (!isSettingsCommand(cmd)) throw new Error(`Unknown settings command: ${cmd}. Try: abject settings help`);
   const { target } = await ensureBackend(dataDir, url, false);
   const client = await connectClient(target);
   try {
-    if (!isSettingsCommand(cmd)) throw new Error(`Unknown settings command: ${cmd}. Try: abject settings get ai`);
     const workspaces = await client.listWorkspaces();
     const ws = workspaces.find(w => w.active) ?? workspaces[0];
     for (const line of await runSettingsCommand(client, cmd, args, ws ? { id: ws.id, name: ws.name } : undefined)) {
@@ -298,10 +318,7 @@ async function main(): Promise<void> {
       const client = await connectClient(target);
       const { restart } = await runRemoteSetup(client, dir);
       client.close();
-      if (restart && target.instance?.edition === 'headless') {
-        say('Restarting the backend to pick up the browser…');
-        await restartBackend(dir);
-      }
+      if (restart) await restartAfterSetup(dir);
       return;
     }
     case 'serve':
@@ -320,13 +337,14 @@ async function main(): Promise<void> {
       say(result === 'stopped' ? 'Stopped.' : 'Not running.');
       return;
     }
-    case 'restart':
-      if (!canServe() || (readInstance(dataDir)?.edition === 'desktop' && await liveInstance(dataDir))) {
-        throw new Error('The desktop app runs this backend: restart the app.');
-      }
+    case 'restart': {
+      if (!canServe()) throw new Error('The desktop app runs its own backend: restart the app.');
+      const owner = await restartOwner(dataDir);
+      if (owner.running && !owner.ours) throw new Error(`This backend was not started by \`abject start\`: ${owner.hint}.`);
       await restartBackend(dataDir);
       say('Restarted.');
       return;
+    }
     case 'status':
       return status(dataDir, args.url);
     case 'logs':

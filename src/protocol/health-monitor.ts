@@ -3,8 +3,9 @@
  * and monitors object liveness via periodic ping.
  *
  * Uses message passing for all dependencies — no direct object references.
- * Exposes message handlers for error tracking so the HealthInterceptor
- * can report errors passively.
+ * A connection's proxy route (src/runtime/proxy-routes.ts) reports each of
+ * the proxy's answers here as recordSuccess or recordError, on whichever bus
+ * carried it.
  *
  * Object liveness: periodically pings monitored objects. After N consecutive
  * failures, notifies the Supervisor to restart the dead object.
@@ -251,7 +252,6 @@ export class HealthMonitor extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
         tags: ['system', 'health', 'monitoring'],
       },
     });
@@ -698,17 +698,13 @@ export class HealthMonitor extends Abject {
 
     log.info(`Triggering renegotiation for ${agreementId}`);
 
-    // Notify listeners
-    this.send(
-      event(
-        this.id,
-        this.id, // Self-notification for logging
-        'renegotiationTriggered',
-        agreementId
-      )
-    );
+    // Tell dependents (a monitor window, a curious agent) it is happening.
+    this.changed('renegotiationTriggered', agreementId);
 
     try {
+      // The Negotiator may have been restarted under a new id since boot.
+      this.negotiatorId = await this.resolveDep('Negotiator', this.negotiatorId);
+      if (!this.negotiatorId) return false;
       const result = await this.request<{ success: boolean }>(
         request(this.id, this.negotiatorId, 'renegotiate', {
           agreementId,

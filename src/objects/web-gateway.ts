@@ -27,6 +27,11 @@
  * abject. Public routes need no credential; authenticated routes take a bearer
  * token, either an API token minted here (stored only as a hash) or a session
  * token from the desktop's own web login.
+ *
+ * Changes are taken from those entitled to them: the listener, its port and
+ * the API tokens from the gateway window, the Peer Network window and abjects
+ * in a local workspace; a workspace's exposure from that workspace's own
+ * WebExposure (admitControl, admitExposer).
  */
 
 import * as http from 'http';
@@ -34,16 +39,34 @@ import * as crypto from 'crypto';
 import { AbjectId, AbjectMessage, InterfaceId, AbjectManifest, MethodDeclaration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { AuthConfig, SessionStore } from '../../server/auth.js';
 import type { WorkspaceExposure, WebExposureEntry } from './web-exposure.js';
-import { DEFAULT_HTTP_HANDLER } from './web-exposure.js';
+import { DEFAULT_HTTP_HANDLER, slugify } from './web-exposure.js';
 import { safeEqual } from './capabilities/crypto.js';
 import { randomToken } from '../core/encoding.js';
 
 const log = new Log('WebGateway');
+
+/**
+ * Who may turn the listener on or off, move its port, and mint or revoke API
+ * tokens, by registered name: the gateway's own window and the Peer Network
+ * window's Web Access tab. Abjects in a local workspace this peer hosts are
+ * admitted as well (see admitControl).
+ */
+const CONTROLLERS: readonly string[] = ['WebGatewayBrowser', 'PeerNetwork'];
+/** The per-workspace object that reports what its workspace exposes. */
+const EXPOSER = 'WebExposure';
+
+/**
+ * A built-in object's typeId: `{peer}/system/{Name}` or
+ * `{peer}/{workspace}/{Name}`. A user object carries
+ * `{peer}/{workspace}/user/{Name}`, so it cannot pass for a built-in by name.
+ */
+function builtinTypeId(typeId: string | undefined): boolean {
+  return !typeId || String(typeId).split('/').length <= 3;
+}
 
 const ENABLED_KEY = 'web-gateway:enabled';
 const TOKENS_KEY = 'web-gateway:tokens';
@@ -114,6 +137,9 @@ const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'tra
 const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
+/** A workspace as WorkspaceManager's listWorkspacesDetailed gives it (the fields used here). */
+interface ListedWorkspace { workspaceId: string; name: string; registryId: AbjectId; childIds: AbjectId[] }
+
 export interface WebGatewayArgs { port: number; bind?: string; authConfig: AuthConfig; sessions: SessionStore; }
 
 export class WebGateway extends Abject {
@@ -144,22 +170,20 @@ export class WebGateway extends Abject {
           description: 'Inbound HTTP for abjects',
           methods: [
             { name: 'getStatus', description: 'Whether the gateway is on, its bound address and port, and how many routes are live.', parameters: [], returns: { kind: 'object', properties: {} } },
-            { name: 'setEnabled', description: 'Turn the HTTP listener on or off.', parameters: [{ name: 'enabled', type: { kind: 'primitive', primitive: 'boolean' }, description: 'On or off' }], returns: { kind: 'object', properties: {} } },
+            { name: 'setEnabled', description: 'Turn the HTTP listener on or off. Taken from the gateway window, the Peer Network window, and abjects in a local workspace only.', parameters: [{ name: 'enabled', type: { kind: 'primitive', primitive: 'boolean' }, description: 'On or off' }], returns: { kind: 'object', properties: {} } },
             { name: 'getRoutes', description: 'The live routes: one entry per exposed abject, with its workspace, access level, and methods.', parameters: [], returns: { kind: 'array', elementType: { kind: 'object', properties: {} } } },
-            { name: 'mintToken', description: 'Create an API token for authenticated routes. The plaintext is returned once and never stored.', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'A label for the token' }], returns: { kind: 'object', properties: {} } },
+            { name: 'mintToken', description: 'Create an API token for authenticated routes. The plaintext is returned once and never stored. Taken from the gateway window, the Peer Network window, and abjects in a local workspace only.', parameters: [{ name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'A label for the token' }], returns: { kind: 'object', properties: {} } },
             { name: 'listTokens', description: 'The API tokens, by id and label (never the secret).', parameters: [], returns: { kind: 'array', elementType: { kind: 'object', properties: {} } } },
-            { name: 'revokeToken', description: 'Revoke an API token by id.', parameters: [{ name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Token id' }], returns: { kind: 'object', properties: {} } },
-            { name: 'setPort', description: 'Set the HTTP gateway port. 0 or null means automatic (the system picks a free port).', parameters: [{ name: 'port', type: { kind: 'primitive', primitive: 'number' }, description: 'TCP port; 0 = automatic' }], returns: { kind: 'object', properties: {} } },
-            { name: 'syncWorkspace', description: "Update a workspace's exposure (called by its WebExposure).", parameters: [{ name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace id' }], returns: { kind: 'object', properties: {} } },
-            { name: 'dropWorkspace', description: 'Forget a workspace (called when its WebExposure stops).', parameters: [{ name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace id' }], returns: { kind: 'object', properties: {} } },
+            { name: 'revokeToken', description: 'Revoke an API token by id. Taken from the gateway window, the Peer Network window, and abjects in a local workspace only.', parameters: [{ name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Token id' }], returns: { kind: 'object', properties: {} } },
+            { name: 'setPort', description: 'Set the HTTP gateway port. 0 or null means automatic (the system picks a free port). Taken from the gateway window, the Peer Network window, and abjects in a local workspace only.', parameters: [{ name: 'port', type: { kind: 'primitive', primitive: 'number' }, description: 'TCP port; 0 = automatic' }], returns: { kind: 'object', properties: {} } },
+            { name: 'syncWorkspace', description: "Update a workspace's exposure. Taken from that workspace's own WebExposure only.", parameters: [{ name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace id' }], returns: { kind: 'object', properties: {} } },
+            { name: 'dropWorkspace', description: 'Forget a workspace (sent when its WebExposure stops). Taken from its WebExposure, or for a workspace WorkspaceManager no longer lists.', parameters: [{ name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace id' }], returns: { kind: 'object', properties: {} } },
             { name: 'getPort', description: 'The port the gateway listens on.', parameters: [], returns: { kind: 'primitive', primitive: 'number' } },
           ],
           events: [
             { name: 'gatewayChanged', description: 'The gateway status, routes, or tokens changed', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.HTTP_SERVER_LISTEN],
         tags: ['system', 'web'],
       },
     });
@@ -170,17 +194,20 @@ export class WebGateway extends Abject {
 
     this.on('getStatus', () => this.gwStatus());
     this.on('setEnabled', async (msg: AbjectMessage) => {
+      await this.admitControl(msg);
       const { enabled } = msg.payload as { enabled: boolean };
       await this.setEnabled(!!enabled);
       return this.gwStatus();
     });
     this.on('setPort', async (msg: AbjectMessage) => {
+      await this.admitControl(msg);
       const { port } = msg.payload as { port?: number | null };
       await this.setPort(typeof port === 'number' && Number.isFinite(port) ? Math.trunc(port) : 0);
       return this.gwStatus();
     });
     this.on('getRoutes', () => this.routes());
     this.on('mintToken', async (msg: AbjectMessage) => {
+      await this.admitControl(msg);
       const { name } = msg.payload as { name?: string };
       const secret = `abjk_${randomToken(24)}`;
       const token: ApiToken = { id: crypto.randomUUID(), name: (name ?? 'token').slice(0, 80), hash: this.hash(secret), createdAt: Date.now() };
@@ -192,6 +219,7 @@ export class WebGateway extends Abject {
     });
     this.on('listTokens', () => this.tokens.map(t => ({ id: t.id, name: t.name, createdAt: t.createdAt, lastUsedAt: t.lastUsedAt })));
     this.on('revokeToken', async (msg: AbjectMessage) => {
+      await this.admitControl(msg);
       const { id } = msg.payload as { id: string };
       const before = this.tokens.length;
       this.tokens = this.tokens.filter(t => t.id !== id);
@@ -199,15 +227,34 @@ export class WebGateway extends Abject {
       this.changed('gatewayChanged', this.gwStatus());
       return { success: this.tokens.length < before };
     });
-    this.on('syncWorkspace', (msg: AbjectMessage) => {
-      const ws = msg.payload as WorkspaceExposure;
-      if (!ws?.workspaceId || !ws.registryId) return { success: false, error: 'workspaceId and registryId required' };
-      this.workspaces.set(ws.workspaceId, { ...ws, slug: this.uniqueSlug(ws.slug, ws.workspaceId) });
+    this.on('syncWorkspace', async (msg: AbjectMessage) => {
+      const ws = (msg.payload ?? {}) as Partial<WorkspaceExposure>;
+      if (typeof ws.workspaceId !== 'string' || ws.workspaceId === '') return { success: false, error: 'workspaceId required' };
+      // A workspace created while the server runs spawns its objects before
+      // WorkspaceManager lists it; its WebExposure pushes again once it does.
+      const listed = await this.listedWorkspace(ws.workspaceId);
+      if (!listed) return { success: false, error: `WorkspaceManager lists no workspace ${ws.workspaceId}` };
+      await this.admitExposer(msg, listed);
+      // The pusher reports what it exposes; where to route (the workspace's
+      // registry) and what to call it come from WorkspaceManager.
+      this.workspaces.set(listed.workspaceId, {
+        workspaceId: listed.workspaceId, name: listed.name,
+        slug: this.uniqueSlug(slugify(listed.name, listed.workspaceId), listed.workspaceId),
+        registryId: listed.registryId,
+        enabled: ws.enabled === true,
+        entries: ws.entries && typeof ws.entries === 'object' ? ws.entries : {},
+      });
       this.changed('gatewayChanged', this.gwStatus());
       return { success: true };
     });
-    this.on('dropWorkspace', (msg: AbjectMessage) => {
-      const { workspaceId } = msg.payload as { workspaceId: string };
+    this.on('dropWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId } = (msg.payload ?? {}) as { workspaceId?: string };
+      if (typeof workspaceId !== 'string' || !this.workspaces.has(workspaceId)) return { success: true };
+      // A workspace WorkspaceManager no longer lists is gone, and forgetting it
+      // is right whoever says so. One it still lists is dropped only on the
+      // word of its own WebExposure.
+      const listed = await this.listedWorkspace(workspaceId);
+      if (listed) await this.admitExposer(msg, listed);
       this.workspaces.delete(workspaceId);
       this.changed('gatewayChanged', this.gwStatus());
       return { success: true };
@@ -248,23 +295,97 @@ export class WebGateway extends Abject {
   // ── Recovery: ask every workspace what it exposes ──
   private async resyncAll(): Promise<void> {
     if (!this.workspaceManagerId) return;
-    let detailed: Array<{ workspaceId: string; name: string; registryId: AbjectId }> = [];
+    let detailed: ListedWorkspace[] = [];
     try {
       detailed = await this.request(request(this.id, this.workspaceManagerId, 'listWorkspacesDetailed', {}), 15_000);
     } catch { return; }
     for (const w of detailed) {
       try {
-        const hits = await this.request<Array<{ id: AbjectId; name: string }>>(request(this.id, w.registryId, 'search', { query: 'WebExposure' }), 10_000);
-        const exp = hits.find(h => h.name === 'WebExposure');
+        const hits = await this.request<Array<{ id: AbjectId; name: string }>>(request(this.id, w.registryId, 'search', { query: EXPOSER }), 10_000);
+        // The workspace's own WebExposure: a search also reaches the global
+        // registry, where any object could have registered under that name.
+        const exp = hits.find(h => h.name === EXPOSER && (w.childIds ?? []).includes(h.id));
         if (!exp) continue;
         const config = await this.request<{ enabled: boolean; entries: Record<string, WebExposureEntry> }>(request(this.id, exp.id, 'getConfig', {}), 10_000);
-        const { slugify } = await import('./web-exposure.js');
         this.workspaces.set(w.workspaceId, {
           workspaceId: w.workspaceId, name: w.name, slug: this.uniqueSlug(slugify(w.name, w.workspaceId), w.workspaceId),
           registryId: w.registryId, enabled: config.enabled, entries: config.entries,
         });
       } catch { /* a workspace without WebExposure simply is not served */ }
     }
+  }
+
+  // ── Who may change the gateway ──
+  // Requests from the network are served inside this object (handle); these
+  // checks are on bus senders only.
+
+  /**
+   * Turning the listener on or off, moving its port, and minting or revoking
+   * API tokens are taken from the gateway's window and the Peer Network
+   * window (system objects, so a user object of the same name, which carries
+   * a `user/` typeId, is refused), and from abjects in a LOCAL workspace this
+   * peer hosts: the person made that workspace and everything in it, and on
+   * the headless edition such an abject is how the gateway is driven. Shared
+   * and public workspaces are refused, as are joined mirrors of remote
+   * workspaces, and so is a caller whose identity cannot be established.
+   */
+  private async admitControl(msg: AbjectMessage): Promise<void> {
+    const caller = msg.routing.from;
+    const identity = await this.resolveCallerIdentity(caller);
+    if (identity && CONTROLLERS.includes(identity.name) && builtinTypeId(identity.typeId)) return;
+    if (identity && (await this.callerInLocalWorkspace(caller))) return;
+    require(false, `WebGateway takes this request from ${CONTROLLERS.join(' or ')}, or an abject in a local workspace, only`);
+  }
+
+  /**
+   * True when the caller belongs to a workspace this peer hosts in local mode.
+   * Any lookup failure denies.
+   */
+  private async callerInLocalWorkspace(callerId: AbjectId): Promise<boolean> {
+    const wmId = await this.resolveDep('WorkspaceManager', this.workspaceManagerId);
+    if (!wmId) return false;
+    this.workspaceManagerId = wmId;
+    try {
+      const ws = await this.request<{ accessMode: string; joined?: boolean } | null>(
+        request(this.id, wmId, 'findWorkspaceForObject', { objectId: callerId }), 5000);
+      return !!ws && ws.accessMode === 'local' && ws.joined !== true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A workspace as WorkspaceManager lists it, or null when it lists none by that id (not yet, or no longer). */
+  private async listedWorkspace(workspaceId: string): Promise<ListedWorkspace | null> {
+    const wmId = await this.resolveDep('WorkspaceManager', this.workspaceManagerId);
+    require(!!wmId, 'WebGateway needs WorkspaceManager to know which workspace a report is about');
+    this.workspaceManagerId = wmId;
+    const all = await this.request<ListedWorkspace[]>(request(this.id, wmId!, 'listWorkspacesDetailed', {}), 15_000);
+    const ws = (Array.isArray(all) ? all : []).find(w => w.workspaceId === workspaceId);
+    return ws ? { workspaceId: ws.workspaceId, name: ws.name, registryId: ws.registryId, childIds: ws.childIds ?? [] } : null;
+  }
+
+  /**
+   * A workspace's exposure is taken from that workspace's own WebExposure
+   * only. The caller must be one of the workspace's objects by
+   * WorkspaceManager's count, and registered in the workspace's registry
+   * under that name with a built-in typeId (a user object's carries `user/`).
+   * So no other object can publish routes, and no WebExposure can speak for
+   * another workspace or point the gateway at a registry of its own making:
+   * the registry routed through is WorkspaceManager's, never the payload's.
+   */
+  private async admitExposer(msg: AbjectMessage, ws: ListedWorkspace): Promise<void> {
+    const caller = msg.routing.from;
+    type Registration = { name?: string; typeId?: string; manifest?: { name?: string } } | null;
+    let reg: Registration = null;
+    if (ws.childIds.includes(caller)) {
+      try {
+        reg = await this.request<Registration>(request(this.id, ws.registryId, 'lookup', { objectId: caller }), 5000);
+      } catch { /* unidentified: refused below */ }
+    }
+    const name = reg?.name ?? reg?.manifest?.name;
+    const typeId = reg?.typeId ? String(reg.typeId) : undefined;
+    require(name === EXPOSER && builtinTypeId(typeId) && (!typeId || typeId.split('/')[1] === ws.workspaceId),
+      `WebGateway takes the exposure of workspace ${ws.workspaceId} from that workspace's ${EXPOSER} only`);
   }
 
   private uniqueSlug(slug: string, workspaceId: string): string {

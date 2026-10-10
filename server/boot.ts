@@ -73,7 +73,6 @@ import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
 import { StreamClient } from '../src/objects/capabilities/stream-client.js';
-import { createCapabilityInterceptor } from '../src/runtime/capability-interceptor.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
@@ -102,7 +101,7 @@ import { WebGateway } from '../src/objects/web-gateway.js';
 import { WebExposure } from '../src/objects/web-exposure.js';
 import { Log } from '../src/core/timed-log.js';
 import {
-  assertNoOtherBackend, newOwnerToken, removeInstance, writeInstance, type Edition,
+  assertNoOtherBackend, newOwnerToken, removeInstance, writeInstance, DETACHED_ENV, type Edition,
 } from './instance-file.js';
 import * as http from 'node:http';
 import * as path from 'node:path';
@@ -326,7 +325,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
   async function factorySpawn(name: string, typeId?: TypeId): Promise<AbjectId> {
     const result = await bootstrapRequest<SpawnResult>(factoryId, 'spawn', {
       manifest: { name, description: '', version: '1.0.0',
-                  requiredCapabilities: [], tags: ['system'] },
+                  tags: ['system'] },
       typeId,
     });
     return result.objectId;
@@ -528,7 +527,8 @@ export async function bootServer(options: BootOptions): Promise<void> {
       // Global services
       'SettingsManager', 'PermissionBroker', 'DialogBroker',
       'ObjectCatalog',
-      'ProxyGenerator', 'Negotiator', 'HealthMonitor', 'CassetteRecorder',
+      // Negotiator stays on the main thread: it installs proxy routes on the main bus.
+      'ProxyGenerator', 'HealthMonitor', 'CassetteRecorder',
       'SkillRegistry',
       'MCPRegistryClient', 'ClawHubClient',
       'SecretsVault', 'OAuthHelper', 'Packages',
@@ -609,8 +609,8 @@ export async function bootServer(options: BootOptions): Promise<void> {
   await supervisedSpawn('Crypto');
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
-  // FileSystem is now per-workspace (spawned by WorkspaceManager rooted at
-  // ~/.abject/ws-<id>/files); no global instance.
+  // FileSystem is per-workspace (spawned by WorkspaceManager, rooted under
+  // the instance's data directory); no global instance.
   const webParserId = await supervisedSpawn('WebParser');
   // Inside the desktop app WebBrowser's pages are Electron windows, which it
   // asks BrowserWindowHost for; outside it there is no host and WebBrowser
@@ -645,14 +645,6 @@ export async function bootServer(options: BootOptions): Promise<void> {
   const peerRouterObj = runtime.objectFactory.getObject(peerRouterId) as unknown as PeerRouter;
   peerRouterObj.setBus(bus);
   bus.addInterceptor(peerRouterObj);
-
-  // Capability enforcement: gates requests from source-backed (scriptable)
-  // objects to capability providers by declared requiredCapabilities. Added
-  // after PeerRouter so remote-inbound messages are re-addressed before the
-  // capability check sees them. Mode follows SettingsManager (default: warn);
-  // the subscription is wired after SettingsManager spawns below.
-  const capInterceptor = createCapabilityInterceptor(registryId, bus);
-  bus.addInterceptor(capInterceptor);
 
   if (DEDICATED_WORKERS) {
     // ── P2P Worker mode ──────────────────────────────────────────────
@@ -701,7 +693,6 @@ export async function bootServer(options: BootOptions): Promise<void> {
           description: `${reg.name} (running in P2P worker)`,
           version: '1.0.0',
           interface: { id: reg.interfaceId, name: reg.name, description: '', methods: [] },
-          requiredCapabilities: [],
           tags: ['system', 'peer'],
         },
         status: 'running',
@@ -834,19 +825,6 @@ export async function bootServer(options: BootOptions): Promise<void> {
   // Version, readiness and edition for abjects (main thread: it reads this process's state).
   await supervisedSpawn('InstanceInfo', 'permanent', systemTypeId('InstanceInfo'));
 
-  // Capability-enforcement mode: register the interceptor's mailbox as a
-  // SettingsManager dependent (mode-change events land there) and pull the
-  // initial value in case the boot announce fired before the registration.
-  try {
-    bus.send(message.request(capInterceptor.mailboxId, settingsManagerId, 'addDependent', {}));
-    const mode = await bootstrapRequest<'off' | 'warn' | 'enforce'>(
-      settingsManagerId, 'getCapabilityEnforcement', {});
-    if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
-      capInterceptor.setMode(mode);
-    }
-  } catch (err) {
-    alog.warn(`capability enforcement mode fetch failed (staying at default): ${String(err)}`);
-  }
   const heapMonitorId = await supervisedSpawn('HeapMonitor', 'permanent', systemTypeId('HeapMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
   await supervisedSpawn('WebGateway', 'permanent', systemTypeId('WebGateway'));
@@ -972,10 +950,10 @@ export async function bootServer(options: BootOptions): Promise<void> {
     version: instanceSource.version,
     wsPort: WS_PORT,
     cliPort: CLI_PORT,
-    httpPort: HTTP_PORT,
     ownerToken,
     dataDir: dataDirAbs,
     startedAt: instanceSource.startedAt,
+    detached: process.env[DETACHED_ENV] === '1',
   });
 
   console.log('');

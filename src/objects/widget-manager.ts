@@ -725,8 +725,6 @@ export class WidgetManager extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

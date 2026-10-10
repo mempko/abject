@@ -329,8 +329,6 @@ export class ExternalProjectRegistry extends Abject {
             { name: 'activeTasksChanged', description: 'The set of tasks working in a project changed', payload: { kind: 'object' } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'projects'],
       },
     });

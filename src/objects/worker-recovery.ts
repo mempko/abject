@@ -58,8 +58,6 @@ export class WorkerRecovery extends Abject {
             { name: 'recovered', description: 'Recovery after a worker death finished; payload is the report', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'runtime'],
       },
     });

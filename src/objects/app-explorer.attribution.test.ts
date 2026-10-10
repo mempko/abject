@@ -15,8 +15,6 @@ function registration(overrides: Partial<ObjectRegistration> = {}): ObjectRegist
       description: 'A remote app',
       version: '1.0.0',
       interfaces: [],
-      requiredCapabilities: [],
-      providedCapabilities: [],
       tags: ['app'],
     },
     state: 'running',

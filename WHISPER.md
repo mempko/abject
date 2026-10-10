@@ -1,16 +1,48 @@
 # WHISPER.md - The Whisper Signaling Server (+ TURN relay)
 
-`whisper` is the signaling server. It is how peers find each other:
-it registers peers by their true name (PeerId), answers "where is peer X?"
-queries, and relays the WebRTC handshake (SDP offers/answers and ICE
-candidates) between them. No application message content passes through it.
+`whisper` is the signaling server (`server/signaling-server.ts`). It is how
+peers find each other: it registers peers by their true name (PeerId), answers
+"where is peer X?" queries, relays the WebRTC handshake (SDP offers/answers and
+ICE candidates) between them, and hands out ICE servers (STUN, plus TURN
+credentials when a relay is configured). No application message content passes
+through it.
 
 This document covers running `whisper` in production behind TLS, and pairing it
 with a **TURN relay (coturn)** so peers that cannot reach each other directly
 (symmetric NAT, CGNAT, most cell networks) can still connect.
 
-- The public deployment is `wss://signal.abject.world`, which clients use by default.
-- The thin client (`client.abject.world`) and the desktop peer mesh both rely on it.
+- The public deployment is `wss://signal.abject.world`, which instances use by
+  default (`PeerRegistry`, and `RemoteUIAccess` for pairing).
+- The thin client (`client.abject.world`) and the peer mesh both rely on it.
+- It is not the only path between peers. Once connected, every peer relays
+  signaling for others over its DataChannels (`SignalingRelay`) and gossips
+  peer lists (`PeerDiscovery`), so the mesh keeps finding itself when the
+  server is down.
+- `whisper` runs from a source checkout (`pnpm whisper`); the desktop app and
+  the headless edition do not ship it.
+
+## Protocol
+
+JSON text frames over one WebSocket per peer. Each frame has a `type`:
+
+| Client sends | Server does |
+|--------------|-------------|
+| `register` `{ peerId, publicSigningKey, publicExchangeKey, name }` | Binds the peerId to this socket, replies `registered`, and sends the updated `peer-list` to every other registered peer |
+| `unregister` `{ peerId }` | Removes the binding (only for the peerId bound to this socket) |
+| `find` `{ targetPeerId }` | Replies `found` (the peer's keys and name) or `not-found` |
+| `list-peers` `{ peerId }` | Replies `peer-list`: every registered peer but the caller |
+| `sdp-offer`, `sdp-answer`, `ice-candidate` `{ targetPeerId, sdp \| candidate }` | Relays the frame to the target, stamped with the sender's registered peerId. A socket must register before it relays, and a frame claiming another peerId is refused |
+| `get-ice` | Replies `ice-servers` `{ iceServers }` |
+| `ping` | Replies `pong` and keeps the peer fresh |
+
+A frame that is not JSON, has no `type`, or carries a `peerId`,
+`targetPeerId` or `name` longer than 1024 characters is dropped. An unknown
+type gets an `error` reply. A peer whose socket closes is removed at once; one
+silent for five minutes is removed by a sweep that runs every minute.
+
+`SignalingServer` also has `enableFederation({ siblingUrls })`, which links
+sibling servers and forwards `find` misses to them. The standalone entry
+(`pnpm whisper`) does not turn it on.
 
 ## Why TURN
 
@@ -58,8 +90,10 @@ No TURN needed for local testing. Just run the signaling server:
 pnpm whisper                    # listens on :7720 (SIGNALING_PORT)
 ```
 
-Point a client at it with `ws://localhost:7720`. With no `TURN_SECRET`,
-`get-ice` returns the default public STUN server only.
+Point an instance at `ws://localhost:7720`: add it under Network → Servers &
+Peers, or start the backend with `ABJECTS_SIGNALING_URLS=ws://localhost:7720`
+to use only it. With no `TURN_SECRET`, `get-ice` returns the default public
+STUN server only.
 
 ## Production deployment
 
@@ -150,7 +184,9 @@ value for both coturn's `static-auth-secret` and whisper's `TURN_SECRET`.
 Plain `turn:3478` (UDP/TCP) covers most cell networks. The strictest networks
 (corporate, captive portals) allow only 443/TLS, where `turns:5349` is the
 candidate that gets through. coturn can reuse the Let's Encrypt cert nginx
-already manages. In `/etc/turnserver.conf`:
+already manages. `site/turnserver.conf` already sets these for
+`signal.abject.world` (along with `realm=abject.world`); point them at your own
+domain:
 
 ```
 tls-listening-port=5349
@@ -200,7 +236,8 @@ node -e 'const W=require("ws");const s=new W("ws://localhost:7720");
 ```
 
 Expect a reply containing a `turns:`/`turn:` entry with a `username` like
-`<timestamp>:...` and a `credential`. If you only see STUN, `TURN_SECRET` or
+`<expiry>:anon` (the probe never registered, so it has no peerId) and a
+`credential`. If you only see STUN, `TURN_SECRET` or
 `TURN_URLS` did not reach the running process (`systemctl show abject-whisper -p Environment`).
 
 **2. The credential authenticates against coturn.** Mint one and allocate a relay:
@@ -236,17 +273,26 @@ Environment variables read by `whisper` (`server/signaling-server.ts`):
 | `STUN_URLS` | `stun:stun.l.google.com:19302` | Comma-separated STUN URLs advertised to clients |
 | `TURN_TTL` | `43200` (12h) | Lifetime in seconds of each minted credential |
 
+`whisper` listens on every interface. On a public host, leave 7720 closed in
+the firewall and let nginx reach it on loopback.
+
 ## How clients use it
 
-Both sides fetch ICE servers via `SignalingClient.requestIceServers()` and pass
-them into `PeerTransport`. `requestIceServers()` resolves to an empty list on
-timeout or against an older signaling server that does not understand `get-ice`,
-in which case the transport falls back to its built-in STUN default. The
-consumers:
+Both sides fetch ICE servers via `SignalingClient.requestIceServers()`
+(`src/network/signaling.ts`) and pass them into `PeerTransport`.
+`requestIceServers()` resolves to an empty list after 3 seconds, when not
+connected, or against an older signaling server that does not understand
+`get-ice`; the transport then falls back to its built-in STUN default
+(`stun:stun.l.google.com:19302`). The consumers:
 
 - `client/webrtc-transport.ts` (the thin mobile/web client, the caller)
-- `src/objects/remote-ui-access.ts` (the server answering paired UI clients)
-- `src/objects/peer-registry.ts` (the desktop peer-to-peer mesh)
+- `src/objects/remote-ui-access.ts` (a desktop answering paired UI clients;
+  the headless edition has no display to pair with, so no RemoteUIAccess)
+- `src/objects/peer-registry.ts` (the peer-to-peer mesh, both editions)
+
+On the backend these objects live in the dedicated P2P worker
+(`workers/p2p-worker-runtime.ts`), unless `ABJECTS_DEDICATED_WORKERS=0` keeps
+them on the main thread.
 
 ## A private signaling server
 
@@ -258,9 +304,10 @@ settings close that:
 - **Fixed signaling.** `ABJECTS_SIGNALING_URLS=wss://signal.example.org`
   makes those the only servers the instance uses: no public default, no
   servers learned from peers or contacts' addresses. Pairing for the remote
-  UI uses the first of them unless `REMOTE_UI_SIGNALING_URL` names another.
-  Without the variable, the same choice is the "Use only these servers"
-  checkbox under Network → Servers & Peers, applied to the servers listed
+  UI (desktop) uses the first of them unless `REMOTE_UI_SIGNALING_URL` names
+  another. Without the variable, the same choice is the "Use only these
+  servers" checkbox under Network → Servers & Peers (or
+  `PeerRegistry.setFixedSignaling` by message), applied to the servers listed
   there.
 - **Mesh admission.** Whisper accepts any registration, so anyone who knows
   the address can register, see the peer list, and try to connect.
@@ -282,7 +329,7 @@ tokens and are not on the peer list.
 | `pnpm: No such file or directory`, `status=127` | systemd PATH does not include pnpm. Use absolute `ExecStart` + `Environment=PATH=` with the nvm/corepack bin dir. |
 | `Start request repeated too quickly` | Crash loop. Fix the underlying error, then `systemctl reset-failed abject-whisper`. Add `RestartSec=2`. |
 | `get-ice` returns STUN only | `TURN_SECRET`/`TURN_URLS` not set on the whisper process. Check `systemctl show abject-whisper -p Environment`. |
-| `Signaling error: Unknown message type: get-ice` (in app logs) | The client is talking to an old signaling server that predates `get-ice`. Harmless: the client falls back to STUN. Deploy the updated signaling server. |
+| Clients use STUN only although `get-ice` works on your server | They are talking to an older signaling server that predates `get-ice`. The client takes its `Unknown message type: get-ice` error as "no ICE servers" and falls back to STUN without logging it. Check which server the instance uses (Network → Servers & Peers) and deploy the updated one. |
 | TURN test returns `401` | coturn's `static-auth-secret` does not match whisper's `TURN_SECRET`. |
 | No `relay` candidate on a real client | Firewall: open UDP 3478 and the UDP relay range externally (cloud security group included). |
 | `turns:` candidate never connects | coturn not listening on 5349, or cert unreadable by the `turnserver` user. |

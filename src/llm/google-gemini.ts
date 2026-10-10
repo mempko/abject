@@ -447,13 +447,3 @@ export class GeminiProvider extends BaseLLMProvider {
     return 'error';
   }
 }
-
-export function createGeminiProvider(): GeminiProvider | undefined {
-  const gt = globalThis as Record<string, unknown>;
-  const apiKey = (gt.GOOGLE_API_KEY ?? gt.GEMINI_API_KEY) as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new GeminiProvider({ apiKey });
-}

@@ -52,7 +52,7 @@ export class WebGatewayBrowser extends Abject {
             { name: 'hide', description: 'Close the gateway window.', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
           ],
         },
-        requiredCapabilities: [], providedCapabilities: [], tags: ['system', 'ui', 'web'],
+        tags: ['system', 'ui', 'web'],
       },
     });
     this.on('show', async () => { await this.showWindow(); return true; });

@@ -2,17 +2,19 @@
  * Package ownership — how an abject that came from an installed package is
  * told apart from one a person or an agent made.
  *
- * A script package's abjects are spawned with the owner `package:<name>`.
- * That one marker is enough for every part of the system that must treat
- * them differently, and it survives respawn, worker recovery and restart
- * because the owner rides the Registry registration:
+ * A package's abjects, script or WASM, are spawned with the owner
+ * `package:<name>`. That one marker is enough for every part of the system
+ * that must treat them differently, and it survives respawn, worker recovery
+ * and restart because the owner rides the Registry registration:
  *
  * - ScriptableAbject refuses source and manifest edits: the code comes from
  *   the installed package, so an edit here would be silently undone by the
  *   next upgrade. Change the package and reinstall it instead.
- * - AbjectStore keeps their data under `package/<TypeName>` and never
- *   restores them as user objects (WorkspaceManager spawns them from the
- *   package, handing that data back).
+ * - AbjectStore keeps their data (a script's saveData, a WASM module's
+ *   persist) under `package/<TypeName>` and never restores them as user
+ *   objects (WorkspaceManager spawns them from the package, handing that
+ *   data back). At system scope the Packages service keeps it instead.
+ * - Packages answers `getSettings` to them for their own package.
  * - Factory.clone / instantiate drop the marker, so a copy of a package
  *   abject is an ordinary, editable user object.
  */

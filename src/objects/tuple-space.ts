@@ -15,7 +15,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 
@@ -157,8 +156,6 @@ export class TupleSpace extends Abject {
             { name: 'tupleClaimed', description: 'A tuple was claimed', payload: { kind: 'reference', reference: 'TupleEntry' } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.TUPLE_SPACE],
         tags: ['system', 'capability', 'coordination'],
       },
     });

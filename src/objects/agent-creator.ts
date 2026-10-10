@@ -10,7 +10,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
 import { noulOf } from '../llm/decision.js';
@@ -61,10 +60,6 @@ export class AgentCreator extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'LLM analysis for autonomous-object design advice', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'agent', 'creation'],
       },
     });

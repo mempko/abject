@@ -13,7 +13,6 @@ import os from 'node:os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error as errorMsg, request } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import { truncateTail, droppedNotice, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from '../../core/tool-output.js';
 import { Log } from '../../core/timed-log.js';
@@ -342,8 +341,6 @@ export class ShellExecutor extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.SHELL_EXECUTE],
         tags: ['system', 'capability', 'shell'],
       },
     });

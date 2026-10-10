@@ -10,7 +10,6 @@ export type AbjectId = string;
 export type InterfaceId = string;
 export type MessageId = string;
 export type AgreementId = string;
-export type CapabilityId = string;
 export type PeerId = string;
 export type TypeId = string;
 
@@ -104,27 +103,6 @@ export interface EventDeclaration {
 }
 
 // =============================================================================
-// Capability Types
-// =============================================================================
-
-export interface CapabilityRequest {
-  capability: CapabilityId;
-  reason: string;
-  required: boolean;
-}
-
-export interface CapabilityGrant {
-  capability: CapabilityId;
-  objectId: AbjectId;
-  restrictions?: CapabilityRestriction[];
-}
-
-export interface CapabilityRestriction {
-  type: string;
-  config: unknown;
-}
-
-// =============================================================================
 // Object Manifest
 // =============================================================================
 
@@ -153,8 +131,6 @@ export interface AbjectManifest {
   description: string;
   version: string;
   interface: InterfaceDeclaration;
-  requiredCapabilities: CapabilityRequest[];
-  providedCapabilities?: CapabilityId[];
   tags?: string[];
   /**
    * Optional display glyph (a single emoji or character) shown next to the
@@ -278,7 +254,6 @@ export interface ObjectSummary {
 export interface DiscoveryQuery {
   name?: string;
   interface?: InterfaceId;
-  capability?: CapabilityId;
   tags?: string[];
 }
 
@@ -300,7 +275,6 @@ export interface SpawnRequest {
   source?: string;
   owner?: AbjectId;
   initialState?: unknown;
-  grantedCapabilities?: CapabilityGrant[];
   parentId?: AbjectId;
   skipGlobalRegistry?: boolean;
   constructorArgs?: unknown;

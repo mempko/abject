@@ -8,7 +8,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
@@ -213,11 +212,6 @@ export class IdentityObject extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.IDENTITY_SIGN,
-          Capabilities.IDENTITY_VERIFY,
-        ],
         tags: ['system', 'identity'],
       },
     });

@@ -18,7 +18,7 @@ function reg(name: string, opts: { tags?: string[]; methods?: string[]; icon?: s
     registeredAt: 0,
     ...(opts.ownerPeerId ? { ownerPeerId: opts.ownerPeerId } : {}),
     manifest: {
-      name, description: '', version: '1.0.0', requiredCapabilities: [],
+      name, description: '', version: '1.0.0', 
       tags: opts.tags ?? ['launcher'],
       ...(opts.icon !== undefined ? { icon: opts.icon } : {}),
       interface: {

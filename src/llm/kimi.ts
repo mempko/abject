@@ -128,12 +128,3 @@ export class KimiProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createKimiProvider(): KimiProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).MOONSHOT_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new KimiProvider({ apiKey });
-}

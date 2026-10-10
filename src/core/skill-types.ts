@@ -2,7 +2,7 @@
  * Shared type definitions for the Skill system.
  *
  * Skills are SKILL.md files (YAML frontmatter + markdown instructions) installed
- * in ~/.abject/skills/. They are compatible with Claude Code and OpenClaw formats.
+ * in $ABJECTS_DATA_DIR/skills/. They are compatible with Claude Code and OpenClaw formats.
  */
 
 /** Information about a discovered skill. */

@@ -35,8 +35,6 @@ function mkManifest(name: string, sharing?: string): AbjectManifest {
         { name: 'echo', description: 'Echo', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
       ],
     },
-    requiredCapabilities: [],
-    providedCapabilities: [`abjects:test:${name.toLowerCase()}`],
     tags: ['test'],
     ...(sharing ? { sharing } : {}),
   } as unknown as AbjectManifest;
@@ -228,7 +226,6 @@ test('P0-3: askPrompt lists pooled objects for local callers and omits the globa
   assert.match(localPrompt, /## Shared Objects \(peer workspaces\)/, 'local prompt needs the pooled section');
   assert.match(localPrompt, /SeattleWeather/, 'local prompt must name the pooled peer object');
   assert.match(localPrompt, /peer-b/, 'local prompt must carry the owning peer id');
-  assert.match(localPrompt, /abjects:test:seattleweather/, 'local prompt must carry pooled capabilities');
   assert.match(localPrompt, /## System Capabilities \(global registry\)/, 'local prompt keeps the global catalog');
   assert.match(localPrompt, /HttpClientLike/, 'local prompt names global system objects');
 

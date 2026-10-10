@@ -230,14 +230,6 @@ class ManifestBuilder {
     return *this;
   }
 
-  ManifestBuilder& requires_capability(const std::string& capability,
-                                       const std::string& reason,
-                                       bool required = true) {
-    required_capabilities_.push_back(
-        {{"capability", capability}, {"reason", reason}, {"required", required}});
-    return *this;
-  }
-
   json build() const {
     json methods = json::array();
     for (const auto& m : methods_) methods.push_back(m.decl_);
@@ -252,7 +244,6 @@ class ManifestBuilder {
           {"description", description_},
           {"methods", std::move(methods)},
           {"events", events_}}},
-        {"requiredCapabilities", required_capabilities_},
         {"tags", tags_},
     };
     if (!icon_.empty()) manifest["icon"] = icon_;
@@ -264,7 +255,6 @@ class ManifestBuilder {
   std::deque<MethodBuilder> methods_;
   json events_ = json::array();
   json tags_ = json::array();
-  json required_capabilities_ = json::array();
 };
 
 // ── The Object base class ────────────────────────────────────────────────
@@ -280,7 +270,7 @@ class Object {
   /// handlers here; `info.data` carries restored durable state.
   virtual void on_init(const InitInfo& info) { (void)info; }
 
-  /// Durable data for the `persist` mechanism (clone/respawn/restore).
+  /// Durable data for the `persist` mechanism (restart/respawn/clone).
   /// Return a JSON object; null (the default) disables snapshots.
   virtual json snapshot() { return nullptr; }
 
@@ -321,7 +311,9 @@ class Object {
         {{"kind", "changed"}, {"aspect", aspect}, {"value", std::move(value)}});
   }
 
-  /// Ask the host to snapshot() and upsert durable data into the Registry.
+  /// Ask the host to snapshot() and save the data durably (coalesced, about
+  /// once a second); it returns as InitInfo::data after a backend restart,
+  /// a respawn or a clone.
   void persist() { detail::queue_envelope({{"kind", "persist"}}); }
 
   /// Deferred reply to an inbound request captured via Request::defer().

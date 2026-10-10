@@ -1,6 +1,6 @@
 /**
  * FileManager -- browse, upload, and remove files in the workspace
- * FileSystem (~/.abject/ws-<id>/files). A toolbar (Up / Add / New Folder /
+ * FileSystem ($ABJECTS_DATA_DIR/ws-<id>/files). A toolbar (Up / Add / New Folder /
  * Rename / Delete / Refresh) sits above a scrollable list of the current directory. Selecting
  * a folder navigates into it; selecting a file opens it in the FileViewer.
  */
@@ -8,7 +8,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
@@ -73,10 +72,6 @@ export class FileManager extends Abject {
             { name: 'getState', description: 'Get window visibility', parameters: [], returns: { kind: 'object', properties: { visible: { kind: 'primitive', primitive: 'boolean' } } } },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display file manager window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

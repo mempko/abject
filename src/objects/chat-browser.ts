@@ -11,7 +11,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { ListItem } from './widgets/list-widget.js';
@@ -88,10 +87,6 @@ export class ChatBrowser extends Abject {
           ],
           events: [],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display conversation overview', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

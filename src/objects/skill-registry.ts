@@ -1,7 +1,7 @@
 /**
  * SkillRegistry -- manages skill lifecycle for a workspace.
  *
- * Scans ~/.abject/skills/ for SKILL.md files (compatible with Claude Code and
+ * Scans $ABJECTS_DATA_DIR/skills/ for SKILL.md files (compatible with Claude Code and
  * OpenClaw formats), manages enable/disable state, and provides enabled skill
  * summaries for AgentAbject to inject into LLM prompts.
  */
@@ -13,7 +13,6 @@ import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { parseSkillMd, ParsedSkill } from '../core/skill-parser.js';
 import { discoverHostMcpServers, synthesizeHostSkillMd } from '../core/host-mcp-import.js';
@@ -220,8 +219,6 @@ export class SkillRegistry extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.SKILL_MANAGE],
         tags: ['system', 'skill'],
       },
     });
@@ -1224,7 +1221,6 @@ whenever the skill set changes.
             description: `MCP bridge for "${name}"`,
             version: '1.0.0',
             interface: { id: 'abjects:mcp-bridge', name: 'MCPBridge', description: 'MCP bridge', methods: [] },
-            requiredCapabilities: [],
             tags: ['system', 'mcp'],
           },
           constructorArgs: {

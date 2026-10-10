@@ -7,7 +7,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest, event as createEvent } from '../core/message.js';
 import type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from '../core/identity.js';
@@ -517,11 +516,6 @@ export class PeerRegistry extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.PEER_CONNECT,
-          Capabilities.PEER_DISCOVER,
-        ],
         tags: ['system', 'peer'],
       },
     });

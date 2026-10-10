@@ -195,8 +195,6 @@ export class WorkspaceCollaboratorInspector extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'peer'],
       },
     });

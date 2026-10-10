@@ -35,8 +35,6 @@ function mkManifest(name: string, description: string): AbjectManifest {
         { name: 'ping', description: 'Ping', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
       ],
     },
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
   } as unknown as AbjectManifest;
 }
@@ -147,8 +145,8 @@ function registerCaller(h: Harness, caller: Stub, name: string, typeId: string):
 async function tryWrite(h: Harness, caller: Stub): Promise<{ ok: boolean; error?: string }> {
   try {
     await caller.call(h.settings.id, 'setSettings', {
-      section: 'objects',
-      values: { capabilityEnforcement: 'warn' },
+      section: 'permissions',
+      values: { mode: 'deny' },
     });
     return { ok: true };
   } catch (err) {
@@ -246,8 +244,8 @@ test('an allowed write persists through Storage', async () => {
   h.wm.answers.set(caller.id, { accessMode: 'local' });
   const r = await tryWrite(h, caller);
   assert.equal(r.ok, true, r.error);
-  const wrote = [...h.storage.data.values()].some((v) => v === 'warn');
-  assert.equal(wrote, true, 'expected the capabilityEnforcement value to reach Storage');
+  const wrote = [...h.storage.data.values()].some((v) => v === 'deny');
+  assert.equal(wrote, true, 'expected the prompt mode to reach Storage');
 });
 
 test('a denied write leaves Storage untouched', async () => {

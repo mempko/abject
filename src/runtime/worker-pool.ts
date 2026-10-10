@@ -6,6 +6,7 @@
  * of Abject instances.
  */
 
+import type { ProxyRoute } from './proxy-routes.js';
 import { AbjectId, TypeId } from '../core/types.js';
 import { require, invariant } from '../core/contracts.js';
 import { WorkerBridge } from './worker-bridge.js';
@@ -211,6 +212,7 @@ export class WorkerPool {
         if (at >= 0 && at !== index) fresh.sendPeerPlace(id, at);
       }
       this.bus.announceLivenessTo(fresh);
+      this.bus.announceProxyRoutesTo(fresh);
       log.info(`pool worker ${index} replaced`);
     } catch (err) {
       log.error(`pool worker ${index} could not be replaced: ${err instanceof Error ? err.message : String(err)}. Its shard stays dead until restart.`);
@@ -226,6 +228,15 @@ export class WorkerPool {
    */
   getBridgeForObject(objectId: AbjectId): WorkerBridge | undefined {
     return this.objectToBridge.get(objectId);
+  }
+
+  /** Copy a proxy route into every pool worker's bus. */
+  broadcastProxyRoute(route: ProxyRoute): void {
+    for (const bridge of this.bridges) bridge.sendProxyRoute(route);
+  }
+
+  broadcastProxyUnroute(agreementId: string): void {
+    for (const bridge of this.bridges) bridge.sendProxyUnroute(agreementId);
   }
 
   /** Push one liveness fact to every pool worker. */

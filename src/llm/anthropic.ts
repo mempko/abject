@@ -740,19 +740,3 @@ export class AnthropicProvider extends BaseLLMProvider {
     };
   }
 }
-
-/**
- * Create an Anthropic provider from environment.
- */
-export function createAnthropicProvider(): AnthropicProvider | undefined {
-  // In browser, check for global config
-  const apiKey =
-    (globalThis as Record<string, unknown>).ANTHROPIC_API_KEY as string | undefined;
-
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-
-  return new AnthropicProvider({ apiKey });
-}

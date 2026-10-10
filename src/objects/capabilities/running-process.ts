@@ -39,7 +39,7 @@ export class RunningProcess extends Abject {
         { name: 'input', description: 'Send text to stdin, optionally close it', parameters: [{ name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text', optional: true }, { name: 'close', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Close stdin', optional: true }], returns: { kind: 'object', properties: {} } },
         { name: 'stop', description: 'Terminate the process tree; repeated requests are safe', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'wait', description: 'Wait for terminal state; includes bounded output previews and an output handle', parameters: [], returns: { kind: 'object', properties: {} } },
-      ] }, requiredCapabilities: [], providedCapabilities: [], tags: ['system', 'process'] } });
+      ] }, tags: ['system', 'process'] } });
     this.on('status', msg => { this.authorize(msg); return this.processStatus(); });
     this.on('readOutput', async msg => {
       this.authorize(msg); const p = msg.payload as { offset?: number; length?: number };

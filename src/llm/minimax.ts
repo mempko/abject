@@ -108,12 +108,3 @@ export class MiniMaxProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createMiniMaxProvider(): MiniMaxProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).MINIMAX_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new MiniMaxProvider({ apiKey });
-}

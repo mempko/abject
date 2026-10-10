@@ -21,7 +21,6 @@ import { Abject } from '../core/abject.js';
 import { shapeOf, type ThemeData } from '../core/theme-data.js';
 import { hatch, withAlpha } from './widgets/widget-types.js';
 import { request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { isHostLocalObject } from './host-local-objects.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, sectionHeaderText, emptyStateMarkdown, emptyStateStyle } from './ui-kit.js';
@@ -226,10 +225,6 @@ export class AppExplorer extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display explorer window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

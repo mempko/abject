@@ -42,7 +42,7 @@ const questions = [
   {
     id: 'safe',
     q: 'Is it safe to let this thing touch my machine?',
-    a: 'Abjects can only reach what you allow. Files, the shell, the network and the clipboard are capabilities you have to grant. An abject created without one can\'t use it, no matter how politely it asks, and the first time anything asks for something new, a prompt waits for you. Code the LLM writes runs in a locked-down interpreter in worker threads, with no direct access to the filesystem, the network or the process. Abjects written in other languages run as WebAssembly under the same rules. Everything stays on your machine. The horror is the theme. The sandbox is real.',
+    a: 'Abjects can only reach what you allow. Code the LLM writes runs in a locked-down interpreter in worker threads, with no access of its own to the filesystem, the network or the process. Abjects written in other languages run as WebAssembly, just as locked down. To touch anything outside, an abject has to send a message to the object that owns it, and those objects check with you: a command, or a file outside the folders you allowed, stops at a prompt and waits for you, and the web follows the domain rules you set. Everything stays on your machine. The horror is the theme. The sandbox is real.',
   },
   {
     id: 'terminal',

@@ -12,6 +12,7 @@ import { Mailbox } from './mailbox.js';
 import type { MessageBusLike } from './message-bus.js';
 import { resetSequence, error as createError } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { ProxyRouteTable, type ProxyRoute } from './proxy-routes.js';
 
 const log = new Log('WorkerBus');
 
@@ -39,6 +40,12 @@ export class WorkerBus implements MessageBusLike {
    * isRegistered() with the same truth the main bus has.
    */
   private globalObjects: Set<AbjectId> = new Set();
+  /**
+   * The main bus's proxy routes, copied here (proxy:route / proxy:unroute)
+   * so a negotiated connection holds for traffic that never leaves this
+   * worker or goes straight to a peer worker.
+   */
+  private proxyRoutes = new ProxyRouteTable();
   /**
    * Requests sent straight to a peer worker and not yet answered. When main
    * reports that peer dead, each gets a WORKER_DEAD reply here, in the
@@ -142,6 +149,11 @@ export class WorkerBus implements MessageBusLike {
    * 3. Main thread fallback
    */
   send(message: AbjectMessage): void {
+    if (this.proxyRoutes.size > 0) {
+      const routed = this.proxyRoutes.apply(message);
+      message = routed.message;
+      if (routed.report) this.send(routed.report);
+    }
     const recipient = message.routing.to;
 
     // 1. Local delivery via mailbox
@@ -173,6 +185,14 @@ export class WorkerBus implements MessageBusLike {
 
     // 3. Main thread fallback
     this.postToMain({ type: 'bus:send', message });
+  }
+
+  setProxyRoute(route: ProxyRoute): void {
+    this.proxyRoutes.set(route);
+  }
+
+  removeProxyRoute(agreementId: string): void {
+    this.proxyRoutes.remove(agreementId);
   }
 
   /**

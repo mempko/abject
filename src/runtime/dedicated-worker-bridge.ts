@@ -62,6 +62,11 @@ export class DedicatedWorkerBridge extends WorkerBridge {
     super(worker, bus);
   }
 
+  /** Dedicated workers apply no proxy routes of their own: the main bus does. */
+  protected override forwardToBus(message: AbjectMessage): void {
+    this.bus.send(message);
+  }
+
   /**
    * Send a configuration object to the worker during initialization.
    */

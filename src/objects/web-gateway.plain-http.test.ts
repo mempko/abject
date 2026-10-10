@@ -24,7 +24,7 @@ import { Registry } from './registry.js';
 import { WebGateway } from './web-gateway.js';
 import { SessionStore } from '../../server/auth.js';
 import { request } from '../core/message.js';
-import type { AbjectId, AbjectManifest, InterfaceId } from '../core/types.js';
+import type { AbjectId, AbjectManifest, AbjectMessage, InterfaceId } from '../core/types.js';
 
 function mkManifest(name: string): AbjectManifest {
   return {
@@ -39,8 +39,6 @@ function mkManifest(name: string): AbjectManifest {
         { name: 'greet', description: 'Greet the caller', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
       ],
     },
-    requiredCapabilities: [],
-    providedCapabilities: [`abjects:test:${name.toLowerCase()}`],
     tags: ['test'],
   } as unknown as AbjectManifest;
 }
@@ -58,9 +56,22 @@ class DiscStub extends Abject {
   constructor(svcId: AbjectId, svcManifest: AbjectManifest) {
     super({ manifest: mkManifest('DiscStub') });
     this.on('discover', () => [{ id: svcId, manifest: svcManifest, name: svcManifest.name }]);
+    // The gateway takes a workspace's exposure from its WebExposure only, as
+    // the workspace's registry names it: the stub pushes as one.
+    this.on('lookup', (msg: AbjectMessage) => (msg.payload as { objectId: AbjectId }).objectId === this.id
+      ? { name: 'WebExposure', typeId: 'peer/ws-demo/WebExposure' } : null);
   }
   async ask<T>(to: AbjectId, method: string, payload: unknown = {}): Promise<T> {
     return this.request<T>(request(this.id, to, method, payload));
+  }
+}
+
+/** Stand-in for WorkspaceManager: lists the one workspace, the stub registry among its objects. */
+class WorkspaceManagerStub extends Abject {
+  constructor(workspace: { workspaceId: string; name: string; registryId: AbjectId }) {
+    super({ manifest: mkManifest('WorkspaceManager') });
+    this.on('listWorkspacesDetailed', () => [{ ...workspace, childIds: [workspace.registryId] }]);
+    this.on('findWorkspaceForObject', () => null);
   }
 }
 
@@ -102,6 +113,12 @@ test('WebGateway serves plain HTTP routes without 426 Upgrade Required', async (
 
   const disc = new DiscStub(svc.id, mkManifest('EchoSvc'));
   await disc.init(bus);
+  // The stub also stands in for the gateway's window, which may switch it on.
+  registry.registerObject(disc.id, disc.manifest, undefined, undefined, undefined, 'WebGatewayBrowser');
+
+  const wm = new WorkspaceManagerStub({ workspaceId: 'ws-demo', name: 'Demo', registryId: disc.id });
+  await wm.init(bus);
+  registry.registerObject(wm.id, wm.manifest, undefined, undefined, undefined, 'WorkspaceManager');
 
   const sessions = new SessionStore();
   const gw = new WebGateway({
@@ -110,7 +127,7 @@ test('WebGateway serves plain HTTP routes without 426 Upgrade Required', async (
     authConfig: { enabled: false, username: '', password: '' },
     sessions,
   });
-  await gw.init(bus);
+  await gw.init(bus, undefined, registry.id);
 
   try {
     // The workspace exposes EchoSvc publicly under slug 'demo'.

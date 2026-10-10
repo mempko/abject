@@ -6,7 +6,6 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { require } from '../../core/contracts.js';
 import { request } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 
 const SCREENSHOT_INTERFACE = 'abjects:screenshot';
 
@@ -77,8 +76,6 @@ export class Screenshot extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.SCREENSHOT],
         tags: ['system', 'capability', 'screenshot'],
       },
     });

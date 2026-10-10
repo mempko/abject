@@ -4,7 +4,6 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
 import { require } from '../../core/contracts.js';
 
@@ -149,11 +148,6 @@ export class Storage extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.STORAGE_READ,
-          Capabilities.STORAGE_WRITE,
-        ],
         tags: ['system', 'capability', 'storage', 'persistence'],
       },
     });

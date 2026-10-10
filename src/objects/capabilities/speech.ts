@@ -17,7 +17,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { require } from '../../core/contracts.js';
 import { request } from '../../core/message.js';
 
@@ -83,8 +82,6 @@ export class Speech extends Abject {
           ],
           events: [],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.SPEECH_SYNTHESIZE, Capabilities.SPEECH_RECOGNIZE],
         tags: ['system', 'capability', 'speech'],
       },
     });

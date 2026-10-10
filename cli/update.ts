@@ -23,7 +23,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { liveInstance } from '../server/instance-file.js';
 import { cliEdition } from './locate.js';
-import { startInBackground, stopBackend, waitForBackend } from './backend.js';
+import { restartOwner, startInBackground, stopBackend, waitForBackend } from './backend.js';
+import { require as contractRequire } from '../src/core/contracts.js';
 
 const REPO = 'mempko/abject';
 const KEEP_VERSIONS = 2;
@@ -167,7 +168,10 @@ export async function runUpdate(opts: { checkOnly: boolean; dataDir: string }): 
     throw new Error(`${name} did not contain the abject binary. Nothing was switched.`);
   }
 
-  const wasRunning = !!(await liveInstance(opts.dataDir));
+  // A backend this command started moves to the new version with it; one a
+  // service manager, a container or a terminal runs is restarted there.
+  const owner = await restartOwner(opts.dataDir);
+  const wasRunning = owner.running && owner.ours;
   if (wasRunning) {
     say('Stopping the backend…');
     await stopBackend(opts.dataDir);
@@ -183,11 +187,18 @@ export async function runUpdate(opts: { checkOnly: boolean; dataDir: string }): 
     // The new binary starts it: this process is still the old one.
     const newBinary = path.join(root, 'current', process.platform === 'win32' ? 'abject.exe' : 'abject');
     execFileSync(newBinary, ['start'], { stdio: 'inherit', env: { ...process.env, ABJECTS_DATA_DIR: opts.dataDir } });
+  } else if (owner.running) {
+    say(`The running backend is still on the old version: ${owner.hint}.`);
   }
 }
 
-/** Kept for symmetry with the other commands: start on whatever binary runs. */
+/**
+ * Restart the background backend on whatever binary runs. Only for one this
+ * command started (see restartOwner): any other would leave its manager.
+ */
 export async function restartBackend(dataDir: string): Promise<void> {
+  const owner = await restartOwner(dataDir);
+  contractRequire(!owner.running || owner.ours, 'only a backend started by `abject start` is restarted from here');
   await stopBackend(dataDir);
   const pid = startInBackground(dataDir);
   await waitForBackend(dataDir, { pid });

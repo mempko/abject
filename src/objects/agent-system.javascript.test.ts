@@ -36,8 +36,7 @@ test('scripted message handlers keep synchronous results and track asynchronous 
   const source = `({ sync() { return 7; }, async asyncResult() { return 8; },
     throws() { throw new Error('sync failure'); }, async rejects() { throw new Error('async failure'); } })`;
   const object: any = new ScriptableAbject({ name: 'HandlerFixture', version: '1', description: 'fixture',
-    interface: { id: 'fixture:handler', name: 'HandlerFixture', description: 'fixture', methods: [] },
-    requiredCapabilities: [], providedCapabilities: [] }, source, 'owner');
+    interface: { id: 'fixture:handler', name: 'HandlerFixture', description: 'fixture', methods: [] } }, source, 'owner');
   await object.init(new MessageBus());
   try {
   const call = (method: string) => object.handlers.get(method)(request(object.id, object.id, method, {}));

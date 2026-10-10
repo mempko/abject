@@ -6,6 +6,7 @@
  * the worker, and relays outbound messages from the worker back to the bus.
  */
 
+import type { ProxyRoute } from './proxy-routes.js';
 import { AbjectMessage, AbjectId, TypeId } from '../core/types.js';
 import { error as errorMessage } from '../core/message.js';
 import type { MessageBus } from './message-bus.js';
@@ -32,7 +33,8 @@ export interface WorkerLike {
 export interface WorkerInboundMessage {
   type: 'init' | 'spawn' | 'kill' | 'bus:deliver'
       | 'peer:port' | 'peer:place' | 'peer:remove' | 'peer:dead'
-      | 'live:add' | 'live:remove' | 'children:signal';
+      | 'live:add' | 'live:remove' | 'children:signal'
+      | 'proxy:route' | 'proxy:unroute';
   objectId?: AbjectId;
   constructorName?: string;
   constructorArgs?: unknown;
@@ -46,6 +48,10 @@ export interface WorkerInboundMessage {
   /** children:signal — the signal, and the id its answer carries back. */
   signal?: string;
   requestId?: number;
+  /** proxy:route — a negotiated connection's route (see proxy-routes.ts). */
+  route?: ProxyRoute;
+  /** proxy:unroute — the agreement whose route goes. */
+  agreementId?: string;
 }
 
 /**
@@ -348,6 +354,28 @@ export class WorkerBridge {
     } catch { /* worker going down */ }
   }
 
+  /** Copy a proxy route into this worker's bus. */
+  sendProxyRoute(route: ProxyRoute): void {
+    if (this._dead) return;
+    try { this.worker.postMessage({ type: 'proxy:route', route } as WorkerInboundMessage); }
+    catch { /* worker going down */ }
+  }
+
+  sendProxyUnroute(agreementId: string): void {
+    if (this._dead) return;
+    try { this.worker.postMessage({ type: 'proxy:unroute', agreementId } as WorkerInboundMessage); }
+    catch { /* worker going down */ }
+  }
+
+  /**
+   * A message the worker sent on to the main bus. A pool worker's own bus
+   * already applied the proxy routes, so it is relayed without them; the
+   * dedicated workers apply none and override this.
+   */
+  protected forwardToBus(message: AbjectMessage): void {
+    this.bus.relayFromPoolWorker(message);
+  }
+
   /**
    * Notify this worker that an object has been placed in a peer worker.
    */
@@ -490,7 +518,7 @@ export class WorkerBridge {
         if ((message.header.type === 'reply' || message.header.type === 'error') && message.header.correlationId) {
           this.inFlight.delete(message.header.correlationId);
         }
-        this.bus.send(message);
+        this.forwardToBus(message);
         break;
       }
 

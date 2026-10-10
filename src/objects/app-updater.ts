@@ -173,8 +173,6 @@ export class AppUpdater extends Abject {
             { name: 'showRequested', description: 'The app menu asked to show software updates (changed aspect).', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'updates'],
       },
     });

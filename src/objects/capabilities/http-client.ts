@@ -5,7 +5,6 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, event } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { ensure } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
 import { bytesToBase64 } from '../../core/encoding.js';
@@ -225,8 +224,6 @@ export class HttpClient extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.HTTP_REQUEST],
         tags: ['system', 'capability', 'http', 'network'],
       },
     });

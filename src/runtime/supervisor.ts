@@ -137,7 +137,6 @@ export class Supervisor extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
         tags: ['system', 'supervisor'],
       },
     });

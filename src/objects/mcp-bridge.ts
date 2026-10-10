@@ -114,8 +114,6 @@ export class MCPBridge extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'mcp'],
       },
     });

@@ -94,8 +94,6 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'peer'],
       },
     });

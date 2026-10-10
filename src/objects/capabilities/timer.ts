@@ -6,7 +6,6 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { require } from '../../core/contracts.js';
 import { event, request } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 
 const TIMER_INTERFACE = 'abjects:timer';
 
@@ -143,8 +142,6 @@ export class Timer extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.TIMER],
         tags: ['system', 'capability', 'timer', 'scheduling'],
       },
     });

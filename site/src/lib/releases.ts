@@ -109,9 +109,13 @@ async function fromManifests(): Promise<ReleaseInfo | null> {
   if (!first) return null;
   const version = first.version;
   const assets = [linux, mac, win].flatMap((m) => m?.files ?? []);
-  // The headless edition ships with every release from 0.16.0 on, named by version.
-  for (const name of headlessArchiveNames(version)) {
-    assets.push({ name, url: `${REPO_URL}/releases/download/v${version}/${name}`, size: 0 });
+  // The headless edition ships with every release from 0.16.0 on, named by
+  // version; earlier releases have none, so no links are made up for them.
+  const [major, minor] = version.split('.').map((n) => parseInt(n, 10) || 0);
+  if (major > 0 || minor >= 16) {
+    for (const name of headlessArchiveNames(version)) {
+      assets.push({ name, url: `${REPO_URL}/releases/download/v${version}/${name}`, size: 0 });
+    }
   }
   return { version, date: first.date, assets, pageUrl: `${REPO_URL}/releases/tag/v${version}` };
 }

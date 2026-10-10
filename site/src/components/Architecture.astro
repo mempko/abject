@@ -47,7 +47,7 @@ const { num = '11' } = Astro.props;
           <h3>The Containment</h3>
           <p class="s-tag">Code the LLM writes runs in a sandbox.</p>
         </div>
-        <p class="s-body">A pool of worker threads. Generated JavaScript runs in a locked-down interpreter with no access of its own to the filesystem, the network or the process. Abjects written in other languages run as WebAssembly and can only import the capabilities they were given. An abject reaches the outside world only through capability objects, and only the ones you granted.</p>
+        <p class="s-body">A pool of worker threads. Generated JavaScript runs in a locked-down interpreter with no access of its own to the filesystem, the network or the process. Abjects written in other languages run as WebAssembly, with nothing to call but sending messages, logging and the clock. An abject reaches the outside world only by messaging the objects that own it, and the shell and your files ask you first.</p>
       </div>
     </div>
 

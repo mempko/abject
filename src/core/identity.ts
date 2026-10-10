@@ -1,7 +1,8 @@
 /**
  * Cryptographic identity helpers.
  *
- * PeerId is the hex-encoded SHA-256 hash of the peer's public signing key (SPKI).
+ * PeerId is the hex-encoded SHA-256 hash of the peer's public signing key in
+ * its 'raw' export (the uncompressed P-256 point, 0x04 || X || Y; not SPKI).
  * Keys are ECDSA P-256 for signing and ECDH P-256 for key agreement.
  */
 
@@ -105,11 +106,12 @@ export async function importExchangePrivateKey(jwkString: string): Promise<Crypt
 
 /**
  * Derive a PeerId from a public signing key.
- * PeerId = hex(SHA-256(SPKI-encoded public key)).
+ * PeerId = hex(SHA-256(raw public key)), the key exported as 'raw' (the
+ * uncompressed point), not SPKI.
  */
 export async function derivePeerId(publicSigningKey: CryptoKey): Promise<PeerId> {
-  const spki = await crypto.subtle.exportKey('raw', publicSigningKey);
-  const hash = await crypto.subtle.digest('SHA-256', spki);
+  const raw = await crypto.subtle.exportKey('raw', publicSigningKey);
+  const hash = await crypto.subtle.digest('SHA-256', raw);
   return bytesToHex(hash);
 }
 

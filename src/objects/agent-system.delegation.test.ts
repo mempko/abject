@@ -13,7 +13,7 @@ class Collaborator extends Abject {
   executions=0;
   agreement:Promise<string>=Promise.resolve('Execute with independent evidence');
   constructor(private runtime:AbjectId){
-    super({manifest:{name:'Collaborator',version:'1',description:'test',interface:{id:'delegation-test',name:'Collaborator',description:'test',methods:[]},requiredCapabilities:[],providedCapabilities:[]}});
+    super({manifest:{name:'Collaborator',version:'1',description:'test',interface:{id:'delegation-test',name:'Collaborator',description:'test',methods:[]}}});
     this.on('taskResult',msg=>{const p=msg.payload as any;this.results.push(p);this.waiters.get(p.ticketId)?.(p);return true;});
     this.on('executeTask',async msg=>{
       this.executions++;

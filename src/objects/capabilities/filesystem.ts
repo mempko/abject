@@ -8,7 +8,10 @@
  * the virtual tree — it can never escape onto the real host filesystem (the
  * only real paths ever touched are `blobs/<uuid>`, which is always safe).
  *
- * Each workspace gets its own root under `~/.abject/ws-<workspaceId>/files`.
+ * Each workspace gets its own root in the instance's data directory,
+ * `$ABJECTS_DATA_DIR/ws-<workspaceId>/files` (see data-dir-layout.ts); a tree
+ * left at `~/.abject/ws-<workspaceId>/files` by an older build moves there the
+ * first time the workspace opens it.
  * This is a `src/` capability object that uses Node `fs` directly (like
  * host-filesystem.ts); it only runs on the Node backend / in a worker_thread,
  * never bundled into the browser client.
@@ -16,13 +19,12 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import { v4 as uuidv4 } from 'uuid';
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { require } from '../../core/contracts.js';
-import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
+import { workspaceDataDir, legacyHomeDataDir, moveLegacyData } from '../data-dir-layout.js';
 
 const log = new Log('FileSystem');
 
@@ -76,6 +78,8 @@ function inferMime(name: string): string | undefined {
  */
 export class FileSystem extends Abject {
   private readonly rootDir: string;
+  /** Where an older build kept this tree, under the home directory. */
+  private readonly legacyRootDir: string;
   private readonly blobsDir: string;
   private readonly metadataPath: string;
 
@@ -201,17 +205,14 @@ export class FileSystem extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.FILESYSTEM_READ,
-          Capabilities.FILESYSTEM_WRITE,
-        ],
         tags: ['system', 'capability', 'filesystem'],
       },
     });
 
-    const scope = workspaceId ? `ws-${workspaceId}` : 'shared';
-    this.rootDir = path.join(os.homedir(), '.abject', scope, 'files');
+    // An empty id means no workspace, as it always has.
+    const wsId = workspaceId || undefined;
+    this.rootDir = path.join(workspaceDataDir(wsId), 'files');
+    this.legacyRootDir = path.join(legacyHomeDataDir(wsId, 'shared'), 'files');
     this.blobsDir = path.join(this.rootDir, 'blobs');
     this.metadataPath = path.join(this.rootDir, 'metadata.json');
 
@@ -219,6 +220,7 @@ export class FileSystem extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    moveLegacyData(this.legacyRootDir, this.rootDir, 'files', log);
     await fs.mkdir(this.blobsDir, { recursive: true });
     await this.loadMetadata();
   }

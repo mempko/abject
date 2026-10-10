@@ -1,132 +1,256 @@
 # src/runtime/ - Runtime Infrastructure
 
-Manages system lifecycle, message routing, and failure handling. This is the execution infrastructure that objects run on top of.
+The machinery objects run on: the `Runtime` that bootstraps Registry and
+Factory, the main-thread `MessageBus` and its interceptors, per-object
+`Mailbox`es, the worker-thread pool and its bridges, the `Supervisor`, and
+the tracker for child processes that must die with the app. Nothing here
+decides what objects do; it only moves their messages and keeps them alive.
+
+`server/boot.ts` (shared by the desktop and headless editions) creates the
+Runtime, sizes the worker pool and installs the interceptors.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Main Thread                         │
-│                                                         │
-│  Object A ──→ MessageBus ──→ Mailbox ──→ Object B      │
-│                   │                                     │
-│                   │ interceptors                        │
-│                   ├── PeerRouter (P2P routing)          │
-│                   ├── HealthInterceptor (error watch)   │
-│                   └── ProxyInterceptor (protocol xlat)  │
-│                                                         │
-│  Runtime (orchestrator)                                 │
-│  Supervisor (failure recovery)                          │
-│                                                         │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │              WorkerPool                            │ │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐        │ │
-│  │  │ Worker 1 │  │ Worker 2 │  │ Worker N │        │ │
-│  │  │WorkerBus │  │WorkerBus │  │WorkerBus │        │ │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘        │ │
-│  │       └──────────────┼──────────────┘              │ │
-│  │                WorkerBridge                        │ │
-│  │           (main ↔ worker forwarding)               │ │
-│  └────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
+ Main thread
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ Runtime ── owns ──► MessageBus ◄── Registry, Factory, main-only      │
+ │                       │            objects (PeerRouter, Supervisor)  │
+ │  send(msg):           ▼                                              │
+ │   1. interceptors in order: LoggingInterceptor (DEBUG), PeerRouter;  │
+ │      then the proxy routes (proxy-routes.ts)                         │
+ │   2. recipient in a worker? ──► its WorkerBridge ──► postMessage     │
+ │   3. local mailbox?         ──► Mailbox.send()                       │
+ │   4. never-seen id          ──► park up to 400 ms, then undeliverable│
+ └───────────┬──────────────────────────────────────┬───────────────────┘
+             │ WorkerPool: N WorkerBridges          │ DedicatedWorkerBridge
+             ▼                                      ▼
+   ┌──────────────┐ MessagePort ┌──────────────┐   P2P worker (always),
+   │ worker 0     │◄───────────►│ worker 1 …   │   UI worker (desktop)
+   │  WorkerBus   │  full mesh  │  WorkerBus   │
+   │  objects     │             │  objects     │
+   └──────────────┘             └──────────────┘
 ```
+
+Every object gets a `Mailbox` from whichever bus it registers on and runs its
+own processing loop (see `Abject` in [../core/README.md](../core/README.md)).
+Buses never await handlers: `send()` enqueues and returns.
+
+**Placement.** The Factory spawns a constructor in a pool worker when it is
+marked worker-eligible (the list in `server/boot.ts`) and workers are on.
+`workerIndexForId()` shards by the object's UUID, so placement is
+deterministic. The pool registers the route on the main bus before the spawn,
+then tells every other worker where the object lives so they can reach it over
+their direct `MessagePort`s. Objects a worker object constructs itself (every
+window and widget a worker-hosted WidgetManager creates) announce themselves
+with `bus:registered` and get the same routing.
+
+**Liveness.** The main bus pushes every registration and unregistration to
+all pool workers (`live:add` / `live:remove`), so `isRegistered()` inside a
+worker gives the same answer as on main.
+
+**Undeliverable messages.** When a recipient does not exist, a request gets a
+`RECIPIENT_NOT_FOUND` error reply at once (so `request()` fails fast instead of
+timing out), an event's sender gets a `recipientGone` event, and the
+undeliverable handler (PeerRouter, for late discovery of remote objects) runs.
+Ids that were never seen are parked for 400 ms first, because a worker's
+registration can arrive after a reply that names the new object. Ids
+unregistered within the last 10 s skip the wait.
+
+## Message flow
+
+```
+Same thread:   A.send ─► bus.send ─► (main only: interceptors) ─► Mailbox(B) ─► B handler
+Main → worker: MessageBus ─► WorkerBridge.deliverMessage ─► bus:deliver ─► WorkerBus ─► Mailbox
+Worker → peer: WorkerBus.send ─► peer MessagePort ─► peer WorkerBus.deliverFromPeer ─► Mailbox
+Worker → main: WorkerBus.send ─► bus:send ─► WorkerBridge ─► MessageBus.send (interceptors run here)
+```
+
+`WorkerBus.send()` tries, in order: a local mailbox, a known peer worker over
+its direct port, then the main thread.
 
 ## Files
 
 ### runtime.ts
 
-Main orchestrator managing the bootstrap sequence.
-
-- **State machine**: `created` → `starting` → `running` → `stopping` → `stopped`
-- **Bootstrap**: creates MessageBus, wires Factory with bus and Registry, initializes Registry (registers itself), initializes Factory (registers itself)
-- **`spawn(obj)`**: delegates to `Factory.spawnInstance()` (requires `running` state)
-- **Singleton**: `getRuntime()`, `resetRuntime()` for testing
-- **Invariant**: running runtime must have >= 2 core objects (Registry + Factory)
-- **Accessors**: `messageBus`, `objectRegistry`, `objectFactory`
-- **Shutdown helpers**: `signalChildProcesses(signal)` signals every child process started on this thread or in a pool worker (the first step of shutdown); `shutdownWorkerPool()` stops the pool early so it can run alongside other teardown (`stop()` then skips it)
+`Runtime` and the `getRuntime()` / `resetRuntime()` singleton.
+- `RuntimeConfig`: `debug` (adds a `LoggingInterceptor`), `workerEnabled`,
+  `workerCount` (default 2 when unset), `workerFactory`.
+- State machine `created` → `starting` → `running` → `stopping` → `stopped`.
+- `start()`: wires Factory to the bus and Registry, inits Registry and Factory
+  and registers both, spawns any `registerCoreObject()` objects, then starts
+  the `WorkerPool` and hands it to the bus and the Factory.
+- `spawn(obj, parentId?)` goes through `Factory.spawnInstance()`.
+- Shutdown: `signalChildProcesses(signal)` first (this thread and every pool
+  worker), `shutdownWorkerPool()` (can run alongside other teardown), then
+  `stop()` stops spawned objects, Registry, Factory and the bus.
+- Accessors: `messageBus`, `objectRegistry`, `objectFactory`, `workerPool`,
+  `config`, `currentState`.
 
 ### message-bus.ts
 
-Central message router. All inter-object communication goes through the bus.
+- **`MessageBusLike`**: what `Abject.init()` needs (`register`, `unregister`,
+  `send`, `isRegistered`); implemented by `MessageBus` and `WorkerBus`.
+- **`MessageBus`**: main-thread router. `register(objectId)` returns a new
+  `Mailbox`; `send()` runs interceptors, applies the proxy routes, then
+  routes as above; `relayFromPoolWorker()` does the same for a message a pool
+  worker sent on, without the routes (its own bus applied them);
+  `setProxyRoute()` / `removeProxyRoute()` / `announceProxyRoutesTo()` keep
+  the route table and copy it to every pool worker;
+  `registerWorkerObject()` / `registerDedicatedBridge()` mark ids that live in
+  a worker; `setWorkerPool()`, `announceLivenessTo()`;
+  `setUndeliverableHandler()`; `subscribe(objectId, handler)` (receives
+  undeliverable messages when `objectId` is `'*'` or `'undeliverable'`);
+  `stop()` clears all of it.
+- **`MessageInterceptor`**: `intercept(msg)` returns `'pass'`, `'drop'`, or a
+  replacement message. Synchronous.
+- **`LoggingInterceptor`**: logs each message, with an optional filter.
 
-- **`register(objectId, handler)`**: creates Mailbox, stores handler
-- **`send(message)`**: runs interceptor pipeline → delivers to Mailbox → invokes handler
-- **Interceptor pipeline**: each returns `'pass'`, `'drop'`, or a transformed message
-  - `LoggingInterceptor` - debug logging with optional filter
-  - `ProxyInterceptor` - reroutes messages between source/target through proxy
-  - `HealthInterceptor` - passively watches for error messages (used by HealthMonitor)
-- **Undeliverable handler**: `setUndeliverableHandler()` for network-layer late-discovery catchall
-- **Invariant**: mailbox count == handler count
+### proxy-routes.ts
+
+`ProxyRouteTable`: the routes of negotiated connections (`ProxyRoute`:
+agreement, source, target, proxy, HealthMonitor). `apply(msg)` re-addresses a
+request or event between the source and the target (either direction) to the
+proxy, and turns the proxy's reply or error to the source into a
+`recordSuccess` / `recordError` event for HealthMonitor. Replies and errors
+otherwise pass untouched, so each still reaches its requester. The main bus
+owns the table (the Negotiator, on the main thread, sets it) and copies every
+change to the pool workers (`proxy:route`, `proxy:unroute`); each `WorkerBus`
+applies the same table on send, so a connection holds for traffic that stays
+inside a worker or goes straight to a peer worker.
 
 ### mailbox.ts
 
-Bounded async message queue per object.
-
-- **`Mailbox`**: bounded (default 1000 messages)
-  - `send()` - enqueue (or hand directly to waiter)
-  - `receive()` - blocking (returns Promise)
-  - `tryReceive()` - non-blocking
-  - `receiveTimeout(ms)` - with deadline
-  - `peek()`, `drain()`, `clear()`, `close()`
-  - **Invariant**: cannot have both queued messages and waiters simultaneously
-
-- **`PriorityMailbox`**: multiple `Mailbox` instances sorted by priority level
+- **`Mailbox`**: bounded FIFO (default 1000). `send()` hands the message to a
+  waiting `receive()` or queues it; when the mailbox is full or closed the
+  message is dropped and counted (`droppedFull`, `droppedClosed`) with a
+  throttled warning. `receive()`, `tryReceive()`, `receiveTimeout(ms)`,
+  `peek()`, `drain()`, `clear()`, `close()`. Invariant: never both queued
+  messages and waiters.
+- **`PriorityMailbox`**: several mailboxes drained highest priority first.
 
 ### supervisor.ts
 
-Erlang-style supervision tree. Is itself an `Abject`.
-
-- **Strategies**: `one_for_one` (restart failed child), `one_for_all` (restart all), `rest_for_one` (restart from failed onward)
-- **Restart tracking**: counts restarts within time window (default 3 restarts in 5s)
-- **Escalation**: removes child from supervision when max restarts exceeded
-- **Handler**: listens for `childFailed` messages
+`Supervisor` (an Abject, `SUPERVISOR_ID`): Erlang-style supervision by child
+spec.
+- `ChildSpec`: `id`, `constructorName`, `restart` (`permanent`, `transient`,
+  `temporary`), `parentId`.
+- Handlers: `addChild`, `removeChild`, `getChildren`, `childFailed`.
+- On `childFailed` it drops `temporary` children and restarts the others by
+  strategy (`one_for_one` default, `one_for_all`, `rest_for_one`), asking the
+  Factory to `respawn` with the same id so references stay valid, then sends
+  `markObjectReady` to the HealthMonitor. More than `maxRestarts` (3) within
+  `maxTime` (5 s) removes the child from supervision.
+- `childFailed` comes from HealthMonitor (missed pings, `LIVENESS_FAILURE`)
+  and WorkerRecovery (`WORKER_DEAD`). `server/boot.ts` registers system
+  objects through `supervisedSpawn()`.
 
 ### worker-pool.ts
 
-Manages a pool of reusable Web Workers (or Node.js worker_threads) for object execution.
-
-- Creates workers on demand up to a configurable pool size
-- Assigns objects to workers for isolated execution
-- Tracks which objects are running on which workers
-- Handles worker termination and cleanup
-- **Shutdown** stops every hosted object at once, each given at most 2.5s, then terminates the workers; `signalChildren(signal)` asks every worker to signal the child processes it started
+`WorkerPool` and `workerIndexForId()`.
+- `start()` creates all `workerCount` workers, waits for `ready`, then links
+  every pair with a `MessageChannel` (full mesh).
+- `spawnInWorker(objectId, constructorName, { constructorArgs, registryId,
+  parentId, typeId })` routes, spawns, and announces placement to peers;
+  `killInWorker()` reverses it. The `typeId` reaches the object before init,
+  so worker-hosted objects carry their durable identity like main-thread ones.
+- Worker death: cuts every route to the lost objects (main bus and peers),
+  tells peers the worker is dead, builds a replacement in the same slot, and
+  calls `onWorkerLost(lostIds, index)` (wired to WorkerRecovery in
+  `server/boot.ts`).
+- `heapSamples()`: each worker's latest heap report (read by HeapMonitor).
+- `signalChildren(signal)`; `shutdown()` stops every hosted object at once,
+  each given at most 2.5 s, then terminates the workers.
 
 ### worker-bridge.ts
 
-Bridge connecting main-thread MessageBus to worker-thread MessageBus instances.
+`WorkerBridge`: the main-thread end of one worker, over the `WorkerLike`
+interface (`postMessage`, `terminate`, `onmessage`, `onerror`, `onexit`).
+Defines the wire protocol (`WorkerInboundMessage`: `init`, `spawn`, `kill`,
+`bus:deliver`, `peer:*`, `live:*`, `children:signal`;
+`WorkerOutboundMessage`: `ready`, `spawned`, `stopped`, `bus:send`,
+`bus:registered`, `bus:unregistered`, `worker:heap`, `error`, ...) and
+`WorkerHeapSample`. Tracks requests forwarded into the worker so that, if the
+worker dies, each caller gets a `WORKER_DEAD` error reply; requests to an
+already dead worker fail the same way. Hooks: `onLocalRegistered`,
+`onLocalUnregistered`, `onDead`, `onHeapSample`.
 
-- Forwards messages between the main bus and worker buses via `postMessage`
-- Serializes/deserializes `AbjectMessage` across the worker boundary
-- Handles worker lifecycle events (ready, error, termination)
+### dedicated-worker-bridge.ts
 
-### child-processes.ts
-
-Child processes this thread started that must not outlive the app (MCP servers, CLI providers, PTY sessions, running processes).
-
-- Spawners call `trackChild(pid, label, { group })`; a `group` child leads its own process group (or, on Windows, the tree `taskkill /T` walks) and the whole group is signalled
-- `untrackIfGone(pid)` forgets a group only once it is empty: a leader can exit while its descendants run on
-- `signalAllChildren(signal)` is the shutdown step: it signals every tracked child, and any child tracked afterwards is signalled as soon as it is recorded
-- Module state is per thread; the main thread asks pool workers with a `children:signal` message
+`DedicatedWorkerBridge` extends `WorkerBridge` for the single-purpose workers
+(the P2P worker, and on the desktop the UI worker): `sendConfig()`,
+`transferPort()`, `sendCustom()` / `onCustom()` for non-Abject messages, and
+`shutdownWorker()`, which asks the worker to stop its objects (and their
+peer connections) before terminating the thread. Their objects are routed
+with `MessageBus.registerDedicatedBridge()`.
 
 ### worker-bus.ts
 
-MessageBus implementation for Web Worker context.
+`WorkerBus`: the `MessageBusLike` inside a worker thread. Local mailboxes,
+peer ports (`addPeerPort`, `addPeerObject`), the global liveness view
+(`addGlobalObject`), and `failPeer()`, which answers every request still out
+to a dead peer with `WORKER_DEAD`. `register()` posts `bus:registered` to main;
+`onUnregistered` lets the worker entry release its references. The worker side
+that drives it is `workers/worker-runtime.ts`.
 
-- Provides an isolated message bus inside each worker thread
-- Objects running in a worker register on the local WorkerBus
-- Cross-worker messages forwarded through `WorkerBridge` to the main bus
+### child-processes.ts
 
-## Message Flow
+Child processes this thread started that must not outlive the app (MCP
+servers, CLI providers, PTY sessions, running processes). Spawners call
+`trackChild(pid, label, { group })`; a `group` child leads its own process
+group and the whole group is signalled. `untrackChild()`, `untrackIfGone()`,
+`trackedChildren()`, `signalChild()`, `signalAllChildren(signal)` (the first
+shutdown step; later arrivals are signalled as soon as they are tracked),
+`resetChildTracking()`. State is per thread; the pool asks each worker with
+`children:signal`.
 
-```
-Object A → this.send(msg) → Abject.send() → MessageBus.send() →
-  interceptor pipeline → Mailbox.send() → handler(msg) →
-  if request and handler returns value → auto-reply
-```
+## Configuration
 
-**Cross-worker message flow:**
+Set in `server/boot.ts`:
+- `ABJECTS_WORKER_COUNT=N` sets the pool size (`0` runs everything on the
+  main thread). The default is the CPU count minus one, between 1 and 8.
+- `ABJECTS_DEDICATED_WORKERS=0` keeps the P2P (and UI) objects on the main
+  thread.
+- `DEBUG` turns on the `LoggingInterceptor`.
 
-```
-Object A (main) → MessageBus → WorkerBridge → postMessage →
-  Worker N → WorkerBus → Object B (worker)
-```
+## Adding things
+
+**Running an object in a worker.** Register its constructor with the Factory
+in `server/boot.ts` and in the worker constructor table
+(`workers/core-constructors.ts`, or `workers/ui-constructors.ts` for display
+objects), then add the name to the `workerEligible` list in `server/boot.ts`.
+A constructor missing from the worker table makes the spawn fail.
+
+**A new interceptor.** Implement `MessageInterceptor` (synchronous, never
+throws, returns quickly; it runs on every main-bus message) and install it
+with `bus.addInterceptor()` in `server/boot.ts`. Order matters: PeerRouter
+re-addresses remote traffic before any later interceptor sees it. If it needs
+replies from objects, register a mailbox of its own on the bus for them. It
+sees only main-bus traffic: messages inside one worker, or between workers
+over their direct ports, never reach it.
+
+## Gotchas
+
+- **Interceptors only see main-bus traffic.** Messages between two objects in
+  the same worker, or between pool workers over their direct ports, never
+  reach the main `MessageBus`, so interceptors do not see them. An object
+  hosted in a worker also has a `WorkerBus`, which has no `addInterceptor()`.
+- **A full mailbox drops.** `Mailbox.send()` does not throw; it logs and
+  counts. A flood shows up as `drop: full mailbox` warnings and requests that
+  time out.
+- **`subscribe()` is not a firehose.** Subscriptions only receive
+  undeliverable messages.
+- **Register worker constructors in both places**, or worker spawns fail.
+- **Supervisor and PeerRouter stay on the main thread.** The Supervisor must
+  not depend on the workers it restarts; PeerRouter is a synchronous
+  interceptor.
+- **`resetRuntime()`** before building a new Runtime in the same process
+  (the bootstrap does this); `getRuntime()` otherwise returns the old one.
+
+## Related
+
+- [../core/README.md](../core/README.md): `Abject`, messages, contracts
+- [../protocol/README.md](../protocol/README.md): Negotiator and HealthMonitor
+- [../network/README.md](../network/README.md): PeerRouter and transports
+- [../../workers/README.md](../../workers/README.md): worker entry points and constructor tables
+- [../../server/README.md](../../server/README.md): bootstrap

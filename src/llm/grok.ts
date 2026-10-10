@@ -122,12 +122,3 @@ export class GrokProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createGrokProvider(): GrokProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).XAI_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new GrokProvider({ apiKey });
-}

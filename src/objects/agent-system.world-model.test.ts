@@ -16,7 +16,7 @@ import { storeWasmModule } from '../sandbox/wasm-module-store.js';
 import { extractWasmManifest } from '../sandbox/wasm-instance.js';
 
 class Endpoint extends Abject {
-  constructor(name: string) { super({manifest:{name,version:'1',description:'Learning fixture',interface:{id:`test:${name}`,name,description:'fixture',methods:[]},requiredCapabilities:[],providedCapabilities:[]}}); }
+  constructor(name: string) { super({manifest:{name,version:'1',description:'Learning fixture',interface:{id:`test:${name}`,name,description:'fixture',methods:[]}}}); }
   public override on(method: string, handler: MessageHandlerFn) { super.on(method,handler); }
   call(to: string, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id,to,method,payload),10000); }
 }

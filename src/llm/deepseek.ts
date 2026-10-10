@@ -126,12 +126,3 @@ export class DeepSeekProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createDeepSeekProvider(): DeepSeekProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).DEEPSEEK_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new DeepSeekProvider({ apiKey });
-}

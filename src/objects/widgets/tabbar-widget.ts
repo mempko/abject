@@ -1,8 +1,10 @@
 /**
  * TabBarWidget — horizontal tab bar with selectable tabs.
  *
- * Divides its width equally among tabs. The active tab gets an accent-colored
- * bottom border and primary text color. Inactive tabs use secondary text.
+ * Divides its width equally among tabs, each drawn as a slanted
+ * parallelogram standing on a heavy ink baseline. The active tab is filled
+ * with the accent (a wedge) and labelled in the action text colour; inactive
+ * tabs are outlined in the divider colour, tinted on hover, with primary text.
  * Clicking a tab switches the selection and emits a 'change' notification.
  * Double-clicking a tab enters inline rename mode.
  * Each tab has a × close button (when closable is true).

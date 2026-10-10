@@ -48,7 +48,7 @@ const EDITABLE_METHODS: MethodDeclaration[] = [
     name: 'updateManifest',
     description: 'Replace this object\'s self-description (description, icon, tags, interface methods and events) with a redrafted one. Handlers the source registers stay declared whatever the draft says, and declarations for handlers the source lacks are dropped; the accepted manifest is published to the Registry. Owner, ObjectCreator, AbjectEditor, and AbjectStore may call it.',
     parameters: [
-      { name: 'manifest', type: { kind: 'object' as const, properties: {} }, description: 'The new manifest ({ name, description, version, icon?, interface: { id, name, description, methods, events? }, requiredCapabilities?, providedCapabilities?, tags? })' },
+      { name: 'manifest', type: { kind: 'object' as const, properties: {} }, description: 'The new manifest ({ name, description, version, icon?, interface: { id, name, description, methods, events? }, tags? })' },
     ],
     returns: { kind: 'object' as const, properties: {} },
   },
@@ -483,8 +483,6 @@ export class ScriptableAbject extends Abject {
         if (!tags.includes('scriptable')) tags.push('scriptable');
         live.tags = tags;
       }
-      if (Array.isArray(draft.requiredCapabilities)) live.requiredCapabilities = draft.requiredCapabilities;
-      if (Array.isArray(draft.providedCapabilities)) live.providedCapabilities = draft.providedCapabilities;
       const iface = live.interface;
       if (typeof draft.interface.description === 'string') iface.description = draft.interface.description;
       // The drafted methods, then the editable methods every scriptable object
@@ -1171,16 +1169,10 @@ export class ScriptableAbject extends Abject {
     const { added, removed } = this.reconcileManifestWithSource(previousUserMethods);
     if (added.length > 0 || removed.length > 0) this.publishManifest();
 
-    // Emit sourceUpdated event so Negotiator can regenerate affected proxies
+    // Tell dependents the source changed: a Negotiator that connected this
+    // object to another regenerates the proxy between them.
     const newMethods = Array.from(this._userMethods);
-    this.send(
-      event(
-        this.id,
-        this.id, // sent to self; Negotiator listens via bus subscription or handler
-        'sourceUpdated',
-        { objectId: this.id, methods: newMethods }
-      )
-    );
+    this.changed('sourceUpdated', { objectId: this.id, methods: newMethods });
 
     return { success: true, ...(added.length > 0 ? { manifestMethodsAdded: added } : {}), ...(removed.length > 0 ? { manifestMethodsRemoved: removed } : {}) };
   }

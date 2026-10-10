@@ -16,7 +16,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { require as contractRequire, invariant } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 import type { ScheduleEntry } from './scheduler.js';
@@ -252,10 +251,6 @@ export class SchedulerBrowser extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display scheduler browser window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

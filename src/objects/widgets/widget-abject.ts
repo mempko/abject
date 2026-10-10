@@ -308,8 +308,6 @@ export abstract class WidgetAbject extends Abject {
         description: `${config.type} widget Abject`,
         version: '1.0.0',
         interface: WIDGET_INTERFACE_DECL,
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['widget', config.type],
       },
     });

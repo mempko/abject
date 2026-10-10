@@ -109,12 +109,3 @@ export class MetaProvider extends OpenAIProvider {
     };
   }
 }
-
-export function createMetaProvider(): MetaProvider | undefined {
-  const apiKey = (globalThis as Record<string, unknown>).META_API_KEY as string | undefined;
-  if (!apiKey) {
-    log.warn('No API key found');
-    return undefined;
-  }
-  return new MetaProvider({ apiKey });
-}

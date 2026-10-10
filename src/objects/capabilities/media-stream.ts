@@ -8,7 +8,6 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { Capabilities } from '../../core/capability.js';
 import { require as precondition } from '../../core/contracts.js';
 import { request as createRequest } from '../../core/message.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -185,10 +184,6 @@ export class MediaStreamCapability extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.MEDIA_STREAM,
-        ],
         tags: ['system', 'capability', 'media-stream'],
       },
     });

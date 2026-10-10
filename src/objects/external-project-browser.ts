@@ -22,7 +22,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { AUTONOMY_LEVELS, type AutonomyLevel, type ExternalProject } from './external-project-registry.js';
 import type { Rule, RuleScope } from './permission-broker.js';
@@ -151,10 +150,6 @@ export class ExternalProjectBrowser extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display the external project window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'projects'],
       },
     });

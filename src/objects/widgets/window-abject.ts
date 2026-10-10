@@ -302,8 +302,6 @@ export class WindowAbject extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['widget', 'window'],
       },
     });

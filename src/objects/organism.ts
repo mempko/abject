@@ -81,7 +81,6 @@ export function buildOrganismManifest(spec: OrganismSpec): AbjectManifest {
     description: spec.description,
     version: spec.version ?? '1.0.0',
     interface: { ...iface, methods, events },
-    requiredCapabilities: ifaceManifest.requiredCapabilities,
     tags,
   };
 }
@@ -123,7 +122,6 @@ export class Organism extends Abject {
           ...ifaceManifest.interface,
           id: ORGANISM_INTERFACE,
         },
-        requiredCapabilities: ifaceManifest.requiredCapabilities,
         tags,
       },
     });
@@ -247,7 +245,6 @@ export class Organism extends Abject {
             description: 'Object registration and discovery',
             methods: [],
           },
-          requiredCapabilities: [],
           tags: ['system', 'core'],
         },
       })

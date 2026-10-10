@@ -19,7 +19,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as requireContract, requireNonEmpty } from '../core/contracts.js';
-import { Capabilities } from '../core/capability.js';
 import { chromeCase } from '../core/theme-data.js';
 import { fontStacks } from './widgets/widget-types.js';
 
@@ -214,10 +213,6 @@ export class WebBrowserViewer extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display browser viewer window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

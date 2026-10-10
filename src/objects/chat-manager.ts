@@ -205,8 +205,6 @@ export class ChatManager extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system'],
       },
     });
@@ -479,7 +477,7 @@ export class ChatManager extends Abject {
         request(this.id, this.factoryId, 'spawn', {
           manifest: {
             name: 'Chat', description: '', version: '1.0.0',
-            requiredCapabilities: [], tags: ['system', 'agent'],
+            tags: ['system', 'agent'],
           },
           registryHint: this.registryId,
           typeId,

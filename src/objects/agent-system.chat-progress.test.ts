@@ -13,8 +13,7 @@ import { Registry } from './registry.js';
 class Endpoint extends Abject {
   constructor(name: string) {
     super({ manifest: { name, version: '1', description: 'Chat event fixture',
-      interface: { id: `fixture:${name}`, name, description: 'fixture', methods: [] },
-      requiredCapabilities: [], providedCapabilities: [] } });
+      interface: { id: `fixture:${name}`, name, description: 'fixture', methods: [] } } });
   }
   public override on(method: string, fn: MessageHandlerFn): void { super.on(method, fn); }
   call(to: AbjectId, method: string, payload: unknown, timeout = 1000): Promise<any> {

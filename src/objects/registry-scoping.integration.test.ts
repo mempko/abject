@@ -45,8 +45,6 @@ function mkManifest(name: string, description: string, sharing?: string): Abject
     version: '1.0.0',
     interface: iface,
     interfaces: [iface],
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
     ...(sharing ? { sharing } : {}),
   } as unknown as AbjectManifest;

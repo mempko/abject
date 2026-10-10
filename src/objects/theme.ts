@@ -4,7 +4,7 @@
  * All communication is via message passing:
  *   getTheme        → returns the current ThemeData
  *   setTheme        → merges partial theme, persists, broadcasts themeChanged
- *   resetTheme      → resets to the default preset (Agitprop)
+ *   resetTheme      → resets to the default preset (Red Sigil)
  *   listPresets     → built-in + user-registered ThemePresets
  *   setThemeById    → swap to a preset by id (atomic, no merge)
  *   getActiveThemeId→ id of the active preset, or 'custom' after setTheme()
@@ -121,7 +121,7 @@ export class ThemeAbject extends Abject {
               },
               {
                 name: 'resetTheme',
-                description: 'Reset to the default theme (Agitprop)',
+                description: 'Reset to the default theme (Red Sigil)',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'ThemeData' },
               },
@@ -166,8 +166,6 @@ export class ThemeAbject extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'theme'],
       },
     });
@@ -504,7 +502,7 @@ Visual language (the same on every theme; a theme is a colour palette of one des
 - Background: theme.windowBg (panels), theme.canvasBg (canvas behind windows)
 - Text: theme.textPrimary (main), theme.textSecondary (muted), theme.textTertiary (disabled)
 - Headings: theme.textHeading, Descriptions: theme.textDescription, Meta: theme.textMeta
-- Accents/highlights: theme.accent (primary accent: red on the default Agitprop theme), theme.accentSecondary, theme.accentTertiary
+- Accents/highlights: theme.accent (primary accent: red on the default Red Sigil theme), theme.accentSecondary, theme.accentTertiary
 - Action buttons: theme.actionBg, theme.actionText, theme.actionBorder
 - Destructive buttons: theme.destructiveBg, theme.destructiveText, theme.destructiveBorder
 - Active items: theme.activeItemBg, theme.activeItemBorder
@@ -529,8 +527,7 @@ Visual language (the same on every theme; a theme is a colour palette of one des
   const presets = await this.call(
     this.dep('Theme'), 'listPresets', {});
   // Returns: [{ id, name, description, builtin, theme }, ...]
-  // Built-ins: agitprop (default), red-wedge, arcane-grimoire, midnight-bloom, paper-light,
-  // high-contrast, sunset, ocean, monochrome, dracula, solarized-light, rose-pine
+  // Built-ins: ${BUILTIN_THEME_PRESETS.map((p) => (p.id === DEFAULT_THEME_ID ? `${p.id} (default)` : p.id)).join(', ')}
 
   await this.call(
     this.dep('Theme'), 'setThemeById', { id: 'ocean' });
@@ -564,7 +561,7 @@ design: a theme is a colour palette.
 
   await this.call(
     this.dep('Theme'), 'unregisterTheme', { id: 'forest' });
-  // If 'forest' was active, the theme falls back to the default (agitprop).
+  // If 'forest' was active, the theme falls back to the default (red-sigil).
 
 ### Subscribing to Theme Changes
 

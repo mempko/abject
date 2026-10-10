@@ -15,8 +15,8 @@
  *   values entered here apply at once. A package's own abjects read them with
  *   `getSettings` (secret values included, for them only) and can observe
  *   this object for `settingsChanged`.
- * - **System-scope package data.** A script package spawned once at system
- *   scope has no workspace AbjectStore; its abject saves and loads its data
+ * - **System-scope package data.** A package (script or WASM) spawned once at
+ *   system scope has no workspace AbjectStore; its abject saves and loads its data
  *   here (`savePackageData`, `getPackageData`), kept in the global Storage
  *   and answered only to that package's own system-scope abject.
  *
@@ -101,7 +101,7 @@ function settingValueValid(spec: PackageSettingSpec, v: unknown): v is PackageSe
   return typeof v === 'string';
 }
 
-/** Global Storage key holding a system-scope script package's data. */
+/** Global Storage key holding a system-scope package's data. */
 const packageDataKey = (packageName: string) => `packages:data:${packageName}`;
 
 export class Packages extends Abject {
@@ -176,13 +176,13 @@ export class Packages extends Abject {
             },
             {
               name: 'getPackageData',
-              description: 'For a script package abject spawned at system scope: its saved data, or null. Answered only to that abject; workspace package abjects keep their data in their workspace\'s AbjectStore.',
+              description: 'For a package abject (script or WASM) spawned at system scope: its saved data, or null. Answered only to that abject; workspace package abjects keep their data in their workspace\'s AbjectStore.',
               parameters: [],
               returns: obj,
             },
             {
               name: 'savePackageData',
-              description: 'For a script package abject spawned at system scope: replace its saved data. Answered only to that abject. Returns { success }.',
+              description: 'For a package abject (script or WASM) spawned at system scope: replace its saved data. Answered only to that abject. Returns { success }.',
               parameters: [
                 { name: 'data', type: obj, description: 'The abject\'s data (JSON)' },
               ],
@@ -194,8 +194,6 @@ export class Packages extends Abject {
             { name: 'settingsChanged', description: 'A package\'s settings changed; payload { package }', payload: obj },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'packages'],
       },
     });
@@ -257,7 +255,7 @@ export class Packages extends Abject {
   }
 
   /**
-   * The package name of a script package abject registered at system scope,
+   * The package name of a package abject registered at system scope,
    * found from where the Factory registered it, never from the message. Its
    * data is keyed by package, so a workspace package abject (one per
    * workspace, data in its workspace's AbjectStore) is refused.
@@ -270,7 +268,7 @@ export class Packages extends Abject {
       this.globalRegistryId = own?.registryId;
     }
     precondition(!!reg && isPackageOwner(reg.owner),
-      'package data is kept only for abjects spawned from an installed script package');
+      'package data is kept only for abjects spawned from an installed package');
     precondition(!!this.globalRegistryId && reg!.registryId === this.globalRegistryId,
       'package data here is for system-scope packages; a workspace package keeps its data in its workspace\'s AbjectStore');
     return packageNameOf(reg!.owner)!;
@@ -495,11 +493,11 @@ export class Packages extends Abject {
   /**
    * The settings of the package the caller was spawned from.
    *
-   * A script package's abjects carry the `package:<name>` owner, which only
-   * the Factory gives out and only when it spawns from that package. A WASM
-   * package's abjects have no owner, so they are recognised by the typeId
-   * WorkspaceManager or the bootstrap stamped at spawn,
-   * `{peer}/{workspace|system}/{TypeName}`, and only for WASM package types.
+   * A package's abjects (script or WASM) carry the `package:<name>` owner,
+   * which only the Factory gives out and only when it spawns from that
+   * package. The typeId fallback below (`{peer}/{workspace|system}/{TypeName}`,
+   * WASM package types only) covers abjects spawned before WASM packages
+   * got the owner too.
    */
   private async getSettingsFor(callerId: AbjectId): Promise<{ package: string; values: Record<string, PackageSettingValue> }> {
     const reg = await this.callerRegistration(callerId);

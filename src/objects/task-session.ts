@@ -119,7 +119,7 @@ export class TaskSession extends Abject {
         { name: 'reconcile', description: 'Record an evidence-backed outcome for an outstanding operation before resuming: id, expectedRevision, evidence, outcome.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'retainPayload', description: 'AgentAbject-only: retain a received payload body by sessionId and payload.id before removing it from active memory.', parameters: [], returns: { kind: 'object', properties: {} } },
         { name: 'readPayload', description: 'AgentAbject-only: retrieve retained evidence by sessionId and id. Agents use runtime read_chunk or readPayload messages.', parameters: [], returns: { kind: 'object', properties: {} } },
-      ] }, requiredCapabilities: [], providedCapabilities: [], tags: ['system', 'agent', 'sessions'] } });
+      ] }, tags: ['system', 'agent', 'sessions'] } });
     this.on('get', async msg => {
       const rec = await this.full((msg.payload as { id: string }).id);
       return rec ? expand(rec) : null;

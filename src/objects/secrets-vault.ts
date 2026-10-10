@@ -139,8 +139,6 @@ export class SecretsVault extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'secrets'],
       },
     });

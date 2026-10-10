@@ -102,6 +102,7 @@ async function main(): Promise<void> {
   if (abi !== WASM_ABI_VERSION) fail(`abject.json: abi ${abi} unsupported (host speaks v${WASM_ABI_VERSION})`);
   const scope = meta.scope ?? 'workspace';
   if (scope !== 'system' && scope !== 'workspace') fail('abject.json: "scope" must be "system" or "workspace"');
+  if (meta.required !== undefined && typeof meta.required !== 'boolean') fail('abject.json: "required" must be true or false');
 
   // 1. Build
   if (meta.build && !noBuild) {
@@ -310,6 +311,10 @@ async function forgeScript(
     console.warn(`forge: warning: the manifest declares ${unhandled.join(', ')} but the source has no handler for ${unhandled.length === 1 ? 'it' : 'them'}`);
   }
 
+  if (meta.ask !== undefined) {
+    console.warn('forge: warning: "ask" applies to WASM packages (the host answers ask for a module); a script package\'s ask is answered from its manifest and source, so it is not installed');
+  }
+
   const kb = (Buffer.byteLength(source) / 1024).toFixed(1);
   const summary = `type '${typeName}' (script, ${scope}${meta.replaces ? `, replaces built-in ${meta.replaces}` : ''}), ` +
     `${kb} KiB, ${handlers.length} handlers, ${settings.length} settings`;
@@ -344,6 +349,7 @@ async function forgeScript(
         ...(meta.replaces ? { replaces: meta.replaces } : {}),
         ...(settings.length > 0 ? { settings } : {}),
         ...(meta.profiles !== undefined ? { profiles: meta.profiles } : {}),
+        ...(meta.required !== undefined ? { required: meta.required } : {}),
         manifest,
       },
       null,

@@ -16,7 +16,6 @@ import {
 import { Abject } from '../src/core/abject.js';
 import { require as contractRequire } from '../src/core/contracts.js';
 import { event, request } from '../src/core/message.js';
-import { Capabilities } from '../src/core/capability.js';
 import type { WebSocket } from 'ws';
 import type {
   BackendToFrontendMsg,
@@ -1006,8 +1005,6 @@ export class BackendUI extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.UI_SURFACE, Capabilities.UI_INPUT],
         tags: ['system', 'ui'],
       },
     });

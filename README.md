@@ -48,7 +48,7 @@ reads its own manifest and source, then answers in natural language.
 
 - **ObjectCreator** asks dependencies how to use them before writing a single line of code.
 - **ProxyGenerator** asks both sides what they expect, then writes a living translator between them.
-- **Chat** lets users ask Abjects about themselves directly. The Abject answers from its own source.
+- **Chat** lets people ask about any Abject. The question reaches the Abject, and it answers from its own manifest and source.
 
 Ordinary messages never touch an LLM: they are typed payloads on a message
 bus, fast and deterministic. The LLM is a service an Abject calls when it
@@ -57,12 +57,12 @@ object, answering a question in plain English).
 
 ## The Standard Bestiary
 
-- **Self-Healing Proxies**: Error rates above 10% trigger LLM proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption. Break them. They always grow back.
+- **Self-Healing Proxies**: Error rates above 10% trigger LLM proxy regeneration. Change an object's source and its proxies are regenerated against the new interface. The new proxy is swapped in for the old one. Break them. They always grow back.
 - **The Negotiator**: Bridges incompatible interfaces. It reads both manifests, generates a real proxy Abject. Not a shim. A living translator.
 - **Everything is an Abject**: The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject. There is no privileged layer. Just Abjects passing messages.
-- **Containment Protocols**: Untrusted code runs inside a WASM sandbox. Capability-gated imports. No ambient authority. Abjects cannot touch anything they haven't been explicitly allowed to reach.
+- **Containment Protocols**: Generated Abjects run in a script sandbox with no file, network, or process access of their own. Code in other languages runs as WASM, which can do nothing but send messages, log, and read the clock. No ambient authority: everything an Abject does is a message to a capability object, and the ones that reach your machine or the network go through a permission broker that follows rules you set or asks you.
 - **True Names**: Every peer has a true name: a SHA-256 hash of its public key. ECDSA/ECDH identity. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.
-- **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an Abject; it comes back knowing what it knew.
+- **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an Abject; it comes back knowing what it knew. Kill the worker thread it lived on; what lived there is rebuilt.
 
 ## Symbiogenesis
 
@@ -74,7 +74,7 @@ a mind, silent otherwise.
 - **ObjectCreator** interviews existing Abjects, learns their protocols through the Ask Protocol, and generates living collaborators. The tool teaches the creator how to use it.
 - **The Negotiator** reads two incompatible manifests and conjures a living proxy between them, a real Abject, not a shim.
 - **The LLM** is a service Abject, summoned when needed, silent otherwise. Abjects create Abjects that create Abjects. The recursion is unlimited.
-- **Canvas UI**: Every Abject can paint its own face. An X11-style compositor gives each one a window with buttons, text inputs, layouts, and custom draw commands. The organism has a body.
+- **Canvas UI**: Every Abject can paint its own face. An X11-style display server gives each one a window with buttons, text inputs, layouts, and custom draw commands, and the client composites the windows in a WebGL scene. The organism has a body. (The headless edition has none, and works the same without it.)
 
 ## Emergence
 
@@ -99,17 +99,35 @@ who can reach, who can speak.
 | Tier | Name | Behavior |
 |------|------|----------|
 | **Local** | The Sealed Vault | No routes exposed. Nothing enters. Nothing leaves. |
-| **Private** | The Inner Circle | Shared with those you name. Encrypted WebRTC, ECDH key agreement, AES-256-GCM. |
+| **Shared** | The Inner Circle | Shared with those you name. Encrypted WebRTC, ECDH key agreement, AES-256-GCM. |
 | **Public** | The Commons | Visible to all. Any peer can discover, connect, and begin the Ask Protocol. |
 
 ## Summon the System
 
-### Prerequisites
+### Install
+
+The desktop app (AppImage and .deb for Linux, an installer for Windows, .dmg
+for macOS) is on the [releases page](https://github.com/mempko/abject/releases).
+
+On a server, or if you live in a terminal, install the headless edition: the
+`abject` command with its own backend and no display.
+
+```bash
+curl -fsSL https://abject.world/install.sh | sh     # Linux and macOS
+irm https://abject.world/install.ps1 | iex          # Windows (PowerShell)
+abject                                              # guided setup the first time, then the chat
+```
+
+The release archives and a container image (`ghcr.io/mempko/abject`) carry
+the same edition; [deploy/README.md](deploy/README.md) covers running it as a
+service.
+
+### From Source: Prerequisites
 
 - **Node.js 22.5+** (the server uses `node:sqlite`). Download from [nodejs.org](https://nodejs.org) or use [nvm](https://github.com/nvm-sh/nvm) (`.nvmrc` pins 22).
 - **pnpm** - install via `npm install -g pnpm` or see [pnpm.io/installation](https://pnpm.io/installation) for other methods (Homebrew, Corepack, standalone script, etc.).
 
-### Setup
+### From Source: Setup
 
 ```bash
 # Clone the repository
@@ -147,13 +165,24 @@ pnpm awaken:headless            # then pnpm abject in another terminal
 
 Three processes. One living system.
 
+A few more, for working on it:
+
+| Command | What it does |
+|---------|-------------|
+| `pnpm abject start` | Start the headless edition from source in the background (`pnpm abject stop` stops it) |
+| `pnpm divine` | The browser client in peer-to-peer mode (what `client.abject.world` serves), on :5180 |
+| `pnpm forge <dir>` | Build and install an abject package, WASM or script ([docs/PACKAGES.md](docs/PACKAGES.md)) |
+| `pnpm smelt` | Rebuild the bundled C++ KnowledgeBase (`native/knowledge-base`) |
+| `pnpm typecheck` | Type-check the whole tree |
+
 ### abject (The Command Line)
 
 The desktop has a canvas; the terminal gets `abject`. It is a whole way to
 run Abject, not only a view: the headless edition is the same backend with
 no display, and `abject` starts it in the background, walks you through
-setup the first time (a model, what agents may do without asking), and
-connects. Quitting the chat leaves the backend running so goals keep going;
+setup the first time (where data lives, a model, what agents may do without
+asking, an optional login, web browsing, starting at login), and connects.
+Quitting the chat leaves the backend running so goals keep going;
 `abject stop` stops it and `abject service install` starts it at login.
 When the desktop app is running, `abject` talks to it instead (the app ships
 its own copy, Help → Install the abject Command), and both share one data
@@ -178,8 +207,8 @@ and `--plain` gives a line-oriented REPL for pipes and dumb terminals.
 `update`, `settings get|set`, `serve`, ...).
 
 Settings work from the terminal too. `/settings` opens every setting the
-Settings window has (AI keys and tiers, login, filesystem, shell, web,
-capability checks) plus the current workspace's (name, access, web
+Settings window has (AI keys and tiers, login, permissions, filesystem,
+shell, web) plus the current workspace's (name, access, web
 exposure, theme): arrow to one, press Enter, type the new value. Keys and
 passwords are hidden as you type and never shown again. The same changes
 are one-liners for scripts and `--plain`:
@@ -198,11 +227,9 @@ round.
 On the same machine, `abject` gets in with the owner token the backend
 writes into its data directory. From elsewhere (`abject --url
 ws://host:7723`, through an SSH tunnel), it asks for the login set in
-settings and shares the browser client's session tokens. Install it with
-one line (`curl -fsSL https://abject.world/install.sh | sh`, or
-`irm https://abject.world/install.ps1 | iex` on Windows); every
-[release](https://github.com/mempko/abject/releases) also carries the
-archives, and a container image is at `ghcr.io/mempko/abject`.
+settings and shares the browser client's session tokens. The one-line
+installers above put it on your PATH; `abject update` moves an install made
+that way to the newest release, and `abject doctor` checks it.
 
 ### Incarnation (Desktop App)
 
@@ -211,8 +238,8 @@ Package Abject as a standalone desktop app for Linux, Windows, or macOS.
 ```bash
 # Build desktop app for your platform
 pnpm incarnate:linux    # AppImage, .deb
-pnpm incarnate:win      # NSIS installer, portable
-pnpm incarnate:mac      # .dmg, .zip
+pnpm incarnate:win      # NSIS installer
+pnpm incarnate:mac      # .dmg, .zip (Apple silicon and Intel)
 
 # Build for all platforms
 pnpm incarnate:all
@@ -221,19 +248,21 @@ pnpm incarnate:all
 | Command | What it does |
 |---------|-------------|
 | `pnpm incarnate:<platform>` | Package as a standalone Electron desktop app |
-| `pnpm bind` | Compile the server bundle only |
+| `pnpm bind` | Compile the server bundles only (desktop and headless; the build fails if display code reaches a headless bundle) |
 | `pnpm etch` | Compile the client bundle only |
 | `pnpm distill` | Bundle the `abject` command (`dist-cli/abject.mjs`), which the desktop app and the headless edition both ship |
 
-Requires Electron. Cross-compilation from Linux to Windows works out of the
-box. macOS builds from Linux produce unsigned binaries (code signing requires
-macOS).
+Requires Electron. The app runs the backend inside Electron's main process,
+opens the client in a window, uses Electron's own Chromium for web browsing,
+and carries the `abject` command. node-datachannel and node-pty are native
+modules, so the release workflow builds each platform on its own runner.
 
 The **backend** is the depths: all Abjects live here, passing messages in a
 Node.js process with worker threads. The **browser client** is the surface: a
-thin Canvas renderer that forwards input and displays composited frames over
-WebSocket. The **signaling server** introduces peers to each other; it never
-sees a byte of the conversation.
+thin renderer that draws what the backend tells it to and sends input back
+over WebSocket. The **signaling server** introduces peers to each other; it
+never sees a byte of the conversation. The headless edition is the depths
+alone, reached through `abject`.
 
 For running the signaling server in production behind TLS, and pairing it with a
 TURN relay so peers behind symmetric NAT or cell networks can still connect, see
@@ -242,76 +271,86 @@ TURN relay so peers behind symmetric NAT or cell networks can still connect, see
 ## Architecture
 
 ```
- ┌─ Node.js Backend (pnpm awaken) ──────────────────────────────────────┐
- │                                                                      │
- │  ┌─────────────────── MessageBus ──────────────────┐                 │
- │  │  Interceptor Pipeline:                          │                 │
- │  │  HealthInterceptor → PeerRouter → Delivery      │                 │
- │  └──────────┬──────────────┬───────────────┬───────┘                 │
- │             │              │               │                         │
- │  ┌──────────▼──┐ ┌────────▼─────┐ ┌───────▼────────┐               │
- │  │  Registry   │ │   Factory    │ │  LLM Object    │               │
- │  │  Negotiator │ │ ProxyGen     │ │  ObjectCreator │               │
- │  │  Supervisor │ │ AgentAbject  │ │  HealthMonitor │               │
- │  └─────────────┘ └──────────────┘ └────────────────┘               │
- │             │              │               │                         │
- │  ┌──────────▼──────────────▼───────────────▼────────┐               │
- │  │            Worker Pool (WorkerBridge)             │               │
- │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐            │               │
- │  │  │Worker 1 │ │Worker 2 │ │Worker N │ ...        │               │
- │  │  │(WASM)   │ │(WASM)   │ │(WASM)   │            │               │
- │  │  └─────────┘ └─────────┘ └─────────┘            │               │
- │  └──────────────────────────────────────────────────┘               │
- │                                                                      │
- │  ┌──── Server-Only ─────┐  ┌──────── P2P ───────────────────────┐   │
- │  │ BackendUI (headless) │  │ PeerTransport ←→ Signaling Server  │   │
- │  │ WebBrowser (Playwright)  │ IdentityObject (ECDSA/ECDH)       │   │
- │  │ WebParser (linkedom) │  │ PeerRegistry / RemoteRegistry     │   │
- │  └──────────────────────┘  └────────────────────────────────────┘   │
- └─────────────────────────────┬───────────────────────────────────────┘
-                               │ WS :7719
- ┌─ Thin Browser Client ──────▼───────────────────────────────────────┐
- │  FrontendClient  │  Compositor (Canvas)  │  Input handling          │
- └─────────────────────────────────────────────────────────────────────┘
+ ┌─ Node.js Backend (desktop: pnpm awaken / the app · headless: abject) ─┐
+ │                                                                       │
+ │  Main thread                                                          │
+ │    MessageBus ── PeerRouter (remote traffic) · proxy routes           │
+ │    Registry · Factory · Supervisor · AuthGate · Negotiator            │
+ │    CliServer (:7723) · WebGateway (HTTP, off until enabled)           │
+ │                                                                       │
+ │  Worker pool (worker threads, one bus each)                           │
+ │    LLM · capabilities · settings · ProxyGenerator · HealthMonitor     │
+ │    workspaces · agents · Chat · KnowledgeBase (C++/WASM)              │
+ │    your Abjects (script sandbox, WASM) · windows (desktop only)       │
+ │                                                                       │
+ │  P2P worker                          UI worker (desktop only)         │
+ │    Identity · PeerRegistry             BackendUI: the display server  │
+ │    RemoteRegistry · PeerDiscovery                                     │
+ └──────┬──────────────────────────┬─────────────────────┬───────────────┘
+        │ WS :7719 (desktop)       │ WS :7723            │ WebRTC
+ ┌──────▼─────────────────┐ ┌──────▼─────────┐ ┌─────────▼───────────────┐
+ │ Thin browser client    │ │ abject         │ │ Peers, paired phones    │
+ │ WebGL compositor, input│ │ (terminal)     │ │ (introduced by whisper) │
+ └────────────────────────┘ └────────────────┘ └─────────────────────────┘
 ```
+
+[ARCHITECTURE.md](ARCHITECTURE.md) walks through the layers, the boot
+sequence and the main flows.
 
 ## Project Structure
 
 ```
 src/
-  core/                 # Types, contracts, message builders, capability definitions
-  runtime/              # MessageBus, Mailbox, Supervisor, WorkerPool, WorkerBridge
-  objects/              # System objects: Registry, Factory, LLM, Negotiator, Agent, Workspaces
-  objects/capabilities/ # HttpClient, Storage, Timer, Clipboard, Console, FileSystem, WebBrowser, WebParser
-  objects/widgets/      # Canvas UI toolkit: buttons, text inputs, layouts, windows (~20 widgets)
-  protocol/             # Negotiator, Agreement management, HealthMonitor
-  llm/                  # Provider interface + implementations (Anthropic, OpenAI, Ollama)
-  network/              # Transport abstraction, WebSocket, PeerTransport, SignalingClient, NetworkBridge
-  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
-  ui/                   # App shell, Canvas Compositor, Window Manager
-server/                 # Node.js backend: server entry, signaling server, node worker adapter
-client/                 # Thin browser client: FrontendClient, input forwarding
-workers/                # Worker thread entry points (shared Abject pool, P2P, UI)
-native/                 # Bundled WASM system packages (e.g. the C++ KnowledgeBase)
+  core/                 # Types, contracts, messages, the Abject base class
+  runtime/              # MessageBus, Mailbox, Supervisor, worker pool and bridges
+  objects/              # System objects: Registry, Factory, LLM, agents, goals, chat, workspaces, settings, windows
+  objects/capabilities/ # HttpClient, Storage, FileSystem, ShellExecutor, WebBrowser, SharedState, ...
+  objects/widgets/      # Canvas UI toolkit: windows, layouts, buttons, text, tables, charts, markdown
+  protocol/             # Negotiator, agreements, HealthMonitor
+  llm/                  # Provider interface and providers (Anthropic, OpenAI, Ollama, OpenRouter, CLI-driven, ...)
+  network/              # Transports, PeerTransport, SignalingClient, PeerRouter, binary wire codec
+  sandbox/              # Packages (WASM and script): discovery, packages.json, ingest; the WASM host
+  ui/                   # The WebGL compositor and 3D scene the browser client draws with
+server/                 # Backend: shared boot (boot.ts), desktop and headless entries, display server, gateways, whisper
+workers/                # Worker thread entries (pool, P2P, UI) and their constructor tables
+client/                 # Thin browser client: FrontendClient, transports, pairing
+cli/                    # The abject command: chat TUI, setup, service, update, doctor
+electron/               # The desktop app (Electron main process)
+native/                 # Bundled WASM system packages (the C++ KnowledgeBase)
 sdk/cpp/                # C++ SDK for writing abjects that compile to WebAssembly
 sdk/script/             # TypeScript types for script packages
 examples/               # User-loadable abject packages, WASM and script (install with pnpm forge)
-docs/                   # Specifications (PACKAGES.md, WASM_ABI.md)
+docs/                   # Specifications (PACKAGES.md, WASM_ABI.md, LLM_PROVIDERS.md, WEB_GATEWAY.md, ...)
+deploy/                 # Running the headless edition as a service (systemd unit, environment file)
+packaging/              # Package-manager manifests for the abject command
+scripts/                # forge, headless packaging, the single-binary bootstrap
+site/                   # abject.world
 ```
 
 ## Design by Contract
 
-Correctness over performance. Every function uses preconditions, postconditions,
-and invariants. They are never disabled.
+Correctness over performance. Abjects state their preconditions,
+postconditions and invariants with `require`, `ensure` and `invariant` from
+`src/core/contracts.ts`. They are never disabled. From `server/auth-gate.ts`,
+the object that holds the login every socket checks:
 
 ```typescript
-function send(message: AbjectMessage): void {
-  require(message.header.messageId !== '', 'messageId must not be empty');
-  require(message.routing.to !== '', 'recipient must be specified');
+this.on('updateAuth', async (msg: AbjectMessage) => {
+  const caller = await this.resolveCallerIdentity(msg.routing.from);
+  const segments = caller?.typeId ? String(caller.typeId).split('/').length : 0;
+  contractRequire(!!caller && (AUTH_WRITERS as readonly string[]).includes(caller.name) && segments <= 3,
+    'AuthGate takes login changes from SettingsManager only');
+  // ...
+  contractRequire(!enabled || ((username as string) !== '' && (password as string) !== ''),
+    'a login needs a username and a password');
+  // ... apply the change ...
+  this.checkInvariants();
+});
 
-  // ... implementation ...
-
-  ensure(this.messageCount > oldMessageCount, 'message count must increase');
+protected override checkInvariants(): void {
+  super.checkInvariants();
+  invariant(!this.authConfig.enabled || (this.authConfig.username !== '' && this.authConfig.password !== ''),
+    'AuthGate: login enabled without credentials');
 }
 ```
 
@@ -319,14 +358,19 @@ function send(message: AbjectMessage): void {
 
 | Object | What It Does |
 |--------|-------------|
-| **HttpClient** | HTTP requests with domain allow/deny |
-| **Storage** | Persistent key-value store |
-| **Timer** | Scheduling and delays |
-| **Clipboard** | System clipboard access |
-| **Console** | Debug logging |
-| **FileSystem** | Virtual filesystem |
-| **WebBrowser** | Headless browser automation (Playwright, server-only) |
-| **WebParser** | HTML parsing and content extraction (linkedom, server-only) |
+| **HttpClient** | HTTP requests with domain allow/deny; private and loopback addresses only when you list them under Private hosts |
+| **StreamClient** | Long-lived WebSocket and Server-Sent Events connections |
+| **Storage** | Persistent key-value store (SQLite), one per workspace plus one global |
+| **FileSystem** | A virtual filesystem per workspace |
+| **HostFileSystem** | Real files on your machine, through the permission broker |
+| **ShellExecutor** | Shell commands on your machine, through the permission broker |
+| **WebSearch** / **WebFetch** | Web search, and a page's readable text |
+| **WebBrowser** | Browser automation with Playwright (in the desktop app, Electron's own Chromium) |
+| **WebParser** | HTML parsing and content extraction (linkedom) |
+| **SharedState** | CRDT state that syncs with peers who share the workspace |
+| **FileTransfer** / **MediaStream** | Files and media tracks over peer connections |
+| **Timer** / **Clipboard** / **Console** / **Crypto** | Timers, the clipboard, per-object logs, hashing and secure randomness |
+| **Screenshot** / **AudioOutput** / **Speech** | Desktop only: captures, sound, text to speech and back |
 
 ## From the Ashes of Fire★
 
@@ -351,30 +395,34 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key (optional) |
-| `OPENAI_API_KEY` | - | OpenAI API key (optional) |
-| `WS_PORT` | `7719` | WebSocket port for client connection |
-| `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
-| `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
-| `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | - | Model keys read at boot (optional; `TYPESAFE_API_KEY` for the TypeSafe decision model too) |
+| `ABJECTS_DATA_DIR` | `.abjects` or the OS location | Where the instance keeps its data. A source checkout uses `.abjects`; the desktop app and an installed headless edition use `~/.config/abject` (Linux), `~/Library/Application Support/abject` (macOS) or `%APPDATA%\abject` (Windows), so both see the same workspaces. One backend per data directory |
+| `WS_PORT` | `7719` | The browser UI socket on a desktop; `GET /healthz` and `GET /version` on both editions (loopback) |
+| `CLI_PORT` / `CLI_BIND` | `WS_PORT+4` / `127.0.0.1` | The gateway `abject` connects to. Bind it wider only with a login set |
+| `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | The HTTP gateway's port and address, when it is enabled (see [docs/WEB_GATEWAY.md](docs/WEB_GATEWAY.md)) |
+| `ABJECTS_AUTH_USER` / `ABJECTS_AUTH_PASSWORD` | - | A login for every socket (both or neither); also set in Settings or `abject setup`. A terminal on the same machine gets in with the owner token in `<data dir>/instance.json` |
+| `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size (`0` turns the pool off) |
 | `ABJECTS_WORKER_MAX_OLD_SPACE_MB` | sized from memory | Heap ceiling per worker (default: three quarters of memory less 512 MB, shared across workers, 512 MB to 8 GB) |
-| `HTTP_PORT` / `HTTP_BIND` | `WS_PORT+5` / `127.0.0.1` | The HTTP gateway's port and address (see [docs/WEB_GATEWAY.md](docs/WEB_GATEWAY.md)) |
+| `ABJECTS_DEDICATED_WORKERS` | on | `0` keeps the peer layer and the display server on the main thread |
+| `ABJECTS_PACKAGE_DIRS` | - | Extra package directories ([docs/PACKAGES.md](docs/PACKAGES.md)) |
 | `ABJECTS_ALLOWED_ORIGINS` | - | Web pages allowed to open the UI WebSocket besides the desktop app and the dev client (`http://127.0.0.1:VITE_CLIENT_PORT`, default 5174), comma-separated, e.g. `https://abject.example.com` for a client served through a reverse proxy that forwards `/ws`. Pages of any other origin are refused; the CLI gateway refuses all pages |
-| `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
-| `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
 | `ABJECTS_SIGNALING_URLS` | - | Use only these signaling servers (comma-separated `ws://`/`wss://`); servers learned from peers and the public default are never used (see [WHISPER.md](WHISPER.md)) |
 | `ABJECTS_PEER_ADMISSION` | `open` | `allowlist`: connect only with allowed peers (Network → Servers & Peers → Who Can Connect, or `ABJECTS_ALLOWED_PEERS`) |
 | `ABJECTS_ALLOWED_PEERS` | - | Peer IDs always allowed to connect (comma-separated) |
+| `ABJECT_PREFIX` | `ctrl+a` | The `abject` chat's chord prefix |
 
-API keys can also be configured through the Global Settings UI at runtime.
+Keys and model tiers are usually set at runtime: Settings → AI on the
+desktop, `abject setup` or `/set ai.credentials.<provider>` in a terminal.
+[deploy/abject.env.example](deploy/abject.env.example) lists the variables a
+service needs.
 
 Beside the environment, the data directory holds `packages.json` (packages and
 their settings, [docs/PACKAGES.md](docs/PACKAGES.md)) and `profiles.json`
 (workspace profiles, [docs/WORKSPACE_PROFILES.md](docs/WORKSPACE_PROFILES.md)).
-The server answers `GET /healthz` and `GET /version` on its WebSocket port.
 
-The signaling server and its optional TURN relay have their own environment and
-deployment guide in [WHISPER.md](WHISPER.md).
+The signaling server and its optional TURN relay have their own environment
+(`SIGNALING_PORT`, `TURN_SECRET`, `TURN_URLS`, ...) and deployment guide in
+[WHISPER.md](WHISPER.md).
 
 ### Using with Ollama (Local LLM)
 
@@ -386,14 +434,16 @@ ollama pull qwen3:8b      # Balanced tier (general purpose)
 ollama pull qwen3:4b      # Fast tier (quick tasks, low latency)
 ```
 
-Start Ollama, then configure in the Global Settings UI:
-1. Click the gear icon in the System toolbar
-2. Select **Ollama** as the provider
-3. Set the Ollama URL (default: `http://localhost:11434`)
-4. Assign models to each tier (Smart, Balanced, Fast)
-5. Click Save
+Start Ollama, then configure it in Settings:
+1. Click the gear in the System section of the dock to open Settings, AI tab
+2. Under **1 · Credentials**, pick **Ollama** and set its URL (default: `http://localhost:11434`)
+3. Under **3 · Model Tiers**, assign a model to each tier (Smart, Balanced, Fast, and Code)
+4. Click **Save Settings**
 
-The tier system lets Abject pick the right model for each task: heavy reasoning uses the smart tier, routine work uses balanced, and quick lookups use fast.
+From a terminal the same is `abject setup`, or one tier at a time:
+`/set ai.tiers.smart ollama qwen3:32b`.
+
+The tier system lets Abject pick the right model for each task: heavy reasoning uses the smart tier, routine work uses balanced, quick lookups use fast, and agents draft source code on the code tier.
 
 ## License
 

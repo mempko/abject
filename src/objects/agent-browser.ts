@@ -24,7 +24,6 @@ import type { SessionRecord } from './task-session.js';
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
 import type { IconName } from '../ui/icons.js';
@@ -194,10 +193,6 @@ export class AgentBrowser extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display agent browser window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

@@ -14,7 +14,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { require as contractRequire } from '../src/core/contracts.js';
-import { liveInstance, processAlive, readInstance, removeInstance, type InstanceRecord } from '../server/instance-file.js';
+import { DETACHED_ENV, liveInstance, processAlive, readInstance, removeInstance, type InstanceRecord } from '../server/instance-file.js';
 import { connectClient } from './connect.js';
 import { cliEdition } from './locate.js';
 
@@ -99,7 +99,7 @@ export function startInBackground(dataDir: string): number {
   const child = spawn(cmd, args, {
     detached: true,
     stdio: ['ignore', out, out],
-    env: serveEnv(dataDir),
+    env: { ...serveEnv(dataDir), [DETACHED_ENV]: '1' },
     windowsHide: true,
     // An install runs from its data directory, so it holds no other folder
     // open. A checkout stays in the repository: its workers load TypeScript
@@ -152,6 +152,24 @@ export async function waitForBackend(
     opts.onWait?.(Math.round((Date.now() - started) / 1000));
     await new Promise((r) => setTimeout(r, 500));
   }
+}
+
+/**
+ * Who restarts the backend running on a data directory, when one is: this
+ * command for one it started in the background, otherwise whatever started
+ * it (a service manager, a container, a terminal running `abject serve`, the
+ * desktop app). Restarting one of those from here would stop it cleanly,
+ * which its manager reads as "stay stopped", and start a stray copy outside it.
+ */
+export async function restartOwner(dataDir: string): Promise<{ running: false } | { running: true; ours: boolean; record: InstanceRecord; hint: string }> {
+  const record = await liveInstance(dataDir);
+  if (!record) return { running: false };
+  const ours = record.edition === 'headless' && record.detached === true;
+  const hint = record.edition === 'desktop'
+    ? 'restart the Abject app'
+    : 'restart it where it runs: `systemctl restart abject` for a system service, `systemctl --user restart abject` '
+      + 'for `abject service install`, `docker restart <container>`, or Ctrl+C and rerun `abject serve` in its terminal';
+  return { running: true, ours, record, hint };
 }
 
 /** Wait for a process to exit; true if it did within the time. */

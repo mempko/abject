@@ -11,7 +11,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { lightenColor } from './widgets/widget-types.js';
 import { dockStyles, spaceNumeral } from './dock-style.js';
@@ -142,10 +141,6 @@ export class WorkspaceSwitcher extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display workspace switcher', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

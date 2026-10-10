@@ -9,7 +9,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { request, error as errorMsg } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
 
@@ -56,10 +55,6 @@ export class WebSearch extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.HTTP_REQUEST, reason: 'Fetch search result pages', required: true },
-        ],
-        providedCapabilities: [Capabilities.WEB_SEARCH],
         tags: ['system', 'capability', 'web', 'search'],
       },
     });

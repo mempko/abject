@@ -186,8 +186,6 @@ export class SceneLibrary extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'scene'],
       },
     });

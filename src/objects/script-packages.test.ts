@@ -42,8 +42,6 @@ function manifestFor(name: string, methods: string[] = ['add', 'get']): AbjectMa
       description: `${name} interface`,
       methods: methods.map(m => ({ name: m, description: m, parameters: [] })),
     },
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
   } as unknown as AbjectManifest;
 }
@@ -126,7 +124,7 @@ async function startRuntime(): Promise<{ rt: Runtime; probe: Probe }> {
 /** Spawn a package type the way WorkspaceManager does: by name, with a stamped typeId. */
 async function spawnByName(rt: Runtime, name: string, extra: Record<string, unknown> = {}): Promise<AbjectId> {
   const result = await rt.objectFactory.spawn({
-    manifest: { name, description: '', version: '1.0.0', requiredCapabilities: [], tags: ['system'] } as unknown as AbjectManifest,
+    manifest: { name, description: '', version: '1.0.0', tags: ['system'] } as unknown as AbjectManifest,
     typeId: `peer/ws/${name}` as TypeId,
     ...extra,
   });
@@ -329,8 +327,8 @@ test('a system-scope script package keeps its data with Packages, which answers 
     assert.equal(await probe.ask<number>(again, 'get'), 4);
 
     // Nobody else reads or writes it: not an ordinary object...
-    await assert.rejects(probe.ask(packages.id, 'getPackageData', {}), /installed script package/);
-    await assert.rejects(probe.ask(packages.id, 'savePackageData', { data: { count: 99 } }), /installed script package/);
+    await assert.rejects(probe.ask(packages.id, 'getPackageData', {}), /installed package/);
+    await assert.rejects(probe.ask(packages.id, 'savePackageData', { data: { count: 99 } }), /installed package/);
     // ...and not the same package's abject in a workspace, which keeps its data
     // in that workspace's AbjectStore.
     const workspaceRegistry = new Registry();

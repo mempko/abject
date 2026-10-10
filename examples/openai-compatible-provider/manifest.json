@@ -31,7 +31,5 @@
       }
     ]
   },
-  "requiredCapabilities": [],
-  "providedCapabilities": [],
   "tags": ["autostart", "llm-provider"]
 }

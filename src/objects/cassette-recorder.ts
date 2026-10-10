@@ -104,8 +104,6 @@ export class CassetteRecorder extends Abject {
           description: 'HTTP traffic recording',
           methods: [],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'recording', 'evidence'],
       },
     });

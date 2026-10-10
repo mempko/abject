@@ -31,13 +31,20 @@ export interface InstanceRecord {
   wsPort: number;
   /** The terminal gateway (CliServer). */
   cliPort: number;
-  /** The HTTP gateway, when enabled. */
-  httpPort: number;
   /** Lets a local terminal in without the login. Secret. */
   ownerToken: string;
   dataDir: string;
   startedAt: number;
+  /**
+   * Started in the background by the `abject` command (`abject start`), so
+   * that command may also restart it. A backend under a service manager,
+   * in a container, or in a terminal (`abject serve`) belongs to them.
+   */
+  detached?: boolean;
 }
+
+/** Set by the `abject` command on the backend it starts in the background. */
+export const DETACHED_ENV = 'ABJECT_DETACHED';
 
 export const INSTANCE_FILE = 'instance.json';
 

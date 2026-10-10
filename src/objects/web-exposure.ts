@@ -120,8 +120,6 @@ export class WebExposure extends Abject {
             { name: 'exposureChanged', description: 'The exposure config changed', payload: { kind: 'object', properties: {} } },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'web'],
       },
     });

@@ -28,7 +28,7 @@ function manifestFor(name: string, methods: string[]): AbjectManifest {
       id: `abjects:${name.toLowerCase()}` as InterfaceId, name, description: name,
       methods: methods.map((m) => ({ name: m, description: m, parameters: [] })),
     },
-    requiredCapabilities: [], providedCapabilities: [], tags: ['test'],
+    tags: ['test'],
   } as unknown as AbjectManifest;
 }
 
@@ -76,9 +76,22 @@ class RegistryStub extends Abject {
       const { name } = msg.payload as { name: string };
       return this.objects.filter((o) => o.manifest.name === name).map((o) => ({ id: o.id, manifest: o.manifest, name: o.manifest.name }));
     });
+    // The gateway takes a workspace's exposure from its WebExposure only, as
+    // the workspace's registry names it: the stub pushes as one.
+    this.on('lookup', (msg: AbjectMessage) => (msg.payload as { objectId: AbjectId }).objectId === this.id
+      ? { name: 'WebExposure', typeId: 'peer/ws-acme/WebExposure' } : null);
   }
   ask<T>(to: AbjectId, method: string, payload: unknown = {}): Promise<T> {
     return this.request<T>(request(this.id, to, method, payload));
+  }
+}
+
+/** Stand-in for WorkspaceManager: lists the one workspace, the stub registry among its objects. */
+class WorkspaceManagerStub extends Abject {
+  constructor(workspace: { workspaceId: string; name: string; registryId: AbjectId }) {
+    super({ manifest: manifestFor('WorkspaceManager', []) });
+    this.on('listWorkspacesDetailed', () => [{ ...workspace, childIds: [workspace.registryId] }]);
+    this.on('findWorkspaceForObject', () => null);
   }
 }
 
@@ -107,9 +120,14 @@ test('an http entry serves pages, redirects with route-scoped cookies, webhooks 
   await noHandler.init(bus);
   const stub = new RegistryStub([portal, noHandler]);
   await stub.init(bus);
+  // The stub also stands in for the gateway's window, which may switch it on.
+  registry.registerObject(stub.id, stub.manifest, undefined, undefined, undefined, 'WebGatewayBrowser');
+  const wm = new WorkspaceManagerStub({ workspaceId: 'ws-acme', name: 'Acme', registryId: stub.id });
+  await wm.init(bus);
+  registry.registerObject(wm.id, wm.manifest, undefined, undefined, undefined, 'WorkspaceManager');
   const sessions = new SessionStore();
   const gw = new WebGateway({ port: 0, bind: '127.0.0.1', authConfig: { enabled: false, username: '', password: '' }, sessions });
-  await gw.init(bus);
+  await gw.init(bus, undefined, registry.id);
   try {
     await stub.ask(gw.id, 'syncWorkspace', {
       workspaceId: 'ws-acme', name: 'Acme', slug: 'acme', registryId: stub.id, enabled: true,

@@ -529,8 +529,6 @@ export class WorkspaceRegistry extends Registry {
         .map((method) => method.name)
         .join(', ');
       let line = parts.join(' ');
-      const caps = (m.providedCapabilities ?? []).join(', ');
-      if (caps) line += ` Capabilities: ${caps}.`;
       if (methods) line += ` Methods: ${methods}.`;
       if (reg.ownerPeerId) line += ` Owner peer: ${reg.ownerPeerId}.`;
       if (reg.workspaceName) line += ` Workspace: ${reg.workspaceName}.`;
@@ -962,9 +960,6 @@ export class WorkspaceRegistry extends Registry {
         continue;
       }
       if (query.interface && reg.manifest.interface.id !== query.interface) {
-        continue;
-      }
-      if (query.capability && !reg.manifest.providedCapabilities?.includes(query.capability as any)) {
         continue;
       }
       if (query.tags && query.tags.length > 0) {

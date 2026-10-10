@@ -188,8 +188,6 @@ export class WindowManager extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

@@ -1,11 +1,22 @@
-# Scene Showcase
+# examples/scene-showcase/ - Scene Showcase
 
 A user-style ScriptableAbject that tours the desktop's 3D scene vocabulary. It
 uses only public messages (WidgetManager, window `scene` / `attachTo`, UIServer
 world `scene`, SceneLibrary), so it doubles as a worked example to copy from.
+It is plain JavaScript and loads with no build step.
 
-- `SceneShowcase.json`: `{ manifest, source }`, the form AbjectStore saves.
-- `SceneShowcase.js`: the same source as plain text, ready to paste.
+It needs the desktop edition: it opens windows and draws in the world scene,
+and the headless edition has no WidgetManager, so `show` fails there.
+
+## Files
+
+- **SceneShowcase.js**: the handler map, plain text, ready to paste. The
+  package's `entry`.
+- **SceneShowcase.json**: `{ manifest, source }`, the form AbjectStore saves.
+  The package reads its `manifest` from here; its `source` holds the same code
+  as `SceneShowcase.js`, so edit both together.
+- **abject.json**: package metadata: script runtime, workspace scope,
+  `entry: SceneShowcase.js`, `manifest: SceneShowcase.json`.
 
 ## What it shows
 
@@ -36,7 +47,8 @@ unregisters the preset; closing only the panel keeps the stage open.
 Package directories, or start the backend with
 `ABJECTS_PACKAGE_DIRS=$PWD/examples/scene-showcase pnpm awaken`, or install a
 copy with `pnpm forge examples/scene-showcase`. After a restart
-**SceneShowcase** is in every workspace's sidebar. As a package abject it is
+**SceneShowcase** is in the sidebar of every workspace with the default
+profile. As a package abject it is
 read-only; clone it to get an editable copy. See `docs/PACKAGES.md`.
 
 **From the Explorer (no AI involved, exact copy):**
@@ -69,4 +81,13 @@ await call(objectId, 'show', {});
 ## Methods
 
 `show`, `hide`, `setStation({ station: 'materials' | 'arcade' | 'title' })`,
-`summonCompanion`, `toggleRide({ ride? })`, `sceneInfo`, `getState`.
+`summonCompanion`, `toggleRide({ ride? })`, `sceneInfo`, `getState`. The
+manifest also lists the callbacks it receives: `changed` (widget events),
+`nodeInput` (clicks and drags on its scene nodes) and `windowCloseRequested`.
+
+## Related
+
+- [../README.md](../README.md): all examples and how to load them
+- [../../docs/PACKAGES.md](../../docs/PACKAGES.md): script packages, read-only package abjects, cloning
+- `src/objects/scene-library.ts`: material, look and preset registration (`registerMaterial`)
+- `src/objects/widget-manager.ts`: windows, `getSceneParams`

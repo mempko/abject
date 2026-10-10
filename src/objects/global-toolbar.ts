@@ -1,7 +1,9 @@
 /**
- * GlobalToolbar -- persistent chromeless panel positioned below WorkspaceSwitcher.
+ * GlobalToolbar -- the System section of the sidebar dock.
  *
- * Provides quick-access buttons for GlobalSettings (API Keys) and
+ * Owns no window: WorkspaceManager hands it the sidebar dock window and a
+ * section layout (`show({ windowId, sectionLayoutId })`), and it builds its
+ * rows there. Provides quick-access rows for GlobalSettings (API Keys) and
  * PeerNetwork (identity, signaling, contacts), plus a row for every global
  * abject that asks for one: tagged `launcher`, with `show` and `hide` methods
  * (a system-scope package with a window, say). Tag it `system` as well to keep
@@ -12,7 +14,6 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject } from '../core/abject.js';
 import { event, request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
 
@@ -129,10 +130,6 @@ export class GlobalToolbar extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display toolbar', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

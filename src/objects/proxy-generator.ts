@@ -106,7 +106,6 @@ export class ProxyGenerator extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
         tags: ['system', 'proxy', 'llm'],
       },
     });
@@ -420,7 +419,6 @@ RULES:
             },
           ],
         },
-      requiredCapabilities: [],
       tags: ['proxy', 'generated'],
     };
   }

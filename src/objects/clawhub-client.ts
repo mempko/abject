@@ -149,8 +149,6 @@ export class ClawHubClient extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'skill', 'registry'],
       },
     });

@@ -10,7 +10,6 @@
 import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { sectionHeaderStyle, hintStyle, emptyStateMarkdown, emptyStateStyle, livingStyle } from './ui-kit.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
@@ -99,10 +98,6 @@ export class WorkspaceBrowser extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display workspace browser', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'peer'],
       },
     });
@@ -975,7 +970,6 @@ discovered, the browser rebuilds automatically if it is visible.
             name: 'AppExplorer',
             description: '',
             version: '1.0.0',
-            requiredCapabilities: [],
             tags: ['system'],
           },
         })

@@ -31,8 +31,6 @@ function mkManifest(name: string, sharing?: string): AbjectManifest {
       description: `${name} fixture`,
       methods: [],
     },
-    requiredCapabilities: [],
-    providedCapabilities: [],
     tags: ['test'],
     ...(sharing ? { sharing } : {}),
   } as unknown as AbjectManifest;

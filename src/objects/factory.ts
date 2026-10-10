@@ -10,12 +10,10 @@ import {
   ObjectRegistration,
   SpawnRequest,
   SpawnResult,
-  CapabilityGrant,
 } from '../core/types.js';
 import { v4 as uuidv4 } from 'uuid';
 import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Factory');
@@ -51,8 +49,13 @@ export interface PackageTypeRegistration {
   source: string;
   /** 'system' types spawn once at boot; 'workspace' types spawn per workspace. */
   scope: 'system' | 'workspace';
-  /** Script packages: the `package:<name>` owner their abjects spawn with. */
-  owner?: AbjectId;
+  /**
+   * The `package:<name>` owner the type's abjects spawn with, either
+   * runtime. It marks them as the package's: their data is kept as package
+   * data (never restored as user objects), a script one's source is
+   * read-only, and a clone or instance drops it.
+   */
+  owner: AbjectId;
   /** The package this type came from, for the Packages settings view. */
   package?: { name: string; version: string };
   /** Workspace scope: the workspace profiles it joins; none means `default`. */
@@ -223,8 +226,6 @@ export class Factory extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.FACTORY_SPAWN],
         tags: ['system', 'core'],
       },
     });
@@ -385,10 +386,10 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       require(registration.runtime === 'script', `unknown package runtime '${String(registration.runtime)}'`);
       require(registration.source.trim() !== '' && !isWasmSourceRef(registration.source),
         'a script package type needs JavaScript handler-map source');
-      require(registration.scope === 'workspace' || registration.scope === 'system',
-        `unknown package scope '${String(registration.scope)}'`);
-      require(isPackageOwner(registration.owner), 'a script package type needs a package owner');
     }
+    require(registration.scope === 'workspace' || registration.scope === 'system',
+      `unknown package scope '${String(registration.scope)}'`);
+    require(isPackageOwner(registration.owner), 'a package type needs a package owner');
     this.packageTypes.set(name, registration);
     log.info(`package type '${name}' registered (${registration.runtime}, ${registration.scope})`);
   }
@@ -698,7 +699,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         log.warn(`respawn: could not read live manifest of ${objectId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
       manifest ??= existingReg?.manifest ?? { name: constructorName, description: '', version: '1.0.0',
-        interface: { id: 'abjects:unknown', name: constructorName, description: '', methods: [] }, requiredCapabilities: [] as never[], tags: ['system'] };
+        interface: { id: 'abjects:unknown', name: constructorName, description: '', methods: [] }, tags: ['system'] };
       const now = Date.now();
       const status = {
         id: objectId, state: 'ready' as const, manifest, connections: [] as AbjectId[],
@@ -798,10 +799,10 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     // Package resolution runs before every other dispatch so installed type
     // overrides win over built-in constructors (that's what `replaces` means).
-    // 1. A registered package type under this name supplies the manifest and
-    //    its code: a module ref (wasm) or handler-map source (script). Script
-    //    packages also supply the package owner, which keeps their source
-    //    read-only and their data out of the user-object restore.
+    // 1. A registered package type under this name supplies the manifest,
+    //    its code (a module ref for wasm, handler-map source for script) and
+    //    the package owner, which keeps the abject's data as package data
+    //    (out of the user-object restore) and a script one's source read-only.
     const packageType =
       !req.source && !req.code && !req.codeBase64
         ? this.packageTypes.get(req.manifest.name)
@@ -811,13 +812,13 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         ...req,
         manifest: packageType.manifest,
         source: packageType.source,
-        ...(packageType.runtime === 'script' ? { owner: packageType.owner } : {}),
+        owner: packageType.owner,
       };
     }
     const scriptPackage = packageType?.runtime === 'script';
     // The package owner is reserved for abjects spawned from an installed
     // package; a request may not claim it for anything else.
-    require(scriptPackage || !isPackageOwner(req.owner),
+    require(packageType !== undefined || !isPackageOwner(req.owner),
       `owner '${String(req.owner)}' is reserved for abjects from installed packages`);
     // 2. Raw module bytes are ingested into the content-addressed store and
     //    replaced by their canonical wasm source ref.
@@ -1450,13 +1451,11 @@ export function createSpawnRequest(
   manifest: AbjectManifest,
   code?: ArrayBuffer,
   initialState?: unknown,
-  grantedCapabilities?: CapabilityGrant[]
 ): AbjectMessage {
   return request(fromId, FACTORY_ID, 'spawn', {
     manifest,
     code,
     initialState,
-    grantedCapabilities,
   } as SpawnRequest);
 }
 

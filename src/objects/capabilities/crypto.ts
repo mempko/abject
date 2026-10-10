@@ -216,8 +216,6 @@ export class Crypto extends Abject {
           description: 'Randomness, hashing, MACs, password hashing and signature checks',
           methods: METHODS,
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'capability', 'crypto'],
       },
     });

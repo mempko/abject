@@ -7,7 +7,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { invariant, require, ensure } from '../core/contracts.js';
 import {
   emptyStateMarkdown, emptyStateStyle, livingStyle, eyeSigilOps, removeSigilOps, sigilStreamOps,
@@ -401,10 +400,6 @@ export class PeerNetwork extends Abject {
               },
             ],
           },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display peer network window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'network'],
       },
     });

@@ -98,8 +98,6 @@ export class ModalDialog extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'ephemeral'],
       },
     });

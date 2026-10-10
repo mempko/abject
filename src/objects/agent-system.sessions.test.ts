@@ -41,7 +41,7 @@ test('agent session codec preserves collection state and omits live promises', (
   assert(restored.deps.get('x')?.methods.has('read')); assert.equal(restored.pending, undefined); assert.equal(restored.deferredMsg, undefined);
 });
 class Client extends Abject {
-  constructor() { super({ manifest: { name: 'ProcessClient', version: '1', description: 'test', interface: { id: 'abjects:process-client', name: 'Client', description: 'test', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
+  constructor() { super({ manifest: { name: 'ProcessClient', version: '1', description: 'test', interface: { id: 'abjects:process-client', name: 'Client', description: 'test', methods: [] } } }); }
   call(id: AbjectId, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id, id, method, payload), 10000); }
 }
 test('running process retains full output behind a message handle and bounds previews', async () => {

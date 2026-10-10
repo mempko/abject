@@ -117,8 +117,6 @@ export class HeapMonitor extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'monitoring'],
       },
     });

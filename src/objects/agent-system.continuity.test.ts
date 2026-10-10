@@ -15,7 +15,7 @@ import { TaskSession } from './task-session.js';
 import { encodeAgentState } from '../core/agent-session-codec.js';
 
 class Endpoint extends Abject {
-  constructor(name: string) { super({ manifest: { name, version: '1', description: 'Isolated continuity fixture', interface: { id: `test:${name}`, name, description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } }); }
+  constructor(name: string) { super({ manifest: { name, version: '1', description: 'Isolated continuity fixture', interface: { id: `test:${name}`, name, description: 'fixture', methods: [] } } }); }
   public override on(method: string, handler: MessageHandlerFn) { super.on(method, handler); }
   call(to: string, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id, to, method, payload), 5000); }
 }

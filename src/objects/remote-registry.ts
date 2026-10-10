@@ -93,8 +93,6 @@ export class RemoteRegistry extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'peer'],
       },
     });

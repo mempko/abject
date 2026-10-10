@@ -193,8 +193,6 @@ export function createDesktopUi(): UiLayer {
             description: 'Surface management and input routing',
             methods: [],
           },
-          requiredCapabilities: [],
-          providedCapabilities: ['abjects:ui:surface', 'abjects:ui:input'],
           tags: ['system', 'ui'],
         },
         status: 'running',

@@ -16,7 +16,7 @@ import { TaskReviewer } from './task-reviewer.js';
 class Endpoint extends Abject {
   constructor(name: string) {
     super({ manifest: { name, version: '1', description: 'Conversation reference test',
-      interface: { id: `fixture:${name}`, name, description: 'fixture', methods: [] }, requiredCapabilities: [], providedCapabilities: [] } });
+      interface: { id: `fixture:${name}`, name, description: 'fixture', methods: [] } } });
   }
   call(to: AbjectId, method: string, payload: unknown = {}): Promise<any> { return this.request(request(this.id, to, method, payload), 5000); }
 }

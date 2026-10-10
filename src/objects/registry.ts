@@ -12,13 +12,11 @@ import {
   DiscoveryQuery,
   AbjectStatus,
   InterfaceId,
-  CapabilityId,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { require, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { type DecisionQuestion } from '../llm/decision.js';
 import { criterion, instruction } from '../core/decision-questions.js';
@@ -35,7 +33,7 @@ const log = new Log('Registry');
 const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
 
 /** The only keys a DiscoveryQuery may carry. */
-const DISCOVERY_QUERY_KEYS = ['name', 'interface', 'capability', 'tags'] as const;
+const DISCOVERY_QUERY_KEYS = ['name', 'interface', 'tags'] as const;
 
 /**
  * Reject a discover query that carries no recognized filter, so a caller
@@ -49,7 +47,7 @@ const DISCOVERY_QUERY_KEYS = ['name', 'interface', 'capability', 'tags'] as cons
  * and point at the two methods that DO take free text.
  */
 function validateDiscoveryQuery(query: unknown): void {
-  const hint = `discover takes EXACT structured filters: { name?, interface?, capability?, tags?: string[] } — e.g. { name: 'WidgetManager' } or { tags: ['capability'] }. It does NOT take free text. To find an object by rough name or by what it DOES, use search({ query: '...' }) for a cheap ranked match, or ask({ question: '...' }) for a semantic answer.`;
+  const hint = `discover takes EXACT structured filters: { name?, interface?, tags?: string[] } — e.g. { name: 'WidgetManager' } or { tags: ['capability'] }. It does NOT take free text. To find an object by rough name or by what it DOES, use search({ query: '...' }) for a cheap ranked match, or ask({ question: '...' }) for a semantic answer.`;
 
   if (query === null || typeof query !== 'object' || Array.isArray(query)) {
     throw new Error(`Registry.discover: query must be an object. ${hint}`);
@@ -75,7 +73,6 @@ function validateDiscoveryQuery(query: unknown): void {
 export interface RegistryState {
   objects: Map<AbjectId, ObjectRegistration>;
   byInterface: Map<InterfaceId, Set<AbjectId>>;
-  byCapability: Map<CapabilityId, Set<AbjectId>>;
   byName: Map<string, Set<AbjectId>>;
   byTypeId: Map<TypeId, AbjectId>;
 }
@@ -86,7 +83,6 @@ export interface RegistryState {
 export class Registry extends Abject {
   private objects: Map<AbjectId, ObjectRegistration> = new Map();
   private byInterface: Map<InterfaceId, Set<AbjectId>> = new Map();
-  private byCapability: Map<CapabilityId, Set<AbjectId>> = new Map();
   private byName: Map<string, Set<AbjectId>> = new Map();
   private byTypeId: Map<TypeId, AbjectId> = new Map();
   private subscribers: Set<AbjectId> = new Set();
@@ -159,12 +155,12 @@ export class Registry extends Abject {
               },
               {
                 name: 'discover',
-                description: 'Find Abjects by EXACT structured filters, returning their full registrations (manifests included — a big payload). The query is an object with these keys and NO others: { name?: exact registered/manifest name, interface?: exact interface id, capability?: exact capability id, tags?: string[] (must have ALL) }. It is NOT free text: `{ query: "canvas" }` or `{ name: "something 3D" }` will not fuzzy-match anything. To look something up by rough name or by what it DOES, use `search` (cheap ranked substring match) or `ask` (semantic question) instead — reach for discover only when you already know the exact name/interface/capability/tag and want the full registration.',
+                description: 'Find Abjects by EXACT structured filters, returning their full registrations (manifests included — a big payload). The query is an object with these keys and NO others: { name?: exact registered/manifest name, interface?: exact interface id, tags?: string[] (must have ALL) }. It is NOT free text: `{ query: "canvas" }` or `{ name: "something 3D" }` will not fuzzy-match anything. To look something up by rough name or by what it DOES, use `search` (cheap ranked substring match) or `ask` (semantic question) instead — reach for discover only when you already know the exact name/interface/tag and want the full registration.',
                 parameters: [
                   {
                     name: 'query',
                     type: { kind: 'reference', reference: 'DiscoveryQuery' },
-                    description: 'Structured filter: { name?, interface?, capability?, tags? }. Unknown keys are rejected. Example: { name: "WidgetManager" } or { tags: ["capability"] }.',
+                    description: 'Structured filter: { name?, interface?, tags? }. Unknown keys are rejected. Example: { name: "WidgetManager" } or { tags: ["capability"] }.',
                   },
                 ],
                 returns: {
@@ -271,11 +267,6 @@ export class Registry extends Abject {
               },
             ],
           },
-        requiredCapabilities: [],
-        providedCapabilities: [
-          Capabilities.REGISTRY_READ,
-          Capabilities.REGISTRY_WRITE,
-        ],
         tags: ['system', 'core'],
       },
     });
@@ -345,7 +336,7 @@ If a caller is asking you ("what is the AbjectId for X?", "which object can do Y
 2. \`findCapable({ need, limit? })\` — Structured "which object does X": ranked \`{ id, name, description, methods, p }\` matches judged over the whole catalog. Use it when code needs ids rather than prose.
 3. \`search({ query, limit? })\` — Compact text search over names, descriptions, tags, and method names (case-insensitive substring). Returns a small ranked list of \`{ id, name, typeId?, description, matchedOn }\`. The cheapest programmatic way to locate an object by rough name or capability.
 4. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
-5. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape. EXACT match only: those four keys are the whole vocabulary, and free text (\`{ query: 'canvas' }\`, or a name like \`'something 3D'\`) matches nothing and is REJECTED with an error. Rough names and "what can do X" belong in \`search\` or \`ask\`.
+5. \`discover({ name?, interface?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape. EXACT match only: those three keys are the whole vocabulary, and free text (\`{ query: 'canvas' }\`, or a name like \`'something 3D'\`) matches nothing and is REJECTED with an error. Rough names and "what can do X" belong in \`search\` or \`ask\`.
 6. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
 7. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\`, \`search\`, or \`listSummaries\` instead.
 
@@ -721,14 +712,6 @@ Each line shows one registered object: id, name, description, and non-meta metho
     }
     this.byInterface.get(ifaceId)!.add(objectId);
 
-    // Index by capability
-    for (const cap of manifest.providedCapabilities ?? []) {
-      if (!this.byCapability.has(cap)) {
-        this.byCapability.set(cap, new Set());
-      }
-      this.byCapability.get(cap)!.add(objectId);
-    }
-
     // Index by registration name
     if (!this.byName.has(uniqueName)) {
       this.byName.set(uniqueName, new Set());
@@ -810,11 +793,6 @@ Each line shows one registered object: id, name, description, and non-meta metho
     // Remove from interface index
     this.byInterface.get(manifest.interface.id)?.delete(objectId);
 
-    // Remove from capability index
-    for (const cap of manifest.providedCapabilities ?? []) {
-      this.byCapability.get(cap)?.delete(objectId);
-    }
-
     // Remove from name index
     this.byName.get(registration.name)?.delete(objectId);
 
@@ -859,19 +837,6 @@ Each line shows one registered object: id, name, description, and non-meta metho
       candidates = this.byInterface.get(query.interface);
       if (!candidates || candidates.size === 0) {
         return [];
-      }
-    }
-
-    // Filter by capability
-    if (query.capability) {
-      const capCandidates = this.byCapability.get(query.capability);
-      if (!capCandidates || capCandidates.size === 0) {
-        return [];
-      }
-      if (candidates) {
-        candidates = new Set([...candidates].filter((id) => capCandidates.has(id)));
-      } else {
-        candidates = capCandidates;
       }
     }
 
@@ -954,9 +919,6 @@ Each line shows one registered object: id, name, description, and non-meta metho
 
     // Remove old indices
     this.byInterface.get(old.interface.id)?.delete(objectId);
-    for (const cap of old.providedCapabilities ?? []) {
-      this.byCapability.get(cap)?.delete(objectId);
-    }
     this.byName.get(reg.name)?.delete(objectId);
 
     // Update
@@ -966,10 +928,6 @@ Each line shows one registered object: id, name, description, and non-meta metho
     const newIfaceId = manifest.interface.id;
     if (!this.byInterface.has(newIfaceId)) this.byInterface.set(newIfaceId, new Set());
     this.byInterface.get(newIfaceId)!.add(objectId);
-    for (const cap of manifest.providedCapabilities ?? []) {
-      if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
-      this.byCapability.get(cap)!.add(objectId);
-    }
     if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
     this.byName.get(reg.name)!.add(objectId);
 

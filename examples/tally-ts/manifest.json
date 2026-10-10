@@ -36,7 +36,5 @@
       { "name": "counted", "description": "A count changed (only when the Announce setting is on); payload { name, count }", "payload": { "kind": "object", "properties": {} } }
     ]
   },
-  "requiredCapabilities": [],
-  "providedCapabilities": [],
   "tags": ["example"]
 }

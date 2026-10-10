@@ -11,7 +11,6 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
 import { sectionHeaderStyle, sectionHeaderText, hintStyle, emptyStateMarkdown } from './ui-kit.js';
@@ -75,10 +74,6 @@ export class DataBrowser extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display data browser window', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'ui'],
       },
     });

@@ -128,8 +128,6 @@ export class PeersViewer extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [],
         tags: ['system', 'ui', 'peer'],
       },
     });

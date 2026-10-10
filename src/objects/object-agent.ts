@@ -2,16 +2,17 @@ import { domainFailure, type ResultContract } from '../core/result-contract.js';
 /**
  * ObjectAgent -- an agent that discovers and calls objects via message passing.
  *
- * Registers with AgentAbject and claims tasks from the
- * TupleSpace. Uses the Registry's ask protocol to discover which objects
- * to talk to, then sends ask/describe/call messages to target objects.
+ * Registers with AgentAbject, which pushes tasks to it: ScrumMaster queues
+ * each task with AgentAbject's `enqueueTask`, and AgentAbject's queue runner
+ * hands it to this agent's `executeTask`. Uses the Registry's ask protocol
+ * to discover which objects to talk to, then sends ask/describe/call
+ * messages to target objects.
  * All interaction is via message passing through the MessageBus.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import { bulkAwareResult, resultEcho } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
@@ -76,10 +77,6 @@ export class ObjectAgent extends Abject {
             },
           ],
         },
-        requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'LLM planning for object discovery and call orchestration', required: true },
-        ],
-        providedCapabilities: [],
         tags: ['system', 'agent', 'call'],
       },
     });

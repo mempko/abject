@@ -280,8 +280,8 @@ const v = rel.version || 'x.y.z';
         </dl>
         <div class="prose">
           <p>
-            Inside: your identity keys, provider keys, every workspace and the objects in it,
-            the knowledge base, and a <code>skills</code> folder. Drop a SKILL.md into
+            Inside: your identity keys, provider keys, every workspace with its objects, files
+            and collections, the knowledge base, and a <code>skills</code> folder. Drop a SKILL.md into
             <code>skills</code> (Claude Code or OpenClaw format, unchanged) and rescan from
             Settings; the agents can use it on their next task. Set <code>ABJECTS_DATA_DIR</code>
             before launching to put all of it somewhere else. Delete the directory to start
@@ -310,13 +310,15 @@ const v = rel.version || 'x.y.z';
           <div>
             <p class="side-label">Updating</p>
             <p>
-              There is no auto-updater yet. Download the new version and install it over the old
-              one; the data directory is untouched and your workspaces come back as they were.
+              The app checks for new versions and installs them itself (Settings, Updates tab, or
+              Help, Check for Updates). On a Mac it points you to the download instead, because
+              the builds aren't signed yet. Installing a new version over the old one by hand works
+              too; the data directory is untouched and your workspaces come back as they were.
               The <a href="/changelog">changelog</a> says what changed.
             </p>
             <p>
-              The command line updates itself: <code>abject update</code> fetches the newest
-              release, checks it, and restarts the backend on it.
+              The command line updates itself too: <code>abject update</code> fetches the newest
+              release, checks it, and restarts the backend on it when <code>abject</code> started it.
             </p>
           </div>
           <span class="rule" aria-hidden="true"></span>

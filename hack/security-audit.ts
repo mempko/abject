@@ -5,6 +5,12 @@
  * coordinates via IPC, and prints a formatted security audit report.
  *
  * Usage: pnpm hack
+ *
+ * Every port comes from one base, WS_PORT (default 7730): the signaling
+ * server listens on the base, the victim takes base+1 and the attacker
+ * base+11 as their own WS_PORT (each also binds WS_PORT+4 for the CLI gateway
+ * and WS_PORT+5 for the HTTP gateway). The two data directories go under
+ * ABJECTS_DATA_DIR when it is set, else in the working directory.
  */
 
 import { fork, type ChildProcess } from 'node:child_process';
@@ -12,10 +18,39 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { SignalingServer } from '../server/signaling-server.js';
 
-const SIGNALING_PORT = 7730;
-const VICTIM_DATA = '.abjects-hack-victim';
-const ATTACKER_DATA = '.abjects-hack-attacker';
-const TIMEOUT_MS = 90_000; // 90s total timeout
+const BASE_PORT = parseInt(process.env.WS_PORT ?? '7730', 10);
+const SIGNALING_PORT = BASE_PORT;
+const VICTIM_PORT = BASE_PORT + 1;
+const ATTACKER_PORT = BASE_PORT + 11;
+const SIGNALING_URL = `ws://localhost:${SIGNALING_PORT}`;
+const DATA_ROOT = process.env.ABJECTS_DATA_DIR ? path.resolve(process.env.ABJECTS_DATA_DIR) : process.cwd();
+const VICTIM_DATA = path.join(DATA_ROOT, process.env.ABJECTS_DATA_DIR ? 'hack-victim' : '.abjects-hack-victim');
+const ATTACKER_DATA = path.join(DATA_ROOT, process.env.ABJECTS_DATA_DIR ? 'hack-attacker' : '.abjects-hack-attacker');
+// Two full backends boot one after the other before the attacks start.
+const TIMEOUT_MS = 180_000;
+
+/** The environment for one instance: its own ports, data and the local signaling server. */
+function instanceEnv(wsPort: number, dataDir: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    WS_PORT: String(wsPort),
+    CLI_PORT: String(wsPort + 4),
+    HTTP_PORT: String(wsPort + 5),
+    ABJECTS_DATA_DIR: dataDir,
+    ABJECTS_SIGNALING_URLS: SIGNALING_URL,
+  };
+}
+
+/** Ask a child to shut down, and SIGKILL it if it has not left in time. */
+async function stopChild(child: ChildProcess | undefined): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>(resolve => child.once('exit', () => resolve()));
+  if (child.connected) child.send({ type: 'shutdown' });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([exited, new Promise(resolve => { timer = setTimeout(resolve, 8000); })]);
+  clearTimeout(timer);
+  child.kill('SIGKILL');
+}
 
 interface AttackResult {
   id: string;
@@ -29,9 +64,8 @@ interface AttackResult {
 }
 
 function cleanDataDir(dir: string): void {
-  const fullPath = path.join(process.cwd(), dir);
-  if (fs.existsSync(fullPath)) {
-    fs.rmSync(fullPath, { recursive: true, force: true });
+  if (fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
     console.log(`  Cleaned ${dir}`);
   }
 }
@@ -110,16 +144,7 @@ async function main(): Promise<void> {
   let attacker: ChildProcess | undefined;
 
   const cleanup = async () => {
-    if (attacker?.connected) {
-      attacker.send({ type: 'shutdown' });
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    if (victim?.connected) {
-      victim.send({ type: 'shutdown' });
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    attacker?.kill('SIGKILL');
-    victim?.kill('SIGKILL');
+    await Promise.all([stopChild(attacker), stopChild(victim)]);
     await signalingServer.close();
 
     // Clean data dirs
@@ -143,7 +168,7 @@ async function main(): Promise<void> {
       {
         execArgv: ['--import', 'tsx'],
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-        env: { ...process.env, ABJECTS_DATA_DIR: VICTIM_DATA },
+        env: instanceEnv(VICTIM_PORT, VICTIM_DATA),
       },
     );
 
@@ -189,7 +214,7 @@ async function main(): Promise<void> {
       {
         execArgv: ['--import', 'tsx'],
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-        env: { ...process.env, ABJECTS_DATA_DIR: ATTACKER_DATA },
+        env: instanceEnv(ATTACKER_PORT, ATTACKER_DATA),
       },
     );
 

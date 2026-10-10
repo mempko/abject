@@ -11,8 +11,8 @@
  * Security model mirrors HttpClient: allow/deny domain sets, scheme
  * allowlist, private-address (SSRF) blocking with the owner's Private hosts
  * exceptions, a master switch, and a single permissions authority
- * (GlobalSettings) that answers requestPermission for unlisted domains with
- * accept_once / accept_always / deny / deny_always. The private-address check
+ * (PermissionBroker, which claims it at boot) that answers requestPermission
+ * for unlisted domains with accept_once / accept_always / deny / deny_always. The private-address check
  * runs again on the addresses each socket connects to, so a name whose DNS
  * answer changes after the first check is still refused.
  */
@@ -20,7 +20,6 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, request } from '../../core/message.js';
-import { Capabilities } from '../../core/capability.js';
 import { require } from '../../core/contracts.js';
 import WebSocket from 'ws';
 import * as http from 'http';
@@ -158,8 +157,6 @@ export class StreamClient extends Abject {
             },
           ],
         },
-        requiredCapabilities: [],
-        providedCapabilities: [Capabilities.STREAM_CONNECT],
         tags: ['system', 'capability', 'stream', 'network'],
       },
     });

@@ -40,7 +40,9 @@ for (const stream of [process.stdout, process.stderr]) {
   });
 }
 
-// One instance per data directory.
+// One instance of the app (Electron's lock is per app, not per data directory;
+// claimDataDir below and the backend's own instance.json check cover another
+// backend on the same data directory).
 //
 // A second launch used to start a whole second backend against the same SQLite
 // files and the same WebSocket port, which does not fail cleanly: the newcomer
