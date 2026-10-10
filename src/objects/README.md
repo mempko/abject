@@ -462,9 +462,25 @@ global window spawns in `spawnGlobalUi` in `server/ui-layer.ts`.
 - **Dialog surfaces are sealed.** Only the bootstrap registers presenters and
   responders. A workspace object asks; it never answers.
 - **Settings writers are checked.** SettingsManager takes writes from
-  GlobalSettings, CliServer and abjects in a local workspace this peer hosts. A
-  user object named like a system object carries a namespaced typeId and is
-  refused.
+  GlobalSettings, CliServer and abjects in a local workspace this peer hosts.
+  A user object named like a system object runs code, so it is not built-in
+  (`src/core/built-in.ts`) and is refused.
+- **Only built-in objects are trusted.** An object that runs code (a
+  ScriptableAbject, WASM, an Organism, a package's abject, a proxy, a remote
+  peer's object) cannot pass for a built-in one:
+  - The Factory spawns server classes, built-in typeId shapes and `respawn`
+    only for built-in requesters. Code may spawn more code, into its own
+    registry, and may stop only itself and the objects it owns.
+  - The registries take `rename`, curation, `setFallback`, remote entries,
+    and writes to other objects' entries from built-in objects only. An
+    object may refresh its own entry but not change its name, typeId, owner
+    or source.
+  - AbjectStore saves and version changes come from built-ins, the object, or
+    its owner.
+  - The Supervisor takes `addChild`, `removeChild` and `childFailed` from
+    built-in objects only.
+
+  Privileged handlers check with `isBuiltInCaller(id, names)` (on Abject).
 - **Background workspaces run.** INFRA objects are up for every workspace,
   shown or not; only UI objects wait for the first switch.
 - **Boot work outside `onInit`.** The bootstrap sends WorkspaceManager `boot`

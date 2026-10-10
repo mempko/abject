@@ -234,6 +234,34 @@ export class AbjectStore extends Abject {
     this.setupHandlers();
   }
 
+  /** An object's registration, from this store's registry (with its fallback). */
+  private async registrationOf(objectId: string): Promise<{ owner?: string; source?: string } | undefined> {
+    if (!this.registryId) return undefined;
+    return await this.request<{ owner?: string; source?: string } | null>(
+      request(this.id, this.registryId, 'lookup', { objectId }), 10_000).catch(() => null) ?? undefined;
+  }
+
+  /**
+   * A snapshot is written by a built-in object (ObjectCreator, the editor,
+   * WorkspaceManager), by the object itself, or by its owner (the object that
+   * created it). Saved source is what the object runs after a restart, so
+   * nothing else may write it. Returns the object's registration when the
+   * writer is not built-in, undefined when it is.
+   */
+  private async requireSnapshotWriter(
+    msg: AbjectMessage, objectId: string, method: string,
+  ): Promise<{ owner?: string; source?: string } | undefined> {
+    const sender = msg.routing.from;
+    if (await this.isBuiltInCaller(sender)) return undefined;
+    precondition(typeof objectId === 'string' && objectId !== '', `${method}: objectId must not be empty`);
+    const registered = await this.registrationOf(objectId);
+    const snap = this.findSnapshot(objectId);
+    const owner = registered?.owner ?? snap?.owner;
+    precondition(objectId === sender || (!!owner && owner === sender),
+      `AbjectStore '${method}' is taken only from the object itself, its owner, or a built-in object`);
+    return registered ?? { owner: snap?.owner };
+  }
+
   private setupHandlers(): void {
     describeMessages(this.manifest, [{name:'getDurableSnapshot',description:'Read a source/data snapshot directly from Storage after durable acknowledgement.',parameters:{objectId:protocolText}}]);
     this.on('save', async (msg: AbjectMessage) => {
@@ -244,17 +272,23 @@ export class AbjectStore extends Abject {
         owner: string;
         data?: Record<string, unknown>;
       };
-      return this.saveSnapshot(objectId, manifest, source, owner, data);
+      // An object saving itself keeps the owner its registration records: a
+      // claimed `package:<name>` would write that package's data instead.
+      const registered = await this.requireSnapshotWriter(msg, objectId, 'save');
+      const finalOwner = registered === undefined ? owner : (registered.owner ?? '');
+      return this.saveSnapshot(objectId, manifest, source, finalOwner, data);
     });
 
     this.on('remove', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
+      await this.requireSnapshotWriter(msg, objectId, 'remove');
       return this.removeSnapshot(objectId);
     });
 
     // Registry catalog events (we subscribe in onInit). A registration whose
     // manifest differs from the snapshot's is the snapshot falling behind.
     const adoptManifest = (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.registryId) return;
       const reg = msg.payload as { id?: string; manifest?: AbjectManifest } | undefined;
       if (!reg?.id || !reg.manifest?.interface) return;
       const snap = this.findSnapshot(reg.id);
@@ -284,15 +318,26 @@ export class AbjectStore extends Abject {
     this.on('getPackageData', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       precondition(typeof name === 'string' && name !== '', 'name must not be empty');
+      // Package data can hold a package's credentials: it goes to built-in
+      // objects (WorkspaceManager hands it to the abject at spawn) and to that
+      // package's own abjects.
+      if (!(await this.isBuiltInCaller(msg.routing.from))) {
+        const caller = await this.registrationOf(msg.routing.from);
+        precondition(!!caller && isPackageOwner(caller.owner)
+          && this.findPackageSnapshot(name)?.owner === caller.owner,
+          'package data goes to built-in objects and to that package\'s own abjects only');
+      }
       return this.findPackageSnapshot(name)?.data ?? null;
     });
 
-    this.on('restoreAll', async () => {
+    this.on('restoreAll', async (msg: AbjectMessage) => {
+      precondition(await this.isBuiltInCaller(msg.routing.from), 'restoreAll is taken from built-in objects only');
       return this.restoreAll();
     });
 
     // A crashed worker takes its objects with it; their snapshots survive.
     this.on('restoreLost', async (msg: AbjectMessage) => {
+      precondition(await this.isBuiltInCaller(msg.routing.from), 'restoreLost is taken from built-in objects only');
       const { objectIds } = msg.payload as { objectIds: string[] };
       const wanted = new Set(Array.isArray(objectIds) ? objectIds : []);
       const hit = [...this.snapshots.values()].filter(s => wanted.has(s.objectId));
@@ -333,11 +378,13 @@ export class AbjectStore extends Abject {
 
     this.on('restoreVersion', async (msg: AbjectMessage) => {
       const { objectId, index } = msg.payload as { objectId: string; index: number };
+      await this.requireSnapshotWriter(msg, objectId, 'restoreVersion');
       return this.restoreVersion(objectId, index);
     });
 
     this.on('deleteVersion', async (msg: AbjectMessage) => {
       const { objectId, index } = msg.payload as { objectId: string; index: number };
+      await this.requireSnapshotWriter(msg, objectId, 'deleteVersion');
       const snap = this.findSnapshot(objectId);
       if (!snap) return { success: false, error: `No snapshot found for '${objectId}'` };
       const versions = snap.versions ?? [];

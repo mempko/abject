@@ -491,9 +491,10 @@ export class SettingsManager extends Abject {
     allowed: readonly string[],
     opts: { allowLocalWorkspace?: boolean } = {},
   ): Promise<void> {
+    // The named built-in objects (src/core/built-in.ts); a user object that
+    // took one of those names runs code and does not pass.
+    if (await this.isBuiltInCaller(msg.routing.from, allowed)) return;
     const identity = await this.resolveCallerIdentity(msg.routing.from);
-    const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-    if (identity && allowed.includes(identity.name) && typeSegments <= 3) return;
     if (opts.allowLocalWorkspace && identity && (await this.callerInLocalWorkspace(msg.routing.from))) return;
     precondition(
       false,

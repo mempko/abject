@@ -107,6 +107,16 @@ Every system service follows this pattern:
 4. **Override `onInit()`** for async initialization, **`onStop()`** for cleanup
 5. **Export a well-known ID constant**: `export const MY_OBJECT_ID = 'abjects:my-object' as AbjectId`
 
+### Trust
+
+Only built-in objects (instances of classes compiled into the server) are
+trusted; anything that runs code (ScriptableAbjects, WASM, Organisms,
+packages, proxies, remote objects) is not, whatever it is named. A handler
+that does something privileged admits its caller with
+`await this.isBuiltInCaller(msg.routing.from, ['AllowedName'])`
+(`src/core/built-in.ts`, `src/core/abject.ts`); never trust a name, a typeId
+shape or a payload field on its own.
+
 ### Message Handlers
 
 - Handlers receive `AbjectMessage`, extract payload via type assertion: `const { key } = msg.payload as { key: string }`

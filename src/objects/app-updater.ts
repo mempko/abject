@@ -271,14 +271,12 @@ export class AppUpdater extends Abject {
   /**
    * Only the Settings window and the terminal client may download, restart,
    * open pages or change the setting. Restarting the app is the user's call;
-   * an agent or a user object calling itself one of them carries a namespaced
-   * typeId and is turned away. Reading the status and checking stay open to
-   * everyone.
+   * anything that is not the built-in object (src/core/built-in.ts) is
+   * turned away, whatever it calls itself. Reading the status and checking
+   * stay open to everyone.
    */
   private async admit(msg: AbjectMessage): Promise<void> {
-    const identity = await this.resolveCallerIdentity(msg.routing.from);
-    const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-    precondition(!!identity && ADMITTED_CALLERS.includes(identity.name) && typeSegments <= 3,
+    precondition(await this.isBuiltInCaller(msg.routing.from, ADMITTED_CALLERS),
       `AppUpdater takes this request from ${ADMITTED_CALLERS.join(' or ')} only`);
   }
 

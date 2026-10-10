@@ -191,14 +191,12 @@ export class BrowserWindowHost extends Abject {
 
   /**
    * Only WebBrowser may open windows. Anything else could put arbitrary
-   * windows on the user's screen, or wipe a profile it does not own. A user
-   * object calling itself WebBrowser carries a namespaced typeId
-   * (`{peer}/{workspace}/user/WebBrowser`) and is turned away.
+   * windows on the user's screen, or wipe a profile it does not own. Only the
+   * built-in WebBrowser (src/core/built-in.ts) passes; a user object calling
+   * itself WebBrowser runs code and is turned away.
    */
   private async admit(msg: AbjectMessage): Promise<void> {
-    const identity = await this.resolveCallerIdentity(msg.routing.from);
-    const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-    requireContract(identity?.name === ADMITTED_CALLER && typeSegments <= 3,
+    requireContract(await this.isBuiltInCaller(msg.routing.from, [ADMITTED_CALLER]),
       `BrowserWindowHost serves ${ADMITTED_CALLER} only`);
   }
 

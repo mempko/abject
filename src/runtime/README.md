@@ -135,7 +135,10 @@ inside a worker or goes straight to a peer worker.
 spec.
 - `ChildSpec`: `id`, `constructorName`, `restart` (`permanent`, `transient`,
   `temporary`), `parentId`.
-- Handlers: `addChild`, `removeChild`, `getChildren`, `childFailed`.
+- Handlers: `addChild`, `removeChild`, `getChildren`, `childFailed`. All but
+  `getChildren` are taken from built-in objects only (`isBuiltInCaller`, see
+  `src/core/built-in.ts`): an object that runs code cannot restart or drop a
+  supervised one.
 - On `childFailed` it drops `temporary` children and restarts the others by
   strategy (`one_for_one` default, `one_for_all`, `rest_for_one`), asking the
   Factory to `respawn` with the same id so references stay valid, then sends

@@ -42,6 +42,12 @@ interface State { count: number }
   randomness, hashes and HMACs through the `Crypto` abject.
 - **`this.data`** is durable and visible to the model through `ask`. Keep
   secrets in package settings (type `secret`) or Storage instead.
+- **Script code is not built-in.** It may spawn more code through the Factory
+  (source, a WASM module, a package type), always into its own workspace's
+  registry, and stop only itself and what it owns. It cannot spawn a server
+  class, take a built-in typeId or name in a way privileged objects trust,
+  rewrite another object's registry entry or snapshot, or restart supervised
+  objects (`src/core/built-in.ts`).
 
 ## Files
 

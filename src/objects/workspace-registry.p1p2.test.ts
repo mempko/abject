@@ -83,7 +83,7 @@ async function harness(): Promise<Harness> {
 
   const localCaller = new Fixture('LocalAgent', 'A local agent');
   await localCaller.init(bus);
-  await localCaller.ask(wsReg.id, 'setFallback', { registryId: globalReg.id });
+  await wsReg.setFallback(globalReg.id); // the registry's maker wires it (by message, only built-ins may)
 
   const exposed = new Fixture('PublicNotes', 'Shared public notes');
   await exposed.init(bus);
@@ -248,12 +248,14 @@ test('P2-1: a remote write is refused and the source stays byte-identical', asyn
   const after = await h.localCaller.ask<string | null>(h.wsReg.id, 'getSource', { objectId: h.exposed.id });
   assert.equal(after, SOURCE_A, 'the source must be byte-identical after the refused remote write');
 
-  // The same write from a LOCAL caller still succeeds — the guard is scoped.
-  const localOk = await h.localCaller.ask<boolean>(h.wsReg.id, 'updateSource', {
+  // A local write by the object itself still succeeds: the guard is scoped.
+  // (Another local object's write is refused too; only the object, its owner
+  // or a built-in object may change an entry's source.)
+  const localOk = await h.exposed.ask<boolean>(h.wsReg.id, 'updateSource', {
     objectId: h.exposed.id,
     source: 'export class PublicNotes { /* LOCAL EDIT */ }\n',
   });
-  assert.equal(localOk, true, 'a local updateSource must still be allowed');
+  assert.equal(localOk, true, 'a local updateSource by the object itself must still be allowed');
 
   await h.stop();
 });

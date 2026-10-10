@@ -144,7 +144,7 @@ async function harness(): Promise<Harness> {
 
   const local = new Fixture('LocalAgent', 'A local agent');
   await local.init(busA);
-  await local.ask(wsReg.id, 'setFallback', { registryId: globalReg.id });
+  await wsReg.setFallback(globalReg.id); // the registry's maker wires it (by message, only built-ins may)
 
   const exposed = new Fixture('PublicNotes', 'Shared public notes');
   await exposed.init(busA);

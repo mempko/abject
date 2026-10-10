@@ -30,6 +30,10 @@ import {
   decodeBase64Module,
 } from '../sandbox/wasm-module-store.js';
 import { isPackageOwner } from '../core/packages.js';
+import { BOOTSTRAP_SENDER_ID, isBuiltInRegistration } from '../core/built-in.js';
+
+/** What the Factory records for objects that run code rather than a server class. */
+const CODE_CONSTRUCTORS: ReadonlySet<string> = new Set(['ScriptableAbject', 'Organism', WASM_ABJECT_CONSTRUCTOR]);
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
@@ -69,6 +73,15 @@ export interface PackageTypeRegistration {
  */
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
+  /**
+   * Objects being built right now: constructed (or sent to a worker) with
+   * their init still running. An object asks for things during onInit, before
+   * `spawned`/`workerSpawned` or any registry knows it, so how it was built
+   * (a server class or code) and where it goes are recorded here first. Each
+   * entry is dropped in the same synchronous step that writes the lasting
+   * record, so nothing can run between the two.
+   */
+  private building: Map<AbjectId, { builtIn: boolean; registryId?: AbjectId }> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
   private packageTypes: Map<string, PackageTypeRegistration> = new Map();
   private _factoryBus?: MessageBusLike;
@@ -242,11 +255,13 @@ export class Factory extends Abject {
       const payload = (msg.payload ?? {}) as SpawnRequest & { request?: SpawnRequest };
       const wrapped = payload.manifest === undefined
         && typeof payload.request === 'object' && payload.request !== null;
-      return this.spawn(wrapped ? payload.request! : payload);
+      const req = wrapped ? payload.request! : payload;
+      return this.spawn(await this.admitSpawn(msg.routing.from, req));
     });
 
     this.on('kill', async (msg: AbjectMessage) => {
       const { objectId, keepSnapshot } = msg.payload as { objectId: AbjectId; keepSnapshot?: boolean };
+      await this.admitKill(msg.routing.from, objectId);
       // Stopping an object is normally the user discarding it, so its
       // snapshot goes too. Recovery stops objects it is about to bring back
       // from those very snapshots, and says so.
@@ -258,7 +273,8 @@ export class Factory extends Abject {
       const { objectId, registryHint, withData } = msg.payload as {
         objectId: AbjectId; registryHint?: AbjectId; withData?: boolean;
       };
-      return this.clone(objectId, registryHint, withData ?? true);
+      const hint = await this.admitCopy(msg.routing.from, objectId, registryHint, 'clone');
+      return this.clone(objectId, hint, withData ?? true);
     });
 
     this.on('instantiate', async (msg: AbjectMessage) => {
@@ -266,7 +282,9 @@ export class Factory extends Abject {
         objectId?: AbjectId; typeId?: TypeId; data?: Record<string, unknown>;
         registryHint?: AbjectId; parentId?: AbjectId;
       };
-      return this.instantiate(req);
+      const key = (req.objectId ?? req.typeId ?? '') as AbjectId;
+      const hint = await this.admitCopy(msg.routing.from, key, req.registryHint, 'instantiate');
+      return this.instantiate({ ...req, ...(hint ? { registryHint: hint } : {}) });
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
@@ -276,6 +294,8 @@ export class Factory extends Abject {
         parentId?: AbjectId;
         registryId?: AbjectId;
       };
+      require(await this.isTrustedRequester(msg.routing.from),
+        'Factory respawns objects only for built-in objects (the Supervisor, worker recovery)');
       return this.respawn(objectId, constructorName, parentId, registryId);
     });
 
@@ -293,6 +313,104 @@ export class Factory extends Abject {
       const registryId = this.workerRegistries.get(objectId) ?? this.spawned.get(objectId)?.getRegistryId();
       return { isWorkerHosted: isWorker, constructorName, workerIndex, ...(registryId ? { registryId } : {}) };
     });
+  }
+
+  // ── Who may ask for what (src/core/built-in.ts) ──────────────────────
+
+  /**
+   * The bootstrap, this Factory, and built-in objects: they may ask for
+   * anything. What this Factory built answers first, from how it built it
+   * (a registered constructor, or code): an object asks for things during its
+   * own onInit, before it is registered anywhere. Anything else is judged by
+   * its registration.
+   */
+  private async isTrustedRequester(requesterId: AbjectId): Promise<boolean> {
+    if (requesterId === BOOTSTRAP_SENDER_ID || requesterId === this.id) return true;
+    const inProgress = this.building.get(requesterId);
+    if (inProgress) return inProgress.builtIn;
+    const local = this.spawned.get(requesterId);
+    if (local) return !(local instanceof ScriptableAbject || local instanceof Organism || local instanceof WasmAbject);
+    const constructorName = this.workerSpawned.get(requesterId);
+    if (constructorName !== undefined) return !CODE_CONSTRUCTORS.has(constructorName);
+    return this.isBuiltInCaller(requesterId);
+  }
+
+  /** The registry this Factory registered an object in, when it spawned it. */
+  private registryOf(objectId: AbjectId): AbjectId | undefined {
+    return this.building.get(objectId)?.registryId
+      ?? this.workerRegistries.get(objectId) ?? this.spawned.get(objectId)?.getRegistryId();
+  }
+
+  /**
+   * Run an instance's init with the object recorded as being built, then
+   * track it as spawned in the same step.
+   */
+  private async initRecorded(obj: Abject, registryId: AbjectId | undefined, init: () => Promise<void>): Promise<void> {
+    this.building.set(obj.id, { builtIn: Factory.isServerClass(obj), registryId });
+    try {
+      await init();
+    } catch (err) {
+      this.building.delete(obj.id);
+      throw err;
+    }
+    this.spawned.set(obj.id, obj);
+    this.building.delete(obj.id);
+  }
+
+  /** Whether an instance runs a server class rather than code. */
+  private static isServerClass(obj: Abject): boolean {
+    return !(obj instanceof ScriptableAbject || obj instanceof Organism || obj instanceof WasmAbject);
+  }
+
+  /** Whether a request asks for a server class (a registered constructor) rather than code. */
+  private asksForServerClass(req: SpawnRequest): boolean {
+    if (req.source || req.code || req.codeBase64) return false;
+    if (req.manifest && this.packageTypes.has(req.manifest.name)) return false;
+    return !!req.manifest && this.constructors.has(req.manifest.name);
+  }
+
+  /**
+   * What a spawn request may ask for, by who sent it. Code that is not built
+   * in may spawn more code (source, a WASM module, an Organism, an installed
+   * package type) into its own registry, never a server class: an instance of
+   * one is trusted by its registration, and it would carry whatever name the
+   * request gave it. Nor may it take a built-in's typeId shape
+   * (`{peer}/{scope}/{Name}`), which peers address built-ins by.
+   */
+  private async admitSpawn(requesterId: AbjectId, req: SpawnRequest): Promise<SpawnRequest> {
+    if (await this.isTrustedRequester(requesterId)) return req;
+    require(!this.asksForServerClass(req),
+      `Factory spawns the built-in '${req.manifest?.name}' only for built-in objects; spawn code (source, a WASM module or a package type) instead`);
+    require(!req.typeId || String(req.typeId).split('/').length !== 3,
+      `typeId '${String(req.typeId)}' has a built-in's shape; user objects use {peer}/{workspace}/user/{Name}`);
+    const own = this.registryOf(requesterId);
+    return own ? { ...req, registryHint: own } : req;
+  }
+
+  /**
+   * Stopping an object: built-in objects stop anything; any other object
+   * stops itself and the objects it owns (created).
+   */
+  private async admitKill(requesterId: AbjectId, objectId: AbjectId): Promise<void> {
+    if (objectId === requesterId || await this.isTrustedRequester(requesterId)) return;
+    const reg = await this.resolveRegistration(objectId, this.registryOf(objectId)).catch(() => null);
+    require(!!reg && !!reg.owner && reg.owner === requesterId,
+      'Factory stops an object only for itself, its owner, or a built-in object');
+  }
+
+  /**
+   * Copying an object (clone, instantiate): anything may copy source-backed
+   * objects, into its own registry; only built-in objects may copy a
+   * built-in one. Returns the registry to place the copy in.
+   */
+  private async admitCopy(
+    requesterId: AbjectId, key: AbjectId, registryHint: AbjectId | undefined, method: string,
+  ): Promise<AbjectId | undefined> {
+    if (await this.isTrustedRequester(requesterId)) return registryHint;
+    const reg = key ? await this.resolveRegistration(key, registryHint).catch(() => null) : null;
+    require(!reg || !isBuiltInRegistration(reg),
+      `Factory '${method}' copies a built-in object only for built-in objects`);
+    return this.registryOf(requesterId) ?? registryHint;
   }
 
   // Spawn/clone/instantiate semantics agents use to create objects correctly.
@@ -659,30 +777,37 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       }
       const isScriptable = constructorName === 'ScriptableAbject';
       const isWasm = constructorName === WASM_ABJECT_CONSTRUCTOR;
-      if (isScriptable || isWasm) {
-        if (!existingReg?.source) {
-          throw new Error(`Cannot respawn ${constructorName} '${objectId}': registration/source not found in Registry`);
+      this.building.set(objectId, { builtIn: !CODE_CONSTRUCTORS.has(constructorName), registryId: effectiveRegistryId });
+      try {
+        if (isScriptable || isWasm) {
+          if (!existingReg?.source) {
+            throw new Error(`Cannot respawn ${constructorName} '${objectId}': registration/source not found in Registry`);
+          }
+          await this._workerPool.spawnInWorker(objectId, constructorName, {
+            constructorArgs: {
+              manifest: existingReg.manifest,
+              source: existingReg.source,
+              owner: existingReg.owner ?? '',
+              data: existingReg.data,
+              ...(isWasm ? this.wasmAskFor(existingReg) : {}),
+            },
+            registryId: effectiveRegistryId,
+            parentId: parentId ?? this.id,
+            typeId: existingReg?.typeId,
+          });
+        } else {
+          await this._workerPool.spawnInWorker(objectId, constructorName, {
+            registryId: effectiveRegistryId,
+            parentId: parentId ?? this.id,
+            typeId: existingReg?.typeId,
+          });
         }
-        await this._workerPool.spawnInWorker(objectId, constructorName, {
-          constructorArgs: {
-            manifest: existingReg.manifest,
-            source: existingReg.source,
-            owner: existingReg.owner ?? '',
-            data: existingReg.data,
-            ...(isWasm ? this.wasmAskFor(existingReg) : {}),
-          },
-          registryId: effectiveRegistryId,
-          parentId: parentId ?? this.id,
-          typeId: existingReg?.typeId,
-        });
-      } else {
-        await this._workerPool.spawnInWorker(objectId, constructorName, {
-          registryId: effectiveRegistryId,
-          parentId: parentId ?? this.id,
-          typeId: existingReg?.typeId,
-        });
+      } catch (err) {
+        this.building.delete(objectId);
+        throw err;
       }
       this.workerSpawned.set(objectId, constructorName);
+      this.building.delete(objectId);
 
       // Register the manifest the live object actually has, not the one the
       // snapshot carried in: a scriptable object declares every handler its
@@ -759,8 +884,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     }
 
     // Initialize and register
-    await obj.init(this._factoryBus!, parentId ?? this.id);
-    this.spawned.set(obj.id, obj);
+    await this.initRecorded(obj, effectiveRegistryId, () => obj.init(this._factoryBus!, parentId ?? this.id));
 
     if (effectiveRegistryId) {
       const payload: Record<string, unknown> = {
@@ -900,11 +1024,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       obj.setRegistryHint(hint);
     }
 
-    // Initialize the object with parentId (default to Factory)
-    await obj.init(this._factoryBus!, req.parentId ?? this.id);
-
-    // Track spawned object
-    this.spawned.set(obj.id, obj);
+    // Initialize the object with parentId (default to Factory), and track it
+    await this.initRecorded(obj, hint, () => obj.init(this._factoryBus!, req.parentId ?? this.id));
 
     // Register with the appropriate registry:
     // - If registryHint is specified, register there (workspace objects)
@@ -954,11 +1075,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       obj.setRegistryHint(this._factoryRegistryId);
     }
 
-    // Initialize the object
-    await obj.init(this._factoryBus!, parentId);
-
-    // Track spawned object
-    this.spawned.set(obj.id, obj);
+    // Initialize the object, and track it
+    await this.initRecorded(obj, this._factoryRegistryId, () => obj.init(this._factoryBus!, parentId));
 
     // Register with registry via message passing
     if (this._factoryRegistryId) {
@@ -1009,6 +1127,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     // Spawn in worker — pass registryId and parentId so the worker-side
     // object can discover dependencies and communicate with the bus hub
+    this.building.set(objectId, { builtIn: true, registryId: req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId) });
     try {
       await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
         constructorArgs: req.constructorArgs,
@@ -1017,12 +1136,14 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         typeId: req.typeId,
       });
     } catch (err) {
+      this.building.delete(objectId);
       log.error(`Failed to spawn ${req.manifest.name} (${objectId.slice(0, 8)}) in worker:`, err);
       throw err;
     }
 
     // Track as worker-spawned
     this.workerSpawned.set(objectId, req.manifest.name);
+    this.building.delete(objectId);
 
     // Register with registry from main thread using the real manifest
     const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
@@ -1076,19 +1197,26 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     const objectId = uuidv4() as AbjectId;
 
-    await this._workerPool!.spawnInWorker(objectId, 'ScriptableAbject', {
-      constructorArgs: {
-        manifest: req.manifest,
-        source: req.source,
-        owner: req.owner ?? '',
-        data: req.data,
-      },
-      registryId: req.registryHint ?? this._factoryRegistryId,
-      parentId: req.parentId ?? this.id,
-      typeId: req.typeId,
-    });
+    this.building.set(objectId, { builtIn: false, registryId: req.registryHint ?? this._factoryRegistryId });
+    try {
+      await this._workerPool!.spawnInWorker(objectId, 'ScriptableAbject', {
+        constructorArgs: {
+          manifest: req.manifest,
+          source: req.source,
+          owner: req.owner ?? '',
+          data: req.data,
+        },
+        registryId: req.registryHint ?? this._factoryRegistryId,
+        parentId: req.parentId ?? this.id,
+        typeId: req.typeId,
+      });
+    } catch (err) {
+      this.building.delete(objectId);
+      throw err;
+    }
 
     this.workerSpawned.set(objectId, 'ScriptableAbject');
+    this.building.delete(objectId);
 
     // Register the manifest the live object has, not the one the request
     // carried in. A scriptable object declares every handler its source
@@ -1163,20 +1291,27 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     const objectId = uuidv4() as AbjectId;
 
-    await this._workerPool!.spawnInWorker(objectId, WASM_ABJECT_CONSTRUCTOR, {
-      constructorArgs: {
-        manifest: req.manifest,
-        source: req.source,
-        owner: req.owner ?? '',
-        data: req.data,
-        ...this.wasmAskFor(req),
-      },
-      registryId: req.registryHint ?? this._factoryRegistryId,
-      parentId: req.parentId ?? this.id,
-      typeId: req.typeId,
-    });
+    this.building.set(objectId, { builtIn: false, registryId: req.registryHint ?? this._factoryRegistryId });
+    try {
+      await this._workerPool!.spawnInWorker(objectId, WASM_ABJECT_CONSTRUCTOR, {
+        constructorArgs: {
+          manifest: req.manifest,
+          source: req.source,
+          owner: req.owner ?? '',
+          data: req.data,
+          ...this.wasmAskFor(req),
+        },
+        registryId: req.registryHint ?? this._factoryRegistryId,
+        parentId: req.parentId ?? this.id,
+        typeId: req.typeId,
+      });
+    } catch (err) {
+      this.building.delete(objectId);
+      throw err;
+    }
 
     this.workerSpawned.set(objectId, WASM_ABJECT_CONSTRUCTOR);
+    this.building.delete(objectId);
 
     // Same merged manifest the worker-side instance declares (introspect + wasm tag)
     const realManifest = mergeWasmManifest(req.manifest);
@@ -1236,14 +1371,21 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     const spec = JSON.parse(req.source!) as OrganismSpec;
     const objectId = uuidv4() as AbjectId;
 
-    await this._workerPool!.spawnInWorker(objectId, 'Organism', {
-      constructorArgs: spec,
-      registryId: req.registryHint ?? this._factoryRegistryId,
-      parentId: req.parentId ?? this.id,
-      typeId: req.typeId,
-    });
+    this.building.set(objectId, { builtIn: false, registryId: req.registryHint ?? this._factoryRegistryId });
+    try {
+      await this._workerPool!.spawnInWorker(objectId, 'Organism', {
+        constructorArgs: spec,
+        registryId: req.registryHint ?? this._factoryRegistryId,
+        parentId: req.parentId ?? this.id,
+        typeId: req.typeId,
+      });
+    } catch (err) {
+      this.building.delete(objectId);
+      throw err;
+    }
 
     this.workerSpawned.set(objectId, 'Organism');
+    this.building.delete(objectId);
 
     // Build the merged manifest for registry registration
     const realManifest = buildOrganismManifest(spec);

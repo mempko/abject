@@ -336,9 +336,7 @@ the object that holds the login every socket checks:
 
 ```typescript
 this.on('updateAuth', async (msg: AbjectMessage) => {
-  const caller = await this.resolveCallerIdentity(msg.routing.from);
-  const segments = caller?.typeId ? String(caller.typeId).split('/').length : 0;
-  contractRequire(!!caller && (AUTH_WRITERS as readonly string[]).includes(caller.name) && segments <= 3,
+  contractRequire(await this.isBuiltInCaller(msg.routing.from, AUTH_WRITERS as readonly string[]),
     'AuthGate takes login changes from SettingsManager only');
   // ...
   contractRequire(!enabled || ((username as string) !== '' && (password as string) !== ''),

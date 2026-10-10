@@ -124,6 +124,22 @@ object system belongs to a capability object (section 4.4): to touch a file,
 run a command or reach the network, an object sends that object a message,
 and the capability object decides.
 
+- **Built-in objects are the trusted ones** (`src/core/built-in.ts`): an
+  instance of a class compiled into the server, which the registry shows as
+  an entry with no `source`, no package owner and no remote peer. Privileged
+  handlers (settings writes and secret reads, the login, the web gateway's
+  controls, updates, trust changes) admit callers with
+  `Abject.isBuiltInCaller(id, names)`. Code cannot pass for a built-in: the
+  Factory builds a server class, a built-in typeId shape or a `respawn` only
+  for a built-in requester (code may spawn more code into its own registry
+  and stop only itself and what it owns); the registries take `rename`,
+  curation, `setFallback`, remote entries and writes to another object's
+  entry only from built-ins, and an object's own entry keeps its name,
+  typeId, owner and source; AbjectStore snapshots and the Supervisor's
+  `addChild` / `removeChild` / `childFailed` follow the same rule. The
+  bootstrap (sender `bootstrap`) anchors it all: it spawns the first built-in
+  objects.
+
 - **PermissionBroker** (`src/objects/permission-broker.ts`) holds the
   permission authority for ShellExecutor, HostFileSystem, HttpClient and
   StreamClient. ShellExecutor, HostFileSystem and StreamClient ask it before

@@ -20,7 +20,8 @@ import { reply, error, errorFromException, event, request, isRequest, isReply, i
 import { Mailbox } from '../runtime/mailbox.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } from './introspect.js';
-import type { InterfaceId } from './types.js';
+import type { InterfaceId, ObjectRegistration } from './types.js';
+import { BOOTSTRAP_SENDER_ID, isBuiltInRegistration } from './built-in.js';
 import { Log } from './timed-log.js';
 import type { ThemeData } from './theme-data.js';
 import type { DecisionOutcome, DecisionQuestion, DecisionState } from '../llm/decision.js';
@@ -55,6 +56,14 @@ const HUMAN_HEARTBEAT_MS = 2_000;
  * answer is never coming.
  */
 const HUMAN_DIALOG_STALL_MS = 10 * 60 * 1000;
+
+/** Who sent a message, as its registry records it. */
+export interface CallerIdentity {
+  name: string;
+  typeId?: TypeId;
+  /** An instance of a class compiled into the server (src/core/built-in.ts). */
+  builtIn: boolean;
+}
 
 export type MessageHandlerFn = (
   message: AbjectMessage
@@ -486,7 +495,7 @@ export abstract class Abject {
   }
 
   /** AbjectId -> registered identity, for objects that gate on who is calling. */
-  private _callerNameCache = new Map<AbjectId, { name: string; typeId?: TypeId }>();
+  private _callerNameCache = new Map<AbjectId, CallerIdentity>();
 
   /**
    * The registered name of whoever sent a message, or undefined when it cannot
@@ -507,18 +516,18 @@ export abstract class Abject {
   }
 
   /**
-   * Registered name AND durable type identity of whoever sent a message.
+   * Registered name, durable type identity, and whether the caller is
+   * built-in (see src/core/built-in.ts), for whoever sent a message.
    *
-   * The typeId is the part to gate privileges on. A registered name is unique
-   * only while its holder exists, so a name that is free (an object the
-   * workspace has not spawned) can be claimed by anything. A typeId cannot be
-   * claimed: WorkspaceManager stamps built-ins `{peer}/{workspace}/{Name}` at
-   * spawn, while a user object is `{peer}/{workspace}/user/{Name}`, and the
-   * Factory is what assigns them.
+   * Gate privileges on `builtIn` together with the name (isBuiltInCaller). A
+   * name alone proves nothing: one that is free (an object this instance has
+   * not spawned) can be taken by any object. Built-in cannot be claimed: only
+   * built-in requesters get a registered constructor from the Factory, and an
+   * object's own registry writes never change its source, owner or name.
    */
   protected async resolveCallerIdentity(
     callerId?: AbjectId,
-  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+  ): Promise<CallerIdentity | undefined> {
     if (!callerId) return undefined;
     const cached = this._callerNameCache.get(callerId);
     if (cached) return cached;
@@ -534,25 +543,37 @@ export abstract class Abject {
 
   private async lookupIdentityIn(
     registryId: AbjectId | null, objectId: AbjectId,
-  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+  ): Promise<CallerIdentity | undefined> {
     if (!registryId) return undefined;
     try {
       const reg = await this.request<
-        { name?: string; typeId?: TypeId; manifest?: { name?: string } } | null
+        (Partial<ObjectRegistration> & { manifest?: { name?: string } }) | null
       >(
         request(this.id, registryId, 'lookup', { objectId }),
         5000,
       );
       const name = reg?.name ?? reg?.manifest?.name;
-      return name ? { name, typeId: reg?.typeId } : undefined;
+      return name ? { name, typeId: reg?.typeId, builtIn: isBuiltInRegistration(reg) } : undefined;
     } catch {
       return undefined;
     }
   }
 
+  /**
+   * Whether a message came from a built-in object (src/core/built-in.ts),
+   * and when `names` is given, one registered under one of those names. The
+   * check privileged handlers make before acting for a caller.
+   */
+  protected async isBuiltInCaller(callerId: AbjectId | undefined, names?: readonly string[]): Promise<boolean> {
+    if (!callerId) return false;
+    if (callerId === BOOTSTRAP_SENDER_ID && !names) return true;
+    const identity = await this.resolveCallerIdentity(callerId);
+    return !!identity && identity.builtIn && (!names || names.includes(identity.name));
+  }
+
   private async lookupIdentityInOwningWorkspace(
     objectId: AbjectId,
-  ): Promise<{ name: string; typeId?: TypeId } | undefined> {
+  ): Promise<CallerIdentity | undefined> {
     const wmId = await this.discoverDep('WorkspaceManager');
     if (!wmId) return undefined;
     try {

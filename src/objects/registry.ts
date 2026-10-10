@@ -14,6 +14,7 @@ import {
   InterfaceId,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { BOOTSTRAP_SENDER_ID, isBuiltInRegistration } from '../core/built-in.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { require, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
@@ -465,11 +466,23 @@ Each line shows one registered object: id, name, description, and non-meta metho
         typeId?: TypeId;
         data?: Record<string, unknown>;
       };
-      return this.registerObject(objectId, manifest, status, owner, source, name, typeId, data);
+      this.denyRemoteWrite(msg, 'register');
+      if (await this.isRegistryAuthority(msg.routing.from)) {
+        return this.registerObject(objectId, manifest, status, owner, source, name, typeId, data);
+      }
+      // An object refreshing its own entry (a WASM abject persisting its
+      // data): manifest, status and data change; who it is does not.
+      const own = this.objects.get(objectId);
+      require(objectId === msg.routing.from && own !== undefined,
+        'Registry: an object may update only its own existing entry; new entries come from the Factory');
+      return this.registerObject(objectId, manifest, status, own!.owner, own!.source, own!.name, own!.typeId, data);
     });
 
     this.on('unregister', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
+      this.denyRemoteWrite(msg, 'unregister');
+      require(objectId === msg.routing.from || await this.isRegistryAuthority(msg.routing.from),
+        'Registry: an object may unregister only itself');
       return this.unregisterObject(objectId);
     });
 
@@ -562,6 +575,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('setExposedObjectIds', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'setExposedObjectIds');
       const { ids, typeIds, names } = msg.payload as {
         ids?: AbjectId[];
         typeIds?: string[];
@@ -574,6 +588,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('setExposedSelectors', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'setExposedSelectors');
       const { ids, typeIds, names } = msg.payload as ExposureSelectorsInput;
       this.setExposedSelectors({ ids, typeIds, names });
       return true;
@@ -609,6 +624,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
       };
       const reg = this.resolveRegistration(ref ?? objectId ?? typeId ?? name ?? '');
       if (!reg) return false;
+      await this.requireEntryWriter(msg, reg, 'updateSource', source);
       reg.source = source;
       return true;
     });
@@ -616,6 +632,8 @@ Each line shows one registered object: id, name, description, and non-meta metho
     this.on('updateManifest', async (msg: AbjectMessage) => {
       this.denyRemoteWrite(msg, 'updateManifest');
       const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
+      const reg = this.objects.get(objectId);
+      if (reg) await this.requireEntryWriter(msg, reg, 'updateManifest');
       return this.updateManifestRegistration(objectId, manifest);
     });
 
@@ -626,6 +644,9 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('rename', async (msg: AbjectMessage) => {
+      // A name is how privileged objects recognise their callers, so only
+      // built-in objects rename entries.
+      await this.requireRegistryAuthority(msg, 'rename');
       const { objectId, name } = msg.payload as { objectId: AbjectId; name: string };
       const reg = this.objects.get(objectId);
       if (!reg) return false;
@@ -637,6 +658,47 @@ Each line shows one registered object: id, name, description, and non-meta metho
       this.byName.get(reg.name)!.add(objectId);
       return { name: reg.name };
     });
+  }
+
+  // ── Who may write ────────────────────────────────────────────────────
+
+  /**
+   * May this sender write entries other than its own? The registry itself,
+   * its parent (an Organism's internal registry), the bootstrap, and built-in
+   * objects (src/core/built-in.ts): the Factory, WorkspaceManager, AbjectStore,
+   * the share registry, editors. Everything else writes only its own entry.
+   */
+  protected async isRegistryAuthority(senderId: AbjectId): Promise<boolean> {
+    if (senderId === this.id || senderId === BOOTSTRAP_SENDER_ID) return true;
+    if (this.parentId !== undefined && senderId === this.parentId) return true;
+    const local = this.objects.get(senderId);
+    if (local) return isBuiltInRegistration(local);
+    return this.isBuiltInCaller(senderId);
+  }
+
+  protected async requireRegistryAuthority(msg: AbjectMessage, method: string): Promise<void> {
+    this.denyRemoteWrite(msg, method);
+    require(await this.isRegistryAuthority(msg.routing.from),
+      `Registry '${method}' is taken from built-in objects only`);
+  }
+
+  /**
+   * An entry's source or manifest may be changed by a built-in object, by the
+   * object itself, or by its owner (the object that created it). The object
+   * itself may never clear its source: an entry with no source is how
+   * built-in code is recognised.
+   */
+  protected async requireEntryWriter(
+    msg: AbjectMessage, target: Pick<ObjectRegistration, 'id' | 'owner' | 'source'>, method: string, newSource?: string,
+  ): Promise<void> {
+    const sender = msg.routing.from;
+    if (await this.isRegistryAuthority(sender)) return;
+    const own = target.id === sender || (!!target.owner && target.owner === sender);
+    require(own, `Registry '${method}' is taken only from the object itself, its owner, or a built-in object`);
+    if (method === 'updateSource') {
+      require(!!target.source && typeof newSource === 'string' && newSource.length > 0,
+        'Registry: only a source-backed object can update its source, and never to an empty one');
+    }
   }
 
   /**

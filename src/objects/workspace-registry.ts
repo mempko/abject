@@ -151,10 +151,11 @@ export class WorkspaceRegistry extends Registry {
     this.on('getWorkspaceId', () => this.workspaceId ?? null);
 
     this.on('setFallback', async (msg: AbjectMessage) => {
+      // Where lookups go on a miss decides whose word this registry takes
+      // about callers, so only built-in objects (WorkspaceManager) set it.
+      await this.requireRegistryAuthority(msg, 'setFallback');
       const { registryId } = msg.payload as { registryId: AbjectId };
-      this.fallbackRegistryId = registryId;
-      this.subscribeToFallback();
-      await this.refreshGlobalCatalog();
+      await this.setFallback(registryId);
       return true;
     });
 
@@ -215,10 +216,14 @@ export class WorkspaceRegistry extends Registry {
       };
       const reg = this.resolveRegistration(ref ?? objectId ?? typeId ?? name ?? '');
       if (reg) {
+        await this.requireEntryWriter(msg, reg, 'updateSource', source);
         reg.source = source;
         return true;
       }
       if (!this.fallbackRegistryId) return false;
+      // The fallback sees this registry as the sender, so the caller is
+      // checked here, against the entry it names.
+      if (!(await this.mayForward(msg, objectId, 'updateSource', source))) return false;
       try {
         return await this.request<boolean>(
           request(this.id, this.fallbackRegistryId, 'updateSource', msg.payload as Record<string, unknown>),
@@ -231,10 +236,13 @@ export class WorkspaceRegistry extends Registry {
     this.on('updateManifest', async (msg: AbjectMessage) => {
       this.denyRemoteWrite(msg, 'updateManifest');
       const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
-      if (this.lookupObject(objectId)) {
+      const local = this.lookupObject(objectId);
+      if (local) {
+        await this.requireEntryWriter(msg, local, 'updateManifest');
         return this.updateManifestRegistration(objectId, manifest);
       }
       if (!this.fallbackRegistryId) return false;
+      if (!(await this.mayForward(msg, objectId, 'updateManifest'))) return false;
       try {
         return await this.request<boolean>(
           request(this.id, this.fallbackRegistryId, 'updateManifest', msg.payload as Record<string, unknown>),
@@ -246,6 +254,7 @@ export class WorkspaceRegistry extends Registry {
 
     // Remote pooling handlers
     this.on('registerRemote', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'registerRemote');
       const payload = msg.payload as {
         object?: ObjectRegistration;
         registration?: ObjectRegistration;
@@ -262,16 +271,19 @@ export class WorkspaceRegistry extends Registry {
     });
 
     this.on('unregisterRemote', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'unregisterRemote');
       const { objectId } = msg.payload as { objectId: AbjectId };
       return this.unregisterRemote(objectId);
     });
 
     this.on('unregisterRemoteForPeer', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'unregisterRemoteForPeer');
       const { peerId, workspaceId } = msg.payload as { peerId: string; workspaceId?: string };
       return this.unregisterRemoteForPeer(peerId, workspaceId);
     });
 
     this.on('unregisterRemoteForWorkspace', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'unregisterRemoteForWorkspace');
       const { workspaceId } = msg.payload as { workspaceId: string };
       return this.unregisterRemoteForWorkspace(workspaceId);
     });
@@ -395,6 +407,9 @@ export class WorkspaceRegistry extends Registry {
     this.on('setSharingPolicy', async (msg: AbjectMessage) => {
       this.denyRemoteWrite(msg, 'setSharingPolicy');
       const { objectId, policy } = msg.payload as { objectId: AbjectId; policy: SharingPolicy };
+      const target = this.lookupObject(objectId);
+      if (target) await this.requireEntryWriter(msg, target, 'setSharingPolicy');
+      else await this.requireRegistryAuthority(msg, 'setSharingPolicy');
       return this.setSharingPolicy(objectId, policy);
     });
 
@@ -408,8 +423,17 @@ export class WorkspaceRegistry extends Registry {
   /**
    * Set the fallback registry (typically the global Registry).
    */
-  setFallback(globalRegistryId: AbjectId): void {
+  /**
+   * Point this registry at its fallback (the global registry, or an
+   * Organism's parent registry) and follow that registry's catalog: a
+   * subscription and a first read, once this registry is on the bus (before
+   * that, onInit does both). Called directly by whoever made this registry;
+   * by message, from built-in objects only (setFallback).
+   */
+  async setFallback(globalRegistryId: AbjectId): Promise<void> {
     this.fallbackRegistryId = globalRegistryId;
+    this.subscribeToFallback();
+    if (this.fallbackSubscribedTo === globalRegistryId) await this.refreshGlobalCatalog();
   }
 
   protected override async onInit(): Promise<void> {
@@ -828,6 +852,26 @@ export class WorkspaceRegistry extends Registry {
   }
 
   /** Factory, looked up once and cached. */
+  /**
+   * A write this registry forwards to its fallback: the fallback sees this
+   * registry (built-in) as the sender, so the caller's right to the entry is
+   * checked here first.
+   */
+  private async mayForward(
+    msg: AbjectMessage, objectId: AbjectId | undefined, method: string, newSource?: string,
+  ): Promise<boolean> {
+    if (await this.isRegistryAuthority(msg.routing.from)) return true;
+    require(typeof objectId === 'string' && objectId.length > 0,
+      `Registry '${method}' through a workspace registry names the entry by objectId`);
+    const target = await this.request<ObjectRegistration | null>(
+      request(this.id, this.fallbackRegistryId!, 'lookup', { objectId }), 10_000).catch(() => null);
+    // No entry yet (an object publishing before the Factory registered it):
+    // nothing to write, as before. Callers retry.
+    if (!target) return false;
+    await this.requireEntryWriter(msg, target, method, newSource);
+    return true;
+  }
+
   private _factoryId?: AbjectId;
 
   private async resolveFactory(): Promise<AbjectId | null> {

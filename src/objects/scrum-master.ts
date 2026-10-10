@@ -596,9 +596,8 @@ export class ScrumMaster extends Abject {
     // running, nothing queued, no task left to run. A review scrum is the
     // only thing that can decide what happens next.
     this.on('goalStalled', async (msg: AbjectMessage) => {
-      const identity = await this.resolveCallerIdentity(msg.routing.from);
-      const typeSegments = identity?.typeId ? String(identity.typeId).split('/').length : 0;
-      precondition(identity?.name === 'GoalObserver' && typeSegments <= 3, 'ScrumMaster takes goalStalled from GoalObserver only');
+      precondition(await this.isBuiltInCaller(msg.routing.from, ['GoalObserver']),
+        'ScrumMaster takes goalStalled from GoalObserver only');
       const { goalId, reason } = msg.payload as { goalId: string; reason?: string };
       requireNonEmpty(goalId, 'goalId');
       if (this.scrumActiveFor(goalId)) return { started: false, coming: true, reason: 'A scrum for this goal is already coming' };

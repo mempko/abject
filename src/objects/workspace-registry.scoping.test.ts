@@ -86,7 +86,7 @@ async function harness(): Promise<Harness> {
   // Wire the fallback through the MESSAGE handler, exactly as WorkspaceManager
   // does in production: the direct setFallback() setter only records the id and
   // never subscribes, so the 'changed'-event refresh would never arm.
-  await localCaller.ask(wsReg.id, 'setFallback', { registryId: globalReg.id });
+  await wsReg.setFallback(globalReg.id); // the registry's maker wires it (by message, only built-ins may)
 
   const exposed = new Fixture('PublicNotes');
   await exposed.init(bus);

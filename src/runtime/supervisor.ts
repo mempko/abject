@@ -144,13 +144,25 @@ export class Supervisor extends Abject {
     this.setupHandlers();
   }
 
+  /**
+   * Supervision decides what restarts and stops, so it is taken from built-in
+   * objects only (src/core/built-in.ts): the bootstrap, the Factory,
+   * HealthMonitor, worker recovery.
+   */
+  private async requireBuiltInCaller(msg: AbjectMessage, method: string): Promise<void> {
+    contractRequire(await this.isBuiltInCaller(msg.routing.from),
+      `Supervisor '${method}' is taken from built-in objects only`);
+  }
+
   private setupHandlers(): void {
     this.on('addChild', async (msg: AbjectMessage) => {
+      await this.requireBuiltInCaller(msg, 'addChild');
       const spec = msg.payload as ChildSpec;
       return this.addChild(spec);
     });
 
     this.on('removeChild', async (msg: AbjectMessage) => {
+      await this.requireBuiltInCaller(msg, 'removeChild');
       const { childId } = msg.payload as { childId: AbjectId };
       return this.removeChild(childId);
     });
@@ -160,6 +172,7 @@ export class Supervisor extends Abject {
     });
 
     this.on('childFailed', async (msg: AbjectMessage) => {
+      await this.requireBuiltInCaller(msg, 'childFailed');
       const { childId, error } = msg.payload as {
         childId: AbjectId;
         error: AbjectError;
@@ -387,6 +400,10 @@ export class Supervisor extends Abject {
 
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Supervisor Usage Guide
+
+addChild, removeChild and childFailed are taken from built-in objects only
+(the bootstrap, the Factory, HealthMonitor, worker recovery); getChildren is
+open to everyone.
 
 ### Add a supervised child
 

@@ -228,7 +228,7 @@ export class Organism extends Abject {
     // Configure fallback: organism registry --> workspace registry
     const parentRegistryId = await this.resolveRegistryId();
     if (parentRegistryId) {
-      registry.setFallback(parentRegistryId);
+      await registry.setFallback(parentRegistryId);
     }
 
     // Register the registry with itself so organelles can discover "Registry"

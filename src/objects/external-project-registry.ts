@@ -605,13 +605,9 @@ with the files each has written so far; agents report through \`taskStarted\`,
    * not the same as knowing it is the user.
    */
   private async isTrustAuthority(callerId: AbjectId): Promise<boolean> {
-    const identity = await this.resolveCallerIdentity(callerId);
-    if (!identity?.typeId) return false;
-    const segments = String(identity.typeId).split('/');
-    const last = segments[segments.length - 1];
-    // `{peer}/{workspace}/{Name}` is a built-in. Anything longer is namespaced
-    // (`.../user/Name`) and is not one, whatever it calls itself.
-    return segments.length === 3 && TRUST_AUTHORITIES.includes(last);
+    // Built-in objects only (src/core/built-in.ts), under one of these names:
+    // a user object calling itself one of them runs code, so it is not one.
+    return this.isBuiltInCaller(callerId, TRUST_AUTHORITIES);
   }
 
   // ═══════════════════════════════════════════════════════════════════

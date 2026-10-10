@@ -34,6 +34,7 @@
  * WebExposure (admitControl, admitExposer).
  */
 
+import { isBuiltInRegistration } from '../core/built-in.js';
 import * as http from 'http';
 import * as crypto from 'crypto';
 import { AbjectId, AbjectMessage, InterfaceId, AbjectManifest, MethodDeclaration } from '../core/types.js';
@@ -59,14 +60,6 @@ const CONTROLLERS: readonly string[] = ['WebGatewayBrowser', 'PeerNetwork'];
 /** The per-workspace object that reports what its workspace exposes. */
 const EXPOSER = 'WebExposure';
 
-/**
- * A built-in object's typeId: `{peer}/system/{Name}` or
- * `{peer}/{workspace}/{Name}`. A user object carries
- * `{peer}/{workspace}/user/{Name}`, so it cannot pass for a built-in by name.
- */
-function builtinTypeId(typeId: string | undefined): boolean {
-  return !typeId || String(typeId).split('/').length <= 3;
-}
 
 const ENABLED_KEY = 'web-gateway:enabled';
 const TOKENS_KEY = 'web-gateway:tokens';
@@ -322,8 +315,8 @@ export class WebGateway extends Abject {
   /**
    * Turning the listener on or off, moving its port, and minting or revoking
    * API tokens are taken from the gateway's window and the Peer Network
-   * window (system objects, so a user object of the same name, which carries
-   * a `user/` typeId, is refused), and from abjects in a LOCAL workspace this
+   * window (the built-in objects, src/core/built-in.ts: a user object of the
+   * same name runs code and is refused), and from abjects in a LOCAL workspace this
    * peer hosts: the person made that workspace and everything in it, and on
    * the headless edition such an abject is how the gateway is driven. Shared
    * and public workspaces are refused, as are joined mirrors of remote
@@ -331,8 +324,8 @@ export class WebGateway extends Abject {
    */
   private async admitControl(msg: AbjectMessage): Promise<void> {
     const caller = msg.routing.from;
+    if (await this.isBuiltInCaller(caller, CONTROLLERS)) return;
     const identity = await this.resolveCallerIdentity(caller);
-    if (identity && CONTROLLERS.includes(identity.name) && builtinTypeId(identity.typeId)) return;
     if (identity && (await this.callerInLocalWorkspace(caller))) return;
     require(false, `WebGateway takes this request from ${CONTROLLERS.join(' or ')}, or an abject in a local workspace, only`);
   }
@@ -367,15 +360,15 @@ export class WebGateway extends Abject {
   /**
    * A workspace's exposure is taken from that workspace's own WebExposure
    * only. The caller must be one of the workspace's objects by
-   * WorkspaceManager's count, and registered in the workspace's registry
-   * under that name with a built-in typeId (a user object's carries `user/`).
+   * WorkspaceManager's count, and the built-in WebExposure registered in the
+   * workspace's registry with that workspace's typeId.
    * So no other object can publish routes, and no WebExposure can speak for
    * another workspace or point the gateway at a registry of its own making:
    * the registry routed through is WorkspaceManager's, never the payload's.
    */
   private async admitExposer(msg: AbjectMessage, ws: ListedWorkspace): Promise<void> {
     const caller = msg.routing.from;
-    type Registration = { name?: string; typeId?: string; manifest?: { name?: string } } | null;
+    type Registration = { name?: string; typeId?: string; source?: string; owner?: string; ownerPeerId?: string; manifest?: { name?: string } } | null;
     let reg: Registration = null;
     if (ws.childIds.includes(caller)) {
       try {
@@ -384,7 +377,7 @@ export class WebGateway extends Abject {
     }
     const name = reg?.name ?? reg?.manifest?.name;
     const typeId = reg?.typeId ? String(reg.typeId) : undefined;
-    require(name === EXPOSER && builtinTypeId(typeId) && (!typeId || typeId.split('/')[1] === ws.workspaceId),
+    require(name === EXPOSER && isBuiltInRegistration(reg) && (!typeId || typeId.split('/')[1] === ws.workspaceId),
       `WebGateway takes the exposure of workspace ${ws.workspaceId} from that workspace's ${EXPOSER} only`);
   }
 

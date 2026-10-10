@@ -10,6 +10,7 @@
  * window, a widget or the display server, so the headless bundle carries none.
  */
 
+import { BOOTSTRAP_SENDER_ID } from '../src/core/built-in.js';
 import { AgentEvaluation } from '../src/objects/agent-evaluation.js';
 import { TaskSession } from '../src/objects/task-session.js';
 import { AbjectId, TypeId, AbjectMessage, SpawnResult } from '../src/core/types.js';
@@ -287,7 +288,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
   const bus = runtime.messageBus;
   const factoryId = runtime.objectFactory.id;
   const registryId = runtime.objectRegistry.id;
-  const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
+  const BOOTSTRAP_ID = BOOTSTRAP_SENDER_ID as AbjectId;
 
   // Register a temporary bootstrap sender on the bus for request-reply.
   // Replies arrive via the mailbox (same path as all other messages).

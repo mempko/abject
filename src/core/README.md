@@ -50,8 +50,15 @@ and a handler dictionary, no subclass needed).
 `typeId` is the durable, scoped identity set before init with `setTypeId()`:
 `{peerId}/system/{Name}` for system objects, `{peerId}/{workspaceId}/{Name}`
 for workspace built-ins, `{peerId}/{workspaceId}/user/{Name}` for user
-objects. Gate privileges on `typeId` (see `resolveCallerIdentity()`), never on
-a name from a payload.
+objects.
+
+**Trust.** Privileged handlers admit callers with `isBuiltInCaller(id,
+names?)`: the caller's registration says it is an instance of a class
+compiled into the server (no `source`, no package owner, not a remote peer's;
+`built-in.ts`), registered under one of `names`. A name alone, or a name from
+a payload, proves nothing. Built-in cannot be claimed: the Factory builds a
+server class only for a built-in requester, and the registries take writes
+to another object's entry only from built-in senders.
 
 **Manifest.** `AbjectManifest` has a single `interface: InterfaceDeclaration`
 (not an array). The constructor merges `INTROSPECT_METHODS` and
@@ -127,7 +134,9 @@ NotificationCenter, a no-op when absent); `fetchTheme()` plus automatic
 the workspace Console (never throws); `setTimer()`, `setRecurringTimer()`,
 `cancelTimer()` (timers that `stop()` cancels, preferred over raw
 `setTimeout` for anything that sends); `resolveCallerName()` /
-`resolveCallerIdentity()` (who sent this, from the Registry);
+`resolveCallerIdentity()` (who sent this, from the Registry: name, typeId,
+`builtIn`) and `isBuiltInCaller()` (the admission check privileged handlers
+make);
 `capabilityCaller()` and `requireTaskRuntime()` (recover the real caller
 behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`.
 
@@ -146,6 +155,11 @@ behind JobManager or AgentAbject); `retainTaskResult()` / `takeTaskResult()`.
   registry types (`ObjectRegistration`, `ObjectSummary`, `DiscoveryQuery`),
   and `SpawnRequest` / `SpawnResult`. WASM ABI types live in
   `src/sandbox/wasm-abi.ts`.
+- **built-in.ts**: which objects the system trusts. `isBuiltInRegistration()`
+  (a registration with no source, no package owner, no remote peer: an
+  instance of a server class) and `BOOTSTRAP_SENDER_ID`, the sender the
+  bootstrap uses. Used by `Abject.isBuiltInCaller()`, the Factory and the
+  registries.
 - **contracts.ts**: `require`, `ensure`, `invariant`, `requireDefined`
   (returns the narrowed value), `requireNonEmpty`, `requireNonEmptyArray`,
   `requirePositive`, `requireNonNegative`. Each throws `ContractViolation`
