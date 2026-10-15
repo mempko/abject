@@ -92,6 +92,18 @@ const MIN_INTERVAL_MS = 10;
 const MAX_TIMER_MS = 2_147_483_647;
 const BOOT_MS = 1000;
 
+/** Globals removed from the sandbox realm so callbacks and shared memory stay out. */
+export const SANDBOX_REMOVED_GLOBALS: readonly string[] = [
+  'FinalizationRegistry', 'WeakRef', 'Atomics', 'SharedArrayBuffer', 'WebAssembly',
+];
+
+/** Keys on the handler `this` target that user handler code must not overwrite.
+ *  Shared with protocol/sandbox-invoker so replay builds the same receiver shape. */
+export const HANDLER_PROXY_BUILTINS: readonly string[] = [
+  'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
+  'data', 'saveData', 'ensure', 'invariant',
+];
+
 // ── The codec, host side ────────────────────────────────────────────────
 
 const TAG = '\u0000abj';
