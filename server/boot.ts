@@ -23,6 +23,7 @@ import { ProxyGenerator } from '../src/objects/proxy-generator.js';
 import { Negotiator } from '../src/protocol/negotiator.js';
 import { HealthMonitor } from '../src/protocol/health-monitor.js';
 import { CassetteRecorder } from '../src/objects/cassette-recorder.js';
+import { FitnessJudge } from '../src/objects/fitness-judge.js';
 import { HttpClient } from '../src/objects/capabilities/http-client.js';
 import { NodeStorage } from './node-storage.js';
 import { Timer } from '../src/objects/capabilities/timer.js';
@@ -460,6 +461,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
   runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
   runtime.objectFactory.registerConstructor('CassetteRecorder', () => new CassetteRecorder());
+  runtime.objectFactory.registerConstructor('FitnessJudge', () => new FitnessJudge());
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
   runtime.objectFactory.registerConstructor('NotificationCenter', () => new NotificationCenter());
   runtime.objectFactory.registerConstructor('ObjectCatalog', () => new ObjectCatalog());
@@ -544,7 +546,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
       'SettingsManager', 'PermissionBroker', 'DialogBroker',
       'ObjectCatalog',
       // Negotiator stays on the main thread: it installs proxy routes on the main bus.
-      'ProxyGenerator', 'HealthMonitor', 'CassetteRecorder',
+      'ProxyGenerator', 'HealthMonitor', 'CassetteRecorder', 'FitnessJudge',
       'SkillRegistry',
       'MCPRegistryClient', 'ClawHubClient',
       'SecretsVault', 'OAuthHelper', 'Packages',
@@ -860,6 +862,7 @@ export async function bootServer(options: BootOptions): Promise<void> {
   // judging generated objects — mempko/abject#11 series). HttpClient finds
   // it through the registry and sends exchanges to it directly.
   await supervisedSpawn('CassetteRecorder', 'permanent', systemTypeId('CassetteRecorder'));
+  await supervisedSpawn('FitnessJudge', 'permanent', systemTypeId('FitnessJudge'));
 
   if (ui) await ui.spawnGlobalUi(ctx);
 

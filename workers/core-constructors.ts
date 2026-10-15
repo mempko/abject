@@ -19,6 +19,7 @@ import { ProxyGenerator } from '../src/objects/proxy-generator.js';
 import { Negotiator } from '../src/protocol/negotiator.js';
 import { HealthMonitor } from '../src/protocol/health-monitor.js';
 import { CassetteRecorder } from '../src/objects/cassette-recorder.js';
+import { FitnessJudge } from '../src/objects/fitness-judge.js';
 import { HttpClient } from '../src/objects/capabilities/http-client.js';
 import { Timer } from '../src/objects/capabilities/timer.js';
 import { Clipboard } from '../src/objects/capabilities/clipboard.js';
@@ -105,6 +106,7 @@ export function coreConstructors(): Map<string, ObjectFactory> {
   map.set('Negotiator', () => new Negotiator());
   map.set('HealthMonitor', () => new HealthMonitor());
   map.set('CassetteRecorder', () => new CassetteRecorder());
+  map.set('FitnessJudge', () => new FitnessJudge());
   map.set('ObjectCreator', () => new ObjectCreator());
   map.set('NotificationCenter', () => new NotificationCenter());
   map.set('ObjectCatalog', () => new ObjectCatalog());
