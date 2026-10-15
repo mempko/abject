@@ -118,9 +118,11 @@ The replay kernel behind `FitnessJudge` (`objects/fitness-judge.ts`): a draft
 source for a user object is run against what the live object was recorded
 doing (`objects/cassette-recorder.ts`) in a fresh `DONT_CONTEXTIFY` vm context
 inside a worker thread (`sandbox-invoker.ts`), with every outbound `call()`
-answered from the recording or refused, and only a contradiction of a
-recording the live source itself reproduces fails the verdict (`fitness.ts`).
-Values are compared as canonical, redacted JSON text (`canonical.ts`).
+answered from the recording (by registered name, or by id when the invocation
+was handed that id in its arguments or an earlier reply) or refused, and only
+a contradiction of a recording the live source itself reproduces fails the
+verdict (`fitness.ts`). Values are compared as canonical, redacted JSON text
+(`canonical.ts`).
 
 ## Using it
 

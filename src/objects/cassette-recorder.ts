@@ -28,9 +28,9 @@
  * Caller attribution comes from `resolveCallerIdentity`, which resolves an
  * id against the registry rather than trusting anything in the payload.
  * Recordings whose caller has no durable typeId, or whose outbound calls
- * name an object the registry cannot identify, are not kept: evidence that
- * cannot be tied to a type, or replayed against a name, is evidence about
- * nothing.
+ * address an object that is neither registered nor an id the invocation was
+ * handed, are not kept: evidence that cannot be tied to a type, or replayed
+ * against the target it addressed, is evidence about nothing.
  *
  * Failure independence: recording proceeds in memory while Storage is
  * missing, with persistence catching up - and merging what the store already
@@ -78,8 +78,9 @@ export interface Cassette {
 
 /** What Storage holds under `invocations:<typeId>`: one handler invocation
  *  as emitted (see InvocationEvent), with each outbound call's live target
- *  id replaced by the registered NAME the registry gave for it - the shape
- *  `protocol/fitness.ts` replays. */
+ *  id replaced by the registered NAME the registry gave for it, unless the
+ *  invocation was handed that id (in its arguments or an earlier reply), in
+ *  which case it stays the id - the shape `protocol/fitness.ts` replays. */
 export interface InvocationCassette {
   method: string;
   argsText: string;
@@ -210,12 +211,19 @@ export class CassetteRecorder extends Abject {
     if ((ev.calls ?? []).some(c => c.replyText === undefined && c.errorText === undefined)) return;
     const typeId = await this.userTypeIdOf(from);
     if (!typeId) return;
-    // Each outbound target becomes the name the registry knows it by. Replay
-    // keys on that name; a target nobody can identify makes the recording
-    // unreplayable, so it is dropped rather than kept as a half-truth.
+    // Each outbound target is keyed the way a replay will address it. An id
+    // the handler was handed in its arguments or got back from an earlier
+    // call (a window from createWindowAbject, a widget, a spawned child)
+    // reaches the replay the same way, from the same recorded text, so it is
+    // kept as that id. Any other target becomes the name the registry knows
+    // it by, since dep()/find() resolve a name. A target that is neither makes
+    // the recording unreplayable, so it is dropped rather than kept as a
+    // half-truth.
     const calls: InvocationCassette['calls'] = [];
     for (const c of ev.calls ?? []) {
-      const target = (await this.resolveCallerIdentity(c.targetId))?.name;
+      const handed = ev.argsText.includes(c.targetId)
+        || calls.some(prev => prev.replyText?.includes(c.targetId));
+      const target = handed ? c.targetId : (await this.resolveCallerIdentity(c.targetId))?.name;
       if (!target) {
         log.info(`invocation of ${typeId}.${ev.method} dropped: outbound target ${c.targetId} is not registered`);
         return;
