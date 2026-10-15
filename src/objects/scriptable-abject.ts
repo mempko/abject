@@ -30,7 +30,7 @@ import { Abject } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
-import { Sandbox, SandboxSourceError, type SandboxOutcome } from '../core/sandbox.js';
+import { Sandbox, SandboxSourceError, HANDLER_PROXY_BUILTINS, type SandboxOutcome } from '../core/sandbox.js';
 import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 import { bytesToHex } from '../core/encoding.js';
@@ -1118,10 +1118,7 @@ export class ScriptableAbject extends Abject {
   static readonly INHERITED_HANDLERS = new Set(['ask', 'describe', 'undo', 'redo', 'getUndoState']);
 
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
-  private static readonly PROXY_BUILTINS = new Set([
-    'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
-    'data', 'saveData', 'ensure', 'invariant',
-  ]);
+  private static readonly PROXY_BUILTINS = new Set<string>(HANDLER_PROXY_BUILTINS);
 
   /** Longest a handler, or a timer callback, may run without pausing. */
   private static readonly HANDLER_SLICE_MS = 1000;
