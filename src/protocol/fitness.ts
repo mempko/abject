@@ -29,13 +29,13 @@
  *   nothing here can compare them.
  * - A handler whose result depends on `this.data` cannot be reproduced by the
  *   control run (the harness's `data` is empty), so it is excluded, not judged.
- * - A handler that calls an object by an id it got from a reply or its
- *   arguments (a window from createWindowAbject, a widget, a spawned child),
- *   or calls any object the registry cannot name, is not judged yet. The
- *   recorder drops an invocation whose outbound target it cannot name, and
- *   the harness keys a call by the value the handler addressed, which for such
- *   an id is the id, not the name it was recorded under. A draft of a typical
- *   UI object therefore deploys `unverified`.
+ * - A handler that calls an object by an id it kept from an EARLIER
+ *   invocation (a window id stored on `this` in show(), used by a later
+ *   handler), or calls an object the registry cannot name and the invocation
+ *   was not handed, is not judged: the recorder drops that invocation. Ids
+ *   the same invocation got from a reply or its arguments (a window from
+ *   createWindowAbject, a widget, a spawned child) are recorded as ids and
+ *   replayed.
  *
  * Recorded values are stored REDACTED (secret-named fields scrubbed at record
  * time). The candidate's values are raw, so both sides get the identical
@@ -62,7 +62,10 @@ function redactedCanonical(text: string): string {
 
 /** One outbound `call()` a handler made while it ran, as recorded. `target`
  *  is the registered NAME of the object addressed (the recorder resolves
- *  the live id it saw to that name, because ids die with their object). */
+ *  the live id it saw to that name, because ids die with their object), or,
+ *  for an id the invocation was handed in its arguments or an earlier reply,
+ *  that id: the replay hands the candidate the same text, so it addresses
+ *  the same id. */
 export interface RecordedCall {
   target: string;
   method: string;
