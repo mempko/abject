@@ -332,6 +332,10 @@ notices show `shown(text, isPrivate)`, which is `[private]` for private text.
   `summary()` for step profiling.
 - **format.ts**: `safeStringify(value, maxLen?)`, which never throws and never
   returns `undefined`.
+- **redaction.ts**: credential scrubbing (`SECRET_NAME_STEM`, `redactUrl`,
+  `redactHeaders`, `redactBodyText`) shared by HttpClient and ScriptableAbject
+  so recorded HTTP exchanges and handler invocations apply the same rules
+  before evidence leaves the caller.
 
 ### Host files, shell and sandboxed code
 

@@ -35,6 +35,8 @@ import { isPackageOwner, packageNameOf } from '../core/packages.js';
 import { Log } from '../core/timed-log.js';
 import { bytesToHex } from '../core/encoding.js';
 import { UndoHistory, UndoRefused, sameValue, undoMethods, type UndoAction, type UndoResult } from '../core/undo.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { redactBodyText } from '../core/redaction.js';
 
 const log = new Log('ScriptableAbject');
 
@@ -160,6 +162,41 @@ export function mergeScriptableManifest(manifest: AbjectManifest): AbjectManifes
  * An Abject whose handlers are compiled from a JavaScript source string.
  * Supports live editing: new source can be applied at runtime without restarting.
  */
+/** What the CassetteRecorder receives per completed handler invocation
+ *  (event `invocation`, sent to that one object only, never broadcast).
+ *  Every text field is redacted and capped before it leaves; nothing on this
+ *  path is parsed back. `calls` are the outbound `call()`s the handler made
+ *  while it ran, keyed by the live id the code addressed -- the recorder
+ *  resolves those to durable names, because an id dies with its object. */
+export interface InvocationEvent {
+  /** The sender's own id, informational only: the recorder attributes the row
+   *  to the bus's `routing.from`, never to this field. */
+  caller: AbjectId;
+  method: string;
+  argsText: string;
+  calls: Array<{ targetId: AbjectId; method: string; payloadText: string; replyText?: string; errorText?: string }>;
+  resultText?: string;
+  errorText?: string;
+  /** Some text hit the cap, or a value JSON could not carry: the recording cannot be replayed faithfully. */
+  truncated?: boolean;
+  durationMs: number;
+  at: number;
+}
+
+const INVOCATION_TEXT_CAP = 64 * 1024; // characters, same cap as an HTTP exchange body
+/** Outbound calls kept per invocation; past this the recording is marked truncated. */
+const INVOCATION_CALL_CAP = 100;
+/** How long a failed recorder discovery is trusted before asking the registry again. */
+const RECORDER_RETRY_MS = 1000;
+
+/** The outbound calls of ONE in-flight invocation. Async-local, so two
+ *  handlers interleaving on the same object each collect only their own. */
+interface InvocationTrace {
+  calls: InvocationEvent['calls'];
+  truncated: boolean;
+  closed?: boolean;
+}
+
 export class ScriptableAbject extends Abject {
   private _source: string;
   private _owner: AbjectId;
@@ -184,6 +221,12 @@ export class ScriptableAbject extends Abject {
   private _pendingSave?: { promise: Promise<void>; resolve: () => void; reject: (err: unknown) => void };
   private _lastSaveStart = 0;
   private _storeId?: AbjectId;
+  /** The one recipient of `invocation` events, found through the registry.
+   *  Resolved lazily and dropped on recipientGone, like HttpClient's. */
+  private recorderId?: AbjectId;
+  private nextRecorderResolveAt = 0;
+  private recorderResolve?: Promise<void>;
+  private static readonly trace = new AsyncLocalStorage<InvocationTrace | undefined>();
   /**
    * Set for a package abject spawned at system scope: its registry has no
    * AbjectStore, so its data is kept by the Packages service instead.
@@ -407,25 +450,134 @@ export class ScriptableAbject extends Abject {
     this.activeUserCalls++;
     const method = msg.routing.method;
     const lifecycle = method === 'show' || method === 'hide';
+    // Recording is decided before the handler runs, on the cached recorder id
+    // only: this path must stay synchronous for UI handlers, so a recorder
+    // not yet discovered means this invocation is not recorded and the lookup
+    // is kicked off for the next one. Requests only -- events delivered to a
+    // handler have no reply to compare against.
+    const recorderId = msg.header.type === 'request' ? this.recorderId : undefined;
+    if (!recorderId && msg.header.type === 'request') void this.resolveRecorder();
+    const trace: InvocationTrace | undefined = recorderId ? { calls: [], truncated: false } : undefined;
+    const started = Date.now();
     let outcome: SandboxOutcome;
     try {
-      outcome = this.sandbox.invoke(name, [msg]);
+      outcome = ScriptableAbject.trace.run(trace, () => this.sandbox.invoke(name, [msg]));
     } catch (err) {
       this.activeUserCalls--;
+      if (trace) this.recordInvocation(recorderId!, name, msg, trace, started, { error: err });
       throw err;
     }
     if (!outcome.sync) {
-      return outcome.promise.then((value) => {
-        if (lifecycle) this._showing = method === 'show';
-        return value;
-      }).finally(() => { this.activeUserCalls--; });
+      return outcome.promise.then(
+        (value) => {
+          if (lifecycle) this._showing = method === 'show';
+          if (trace) this.recordInvocation(recorderId!, name, msg, trace, started, { value });
+          return value;
+        },
+        (err) => {
+          if (trace) this.recordInvocation(recorderId!, name, msg, trace, started, { error: err });
+          throw err;
+        },
+      ).finally(() => { this.activeUserCalls--; });
     }
     if (lifecycle) this._showing = method === 'show';
     this.activeUserCalls--;
+    if (trace) this.recordInvocation(recorderId!, name, msg, trace, started, { value: outcome.value });
     return outcome.value;
   }
 
+  // ── Invocation recording ──────────────────────────────────────────────
+  //
+  // The evidence half the traffic recorder (HttpClient's `httpExchange`)
+  // cannot supply: which handler ran, with what, what it asked of other
+  // objects, and what it returned. The judge (FitnessJudge) replays these
+  // against a redrafted source. Same seam shape as HttpClient's: the
+  // recorder is found through the registry and addressed directly, never
+  // broadcast; the event is data, redacted and capped before it leaves; with
+  // no recorder discoverable nothing is built and nothing is sent.
+
+  /** The proxy's `call()`: a request that, inside a recorded invocation, notes
+   *  what was asked and what came back. Outside one it is `request`. */
+  private async tracedRequest<T>(message: AbjectMessage, timeoutMs?: number): Promise<T> {
+    const trace = ScriptableAbject.trace.getStore();
+    if (!trace || trace.closed) return this.request<T>(message, timeoutMs);
+    if (trace.calls.length >= INVOCATION_CALL_CAP) {
+      trace.truncated = true;
+      return this.request<T>(message, timeoutMs);
+    }
+    const [payloadText, payloadCut] = capText(message.payload);
+    const entry: InvocationEvent['calls'][number] = { targetId: message.routing.to, method: message.routing.method ?? '', payloadText: payloadText ?? '' };
+    if (payloadCut) trace.truncated = true;
+    trace.calls.push(entry);
+    try {
+      const reply = await this.request<T>(message, timeoutMs);
+      if (!trace.closed) {
+        const [replyText, replyCut] = capText(reply);
+        if (replyCut) trace.truncated = true;
+        if (replyText !== undefined) entry.replyText = replyText;
+      }
+      return reply;
+    } catch (err) {
+      if (!trace.closed) {
+        const [errorText, errorCut] = capError(err);
+        entry.errorText = errorText;
+        if (errorCut) trace.truncated = true;
+      }
+      throw err;
+    }
+  }
+
+  private recordInvocation(recorderId: AbjectId, method: string, msg: AbjectMessage, trace: InvocationTrace,
+                           started: number, outcome: { value?: unknown; error?: unknown }): void {
+    trace.closed = true;
+    try {
+      const [argsText, argsCut] = capText(msg.payload);
+      const ev: InvocationEvent = {
+        caller: this.id, method, argsText: argsText ?? '', calls: trace.calls.map(c => ({ ...c })),
+        durationMs: Date.now() - started, at: Date.now(),
+      };
+      if ('error' in outcome) {
+        ev.errorText = capError(outcome.error)[0];
+      } else {
+        const [resultText, resultCut] = capText(outcome.value);
+        if (resultText === undefined || resultCut) trace.truncated = true;
+        if (resultText !== undefined) ev.resultText = resultText;
+      }
+      if (trace.truncated || argsCut) ev.truncated = true;
+      this.send(event(this.id, recorderId, 'invocation', ev));
+    } catch (err) {
+      log.warn(`invocation recording failed for '${this.manifest.name}':`, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async resolveRecorder(): Promise<AbjectId | undefined> {
+    if (this.recorderId) return this.recorderId;
+    if (Date.now() < this.nextRecorderResolveAt) return undefined;
+    this.recorderResolve ??= (async () => {
+      try {
+        this.recorderId = await this.discoverDep('CassetteRecorder') ?? undefined;
+      } catch {
+        this.recorderId = undefined;
+      } finally {
+        if (!this.recorderId) this.nextRecorderResolveAt = Date.now() + RECORDER_RETRY_MS;
+        this.recorderResolve = undefined;
+      }
+    })();
+    await this.recorderResolve;
+    return this.recorderId;
+  }
+
   private setupEditableHandlers(): void {
+    // The bus sends this when an `invocation` event bounced off a dead
+    // recorder; forget the id so the next invocation re-resolves.
+    this.on('recipientGone', (msg: AbjectMessage) => {
+      const { recipient } = msg.payload as { recipient?: AbjectId };
+      if (recipient && recipient === this.recorderId) {
+        this.recorderId = undefined;
+        this.nextRecorderResolveAt = 0;
+      }
+      return true;
+    });
     this.on('persistSnapshot', async msg => withKeyedLock(`${this.id}:source-activation`, async () => {
       const { expectedSource } = msg.payload as { expectedSource?: string };
       if (expectedSource !== undefined && expectedSource !== this._source) return { success: false, conflict: true, error: 'Source changed before persistence' };
@@ -787,7 +939,7 @@ export class ScriptableAbject extends Abject {
       const actualMethod = payload as unknown as string;
       const actualPayload = options;
       const resolvedTo = await to;
-      return this.request<T>(
+      return this.tracedRequest<T>(
         request(this.id, resolvedTo as AbjectId, actualMethod, actualPayload)
       );
     }
@@ -795,7 +947,7 @@ export class ScriptableAbject extends Abject {
     const timeoutMs = (options && typeof options === 'object' && 'timeout' in options)
       ? (options as { timeout?: number }).timeout
       : undefined;
-    return this.request<T>(
+    return this.tracedRequest<T>(
       request(this.id, resolvedTo as AbjectId, method, payload ?? {}),
       timeoutMs,
     );
@@ -857,6 +1009,8 @@ export class ScriptableAbject extends Abject {
     'getSource', 'getData', 'updateSource', 'persistSnapshot', 'probe',
     'getRegistry',
     'ping', 'addDependent', 'removeDependent', 'freeMemory',
+    // Internal: re-resolves the invocation recorder after it went away.
+    'recipientGone',
   ]);
 
   /**
@@ -1311,4 +1465,24 @@ interface ApplyResult {
   errorLine?: number;
   manifestMethodsAdded?: string[];
   manifestMethodsRemoved?: string[];
+}
+
+/** JSON text of a value, secrets scrubbed by field name, cut at the cap.
+ *  `undefined` when JSON cannot carry the value (a function, a symbol, a
+ *  cycle): that recording is then marked truncated, never guessed at. */
+function capText(value: unknown): [string | undefined, boolean] {
+  let text: string | undefined;
+  try { text = JSON.stringify(value === undefined ? null : value); } catch { return [undefined, true]; }
+  if (text === undefined) return [undefined, true];
+  const scrubbed = redactBodyText(text);
+  const truncated = scrubbed.length > INVOCATION_TEXT_CAP;
+  return [truncated ? scrubbed.slice(0, INVOCATION_TEXT_CAP) : scrubbed, truncated];
+}
+
+/** An error's message, scrubbed and capped like the other recorded text. The
+ *  scrub is by field name, so it catches a `"token":"…"` echoed in the
+ *  message, not a secret in free prose: error text is stored as it reads. */
+function capError(err: unknown): [string, boolean] {
+  const text = redactBodyText(err instanceof Error ? err.message : String(err));
+  return text.length > INVOCATION_TEXT_CAP ? [text.slice(0, INVOCATION_TEXT_CAP), true] : [text, false];
 }
