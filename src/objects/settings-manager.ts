@@ -932,7 +932,14 @@ export class SettingsManager extends Abject {
     }
     for (const key of AUX_ROW_KEYS) {
       const provider = await this.fetch<string>(AUX_ROWS[key].storageProvider);
-      const model = await this.fetch<string>(AUX_ROWS[key].storageModel);
+      let model = await this.fetch<string>(AUX_ROWS[key].storageModel);
+      // Aux rows pin a model the same way tier rows do, so they take the same migrations.
+      const migrated = provider && model ? this.providerDescById.get(provider)?.modelMigrations?.[model] : undefined;
+      if (migrated && migrated !== model) {
+        log.info(`Migrated ${provider} ${key} row model "${model}" → "${migrated}"`);
+        model = migrated;
+        await this.store('set', AUX_ROWS[key].storageModel, migrated);
+      }
       this.aux[key] = provider && model ? { provider, model } : null;
     }
     const gates = await this.fetch<string>(STORAGE_KEY_DECISION_GATES);

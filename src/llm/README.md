@@ -214,7 +214,11 @@ Run with `pnpm test` (Node test runner over `src/llm/*.test.ts` among others).
 - **`anthropic.sampling.test.ts`**: `complete` and `stream` never send
   `temperature`, even when a caller's options still carry it.
 - **`antigravity-cli.test.ts`**: a stand-in `agy` that denies a tool; checks
-  `NativeToolAbandonedError` and the provenance it carries.
+  `NativeToolAbandonedError` and the provenance it carries. Also checks that
+  every model id the catalog ever shipped is either still listed or migrated
+  to a listed id. An opt-in tripwire (`AGY_LIVE=1 pnpm test`) runs the real
+  `agy models` and requires every catalog id, tier default and migration
+  target to be there.
 - **`execution-context.test.ts`**: Codex parsing and arguments, boundary
   enforcement, execution context and prompt guidance on real LLMObject calls.
 - **`peerllm.test.ts`**: PeerLLM description, model listing, request shape,

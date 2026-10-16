@@ -82,10 +82,10 @@ import {
 const AUTO_MODEL = 'auto';
 
 /**
- * Mirrors `agy models`. IDs carry the reasoning effort suffix where the CLI
- * requires one (bare names like `gemini-3.7-flash` are rejected without a
- * separate `--effort`, and pro/claude models reject `--effort` outright), so
- * passing the suffixed ID alone is the only form that works for every model.
+ * Mirrors `agy models` (agy 1.3.4). IDs carry the reasoning effort suffix.
+ * Older agy versions rejected bare names without a separate `--effort`, and
+ * rejected `--effort` outright for pro/claude models; agy 1.3.4 accepts both
+ * forms, but the suffixed ID alone is the one form every version accepts.
  *
  * vision is false throughout: agy rejects an image content block outright
  * (exit 1, result status ERROR), so image requests must be routed away from
@@ -93,16 +93,18 @@ const AUTO_MODEL = 'auto';
  */
 const AGY_MODELS = [
   { id: AUTO_MODEL,                 name: 'Auto (recommended)', vision: false },
-  { id: 'gemini-3.7-flash-high',    name: 'Gemini 3.7 Flash (High)', vision: false },
-  { id: 'gemini-3.7-flash-medium',  name: 'Gemini 3.7 Flash (Medium)', vision: false },
-  { id: 'gemini-3.7-flash-low',     name: 'Gemini 3.7 Flash (Low)', vision: false },
-  { id: 'gemini-3.6-flash-high',    name: 'Gemini 3.6 Flash (High)', vision: false },
-  { id: 'gemini-3.6-flash-medium',  name: 'Gemini 3.6 Flash (Medium)', vision: false },
-  { id: 'gemini-3.6-flash-low',     name: 'Gemini 3.6 Flash (Low)', vision: false },
-  { id: 'gemini-3.1-pro-high',      name: 'Gemini 3.1 Pro (High)', vision: false },
-  { id: 'gemini-3.1-pro-low',       name: 'Gemini 3.1 Pro (Low)', vision: false },
-  { id: 'claude-sonnet-4-6',        name: 'Claude Sonnet 4.6 (Thinking)', vision: false },
-  { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)', vision: false },
+  { id: 'gemini-4-argon-high',      name: 'Gemini 4 Argon (High)', vision: false },
+  { id: 'gemini-4-argon-medium',    name: 'Gemini 4 Argon (Medium)', vision: false },
+  { id: 'gemini-4-argon-low',       name: 'Gemini 4 Argon (Low)', vision: false },
+  { id: 'gemini-3.8-flash-high',    name: 'Gemini 3.8 Flash (High)', vision: false },
+  { id: 'gemini-3.8-flash-medium',  name: 'Gemini 3.8 Flash (Medium)', vision: false },
+  { id: 'gemini-3.8-flash-low',     name: 'Gemini 3.8 Flash (Low)', vision: false },
+  { id: 'claude-opus-5-5-high',     name: 'Claude Opus 5.5 (High)', vision: false },
+  { id: 'claude-opus-5-5-medium',   name: 'Claude Opus 5.5 (Medium)', vision: false },
+  { id: 'claude-opus-5-5-low',      name: 'Claude Opus 5.5 (Low)', vision: false },
+  { id: 'claude-sonnet-5-5-high',   name: 'Claude Sonnet 5.5 (High)', vision: false },
+  { id: 'claude-sonnet-5-5-medium', name: 'Claude Sonnet 5.5 (Medium)', vision: false },
+  { id: 'claude-sonnet-5-5-low',    name: 'Claude Sonnet 5.5 (Low)', vision: false },
   { id: 'gpt-oss-120b-medium',      name: 'GPT-OSS 120B (Medium)', vision: false },
 ] as const satisfies readonly ModelInfo[];
 
@@ -160,19 +162,21 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
 /**
  * Default model per routing tier. Explicit effort-suffixed IDs, never
  * AUTO_MODEL: "auto" resolves server-side to a high thinking budget
- * (measured: gemini-3.7-flash-high behavior), which is a tail-latency
+ * (measured on agy before 1.3.4: gemini-3.7-flash-high behavior), a tail-latency
  * amplifier on hard prompts (LINC#571). Explicit suffixes bound thinking
  * per tier; AUTO_MODEL remains user-selectable in AGY_MODELS.
  *
- * code and smart share flash-high DELIBERATELY: there is no higher non-pro
- * rung — the pro models reject --effort and pay pro-grade latency, wrong
- * for a tier default. Kept honest by the `agy models` tripwire test.
+ * code and smart share flash-high DELIBERATELY. The pro models of earlier agy
+ * versions paid pro-grade latency, wrong for a tier default. Gemini 4 Argon
+ * is listed in AGY_MODELS for anyone who wants it on a tier, but is not a
+ * default until its latency and plan availability are measured. Kept honest
+ * by the opt-in `agy models` tripwire test (AGY_LIVE=1, antigravity-cli.test.ts).
  */
 export const AGY_TIER_MODELS: Record<ModelTier, AgyModelId> = {
-  smart: 'gemini-3.7-flash-high',
-  balanced: 'gemini-3.7-flash-medium',
-  fast: 'gemini-3.7-flash-low',
-  code: 'gemini-3.7-flash-high',
+  smart: 'gemini-3.8-flash-high',
+  balanced: 'gemini-3.8-flash-medium',
+  fast: 'gemini-3.8-flash-low',
+  code: 'gemini-3.8-flash-high',
 };
 
 /**
@@ -520,13 +524,30 @@ export class AntigravityCliProvider extends BaseLLMProvider {
       // built-in list.
       models: peekCachedModels(MODEL_DISCOVERY_KEY) ?? [...AGY_MODELS],
       defaultTierModels: AGY_TIER_MODELS,
-      // agy sunset the 3.5 flash line (caught live by the models tripwire
-      // test); migrate any saved tier routing to the current 3.7 line at
-      // the same effort, matching the tier defaults above.
+      // agy 1.3.4 lists only the 3.8 flash line, Gemini 4 Argon and the 5.5
+      // Claude models. Migrate saved tier routing on every id this list ever
+      // carried that agy no longer accepts: flash lines to 3.8 flash at the
+      // same effort (unsuffixed ids to medium), the retired pro models to 3.8
+      // flash at the same effort (Gemini 4 Argon is the pro-class successor,
+      // but its availability outside some plans is unverified), the 4.6 Claude
+      // models to their 5.5 successors at high effort (both were thinking variants).
       modelMigrations: {
-        'gemini-3.5-flash-high': 'gemini-3.7-flash-high',
-        'gemini-3.5-flash-medium': 'gemini-3.7-flash-medium',
-        'gemini-3.5-flash-low': 'gemini-3.7-flash-low',
+        'gemini-3.5-flash-high': 'gemini-3.8-flash-high',
+        'gemini-3.5-flash-medium': 'gemini-3.8-flash-medium',
+        'gemini-3.5-flash-low': 'gemini-3.8-flash-low',
+        'gemini-3.6-flash': 'gemini-3.8-flash-medium',
+        'gemini-3.6-flash-high': 'gemini-3.8-flash-high',
+        'gemini-3.6-flash-medium': 'gemini-3.8-flash-medium',
+        'gemini-3.6-flash-low': 'gemini-3.8-flash-low',
+        'gemini-3.7-flash-high': 'gemini-3.8-flash-high',
+        'gemini-3.7-flash-medium': 'gemini-3.8-flash-medium',
+        'gemini-3.7-flash-low': 'gemini-3.8-flash-low',
+        'gemini-3.1-pro': 'gemini-3.8-flash-medium',
+        'gemini-3.1-pro-high': 'gemini-3.8-flash-high',
+        'gemini-3.1-pro-low': 'gemini-3.8-flash-low',
+        'gemini-3.6-pro': 'gemini-3.8-flash-medium',
+        'claude-sonnet-4-6': 'claude-sonnet-5-5-high',
+        'claude-opus-4-6-thinking': 'claude-opus-5-5-high',
       } satisfies Record<string, AgyModelId>,
     };
   }
@@ -557,7 +578,8 @@ export class AntigravityCliProvider extends BaseLLMProvider {
     ];
 
     // Effort-suffixed IDs (see AGY_MODELS) are self-contained; a separate
-    // --effort flag is rejected by pro/claude models, so never pass one.
+    // Older agy versions rejected --effort for pro/claude models; the suffixed
+    // ID carries the effort, so never pass one.
     // Resolution matches what the ledger reports: explicit model, then the
     // tier default, then auto (no flag).
     const model = this.resolveModel(options);

@@ -20,6 +20,7 @@ import { Abject } from '../core/abject.js';
 import { Registry } from './registry.js';
 import { SettingsManager } from './settings-manager.js';
 import { request } from '../core/message.js';
+import { AntigravityCliProvider } from '../llm/antigravity-cli.js';
 import type { AbjectId, AbjectMessage, AbjectManifest, InterfaceId } from '../core/types.js';
 
 function mkManifest(name: string, description: string): AbjectManifest {
@@ -95,7 +96,7 @@ interface Harness {
   ui: Stub;
 }
 
-async function harness(): Promise<Harness> {
+async function harness(seed: { storage?: Record<string, unknown>; providers?: unknown[] } = {}): Promise<Harness> {
   const bus = new MessageBus();
   const reg = new Registry();
   await reg.init(bus);
@@ -105,11 +106,13 @@ async function harness(): Promise<Harness> {
   reg.registerObject(wm.id, wm.manifest, undefined, undefined, undefined, 'WorkspaceManager');
 
   const storage = new StorageStub();
+  for (const [k, v] of Object.entries(seed.storage ?? {})) storage.data.set(k, v);
   await storage.init(bus);
   reg.registerObject(storage.id, storage.manifest, undefined, undefined, undefined, 'Storage');
 
   const llm = new Stub('LLM', 'Language model service stand-in');
   await llm.init(bus);
+  llm.hook('listProviderDescriptions', () => seed.providers ?? []);
   llm.hook('*', () => []);
   reg.registerObject(llm.id, llm.manifest, undefined, undefined, undefined, 'LLM');
 
@@ -257,4 +260,15 @@ test('a denied write leaves Storage untouched', async () => {
   const r = await tryWrite(h, caller);
   assert.equal(r.ok, false);
   assert.equal(h.storage.data.size, 0, 'denied write must not persist anything');
+});
+
+test('an aux row pinned to a retired provider model is migrated on load, like the tier rows', async () => {
+  const h = await harness({
+    providers: [new AntigravityCliProvider().describe()],
+    storage: {
+      'global-settings:tierFallbackProvider': 'antigravity-cli',
+      'global-settings:tierFallbackModel': 'gemini-3.7-flash-medium',
+    },
+  });
+  assert.equal(h.storage.data.get('global-settings:tierFallbackModel'), 'gemini-3.8-flash-medium');
 });
