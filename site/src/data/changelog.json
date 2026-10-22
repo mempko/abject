@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.15.15",
+    "date": "2026-10-22",
+    "title": "Sleeping Objects You Can Keep",
+    "summary": "You can now keep the objects you care about: they sleep in folders until something needs them, and they show on your own board as live cards. The built-in browser also gets through bot checks such as Cloudflare Turnstile again.",
+    "highlights": [
+      "Kept objects: you can keep named objects in folders, where they sleep while nobody is using them. When another object or agent asks for one, it wakes up, so nothing has to stay running just to stay available.",
+      "A board of your own: the new pinboard shows your kept objects as cards, and any object that can draw itself appears inline in a slot. A slot keeps its last picture as a preview, uses your theme's colours and fonts, and passes your clicks and typing to the object.",
+      "Shorter goal rows in Chat: each goal now reads as one sentence, and goal cards have a plain headline you can take in at a glance.",
+      "Tap to answer: when Chat, a running goal or a dialog asks you a question, it offers short answers you can tap instead of typing."
+    ],
+    "fixes": [
+      "The built-in browser now passes bot checks such as Cloudflare Turnstile. Before, it told pages it was plain Chrome, but those checks look at what the browser can do rather than what it says, so they failed every time, even when a person clicked the challenge."
+    ]
+  },
+  {
     "version": "0.15.14",
     "date": "2026-10-22",
     "title": "Goals you can watch, calls you can stop",
