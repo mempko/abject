@@ -22,7 +22,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
-import { require as requireContract, invariant } from '../../core/contracts.js';
+import { require as requireContract, ensure, invariant } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
 
 const log = new Log('BrowserWindowHost');
@@ -415,8 +415,7 @@ export class BrowserWindowHost extends Abject {
   /**
    * Electron's defaults suit an app, not a browser an agent drives:
    *
-   * - Its user agent names Electron and the app, which sites read as
-   *   automation. Pages get the tokens Chrome itself sends.
+   * - Its user agent names the app. Pages get the user agent without it.
    * - It grants every permission request. Automation pages get none.
    * - It answers a download with a native save dialog. Pages never download;
    *   WebBrowser reads non-HTML responses another way.
@@ -424,22 +423,28 @@ export class BrowserWindowHost extends Abject {
   private configure(ses: Session): void {
     if (this.configuredSessions.has(ses)) return;
     this.configuredSessions.add(ses);
-    ses.setUserAgent(this.chromeUserAgent());
+    ses.setUserAgent(this.pageUserAgent());
     ses.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
     ses.setPermissionCheckHandler(() => false);
     ses.on('will-download', (event) => event.preventDefault());
   }
 
   /**
-   * Electron's default user agent with the app's and Electron's own tokens
-   * removed and the Chrome version reduced the way Chrome reduces it:
-   * `... (KHTML, like Gecko) abjects/0.13.0 Chrome/134.0.6998.205 Electron/35.7.5 Safari/537.36`
-   * becomes `... (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`.
+   * Electron's default user agent with the app's own token removed:
+   * `... (KHTML, like Gecko) Abject/0.15.14 Chrome/152.0.7977.130 Electron/44.5.1 Safari/537.36`
+   * becomes `... (KHTML, like Gecko) Chrome/152.0.7977.130 Electron/44.5.1 Safari/537.36`.
+   *
+   * The Electron token stays. Bot checks such as Cloudflare Turnstile tell
+   * Electron from Chrome by what the page can do, not by what the user agent
+   * says, and fail a browser whose user agent claims to be Chrome when it is
+   * not: with the Electron token hidden, Turnstile failed every time, even
+   * for a person clicking it; with the token kept, it passes on its own.
    */
-  private chromeUserAgent(): string {
-    return this.requireElectron().app.userAgentFallback
-      .replace(/ (?!(?:Mozilla|AppleWebKit|Chrome|Safari)\/)[^\s()/]+\/\S+/g, '')
-      .replace(/Chrome\/(\d+)[\d.]*/, 'Chrome/$1.0.0.0');
+  private pageUserAgent(): string {
+    const ua = this.requireElectron().app.userAgentFallback
+      .replace(/ (?!(?:Mozilla|AppleWebKit|Chrome|Electron|Safari)\/)[^\s()/]+\/\S+/g, '');
+    ensure(/ Electron\//.test(ua), 'the page user agent keeps the Electron token');
+    return ua;
   }
 
   private async clearSession(sessionPath: string): Promise<{ live: boolean }> {
