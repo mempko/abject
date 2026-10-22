@@ -51,10 +51,22 @@ a dependent of every window and forwards some window aspects to the window's
 owner (`windowCloseRequested`, `windowMinimized`, `windowRestored`, and
 `windowRect` as `windowMoved` / `windowResized`).
 
+**Who may change a window.** A window and its widgets take changes (new
+widgets, `update`, `destroy`, layout edits, `draw`, `input`, title, focus,
+effects) and value reads (`getValue`) only from the window's owner, its own
+widgets, WidgetManager, UIServer, objects the owner let in with
+`grantWindowAccess` (taken back with `revokeWindowAccess`), and built-in
+objects. WidgetManager records each window's owner and ties every widget to
+its window (`bindWindow`) when it makes it; a window or widget asks
+WidgetManager (`admitsToWindow`) about any other sender once and remembers
+the answer. Anything else is refused with a contract error, so an object
+cannot add to, read, click or tear down another object's window.
+
 **3D.** A window fronts the scene vocabulary for its surface: `scene { ops }`
 adds retained nodes to the window's subtree (any Abject may contribute; UIServer
 routes those nodes' input back to the contributor and removes them when it
-dies), and `draw { nodeId, commands }` paints a `kind: 'canvas'` layer node.
+dies; a contributor the window does not admit may only add new nodes and change
+its own), and `draw { nodeId, commands }` paints a `kind: 'canvas'` layer node.
 CanvasWidget, GraphWidget, pop-outs and widget decorations are built on these
 two messages. See [../../ui/README.md](../../ui/README.md).
 
@@ -133,7 +145,9 @@ which lists it in `listLayoutIssues`.
   `moveLayoutChildrenToEnd`), margins,
   `getPreferredHeight`, `getFocusableWidgets`, overflow reporting. Draws
   expanded children (an open select) last.
-- **`widget-types.ts`**: shared types and constants (`WidgetStyle`,
+- **`widget-types.ts`**: shared types and constants (`WidgetStyle`, whose
+  `enter: 'rise'` makes any widget fade in and rise a few pixels the first
+  time it is drawn,
   `WidgetType`, `SizePolicy`, `Rect`, interface ids, draw-command names and
   aliases, `TITLE_BAR_HEIGHT`), size helpers (`resolveWH`, `coerceRect`),
   theme-aware fonts (`fontStacks`, `widgetFont`, `titleFont`, `codeFont`),
@@ -156,7 +170,8 @@ which lists it in `listLayoutIssues`.
 
 - **`button-widget.ts`**: `ButtonWidget`. Flat print block with a hard offset
   shadow; `click` on mousedown or Enter/Space; optional `style.icon` from
-  `src/ui/icons.ts`.
+  `src/ui/icons.ts`; with `style.caption` it draws as a tile (icon at the top,
+  bold text and a quieter caption line under it).
 - **`text-input-widget.ts`**: `TextInputWidget`. Single line (optionally
   wrapping), cursor, selection, clipboard, undo, masking, placeholder. Events
   `change`, `submit`, `resize`, `attach`.
@@ -207,8 +222,20 @@ which lists it in `listLayoutIssues`.
   optional inline editing; `rowSelected`, `cellEdited`.
 - **`chart-widget.ts`**: `ChartWidget`. Line, bar, area, pie and sparkline from
   plain series data in theme colours; `pointClicked`.
+- **`slot-widget.ts`**: `SlotWidget` (`type: 'slot'`, with `target` the
+  object's typeId and `storeId` its AbjectStore). Shows any object that answers
+  `render({ width, host })` with `{ commands, height }` in its own coordinates:
+  the slot checks the commands (`cleanSlotCommands`: no network images, no
+  surface of their own, balanced save/restore), resolves `$theme` colours and
+  `$display`/`$body`/`$mono` fonts, and clips and moves them into its box.
+  Draws the object's saved preview first, holds the object awake while on
+  screen (AbjectStore `hold`), lets go 30 s after it scrolls away, saves new
+  drawings as the preview, forwards input as `handleInput`, and passes the
+  object's `changed('action', { say | open })` to its owner as `action`. Its
+  `measureText` and `wrapText` serve the object. `contentHeight`, `action`.
 - **`goal-progress-widget.ts`**: `GoalProgressWidget`. Draws `goal-tree.ts`
-  rows (a goal's card or the Goals list): wrapped text with an agent chip,
+  rows (a goal's card, Chat's one-sentence view, or the Goals list): wrapped
+  text (a larger `headline` row) with an agent chip,
   right-aligned meta, detail lines, a command line, a progress bar, a band and
   the step trail; per-row controls; `toggle`, `select`, `goalAction`,
   `contentHeight`.

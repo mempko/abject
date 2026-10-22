@@ -53,6 +53,9 @@ export class ModalDialog extends Abject {
   private displaySize = { width: 0, height: 0 };
   /** The message's height: a guess until it measures itself. */
   private messageHeight = 0;
+  /** A card shown with the question, and its measured height. */
+  private cardSlotId?: AbjectId;
+  private cardHeight = 0;
   /** Fits run one at a time, each with the latest message height. */
   private fitting: Promise<void> = Promise.resolve();
   private promptMode = false;
@@ -193,6 +196,21 @@ Interface: abjects:modal-dialog`;
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
+      // The card drew itself: give it its height and refit the window.
+      if (fromId === this.cardSlotId && aspect === 'contentHeight') {
+        const height = typeof value === 'number' ? value : Number(value);
+        if (Number.isFinite(height) && height > 0 && Math.abs(height - this.cardHeight) >= 1 && this.rootLayoutId) {
+          this.cardHeight = Math.ceil(height);
+          try {
+            await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+              widgetId: this.cardSlotId, preferredSize: { height: this.cardHeight },
+            }));
+          } catch { /* dialog closed meanwhile */ }
+          await this.fitWindow();
+        }
+        return;
+      }
+
       // The message wrapped and measured itself: fit the window to it.
       if (fromId === this.messageBlockId && aspect === 'contentHeight') {
         const height = typeof value === 'number' ? value : Number(value);
@@ -326,6 +344,7 @@ Interface: abjects:modal-dialog`;
       theme,
       defaultValue,
       placeholder,
+      card,
     } = msg.payload as {
       title: string;
       message: string;
@@ -335,6 +354,7 @@ Interface: abjects:modal-dialog`;
       theme?: ThemeData;
       defaultValue?: string;
       placeholder?: string;
+      card?: { typeId: string; storeId: string; text: string };
     };
 
     // Without an explicit theme, wear the workspace's active theme so the
@@ -447,6 +467,24 @@ Interface: abjects:modal-dialog`;
       preferredSize: { height: messageGuess },
     }));
 
+    // A card shown with the question: its own object, in a slot. Only the
+    // dialog's buttons below answer the question; the card's taps do not.
+    if (card) {
+      const { widgetIds: [slotId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, wmId, 'create', {
+          specs: [{ type: 'slot', windowId: this.dialogWindowId, target: card.typeId, storeId: card.storeId, height: CARD_START_HEIGHT }],
+        })
+      );
+      this.cardSlotId = slotId;
+      this.cardHeight = CARD_START_HEIGHT;
+      await this.request(request(this.id, slotId, 'addDependent', {}));
+      await this.request(request(this.id, rootLayoutId, 'addLayoutChild', {
+        widgetId: slotId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: CARD_START_HEIGHT },
+      }));
+    }
+
     // Prompt mode: insert a text input below the message.
     if (this.promptMode) {
       const { widgetIds: [inputId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -556,6 +594,8 @@ Interface: abjects:modal-dialog`;
 }
 
 const MIN_DIALOG_HEIGHT = 220;
+/** A card's height before it measures itself. */
+const CARD_START_HEIGHT = 140;
 /** Room left between the dialog and the display's edges. */
 const DISPLAY_INSET = 40;
 const SPACING = 12;

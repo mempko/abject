@@ -13,6 +13,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 import { CONVERSATION_CONTEXT_KEY, type ConversationContext } from '../core/conversation-context.js';
@@ -160,6 +161,14 @@ export class GoalBrowser extends Abject {
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
             {
+              name: 'showGoal',
+              description: 'Show the goal browser window with one goal selected',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'The goal to select' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
               name: 'hide',
               description: 'Hide the goal browser window',
               parameters: [],
@@ -207,6 +216,13 @@ export class GoalBrowser extends Abject {
 
   private setupHandlers(): void {
     this.on('show', async () => this.show());
+    this.on('showGoal', async (msg: AbjectMessage) => {
+      const { goalId } = (msg.payload ?? {}) as { goalId?: string };
+      requireNonEmpty(goalId ?? '', 'showGoal needs a goalId');
+      const shown = await this.show();
+      if (shown) await this.selectGoal(goalId as GoalId);
+      return shown;
+    });
     this.on('hide', async () => this.hide());
     this.on('getState', async () => ({
       visible: !!this.windowId,
@@ -236,6 +252,7 @@ export class GoalBrowser extends Abject {
 
 ### Methods
 - \`show()\` -- Open the Goals window. If already open, raises it to front.
+- \`showGoal({ goalId })\` -- Open the Goals window with that goal selected.
 - \`hide()\` -- Close the Goals window and unsubscribe from GoalManager.
 - \`getState()\` -- Returns { visible, goalCount, selectedGoalId }.
 

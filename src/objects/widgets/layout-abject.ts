@@ -174,6 +174,11 @@ export interface LayoutConfig {
  */
 export abstract class LayoutAbject extends WidgetAbject {
   protected layoutChildren: (LayoutChildConfig | SpacerConfig)[] = [];
+
+  /** A layout's own children size themselves through it (updateLayoutChild). */
+  protected override isFamiliar(from: AbjectId): boolean {
+    return this.layoutChildren.some((c) => !isSpacer(c) && c.widgetId === from);
+  }
   protected margins: LayoutMargins;
   protected spacing: number;
   private hoveredLayoutChildId?: AbjectId;
@@ -343,6 +348,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('addLayoutChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'addLayoutChild');
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
         sizePolicy?: { horizontal?: string; vertical?: string };
@@ -392,6 +398,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('addLayoutSpacer', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'addLayoutSpacer');
       const { stretch } = msg.payload as { stretch?: number };
       this.layoutChildren.push({
         type: 'spacer',
@@ -403,6 +410,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('addLayoutChildren', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'addLayoutChildren');
       const { children } = msg.payload as {
         children: Array<{
           widgetId: AbjectId;
@@ -450,6 +458,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('removeLayoutChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'removeLayoutChild');
       const { widgetId } = msg.payload as { widgetId: AbjectId };
       const wasChild = this.layoutChildren.some((c) => !isSpacer(c) && c.widgetId === widgetId);
       this.layoutChildren = this.layoutChildren.filter(
@@ -487,6 +496,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     // to `this.ownerId` reaches the window (whose `removeChild` does the real
     // detach) regardless of nesting depth; the chain terminates at the window.
     this.on('removeChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'removeChild');
       const { widgetId } = msg.payload as { widgetId: AbjectId };
       this.send(
         request(this.id, this.ownerId, 'removeChild', { widgetId })
@@ -495,6 +505,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('clearLayoutChildren', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'clearLayoutChildren');
       const { keep } = (msg.payload ?? {}) as { keep?: boolean };
       // Cleared children are no longer drawn here: their scene decorations
       // (busy lights) leave with them, even if the caller keeps them alive.
@@ -518,6 +529,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('moveLayoutChildrenToEnd', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'moveLayoutChildrenToEnd');
       const { widgetIds } = msg.payload as { widgetIds?: AbjectId[] };
       if (!Array.isArray(widgetIds) || widgetIds.length === 0) return false;
       const moved: LayoutChildConfig[] = [];
@@ -533,6 +545,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('updateLayoutChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'updateLayoutChild');
       const { widgetId, preferredSize, sizePolicy, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
         preferredSize?: SizeInput;

@@ -2335,7 +2335,7 @@ ${source}
     };
   }
 
-  private async opDeploySpawn(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+  private async opDeploySpawn(state: LoopState, action: Record<string, unknown> = {}): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.factoryId) return { ok: false, summary: 'deploy_spawn: Factory unavailable', error: 'Factory not resolved' };
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
     if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, edit_source, or draft_via_llm({kind: "source"}) first' };
@@ -2371,6 +2371,11 @@ ${source}
 
     // Persist to AbjectStore so the spawned object survives a restart.
     // Use request+catch so save failures show up in logs instead of vanishing.
+    // Where it lives and when it runs, as the action asked: a folder, tags
+    // for search and filtering, and loading 'boot' or 'needed'.
+    const folder = typeof action.folder === 'string' && action.folder ? action.folder : undefined;
+    const loading = action.loading === 'needed' || action.loading === 'boot' ? action.loading : undefined;
+    const tags = Array.isArray(action.tags) ? (action.tags as unknown[]).filter((t): t is string => typeof t === 'string') : undefined;
     if (this.abjectStoreId) {
       await this.sendRequest<unknown>(
         this.abjectStoreId,
@@ -2380,10 +2385,18 @@ ${source}
           manifest: state.draftManifest,
           source: state.draftSource,
           owner: this.id,
+          ...(folder ? { folder } : {}),
+          ...(loading ? { loading } : {}),
         },
         15000,
       );
+      if (tags && tags.length > 0) {
+        await this.sendRequest<unknown>(this.abjectStoreId, 'place', { objectId: result.objectId, tags }, 15000);
+      }
     }
+    const sleepsNote = loading === 'needed' && /setInterval|setTimeout|setRecurring/.test(state.draftSource)
+      ? ' NOTE: this object loads when needed, so it sleeps when idle and its timers stop with it. Work it must do on its own belongs on a schedule (Scheduler job code that calls it): a call wakes it.'
+      : '';
 
     if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.lastDeployedSource = state.draftSource;
@@ -2415,7 +2428,7 @@ ${source}
 
     return {
       ok: true,
-      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${collisionNote}${spawnManifestNote}`,
+      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${folder ? ` in ${folder}` : ''}${loading ? ` (loads at ${loading})` : ''}${collisionNote}${spawnManifestNote}${sleepsNote}`,
       data: {
         objectId: result.objectId,
         manifest: state.draftManifest,
@@ -4710,7 +4723,7 @@ ${source}
           res = await this.opReviewSemantics(state);
           break;
         case 'deploy_spawn':
-          res = await this.opDeploySpawn(state);
+          res = await this.opDeploySpawn(state, action);
           break;
         case 'deploy_update':
           res = await this.opDeployUpdate(state, action);
@@ -5139,7 +5152,14 @@ Your local actions are the supported way to create and modify Abjects: they carr
 - \`read_draft({handler?, lineRange?, grep?})\` — read the CURRENT source exactly as it stands. No args → the member outline. \`{handler:"name"}\` → that member's exact text, line-numbered. \`{lineRange:"a-b"}\` / \`{grep:"pattern"}\` → those lines. Read-only: it stages nothing; use it to resolve a concrete uncertainty. Use it to look at a member you are about to rewrite, or one a check named. Read related members as needed to understand the change; avoid repeating an unchanged read without a new question.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`edit_source\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` / \`validate_calls()\` / \`review_semantics()\` — the checks, available explicitly but **rarely worth a step**: they run on their own (see *Checks run themselves*, below).
-- \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
+- \`deploy_spawn({ folder?, tags?, loading? })\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint, then keeps it in AbjectStore. The staged drafts are read from loop state; the payload says where it lives: \`folder\` (e.g. "user/recipes", a group named for what it is about), \`tags\` (words for search and filtering), \`loading\` ("boot" to run with the workspace, the default; "needed" to sleep until looked up or shown, right for things shown on demand such as cards).
+
+### Placing objects, more of the same, and objects shown inline
+
+- **Folders and tags** group the person's objects: put related things in one folder ("user/kitchen") and tag them so they can be found ("recipes", "card"). Move or retag later with \`call("AbjectStore", "place", { objectId, folder?, tags?, loading? })\`.
+- **More of the same is a copy with new data**, not a new kind of thing: \`call("AbjectStore", "copy", { objectId: <the original's typeId>, data: {...}, folder? })\` gives an independent object with the original's code. Each copy is its own object; to change several, change each one (or a folder's worth, listed with \`call("AbjectStore", "list", { folder })\`).
+- **Loading when needed** suits objects shown on demand: they wake when looked up or shown and sleep when idle. An object that must act on its own runs at boot, or is woken by a Scheduler job. An object that loads when needed and declares a \`startup\` method hears it each time it wakes.
+- **Something shown inline** (in a chat, a dialog, pinned to the desktop) is any object that answers \`render({ width, host })\` with \`{ commands, height }\`: draw commands in its own coordinates (0,0 top left), colours as theme names (\`"$accent"\`, \`"$textPrimary"\`, \`"$buttonBg"\`, \`"$divider"\`), fonts naming the theme's faces (\`"600 26px $display"\`, \`"14px $body"\`). \`call(host, "wrapText", { text, font, maxWidth })\` and \`call(host, "measureText", { text, font })\` lay text out. \`handleInput({ type, x, y })\` gets clicks in its own coordinates; \`this.changed("redraw")\` asks for a fresh drawing; \`this.changed("action", { say })\` sends words as the person's (in a chat), \`{ open: typeId }\` opens an object. Show it in a conversation with \`call(<the Chat>, "postCard", { typeId, text })\`.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here. A redrafted manifest with no source change ships the same way: draft_manifest, then deploy_update. Calling Registry.updateManifest yourself updates only the Registry's copy; the object and its snapshot keep the old one and it is lost on restart.
 - \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
 - \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.

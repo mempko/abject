@@ -360,6 +360,7 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
 
   private setupCanvasHandlers(): void {
     this.on('draw', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'draw');
       const payload = msg.payload as { commands: unknown[] };
       const commands = normalizeDrawCommands(payload.commands ?? []);
 

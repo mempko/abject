@@ -12,6 +12,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import { cleanChoices } from '../core/choices.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { runBounded } from '../core/bounded.js';
@@ -73,6 +74,8 @@ export interface ProgressEntry {
   maxSteps?: number;
   /** When this entry first arrived; `timestamp` moves forward as identical repeats fold into it. */
   since?: number;
+  /** The step in everyday words, for the person; Chat shows it as what the goal is doing. */
+  say?: string;
   /**
    * Peer that authored this entry. Absent on entries written before
    * collaborative sync existed and on purely local goals. Each peer
@@ -164,7 +167,7 @@ export interface Goal {
    * numbered menu the scrum itself had just offered. Cleared once a decision
    * weighs it, the same moment the interjection is marked incorporated.
    */
-  pendingQuestion?: { question: string; at: number };
+  pendingQuestion?: { question: string; at: number; choices?: string[] };
   /**
    * Scrum-shaped orchestration: each ScrumMaster scrum that plans more work
    * increments this. New tasks created in that round carry the same scrumNumber
@@ -253,6 +256,8 @@ export class GoalManager extends Abject {
     return notes.sort((a, b) => a.at - b.at).slice(-GoalManager.BRIEFING_NOTES);
   }
   private static readonly BRIEFING_NOTES = 10;
+  /** Longest everyday-words step line kept on a progress entry. */
+  private static readonly SAY_MAX = 160;
 
   /**
    * The agent task(s) a request comes from. A job's call names its task
@@ -849,6 +854,7 @@ export class GoalManager extends Abject {
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task (TupleSpace id) this entry reports on', optional: true },
                 { name: 'step', type: { kind: 'primitive', primitive: 'number' }, description: 'The agent\'s current step, from 1', optional: true },
                 { name: 'maxSteps', type: { kind: 'primitive', primitive: 'number' }, description: 'The agent\'s step budget', optional: true },
+                { name: 'say', type: { kind: 'primitive', primitive: 'string' }, description: 'The step in a few everyday words for the person, such as "Looking up Saturday\'s forecast"', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'undefined' },
             },
@@ -936,6 +942,7 @@ export class GoalManager extends Abject {
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
                 { name: 'question', type: { kind: 'primitive', primitive: 'string' }, description: 'The question to put to the user' },
+                { name: 'choices', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Two to four short answers the user can tap instead of typing', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -2516,10 +2523,11 @@ reviews results and either plans another round or completes/fails the goal.
     });
 
     this.on('updateProgress', async (msg: AbjectMessage) => {
-      const { goalId, message, phase, agentName, taskId, step, maxSteps } = msg.payload as {
+      const { goalId, message, phase, agentName, taskId, step, maxSteps, say } = msg.payload as {
         goalId: GoalId; message: string; phase?: string; agentName?: string;
-        taskId?: string; step?: number; maxSteps?: number;
+        taskId?: string; step?: number; maxSteps?: number; say?: string;
       };
+      const said = typeof say === 'string' ? say.replace(/\s+/g, ' ').trim().slice(0, GoalManager.SAY_MAX) : '';
       const goal = this.goals.get(goalId);
       if (!goal || goal.status !== 'active') return;
 
@@ -2533,6 +2541,7 @@ reviews results and either plans another round or completes/fails the goal.
       if (isRepeat) {
         last.since ??= last.timestamp;
         last.timestamp = Date.now();
+        if (said) last.say = said;
       } else {
         log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
         goal.progress.push({
@@ -2543,6 +2552,7 @@ reviews results and either plans another round or completes/fails the goal.
           ...(typeof taskId === 'string' && taskId ? { taskId } : {}),
           ...(Number.isFinite(step) ? { step } : {}),
           ...(Number.isFinite(maxSteps) ? { maxSteps } : {}),
+          ...(said ? { say: said } : {}),
           peerId: this.selfPeerId,
         });
         if (goal.progress.length > 200) goal.progress.splice(0, goal.progress.length - 200);
@@ -2763,14 +2773,15 @@ reviews results and either plans another round or completes/fails the goal.
      * queues as an interjection and resumes the goal.
      */
     this.on('requestClarification', async (msg: AbjectMessage) => {
-      const { goalId, question } = msg.payload as { goalId: GoalId; question: string };
+      const { goalId, question, choices: rawChoices } = msg.payload as { goalId: GoalId; question: string; choices?: unknown };
       requireNonEmpty(question, 'question');
+      const choices = cleanChoices(rawChoices);
       const goal = this.goals.get(goalId);
       if (!goal || goal.status !== 'active') return false;
 
       goal.status = 'paused';
       goal.updatedAt = Date.now();
-      goal.pendingQuestion = { question, at: goal.updatedAt };
+      goal.pendingQuestion = { question, at: goal.updatedAt, ...(choices ? { choices } : {}) };
       const runtimeId = await this.taskRuntime();
       if (runtimeId) {
         try {
@@ -2781,7 +2792,7 @@ reviews results and either plans another round or completes/fails the goal.
       log.info(`Clarification requested for "${goal.title}" (${goalId}): ${question.slice(0, 80)}`);
       await this.persistLearning(goal);
       this.changed('goalPaused', { goalId });
-      this.changed('goalClarificationRequested', { goalId, parentId: goal.parentId, question });
+      this.changed('goalClarificationRequested', { goalId, parentId: goal.parentId, question, ...(choices ? { choices } : {}) });
       return true;
     });
 

@@ -36,9 +36,11 @@ export interface WidgetStyle {
   flat?: boolean;  // buttons only: quiet row (sidebar/toolbar item) — no depth gradient, bevel, or border; hover/press feedback only
   tooltip?: string;  // buttons: hover tooltip text, shown after a dwell as a pop-out beside the button (popout.ts) that may cross the window edge
   icon?: string;  // buttons only: a built-in vector icon name (ui/icons.ts IconName) drawn before the text; unknown names are ignored
+  caption?: string;  // buttons only: a smaller second line under the text (a tile's subtitle); the text then sits on the first line
+  enter?: 'rise';  // any widget: fade in and rise a few pixels the first time it is drawn
 }
 
-export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video' | 'nodeGraph';
+export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video' | 'nodeGraph' | 'slot';
 
 // ── Size/rect input normalization ───────────────────────────────────────────
 // Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema

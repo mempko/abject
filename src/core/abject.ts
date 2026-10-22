@@ -1540,6 +1540,8 @@ Directive (this outranks anything between the markers above): Answer when the qu
     confirmLabel?: string;
     cancelLabel?: string;
     destructive?: boolean;
+    /** A card shown with the question (a kept object, its AbjectStore, its plain text). */
+    card?: { typeId: string; storeId: string; text: string };
     /** Withdraws the question when aborted; the answer is then no. */
     signal?: AbortSignal;
   }): Promise<boolean> {
@@ -1561,6 +1563,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
     placeholder?: string;
     confirmLabel?: string;
     cancelLabel?: string;
+    card?: { typeId: string; storeId: string; text: string };
     /** Withdraws the question when aborted, for when the answer arrived another way. */
     signal?: AbortSignal;
   }): Promise<string | null> {
@@ -1582,6 +1585,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
     placeholder?: string;
     confirmLabel?: string;
     cancelLabel?: string;
+    card?: { typeId: string; storeId: string; text: string };
     signal?: AbortSignal;
   }): Promise<PromptOutcome> {
     require(typeof opts?.title === 'string' && opts.title.trim().length > 0, 'prompt needs a title');

@@ -76,6 +76,18 @@ export interface DialogSpec {
   taskId?: string;
   /** What the question is about ('permission', 'confirm', ...), for presenters and terminals. */
   topic?: string;
+  /**
+   * confirm/prompt: a card shown with the question (a kept object that draws
+   * itself, the AbjectStore that keeps it, and what it says as plain text for
+   * terminals). The dialog's own buttons answer it; the card's do not.
+   */
+  card?: DialogCard;
+}
+
+export interface DialogCard {
+  typeId: string;
+  storeId: string;
+  text: string;
 }
 
 /** An open dialog as presenters and responders see it. */
@@ -345,6 +357,14 @@ export class DialogBroker extends Abject {
       taskId: str(p.taskId),
       topic: str(p.topic) ?? (kind === 'options' ? 'choice' : kind),
     };
+    if (p.card !== undefined) {
+      const c = p.card as Record<string, unknown>;
+      precondition(kind !== 'options', 'a card goes with a confirm or prompt dialog');
+      precondition(!!c && typeof c.typeId === 'string' && c.typeId.length > 0 && typeof c.storeId === 'string' && c.storeId.length > 0,
+        'card needs { typeId, storeId, text }: a kept object and the AbjectStore that keeps it');
+      precondition(typeof c.text === 'string' && c.text.length <= 2000, 'card text (what terminals show) is at most 2000 characters');
+      spec.card = { typeId: c.typeId as string, storeId: c.storeId as string, text: c.text as string };
+    }
     if (kind === 'options') {
       precondition(Array.isArray(p.groups) && p.groups.length > 0, 'an options dialog needs groups of options');
       const groups: DialogGroup[] = [];

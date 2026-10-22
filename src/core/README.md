@@ -309,6 +309,9 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
   `blockedOn`, `indexById`, `orderTopologically`,
   `transitiveDependentCounts`, `deriveContractEdges` (edges implied by
   produces/consumes keys), `validateDataFlow`.
+- **choices.ts**: `cleanChoices`, the short answers a question offers the
+  person to tap (two to four, trimmed, short, no repeats), for GoalManager's
+  `requestClarification` and Chat's `clarify`.
 - **conversation-context.ts**: the bounded chat history a goal carries
   (`captureConversation`, at most 40 messages), `conversationBriefing()` for
   prompts, `identifyMessages()`, `CONVERSATION_CONTEXT_KEY`.

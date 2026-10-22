@@ -63,6 +63,7 @@ import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
 import { ThemeSwatchWidget, ThemeSwatchWidgetConfig } from './widgets/theme-swatch-widget.js';
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
 import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
+import { SlotWidget } from './widgets/slot-widget.js';
 import { GoalProgressWidget } from './widgets/goal-progress-widget.js';
 import { TableWidget, TableColumnSpec } from './widgets/table-widget.js';
 import { FormWidget, FormSchema } from './widgets/form-widget.js';
@@ -109,7 +110,7 @@ const VALID_WIDGET_TYPES = [
   'label', 'markdown', 'contentBlock', 'button', 'textInput', 'textArea',
   'checkbox', 'progress', 'divider', 'select', 'tabBar', 'slider', 'image',
   'themeSwatch', 'list', 'tree', 'goalProgress', 'table', 'form', 'chart',
-  'video', 'splitPane', 'nodeGraph',
+  'video', 'splitPane', 'nodeGraph', 'slot',
 ] as const;
 
 /**
@@ -203,6 +204,8 @@ export class WidgetManager extends Abject {
   private widgetToWindowShimId: Map<AbjectId, string> = new Map();
   // Maps widget AbjectId → parent WindowAbject AbjectId (for workspace tracing)
   private widgetToWindow: Map<AbjectId, AbjectId> = new Map();
+  /** Objects a window's owner let change that window (grantWindowAccess). */
+  private windowGrants: Map<AbjectId, Set<AbjectId>> = new Map();
 
   // ── Tooltip service state ──
   // One shared tooltip at a time: a tiny chromeless window created after a
@@ -253,6 +256,33 @@ export class WidgetManager extends Abject {
                 description: 'Destroy a window by its AbjectId and all its child widgets.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId to destroy' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'grantWindowAccess',
+                description: 'Let another object change your window and its widgets (add widgets, update them, draw). Only the window\'s owner may grant. A window otherwise takes changes from its owner, its own widgets and built-in objects.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Your window' },
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to let in' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'revokeWindowAccess',
+                description: 'Take back access granted with grantWindowAccess.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Your window' },
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to shut out' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'admitsToWindow',
+                description: 'Whether an object may change a window: its owner, its widgets, objects the owner granted access, built-in objects. Windows and widgets ask this about senders they do not recognise.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'The window' },
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The sender in question' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -780,7 +810,44 @@ export class WidgetManager extends Abject {
     // Direct factory: destroy window by AbjectId (not shim string)
     this.on('destroyWindowAbject', async (msg: AbjectMessage) => {
       const { windowId } = msg.payload as { windowId: AbjectId };
+      await this.requireWindowAccess(msg, windowId, 'destroyWindowAbject');
       return this.destroyWindowDirect(windowId);
+    });
+
+    // ── Who may change a window ──
+    // A window takes changes from its owner, its own widgets, built-in
+    // objects, and objects its owner granted access; windows and widgets ask
+    // here about any other sender.
+    this.on('admitsToWindow', async (msg: AbjectMessage) => {
+      const { windowId, objectId } = msg.payload as { windowId: AbjectId; objectId: AbjectId };
+      require(typeof windowId === 'string' && windowId.length > 0, 'admitsToWindow: windowId is required');
+      require(typeof objectId === 'string' && objectId.length > 0, 'admitsToWindow: objectId is required');
+      return this.mayTouchWindow(objectId, windowId);
+    });
+
+    this.on('grantWindowAccess', async (msg: AbjectMessage) => {
+      const { windowId, objectId } = msg.payload as { windowId: AbjectId; objectId: AbjectId };
+      require(typeof objectId === 'string' && objectId.length > 0, 'grantWindowAccess: objectId is required');
+      await this.requireWindowOwner(msg, windowId, 'grantWindowAccess');
+      const grants = this.windowGrants.get(windowId) ?? new Set<AbjectId>();
+      grants.add(objectId);
+      this.windowGrants.set(windowId, grants);
+      return true;
+    });
+
+    this.on('revokeWindowAccess', async (msg: AbjectMessage) => {
+      const { windowId, objectId } = msg.payload as { windowId: AbjectId; objectId: AbjectId };
+      await this.requireWindowOwner(msg, windowId, 'revokeWindowAccess');
+      const removed = this.windowGrants.get(windowId)?.delete(objectId) ?? false;
+      // Widgets and the window remember who they admitted; they ask again
+      // only after a restart of their cache, so a revoke reaches them as an
+      // instruction to forget.
+      if (removed) {
+        for (const id of [windowId, ...this.spawnedWidgets]) {
+          if (this.windowOf(id) === windowId) this.send(event(this.id, id, 'forgetAdmitted', { objectId }));
+        }
+      }
+      return removed;
     });
 
     // Discovery: every live window with its owner, title, and rect — lets
@@ -838,6 +905,12 @@ export class WidgetManager extends Abject {
     // ── Batch widget creation (unified create method) ──
 
     this.on('create', async (msg: AbjectMessage) => {
+      {
+        const { specs: requested } = (msg.payload ?? {}) as { specs?: Array<{ windowId?: AbjectId }> };
+        for (const windowId of new Set((requested ?? []).map((spec) => spec.windowId).filter((id): id is AbjectId => !!id))) {
+          await this.requireWindowAccess(msg, windowId, 'create');
+        }
+      }
       const { specs } = msg.payload as {
         specs: Array<{
           type: string;
@@ -887,6 +960,7 @@ export class WidgetManager extends Abject {
     // ── Layout factory methods ──
 
     this.on('createVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createVBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
@@ -904,6 +978,7 @@ export class WidgetManager extends Abject {
     });
 
     this.on('createHBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createHBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
@@ -921,6 +996,7 @@ export class WidgetManager extends Abject {
     });
 
     this.on('createNestedVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, this.windowOf((msg.payload as { parentLayoutId: AbjectId }).parentLayoutId), 'createNestedVBox');
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
         autoSize?: boolean;
@@ -939,6 +1015,7 @@ export class WidgetManager extends Abject {
     });
 
     this.on('createNestedHBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, this.windowOf((msg.payload as { parentLayoutId: AbjectId }).parentLayoutId), 'createNestedHBox');
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
         autoSize?: boolean;
@@ -957,6 +1034,7 @@ export class WidgetManager extends Abject {
     });
 
     this.on('createScrollableVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createScrollableVBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         autoScroll?: boolean;
@@ -976,6 +1054,7 @@ export class WidgetManager extends Abject {
     });
 
     this.on('createNestedScrollableVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, this.windowOf((msg.payload as { parentLayoutId: AbjectId }).parentLayoutId), 'createNestedScrollableVBox');
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
         autoSize?: boolean;
@@ -998,6 +1077,7 @@ export class WidgetManager extends Abject {
     // ── Detached layout factories (for split pane children) ──
 
     this.on('createDetachedVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createDetachedVBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
@@ -1011,10 +1091,11 @@ export class WidgetManager extends Abject {
         spacing: payload.spacing,
         style: payload.style,
         theme: this.getThemeForWindow(payload.windowId),
-      }));
+      }), payload.windowId);
     });
 
     this.on('createDetachedHBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createDetachedHBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
@@ -1028,10 +1109,11 @@ export class WidgetManager extends Abject {
         spacing: payload.spacing,
         style: payload.style,
         theme: this.getThemeForWindow(payload.windowId),
-      }));
+      }), payload.windowId);
     });
 
     this.on('createDetachedScrollableVBox', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createDetachedScrollableVBox');
       const payload = msg.payload as {
         windowId: AbjectId;
         autoScroll?: boolean;
@@ -1047,12 +1129,13 @@ export class WidgetManager extends Abject {
         spacing: payload.spacing,
         style: payload.style,
         theme: this.getThemeForWindow(payload.windowId),
-      }));
+      }), payload.windowId);
     });
 
     // ── Canvas widget factory ──
 
     this.on('createCanvas', async (msg: AbjectMessage) => {
+      await this.requireWindowAccess(msg, (msg.payload as { windowId: AbjectId }).windowId, 'createCanvas');
       const { windowId, inputTargetId } = msg.payload as {
         windowId: AbjectId;
         inputTargetId?: AbjectId;
@@ -1267,6 +1350,7 @@ export class WidgetManager extends Abject {
       };
       require(typeof parentLayoutId === 'string' && parentLayoutId.length > 0, 'createSection: parentLayoutId is required');
       require(typeof windowId === 'string' && windowId.length > 0, 'createSection: windowId is required');
+      await this.requireWindowAccess(msg, this.windowOf(parentLayoutId), 'createSection');
       require(typeof title === 'string' && title.length > 0, 'createSection: title is required');
       const theme = this.getThemeForWindow(windowId);
       // Size to content inside a ScrollableVBox; fill a plain VBox when expanding.
@@ -1362,6 +1446,7 @@ export class WidgetManager extends Abject {
     this.on('windowEffect', async (msg: AbjectMessage) => {
       const { windowId, effect, color } = msg.payload as { windowId: AbjectId; effect: string | SlabEffectSpec; color?: string };
       require(typeof windowId === 'string' && windowId.length > 0, 'windowEffect: windowId is required');
+      await this.requireWindowAccess(msg, windowId, 'windowEffect');
       if (typeof effect !== 'string') {
         const problems = validateSlabEffectSpec(effect);
         require(problems.length === 0, `windowEffect: invalid spec: ${problems.join('; ')}`);
@@ -1372,6 +1457,7 @@ export class WidgetManager extends Abject {
     this.on('setWindowModal', async (msg: AbjectMessage) => {
       const { windowId, modal } = msg.payload as { windowId: AbjectId; modal: boolean };
       require(typeof windowId === 'string' && windowId.length > 0, 'setWindowModal: windowId is required');
+      await this.requireWindowAccess(msg, windowId, 'setWindowModal');
       return this.request<boolean>(request(this.id, windowId, 'setModal', { modal: modal === true }));
     });
 
@@ -1507,6 +1593,7 @@ export class WidgetManager extends Abject {
         dialogId: string; kind: string; title: string; message: string;
         confirmLabel?: string; cancelLabel?: string; destructive?: boolean;
         defaultValue?: string; placeholder?: string;
+        card?: { typeId: string; storeId: string; text: string };
       };
       require(typeof dialog?.dialogId === 'string' && dialog.dialogId.length > 0, 'presentDialog needs a dialogId');
       void this.presentModal(dialog);
@@ -1850,6 +1937,7 @@ export class WidgetManager extends Abject {
     dialogId: string; kind: string; title: string; message: string;
     confirmLabel?: string; cancelLabel?: string; destructive?: boolean;
     defaultValue?: string; placeholder?: string;
+    card?: { typeId: string; storeId: string; text: string };
   }): Promise<void> {
     const modal = new ModalDialog();
     modal.setWidgetManagerId(this.id);
@@ -1863,7 +1951,7 @@ export class WidgetManager extends Abject {
             title: dialog.title, message: dialog.message,
             defaultValue: dialog.defaultValue, placeholder: dialog.placeholder,
             confirmLabel: dialog.confirmLabel, cancelLabel: dialog.cancelLabel,
-            theme: this.defaultTheme,
+            theme: this.defaultTheme, ...(dialog.card ? { card: dialog.card } : {}),
           }),
           MODAL_STALL_MS,
         );
@@ -1873,7 +1961,7 @@ export class WidgetManager extends Abject {
           request(this.id, modal.id, 'show', {
             title: dialog.title, message: dialog.message,
             confirmLabel: dialog.confirmLabel, cancelLabel: dialog.cancelLabel, destructive: dialog.destructive,
-            theme: this.defaultTheme,
+            theme: this.defaultTheme, ...(dialog.card ? { card: dialog.card } : {}),
           }),
           MODAL_STALL_MS,
         );
@@ -2546,6 +2634,9 @@ Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read
 Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(msg) handler — for clicks, slider/textInput changes
 Update:   this.call(widgetId, 'update', { text, style, ... })
 Destroy:  this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId })
+Share:    this.call(this.dep('WidgetManager'), 'grantWindowAccess', { windowId, objectId })
+          (a window takes changes only from its owner, its widgets and built-in objects;
+          grant another of your objects access when it should add to or draw in your window)
 
 ### Building the window in show() — the async handler model (there is no self-deadlock)
 
@@ -3288,6 +3379,8 @@ async timerFired(msg) {
       title,
       rect,
       uiServerId: this.uiServerId!,
+      managerId: this.id,
+      ownerAppId: owner,
       chromeless: options?.chromeless,
       resizable: options?.resizable,
       zIndex: options?.zIndex ?? 100,
@@ -3386,6 +3479,8 @@ async timerFired(msg) {
       title,
       rect,
       uiServerId: this.uiServerId!,
+      managerId: this.id,
+      ownerAppId: owner,
       chromeless: options?.chromeless,
       transparent: options?.transparent,
       resizable: options?.resizable,
@@ -3616,12 +3711,56 @@ async timerFired(msg) {
 
   // ── Factory: createLayoutWidget — init layout and add as window child ──
 
+  // ── Who may change a window ───────────────────────────────────────
+
+  /** The window a widget or layout belongs to (a window is its own). */
+  private windowOf(id: AbjectId | undefined): AbjectId | undefined {
+    let current = id;
+    for (let depth = 0; depth < 64 && current; depth++) {
+      if (this.spawnedWindows.has(current)) return current;
+      const window = this.widgetToWindow.get(current);
+      if (window) return window;
+      current = this.layoutOwners.get(current);
+    }
+    return undefined;
+  }
+
+  /**
+   * Whether `callerId` may change `windowId` or anything in it: its owner,
+   * the window itself and its widgets, objects the owner granted access,
+   * and built-in objects.
+   */
+  private async mayTouchWindow(callerId: AbjectId, windowId: AbjectId): Promise<boolean> {
+    if (!this.spawnedWindows.has(windowId)) return false;
+    if (callerId === this.id || callerId === windowId) return true;
+    if (this.windowOwners.get(windowId) === callerId) return true;
+    if (this.windowGrants.get(windowId)?.has(callerId)) return true;
+    if (this.windowOf(callerId) === windowId) return true;
+    return this.isBuiltInCaller(callerId);
+  }
+
+  /** Refuse a change to a window from a caller it does not admit. */
+  private async requireWindowAccess(msg: AbjectMessage, windowId: AbjectId | undefined, what: string): Promise<void> {
+    require(typeof windowId === 'string' && windowId.length > 0, `${what}: needs a window (or a layout in one) made here`);
+    require(await this.mayTouchWindow(msg.routing.from, windowId),
+      `${what}: only the window's owner, its widgets, objects its owner granted access and built-in objects may change it`);
+  }
+
+  /** Only a window's owner (or a built-in object) hands out access to it. */
+  private async requireWindowOwner(msg: AbjectMessage, windowId: AbjectId, what: string): Promise<void> {
+    require(typeof windowId === 'string' && this.spawnedWindows.has(windowId), `${what}: unknown window`);
+    const from = msg.routing.from;
+    require(this.windowOwners.get(windowId) === from || await this.isBuiltInCaller(from),
+      `${what}: only the window's owner grants or revokes access to it`);
+  }
+
   private async createLayoutWidget(
     windowId: AbjectId,
     layout: LayoutAbject
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    layout.bindWindow(windowId, this.id, this.windowOwners.get(windowId));
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
     this.layoutOwners.set(layout.id, windowId);
@@ -3655,6 +3794,8 @@ async timerFired(msg) {
       layout.setParentLayoutId(parentLayoutId);
     }
 
+    const windowId = this.windowOf(parentLayoutId);
+    if (windowId) layout.bindWindow(windowId, this.id, this.windowOwners.get(windowId));
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
     this.layoutOwners.set(layout.id, parentLayoutId);
@@ -3671,11 +3812,14 @@ async timerFired(msg) {
   // ── Factory: createDetachedLayout — init layout without adding to any parent ──
   // Used for layouts that will be split pane children (managed via setLeftChild/setRightChild).
 
-  private async createDetachedLayout(layout: LayoutAbject): Promise<AbjectId> {
+  private async createDetachedLayout(layout: LayoutAbject, windowId: AbjectId): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    layout.bindWindow(windowId, this.id, this.windowOwners.get(windowId));
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
+    // Not in any layout yet, but it belongs to the window it was made for.
+    this.layoutOwners.set(layout.id, windowId);
 
     return layout.id;
   }
@@ -3737,6 +3881,10 @@ async timerFired(msg) {
     showGrid?: boolean;
     yMin?: number;
     yMax?: number;
+    /** slot: the shown object's typeId, the AbjectStore that keeps it, and a starting height. */
+    target?: string;
+    storeId?: AbjectId;
+    height?: number;
     source?: string;
     controls?: boolean;
     muted?: boolean;
@@ -3857,6 +4005,13 @@ async timerFired(msg) {
           items: spec.treeItems, selectedId: spec.selectedId,
           itemHeight: spec.itemHeight, ...base,
         }), rect);
+      case 'slot':
+        require(typeof spec.target === 'string' && spec.target.length > 0, 'slot: target (the shown object\'s typeId) is required');
+        require(typeof spec.storeId === 'string' && spec.storeId.length > 0, 'slot: storeId (the AbjectStore that keeps it) is required');
+        return this.createTypedWidget(spec.windowId, new SlotWidget({
+          type: 'slot', rect, style: spec.style, target: spec.target, storeId: spec.storeId,
+          ...(typeof spec.height === 'number' ? { height: spec.height } : {}), ...base,
+        }), rect);
       case 'goalProgress':
         return this.createTypedWidget(spec.windowId, new GoalProgressWidget({
           type: 'goalProgress', rect, style: spec.style,
@@ -3950,6 +4105,7 @@ async timerFired(msg) {
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    widget.bindWindow(windowId, this.id, this.windowOwners.get(windowId));
     await widget.init(this.bus, this.id);
     this.spawnedWidgets.add(widget.id);
     this.widgetToWindow.set(widget.id, windowId);

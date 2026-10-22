@@ -41,6 +41,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import type { SessionRecord } from './task-session.js';
 import { Abject, isTemporaryAskResponse } from '../core/abject.js';
+import { CARD_GUIDANCE } from './standard-card.js';
 import { withKeyedLock } from '../core/keyed-lock.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
@@ -1270,7 +1271,9 @@ export class ScrumMaster extends Abject {
       || 'The scrum needs a bit more direction — how would you like to proceed?';
     log.info(`ask_user: goal ${goalId.slice(0, 8)} — "${question.slice(0, 80)}"`);
     const ok = await this.request<boolean>(
-      request(this.id, this.goalManagerId, 'requestClarification', { goalId, question }), 10000,
+      request(this.id, this.goalManagerId, 'requestClarification', {
+        goalId, question, ...(Array.isArray(action.choices) ? { choices: action.choices } : {}),
+      }), 10000,
     ).catch(() => false);
     if (!ok) {
       log.warn(`ask_user for ${goalId.slice(0, 8)} could not pause the goal (already terminal?)`);
@@ -2020,6 +2023,7 @@ ${record.length > 0
     ? 'When the work created or modified objects, open with how the user reaches the result: a window they can open now, or — for objects with no visual surface — say plainly that nothing appears on screen and they use it by asking in chat; offer building a window as a natural next step.'
     : 'When the work created or modified objects, open with how the user reaches the result: by asking in this conversation, on a schedule, or through the web gateway. This instance has no display, so nothing opens in a window.'}
 - Markdown formatting is fine and encouraged.
+- ${CARD_GUIDANCE}
 - A markdown image line in a task result (\`![name](abject://...)\`) is how the user sees that picture. Carry each one the answer needs over unchanged, on a line of its own.
 - If the scratchpad is empty or the goal couldn't be resolved, say so plainly.
 - Write the answer itself, with no action JSON.
@@ -3126,7 +3130,7 @@ Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-fre
 The user's mid-round message needs no plan change: the work in flight already serves it. Nothing is cancelled, nothing is staged; agents keep working and the user sees a short acknowledgment. The note stays visible at the round boundary so the review scrum confirms the finished work really honors it.
 
 ### \`ask_user({ question })\` — TERMINAL success
-Pause the sprint and put ONE specific question to the user. Use when a user interjection (or the goal itself) is ambiguous in a way that changes what you would plan — a wrong guess costs a whole round, a good question costs seconds. The user sees the question in their chat; their reply arrives as the next interjection and the sprint resumes into a review scrum that reads it. Ask sparingly and concretely: name the alternatives you are choosing between.
+Pause the sprint and put ONE specific question to the user. Use when a user interjection (or the goal itself) is ambiguous in a way that changes what you would plan — a wrong guess costs a whole round, a good question costs seconds. The user sees the question in their chat; their reply arrives as the next interjection and the sprint resumes into a review scrum that reads it. Ask sparingly and concretely: name the alternatives you are choosing between. When the answers are few and short, list them as \`choices\` (two to four, a few words each) so the user can tap one: \`ask_user({ question: "Which style should I finish?", choices: ["The plain one", "The illustrated one"] })\`. They can still type anything else.
 
 ### \`save_knowledge({ title, content, type?, tags? })\`
 Persist a genuinely reusable FACT to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact that holds on its own, not a log of this sprint.

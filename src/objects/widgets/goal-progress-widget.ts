@@ -31,6 +31,7 @@ export interface GoalProgressWidgetConfig extends WidgetConfig {
 
 const LINE_HEIGHT = 18;
 const TITLE_LINE_HEIGHT = 21;
+const HEADLINE_LINE_HEIGHT = 25;
 const DETAIL_LINE_HEIGHT = 16;
 const CODE_HEIGHT = 18;
 const BAR_HEIGHT = 3;
@@ -95,6 +96,7 @@ export class GoalProgressWidget extends WidgetAbject {
     const f = fontStacks(this.theme);
     if (row.display) return `600 11px ${f.display}`;
     if (row.kind === 'title') return `600 15px ${f.body}`;
+    if (row.kind === 'headline') return `17px ${f.body}`;
     return row.bold ? `600 13px ${f.body}` : `13px ${f.body}`;
   }
   private get metaFont(): string { return `12px ${fontStacks(this.theme).body}`; }
@@ -178,10 +180,10 @@ export class GoalProgressWidget extends WidgetAbject {
       const row = this.rows[index];
       if (row.kind === 'section' && index > 0) localY += SECTION_GAP;
       const font = this.fontFor(row);
-      const lineHeight = row.kind === 'title' ? TITLE_LINE_HEIGHT : LINE_HEIGHT;
+      const lineHeight = row.kind === 'headline' ? HEADLINE_LINE_HEIGHT : row.kind === 'title' ? TITLE_LINE_HEIGHT : LINE_HEIGHT;
       const pad = row.band ? BAND_PAD : 0;
       const x0 = LEFT_PAD + row.depth * INDENT_PX;
-      const textX = x0 + (row.iconName ? ICON_WIDTH : 0);
+      const textX = x0 + (row.iconName || row.iconSpace ? ICON_WIDTH : 0);
 
       const actions = row.actions ?? [];
       const actionsWidth = actions.length > 0
@@ -229,7 +231,7 @@ export class GoalProgressWidget extends WidgetAbject {
         const iconY = contentTop + (lineHeight - ICON_SIZE) / 2;
         const color = this.roleColor(row.iconColorRole);
         if (row.iconName === 'dot') {
-          commands.push(...squareMark(surfaceId, ox + x0 + ICON_SIZE / 2, contentTop + lineHeight / 2, row.kind === 'header' ? 8 : 6, color));
+          commands.push(...squareMark(surfaceId, ox + x0 + ICON_SIZE / 2, contentTop + lineHeight / 2, row.kind === 'header' || row.kind === 'headline' ? 8 : 6, color));
         } else {
           commands.push(...iconCommands(row.iconName, { surfaceId, x: ox + x0, y: iconY, size: ICON_SIZE, color }));
         }

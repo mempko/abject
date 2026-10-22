@@ -16,10 +16,11 @@
  */
 
 import type { IconName } from '../ui/icons.js';
+import { require } from '../core/contracts.js';
 import { orderTopologically, blockedOn, indexById, isTerminal } from '../core/task-graph.js';
 
 export type GoalRowKind =
-  | 'header' | 'title' | 'question' | 'planner' | 'section' | 'task' | 'step'
+  | 'header' | 'headline' | 'title' | 'question' | 'planner' | 'section' | 'task' | 'step'
   | 'more' | 'next' | 'error' | 'result' | 'note' | 'footer' | 'item' | 'empty';
 
 /**
@@ -51,6 +52,8 @@ export interface GoalRow {
   text: string;
   /** No icon: the text starts at the icon column. */
   iconName?: IconName;
+  /** Keep the icon column empty so the text lines up under an icon row above. */
+  iconSpace?: boolean;
   iconColorRole: ColorRole;
   textColorRole: ColorRole;
   /** Short text right-aligned on the first line (a step count, a time). */
@@ -89,6 +92,8 @@ export interface ProgressLike {
   step?: number;
   maxSteps?: number;
   since?: number;
+  /** The step in everyday words, for the person ("Looking up Saturday's forecast"). */
+  say?: string;
 }
 
 /** A task as both callers read it from GoalManager's tuples. */
@@ -176,6 +181,19 @@ export function formatWhen(ts: number, now: number): string {
   if (ts >= today) return clock(ts);
   if (ts >= today - 6 * 86400000) return new Date(ts).toLocaleDateString([], { weekday: 'short' });
   return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+/** How long ago, in words: "just now", "14 seconds ago", "3 minutes ago". */
+export function formatAgo(ms: number): string {
+  const s = Math.floor(Math.max(0, ms) / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s} seconds ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return m === 1 ? 'a minute ago' : `${m} minutes ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return h === 1 ? 'an hour ago' : `${h} hours ago`;
+  const d = Math.floor(h / 24);
+  return d === 1 ? 'a day ago' : `${d} days ago`;
 }
 
 /** The first line of a text, stripped of markdown marks and cut at a word near `max`. */
@@ -658,6 +676,129 @@ export function buildGoalDetailRows(view: GoalView, opts: DetailOptions): GoalRo
       iconColorRole: 'tertiary', textColorRole: 'tertiary',
     });
   }
+  return rows;
+}
+
+// ─── The chat card ───────────────────────────────────────────────────
+
+/** One step of the work as the person reads it: what was said, and when it began. */
+interface StoryStep {
+  text: string;
+  at: number;
+  agentName: string;
+}
+
+/** The `say` lines in the order they came, a repeat folded into the line before it. */
+function storyOf(progress: ProgressLike[]): StoryStep[] {
+  const steps: StoryStep[] = [];
+  for (const e of progress) {
+    const said = e.say ? oneLine(e.say, 160) : '';
+    if (!said) continue;
+    if (steps.length > 0 && steps[steps.length - 1].text === said) continue;
+    steps.push({ text: said, at: e.since ?? e.timestamp, agentName: e.agentName });
+  }
+  return steps;
+}
+
+/** Who is doing the work now: the agents of running tasks, else whoever spoke last. */
+function workersOf(view: Pick<GoalView, 'progress' | 'tasks'>): string[] {
+  const { reported } = attributeProgress(view);
+  const running = new Set(view.tasks.filter(t => isRunning(t, reported)).map(t => t.id));
+  const names: string[] = [];
+  for (let i = view.progress.length - 1; i >= 0 && names.length < 3; i--) {
+    const e = view.progress[i];
+    if (e.taskId && running.has(e.taskId) && !names.includes(e.agentName)) names.push(e.agentName);
+  }
+  if (names.length === 0 && view.progress.length > 0) names.push(view.progress[view.progress.length - 1].agentName);
+  return names;
+}
+
+const STORY_SHOWN = 6;
+
+/**
+ * A running goal as Chat shows it: one sentence of what it is doing now, in
+ * everyday words, with the steps so far behind "Show details". The Goals
+ * window keeps the full card (`buildGoalDetailRows`).
+ */
+export function buildGoalChatRows(view: GoalView, opts: Pick<DetailOptions, 'now' | 'isOpen'>): GoalRow[] {
+  require(typeof view.id === 'string' && view.id.length > 0, 'buildGoalChatRows needs a goal id');
+  const rows: GoalRow[] = [];
+  const story = storyOf(view.progress);
+  const last = story[story.length - 1];
+  const waiting = !!view.question && (view.status === 'active' || view.status === 'paused');
+  const paused = !waiting && view.status === 'paused';
+
+  const headline = waiting ? 'Waiting for your answer'
+    : paused ? 'Paused. Resume when you are ready.'
+    : last?.text ?? `Working on ${view.title}`;
+  const started = view.createdAt ?? story[0]?.at;
+  rows.push({
+    id: `headline:${view.id}`, kind: 'headline', depth: 0,
+    text: headline,
+    iconName: 'dot', iconColorRole: waiting ? 'caution' : paused ? 'neutral' : 'live',
+    textColorRole: 'primary',
+    ...(started ? { detail: `Started ${formatAgo(opts.now - started)}`, detailColorRole: 'tertiary' as ColorRole } : {}),
+  });
+
+  const detailsId = `details:${view.id}`;
+  const open = opts.isOpen(detailsId) ?? false;
+  rows.push({
+    id: detailsId, kind: 'more', depth: 0, iconSpace: true,
+    text: open ? 'Hide details' : 'Show details',
+    iconColorRole: 'live', textColorRole: 'live',
+    click: 'toggle', expanded: open,
+  });
+  if (!open) return rows;
+
+  if (story.length === 0) {
+    rows.push({
+      id: `story-empty:${view.id}`, kind: 'empty', depth: 1,
+      text: 'The steps show here as the work goes.',
+      iconColorRole: 'tertiary', textColorRole: 'tertiary',
+    });
+  }
+  const earlierId = `story-earlier:${view.id}`;
+  const showAll = opts.isOpen(earlierId) ?? false;
+  const hidden = showAll ? 0 : Math.max(0, story.length - STORY_SHOWN);
+  if (hidden > 0) {
+    rows.push({
+      id: earlierId, kind: 'more', depth: 1,
+      text: `Show ${hidden} earlier step${hidden === 1 ? '' : 's'}`,
+      iconName: 'chevronRight', iconColorRole: 'tertiary', textColorRole: 'tertiary',
+      click: 'toggle', expanded: false,
+    });
+  }
+  const moving = view.status === 'active' && !waiting;
+  story.forEach((step, i) => {
+    if (i < hidden) return;
+    const current = moving && i === story.length - 1;
+    const end = i + 1 < story.length ? story[i + 1].at : opts.now;
+    rows.push({
+      id: `story:${view.id}:${i}`, kind: 'step', depth: 1,
+      text: step.text,
+      iconName: current ? 'dot' : 'check',
+      iconColorRole: current ? 'live' : 'success',
+      textColorRole: current ? 'primary' : 'secondary',
+      meta: formatDuration(Math.max(0, end - step.at)),
+      metaColorRole: current ? 'live' : 'tertiary',
+    });
+  });
+
+  const workers = workersOf(view);
+  if (workers.length > 0) {
+    const who = workers.length === 1 ? workers[0] : `${workers.slice(0, -1).join(', ')} and ${workers[workers.length - 1]}`;
+    rows.push({
+      id: `workers:${view.id}`, kind: 'footer', depth: 1,
+      text: `${who} ${workers.length === 1 ? 'is' : 'are'} on it`,
+      iconColorRole: 'tertiary', textColorRole: 'tertiary',
+    });
+  }
+  rows.push({
+    id: `open-goals:${view.id}`, kind: 'footer', depth: 1,
+    text: 'Open in Goals',
+    iconColorRole: 'live', textColorRole: 'live',
+    click: 'select',
+  });
   return rows;
 }
 

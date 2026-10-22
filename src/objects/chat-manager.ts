@@ -590,6 +590,14 @@ export class ChatManager extends Abject {
       } catch { /* best effort */ }
     }
 
+    // The conversation's cards are objects in its folder; they go with it.
+    const storeId = await this.discoverDep('AbjectStore');
+    if (storeId) {
+      try {
+        await this.request(request(this.id, storeId, 'removeFolder', { folder: `chats/${conversationId.toLowerCase()}` }), 30_000);
+      } catch { /* best effort */ }
+    }
+
     if (c.chatId) {
       this.busyChats.delete(c.chatId);
       this.emitGoalActivity();

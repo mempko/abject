@@ -164,6 +164,12 @@ export class Factory extends Abject {
                     optional: true,
                   },
                   {
+                    name: 'data',
+                    type: { kind: 'object', properties: {} },
+                    description: 'Start the clone with this data instead (more of the same thing with different data). For a kept copy in a folder, use AbjectStore copy.',
+                    optional: true,
+                  },
+                  {
                     name: 'registryHint',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Optional registry ID to register the clone in (e.g. workspace registry). Defaults to global registry.',
@@ -270,11 +276,11 @@ export class Factory extends Abject {
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
-      const { objectId, registryHint, withData } = msg.payload as {
-        objectId: AbjectId; registryHint?: AbjectId; withData?: boolean;
+      const { objectId, registryHint, withData, data } = msg.payload as {
+        objectId: AbjectId; registryHint?: AbjectId; withData?: boolean; data?: Record<string, unknown>;
       };
       const hint = await this.admitCopy(msg.routing.from, objectId, registryHint, 'clone');
-      return this.clone(objectId, hint, withData ?? true);
+      return this.clone(objectId, hint, withData ?? true, data);
     });
 
     this.on('instantiate', async (msg: AbjectMessage) => {
@@ -643,8 +649,9 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
    * clonedFrom (the original's typeId when it has one, else its AbjectId) and
    * generation (parent's generation + 1).
    */
-  async clone(objectId: AbjectId, registryHint?: AbjectId, withData = true): Promise<SpawnResult> {
+  async clone(objectId: AbjectId, registryHint?: AbjectId, withData = true, data?: Record<string, unknown>): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
+    require(data === undefined || (typeof data === 'object' && data !== null && !Array.isArray(data)), 'clone: data must be an object');
     require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
 
     const reg = await this.resolveRegistration(objectId, registryHint);
@@ -672,7 +679,10 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       spawnReq.source = reg!.source;
       if (!fromPackage) spawnReq.owner = reg!.owner;
     }
-    if (withData && reg!.data !== undefined) {
+    if (data !== undefined) {
+      // "More of the same": the original's behavior with data of the caller's choosing.
+      spawnReq.data = JSON.parse(JSON.stringify(data));
+    } else if (withData && reg!.data !== undefined) {
       // Deep-copy via JSON so the clone's data is independent of the original's.
       try {
         spawnReq.data = JSON.parse(JSON.stringify(reg!.data));

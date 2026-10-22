@@ -17,10 +17,10 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
-import { buildGoalDetailRows, type GoalRow, type GoalView } from './goal-tree.js';
+import { buildGoalChatRows, type GoalRow, type GoalView } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
 import { chromeCase } from '../core/theme-data.js';
-import { sectionHeaderText, livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps } from './ui-kit.js';
+import { livingStyle, eyeSigilOps, removeSigilOps, type SceneOp, sigilStreamOps } from './ui-kit.js';
 import type { ChatActivity, ChatControls, ChatImage, ChatMessageView } from './chat.js';
 import { Log } from '../core/timed-log.js';
 
@@ -31,12 +31,15 @@ const DEFAULT_WIN_W = 640;
 const DEFAULT_WIN_H = 620;
 
 // ── Bubble styling ─────────────────────────────────────────────────────
-const BUBBLE_MAX_FRACTION = 0.75;
+const BUBBLE_MAX_FRACTION = 0.8;
 const BUBBLE_MIN_WIDTH = 240;
-const SENDER_LABEL_HEIGHT = 18;
-// Static welcome-card body copy; shared by creation and resize reflow so the
-// height estimate never diverges between the two paths.
-const WELCOME_BODY_TEXT = 'Abjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents.\n\nAsk me to explore what objects exist, create new ones, fetch your email, or anything else \u2014 specialized agents pick up the work automatically.';
+const SENDER_LABEL_HEIGHT = 26;
+const CHOICE_HEIGHT = 36;
+/** Cards are as wide as the log allows, up to this. */
+const CARD_MAX_WIDTH = 560;
+const CARD_START_HEIGHT = 160;
+/** Message text size; the estimate before a bubble measures itself uses it too. */
+const BUBBLE_FONT_SIZE = 15;
 const GROUP_WINDOW_MS = 3 * 60_000;
 /** A message reads "now" for this long after it was sent, then shows its time. */
 const NOW_WINDOW_MS = 60_000;
@@ -51,6 +54,11 @@ const RESUME_GLYPH = '\u25B6';     // ▶ resume the paused goal
 const STOP_GLYPH = '\u25A0';       // ■ stop the goal entirely
 const SEND_BTN_SIZE = 44;
 const INPUT_MIN_HEIGHT = 44;
+// What the empty input invites, by what the conversation is doing.
+const PLACEHOLDER_DEFAULT = 'Ask anything, or describe what to make\u2026';
+const PLACEHOLDER_GOAL = 'Add a note while it works\u2026';
+const PLACEHOLDER_PAUSED = 'Add a note, then resume\u2026';
+const PLACEHOLDER_ANSWER = 'Or type your own answer\u2026';
 const COMPOSER_HINT_DEFAULT = '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline';
 const COMPOSER_HINT_GOAL = `\u21B5  Queue a note for the goal   \u00B7   ${PAUSE_GLYPH}  Pause   \u00B7   ${STOP_GLYPH}  Stop`;
 const COMPOSER_HINT_PAUSED = `\u21B5  Send note   \u00B7   ${RESUME_GLYPH}  Resume   \u00B7   ${STOP_GLYPH}  Stop`;
@@ -84,14 +92,21 @@ interface MessageMeta {
 
 interface SuggestionChip {
   label: string;
+  caption: string;
+  icon: string;
   prompt: string;
 }
 
+/** The welcome's tiles: things to try, each sent as a request when tapped. */
 const DEFAULT_SUGGESTIONS: SuggestionChip[] = [
-  { label: 'What objects do I have?', prompt: 'What objects do I have?' },
-  { label: 'Create a weather reporter', prompt: 'Create a weather reporter that posts daily briefings to chat.' },
-  { label: 'Show me the system', prompt: 'Give me a tour of what this system can do.' },
+  { label: 'Check the weather', caption: 'for this weekend at home', icon: 'globe', prompt: 'What is the weather going to be like this weekend?' },
+  { label: 'Make something new', caption: 'an app, a game, a helper', icon: 'plus', prompt: 'I would like to make something new. Ask me what it should be.' },
+  { label: 'Show me around', caption: 'a short tour of what is here', icon: 'grid', prompt: 'Give me a short tour of what this system can do.' },
+  { label: 'Catch me up', caption: 'what my goals did today', icon: 'list', prompt: 'Catch me up on what my goals did today.' },
 ];
+
+/** Height of one row of welcome tiles. */
+const WELCOME_TILE_H = 92;
 
 
 interface ChatWindowArgs {
@@ -147,6 +162,17 @@ export class ChatWindow extends Abject {
 
   /** Per-message metadata (role/sender/timestamp) keyed by label AbjectId. */
   private messageMetadata = new Map<AbjectId, MessageMeta>();
+  /** A question's row of answer buttons, by message id, while it waits for an answer. */
+  private choiceRows = new Map<string, AbjectId>();
+  /** Each answer button: the question it answers and the words it sends. */
+  private choiceButtons = new Map<AbjectId, { messageId: string; text: string }>();
+  /** Card slots in the log, with the card object each shows and its current height. */
+  private cardSlots = new Map<AbjectId, { typeId: string; height: number }>();
+  /** "Pin to desktop" links, by the card each pins. */
+  private pinButtons = new Map<AbjectId, string>();
+  private abjectStoreId?: AbjectId;
+  /** The placeholder the input shows now. */
+  private placeholderShown = PLACEHOLDER_DEFAULT;
   /** bubble label id → its preceding sender header label id (if any). */
   private bubbleSenderLabels = new Map<AbjectId, AbjectId>();
   /** Pending debounced resize-reflow timer. */
@@ -157,6 +183,8 @@ export class ChatWindow extends Abject {
   /** Embedded goal-progress widget shown beneath the activity header. */
   private activityGoalWidgetId?: AbjectId;
   private activityGoalHeight = 0;
+  /** Whether the activity bubble's own text line shows (it steps aside for the goal card). */
+  private activityTextShown = true;
   /** Rows the person opened or folded in the goal card (each has its own default). */
   private goalToggles = new Map<string, boolean>();
   /** The rows last sent to the card: a click flips the row's shown state, and an unchanged build is not resent. */
@@ -169,6 +197,8 @@ export class ChatWindow extends Abject {
 
   /** Welcome-card widget ids (destroyed on first message / clear). */
   private welcomeWidgetIds: AbjectId[] = [];
+  /** The welcome's tile buttons (inside its tile rows), whose taps send a request. */
+  private welcomeTileIds: AbjectId[] = [];
 
   /**
    * Images pasted into the composer (the input emitted their bytes via an
@@ -347,7 +377,10 @@ export class ChatWindow extends Abject {
       if (fromId === this.chatId) {
         if (aspect === 'messageAdded') {
           const m = value as ChatMessageView;
-          void this.render(() => this.drawMessage(m));
+          void this.render(() => this.drawMessage(m, true));
+        } else if (aspect === 'messageAnswered') {
+          const { id } = value as { id: string };
+          void this.render(() => this.retireChoices(id));
         } else if (aspect === 'titleChanged') {
           const { title } = value as { title: string };
           this.conversationTitle = title;
@@ -366,6 +399,28 @@ export class ChatWindow extends Abject {
           return;
         }
         await this.handleSendClick();
+        return;
+      }
+
+      const pinned = aspect === 'click' ? this.pinButtons.get(fromId) : undefined;
+      if (pinned) {
+        await this.pinCard(pinned);
+        return;
+      }
+
+      // A card asked for something: words to send as the person's, or an object to open.
+      if (aspect === 'action' && this.cardSlots.has(fromId)) {
+        const { say, open } = (value ?? {}) as { say?: string; open?: string };
+        if (say) await this.sendToChat({ message: say });
+        else if (open) await this.openObject(open);
+        return;
+      }
+
+      // A tap on one of a question's answers sends it, as if typed.
+      const choice = aspect === 'click' ? this.choiceButtons.get(fromId) : undefined;
+      if (choice) {
+        await this.sendToChat({ message: choice.text });
+        await this.render(() => this.retireChoices(choice.messageId));
         return;
       }
 
@@ -393,7 +448,7 @@ export class ChatWindow extends Abject {
       }
 
       // Welcome suggestion chips: clicking a chip sends the chip's prompt.
-      if (aspect === 'click' && this.welcomeWidgetIds.includes(fromId)) {
+      if (aspect === 'click' && this.welcomeTileIds.includes(fromId)) {
         const chipText = value as string | undefined;
         const prompt = chipText ? this.promptForChipText(chipText) : undefined;
         if (prompt && !this.controls.turnBusy && !this.controls.goalActive) {
@@ -426,7 +481,16 @@ export class ChatWindow extends Abject {
         return;
       }
 
-      // A task, its earlier steps or the older rounds open and fold.
+      // "Open in Goals" under the running goal's steps.
+      if (aspect === 'select' && fromId === this.activityGoalWidgetId) {
+        try {
+          const { id } = JSON.parse(value as string) as { id?: string };
+          if (id?.startsWith('open-goals:')) await this.openGoalInBrowser(id.slice('open-goals:'.length));
+        } catch { /* malformed select */ }
+        return;
+      }
+
+      // The details, and the earlier steps inside them, open and fold.
       if (aspect === 'toggle' && fromId === this.activityGoalWidgetId) {
         try {
           const { id } = JSON.parse(value as string) as { id?: string };
@@ -448,6 +512,14 @@ export class ChatWindow extends Abject {
         if (fromId === this.activityGoalWidgetId) {
           if (Math.abs(h - this.activityGoalHeight) >= 1) {
             this.activityGoalHeight = h;
+            await this.setLabelHeight(fromId, h);
+          }
+          return;
+        }
+        const card = this.cardSlots.get(fromId);
+        if (card) {
+          if (Math.abs(h - card.height) >= 1) {
+            card.height = h;
             await this.setLabelHeight(fromId, h);
           }
           return;
@@ -518,7 +590,7 @@ export class ChatWindow extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: this.theme.tokens.space.md, right: this.theme.tokens.space.lg, bottom: this.theme.tokens.space.md, left: this.theme.tokens.space.lg },
+        margins: { top: this.theme.tokens.space.md, right: this.theme.tokens.space.xxl, bottom: this.theme.tokens.space.lg, left: this.theme.tokens.space.xxl },
         spacing: this.theme.tokens.space.md,
       })
     );
@@ -584,7 +656,7 @@ export class ChatWindow extends Abject {
         specs: [
           {
             type: 'textInput', windowId: this.windowId,
-            placeholder: 'Message the agent…',
+            placeholder: PLACEHOLDER_DEFAULT,
             wordWrap: true, maxLines: 6,
             // Keep the comfortable empty height as the auto-grow floor so the
             // composer doesn't shrink the moment the first character is typed.
@@ -702,6 +774,10 @@ export class ChatWindow extends Abject {
     this.messageLabelIds = [];
     this.shownMessageIds.clear();
     this.messageMetadata.clear();
+    this.choiceRows.clear();
+    this.choiceButtons.clear();
+    this.cardSlots.clear();
+    this.pinButtons.clear();
     this.bubbleSenderLabels.clear();
     this.activityBubbleLabelId = undefined;
     this.activityGoalWidgetId = undefined;
@@ -710,6 +786,7 @@ export class ChatWindow extends Abject {
     this.lastGoalRowsKey = '';
     if (this.goalTick) { this.cancelTimer(this.goalTick); this.goalTick = undefined; }
     this.welcomeWidgetIds = [];
+    this.welcomeTileIds = [];
     this.pendingImages = [];
     if (this.reflowTimer) {
       this.cancelTimer(this.reflowTimer);
@@ -722,7 +799,7 @@ export class ChatWindow extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   /** Draw one message once, whether it came from the transcript or live. */
-  private async drawMessage(m: ChatMessageView): Promise<void> {
+  private async drawMessage(m: ChatMessageView, live = false): Promise<void> {
     if (!this.windowId || !m || m.role === 'activity') return;
     if (m.id) {
       if (this.shownMessageIds.has(m.id)) return;
@@ -730,8 +807,132 @@ export class ChatWindow extends Abject {
     }
     await this.removeWelcomeState();
     // The message's own time; 0 means it was saved before times were kept.
-    await this.appendBubble(m.role, m.sender, m.text, m.markdown, m.at > 0 ? m.at : undefined);
+    await this.appendBubble(m.role, m.sender, m.text, m.markdown, m.at > 0 ? m.at : undefined, live);
+    if (m.card?.typeId) await this.addCardSlot(m.card.typeId);
+    if (m.id && m.choices && m.choices.length > 0 && !m.answered) await this.addChoices(m.id, m.choices, live);
     await this.keepActivityLast();
+  }
+
+  /** A card under its message: a slot showing the card's own object. */
+  private async addCardSlot(typeId: string): Promise<void> {
+    precondition(typeId.length > 0, 'a card slot needs the card\'s typeId');
+    if (!this.messageLogId || !this.windowId) return;
+    const storeId = this.abjectStoreId ?? await this.discoverDep('AbjectStore') ?? undefined;
+    if (!storeId) return;
+    this.abjectStoreId = storeId;
+    const width = Math.min(this.computeAvailableWidth(), CARD_MAX_WIDTH);
+    const { widgetIds: [slotId] } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId!, 'create', {
+      specs: [{ type: 'slot', windowId: this.windowId, target: typeId, storeId, height: CARD_START_HEIGHT }],
+    }));
+    this.cardSlots.set(slotId, { typeId, height: CARD_START_HEIGHT });
+    this.send(request(this.id, slotId, 'addDependent', {}));
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+      widgetId: slotId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width, height: CARD_START_HEIGHT },
+      alignment: 'left',
+    }));
+    this.messageLabelIds.push(slotId);
+
+    // A quiet link under the card pins a copy of it to the desktop.
+    const { widgetIds: [pinId] } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId!, 'create', {
+      specs: [{ type: 'button', windowId: this.windowId, text: 'Pin to desktop', style: { flat: true, color: this.theme.textMeta, fontSize: 12, align: 'left' } }],
+    }));
+    this.pinButtons.set(pinId, typeId);
+    this.send(request(this.id, pinId, 'addDependent', {}));
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+      widgetId: pinId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 24 },
+      alignment: 'left',
+    }));
+    this.messageLabelIds.push(pinId);
+  }
+
+  /** Pin a copy of a card to the desktop (Pinboard keeps it in a window of its own). */
+  private async pinCard(typeId: string): Promise<void> {
+    const pinboardId = await this.discoverDep('Pinboard');
+    if (!pinboardId) return;
+    try {
+      await this.request(request(this.id, pinboardId, 'pin', { typeId, title: this.conversationTitle ?? 'Pinned' }), 30_000);
+    } catch { /* no desktop, or the card is gone */ }
+  }
+
+  /** Open an object a card points at: wake it if it sleeps, then show it. */
+  private async openObject(typeId: string): Promise<void> {
+    const registryId = await this.resolveRegistryId();
+    if (!registryId) return;
+    try {
+      const objectId = await this.request<AbjectId | null>(request(this.id, registryId, 'resolveType', { typeId }));
+      if (objectId) await this.request(request(this.id, objectId, 'show', {}));
+    } catch { /* it cannot be shown */ }
+  }
+
+  /** The answers a question offers, as buttons under it; a tap sends that answer. */
+  private async addChoices(messageId: string, choices: string[], animate = false): Promise<void> {
+    precondition(choices.length > 0, 'a choice row needs choices');
+    if (!this.messageLogId || !this.windowId || this.choiceRows.has(messageId)) return;
+    const space = this.theme.tokens.space;
+    const rowId = await this.request<AbjectId>(request(this.id, this.widgetManagerId!, 'createDetachedHBox', {
+      windowId: this.windowId, spacing: space.md, margins: { top: space.xs, right: 0, bottom: space.xs, left: 0 },
+    }));
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(request(this.id, this.widgetManagerId!, 'create', {
+      specs: choices.map(text => ({
+        type: 'button', windowId: this.windowId, text,
+        style: {
+          background: this.theme.buttonBg, borderColor: this.theme.statusWarning, color: this.theme.textPrimary, fontSize: 14,
+          ...(animate ? { enter: 'rise' as const } : {}),
+        },
+      })),
+    }));
+    for (let i = 0; i < widgetIds.length; i++) {
+      this.choiceButtons.set(widgetIds[i], { messageId, text: choices[i] });
+      this.send(request(this.id, widgetIds[i], 'addDependent', {}));
+      await this.request(request(this.id, rowId, 'addLayoutChild', {
+        widgetId: widgetIds[i],
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: ChatWindow.choiceWidth(choices[i]), height: CHOICE_HEIGHT },
+      }));
+    }
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+      widgetId: rowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: this.computeBubbleMaxWidth(), height: CHOICE_HEIGHT + space.xs * 2 },
+      alignment: 'left',
+    }));
+    this.messageLabelIds.push(rowId);
+    this.choiceRows.set(messageId, rowId);
+    await this.refreshPlaceholder();
+  }
+
+  /** A button wide enough for its words at the choice font. */
+  private static choiceWidth(text: string): number {
+    return Math.min(320, Math.ceil(text.length * 8.4) + 40);
+  }
+
+  /** The question was answered: its buttons go. */
+  private async retireChoices(messageId: string): Promise<void> {
+    const rowId = this.choiceRows.get(messageId);
+    if (!rowId) return;
+    this.choiceRows.delete(messageId);
+    for (const [buttonId, choice] of this.choiceButtons) {
+      if (choice.messageId === messageId) this.choiceButtons.delete(buttonId);
+    }
+    await this.detachLabel(rowId);
+    await this.refreshPlaceholder();
+  }
+
+  /** The input's placeholder says what typing does right now. */
+  private async refreshPlaceholder(): Promise<void> {
+    if (!this.textInputId) return;
+    const c = this.controls;
+    const next = this.choiceRows.size > 0 || c.clarifying ? PLACEHOLDER_ANSWER
+      : c.goalActive && c.paused ? PLACEHOLDER_PAUSED
+      : c.goalActive ? PLACEHOLDER_GOAL
+      : PLACEHOLDER_DEFAULT;
+    if (next === this.placeholderShown) return;
+    this.placeholderShown = next;
+    try { await this.request(request(this.id, this.textInputId, 'update', { placeholder: next })); } catch { /* widget gone */ }
   }
 
   /** Chat started or stopped working: status strip, eye, title dot. */
@@ -759,6 +960,7 @@ export class ChatWindow extends Abject {
     // waits; a running goal keeps it live, since a message there is a note.
     const locked = this.controls.turnBusy && !this.controls.goalActive;
     await this.setInputDisabled(locked);
+    await this.refreshPlaceholder();
     if (prev.turnBusy !== this.controls.turnBusy && this.sendBtnId) {
       // Long-op accent halo on the send button so the person sees the agent
       // is working even when the activity bubble scrolls off-screen.
@@ -947,7 +1149,8 @@ export class ChatWindow extends Abject {
   private async showActivityBubble(): Promise<void> {
     if (this.activityBubbleLabelId) return;
     this.activityGoalHeight = 0;
-    this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activity?.header ?? THINKING_TEXT, false, Date.now());
+    this.activityTextShown = true;
+    this.activityBubbleLabelId = await this.appendBubble('activity', 'Abject', this.activity?.header ?? THINKING_TEXT, false, Date.now(), true);
 
     // Embed the shared goal-progress widget directly beneath the header so the
     // running goal tree renders identically to the Goals window (word-wrapped,
@@ -992,7 +1195,26 @@ export class ChatWindow extends Abject {
         .filter(g => g.parentId === root.id)
         .map(g => ({ id: g.id, title: g.title, status: g.status, latest: g.latestMessage })),
     };
-    return buildGoalDetailRows(view, { now: Date.now(), isOpen: (id) => this.goalToggles.get(id), surface: 'chat' });
+    return buildGoalChatRows(view, { now: Date.now(), isOpen: (id) => this.goalToggles.get(id) });
+  }
+
+  /** Show or hide the activity bubble's own text line. */
+  private async setActivityTextShown(shown: boolean): Promise<void> {
+    if (!this.activityBubbleLabelId || shown === this.activityTextShown) return;
+    this.activityTextShown = shown;
+    try {
+      await this.request(request(this.id, this.activityBubbleLabelId, 'update', { visible: shown }));
+    } catch { /* bubble gone */ }
+  }
+
+  /** Open the Goals window on the goal this chat is running. */
+  private async openGoalInBrowser(goalId: string): Promise<void> {
+    if (!goalId) return;
+    const browserId = await this.discoverDep('GoalBrowser');
+    if (!browserId) return;
+    try {
+      await this.request(request(this.id, browserId, 'showGoal', { goalId }));
+    } catch { /* the Goals window is unavailable */ }
   }
 
   /** Send the card its rows when they changed, and keep its timers ticking while the goal runs. */
@@ -1007,6 +1229,9 @@ export class ChatWindow extends Abject {
         await this.request(request(this.id, this.activityGoalWidgetId, 'update', { rows }));
       } catch { /* widget may be gone */ }
     }
+    // The card's headline says what the goal is doing, so the bubble's own
+    // line ("Thinking…", the goal title) steps aside while the card shows.
+    await this.setActivityTextShown(rows.length === 0);
     const root = this.activity?.goals.find(g => g.id === this.activity?.rootId);
     if (!this.goalTick && root?.status === 'active') {
       this.goalTick = this.setTimer(() => {
@@ -1068,118 +1293,109 @@ export class ChatWindow extends Abject {
     if (!this.messageLogId || !this.windowId) return;
     if (this.welcomeWidgetIds.length > 0) return;
 
-    const tokens = this.theme.tokens;
-    const headingText = sectionHeaderText(this.theme, 'Welcome to Chat');
-    const bodyText = WELCOME_BODY_TEXT;
-
-    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
-
-    const specs: Array<Record<string, unknown>> = [
-      // Spacer above the card for vertical breathing room.
-      {
-        type: 'label', windowId: this.windowId, text: '',
-        style: { color: this.theme.textTertiary, fontSize: 1, wordWrap: false, selectable: false },
-      },
-      // Display-font heading.
-      {
-        type: 'label', windowId: this.windowId, text: headingText,
-        style: {
-          color: this.theme.textHeading,
-          fontSize: 20,
-          fontWeight: 'bold',
-          fontFamily: 'display',
-          wordWrap: false,
-          selectable: false,
-          align: 'center' as const,
-        },
-      },
-      // Body description in a ruled card.
-      {
-        type: 'label', windowId: this.windowId, text: bodyText,
-        style: {
-          color: this.theme.textSecondary,
-          background: this.theme.inputBg,
-          borderColor: this.theme.windowBorder,
-          radius: tokens.radius.lg,
-          fontSize: 13,
-          wordWrap: true,
-          selectable: false,
-          align: 'center' as const,
-        },
-      },
-    ];
-
+    const now = new Date();
+    const hour = now.getHours();
+    const part = hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening';
+    const day = now.toLocaleDateString([], { weekday: 'long' });
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs })
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          // Spacer that centres the welcome in the empty log.
+          { type: 'label', windowId: this.windowId, text: '',
+            style: { color: this.theme.textTertiary, fontSize: 1, wordWrap: false, selectable: false } },
+          { type: 'label', windowId: this.windowId, text: chromeCase(this.theme, `${day} ${part}`),
+            style: { color: this.theme.textSecondary, fontSize: 12, fontFamily: 'display', wordWrap: false, selectable: false } },
+          { type: 'label', windowId: this.windowId, text: `Good ${part}.`,
+            style: { color: this.theme.textHeading, fontSize: 40, fontFamily: 'display', wordWrap: false, selectable: false } },
+          { type: 'label', windowId: this.windowId, text: 'What would you like to do today?',
+            style: { color: this.theme.textSecondary, fontSize: 17, wordWrap: true, selectable: false } },
+        ],
+      })
     );
-    const [spacerId, headingId, bodyId] = widgetIds;
-
-    const addCentered = async (id: AbjectId, width: number, height: number) => {
+    const [spacerId, dayId, greetingId, askId] = widgetIds;
+    const layout = this.welcomeCardLayout();
+    const add = async (id: AbjectId, height: number) => {
       await this.request(request(this.id, this.messageLogId!, 'addLayoutChild', {
         widgetId: id,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-        preferredSize: { width, height },
+        preferredSize: { width: layout.cardWidth, height },
         alignment: 'center',
       }));
       this.welcomeWidgetIds.push(id);
       this.messageLabelIds.push(id);
     };
+    await add(spacerId, layout.heights[0]);
+    await add(dayId, layout.heights[1]);
+    await add(greetingId, layout.heights[2]);
+    await add(askId, layout.heights[3]);
 
-    await addCentered(spacerId, cardWidth, spacerHeight);
-    await addCentered(headingId, cardWidth, headingHeight);
-    await addCentered(bodyId, cardWidth, bodyHeight);
+    // Two rows of two tiles; a tap sends the tile's request.
+    for (let row = 0; row < DEFAULT_SUGGESTIONS.length / 2; row++) {
+      const rowId = await this.request<AbjectId>(request(this.id, this.widgetManagerId!, 'createDetachedHBox', {
+        windowId: this.windowId, spacing: this.theme.tokens.space.lg, margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      }));
+      const tiles = DEFAULT_SUGGESTIONS.slice(row * 2, row * 2 + 2);
+      const { widgetIds: tileIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: tiles.map(t => ({
+            type: 'button', windowId: this.windowId, text: t.label,
+            style: { icon: t.icon, caption: t.caption, background: this.theme.buttonBg, borderColor: this.theme.divider, fontSize: 15, enter: 'rise' },
+          })),
+        })
+      );
+      for (const tileId of tileIds) {
+        this.welcomeTileIds.push(tileId);
+        this.send(request(this.id, tileId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: tileId,
+          sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+        }));
+      }
+      await add(rowId, WELCOME_TILE_H);
+    }
   }
 
   /**
-   * Shared sizing for the welcome card so creation (showWelcomeState) and
-   * resize reflow (updateWelcomeLayout) compute identical geometry.
+   * Shared sizing for the welcome so creation (showWelcomeState) and resize
+   * reflow (updateWelcomeLayout) compute identical geometry: the spacer,
+   * day line, greeting and question heights, then the tile rows.
    */
-  private welcomeCardLayout(): {
-    cardWidth: number;
-    spacerHeight: number;
-    headingHeight: number;
-    bodyHeight: number;
-  } {
+  private welcomeCardLayout(): { cardWidth: number; heights: number[] } {
     const tokens = this.theme.tokens;
-    const cardWidth = Math.min(this.computeBubbleMaxWidth(), 460);
-    const innerWidth = cardWidth - tokens.space.lg * 2;
-    // Use the markdown estimator (paragraph-aware) + padding so the card never clips.
-    const bodyHeight = this.estimateBubbleHeight(WELCOME_BODY_TEXT, innerWidth, true) + tokens.space.xl;
-    return { cardWidth, spacerHeight: tokens.space.xl, headingHeight: 30, bodyHeight };
+    const cardWidth = Math.min(this.computeAvailableWidth(), 520);
+    const content = [20, 52, 30, WELCOME_TILE_H, WELCOME_TILE_H];
+    const used = content.reduce((a, b) => a + b, 0) + tokens.space.md * content.length;
+    // The log sits under the title bar and status strip, over the composer.
+    const logHeight = (this.currentRect?.height ?? DEFAULT_WIN_H) - 36 - STATUS_STRIP_H - 110;
+    const spacer = Math.max(tokens.space.xl, Math.floor((logHeight - used) / 2));
+    return { cardWidth, heights: [spacer, ...content] };
   }
 
   /**
-   * Re-fit the welcome card widgets in place for the current window size.
-   * updateLayoutChild merges the new preferredSize into the existing layout
-   * entry, so the three labels keep their ids and content — no destroy/recreate
-   * cycle, hence no blank frame while replacements render (resize flash).
+   * Re-fit the welcome in place for the current window size. updateLayoutChild
+   * merges the new preferredSize into the existing layout entry, so the
+   * widgets keep their ids and content: no blank frame while replacements
+   * render (resize flash).
    */
   private async updateWelcomeLayout(): Promise<void> {
     if (!this.messageLogId || !this.windowId) return;
     if (this.welcomeWidgetIds.length === 0) return;
 
-    const { cardWidth, spacerHeight, headingHeight, bodyHeight } = this.welcomeCardLayout();
-    const heights = [spacerHeight, headingHeight, bodyHeight];
-    const updates: Promise<unknown>[] = [];
-    for (let i = 0; i < this.welcomeWidgetIds.length; i++) {
-      const id = this.welcomeWidgetIds[i];
-      const height = heights[i] ?? bodyHeight;
-      updates.push(
-        this.request(request(this.id, this.messageLogId!, 'updateLayoutChild', {
-          widgetId: id,
-          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-          preferredSize: { width: cardWidth, height },
-          alignment: 'center',
-        }))
-      );
-    }
-    await Promise.all(updates);
+    const { cardWidth, heights } = this.welcomeCardLayout();
+    await Promise.all(this.welcomeWidgetIds.map((id, i) =>
+      this.request(request(this.id, this.messageLogId!, 'updateLayoutChild', {
+        widgetId: id,
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: cardWidth, height: heights[i] ?? WELCOME_TILE_H },
+        alignment: 'center',
+      }))));
   }
 
   private async removeWelcomeState(): Promise<void> {
     if (this.welcomeWidgetIds.length === 0) return;
     const ids = [...this.welcomeWidgetIds];
     this.welcomeWidgetIds = [];
+    this.welcomeTileIds = [];
     for (const id of ids) {
       await this.removeLabel(id);
     }
@@ -1284,16 +1500,17 @@ export class ChatWindow extends Abject {
   private bubbleStyleForRole(role: BubbleRole): { background: string; color: string; align: BubbleAlign; borderColor?: string } {
     const t = this.theme;
     switch (role) {
+      // Your words sit in a quiet block; replies are plain text on the page.
       case 'user':
-        return { background: t.inputBg, color: t.textPrimary, align: 'right', borderColor: t.accent };
+        return { background: t.activeItemBg, color: t.textPrimary, align: 'right' };
       case 'assistant':
-        return { background: t.windowBg, color: t.textPrimary, align: 'left', borderColor: t.windowBorder };
+        return { background: t.windowBg, color: t.textPrimary, align: 'left' };
       case 'system':
         return { background: t.progressTrack, color: t.textSecondary, align: 'center' };
       case 'error':
         return { background: t.inputBg, color: t.statusError, align: 'left', borderColor: t.statusError };
       case 'activity':
-        return { background: t.windowBg, color: t.textSecondary, align: 'left', borderColor: t.accentSecondary };
+        return { background: t.windowBg, color: t.textSecondary, align: 'left' };
     }
   }
 
@@ -1308,9 +1525,10 @@ export class ChatWindow extends Abject {
     const after = time ? `  \u00B7  ${time}` : '';
     switch (role) {
       case 'user':
-        return { text: `${time ? `${time}  \u00B7  ` : ''}${name}  \u25A0`, color: this.theme.accent, bold: true };
+        return { text: `${name}${after}`, color: this.theme.accent, bold: false };
       case 'assistant':
-        return { text: `\u25C9  ${name}${after}`, color: this.theme.textSecondary, bold: true };
+      case 'activity':
+        return { text: `${name}${after}`, color: this.theme.textMeta, bold: false };
       case 'error':
         return { text: `${name}${after}`, color: this.theme.statusError, bold: true };
       default:
@@ -1320,7 +1538,7 @@ export class ChatWindow extends Abject {
 
   private computeAvailableWidth(): number {
     // Window content area = window width - side margins - scrollbar.
-    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - this.theme.tokens.space.lg * 2 - 8);
+    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - this.theme.tokens.space.xxl * 2 - 8);
   }
 
   private computeBubbleMaxWidth(): number {
@@ -1371,7 +1589,7 @@ export class ChatWindow extends Abject {
   }
 
   private estimateBubbleHeight(text: string, innerWidth: number, markdown: boolean): number {
-    const fontSize = 13;
+    const fontSize = BUBBLE_FONT_SIZE;
     const lineHeight = fontSize + 4;
     const raw = markdown
       ? estimateMarkdownHeight(text, innerWidth, fontSize)
@@ -1391,6 +1609,7 @@ export class ChatWindow extends Abject {
     text: string,
     markdown = false,
     at?: number,
+    animate = false,
   ): Promise<AbjectId> {
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;
 
@@ -1419,6 +1638,7 @@ export class ChatWindow extends Abject {
                 wordWrap: false,
                 selectable: false,
                 align,
+                ...(animate ? { enter: 'rise' as const } : {}),
               },
             },
           ],
@@ -1448,7 +1668,8 @@ export class ChatWindow extends Abject {
             type: 'contentBlock', windowId: this.windowId, text,
             style: {
               color,
-              fontSize: 13,
+              fontSize: BUBBLE_FONT_SIZE,
+              ...(animate ? { enter: 'rise' as const } : {}),
               wordWrap: true,
               selectable: true,
               markdown,
@@ -1622,6 +1843,10 @@ export class ChatWindow extends Abject {
     }
     this.messageLabelIds = [];
     this.messageMetadata.clear();
+    this.choiceRows.clear();
+    this.choiceButtons.clear();
+    this.cardSlots.clear();
+    this.pinButtons.clear();
     this.bubbleSenderLabels.clear();
     this.activityBubbleLabelId = undefined;
     this.activityGoalWidgetId = undefined;
@@ -1631,6 +1856,7 @@ export class ChatWindow extends Abject {
     // Welcome widgets (chips + card) live inside the message log and were
     // just cleared above; drop our tracked ids.
     this.welcomeWidgetIds = [];
+    this.welcomeTileIds = [];
   }
 }
 

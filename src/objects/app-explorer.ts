@@ -118,6 +118,20 @@ export function appExplorerPeerAttributionLabels(
   ];
 }
 
+/** One of the person's objects as AbjectStore keeps it (its `list` entry). */
+interface KeptEntry {
+  typeId: string;
+  objectId: string;
+  name: string;
+  description?: string;
+  tags: string[];
+  folder: string;
+  loading: 'boot' | 'needed';
+  asleep: boolean;
+  owner: string;
+  savedAt: number;
+}
+
 export class AppExplorer extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
@@ -134,6 +148,10 @@ export class AppExplorer extends Abject {
   private outerSplitId?: AbjectId;
   private innerSplitId?: AbjectId;
   private cachedObjects: ObjectRegistration[] = [];
+  /** What AbjectStore keeps about each of the person's objects, by live id (or typeId while asleep). */
+  private kept = new Map<string, KeptEntry>();
+  /** Kept objects that are asleep (listed by typeId). */
+  private asleepIds = new Set<string>();
 
   // ── Remote mode ──
   private isRemote = false;
@@ -161,6 +179,7 @@ export class AppExplorer extends Abject {
   private detailPaneId?: AbjectId;
   private detailWidgetIds: AbjectId[] = [];
   private detailButtonIds: Map<AbjectId, string> = new Map();
+  private detailRebuild: Promise<void> = Promise.resolve();
 
   // ── Shared workspace context (drives the optional Shared tab) ──
   private isSharedWorkspace = false;
@@ -250,6 +269,44 @@ export class AppExplorer extends Abject {
     if (this.registryId) {
       await this.request(request(this.id, this.registryId, 'subscribe', {}));
     }
+  }
+
+  /**
+   * The registry's objects plus what AbjectStore keeps about the person's own
+   * (folder, tags, when it loads), with kept objects that sleep listed too.
+   * Remote browsing shows only the registry.
+   */
+  private async objectsWithKept(): Promise<ObjectRegistration[]> {
+    const live = await this.registryList();
+    this.kept.clear();
+    this.asleepIds.clear();
+    if (this.isRemote) return live;
+    const storeId = await this.discoverDep('AbjectStore');
+    if (!storeId) return live;
+    let entries: KeptEntry[] = [];
+    try {
+      entries = await this.request<KeptEntry[]>(request(this.id, storeId, 'list', {}));
+    } catch { return live; }
+    const out = [...live];
+    for (const e of entries) {
+      if (e.objectId) {
+        this.kept.set(e.objectId, e);
+        continue;
+      }
+      // Asleep: listed under its typeId until something wakes it.
+      this.kept.set(e.typeId, e);
+      this.asleepIds.add(e.typeId);
+      out.push({
+        id: e.typeId as AbjectId,
+        name: e.name,
+        manifest: { name: e.name, description: e.description ?? '', version: '', interface: { id: 'abjects:asleep' as InterfaceId, name: e.name, description: '', methods: [] }, tags: e.tags },
+        status: { state: 'stopped' },
+        registeredAt: e.savedAt,
+        owner: e.owner,
+        typeId: e.typeId,
+      } as unknown as ObjectRegistration);
+    }
+    return out;
   }
 
   private async registryList(): Promise<ObjectRegistration[]> {
@@ -591,7 +648,7 @@ export class AppExplorer extends Abject {
     });
 
     this.on('objectRegistered', async () => {
-      this.cachedObjects = await this.registryList();
+      this.cachedObjects = await this.objectsWithKept();
       if (this.windowId) {
         await this.rebuildKindList();
         if (this.selectedKindName) {
@@ -601,7 +658,7 @@ export class AppExplorer extends Abject {
     });
 
     this.on('objectUnregistered', async () => {
-      this.cachedObjects = await this.registryList();
+      this.cachedObjects = await this.objectsWithKept();
       if (this.windowId) {
         await this.rebuildKindList();
         if (this.selectedKindName) {
@@ -618,7 +675,7 @@ export class AppExplorer extends Abject {
     this.selectedKindTab = 0;
     this.selectedInstanceIndex = -1;
     await this.refreshSharedContext();
-    this.cachedObjects = await this.registryList();
+    this.cachedObjects = await this.objectsWithKept();
     await this.buildUI();
     this.changed('visibility', true);
     return true;
@@ -814,9 +871,14 @@ export class AppExplorer extends Abject {
     const { user, system } = this.groupByKind();
 
     this.userKindEntries = Array.from(user.keys()).sort();
-    const userItems = this.userKindEntries.map(name => ({
-      label: name, value: name, secondary: `(${user.get(name)!.length})`,
-    }));
+    const userItems = this.userKindEntries.map(name => {
+      // Folders and tags ride along, so the list's search finds them.
+      const instances = user.get(name)!;
+      const folders = [...new Set(instances.map(o => this.kept.get(o.id)?.folder).filter((f): f is string => !!f))].slice(0, 2);
+      const tags = [...new Set(instances.flatMap(o => this.kept.get(o.id)?.tags ?? []))].filter(t => t !== 'scriptable').slice(0, 3);
+      const extra = [...folders, ...tags.map(t => `#${t}`)].join(' · ');
+      return { label: name, value: name, secondary: `(${instances.length})${extra ? ` · ${extra}` : ''}` };
+    });
     let userSelected = -1;
     if (this.selectedKindName && this.selectedKindTab === 0) {
       userSelected = this.userKindEntries.indexOf(this.selectedKindName);
@@ -886,12 +948,14 @@ export class AppExplorer extends Abject {
 
     const items = this.instanceEntries.map(inst => {
       const shortId = inst.id.slice(0, 8);
+      const keptEntry = this.kept.get(inst.id);
+      const where = keptEntry ? ` · ${keptEntry.folder}${this.asleepIds.has(inst.id) ? ' · asleep' : ''}` : '';
       return {
         label: `${inst.manifest.name}`,
         value: inst.id,
         secondary: this.selectedKindTab === 2
           ? `${this.ownerLabel(inst)} · [${shortId}...]`
-          : `[${shortId}...]`,
+          : this.asleepIds.has(inst.id) ? `asleep${where.replace(' · asleep', '')}` : `[${shortId}...]${where}`,
       };
     });
 
@@ -906,7 +970,16 @@ export class AppExplorer extends Abject {
   // Detail Pane (Pane 3)
   // ═══════════════════════════════════════════════════════════════════
 
-  private async rebuildDetailPane(): Promise<void> {
+  /**
+   * Rebuilds run one at a time: a refresh and a Registry event arriving
+   * together would otherwise both clear the pane and both fill it.
+   */
+  private rebuildDetailPane(): Promise<void> {
+    this.detailRebuild = this.detailRebuild.then(() => this.rebuildDetailPaneNow(), () => this.rebuildDetailPaneNow());
+    return this.detailRebuild;
+  }
+
+  private async rebuildDetailPaneNow(): Promise<void> {
     if (!this.detailPaneId || !this.windowId) return;
 
     // Fire-and-forget destroy old detail widgets
@@ -1012,6 +1085,20 @@ export class AppExplorer extends Abject {
         style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true, selectable: true } });
     }
 
+    // Where it is kept and when it runs.
+    const keptEntry = this.kept.get(inst.id);
+    const asleep = this.asleepIds.has(inst.id);
+    if (keptEntry) {
+      specs.push({ type: 'label', windowId, rect: r0,
+        text: `Folder: ${keptEntry.folder}`,
+        style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true, selectable: true } });
+      specs.push({ type: 'label', windowId, rect: r0,
+        text: keptEntry.loading === 'needed'
+          ? `Loads: when needed${asleep ? ' (asleep now)' : ' (awake now)'}`
+          : 'Loads: at startup',
+        style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true, selectable: true } });
+    }
+
     // Methods
     const iface = manifest.interface;
     if (iface && 'methods' in iface && Array.isArray(iface.methods) && iface.methods.length > 0) {
@@ -1026,9 +1113,18 @@ export class AppExplorer extends Abject {
     specs.push({ type: 'label', windowId, rect: r0,
       text: actionsHeader, style: { ...sectionHeaderStyle(this.theme, 12) } });
 
-    // Browse button (always)
+    // Browse button (always; a sleeping object is woken first)
     specs.push({ type: 'button', windowId, rect: r0,
-      text: 'Browse', style: { fontSize: 12 }, action: 'browse' });
+      text: asleep ? 'Wake' : 'Browse', style: { fontSize: 12 }, action: asleep ? 'wake' : 'browse' });
+
+    // The person's own kept objects: where they live and when they run.
+    if (keptEntry && !this.isRemote && this.selectedKindTab === 0) {
+      specs.push({ type: 'button', windowId, rect: r0, text: 'Move to folder…', style: { fontSize: 12 }, action: 'moveFolder' });
+      specs.push({ type: 'button', windowId, rect: r0, text: 'Edit tags…', style: { fontSize: 12 }, action: 'editTags' });
+      specs.push({ type: 'button', windowId, rect: r0,
+        text: keptEntry.loading === 'needed' ? 'Load at startup' : 'Load when needed', style: { fontSize: 12 }, action: 'toggleLoading' });
+      specs.push({ type: 'button', windowId, rect: r0, text: 'Make a copy', style: { fontSize: 12 }, action: 'copy' });
+    }
 
     // Peer-owned entries (Shared tab) are read-only: Edit Source and Delete are
     // suppressed — never a permission error on click — while scriptable entries
@@ -1240,6 +1336,10 @@ export class AppExplorer extends Abject {
     if (action && aspect === 'click') {
       if (action === 'browse') {
         await this.browseSelectedKind();
+      } else if (action === 'wake' || action === 'moveFolder' || action === 'editTags' || action === 'toggleLoading' || action === 'copy') {
+        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
+          await this.keptAction(action, this.instanceEntries[this.selectedInstanceIndex]);
+        }
       } else if (action === 'delete') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           const target = this.instanceEntries[this.selectedInstanceIndex];
@@ -1291,6 +1391,42 @@ export class AppExplorer extends Abject {
   // Browse / Clone / Delete / Clone to Local
   // ═══════════════════════════════════════════════════════════════════
 
+  /** Wake, move, retag, change loading, or copy one of the person's kept objects. */
+  private async keptAction(action: string, inst: ObjectRegistration): Promise<void> {
+    const entry = this.kept.get(inst.id);
+    const storeId = await this.discoverDep('AbjectStore');
+    if (!entry || !storeId) return;
+    const ref = entry.typeId;
+    try {
+      if (action === 'wake') {
+        const regId = this.workspaceRegistryId ?? this.registryId;
+        if (regId) await this.request(request(this.id, regId, 'resolveType', { typeId: ref }), 30_000);
+      } else if (action === 'moveFolder') {
+        const folder = await this.prompt({ title: 'Move to folder', message: `Which folder should "${entry.name}" live in? Use lowercase words, nested with /, such as user/kitchen.`, defaultValue: entry.folder });
+        if (!folder || folder.trim() === entry.folder) return;
+        await this.request(request(this.id, storeId, 'place', { objectId: ref, folder: folder.trim() }));
+      } else if (action === 'editTags') {
+        const current = entry.tags.filter(t => t !== 'scriptable').join(', ');
+        const answer = await this.prompt({ title: 'Edit tags', message: `Tags for "${entry.name}", separated by commas. They help you find and filter it.`, defaultValue: current });
+        if (answer === null || answer.trim() === current) return;
+        const tags = answer.split(',').map(t => t.trim()).filter(Boolean);
+        await this.request(request(this.id, storeId, 'place', { objectId: ref, tags }));
+      } else if (action === 'toggleLoading') {
+        await this.request(request(this.id, storeId, 'place', { objectId: ref, loading: entry.loading === 'needed' ? 'boot' : 'needed' }));
+      } else if (action === 'copy') {
+        const made = await this.request<{ typeId: string }>(request(this.id, storeId, 'copy', { objectId: ref }), 30_000);
+        await this.notify(`Made a copy: ${made.typeId.split('/').pop()}`, 'success');
+      }
+    } catch (err) {
+      this.windowEffect('shake');
+      await this.notify(err instanceof Error ? err.message.replace(/^\[REQUIRE\]\s*/, '') : String(err), 'warning');
+      return;
+    }
+    this.cachedObjects = await this.objectsWithKept();
+    await this.rebuildKindList();
+    await this.rebuildInstanceList();
+  }
+
   private async browseSelectedKind(): Promise<void> {
     if (!this.selectedKindName) return;
 
@@ -1311,15 +1447,21 @@ export class AppExplorer extends Abject {
 
     let ok = true;
     try {
-      await this.request(request(this.id, this.factoryId,
-        'kill', { objectId }));
+      if (this.asleepIds.has(objectId)) {
+        // Asleep: nothing runs, so its record is all there is to remove.
+        const storeId = await this.discoverDep('AbjectStore');
+        ok = !!storeId && await this.request<boolean>(request(this.id, storeId, 'remove', { objectId }));
+      } else {
+        await this.request(request(this.id, this.factoryId,
+          'kill', { objectId }));
+      }
     } catch {
       ok = false; /* object may already be gone */
     }
     if (!ok) this.windowEffect('shake');
     await this.notify(ok ? 'Object deleted' : 'Delete failed', ok ? 'success' : 'error');
 
-    this.cachedObjects = await this.registryList();
+    this.cachedObjects = await this.objectsWithKept();
 
     if (this.selectedKindName) {
       // Mirrors rebuildInstanceList's predicate so "is this kind now empty?"

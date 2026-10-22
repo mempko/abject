@@ -45,7 +45,7 @@ export const UI_OBJECTS = [
   // Taskbar resolves its optional browsers at init, so every object it offers a
   // row for has to be spawned before it.
   'AbjectEditor', 'PeersViewer', 'Taskbar',
-  'CommandPalette', 'WindowSwitcher', 'DataBrowser',
+  'CommandPalette', 'WindowSwitcher', 'DataBrowser', 'Pinboard',
 ] as const;
 
 /** All per-workspace objects in dependency order. */
@@ -67,6 +67,7 @@ export const WORKSPACE_OBJECT_REQUIRES: Readonly<Record<string, readonly string[
   GoalBrowser: ['GoalManager'],
   JobBrowser: ['JobManager'],
   ChatBrowser: ['ChatManager'],
+  Pinboard: ['AbjectStore'],
   Taskbar: ['AppExplorer', 'ChatBrowser', 'JobBrowser', 'PeersViewer'],
 };
 

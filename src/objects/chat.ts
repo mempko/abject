@@ -23,6 +23,8 @@ import { replyKindQuestions, REPLY_KINDS_TO_AUDIT, criterion, instruction } from
 import { choiceOf, type DecisionOutcome, type DecisionQuestion } from '../llm/decision.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, invariant } from '../core/contracts.js';
+import { cleanChoices } from '../core/choices.js';
+import { cleanCardData, cardText, standardCardManifest, STANDARD_CARD_SOURCE, CARD_GUIDANCE } from './standard-card.js';
 import type { AgentAction } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
@@ -110,6 +112,9 @@ const THINKING_TEXT = '◉ Thinking…';
 /** Progress lines of a running goal kept for its card (GoalManager keeps 200). */
 const GOAL_PROGRESS_KEPT = 200;
 
+/** The name the assistant's messages carry. */
+const ASSISTANT_SENDER = 'Abject';
+
 /** How long the answer to "does this instance have a display" is trusted. */
 const DISPLAY_CHECK_TTL_MS = 60_000;
 
@@ -181,6 +186,29 @@ export interface ChatMessageView {
   text: string;
   markdown: boolean;
   at: number;
+  /** Short answers the person can tap; the question waits for one until `answered`. */
+  choices?: string[];
+  /** The question was answered (by a tap or a typed reply), so its choices are spent. */
+  answered?: boolean;
+  /** A card under the message: the card object's typeId and what it shows as plain text. */
+  card?: { typeId: string; text: string };
+}
+
+/** A ```card fenced block in a reply: its JSON, and the text without it. */
+export function extractCardBlock(text: string): { text: string; card?: unknown } {
+  const match = /```card\s*\n([\s\S]*?)\n```/.exec(text);
+  if (!match) return { text };
+  try {
+    const card = JSON.parse(match[1]);
+    return { text: (text.slice(0, match.index) + text.slice(match.index + match[0].length)).replace(/\n{3,}/g, '\n\n').trim(), card };
+  } catch {
+    return { text };
+  }
+}
+
+/** An entry as the model reads it: its text, then its card's plain text. */
+function withCardText(entry: { content: string; card?: { text: string } }): string {
+  return entry.card ? `${entry.content}${entry.content ? '\n\n' : ''}${entry.card.text}` : entry.content;
 }
 
 // ─── Chat-specific types ─────────────────────────────────────────────
@@ -201,6 +229,17 @@ interface ConversationEntry {
   media?: boolean;
   /** Display-name override; otherwise "You" / "Agent" / "System" by role. */
   sender?: string;
+  /** Shown as an error (kept display-only, with `media`). */
+  error?: boolean;
+  /** A question's suggested answers; `answered` once the person replied. */
+  choices?: string[];
+  answered?: boolean;
+  /**
+   * A card shown under the message: an object kept by AbjectStore (in this
+   * conversation's folder) and the plain text it reads as, which the model,
+   * the terminal app and search use.
+   */
+  card?: { typeId: string; text: string };
   /**
    * An uploaded file stored in the workspace FileSystem. Unlike `media`,
    * attachments ARE included in the LLM context: once with full content (on
@@ -260,6 +299,8 @@ export class Chat extends Abject {
   private clarificationPending = false;
   /** The question the paused goal asked, shown pinned on its card. */
   private pendingQuestion?: string;
+  /** Answers the person can tap, from this turn's `clarify`; posted with its question. */
+  private turnChoices?: string[];
 
   private conversationHistory: ConversationEntry[] = [];
   private turnContext?: ConversationContext;
@@ -429,6 +470,17 @@ export class Chat extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'postCard',
+                description: 'Put a card in the conversation, under optional text: either standard card data (Chat makes it as its own object in this conversation\'s folder) or the typeId of a kept object that draws itself (answers render). Returns { messageId, typeId }.',
+                parameters: [
+                  { name: 'card', type: { kind: 'object', properties: {} }, description: 'Standard card data: { label?, aside?, tone?, icon?, value?, valueCaption?, title?, body?, facts?: [{label, value}], actions?: [{label, say | open, primary?}], notice?: { text, action? } }', optional: true },
+                  { name: 'typeId', type: { kind: 'primitive', primitive: 'string' }, description: 'A kept object to show instead', optional: true },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Words above the card', optional: true },
+                  { name: 'sender', type: { kind: 'primitive', primitive: 'string' }, description: 'Display name (default Abject)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {} },
+              },
+              {
                 name: 'attachMedia',
                 description: 'Append an assistant message containing markdown media (typically an image data URI from a screenshot or render). Bypasses the LLM context so large data URIs never enter it; the LLM sees the agent\'s text summary instead. Use this from sub-task agents that captured user-facing media.',
                 parameters: [
@@ -474,6 +526,15 @@ export class Chat extends Abject {
                   text: { kind: 'primitive', primitive: 'string' },
                   markdown: { kind: 'primitive', primitive: 'boolean' },
                   at: { kind: 'primitive', primitive: 'number' },
+                  choices: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                }},
+              },
+              {
+                name: 'messageAnswered',
+                description: 'Fires when the person replies to a question that offered choices: its choices are spent.',
+                payload: { kind: 'object', properties: {
+                  conversationId: { kind: 'primitive', primitive: 'string' },
+                  id: { kind: 'primitive', primitive: 'string' },
                 }},
               },
               {
@@ -561,7 +622,7 @@ export class Chat extends Abject {
         terminalActions: {
           goal: { type: 'success', execute: true },
           done: { type: 'success', resultFields: ['text', 'result', 'reasoning'] },
-          clarify: { type: 'success', resultFields: ['question'], ownContentRequired: true },
+          clarify: { type: 'success', execute: true, resultFields: ['question'], ownContentRequired: true },
           fail: { type: 'error', resultFields: ['reason'] },
         },
         intermediateActions: ['reply'],
@@ -639,7 +700,7 @@ export class Chat extends Abject {
       const { markdown, sender } = msg.payload as { markdown: string; sender?: string };
       if (!markdown?.trim()) return false;
       const trimmed = markdown.trim();
-      const displaySender = sender || 'Agent';
+      const displaySender = sender || ASSISTANT_SENDER;
       // Persist as a media-flagged entry. The flag keeps the data URI out of
       // every subsequent LLM call while still letting a reopened window replay
       // the image.
@@ -669,6 +730,30 @@ export class Chat extends Abject {
       this.appendMessage('system', sender || 'System', message.trim(), true, id);
       this.schedulePersist();
       return true;
+    });
+
+    // A card in the conversation: standard card data (Chat makes the card
+    // object), or the typeId of any kept object that draws itself.
+    this.on('postCard', async (msg: AbjectMessage) => {
+      const { card, typeId, text, sender } = msg.payload as { card?: unknown; typeId?: string; text?: string; sender?: string };
+      precondition(card !== undefined || (typeof typeId === 'string' && typeId.length > 0), 'postCard needs card data or the typeId of an object to show');
+      const words = typeof text === 'string' ? text.trim().slice(0, 4000) : '';
+      let shown: { typeId: string; text: string };
+      if (card !== undefined) {
+        shown = await this.makeCard(card);
+      } else {
+        const storeId = await this.discoverDep('AbjectStore');
+        precondition(!!storeId, 'postCard needs the workspace AbjectStore');
+        const kept = await this.request<Array<{ typeId: string; name: string; description?: string }>>(request(this.id, storeId!, 'list', {}));
+        const found = kept.find(e => e.typeId === typeId);
+        precondition(!!found, `postCard: no kept object '${typeId}' in this workspace`);
+        shown = { typeId: found!.typeId, text: `[${found!.name}: ${found!.description ?? ''}]` };
+      }
+      const id = uuidv4();
+      this.recordEntry({ id, role: 'assistant', content: words, card: shown, ...(sender ? { sender } : {}) });
+      this.appendMessage('assistant', sender || ASSISTANT_SENDER, words, true, id, { card: shown });
+      this.schedulePersist();
+      return { messageId: id, typeId: shown.typeId };
     });
 
     this.on('getState', async () => {
@@ -759,9 +844,9 @@ export class Chat extends Abject {
       if (!this._currentGoalId) return;
 
       if (aspect === 'goalClarificationRequested') {
-        const data = value as { goalId: string; question: string };
+        const data = value as { goalId: string; question: string; choices?: unknown };
         if (data.goalId === this._currentGoalId) {
-          await this.handleClarificationRequested(data.question);
+          await this.handleClarificationRequested(data.question, cleanChoices(data.choices));
         }
         return;
       }
@@ -923,7 +1008,7 @@ export class Chat extends Abject {
           this._streamBuffer = '';
           const id = uuidv4();
           this.recordEntry({ id, role: 'assistant', content: text });
-          this.appendMessage('assistant', 'Agent', await this.showable(text), true, id);
+          this.appendMessage('assistant', ASSISTANT_SENDER, await this.showable(text), true, id);
           this.schedulePersist();
           this.stepStreamChars = 0;
           this.scheduleActivityRefresh();
@@ -949,7 +1034,7 @@ export class Chat extends Abject {
       const entry = goalId ? this.liveGoals.get(goalId) : undefined;
       if (!entry || entry.status !== 'active') return;
       const note = `Lost contact with goal "${entry.title}" (${result.error ?? 'wait failed'}), its last recorded status is active. Progress is unconfirmed; this chat will receive further goal events.`;
-      this.appendMessage('system', 'Chat', note, false);
+      this.postDisplayOnly('system', 'Chat', note);
     });
   }
 
@@ -1059,7 +1144,10 @@ export class Chat extends Abject {
    * terminal gateway, bridges, the window). Persisting it is the caller's
    * business; some messages (errors, notes) are shown but never saved.
    */
-  private appendMessage(role: Exclude<ChatRole, 'activity'>, sender: string, text: string, markdown: boolean, id: string = uuidv4()): void {
+  private appendMessage(
+    role: Exclude<ChatRole, 'activity'>, sender: string, text: string, markdown: boolean,
+    id: string = uuidv4(), extra: { choices?: string[]; card?: { typeId: string; text: string } } = {},
+  ): void {
     precondition(typeof text === 'string', 'message text must be a string');
     this.changed('messageAdded', {
       conversationId: this.conversationId ?? '',
@@ -1069,7 +1157,50 @@ export class Chat extends Abject {
       text,
       markdown,
       at: Date.now(),
+      ...(extra.choices ? { choices: extra.choices } : {}),
+      ...(extra.card ? { card: extra.card } : {}),
     });
+  }
+
+  /**
+   * Show a message and keep it for the window only: a reopened conversation
+   * replays it, the model's context leaves it out (errors, pause notes,
+   * connection notes).
+   */
+  private postDisplayOnly(role: 'assistant' | 'system' | 'error', sender: string, text: string, markdown = false): void {
+    precondition(text.trim().length > 0, 'a display-only message needs text');
+    const id = uuidv4();
+    this.recordEntry({
+      id, role: role === 'error' ? 'system' : role, content: text, media: true, sender,
+      ...(role === 'error' ? { error: true } : {}),
+    });
+    this.appendMessage(role, sender, text, markdown, id);
+    this.schedulePersist();
+  }
+
+  /** Put a question to the person, with the answers they can tap, and keep it. */
+  private postQuestion(question: string, choices: string[] | undefined): void {
+    precondition(question.trim().length > 0, 'a question needs text');
+    const id = uuidv4();
+    this.recordEntry({ id, role: 'assistant', content: question, ...(choices ? { choices } : {}) });
+    this.appendMessage('assistant', ASSISTANT_SENDER, question, true, id, choices ? { choices } : {});
+    this.schedulePersist();
+  }
+
+  /**
+   * The person replied: the latest open question is answered and its
+   * choices are spent. Listeners hear `messageAnswered` to retire them.
+   */
+  private markQuestionAnswered(): void {
+    for (let i = this.conversationHistory.length - 1; i >= 0; i--) {
+      const entry = this.conversationHistory[i];
+      if (entry.role === 'user') continue;
+      if (!entry.choices || entry.answered) return;
+      entry.answered = true;
+      if (entry.id) this.changed('messageAnswered', { conversationId: this.conversationId ?? '', id: entry.id });
+      this.schedulePersist();
+      return;
+    }
   }
 
   /** Add a message to the saved conversation, stamped with when it joined. */
@@ -1123,11 +1254,13 @@ export class Chat extends Abject {
   /** The saved conversation as listeners render it. */
   private async transcriptViews(): Promise<ChatMessageView[]> {
     return Promise.all(this.conversationHistory.map(async (entry) => {
-      const role: ChatRole = entry.role === 'user' ? 'user' : entry.role === 'assistant' ? 'assistant' : 'system';
-      const defaultSender = entry.role === 'user' ? 'You' : entry.role === 'assistant' ? 'Agent' : 'System';
+      const role: ChatRole = entry.error ? 'error' : entry.role === 'user' ? 'user' : entry.role === 'assistant' ? 'assistant' : 'system';
+      const defaultSender = entry.error ? 'Error' : entry.role === 'user' ? 'You' : entry.role === 'assistant' ? ASSISTANT_SENDER : 'System';
       return {
         id: entry.id ?? uuidv4(),
         role,
+        ...(entry.choices ? { choices: entry.choices, answered: !!entry.answered } : {}),
+        ...(entry.card ? { card: entry.card } : {}),
         sender: entry.sender ?? defaultSender,
         text: entry.role === 'assistant' ? await this.showable(entry.content) : entry.content,
         // Attachment chips use markdown (bold filename) even though they're user-role.
@@ -1400,14 +1533,62 @@ export class Chat extends Abject {
    * returned, into the conversation where the user asked.
    */
   private async deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed'; goalId?: string }): Promise<void> {
+    // A result may carry a card: { text, card } from an agent, or a ```card
+    // block in the synthesized answer.
+    const r = outcome.result;
+    const carried = r && typeof r === 'object' && 'card' in (r as Record<string, unknown>) ? (r as { card?: unknown }).card : undefined;
     const text = outcome.status === 'completed'
-      ? (typeof outcome.result === 'string' ? outcome.result : JSON.stringify(outcome.result))
+      ? (typeof r === 'string' ? r
+        : carried !== undefined ? String((r as { text?: unknown; summary?: unknown }).text ?? (r as { summary?: unknown }).summary ?? '')
+        : JSON.stringify(r))
       : `The goal did not complete: ${outcome.error ?? 'unknown error'}`;
-    if (!text?.trim()) return;
+    await this.postReply(text ?? '', { sourceGoalId: outcome.goalId, card: carried });
+  }
+
+  /**
+   * Post an answer: its text, and a card when it carries one (a ```card
+   * block in the text, or card data given). A card that does not pass its
+   * check is left out and the text still goes.
+   */
+  private async postReply(rawText: string, opts: { sourceGoalId?: string; card?: unknown } = {}): Promise<void> {
+    const { text, card: block } = extractCardBlock(rawText);
+    const cardData = opts.card ?? block;
+    const card = cardData !== undefined ? await this.makeCard(cardData).catch((err) => {
+      log.warn(`[Chat] card left out: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }) : undefined;
+    if (!text.trim() && !card) return;
     const id = uuidv4();
-    this.recordEntry({ id, role: 'assistant', content: text.trim(), sourceGoalId: outcome.goalId });
-    this.appendMessage('assistant', 'Agent', await this.showable(text.trim()), true, id);
+    this.recordEntry({ id, role: 'assistant', content: text.trim(), ...(opts.sourceGoalId ? { sourceGoalId: opts.sourceGoalId } : {}), ...(card ? { card } : {}) });
+    this.appendMessage('assistant', ASSISTANT_SENDER, await this.showable(text.trim()), true, id, card ? { card } : {});
     this.schedulePersist();
+  }
+
+  /**
+   * A standard card for this conversation: checked, made as its own object
+   * in the conversation's folder (asleep until shown), tagged `card`.
+   */
+  private async makeCard(raw: unknown): Promise<{ typeId: string; text: string }> {
+    const card = cleanCardData(raw);
+    const storeId = await this.discoverDep('AbjectStore');
+    precondition(!!storeId, 'cards need the workspace AbjectStore');
+    const made = await this.request<{ typeId: string }>(request(this.id, storeId!, 'create', {
+      manifest: standardCardManifest(card),
+      source: STANDARD_CARD_SOURCE,
+      data: { card },
+      folder: this.cardFolder(),
+      tags: ['card'],
+      loading: 'needed',
+      // The system's: a card outlives this Chat instance (whose id changes
+      // each time the conversation reopens).
+      owner: '',
+    }), 30_000);
+    return { typeId: made.typeId, text: cardText(card) };
+  }
+
+  /** The folder this conversation's cards live in. */
+  private cardFolder(): string {
+    return `chats/${(this.conversationId ?? this.id).toLowerCase()}`;
   }
 
   /** Record a finished goal for planning context (newest last, capped at 8). */
@@ -1514,7 +1695,7 @@ export class Chat extends Abject {
     if (!ok) { this.playEffect('shake'); return false; }
     this.goalPaused = true;
     this.pushControls();
-    this.appendMessage('assistant', 'Agent', 'Paused. Work has stopped. Send a note to steer the goal, then resume to continue or stop to end it.', false);
+    this.postDisplayOnly('assistant', ASSISTANT_SENDER, 'Paused. Work has stopped. Send a note to steer the goal, then resume to continue or stop to end it.');
     return true;
   }
 
@@ -1555,7 +1736,7 @@ export class Chat extends Abject {
    * The scrum master paused the goal to ask the user a question. Show it, and
    * take the next message as the answer (which resumes the goal).
    */
-  private async handleClarificationRequested(question: string): Promise<void> {
+  private async handleClarificationRequested(question: string, choices?: string[]): Promise<void> {
     const goalId = this._currentGoalId;
     if (!goalId) return;
     this.goalPaused = true;
@@ -1563,7 +1744,7 @@ export class Chat extends Abject {
     this.pendingQuestion = question;
     this.pushControls();
     this.scheduleActivityRefresh();
-    this.appendMessage('assistant', 'Agent', question, true);
+    this.postQuestion(question, choices);
   }
 
   /**
@@ -1575,6 +1756,7 @@ export class Chat extends Abject {
     const goalId = this._currentGoalId;
     if (!goalId || !this.goalManagerId) return;
     const id = uuidv4();
+    this.markQuestionAnswered();
     this.recordEntry({ id, role: 'user', content: `[Note to the running goal] ${note}` });
     this.appendMessage('user', 'You', note, false, id);
     this.schedulePersist();
@@ -1582,7 +1764,7 @@ export class Chat extends Abject {
       request(this.id, this.goalManagerId, 'appendGoalNote', { goalId, note })
     ).catch(() => false);
     if (!ok) {
-      this.appendMessage('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).', false);
+      this.postDisplayOnly('error', 'Error', 'Could not deliver the note to the goal (it may have just finished).');
       this.playEffect('shake');
       return;
     }
@@ -1605,6 +1787,13 @@ export class Chat extends Abject {
 
   private async handleAgentAct(action: AgentAction, caller: { id: AbjectId; taskId: string }): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action}`);
+
+    // A question for the person: its suggested answers ride with the question
+    // the turn ends on (the terminal result carries the question text).
+    if (action.action === 'clarify') {
+      this.turnChoices = cleanChoices(action.choices);
+      return { success: true };
+    }
 
     // Handle remember action directly (no agent dispatch needed)
     if (action.action === 'remember') {
@@ -1784,7 +1973,9 @@ So:
   irreversible choice. When the system could settle it instead (which object or skill, whether
   something exists here, what some state is), create a goal and find out. The user will see
   your question and respond.
-  \`{ "action": "clarify", "question": "Did you mean X or Y?", "assumptions": [
+  When the likely answers are few and short, list them as \`choices\` (two to four, a few
+  words each) so the user can tap one; they can still type anything else.
+  \`{ "action": "clarify", "question": "Which day should I look at?", "choices": ["Saturday", "Sunday", "Both days"], "assumptions": [
     { "assumption": "User wants to modify the existing Counter", "confidence": "high" },
     { "assumption": "The reset should set count to zero", "confidence": "low" }
   ] }\`
@@ -1794,6 +1985,8 @@ So:
   \`{ "action": "done", "text": "Here are the results: ..." }\`
   Everything you assert in done text about an action or an outcome must trace to a goal result from this conversation. With no goal run this turn, done text may greet, answer from known facts, or acknowledge and ask, but it may not claim an action happened or was verified. If the user asked you to DO something and you have no goal result yet, you are not done: create the goal instead.
   When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity; the result fits.
+
+  ${CARD_GUIDANCE}
 
   **Self-contained text rule.** The done text is the user's ONLY view of the result. Do not reference internal artifacts the user can't see — no "see above", "see the prioritized list", "see scratchpad", "see goal X", "see the attached", "as shown earlier". The user has not seen anything earlier; they only see this reply. If the goal result or scratchpad contains a list, table, or detailed data the user asked for, INLINE it directly in the done text. Pull values out of the scratchpad and write them into your reply.
 
@@ -1959,7 +2152,7 @@ A single successful creation goal is a complete turn. End it with **done**.
    */
   private async handleFileUploaded(name: string, mimeType: string, base64: string): Promise<void> {
     if (!this.fileSystemId) {
-      this.appendMessage('error', 'Upload', 'No filesystem available to store the file.', false);
+      this.postDisplayOnly('error', 'Upload', 'No filesystem available to store the file.');
       this.playEffect('shake');
       return;
     }
@@ -1973,7 +2166,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       );
     } catch (err) {
       log.warn(`[Chat] failed to store upload ${safeName}:`, err);
-      this.appendMessage('error', 'Upload', `Failed to store "${safeName}".`, false);
+      this.postDisplayOnly('error', 'Upload', `Failed to store "${safeName}".`);
       this.playEffect('shake');
       return;
     }
@@ -2084,7 +2277,9 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private captureGoalContext(): ConversationContext | undefined {
     this.conversationHistory = identifyMessages(this.conversationId ?? this.id, this.conversationHistory);
-    return this.conversationHistory.length ? captureConversation(this.conversationId ?? this.id, this.conversationHistory) : undefined;
+    return this.conversationHistory.length
+      ? captureConversation(this.conversationId ?? this.id, this.conversationHistory.map(e => (e.card ? { ...e, content: withCardText(e) } : e)))
+      : undefined;
   }
 
   /**
@@ -2172,7 +2367,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     // on it can skip the re-prompt the shapes asked for.
     const nativeOnly = !(mode === 'act' && shaped);
     const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
-      .map(e => ({ role: e.role, content: e.content.slice(0, 300) }));
+      .map(e => ({ role: e.role, content: withCardText(e).slice(0, 300) }));
     const outcome = await this.askDecision('chat.audit', {
       request: userText.slice(0, 1500), text: draft.slice(0, 4000), recent,
     }, replyKindQuestions(), { onBehalfOf: 'Chat', nativeOnly });
@@ -2213,7 +2408,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private async decideRoute(userText: string, newAttachment: boolean): Promise<{ outcome: DecisionOutcome; route: string; routeP: number } | null> {
     const recent = this.conversationHistory.filter(e => e.media !== true).slice(-7, -1)
-      .map(e => ({ role: e.role, content: e.content.slice(0, 500) }));
+      .map(e => ({ role: e.role, content: withCardText(e).slice(0, 500) }));
     const recentGoals = [...this.liveGoals.values()].slice(-3).map(g => ({ title: g.title, status: g.status }));
     const outcome = await this.askDecision('chat.route', {
       message: userText.slice(0, 3000), recent, recent_goals: recentGoals, has_new_attachment: newAttachment,
@@ -2237,7 +2432,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       const outcome = await this.handleAgentAct({ action: 'goal', title, description: userText.trim() } as AgentAction, { id: this.id, taskId: `route-${uuidv4()}` }) as { success: boolean; error?: string };
       if (!outcome.success) {
         // Fall back to the normal turn: nothing was created.
-        return this.runTaskTurn(userText, this.conversationHistory.filter(e => e.media !== true).slice(-MAX_CONVERSATION_ENTRIES).map(e => ({ role: e.role, content: e.content })), desktop);
+        return this.runTaskTurn(userText, this.conversationHistory.filter(e => e.media !== true).slice(-MAX_CONVERSATION_ENTRIES).map(e => ({ role: e.role, content: withCardText(e) })), desktop);
       }
       return { success: true, result: '', goalCreated: this._goalCreatedThisTurn };
     } finally {
@@ -2262,7 +2457,9 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     // The user's message joins the transcript. Skipped when empty (an
     // image-only send, where the image messages were already committed).
+    this.turnChoices = undefined;
     if (userText) {
+      this.markQuestionAnswered();
       const id = uuidv4();
       this.recordEntry({ id, role: 'user', content: userText });
       this.appendMessage('user', 'You', userText, false, id);
@@ -2299,7 +2496,7 @@ A single successful creation goal is a complete turn. End it with **done**.
           }
           continue;
         }
-        initialMessages.push({ role: entry.role, content: entry.content });
+        initialMessages.push({ role: entry.role, content: withCardText(entry) });
       }
       // Persist the flipped `injected` flags so a reload doesn't re-send bytes.
       if (attachmentsInjected) this.schedulePersist();
@@ -2334,16 +2531,17 @@ A single successful creation goal is a complete turn. End it with **done**.
 
       if (result.success) {
         const text = (result.result as string) ?? '';
-        if (text) {
-          const id = uuidv4();
-          this.recordEntry({ id, role: 'assistant', content: text });
-          this.appendMessage('assistant', 'Agent', await this.showable(text), true, id);
-          this.schedulePersist();
+        const choices = this.turnChoices;
+        this.turnChoices = undefined;
+        if (text && choices) {
+          this.postQuestion(text, choices);
+        } else if (text) {
+          await this.postReply(text);
         }
       } else {
         const errorText = (result.error ?? 'Unknown error').slice(0, 200);
         const note = result.maxStepsReached ? ' (step limit reached)' : '';
-        this.appendMessage('error', 'Error', errorText + note, false);
+        this.postDisplayOnly('error', 'Error', errorText + note);
         this.playEffect('glitch');
         await this.notify(
           result.maxStepsReached ? 'Agent stopped: step limit reached' : 'Agent error',
@@ -2354,7 +2552,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       this._currentTicketId = undefined;
       if (!this._currentGoalId) this.removeActivity();
       const errMsg = err instanceof Error ? err.message : String(err);
-      this.appendMessage('error', 'Error', errMsg.slice(0, 200), false);
+      this.postDisplayOnly('error', 'Error', errMsg.slice(0, 200));
       this.playEffect('glitch');
       await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
     }

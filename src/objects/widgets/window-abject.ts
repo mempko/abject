@@ -37,6 +37,14 @@ export interface WindowConfig {
   title: string;
   rect: Rect;
   uiServerId: AbjectId;
+  /**
+   * The WidgetManager that made this window and the object it made it for.
+   * With them the window takes changes only from its owner, its own widgets,
+   * WidgetManager and whoever WidgetManager admits (owner grants, built-in
+   * objects); without them it takes changes from anyone.
+   */
+  managerId?: AbjectId;
+  ownerAppId?: AbjectId;
   chromeless?: boolean;
   transparent?: boolean;
   resizable?: boolean;
@@ -96,6 +104,12 @@ export class WindowAbject extends Abject {
   get surface(): string | undefined { return this.surfaceId; }
 
   private children: AbjectId[] = [];
+  /** Who made this window and for whom (see WindowConfig). */
+  private readonly managerId?: AbjectId;
+  private readonly ownerAppId?: AbjectId;
+  /** Senders WidgetManager admitted to this window, so they are asked about once. */
+  private admitted = new Set<AbjectId>();
+  private static readonly ADMITTED_MAX = 256;
   private childRects: Map<AbjectId, Rect> = new Map();
   private expandedSelects: Set<AbjectId> = new Set();
   private focusedChildId?: AbjectId;
@@ -307,6 +321,8 @@ export class WindowAbject extends Abject {
     });
 
     this.uiServerId = config.uiServerId;
+    this.managerId = config.managerId;
+    this.ownerAppId = config.ownerAppId;
     this.title = config.title;
     this.rect = { ...config.rect };
     this.focusDecoration = config.focusDecoration ?? null;
@@ -325,8 +341,41 @@ export class WindowAbject extends Abject {
     this.setupHandlers();
   }
 
+  /**
+   * Whether `from` may change this window: its owner, its widgets, the
+   * UIServer and WidgetManager always; anyone else when WidgetManager admits
+   * them (an owner's grant, a widget of this window, a built-in object).
+   */
+  private async admits(from: AbjectId): Promise<boolean> {
+    if (!this.managerId) return true;
+    if (from === this.id || from === this.managerId || from === this.ownerAppId || from === this.uiServerId) return true;
+    if (this.children.includes(from) || this.admitted.has(from)) return true;
+    const ok = await this.request<boolean>(
+      request(this.id, this.managerId, 'admitsToWindow', { windowId: this.id, objectId: from }), 5000,
+    ).catch(() => false);
+    if (ok === true) {
+      if (this.admitted.size >= WindowAbject.ADMITTED_MAX) this.admitted.clear();
+      this.admitted.add(from);
+    }
+    return ok === true;
+  }
+
+  /** Refuse a change from a sender this window does not admit. */
+  private async requireAdmitted(msg: AbjectMessage, what: string): Promise<void> {
+    contractRequire(await this.admits(msg.routing.from),
+      `${what}: only this window's owner, its widgets, objects its owner granted access and built-in objects may change it`);
+  }
+
   private setupHandlers(): void {
+    // WidgetManager: an owner revoked someone's access.
+    this.on('forgetAdmitted', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.managerId) return false;
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.admitted.delete(objectId);
+    });
+
     this.on('addChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'addChild');
       const { widgetId, rect } = msg.payload as { widgetId: AbjectId; rect: Rect };
       console.debug(`[Window:${this.id}] addChild — widgetId=${widgetId}`);
       this.children.push(widgetId);
@@ -355,6 +404,7 @@ export class WindowAbject extends Abject {
     });
 
     this.on('removeChild', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'removeChild');
       const { widgetId } = msg.payload as { widgetId: AbjectId };
       if (!this.children.includes(widgetId)) return true;  // Not a direct child (layout-managed) — no-op
       this.children = this.children.filter((id) => id !== widgetId);
@@ -368,6 +418,7 @@ export class WindowAbject extends Abject {
     });
 
     this.on('setTitle', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'setTitle');
       const { title } = msg.payload as { title: string };
       this.title = title;
       if (this.surfaceId) {
@@ -409,9 +460,12 @@ export class WindowAbject extends Abject {
       // Everything below runs before the first await, so batches reach the
       // UIServer in the order they arrived (an add never overtakes its remove).
       const out = origin === 'topLeft' ? this.hangOnOriginAnchor(ops) : ops;
+      // Anyone may decorate the window; only those it admits may change or
+      // remove nodes others added.
+      const trusted = await this.admits(msg.routing.from);
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'scene', {
-          surfaceId: this.surfaceId, ops: out, contributorId: msg.routing.from,
+          surfaceId: this.surfaceId, ops: out, contributorId: msg.routing.from, trusted,
         })
       );
     });
@@ -428,6 +482,7 @@ export class WindowAbject extends Abject {
       };
       contractRequire(this.surfaceId !== undefined, 'draw: window has no surface yet');
       contractRequire(Array.isArray(commands), 'draw needs a commands array');
+      await this.requireAdmitted(msg, 'draw');
       let out: Array<Record<string, unknown>> = commands.map((c) => ({
         ...(c as Record<string, unknown>),
         surfaceId: this.surfaceId!,
@@ -447,6 +502,7 @@ export class WindowAbject extends Abject {
 
     // WidgetManager pushes the desktop's focus decoration (scene ops).
     this.on('setFocusDecoration', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'setFocusDecoration');
       const { ops } = msg.payload as { ops: Array<Record<string, unknown>> | null };
       if (this.decorationShown) await this.removeFocusDecoration();
       this.focusDecoration = Array.isArray(ops) && ops.length > 0 ? ops : null;
@@ -457,6 +513,7 @@ export class WindowAbject extends Abject {
     this.on('effect', async (msg: AbjectMessage) => {
       const { effect, color } = msg.payload as { effect: unknown; color?: string };
       contractRequire(this.surfaceId !== undefined, 'effect: window has no surface yet');
+      await this.requireAdmitted(msg, 'effect');
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'surfaceEffect', { surfaceId: this.surfaceId, effect, ...(color ? { color } : {}) })
       );
@@ -465,6 +522,7 @@ export class WindowAbject extends Abject {
     this.on('setModal', async (msg: AbjectMessage) => {
       const { modal } = msg.payload as { modal: boolean };
       contractRequire(this.surfaceId !== undefined, 'setModal: window has no surface yet');
+      await this.requireAdmitted(msg, 'setModal');
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'setSurfaceModal', { surfaceId: this.surfaceId, modal: modal === true })
       );
@@ -473,6 +531,7 @@ export class WindowAbject extends Abject {
     this.on('setSlabTransform', async (msg: AbjectMessage) => {
       const { rotation, z } = msg.payload as { rotation?: [number, number, number]; z?: number };
       contractRequire(this.surfaceId !== undefined, 'setSlabTransform: window has no surface yet');
+      await this.requireAdmitted(msg, 'setSlabTransform');
       return this.request<boolean>(
         request(this.id, this.uiServerId, 'setSurfaceTransform', { surfaceId: this.surfaceId, rotation, z })
       );
@@ -495,6 +554,7 @@ export class WindowAbject extends Abject {
         windowId?: AbjectId; surfaceId?: string; offset?: [number, number, number]; detach?: boolean;
       };
       contractRequire(this.surfaceId !== undefined, 'attachTo: window has no surface yet');
+      await this.requireAdmitted(msg, 'attachTo');
       if (p.detach === true) {
         return this.request<boolean>(
           request(this.id, this.uiServerId, 'attachSurface', { surfaceId: this.surfaceId, target: null })
@@ -523,7 +583,8 @@ export class WindowAbject extends Abject {
       );
     });
 
-    this.on('destroy', async () => {
+    this.on('destroy', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'destroy');
       await this.destroyWindow();
       return true;
     });
@@ -540,6 +601,9 @@ export class WindowAbject extends Abject {
 
     // Input events forwarded from UIServer
     this.on('input', async (msg: AbjectMessage) => {
+      // Input is the person's: it comes from UIServer, and a synthetic click
+      // from anyone else could answer a dialog for them.
+      await this.requireAdmitted(msg, 'input');
       const inputEvent = msg.payload as {
         type: string;
         surfaceId?: string;
@@ -559,6 +623,7 @@ export class WindowAbject extends Abject {
     // Owner (e.g. Chat) asks to open a native file picker for this window's
     // surface. The chosen file comes back as a 'fileUploaded' event below.
     this.on('openFilePicker', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'openFilePicker');
       const { accept, multiple } = msg.payload as { accept?: string; multiple?: boolean };
       if (this.surfaceId) {
         this.send(request(this.id, this.uiServerId, 'openFilePicker', {
@@ -606,6 +671,7 @@ export class WindowAbject extends Abject {
 
     // Focus/unfocus events from UIServer
     this.on('focus', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'focus');
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       // Dependents hear focus transitions (an open pop-out closes on blur).
       if (focused !== this.windowFocused) this.changed('windowFocus', { focused });
@@ -641,6 +707,7 @@ export class WindowAbject extends Abject {
     });
 
     this.on('updateTheme', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'updateTheme');
       this.theme = msg.payload as ThemeData;
       this.scheduleFrame();
       return true;
@@ -654,6 +721,7 @@ export class WindowAbject extends Abject {
 
     // WindowManager sends titleBarAction when close/minimize buttons are clicked
     this.on('titleBarAction', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'titleBarAction');
       const { action } = msg.payload as { action: string };
       if (action === 'close') {
         this.changed('windowCloseRequested', {});
@@ -678,6 +746,7 @@ export class WindowAbject extends Abject {
     // WindowManager sends rect updates during drag/resize;
     // Taskbar (and other owners) may also send windowRect for programmatic resize.
     this.on('windowRect', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'windowRect');
       const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
       const moved = x !== this.rect.x || y !== this.rect.y;
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;

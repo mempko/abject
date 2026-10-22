@@ -363,7 +363,9 @@ export class WorkspaceRegistry extends Registry {
       const union = local
         ? this.localAndPooled()
         : this.filterForCaller(this.localAndPooled(), caller);
-      const hits = this.scoreSearch(union, query as string, max);
+      const scored = this.scoreSearch(union, query as string, max);
+      // Kept objects asleep in this workspace are found too (local callers).
+      const hits = local ? [...scored, ...this.asleepSearchHits(query as string)].slice(0, max) : scored;
       if (hits.length > 0 || !local) return hits;
       return this.fallbackSearch(query as string, max);
     });

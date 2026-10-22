@@ -261,6 +261,16 @@ export abstract class WidgetAbject extends Abject {
   protected text: string;
   protected ownerId: AbjectId;
   protected uiServerId: AbjectId;
+  /**
+   * The window this widget belongs to and the WidgetManager that made it
+   * (bindWindow). With them the widget takes changes only from its parent,
+   * its window, WidgetManager and whoever WidgetManager admits to the window.
+   */
+  private accessWindowId?: AbjectId;
+  private accessManagerId?: AbjectId;
+  private accessOwnerId?: AbjectId;
+  private admitted = new Set<AbjectId>();
+  private static readonly ADMITTED_MAX = 64;
   protected href: string = '';
   protected focused = false;
   /**
@@ -326,6 +336,46 @@ export abstract class WidgetAbject extends Abject {
     this.setupWidgetHandlers();
   }
 
+  /**
+   * Tie this widget to its window before it starts: the WidgetManager that
+   * made it calls this once, with the window's owner, so changes from
+   * anyone else are checked against that window.
+   */
+  bindWindow(windowId: AbjectId, managerId: AbjectId, ownerAppId?: AbjectId): void {
+    contractRequire(!this.accessWindowId || this.accessWindowId === windowId,
+      'bindWindow: a widget belongs to one window');
+    this.accessWindowId = windowId;
+    this.accessManagerId = managerId;
+    this.accessOwnerId = ownerAppId;
+  }
+
+  /** Senders a subclass always takes changes from (a layout's own children). */
+  protected isFamiliar(_from: AbjectId): boolean {
+    return false;
+  }
+
+  /** Whether `from` may change or read this widget (see bindWindow). */
+  protected async admits(from: AbjectId): Promise<boolean> {
+    if (!this.accessManagerId || !this.accessWindowId) return true;
+    if (from === this.id || from === this.ownerId || from === this.accessWindowId
+      || from === this.accessManagerId || from === this.accessOwnerId || from === this.uiServerId) return true;
+    if (this.admitted.has(from) || this.isFamiliar(from)) return true;
+    const ok = await this.request<boolean>(
+      request(this.id, this.accessManagerId, 'admitsToWindow', { windowId: this.accessWindowId, objectId: from }), 5000,
+    ).catch(() => false);
+    if (ok === true) {
+      if (this.admitted.size >= WidgetAbject.ADMITTED_MAX) this.admitted.clear();
+      this.admitted.add(from);
+    }
+    return ok === true;
+  }
+
+  /** Refuse a change (or a read of the value) from a sender this widget does not admit. */
+  protected async requireAdmitted(msg: AbjectMessage, what: string): Promise<void> {
+    contractRequire(await this.admits(msg.routing.from),
+      `${what}: only the window's owner, its widgets, objects its owner granted access and built-in objects may use this widget`);
+  }
+
   /** Render-time snapshot: consistent state across async draw commands. */
   protected _renderText: string = '';
   protected _renderRect: Rect = { x: 0, y: 0, width: 0, height: 0 };
@@ -336,6 +386,12 @@ export abstract class WidgetAbject extends Abject {
    * emitting draw commands for lines outside the visible scroll area.
    */
   protected _renderViewportClip: { top: number; bottom: number } | null = null;
+  /** The entrance (style.enter): when it began, and whether it has played. */
+  private enterStartedAt?: number;
+  private enterDone = false;
+  private static readonly ENTER_MS = 240;
+  private static readonly ENTER_FRAME_MS = 33;
+  private static readonly ENTER_RISE_PX = 6;
   /** Where the widget last drew (surface and surface-local origin), for showMobileKeyboard. */
   private _lastDrawnAt?: { surfaceId: string; ox: number; oy: number };
 
@@ -376,6 +432,12 @@ export abstract class WidgetAbject extends Abject {
         commands.push(...this.buildBusyPulse(surfaceId, ox, oy));
       }
 
+      const entering = this.enterFrame(surfaceId, commands);
+      if (entering) {
+        commands.length = 0;
+        commands.push(...entering);
+      }
+
       // Retained 3D decorations follow the rect just drawn (sent only when
       // something changed, so a steady repaint costs nothing here).
       this.drawnSinceCull = true;
@@ -393,11 +455,20 @@ export abstract class WidgetAbject extends Abject {
       return true;
     });
 
-    this.on('getValue', async () => {
+    // WidgetManager: the window's owner revoked someone's access.
+    this.on('forgetAdmitted', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.accessManagerId) return false;
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.admitted.delete(objectId);
+    });
+
+    this.on('getValue', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'getValue');
       return this.getWidgetValue();
     });
 
     this.on('update', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'update');
       const updates = msg.payload as Record<string, unknown>;
       const oldVisible = this.visible;
       this.applyCommonUpdates(updates);
@@ -484,7 +555,8 @@ export abstract class WidgetAbject extends Abject {
       return true;
     });
 
-    this.on('destroy', async () => {
+    this.on('destroy', async (msg: AbjectMessage) => {
+      await this.requireAdmitted(msg, 'destroy');
       await this.stop();
       return true;
     });
@@ -847,6 +919,33 @@ export abstract class WidgetAbject extends Abject {
   /**
    * Request parent window to redraw (sends childDirty event).
    */
+  /**
+   * The entrance (style.enter 'rise'): for its first ENTER_MS on screen the
+   * widget's drawing fades in and settles up from a few pixels lower. Returns
+   * the wrapped commands while it plays and asks for the next frame;
+   * undefined once it has played (or for widgets without one).
+   */
+  private enterFrame(surfaceId: string, commands: unknown[]): unknown[] | undefined {
+    if (this.style.enter !== 'rise' || this.enterDone) return undefined;
+    const now = Date.now();
+    this.enterStartedAt ??= now;
+    const t = (now - this.enterStartedAt) / WidgetAbject.ENTER_MS;
+    if (t >= 1) {
+      this.enterDone = true;
+      return undefined;
+    }
+    // Decelerate: quick at first, gently settling.
+    const eased = 1 - (1 - t) * (1 - t);
+    this.setTimer(() => { void this.requestRedraw(); }, WidgetAbject.ENTER_FRAME_MS);
+    return [
+      { type: 'save', surfaceId, params: {} },
+      { type: 'globalAlpha', surfaceId, params: { value: Math.max(0.05, eased) } },
+      { type: 'translate', surfaceId, params: { x: 0, y: Math.round((1 - eased) * WidgetAbject.ENTER_RISE_PX) } },
+      ...commands,
+      { type: 'restore', surfaceId, params: {} },
+    ];
+  }
+
   protected async requestRedraw(): Promise<void> {
     this.send(event(this.id, this.ownerId, 'childDirty', {
       widgetId: this.id,

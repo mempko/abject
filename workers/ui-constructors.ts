@@ -12,6 +12,7 @@ import { AgentBrowser } from '../src/objects/agent-browser.js';
 import { SchedulerBrowser } from '../src/objects/scheduler-browser.js';
 import { DataBrowser } from '../src/objects/data-browser.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
+import { Pinboard } from '../src/objects/pinboard.js';
 import { Settings } from '../src/objects/settings.js';
 import { CommandPaletteAbject } from '../src/objects/command-palette.js';
 import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
@@ -59,6 +60,7 @@ export function addUiConstructors(map: Map<string, ObjectFactory>): Map<string, 
   map.set('SchedulerBrowser', () => new SchedulerBrowser());
   map.set('DataBrowser', () => new DataBrowser());
   map.set('GoalBrowser', () => new GoalBrowser());
+  map.set('Pinboard', () => new Pinboard());
   map.set('ChatWindow', (args?: unknown) => new ChatWindow(args as ConstructorParameters<typeof ChatWindow>[0]));
   map.set('ChatBrowser', () => new ChatBrowser());
   map.set('Taskbar', () => new Taskbar());

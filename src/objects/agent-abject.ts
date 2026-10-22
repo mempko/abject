@@ -924,7 +924,16 @@ function assignedPatternsOf(raw: unknown): Array<{ id: string; why: string }> | 
 }
 
 /** Fields of an action that say how it went or why, not what it does. */
-const ACTION_ASIDES = new Set(['action', 'target', 'method', 'expect', 'reasoning', 'learned', 'note']);
+const ACTION_ASIDES = new Set(['action', 'target', 'method', 'expect', 'reasoning', 'learned', 'note', 'say']);
+
+/** The everyday-words line a model gave its action (`say`), if any. */
+function actionSay(action: unknown): string | undefined {
+  if (!action || typeof action !== 'object') return undefined;
+  const say = (action as Record<string, unknown>).say;
+  if (typeof say !== 'string') return undefined;
+  const line = say.replace(/\s+/g, ' ').trim();
+  return line ? line.slice(0, 160) : undefined;
+}
 
 /**
  * Words for an action a model sent without reasoning: its verb, whom it
@@ -2664,12 +2673,14 @@ The registered object must implement these handlers to participate in the agent 
       const msg = newPhase === 'acting' && entry.state.action?.action
         ? (reasoning || actionProgressText(entry.state.action as Record<string, unknown>)).slice(0, 140)
         : `${newPhase} (step ${entry.state.step + 1}/${entry.state.maxSteps})`;
+      const say = newPhase === 'acting' ? actionSay(entry.state.action) : undefined;
       this.send(event(this.id, this.goalManagerId, 'updateProgress', {
         goalId: entry.goalId,
         message: msg,
         phase: newPhase,
         agentName,
         ...this.goalProgressTags(entry),
+        ...(say ? { say } : {}),
       }));
     }
   }
@@ -3539,6 +3550,7 @@ The registered object must implement these handlers to participate in the agent 
                         phase: 'acting',
                         agentName,
                         ...this.goalProgressTags(entry),
+                        ...(actionSay(task.action) ? { say: actionSay(task.action) } : {}),
                       }));
                     }
                     // The job runs while this task stays in thinking, so the
@@ -4208,7 +4220,7 @@ The registered object must implement these handlers to participate in the agent 
   /** An action without its prose fields, long strings clipped: what a judge needs to see. */
   private static briefAction(action: AgentAction | undefined): Record<string, unknown> {
     if (!action) return {};
-    const { reasoning: _r, expect: _e, patterns: _p, ...rest } = action as Record<string, unknown>;
+    const { reasoning: _r, expect: _e, patterns: _p, say: _s, ...rest } = action as Record<string, unknown>;
     try {
       return JSON.parse(JSON.stringify(rest, (_k, v) => (typeof v === 'string' && v.length > 300 ? `${v.slice(0, 300)}… [+${v.length - 300} chars]` : v)));
     } catch {
@@ -5024,7 +5036,7 @@ When producing work likely to be continued later, save its execution details wit
     // Chatty models narrate their plan as prose instead of emitting the action
     // envelope; each such turn costs a reparse round-trip. Give every agent
     // one clear place to put the narration.
-    add('response-format', '\n\n## Response Format\nPut each action in a ```json block. Use one action unless your agent instructions allow batching independent actions in separate blocks. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nA terminal action still needs its own content field filled in: "reasoning" says why you are finishing, and the result field says what you are delivering. When the action asks the user something, that field carries the question itself, phrased for them to answer.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
+    add('response-format', '\n\n## Response Format\nPut each action in a ```json block. Use one action unless your agent instructions allow batching independent actions in separate blocks. Narration belongs inside the action\'s "reasoning" field, where it is read and kept.\n\nGive each action a `"say"` field too: a few everyday words telling the person what this step does, the way you would tell a friend who does not program ("Looking up Saturday\'s forecast", "Saving your new preset"). It is what they see while you work, so name the thing being done for them rather than the method or object you call.\n\nA terminal action still needs its own content field filled in: "reasoning" says why you are finishing, and the result field says what you are delivering. When the action asks the user something, that field carries the question itself, phrased for them to answer.\n\nThe block must be valid JSON, which matters most when a field carries prose. Write line breaks inside a string as `\\n`, never as a real line break: a string broken across lines is invalid JSON, and your answer has to be re-sent. Markdown is welcome inside that string — headings, bullets, bold — as long as every newline in it is escaped.\n\n```json\n{ "action": "done", "text": "### Result\\n\\n- **Low tide:** 11:26 AM\\n- **Weather:** clear" }\n```', true);
     // Every agent gets this, so the envelope stays one shape across the system
     // and no agent has to redeclare the field in its own action table.
     add('large-payloads', `\n\n## Large results

@@ -67,7 +67,7 @@ function artWidth(): number {
   return Math.max(16, Math.min((process.stdout.columns || 80) - 4, 76));
 }
 
-function formatMessage(role: string, sender: string, text: string, markdown = false, art = true): Line[] {
+function formatMessage(role: string, sender: string, text: string, markdown = false, art = true, choices?: string[], card?: string): Line[] {
   const color: LineColor =
     role === 'user' ? 'cyan' :
     role === 'error' ? 'red' :
@@ -90,6 +90,15 @@ function formatMessage(role: string, sender: string, text: string, markdown = fa
     if (rendered) {
       lines.push(...rendered.map(row => ({ text: '  ' + row, color: 'normal' as LineColor })));
     }
+  }
+  if (card) {
+    // A card, as text: a ruled block under the message.
+    lines.push({ text: '  ┌─', color: 'dim' });
+    for (const line of card.split('\n')) lines.push({ text: `  │ ${line}`, color: 'normal' });
+    lines.push({ text: '  └─', color: 'dim' });
+  }
+  if (choices && choices.length > 0) {
+    lines.push({ text: `  Answer with: ${choices.join(' · ')} (or type your own)`, color: 'yellow' });
   }
   return lines;
 }
@@ -350,8 +359,8 @@ class TuiApp {
     try {
       const history = await this.client.history(tab.workspaceId, tab.conversationId);
       for (const entry of history) {
-        tab.lines.push(...formatMessage(entry.role, entry.sender ?? entry.role, entry.content,
-          isMarkdownMessage(entry.role)));
+        tab.lines.push(...formatMessage(entry.error ? 'error' : entry.role, entry.sender ?? entry.role, entry.content,
+          isMarkdownMessage(entry.role), true, entry.answered ? undefined : entry.choices, entry.card?.text));
       }
       if (history.length > 0) {
         tab.lines.push({ text: '── live ──', color: 'dim' });
@@ -404,7 +413,7 @@ class TuiApp {
           t => t.workspaceId === event.workspaceId && t.conversationId === event.conversationId);
         if (!tab) return;
         this.appendTo(tab, formatMessage(data.role, data.sender, data.text,
-          isMarkdownMessage(data.role, data.markdown)));
+          isMarkdownMessage(data.role, data.markdown), true, data.choices, data.card?.text));
         break;
       }
       case 'goalProgress': {
@@ -727,6 +736,11 @@ class TuiApp {
     }
     for (const detail of dialog.detail ?? []) {
       lines.push({ text: `  ${detail}`, color: 'dim' });
+    }
+    if (dialog.card?.text) {
+      lines.push({ text: '  ┌─', color: 'dim' });
+      for (const line of dialog.card.text.split('\n')) lines.push({ text: `  │ ${line}`, color: 'normal' });
+      lines.push({ text: '  └─', color: 'dim' });
     }
     lines.push({ text: '', color: 'normal' });
     if (dialog.kind === 'options' && dialog.options) {
@@ -1489,7 +1503,7 @@ export async function runPlain(target: BackendTarget): Promise<void> {
       if (event.event === 'message' && event.conversationId === conversationId) {
         const data = event.data as unknown as MessageEvent;
         for (const line of formatMessage(data.role, data.sender, data.text,
-          isMarkdownMessage(data.role, data.markdown), art)) print(line);
+          isMarkdownMessage(data.role, data.markdown), art, data.choices, data.card?.text)) print(line);
       } else if (event.event === 'goalProgress' && event.workspaceId === workspace?.id) {
         // Milestones only — the step-by-step goalUpdated chatter would flood a
         // line-oriented log.
@@ -1505,6 +1519,7 @@ export async function runPlain(target: BackendTarget): Promise<void> {
         print({ text: `[dialog] ${pendingDialog.title}: ${pendingDialog.message}`, color: 'yellow' });
         if (pendingDialog.summary) print({ text: `  ${pendingDialog.summary} (explained by AI)`, color: 'normal' });
         if (pendingDialog.resource) print({ text: `  ${pendingDialog.resource}`, color: 'yellow' });
+        for (const line of pendingDialog.card?.text.split('\n') ?? []) print({ text: `  │ ${line}`, color: 'normal' });
         if (pendingDialog.kind === 'options' && pendingDialog.options) {
           pendingDialog.options.forEach((option, i) =>
             print({ text: `  ${i + 1}: ${option.label}`, color: 'normal' }));
@@ -1552,8 +1567,8 @@ export async function runPlain(target: BackendTarget): Promise<void> {
     conversationId = opened.conversationId;
     const history = await client.history(workspace!.id, conversationId);
     for (const entry of history) {
-      for (const line of formatMessage(entry.role, entry.sender ?? entry.role, entry.content,
-        isMarkdownMessage(entry.role), art)) print(line);
+      for (const line of formatMessage(entry.error ? 'error' : entry.role, entry.sender ?? entry.role, entry.content,
+        isMarkdownMessage(entry.role), art, entry.answered ? undefined : entry.choices, entry.card?.text)) print(line);
     }
     print({ text: `— ${workspace!.name} / ${chats.find(c => c.conversationId === conversationId)?.title ?? 'new chat'} —`, color: 'dim' });
   };

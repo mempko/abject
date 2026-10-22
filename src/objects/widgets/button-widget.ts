@@ -127,13 +127,59 @@ export class ButtonWidget extends WidgetAbject {
       });
     }
 
-    commands.push(...await this.labelCommands(
-      surfaceId, face, font, textColor, style.align ?? 'center', hasMarker ? 4 : 0,
-    ));
+    commands.push(...(style.caption
+      ? await this.tileCommands(surfaceId, face, textColor, hovered)
+      : await this.labelCommands(surfaceId, face, font, textColor, style.align ?? 'center', hasMarker ? 4 : 0)));
 
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
+    return commands;
+  }
+
+  /**
+   * A tile (style.caption): the icon at the top left, the text in bold under
+   * it and the caption in a smaller, quieter line below, all left-aligned.
+   */
+  private async tileCommands(
+    surfaceId: string,
+    area: { x: number; y: number; width: number; height: number },
+    color: string,
+    hovered: boolean,
+  ): Promise<unknown[]> {
+    const commands: unknown[] = [];
+    const pad = 14;
+    const stacks = fontStacks(this.theme);
+    const titleFont = `700 ${this.style.fontSize ?? 15}px ${stacks.body}`;
+    const captionFont = `13px ${stacks.body}`;
+    const icon = this.style.icon && isIconName(this.style.icon) ? this.style.icon : undefined;
+    const iconSize = 18;
+    const textWidth = area.width - pad * 2;
+    // Title and caption sit together at the bottom; the icon keeps the top.
+    const captionY = area.y + area.height - pad - 8;
+    const titleY = captionY - 19;
+    if (icon) {
+      commands.push(...iconCommands(icon, {
+        surfaceId, x: Math.round(area.x + pad), y: Math.round(area.y + pad), size: iconSize,
+        color: hovered ? color : this.theme.accentSecondary, caps: shapeOf(this.theme).iconCaps,
+      }));
+    }
+    if (this.text) {
+      commands.push({
+        type: 'text', surfaceId,
+        params: {
+          x: area.x + pad, y: titleY, font: titleFont, fill: color, align: 'left', baseline: 'middle',
+          text: await this.truncateWithEllipsis(surfaceId, this.text, textWidth, titleFont),
+        },
+      });
+    }
+    commands.push({
+      type: 'text', surfaceId,
+      params: {
+        x: area.x + pad, y: captionY, font: captionFont, fill: hovered ? color : this.theme.textMeta, align: 'left', baseline: 'middle',
+        text: await this.truncateWithEllipsis(surfaceId, this.style.caption ?? '', textWidth, captionFont),
+      },
+    });
     return commands;
   }
 

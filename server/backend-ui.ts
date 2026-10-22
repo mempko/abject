@@ -1044,15 +1044,16 @@ export class BackendUI extends Abject {
     // ── Scene vocabulary: retained 3D nodes riding a window's slab, or
     // attached to the WORLD (the global scene graph beyond windows) ──
     this.on('scene', async (msg: AbjectMessage) => {
-      const { surfaceId, world, ops, contributorId } = msg.payload as {
-        surfaceId?: string; world?: boolean; ops: SceneOp[]; contributorId?: AbjectId;
+      const { surfaceId, world, ops, contributorId, trusted } = msg.payload as {
+        surfaceId?: string; world?: boolean; ops: SceneOp[]; contributorId?: AbjectId; trusted?: boolean;
       };
       if (world) {
         return this.handleWorldSceneOps(msg.routing.from, ops);
       }
-      // contributorId is trusted only because the direct caller must own the
-      // surface (windows relay decoration batches from other abjects).
-      return this.handleSceneOps(msg.routing.from, surfaceId, ops, contributorId);
+      // contributorId and trusted are believed only because the direct caller
+      // must own the surface (windows relay decoration batches from other
+      // abjects and say whether they admit the contributor).
+      return this.handleSceneOps(msg.routing.from, surfaceId, ops, contributorId, trusted !== false);
     });
 
     this.on('setSceneTheme', async (msg: AbjectMessage) => {
@@ -2857,7 +2858,7 @@ IMPORTANT:
    * vocabulary), compact into the retained per-surface node map for
    * reconnect replay, and broadcast.
    */
-  private handleSceneOps(objectId: AbjectId, surfaceId: string | undefined, rawOps: SceneOp[], contributorId?: AbjectId): boolean {
+  private handleSceneOps(objectId: AbjectId, surfaceId: string | undefined, rawOps: SceneOp[], contributorId?: AbjectId, trusted = true): boolean {
     // Forgiving field aliases (e.g. parent → parentId) before anything else.
     const ops = normalizeSceneOps(rawOps) as SceneOp[];
     // Default to the caller's first surface so windowless callers fail loudly
@@ -2888,6 +2889,16 @@ IMPORTANT:
     // never merge them into the retained node (their channel/to/duration are
     // not node params and would corrupt the snapshot + reconnect replay).
     const foreign = contributorId !== undefined && contributorId !== state!.objectId;
+    // A decorator the window does not admit changes only the nodes it added:
+    // it may add under new ids, never replace, move or remove another's.
+    if (foreign && !trusted) {
+      for (const op of ops) {
+        const owner = state!.sceneContributors.get(op.id);
+        const exists = state!.sceneNodes.has(op.id);
+        contractRequire(op.op === 'add' ? !exists : (exists && owner === contributorId),
+          `scene: '${op.id}' belongs to another contributor; a decoration may only add new nodes and change its own`);
+      }
+    }
     for (const op of ops) {
       if (op.op === 'animate') {
         retainAnimateOp(state!.sceneAnims, op);

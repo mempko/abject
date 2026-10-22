@@ -32,6 +32,13 @@ export interface HistoryEntry {
   role: 'user' | 'assistant' | 'system';
   content: string;
   sender?: string;
+  /** Shown as an error. */
+  error?: boolean;
+  /** A question's suggested answers, and whether it was answered. */
+  choices?: string[];
+  answered?: boolean;
+  /** A card under the message, as plain text. */
+  card?: { typeId: string; text: string };
 }
 
 export interface MessageEvent {
@@ -41,6 +48,10 @@ export interface MessageEvent {
   text: string;
   markdown: boolean;
   at: number;
+  /** A question's suggested answers. */
+  choices?: string[];
+  /** A card under the message, as plain text. */
+  card?: { typeId: string; text: string };
 }
 
 export interface PushedEvent {
@@ -78,6 +89,8 @@ export interface DialogInfo {
   topic?: string;
   /** Analysis lines shown under the resource (permission prompts). */
   detail?: string[];
+  /** A card shown with the question, as plain text. */
+  card?: { typeId: string; storeId: string; text: string };
   /** The object that asked, when known. */
   askedBy?: string;
   openedAt?: number;

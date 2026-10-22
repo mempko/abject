@@ -86,6 +86,13 @@ export class Registry extends Abject {
   private byInterface: Map<InterfaceId, Set<AbjectId>> = new Map();
   private byName: Map<string, Set<AbjectId>> = new Map();
   private byTypeId: Map<TypeId, AbjectId> = new Map();
+  /**
+   * Objects kept but not running (AbjectStore, loading when needed): known by
+   * typeId, name and tags, woken by whoever registered them when looked up.
+   */
+  private asleep: Map<TypeId, { typeId: TypeId; name: string; manifest: AbjectManifest; owner?: string; folder?: string; wakerId: AbjectId }> = new Map();
+  /** Wakes in flight, so concurrent lookups share one. */
+  private waking: Map<TypeId, Promise<AbjectId | null>> = new Map();
   private subscribers: Set<AbjectId> = new Set();
   /**
    * Durable curation selectors (P1-2). Keyed on ephemeral AbjectId OR durable
@@ -213,8 +220,32 @@ export class Registry extends Abject {
                 } },
               },
               {
+                name: 'resolveType',
+                description: 'The live AbjectId of the object with this durable typeId, or null. A kept object that is asleep (it loads when needed) is woken first, so this always reaches it.',
+                parameters: [
+                  { name: 'typeId', type: { kind: 'primitive', primitive: 'string' }, description: 'The durable typeId' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'registerAsleep',
+                description: 'Record kept objects that are not running (AbjectStore, for objects that load when needed): findable by search and by name, woken by the registering object when looked up. Built-in objects only.',
+                parameters: [
+                  { name: 'entries', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: '[{ typeId, manifest, owner?, folder? }]' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'forgetAsleep',
+                description: 'Drop sleeping entries (their objects were removed). Built-in objects only.',
+                parameters: [
+                  { name: 'typeIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'TypeIds to forget' },
+                ],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
                 name: 'search',
-                description: 'Find objects by a text query matched against name, description, tags, and method names (case-insensitive substring). Returns a small ranked list of {id, name, typeId?, description, matchedOn}. The cheapest way to locate an object when you know roughly what it is called or does.',
+                description: 'Find objects by a text query matched against name, description, tags, and method names (case-insensitive substring). Returns a small ranked list of {id, name, typeId?, description, matchedOn}; a kept object that is asleep comes back with asleep: true and no id (resolveType on its typeId wakes it). The cheapest way to locate an object when you know roughly what it is called or does.',
                 parameters: [
                   {
                     name: 'query',
@@ -499,7 +530,14 @@ Each line shows one registered object: id, name, description, and non-meta metho
       this.reconcileDeadEntries();
       const query = msg.payload as DiscoveryQuery;
       validateDiscoveryQuery(query);
-      const results = await this.handleDiscover(query);
+      let results = await this.handleDiscover(query);
+      // Looking a sleeping object up by name wakes it (a schedule's dep(name)
+      // reaches it the same as a running one).
+      if (results.length === 0 && query.name && !this.isRemoteCaller(msg)) {
+        const sleeper = [...this.asleep.values()].find((a) => a.name === query.name
+          && (!query.tags?.length || query.tags.every((t) => (a.manifest.tags ?? []).includes(t))));
+        if (sleeper && await this.wakeAsleep(sleeper.typeId)) results = await this.handleDiscover(query);
+      }
       return this.filterForCaller(results, msg.routing.from);
     });
 
@@ -550,7 +588,8 @@ Each line shows one registered object: id, name, description, and non-meta metho
         });
       }
       hits.sort((a, b) => a.rank - b.rank || a.hit.name.localeCompare(b.hit.name));
-      return hits.slice(0, max).map((h) => h.hit);
+      const running = hits.slice(0, max).map((h) => h.hit);
+      return this.isRemoteCaller(msg) ? running : [...running, ...this.asleepSearchHits(q)].slice(0, max);
     });
 
     this.on('subscribe', async (msg: AbjectMessage) => {
@@ -640,7 +679,32 @@ Each line shows one registered object: id, name, description, and non-meta metho
     this.on('resolveType', async (msg: AbjectMessage) => {
       this.reconcileDeadEntries();
       const { typeId } = msg.payload as { typeId: TypeId };
-      return this.byTypeId.get(typeId) ?? null;
+      return this.byTypeId.get(typeId) ?? await this.wakeAsleep(typeId);
+    });
+
+    // Objects kept but not running: findable, and woken when looked up.
+    this.on('registerAsleep', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'registerAsleep');
+      const { entries } = msg.payload as { entries: Array<{ typeId: TypeId; manifest: AbjectManifest; owner?: string; folder?: string }> };
+      require(Array.isArray(entries), 'registerAsleep: entries must be an array');
+      for (const e of entries) {
+        require(typeof e?.typeId === 'string' && e.typeId.length > 0 && !!e.manifest?.name, 'registerAsleep: each entry needs a typeId and a manifest');
+        if (this.byTypeId.has(e.typeId)) continue;
+        // A copy's typeId ends in its numbered name (RecipeCard-2); that is
+        // the name it answers to while it sleeps.
+        const tail = e.typeId.split('/').pop() ?? '';
+        const name = tail.startsWith(e.manifest.name) ? tail : e.manifest.name;
+        this.asleep.set(e.typeId, { typeId: e.typeId, name, manifest: e.manifest, owner: e.owner, folder: e.folder, wakerId: msg.routing.from });
+      }
+      return true;
+    });
+
+    this.on('forgetAsleep', async (msg: AbjectMessage) => {
+      await this.requireRegistryAuthority(msg, 'forgetAsleep');
+      const { typeIds } = msg.payload as { typeIds: TypeId[] };
+      let forgotten = 0;
+      for (const typeId of typeIds ?? []) if (this.asleep.delete(typeId)) forgotten++;
+      return forgotten;
     });
 
     this.on('rename', async (msg: AbjectMessage) => {
@@ -716,6 +780,8 @@ Each line shows one registered object: id, name, description, and non-meta metho
   ): boolean {
     require(objectId !== '', 'objectId must not be empty');
     require(manifest !== undefined, 'manifest is required');
+    // A sleeping object that started is a running one now.
+    if (typeId) this.asleep.delete(typeId);
 
     // Enforce TypeId uniqueness
     if (typeId) {
@@ -879,6 +945,50 @@ Each line shows one registered object: id, name, description, and non-meta metho
    */
   resolveType(typeId: TypeId): AbjectId | null {
     return this.byTypeId.get(typeId) ?? null;
+  }
+
+  /**
+   * Kept objects that sleep, matching a search: by name, tags, description or
+   * folder, marked `asleep` with no id. resolveType on their typeId (or a
+   * name lookup) wakes them.
+   */
+  protected asleepSearchHits(query: string): Array<{ id: AbjectId; name: string; typeId: TypeId; description: string; matchedOn: string; asleep: true }> {
+    const q = query.toLowerCase();
+    const hits: Array<{ rank: number; hit: { id: AbjectId; name: string; typeId: TypeId; description: string; matchedOn: string; asleep: true } }> = [];
+    for (const a of this.asleep.values()) {
+      const m = a.manifest;
+      let rank: number | undefined;
+      let matchedOn: string | undefined;
+      if (a.name.toLowerCase().includes(q)) { rank = 0; matchedOn = 'name'; }
+      else if ((m.tags ?? []).join(' ').toLowerCase().includes(q)) { rank = 1; matchedOn = 'tags'; }
+      else if ((m.description ?? '').toLowerCase().includes(q)) { rank = 2; matchedOn = 'description'; }
+      else if ((a.folder ?? '').toLowerCase().includes(q)) { rank = 3; matchedOn = 'folder'; }
+      if (rank === undefined) continue;
+      hits.push({ rank, hit: { id: '' as AbjectId, name: a.name, typeId: a.typeId, description: (m.description ?? '').slice(0, 160), matchedOn: matchedOn!, asleep: true } });
+    }
+    hits.sort((a, b) => a.rank - b.rank || a.hit.name.localeCompare(b.hit.name));
+    return hits.map((h) => h.hit);
+  }
+
+  /**
+   * Wake a sleeping object through whoever registered it (AbjectStore) and
+   * return its live id; null when nothing by that typeId sleeps here or it
+   * could not start.
+   */
+  protected async wakeAsleep(typeId: TypeId): Promise<AbjectId | null> {
+    const sleeper = this.asleep.get(typeId);
+    if (!sleeper) return null;
+    const inFlight = this.waking.get(typeId);
+    if (inFlight) return inFlight;
+    const woken = this.request<string>(request(this.id, sleeper.wakerId, 'wake', { objectId: typeId }), 30_000)
+      .then((id) => (typeof id === 'string' && id.length > 0 ? id as AbjectId : null))
+      .catch(() => null);
+    this.waking.set(typeId, woken);
+    try {
+      return await woken;
+    } finally {
+      this.waking.delete(typeId);
+    }
   }
 
   /**

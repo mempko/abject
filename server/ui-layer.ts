@@ -39,6 +39,7 @@ import { WindowManager } from '../src/objects/window-manager.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
+import { Pinboard } from '../src/objects/pinboard.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
 import { FileManager } from '../src/objects/file-manager.js';
 import { FileViewer } from '../src/objects/file-viewer.js';
@@ -125,7 +126,7 @@ export function createDesktopUi(): UiLayer {
       'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'SkillBrowser', 'CatalogBrowser',
       // Per-workspace windows
-      'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser',
+      'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'Pinboard',
       'FileManager', 'FileViewer', 'AgentBrowser', 'ExternalProjectBrowser', 'DataBrowser', 'SchedulerBrowser',
       'ChatWindow', 'ChatBrowser', 'AbjectEditor', 'PeersViewer', 'Taskbar',
       'WorkspaceBrowser', 'WorkspaceCollaboratorInspector', 'CommandPalette', 'WindowSwitcher',
@@ -269,6 +270,7 @@ export function createDesktopUi(): UiLayer {
       factory.registerConstructor('MethodInspector', () => new MethodInspector());
       factory.registerConstructor('JobBrowser', () => new JobBrowser());
       factory.registerConstructor('GoalBrowser', () => new GoalBrowser());
+      factory.registerConstructor('Pinboard', () => new Pinboard());
       factory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
       factory.registerConstructor('FileManager', () => new FileManager());
       factory.registerConstructor('FileViewer', () => new FileViewer());
