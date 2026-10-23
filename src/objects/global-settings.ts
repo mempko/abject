@@ -3502,12 +3502,19 @@ The settings themselves live in SettingsManager, which this window loads from an
 
   /** Run `<bin> --version` and return the binary name on success, or null. */
   private async probeCliPath(bin: string): Promise<string | null> {
+    let spawn: typeof import('node:child_process').spawn;
+    try {
+      // Lazily import `node:child_process` so the browser bundle never
+      // pulls it (this Abject runs server-side, but be defensive). A dynamic
+      // import rather than require(): this package is ESM, and under tsx
+      // require is not defined.
+      const mod = 'node:child_process';
+      ({ spawn } = await import(/* @vite-ignore */ mod) as typeof import('node:child_process'));
+    } catch {
+      return null;
+    }
     return new Promise((resolve) => {
       try {
-        // Lazily require `node:child_process` so the browser bundle never
-        // pulls it (this Abject runs server-side, but be defensive).
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { spawn } = require('node:child_process') as typeof import('node:child_process');
         const proc = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
         let resolved = false;
         const timer = setTimeout(() => {
