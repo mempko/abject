@@ -2014,6 +2014,7 @@ Rules:
 - Answer what the user asked. A question gets its answer first, then the supporting detail; a request for a list, table or report gets the whole of it. Let the length follow the question: a short question gets a short answer.
 - INLINE the actual data from the scratchpad that the answer needs, in full where the user asked for it. Refer only to what is in this text, so "see above" never comes up.
 - Write about what was found and done. How the team organized the work (tasks, rounds, lanes, retries, cancellations, internal records) belongs in the answer only when the user asked about it.
+- Speak of things by the names the user sees: a window by its title, a file by its name. Object and window ids, storage keys, command counts and how a slip along the way was caught and fixed are the system's own bookkeeping; mention them when the user asked how it was done.
 ${record.length > 0
     ? `- Figures about checks and tests (how many ran, passed, failed; exit codes) come ONLY from the verification record, and the newest run supersedes every earlier figure, including numbers quoted in older scratchpad prose.
 - When the verification record shows that a task asked to change something modified 0 files, say so plainly: the change was already present in the working tree, or nothing was changed by this run. Describe it as such, not as work done now.`

@@ -94,14 +94,30 @@ const PARAM_ALIASES: Record<string, string> = {
   h: 'height',
 };
 
+/** Params that hold a colour, on every command type. */
+const COLOR_PARAMS = ['fill', 'stroke', 'color', 'fillStyle', 'strokeStyle'];
+/** Commands whose `value` param is a colour. */
+const COLOR_VALUE_TYPES = new Set(['fillStyle', 'strokeStyle', 'shadowColor']);
+/** A hex colour written without its '#': 'a8683c', 'fff', 'ffffff80'. */
+const BARE_HEX = /^(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
 /**
- * Rewrite shorthand param names to their canonical equivalents. A shorthand
- * is only renamed when the canonical name is absent. Input objects are not
- * mutated.
+ * The colour with its '#' when it was written as bare hex. Canvas reads
+ * 'a8683c' as no colour at all and paints black, and generated code writes
+ * it that way often enough; the meaning is never in doubt.
+ */
+function withHash(value: unknown): unknown {
+  return typeof value === 'string' && BARE_HEX.test(value) ? `#${value}` : value;
+}
+
+/**
+ * Rewrite shorthand param names to their canonical equivalents, and bare hex
+ * colours to '#' hex. A shorthand is only renamed when the canonical name is
+ * absent. Input objects are not mutated.
  */
 function normalizeDrawCommands(commands: unknown[]): unknown[] {
   return commands.map((cmd) => {
-    const c = cmd as { params?: Record<string, unknown> };
+    const c = cmd as { type?: unknown; params?: Record<string, unknown> };
     const params = c?.params;
     if (!params || typeof params !== 'object') return cmd;
     let renamed: Record<string, unknown> | undefined;
@@ -111,6 +127,21 @@ function normalizeDrawCommands(commands: unknown[]): unknown[] {
         renamed[canonical] = renamed[alias];
         delete renamed[alias];
       }
+    }
+    const colorKeys = typeof c.type === 'string' && COLOR_VALUE_TYPES.has(c.type) ? [...COLOR_PARAMS, 'value'] : COLOR_PARAMS;
+    for (const key of colorKeys) {
+      const fixed = withHash(params[key]);
+      if (fixed !== params[key]) {
+        renamed ??= { ...params };
+        renamed[key] = fixed;
+      }
+    }
+    if (Array.isArray(params.stops) && params.stops.some((st) => withHash((st as { color?: unknown })?.color) !== (st as { color?: unknown })?.color)) {
+      renamed ??= { ...params };
+      renamed.stops = params.stops.map((st) => {
+        const stop = st as { color?: unknown };
+        return stop && typeof stop === 'object' ? { ...stop, color: withHash(stop.color) } : st;
+      });
     }
     return renamed ? { ...(cmd as object), params: renamed } : cmd;
   });

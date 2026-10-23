@@ -41,6 +41,12 @@ interface TaskExtra {
   task?: string;
   /** The last action, without its prose fields (runtime decisions read it). */
   lastAction?: Record<string, unknown>;
+  /**
+   * The newest screenshot this task took. Screenshots are how the agent
+   * checks its own work, so most are of work in progress; the person sees
+   * only this one, once the task has succeeded.
+   */
+  lastShot?: { imageBase64: string; width: number; height: number };
 }
 
 export class ObjectAgent extends Abject {
@@ -290,6 +296,11 @@ When asked about a task, describe which objects you would message and what you w
           }),
         );
         const result = await this.waitForTaskResult(ticketId, 180000);
+        const shot = this.taskExtras.get(taskId)?.lastShot;
+        if (result.success && shot && goalId && this.goalManagerId) {
+          // Best effort: the chat may have closed, or the goal's creator may not be a chat.
+          await this.deliverScreenshotToChat(goalId, shot).catch(() => {});
+        }
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
@@ -626,15 +637,8 @@ When asked about a task, describe which objects you would message and what you w
                 data: img.imageBase64,
               }];
 
-              // Deliver the image to the dispatching chat (the goal's creator)
-              // as a markdown bubble. Routes data URI bytes around the LLM —
-              // attachMedia skips conversationHistory so neither this agent's
-              // LLM nor the chat's LLM ever sees the raw base64.
-              if (goalId && this.goalManagerId) {
-                this.deliverScreenshotToChat(goalId, img).catch(() => {
-                  // Best-effort: chat may have closed, or creator may not be a Chat.
-                });
-              }
+              // Kept for the person, who sees the newest one when the task succeeds.
+              extra.lastShot = img;
 
               result = `Screenshot captured (${img.width}x${img.height}). The image is attached for your analysis.`;
               break;
@@ -689,8 +693,9 @@ When asked about a task, describe which objects you would message and what you w
   /**
    * Look up the goal's creator (typically the dispatching Chat) and send it
    * an `attachMedia` message containing the screenshot as a markdown image
-   * data URI. Bypasses every LLM context — the chat renders the bubble
-   * directly. Targets that don't implement `attachMedia` ignore it.
+   * data URI. Routes the bytes around every LLM context: attachMedia skips
+   * conversationHistory, and the chat renders the bubble directly. Targets
+   * that don't implement `attachMedia` ignore it.
    */
   private async deliverScreenshotToChat(
     goalId: string,
@@ -705,10 +710,7 @@ When asked about a task, describe which objects you would message and what you w
     const dataUri = `data:image/png;base64,${img.imageBase64}`;
     const markdown = `![screenshot|${img.width}x${img.height}](${dataUri})`;
 
-    this.send(request(this.id, goal.createdBy, 'attachMedia', {
-      markdown,
-      sender: 'Screenshot',
-    }));
+    this.send(request(this.id, goal.createdBy, 'attachMedia', { markdown }));
   }
 
   // ═══════════════════════════════════════════════════════════════════

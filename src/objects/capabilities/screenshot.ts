@@ -41,6 +41,13 @@ export class Screenshot extends Abject {
                   name: 'objectId',
                   type: { kind: 'primitive', primitive: 'string' },
                   description: 'The window\'s owning object: its registered name, full AbjectId, or the windowId returned by show()/createWindowAbject',
+                  optional: true,
+                },
+                {
+                  name: 'windowId',
+                  type: { kind: 'primitive', primitive: 'string' },
+                  description: 'The windowId returned by show()/createWindowAbject; give this or objectId',
+                  optional: true,
                 },
               ],
               returns: {
@@ -85,8 +92,10 @@ export class Screenshot extends Abject {
 
   private setupHandlers(): void {
     this.on('captureWindow', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: string };
-      require(!!objectId, 'objectId is required');
+      const payload = msg.payload as { objectId?: string; windowId?: string };
+      // A window is named by its owner or by its own id; either finds it.
+      const objectId = payload.objectId || payload.windowId;
+      require(typeof objectId === 'string' && objectId.length > 0, 'captureWindow needs objectId or windowId');
       require(this.uiServerId !== undefined, 'UIServer not discovered');
 
       const shot = await this.captureForOwner(objectId as AbjectId);
@@ -243,7 +252,7 @@ Use listWindows to get surfaceIds, then click/type/keyPress to interact.
 ### IMPORTANT
 - imageBase64 is raw base64-encoded PNG data (no data URI prefix).
 - To display as an image in a canvas, prepend 'data:image/png;base64,' to create a data URI.
-- captureWindow accepts the owning object's registered name, its FULL AbjectId, or a windowId; truncated ids never match.
+- captureWindow takes { objectId } (the owning object's registered name or its FULL AbjectId) or { windowId }; truncated ids never match.
 - When nothing can be captured, captureWindow returns { error: "..." } explaining why — a result WITHOUT imageBase64 means you have NOT seen the window; do not treat it as visual confirmation.
 - Screenshots capture the current rendered state; ensure the target has drawn before capturing.
 - captureWindow shows the window AS COMPOSITED — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) — so it verifies 3D rendering. It works wherever the window is: off-screen, under other windows, or in a workspace other than the one the user is looking at. The capture brings the window forward for that one shot and puts everything back, so capture each window where it lives.
