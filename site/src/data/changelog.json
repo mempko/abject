@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.15.16",
+    "date": "2026-10-23",
+    "title": "Work in progress stays in progress",
+    "summary": "This is a small release about trust. Agents no longer deploy an edit that was made against an older copy of an object, and they now talk about your work in the words you use, showing you the finished result instead of every step on the way.",
+    "highlights": [
+      "When an agent edits an object that changed after its draft was started (by you, by another task, or by an earlier deploy), it now sets the old draft aside with a note explaining why, instead of deploying it over the newer changes",
+      "When a task finishes, its chat now shows one screenshot of the final result; screenshots of half-finished work stay out of the conversation",
+      "Agents now name things the way you see them (a window by its title, a file by its name) and leave out ids, storage keys and technical counts unless you ask how something was done",
+      "Cards now state facts in plain terms (where, when, how much) and leave internal ids out",
+      "Agents can take a screenshot of a window by its window id, so they don't have to look up which object owns it first"
+    ],
+    "fixes": [
+      "Colors written without a leading '#' (for example 'a8683c') in generated drawing code and gradients now show the intended color; before, they painted black",
+      "One bad entry in the object registry can no longer break every lookup in a workspace until restart; the bad entry is dropped and logged",
+      "Object storage and the registry now reject a missing object id, where before it could slip through and corrupt the registry",
+      "When an agent sends an edit with nothing in it, it is now told which fields it did send, so it stops repeating the same empty edit"
+    ]
+  },
+  {
     "version": "0.15.15",
     "date": "2026-10-22",
     "title": "Sleeping Objects You Can Keep",
