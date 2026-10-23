@@ -534,6 +534,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(request),
+        signal: options.signal,
       }, { timeout: 300000 });
 
       const data = JSON.parse(response.body) as OpenAIResponse;
@@ -557,7 +558,10 @@ export class OpenAIProvider extends BaseLLMProvider {
           reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
         },
       };
-    }, { label: `${this.name}.complete` });
+    }, {
+      label: `${this.name}.complete`,
+      isRetryable: (err) => !options.signal?.aborted && defaultIsRetryable(err),
+    });
   }
 
   /** Non-streaming result assembled from the streaming path, for large-cap
