@@ -398,9 +398,9 @@ export class AbjectStore extends Abject {
   private async requireSnapshotWriter(
     msg: AbjectMessage, ref: string, method: string,
   ): Promise<{ owner?: string; source?: string; typeId?: string } | undefined> {
+    precondition(typeof ref === 'string' && ref !== '', `${method}: objectId must be a non-empty string`);
     const sender = msg.routing.from;
     if (await this.isBuiltInCaller(sender)) return undefined;
-    precondition(typeof ref === 'string' && ref !== '', `${method}: objectId must not be empty`);
     const entry = this.findEntry(ref);
     const objectId = entry?.objectId || ref;
     const registered = await this.registrationOf(objectId);
@@ -1048,8 +1048,8 @@ export class AbjectStore extends Abject {
     data?: Record<string, unknown>,
     placement: Placement = {},
   ): Promise<boolean> {
-    precondition(objectId !== '', 'objectId must not be empty');
-    precondition(source !== '', 'source must not be empty');
+    precondition(typeof objectId === 'string' && objectId !== '', 'objectId must be a non-empty string');
+    precondition(typeof source === 'string' && source !== '', 'source must be a non-empty string');
     precondition(
       isValidManifest(manifest),
       'manifest must be a structured AbjectManifest with a non-empty name and interface.methods (refusing to persist free-form text)',
@@ -1568,7 +1568,10 @@ AbjectStore keeps this workspace's objects: their code and data, a folder, tags,
 
 ### Save and remove
 
-  await call(await dep('AbjectStore'), 'save', { objectId: 'the-object-id' });
+  // save records a snapshot (taken from the object itself, its owner, or a
+  // built-in object). It does not change the code a running object executes:
+  // a source change goes to the live object, and ObjectCreator makes it.
+  await call(await dep('AbjectStore'), 'save', { objectId: 'the-object-id', manifest, source, data });
   await call(await dep('AbjectStore'), 'remove', { objectId: 'the-object-id' });
 
 ### Version history (undo a bad source edit)

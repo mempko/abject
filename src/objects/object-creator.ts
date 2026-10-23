@@ -62,6 +62,21 @@ const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
  */
 const GOAL_DRAFT_KEY = 'objectcreator:staged-draft';
 
+/**
+ * A short fingerprint of a source text: its length and a 32-bit FNV-1a hash.
+ * It names which version of an object a draft was built on, so a draft whose
+ * base is no longer live is recognised as stale rather than deployed over the
+ * changes made since.
+ */
+function sourceFingerprint(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${text.length}:${(h >>> 0).toString(36)}`;
+}
+
 // ── Manifest normalization ────────────────────────────────────────────────
 // LLMs frequently draft an interface with `methods`/`events` as bare string
 // arrays (e.g. ["show","hide"]) or partial objects, but the schema wants
@@ -257,6 +272,15 @@ interface LoopState {
 
   draftManifest?: AbjectManifest;
   draftSource?: string;
+  /**
+   * Fingerprint (sourceFingerprint) of the live source the staged draft was
+   * built on: the target's source when the first edit staged, what a deploy
+   * just made live, or a resumed draft's recorded base. A draft whose base is
+   * not the live source would overwrite whatever changed since, so load_target
+   * and resume_draft drop it instead of editing it. Undefined while a draft is
+   * staged means a brand-new object with no live source yet.
+   */
+  draftBase?: string;
   usedObjects: string[];
 
   turn: number;
@@ -808,6 +832,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     revert?: { draft: string | undefined },
   ): { ok: boolean; summary: string; error?: string; data?: unknown } {
     const source = state.draftSource ?? '';
+    // The first edit staged on an existing object is built on its live source.
+    if (state.draftSource !== undefined && state.draftBase === undefined && state.targetSource !== undefined) {
+      state.draftBase = sourceFingerprint(state.targetSource);
+    }
     const syntaxError = ScriptableAbject.tryCompile(source);
     state.lastValidation = { ...(state.lastValidation ?? {}), compile: syntaxError ?? '' };
 
@@ -815,6 +843,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       // Refuse the edit rather than leave a draft that can no longer be edited
       // by member name. The draft is untouched, so the next attempt starts clean.
       state.draftSource = revert.draft;
+      if (revert.draft === undefined) state.draftBase = undefined;
       // The staged draft is back to a state whose checks no longer describe an
       // edit in progress: drop the stale verdicts rather than leave the loop
       // asserting a deferred check that will never fire on its own.
@@ -1011,10 +1040,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const raw = this.actionField(action, ['edits', 'changes', 'ops', 'operations']);
     const edits = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : []);
     if (edits.length === 0) {
+      // Planning the edits in reasoning and then sending the action without
+      // them is the usual way this happens, and it repeats unless named.
+      const carried = Object.keys(action).filter(k => k !== 'action');
       return {
         ok: false,
         summary: 'edit_source: missing edits',
-        error: 'Pass `edits`: an array of { op: "replace" | "add" | "remove", name, body } entries (body is the FULL member text including its signature, e.g. "openMap(msg) { … }"), and/or { op: "diff", blocks: "<<<<<<< SEARCH …" } for a change inside a member. They apply in order.',
+        error: `This edit_source action carried no edits (its fields: ${carried.join(', ') || 'none'}), so nothing was staged. The edits themselves go in the action, not in your reasoning. ` +
+          'Pass `edits`: an array of { op: "replace" | "add" | "remove", name, body } entries (body is the FULL member text including its signature, e.g. "openMap(msg) { … }"), and/or { op: "diff", blocks: "<<<<<<< SEARCH …" } for a change inside a member. They apply in order.',
       };
     }
 
@@ -1458,10 +1491,15 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     state.targetObjectId = resolvedId;
     state.targetName = nameOrId.includes('-') && nameOrId.length > 20 ? undefined : nameOrId;
+    let dropped = '';
     if (source !== undefined) {
       state.targetSource = source;
       // A different object's pre-existing call issues are not this one's baseline.
       state.baselineCallKeys = undefined;
+      // Edits are made on the draft (read_draft and edit_source read it before
+      // the target), so a draft built on any other version would hide the
+      // source just loaded and, deployed, overwrite it.
+      dropped = this.dropDraftNotBuiltOn(state, source);
     }
     // Pivot the loop: from here this is a modification of an existing object.
     if (state.kind === 'create') state.kind = 'modify';
@@ -1475,8 +1513,31 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
     return {
       ok: true,
-      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with edit_source, deploy with deploy_update)`,
+      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with edit_source, deploy with deploy_update)${dropped}`,
     };
+  }
+
+  /**
+   * Make the live `source` what the next edit starts from. A staged draft
+   * built on that same source is kept (its edits still apply); any other is
+   * dropped with its manifest and checks, and the returned note says so.
+   */
+  private dropDraftNotBuiltOn(state: LoopState, source: string): string {
+    if (state.draftSource === undefined) return '';
+    const live = sourceFingerprint(source);
+    if (state.draftSource === source) {
+      state.draftBase = live;
+      return '';
+    }
+    if (state.draftBase === live) return '';
+    const lines = state.draftSource.split('\n').length;
+    state.draftSource = undefined;
+    state.draftManifest = undefined;
+    state.draftBase = undefined;
+    state.checkDeferred = false;
+    state.lastValidation = undefined;
+    state.semanticReviewedSource = undefined;
+    return `. The ${lines}-line staged draft was built on a different version of this object, so it was set aside: read_draft and edit_source now work on the live source just loaded.`;
   }
 
   /**
@@ -2400,6 +2461,7 @@ ${source}
 
     if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.lastDeployedSource = state.draftSource;
+    state.draftBase = sourceFingerprint(state.draftSource);
 
     // Detect a live name collision. Registry uniquifies duplicate registration
     // names (Name → Name-2), so discover({name}) keeps resolving to the
@@ -2591,6 +2653,7 @@ ${source}
     if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.deployedViaUpdateSource = true;
     state.lastDeployedSource = draftSource;
+    state.draftBase = sourceFingerprint(draftSource);
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
     if (targetLabel && !state.targetName) state.targetName = targetLabel;
     // What is live is now what we just wrote, so a second deploy in this same
@@ -2795,6 +2858,7 @@ ${source}
     // The staged membrane drafts are now live inside the organism.
     if (!this.abjectStoreId) return { ok: false, summary: 'Object is live but not saved', error: 'AbjectStore unavailable; persistence is incomplete' };
     state.lastDeployedSource = state.draftSource;
+    state.draftBase = state.draftSource !== undefined ? sourceFingerprint(state.draftSource) : undefined;
 
     // Persist so the organism survives a restart (same path deploy_spawn uses;
     // Factory re-detects the organism tag + JSON spec on restore).
@@ -3880,6 +3944,7 @@ ${source}
         targetObjectId: s.targetObjectId,
         manifest: s.draftManifest,
         source: s.draftSource,
+        ...(s.draftBase ? { baseFingerprint: s.draftBase } : {}),
       };
       await this.sendRequest(this.goalManagerId, 'writeGoalData', {
         goalId: extra.goalId, key: `${GOAL_DRAFT_KEY}/${extra.taskId}`, value: JSON.stringify(payload),
@@ -3916,13 +3981,30 @@ ${source}
       if (!raw || typeof raw !== 'string') return;
       const payload = JSON.parse(raw) as {
         taskId?: string; kind?: string; targetName?: string; targetObjectId?: string;
-        manifest?: AbjectManifest; source?: string;
+        manifest?: AbjectManifest; source?: string; baseFingerprint?: string;
       };
       if (!payload.source) return;
       if (state.targetObjectId && payload.targetObjectId !== state.targetObjectId) return;
       // A draft authored for a DIFFERENT named target is not ours to adopt.
       if (payload.targetName && state.targetName && payload.targetName !== state.targetName) return;
+      // A draft is adopted only onto the version it was built on. Another task
+      // may have shipped a newer version since, and deploying the old draft
+      // would quietly undo that work.
+      const live = state.targetSource ?? await this.liveSourceOf(payload.targetObjectId, payload.targetName ?? payload.manifest?.name);
+      const lines = payload.source.split('\n').length;
+      if (live !== undefined && live === payload.source) return;
+      if (live !== undefined && payload.baseFingerprint !== sourceFingerprint(live)) {
+        state.turnLog.push({
+          turn: 0,
+          action: 'resume_draft',
+          ok: false,
+          summary: `Set aside the ${lines}-line draft a previous task in this goal saved (scratchpad key '${draftKey}'): it was built on a different version of ${payload.targetName ?? payload.manifest?.name ?? 'the object'} than the one live now (${live.split('\n').length} lines), so deploying it would undo the changes made since. Work from the live source: load_target it, then edit and deploy.`,
+        });
+        log.info(`Set aside stale persisted draft for goal ${goalId.slice(0, 8)} (${lines} lines, live ${live.split('\n').length})`);
+        return;
+      }
       state.draftSource = payload.source;
+      state.draftBase = payload.baseFingerprint;
       if (payload.manifest && !state.draftManifest) state.draftManifest = payload.manifest;
       state.turnLog.push({
         turn: 0,
@@ -3932,6 +4014,25 @@ ${source}
       });
       log.info(`Resumed persisted draft for goal ${goalId.slice(0, 8)} (${payload.source.split('\n').length} lines)`);
     } catch { /* absence of a persisted draft is the normal case */ }
+  }
+
+  /**
+   * The source a saved draft's object runs now, found by its id or, after a
+   * respawn gave it a new id, by its name. Undefined when no such object is
+   * live, which is the case for a draft of an object not yet spawned.
+   */
+  private async liveSourceOf(objectId: string | undefined, name: string | undefined): Promise<string | undefined> {
+    if (!this.registryId) return undefined;
+    for (const ref of [objectId, name]) {
+      if (!ref) continue;
+      const id = await this.resolveTarget(ref);
+      if (!id) continue;
+      try {
+        const src = await this.sendRequest<string | null>(this.registryId, 'getSource', { objectId: id }, 5000);
+        if (typeof src === 'string' && src.length > 0) return src;
+      } catch { /* try the next reference */ }
+    }
+    return undefined;
   }
 
   // ── Runtime decisions (object-creator.* decision sites) ───────────────

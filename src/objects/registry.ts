@@ -778,7 +778,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     typeId?: TypeId,
     data?: Record<string, unknown>,
   ): boolean {
-    require(objectId !== '', 'objectId must not be empty');
+    require(typeof objectId === 'string' && objectId !== '', 'objectId must be a non-empty string');
     require(manifest !== undefined, 'manifest is required');
     // A sleeping object that started is a running one now.
     if (typeId) this.asleep.delete(typeId);
@@ -877,13 +877,21 @@ Each line shows one registered object: id, name, description, and non-meta metho
     for (const [id, reg] of this.objects) {
       // Skip self and core system objects (see note above).
       if (id === this.id) continue;
-      if (reg.manifest.tags?.includes('core')) continue;
+      // An entry without a usable id can never be delivered to; it goes too.
+      if (typeof id !== 'string' || id === '') { deadIds.push(id); continue; }
+      if (reg.manifest?.tags?.includes('core')) continue;
       if (!bus.isRegistered(id)) deadIds.push(id);
     }
+    // Every query runs this first, so one bad entry must not fail them all.
     for (const id of deadIds) {
       const reg = this.objects.get(id);
-      log.info(`reconcile: unregistering dead entry ${id.slice(0, 8)} (${reg?.name ?? reg?.manifest.name})`);
-      this.unregisterObject(id);
+      log.info(`reconcile: unregistering dead entry ${String(id).slice(0, 8)} (${reg?.name ?? reg?.manifest?.name})`);
+      try {
+        this.unregisterObject(id);
+      } catch (err) {
+        this.objects.delete(id);
+        log.warn(`reconcile: dropped entry ${String(id).slice(0, 8)} after unregister failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
