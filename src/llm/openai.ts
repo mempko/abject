@@ -139,7 +139,10 @@ interface OpenAIResponse {
     index: number;
     message: {
       role: string;
-      content: string;
+      /** Null when the model wrote no text: all of its output went to
+       * reasoning, or it refused (see refusal). */
+      content: string | null;
+      refusal?: string | null;
     };
     finish_reason: string;
   }[];
@@ -531,6 +534,18 @@ export class OpenAIProvider extends BaseLLMProvider {
       return this.completeViaStream(messages, options);
     }
 
+    try {
+      return await this.completeOnce(request);
+    } catch (err) {
+      // As the stream does: with retries exhausted, an empty completion is an
+      // empty answer, for callers that have their own empty-reply handling.
+      if (err instanceof EmptyCompletionError) return { content: '', finishReason: err.stopReason === 'stop' ? 'stop' : 'length' };
+      throw err;
+    }
+  }
+
+  /** One plain chat-completions request, retried; a reply with no text throws EmptyCompletionError. */
+  private completeOnce(request: OpenAIRequest): Promise<LLMCompletionResult> {
     return this.withRetries(async () => {
       const response = await this.fetch(`${this.baseUrl}/v1/chat/completions`, {
         method: 'POST',
@@ -544,9 +559,18 @@ export class OpenAIProvider extends BaseLLMProvider {
       if (!choice) {
         throw new Error('No completion returned');
       }
+      // The same contract as the stream: a reply with no text is an empty
+      // completion, retried or routed elsewhere, never a success with null
+      // content for the caller to trip over.
+      const content = choice.message.content;
+      if (typeof content !== 'string' || content.trim().length === 0) {
+        const refusal = choice.message.refusal ? ` refusal="${choice.message.refusal.replace(/\s+/g, ' ').slice(0, 200)}"` : '';
+        const detail = `finish_reason=${choice.finish_reason ?? 'unknown'} usage=${data.usage?.prompt_tokens ?? '?'}in/${data.usage?.completion_tokens ?? '?'}out/reasoning=${data.usage?.completion_tokens_details?.reasoning_tokens ?? '?'}${refusal}`;
+        throw new EmptyCompletionError(`LLM returned an empty completion (${detail})`, choice.finish_reason);
+      }
 
       return {
-        content: choice.message.content,
+        content,
         finishReason: choice.finish_reason === 'stop' ? 'stop' : 'length',
         usage: {
           // prompt_tokens is the whole prompt, cached pieces included; the
@@ -559,7 +583,13 @@ export class OpenAIProvider extends BaseLLMProvider {
           reasoningTokens: data.usage.completion_tokens_details?.reasoning_tokens,
         },
       };
-    }, { label: `${this.name}.complete` });
+    }, {
+      label: `${this.name}.complete`,
+      // An empty completion is a stochastic model behavior: always worth an
+      // immediate retry, whatever numbers its message happens to carry.
+      isRetryable: err => err instanceof EmptyCompletionError || defaultIsRetryable(err),
+      delayMs: (err, _attempt, delay) => (err instanceof EmptyCompletionError ? 0 : delay),
+    });
   }
 
   /** Non-streaming result assembled from the streaming path, for large-cap

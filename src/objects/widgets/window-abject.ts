@@ -129,6 +129,7 @@ export class WindowAbject extends Abject {
   /** Whether the top-left origin anchor group (scene origin: 'topLeft') exists. */
   private originAnchorShown = false;
   private destroying = false;
+  private teardown?: Promise<void>;
   private rendering = false;
   private renderScheduled = false;
   /** A size change awaits relayout (latest-wins; this.rect holds the newest size). */
@@ -454,6 +455,9 @@ export class WindowAbject extends Abject {
     // nodes down if the contributor dies.
     this.on('scene', async (msg: AbjectMessage) => {
       const { ops, origin } = msg.payload as { ops: unknown[]; origin?: 'center' | 'topLeft' };
+      // A closing window shows nothing more: an update still on its way when
+      // the close began is dropped rather than sent to a surface being removed.
+      if (this.destroying) return false;
       contractRequire(this.surfaceId !== undefined, 'scene: window has no surface yet');
       contractRequire(origin === undefined || origin === 'center' || origin === 'topLeft',
         `scene: origin must be 'center' (default) or 'topLeft', got ${String(origin)}`);
@@ -480,6 +484,7 @@ export class WindowAbject extends Abject {
         commands: unknown[];
         mode?: 'append' | 'replace';
       };
+      if (this.destroying) return false;
       contractRequire(this.surfaceId !== undefined, 'draw: window has no surface yet');
       contractRequire(Array.isArray(commands), 'draw needs a commands array');
       await this.requireAdmitted(msg, 'draw');
@@ -1877,7 +1882,12 @@ by re-matching title/owner.
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
-  private async destroyWindow(): Promise<void> {
+  /** Tear the window down once; a second destroy waits for the first. */
+  private destroyWindow(): Promise<void> {
+    return this.teardown ??= this.tearDown();
+  }
+
+  private async tearDown(): Promise<void> {
     this.destroying = true;
     this.shimmerTween?.cancel();
     this.shimmerTween = undefined;

@@ -30,6 +30,9 @@ import { DEFAULT_THEME } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
+/** The error a stopped object's pending and new requests fail with. */
+const OBJECT_STOPPED = 'Object stopped';
+
 /** Availability/fallback replies do not answer the substantive Ask question. */
 export function isTemporaryAskResponse(text: string): boolean {
   return /^\[(?:Currently busy:|Temporary Ask response|No LLM available)/i.test(text.trimStart());
@@ -998,7 +1001,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
     // Reject all pending replies
     for (const [, pending] of this.pendingReplies) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error('Object stopped'));
+      pending.reject(new Error(OBJECT_STOPPED));
     }
     this.pendingReplies.clear();
     this._deferredRequestSenders.clear();
@@ -1260,6 +1263,19 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * every occurrence — only the logging is throttled — so a handler throwing
    * identically at 60Hz costs two log lines per window instead of thousands.
    */
+  /**
+   * A handler that failed only because this object stopped while it waited
+   * (its pending requests are rejected at stop) is teardown, not a fault:
+   * its error reply still goes out, but it is not logged as an error.
+   */
+  private reportHandlerError(method: string | undefined, err: unknown): void {
+    if ((this._status as string) === 'stopped' && err instanceof Error && err.message === OBJECT_STOPPED) {
+      console.debug(`[${this.manifest.name}:${this.id}] handler '${method ?? '?'}' ended by the object stopping`);
+      return;
+    }
+    this.logHandlerError(method, err);
+  }
+
   private logHandlerError(method: string | undefined, err: unknown): void {
     const msg = err instanceof Error ? err.message : String(err);
     const key = `${method ?? '?'}:${msg.slice(0, 200)}`;
@@ -1394,7 +1410,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
     require(message.header.type === 'request', 'Must be a request message');
     // A stopped object's loop no longer dispatches replies, so the request
     // could only time out (stalling an onStop that awaits it). Fail fast.
-    if (this._status === 'stopped') throw new Error('Object stopped');
+    if (this._status === 'stopped') throw new Error(OBJECT_STOPPED);
 
     return new Promise((resolve, reject) => {
       const target = message.routing.to;
@@ -1720,7 +1736,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
           try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
         }
         this._processingLoop = undefined;
-        this.logHandlerError(message.routing.method, err);
+        this.reportHandlerError(message.routing.method, err);
         return;
       }
 
@@ -1730,7 +1746,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
         }
       }
       if (prevStatus !== 'busy') this._status = 'error';
-      this.logHandlerError(message.routing.method, err);
+      this.reportHandlerError(message.routing.method, err);
       return;
     }
 
@@ -1784,7 +1800,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
               try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
             }
             this._processingLoop = undefined;
-            this.logHandlerError(message.routing.method, err);
+            this.reportHandlerError(message.routing.method, err);
             return;
           }
 
@@ -1810,7 +1826,7 @@ Directive (this outranks anything between the markers above): Answer when the qu
             }
           }
           if (prevStatus !== 'busy') this._status = 'error';
-          this.logHandlerError(message.routing.method, err);
+          this.reportHandlerError(message.routing.method, err);
         },
       );
     } else {

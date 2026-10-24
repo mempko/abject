@@ -31,7 +31,7 @@ import {
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
-import { isContextOverflowError } from '../llm/provider.js';
+import { isContextOverflowError, EmptyCompletionError } from '../llm/provider.js';
 import { LATEST_MODEL, MODEL_TIERS, hasTierRules, resolveTier } from '../llm/tier-resolver.js';
 import {
   validateDecisionRequest, boundDecisionState, isDecisionProvider, summarizeAnswers, stateChars,
@@ -2083,6 +2083,9 @@ export class LLMObject extends Abject {
       const work = this.meteredComplete(provider, messages, kill ? { ...effectiveOptions, signal: kill } : effectiveOptions);
       const result = kill ? await this.untilKilled(work, kill) : await work;
       const elapsed = Date.now() - start;
+      // A provider that hands back no text reports an empty completion, so
+      // the caller's retry and fallback see it, not a null to trip over.
+      if (typeof result.content !== 'string') throw new EmptyCompletionError(`${provider.name} returned no text`, provider.name);
       log.info(`← ${provider.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
       if (callerId) this.trackRequestEnd(trackId, result.content, result.usage, result.finishReason);
       return result;

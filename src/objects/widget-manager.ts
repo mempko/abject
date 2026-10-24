@@ -175,6 +175,8 @@ export class WidgetManager extends Abject {
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
+  /** Windows being destroyed: a second request for the same window joins the first. */
+  private destroyingWindows = new Map<AbjectId, Promise<boolean>>();
   private spawnedWidgets: Set<AbjectId> = new Set();
   private orphanSweepTimer?: ReturnType<typeof setInterval>;
   // Maps windowId → surfaceId for raiseWindow support
@@ -3639,8 +3641,22 @@ async timerFired(msg) {
 
   // ── Factory: destroyWindowDirect — destroy by AbjectId ─────────────
 
-  private async destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
-    if (!this.spawnedWindows.has(windowId)) return false;
+  /**
+   * Destroy a window once. A close can arrive twice (a window's events are
+   * delivered twice), and the window stays in spawnedWindows until its
+   * destroy reply, so a second call joins the teardown already running
+   * instead of destroying it again and announcing windowDestroyed twice.
+   */
+  private destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
+    const running = this.destroyingWindows.get(windowId);
+    if (running) return running;
+    if (!this.spawnedWindows.has(windowId)) return Promise.resolve(false);
+    const teardown = this.tearDownWindow(windowId).finally(() => this.destroyingWindows.delete(windowId));
+    this.destroyingWindows.set(windowId, teardown);
+    return teardown;
+  }
+
+  private async tearDownWindow(windowId: AbjectId): Promise<boolean> {
     console.debug(`[WidgetManager] destroyWindowDirect(${windowId})`);
     const destroyedOwner = this.windowOwners.get(windowId);
 
