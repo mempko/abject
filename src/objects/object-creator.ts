@@ -3370,6 +3370,22 @@ ${source}
    * Failing to ask (no WidgetManager, a timeout) reads as "unchecked", never
    * as "fits".
    */
+  /**
+   * Whether an object owns a window, by WidgetManager's list. Undefined when
+   * that cannot be learned (no WidgetManager, a timeout), which callers read
+   * as "may own one".
+   */
+  private async ownsWindow(objectId: string): Promise<boolean | undefined> {
+    try {
+      const wm = await this.discoverDep('WidgetManager');
+      if (!wm) return undefined;
+      const windows = await this.request<Array<{ ownerId?: string }>>(request(this.id, wm, 'listWindows', {}), 5000);
+      return Array.isArray(windows) ? windows.some(w => w.ownerId === objectId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async layoutIssueNote(ownerId: string | undefined): Promise<string> {
     if (!ownerId) return '';
     try {
@@ -3418,8 +3434,12 @@ ${source}
       extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
       const screenshotService = await this.discoverDep('Screenshot');
       const target = extra.state.spawnedObjectId ?? extra.state.targetObjectId;
-      if (extra.state.deployTurn !== undefined && method === 'captureWindow' &&
-          (action.target === 'Screenshot' || action.target === screenshotService) && img.ownerId === target) extra.state.visualSinceDeploy = true;
+      if (extra.state.deployTurn !== undefined && target && (action.target === 'Screenshot' || action.target === screenshotService)) {
+        // Its own window shows an object; one that owns no window draws into
+        // the desktop scene, so the desktop shows it.
+        if (method === 'captureWindow' && img.ownerId === target) extra.state.visualSinceDeploy = true;
+        else if (method === 'captureDesktop' && await this.ownsWindow(target) === false) extra.state.visualSinceDeploy = true;
+      }
       res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.${layoutNote}`;
       res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)${layoutNote ? '; layout overflow reported' : ''}`;
       return;
@@ -3697,7 +3717,12 @@ ${source}
       const noDisplay = (await this.refreshDisplay()) === false;
       const visualAvailable = noDisplay ? false : visionAvailable;
       const authorsUI = extra.state.kind !== 'investigate' && !!extra.state.draftSource && ObjectCreator.authorsUI(extra.state);
-      if (gate.ok && authorsUI && visualAvailable === true && !extra.state.visualSinceDeploy) return { accepted: false, reason: 'Capture and inspect this application through Screenshot.captureWindow after the last deployment; unrelated windows cannot verify it' };
+      if (gate.ok && authorsUI && visualAvailable === true && !extra.state.visualSinceDeploy) {
+        const windowless = target !== undefined && await this.ownsWindow(target) === false;
+        return { accepted: false, reason: windowless
+          ? 'Capture and inspect this object through Screenshot.captureDesktop after the last deployment: it owns no window, so it is seen where it draws, on the desktop'
+          : 'Capture and inspect this application through Screenshot.captureWindow after the last deployment; unrelated windows cannot verify it' };
+      }
       if (gate.ok && target && extra.state.draftSource) {
         if (!this.abjectStoreId) return {accepted:false,reason:'Durable snapshot service unavailable'};
         const persisted = await this.sendRequest<{ success: boolean; error?: string }>(target, 'persistSnapshot', { expectedSource: extra.state.lastDeployedSource }, 15000);
@@ -4132,9 +4157,9 @@ ${source}
           notFor: 'An object that is not deployed yet (deploy_now).',
           examples: ['deployed, and not exercised since'],
         }),
-        screenshot_now: criterion('Capture and inspect the deployed UI now.', {
-          notFor: 'An object without a window.',
-          examples: ['a deployed, exercised window that was never captured'],
+        screenshot_now: criterion('Capture and inspect the deployed UI now: its window, or the desktop for an object that draws without one.', {
+          notFor: 'An object that draws nothing.',
+          examples: ['a deployed, exercised window that was never captured', 'a deployed, exercised desktop scene object never seen on the desktop'],
         }),
         finish_now: criterion('The work is deployed and verified; write the final report now.', {
           notFor: 'Deployed but never exercised (exercise_now).',
@@ -5394,7 +5419,7 @@ A model that lives in the object stays available once this task ends: the object
     ? `**This instance has no display (the headless edition).** Nothing here draws windows, so there is no window to open, screenshot, or inspect, and the window and widget services are absent from the registry. Build objects whose value reaches the person through messages: replies in the conversation, notifications, scheduled work, data they can ask for, or pages served through the web gateway. Verify through behavior: \`getState\`, method calls and their results. When a goal asks for a visual UI, build the model and its methods so they work here, and say in your final result that this instance has no display to show a window on.`
     : this.visionCapable === false
     ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
-    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It works wherever the window is, including a workspace other than the one the user is looking at, so capture the window where it lives. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. For a 3D scene, judge the DEPTH: near objects must look bigger than far ones, and a scene where everything is the same apparent size is flat, not 3D, however "3D" the geometry is. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
+    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It works wherever the window is, including a workspace other than the one the user is looking at, so capture the window where it lives. An object that owns no window and draws straight into the desktop scene is seen on the desktop instead: \`call("Screenshot", "captureDesktop", {})\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. For a 3D scene, judge the DEPTH: near objects must look bigger than far ones, and a scene where everything is the same apparent size is flat, not 3D, however "3D" the geometry is. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
 
    **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
 

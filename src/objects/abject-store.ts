@@ -159,6 +159,8 @@ export class AbjectStore extends Abject {
   private sourceCache: Map<string, string> = new Map();
   /** Hashes known to be in Storage. */
   private storedSources: Set<string> = new Set();
+  /** Hash of the data last written for each record, so an unchanged save writes nothing. */
+  private bodyHashes: Map<string, string> = new Map();
   /** Objects woken but not yet up, by typeId, so concurrent lookups share one wake. */
   private waking: Map<string, Promise<AbjectId>> = new Map();
   /** Who holds a sleeping-kind object awake (slots, windows), by typeId. */
@@ -775,6 +777,15 @@ export class AbjectStore extends Abject {
     return hash;
   }
 
+  /** Write a record's data; false when it is the data last written there. */
+  private async writeBody(typeId: string, data: Record<string, unknown>): Promise<boolean> {
+    const hash = await sha256Hex(JSON.stringify(data));
+    if (this.bodyHashes.get(typeId) === hash) return false;
+    await this.storageSet(bodyKey(typeId), { data });
+    this.bodyHashes.set(typeId, hash);
+    return true;
+  }
+
   private cacheSource(hash: string, source: string): void {
     this.sourceCache.delete(hash);
     this.sourceCache.set(hash, source);
@@ -1081,6 +1092,27 @@ export class AbjectStore extends Abject {
       const place = this.placementOf(placement, { folder: existing?.folder ?? DEFAULT_FOLDER, loading: existing?.loading ?? 'boot' });
 
       const sourceHash = await this.writeSource(source);
+      const finalManifest = this.withTags(manifest, place.tags);
+
+      // An object saving its state as it runs sends the same source and
+      // manifest every time. Such a save writes only the data, and nothing
+      // at all when the data is unchanged; the record, the index and the
+      // workspace tag stay as they are. The Registry still hears changed
+      // data, since a respawn after a worker crash reads it there.
+      if (existing && !retired && existing.objectId === objectId && existing.sourceHash === sourceHash &&
+          existing.owner === owner && existing.folder === place.folder && existing.loading === place.loading &&
+          JSON.stringify(existing.manifest) === JSON.stringify(finalManifest)) {
+        existing.savedAt = Date.now();
+        if (data === undefined || !(await this.writeBody(typeId, data))) return true;
+        if (this.registryId) {
+          try {
+            await this.request(request(this.id, this.registryId, 'register', {
+              objectId, manifest: finalManifest, owner, source, typeId: typeId as TypeId, data,
+            }));
+          } catch { /* best effort — registry may not be ready */ }
+        }
+        return true;
+      }
       // Version history: a save that CHANGES the source pushes the outgoing
       // source onto the ring first, so it stays restorable.
       let versions = existing?.versions;
@@ -1091,10 +1123,9 @@ export class AbjectStore extends Abject {
       }
       // A save without data (an ObjectCreator-driven save after a source
       // edit) keeps the data the object had.
-      if (data !== undefined) await this.storageSet(bodyKey(typeId), { data });
+      if (data !== undefined) await this.writeBody(typeId, data);
       const finalData = data !== undefined ? data : (existing ? (await this.readBody(typeId))?.data : undefined);
 
-      const finalManifest = this.withTags(manifest, place.tags);
       const entry: StoreEntry = {
         typeId,
         objectId: retired ? (existing?.objectId ?? '') : objectId,
@@ -1154,7 +1185,7 @@ export class AbjectStore extends Abject {
     const key = packageDataKey(manifest.name);
     const existing = this.findPackageEntry(manifest.name);
     const sourceHash = await this.writeSource(source);
-    if (data !== undefined) await this.storageSet(bodyKey(key), { data });
+    if (data !== undefined) await this.writeBody(key, data);
     const finalData = data !== undefined ? data : (existing ? (await this.readBody(key))?.data : undefined);
     this.entries.set(key, {
       typeId: key, objectId, manifest, owner, savedAt: Date.now(), sourceHash,
@@ -1267,6 +1298,7 @@ export class AbjectStore extends Abject {
     this.schedulePersist();
     await this.flushPersist();
     await this.storageDelete(bodyKey(entry.typeId));
+    this.bodyHashes.delete(entry.typeId);
     if (entry.preview) await this.storageDelete(previewKey(entry.typeId));
     await this.dropUnusedSources([entry.sourceHash, ...(entry.versions ?? []).map(v => v.sourceHash)]);
     if (!entry.objectId && this.registryId) {
