@@ -23,6 +23,7 @@ import {
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('ANTHROPIC');
 
@@ -352,7 +353,7 @@ export class AnthropicProvider extends BaseLLMProvider {
       return rows.map(r => {
         const created = r.created_at ? Math.floor(Date.parse(r.created_at) / 1000) : NaN;
         return {
-          id: r.id, name: r.display_name ?? r.id, vision: true, efforts: this.supportedEfforts(r.id),
+          id: r.id, name: r.display_name ?? r.id, vision: true, efforts: this.supportedEfforts(r.id), ...windowField(r),
           ...(Number.isFinite(created) ? { created } : {}),
         };
       });

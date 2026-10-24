@@ -100,7 +100,10 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'
 const ABJECT_IMAGE = /!\[([^\]]*)\]\((abject:\/\/[^)\s]+)\)/g;
 /** Images read for display, kept for replays (oldest dropped first). */
 const IMAGE_CACHE_LIMIT = 16;
-/** Max characters of a text/code attachment injected into the prompt. */
+/**
+ * Characters of a text/code attachment injected into the prompt, at least:
+ * a larger window takes a tenth of its conversation budget (attachmentLimit).
+ */
 const MAX_ATTACHMENT_CHARS = 40_000;
 const ATTACH_GLYPH = '📎';
 
@@ -266,6 +269,8 @@ interface ChatConstructorArgs {
 
 export class Chat extends Abject {
   private registryId?: AbjectId;
+  /** attachmentLimit's last answer, re-asked of LLM after a minute. */
+  private attachmentChars?: { chars: number; at: number };
   private agentAbjectId?: AbjectId;
   private storageId?: AbjectId;
   private chatManagerId?: AbjectId;
@@ -2240,6 +2245,22 @@ A single successful creation goal is a complete turn. End it with **done**.
    * text/code inline (truncated), images and PDFs as binary content parts.
    * Returns null if the file can't be read (caller falls back to a reference).
    */
+  /** How much of a text attachment goes in: a tenth of the think tier's conversation budget, at least MAX_ATTACHMENT_CHARS. */
+  private async attachmentLimit(): Promise<number> {
+    const now = Date.now();
+    if (this.attachmentChars && now - this.attachmentChars.at < 60_000) return this.attachmentChars.chars;
+    let chars = MAX_ATTACHMENT_CHARS;
+    try {
+      const llm = await this.discoverDep('LLM');
+      if (llm) {
+        const budget = await this.request<{ soft: number }>(request(this.id, llm, 'getContextBudget', { tier: CHAT_THINK_TIER }), 10000);
+        chars = Math.max(MAX_ATTACHMENT_CHARS, Math.floor(budget.soft * 0.10));
+      }
+    } catch { /* keep the floor */ }
+    this.attachmentChars = { chars, at: now };
+    return chars;
+  }
+
   private async buildAttachmentContent(att: {
     path: string; name: string; mimeType: string; kind: 'text' | 'image' | 'document';
   }): Promise<string | ContentPart[] | null> {
@@ -2248,8 +2269,9 @@ A single successful creation goal is a complete turn. End it with **done**.
       if (att.kind === 'text') {
         const text = await this.request<string>(
           request(this.id, this.fileSystemId, 'readFile', { path: att.path }), 30000);
-        const body = text.length > MAX_ATTACHMENT_CHARS
-          ? text.slice(0, MAX_ATTACHMENT_CHARS) + '\n…[truncated]'
+        const limit = await this.attachmentLimit();
+        const body = text.length > limit
+          ? text.slice(0, limit) + '\n…[truncated]'
           : text;
         return `Attached file ${att.name}:\n\`\`\`\n${body}\n\`\`\``;
       }

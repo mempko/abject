@@ -204,6 +204,7 @@ const BOOTSTRAP_SOURCE = String.raw`(function abjectSandboxBootstrap(host, confi
   const defineProperty = Object.defineProperty;
   const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
   const getPrototypeOf = Object.getPrototypeOf;
+  const setPrototypeOf = Object.setPrototypeOf;
   const objectKeys = Object.keys;
   const isArray = Array.isArray;
   const JSONParse = JSON.parse;
@@ -446,6 +447,15 @@ const BOOTSTRAP_SOURCE = String.raw`(function abjectSandboxBootstrap(host, confi
   let self;
   function installHandlers(map) {
     if (map === null || typeof map !== 'object') throw new TypeErrorCtor('Source must evaluate to a non-null object');
+    if (cfg.inherited.length > 0) {
+      // super.<name>(...) in a method of the map reaches what the host
+      // inherits under that name.
+      const parent = {};
+      for (let i = 0; i < cfg.inherited.length; i++) {
+        defineProperty(parent, cfg.inherited[i], { value: asyncHelper('super.' + cfg.inherited[i]), writable: false, enumerable: false, configurable: false });
+      }
+      try { setPrototypeOf(map, parent); } catch {}
+    }
     const target = {};
     for (let i = 0; i < helperNames.length; i++) {
       defineProperty(target, helperNames[i], { value: helpers[helperNames[i]], writable: true, enumerable: true, configurable: true });
@@ -698,6 +708,11 @@ export interface SandboxOptions {
   /** Handler-map names that do not replace a helper on `this`. */
   reservedNames?: readonly string[];
   /**
+   * What a handler map inherits: inside a method written in method syntax,
+   * `super.<name>(...args)` calls the helper here with copies and awaits it.
+   */
+  inherited?: Record<string, Helper>;
+  /**
    * Fail a call that waits while nothing can ever wake it: no helper call
    * outstanding and no timer set. Only where no other call can enter the
    * sandbox (a job); a handler may be woken by the next message.
@@ -735,6 +750,7 @@ export class Sandbox {
   private readonly sliceMs: number;
   private readonly asyncHelpers: Record<string, Helper>;
   private readonly syncHelpers: Record<string, Helper>;
+  private readonly inherited: Record<string, Helper>;
   private seq = 0;
   private readonly invocations = new Map<number, Invocation>();
   private readonly tickets = new Set<number>();
@@ -749,7 +765,8 @@ export class Sandbox {
     this.sliceMs = options.sliceMs;
     this.asyncHelpers = { ...(options.asyncHelpers ?? {}) };
     this.syncHelpers = { ...(options.syncHelpers ?? {}) };
-    for (const name of [...Object.keys(this.asyncHelpers), ...Object.keys(this.syncHelpers)]) {
+    this.inherited = { ...(options.inherited ?? {}) };
+    for (const name of [...Object.keys(this.asyncHelpers), ...Object.keys(this.syncHelpers), ...Object.keys(this.inherited)]) {
       contractRequire(IDENTIFIER.test(name), `helper name must be an identifier: ${name}`);
     }
     const config = {
@@ -761,6 +778,7 @@ export class Sandbox {
       timers: !!options.timers,
       contracts: !!options.contracts,
       reserved: [...(options.reservedNames ?? [])],
+      inherited: Object.keys(this.inherited),
     };
     this.ctx = vm.createContext(vm.constants.DONT_CONTEXTIFY, {
       name: options.filename,
@@ -1079,7 +1097,8 @@ export class Sandbox {
   }
 
   private callAsync(ticket: number, name: string, argsText: string): string {
-    const fn = Object.prototype.hasOwnProperty.call(this.asyncHelpers, name) ? this.asyncHelpers[name] : undefined;
+    const [helpers, key] = name.startsWith('super.') ? [this.inherited, name.slice(6)] : [this.asyncHelpers, name];
+    const fn = Object.prototype.hasOwnProperty.call(helpers, key) ? helpers[key] : undefined;
     if (!fn) return refusal(`${name} is not available here`);
     if (this.tickets.size >= MAX_TICKETS) return refusal(`More than ${MAX_TICKETS} calls are already waiting for answers`);
     const args = decodeOut(argsText);

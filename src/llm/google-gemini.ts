@@ -26,6 +26,7 @@ import {
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('GEMINI');
 
@@ -205,6 +206,7 @@ export class GeminiProvider extends BaseLLMProvider {
         .map(m => ({
           id: m.name.replace(/^models\//, ''),
           name: m.displayName ?? m.name,
+          ...windowField(m),
           // Every current Gemini generateContent model is multimodal
           vision: true,
           efforts: this.supportedEfforts(m.name),

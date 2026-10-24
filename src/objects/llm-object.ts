@@ -54,6 +54,7 @@ import {
   loadPricingOverrides,
   setPricingOverride,
 } from '../llm/pricing.js';
+import { conversationBudget, publicContextWindow } from '../llm/context-window.js';
 
 export interface TierConfig {
   provider: string;
@@ -152,8 +153,8 @@ export interface TierCapability {
   model: string | null;
   vision: boolean | null;
   /**
-   * Total context window in tokens, or null when the provider does not
-   * report one. Null is not "small" — callers keep their own fixed budget
+   * Total context window in tokens, or null when neither the provider nor
+   * the public model catalog reports one. Null is not "small" — callers keep their own fixed budget
    * rather than deriving one from a number nobody supplied.
    */
   contextWindow: number | null;
@@ -1023,6 +1024,22 @@ export class LLMObject extends Abject {
                 returns: { kind: 'reference', reference: 'TierCapabilities' },
               },
               {
+                name: 'getContextBudget',
+                description: 'How much conversation a model takes: its context window and the character budgets that follow from it. Give a tier (the model routed to it), or a provider and model (e.g. a vision fallback). Returns { tier?, provider, model, windowTokens, soft, hard }: windowTokens is the window in tokens (null when neither the provider nor the public model catalog reports one), soft is the size in characters at which a conversation should start eliding, hard where it may summarize. An unknown window gets a small fixed budget. Size what one step shows (a result, an observation, an attached file) as a share of soft.',
+                parameters: [
+                  { name: 'tier', type: { kind: 'primitive', primitive: 'string' }, description: 'smart, balanced, fast or code', optional: true },
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'A provider name, with model', optional: true },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'A model id, with provider', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  provider: { kind: 'primitive', primitive: 'string' },
+                  model: { kind: 'primitive', primitive: 'string' },
+                  windowTokens: { kind: 'primitive', primitive: 'number' },
+                  soft: { kind: 'primitive', primitive: 'number' },
+                  hard: { kind: 'primitive', primitive: 'number' },
+                } },
+              },
+              {
                 name: 'getVisionModel',
                 description: 'The first configured model that accepts image input, searched in tier order (smart, balanced, fast) and then the vision fallback. Returns { tier, provider, model, vision } or null when every configured model is text-only. Consult this BEFORE building a workflow around screenshots or image analysis: null means images sent to the LLM are silently replaced with text notes, so visual verification is impossible until a vision-capable model is configured.',
                 parameters: [],
@@ -1537,6 +1554,13 @@ export class LLMObject extends Abject {
 
     this.on('describeTiers', async () => {
       return this.describeTiers();
+    });
+
+    this.on('getContextBudget', async (msg: AbjectMessage) => {
+      const { tier, provider, model } = msg.payload as { tier?: string; provider?: string; model?: string };
+      require(tier === undefined || ['smart', 'balanced', 'fast', 'code'].includes(tier), 'getContextBudget: tier must be smart, balanced, fast or code');
+      require(tier !== undefined || (typeof provider === 'string' && typeof model === 'string'), 'getContextBudget: give a tier, or a provider and model');
+      return this.contextBudget(tier as ModelTier | undefined, provider, model);
     });
 
     this.on('getVisionModel', async () => {
@@ -3751,13 +3775,33 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return catalog.find(mi => mi.id === model)?.vision ?? null;
   }
 
-  /** Same live-then-catalog resolution as lookupVision, for the token window. */
+  /** The window and conversation budget of a tier's model, or of a named provider and model. */
+  private async contextBudget(tier: ModelTier | undefined, provider?: string, model?: string): Promise<{ tier?: ModelTier; provider: string | null; model: string | null; windowTokens: number | null; soft: number; hard: number }> {
+    let route: { provider: string | null; model: string | null; windowTokens: number | null };
+    if (provider && model) {
+      route = { provider, model, windowTokens: this.providers.has(provider) ? await this.lookupContextWindow(provider, model) : null };
+    } else {
+      const cap = (await this.describeTiers())[tier!];
+      route = { provider: cap?.provider ?? null, model: cap?.model ?? null, windowTokens: cap?.contextWindow ?? null };
+    }
+    return { ...(tier ? { tier } : {}), ...route, ...conversationBudget(route.windowTokens) };
+  }
+
+  /**
+   * Same live-then-catalog resolution as lookupVision, for the token window,
+   * then the public model catalog for a hosted model its provider does not
+   * describe. A local runtime (Ollama) reports its own configured window and
+   * never takes a hosted model's.
+   */
   private async lookupContextWindow(providerName: string, model: string): Promise<number | null> {
     const models = await this.getProviderModels(providerName);
     const live = models.find(mi => mi.id === model);
     if (live?.contextWindow !== undefined) return live.contextWindow;
     const catalog = this.providers.get(providerName)?.describe().models ?? [];
-    return catalog.find(mi => mi.id === model)?.contextWindow ?? null;
+    const listed = catalog.find(mi => mi.id === model)?.contextWindow;
+    if (listed !== undefined) return listed;
+    if (providerName === 'ollama') return null;
+    return publicContextWindow(model).catch(() => null);
   }
 
   private resolveProviderAndModel(

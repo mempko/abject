@@ -50,7 +50,7 @@ interface AstNode {
 }
 
 /** Methods provided by the Abject / ScriptableAbject framework; valid on every object. */
-const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
+const FRAMEWORK_PROVIDED_METHODS: ReadonlySet<string> = new Set([...ScriptableAbject.PROTECTED_HANDLERS, ...ScriptableAbject.INHERITED_HANDLERS]);
 
 export const OBJECT_CREATOR_ID = 'abjects:object-creator' as AbjectId;
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
@@ -607,6 +607,23 @@ export class ObjectCreator extends Abject {
     return this.visionCapable;
   }
 
+  /** Re-derive inlineSourceChars from LLM's budgets for the tiers this loop thinks on (same TTL as vision). */
+  private async refreshInlineBudget(): Promise<number> {
+    const now = Date.now();
+    if (now - this.inlineCheckedAt < ObjectCreator.VISION_TTL_MS) return this.inlineSourceChars;
+    this.inlineCheckedAt = now;
+    try {
+      if (!this.llmId) return this.inlineSourceChars;
+      // A tier whose window is unknown answers with the small fallback
+      // budget, which is what its conversation gets, so it counts at that.
+      const budgets = await Promise.all((['smart', 'balanced', 'code'] as const).map(tier =>
+        this.sendRequest<{ provider: string | null; soft: number }>(this.llmId!, 'getContextBudget', { tier }, 10000)));
+      const routed = budgets.filter(b => b && b.provider !== null && b.soft > 0);
+      if (routed.length > 0) this.inlineSourceChars = Math.floor(Math.min(...routed.map(b => b.soft)) / 3);
+    } catch { /* keep the previous answer */ }
+    return this.inlineSourceChars;
+  }
+
   /** Ask InstanceInfo whether this instance has a display (same TTL as vision). */
   private async refreshDisplay(): Promise<boolean | undefined> {
     const now = Date.now();
@@ -811,6 +828,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Cap on how large a source may be before observations show an outline instead of the text. */
   private static readonly MAX_INLINE_SOURCE_CHARS = 30000;
+  /**
+   * How much source an observation shows whole, in characters: a third of
+   * the conversation's soft budget on the smallest window among the tiers
+   * this loop thinks on, so the source fits beside the rest of the
+   * conversation. MAX_INLINE_SOURCE_CHARS until the windows are known.
+   */
+  private inlineSourceChars = ObjectCreator.MAX_INLINE_SOURCE_CHARS;
+  private inlineCheckedAt = 0;
 
   /**
    * Close out a staging op.
@@ -886,16 +911,27 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     state.checkDeferred = false;
     const callErrors = this.walkCalls(state, source);
     state.lastValidation = { ...(state.lastValidation ?? {}), calls: callErrors };
+    const reserved = this.reservedMembers(source);
+    const reservedSummary = reserved.length > 0 ? `; ${reserved.join(', ')} never run${reserved.length === 1 ? 's' : ''} (system handler)` : '';
+    const reservedNote = reserved.length > 0
+      ? `\n\n${reserved.map(n => `\`${n}\``).join(', ')} ${reserved.length === 1 ? 'is a system handler' : 'are system handlers'}: the system answers ${reserved.length === 1 ? 'it' : 'them'}, so ${reserved.length === 1 ? 'this member never runs' : 'these members never run'}. Rename ${reserved.length === 1 ? 'it' : 'them'}, and update whatever calls ${reserved.length === 1 ? 'it' : 'them'}. Only \`ask\` and \`describe\` can be overridden (in method syntax, calling super.ask(msg) / super.describe(msg) for the system's own).`
+      : '';
 
     if (callErrors.length === 0) {
-      return { ok: true, summary: `${summary} — parses OK, 0 call issues`, data: 'Checks passed. Deploy when the object is complete.' };
+      return { ok: true, summary: `${summary} — parses OK, 0 call issues${reservedSummary}`, data: `Checks passed. Deploy when the object is complete.${reservedNote}` };
     }
     const blocking = callErrors.filter(e => e.kind !== 'unknown-dep').length;
     return {
       ok: true,
-      summary: `${summary} — parses OK, ${callErrors.length} call issue${callErrors.length === 1 ? '' : 's'}${blocking > 0 ? ` (${blocking} block deploy)` : ' (advisory)'}`,
-      data: this.formatCallErrors(callErrors),
+      summary: `${summary} — parses OK, ${callErrors.length} call issue${callErrors.length === 1 ? '' : 's'}${blocking > 0 ? ` (${blocking} block deploy)` : ' (advisory)'}${reservedSummary}`,
+      data: `${this.formatCallErrors(callErrors)}${reservedNote}`,
     };
+  }
+
+  /** Members the source defines under a system handler's name, which never run. */
+  private reservedMembers(source: string): string[] {
+    const members = this.parseHandlerMembers(source)?.members ?? [];
+    return [...new Set(members.map(m => m.name).filter(n => ScriptableAbject.PROTECTED_HANDLERS.has(n)))];
   }
 
   // ── Pure member edits (no state) — shared by the single-edit verbs and edit_source ──
@@ -1374,7 +1410,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const hits = base.split('\n')
         .map((l, i) => ({ n: i + 1, l }))
         .filter(x => test(x.l))
-        .slice(0, 60)
+        // As many matching lines as an inline source would hold, at least 60.
+        .slice(0, Math.max(60, Math.floor(this.inlineSourceChars / 200)))
         .map(x => `${x.n}\t${x.l}`)
         .join('\n');
       return { ok: true, summary: `read_draft: grep "${grep}"`, data: hits || '(no matches)' };
@@ -1405,7 +1442,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private relevanceLine(state: LoopState, source: string): string | undefined {
     const rel = state.memberRelevance;
     if (!rel || rel.key !== this.relevanceKey(state) || rel.relevant.length === 0) return undefined;
-    if (source.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) return undefined;
+    if (source.length <= this.inlineSourceChars) return undefined;
     const present = new Set((this.parseHandlerMembers(source)?.members ?? []).map(m => m.name));
     const names = rel.relevant.filter(r => present.has(r.name)).map(r => r.name);
     if (names.length === 0) return undefined;
@@ -1751,6 +1788,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           .join('\n');
         detail = `\n\nSyntax error near line ${loc.line}:${loc.column}:\n${ctx}`;
       }
+    }
+    if (/'super' keyword/.test(err)) {
+      detail += '\n\n`super` works only in a member written in method syntax: `async ask(msg) { ... return super.ask(msg); }`, not `ask: async function (msg) { ... }` or an arrow function.';
     }
     detail += `\n\nSource is ${lines.length} lines. The failing line and its surrounding context are shown above; you already have the exact location, so do NOT use read_draft to find it again. Fix it in place: edit_source with one { op: "replace", name, body } for the member that contains it, or regenerate the whole object with draft_source. A syntax error at or near the last line is almost always an unbalanced brace/paren/bracket, so check the object literal's closing.`;
     return `${err}${detail}`;
@@ -2996,6 +3036,7 @@ ${source}
       'In generated handler code, `this.call(target, …)` routes by AbjectId only — the bus does NOT resolve names on the send path. Resolve a dependency to its id first: `const id = await this.dep("Name")` (or `this.find("Name")`), then `await this.call(id, method, payload)` — or inline `await this.call(this.dep("Name"), method, payload)`. NEVER pass a bare name string as the recipient (e.g. `this.call("WidgetManager", …)`); that call is delivered nowhere and times out. (This differs from the ObjectCreator `call` ACTION you use to investigate, which DOES accept a bare name — generated code does not.) Ids returned at runtime (window/canvas/layout ids from create*) are already resolved; pass them directly.',
       'Build windows/canvas from an async handler and AWAIT each step in order. Awaiting an inter-object call inside your own handler is correct and does NOT deadlock — the reply is delivered while the handler is suspended. A build that times out means a wrong recipient or a missing await, never the awaiting itself; do not detach the build into a fire-and-forget chain to "avoid a deadlock". Ask the window/canvas factory for its build recipe before drafting.',
       'Use ONLY methods listed in the provided dependency manifests / usage guides. Do not invent method names.',
+      'An object may override `ask` and `describe`, written in method syntax so it can call the system\'s own with `super.ask(msg)` / `super.describe(msg)`: answer only the questions the object is for and pass the rest to super.ask; describe returns a description string or extra fields (the real manifest always goes with it). Every other system handler (getSource, getData, updateSource, persistSnapshot, probe, getRegistry, ping, addDependent, removeDependent, freeMemory) is the system\'s, and a member with its name never runs.',
       'Method names that are not in the framework or in a dependency\'s manifest do not exist — pick a real one or restructure.',
       'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
       'Prefer composing high-level building blocks over hand-writing equivalents — e.g. render markdown with a markdown-capable label/widget rather than writing your own parser and text-layout engine on a canvas. This keeps the object small and the formatting correct.',
@@ -3245,6 +3286,8 @@ ${source}
     if (state.deployTurn !== undefined) {
       const live = state.spawnedObjectId ?? state.targetObjectId;
       const readOnly = new Set(['describe', 'ask', 'getSource', 'probe', 'getState', 'getData', 'saveData', 'show', 'hide']);
+      // An object that answers ask itself does what its source says there.
+      if (method === 'ask' && this.parseHandlerMembers(state.lastDeployedSource ?? '')?.members.some(m => m.name === 'ask')) readOnly.delete('ask');
       let ownedWidget = false;
       if (method === 'input' && live && resolvedId !== live) {
         const manager = await this.discoverDep('WidgetManager');
@@ -4347,7 +4390,7 @@ ${source}
     const state = extra.state;
     const memo = (extra.decisions ??= {});
     const base = state.targetSource ?? state.draftSource;
-    if (!base || base.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) return Promise.resolve();
+    if (!base || base.length <= this.inlineSourceChars) return Promise.resolve();
     const key = this.relevanceKey(state);
     if (state.memberRelevance?.key === key) return Promise.resolve();
     if (memo.membersKey === key && memo.membersJob) return Promise.resolve();
@@ -4507,7 +4550,7 @@ ${source}
       membersRead,
       relevantMembers,
       sourceLines: source ? source.split('\n').length : 0,
-      sourceShownInFull: !!source && source.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS,
+      sourceShownInFull: !!source && source.length <= this.inlineSourceChars,
       draftStaged: !!state.draftSource,
       undeployed: !!state.draftSource && state.draftSource !== state.lastDeployedSource,
       deployed: state.deployTurn !== undefined,
@@ -4703,6 +4746,7 @@ ${source}
     extra.state.turn += 1;
     const memo = (extra.decisions ??= {});
     if (budget) memo.budget = budget;
+    await this.refreshInlineBudget();
 
     // This turn's judgments run together: the tier (needed only once the
     // observation is built), member relevance for a large source, and the
@@ -4982,7 +5026,7 @@ ${source}
     let relevanceShown = false;
     if (state.targetSource && state.renderedTargetSource !== state.targetSource) {
       const n = state.targetSource.split('\n').length;
-      if (state.targetSource.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) {
+      if (state.targetSource.length <= this.inlineSourceChars) {
         lines.push(`EXISTING SOURCE of ${targetLabel} (${n} lines — this is the code running LIVE right now)`);
         lines.push('```javascript');
         lines.push(state.targetSource);
@@ -5004,7 +5048,7 @@ ${source}
       const nLines = current.split('\n').length;
       const origin = state.draftSource ? 'staged draft' : `live code of ${targetLabel}`;
       const firstLook = state.renderedSource === undefined && !state.targetSource;
-      if (firstLook && current.length <= ObjectCreator.MAX_INLINE_SOURCE_CHARS) {
+      if (firstLook && current.length <= this.inlineSourceChars) {
         lines.push(`SOURCE (${nLines} lines — ${origin})`);
         lines.push('```javascript');
         lines.push(current);
@@ -5362,6 +5406,32 @@ this.changed('completed', { resultCount });
 \`this.changed\` broadcasts to every Abject that subscribed via \`await this.observe(targetId)\` (a thin helper that sends the universal \`addDependent\` protocol message — both forms are equivalent and you'll see either in existing source). Subscribers implement either \`changed(msg)\` (dispatch by \`msg.payload.aspect\`) or a method named after each aspect (\`progress(msg)\`, \`completed(msg)\`). Both delivery shapes carry the same value.
 
 \`this.emit(toId, eventName, payload)\` is a separate primitive: it sends a single event to one specific recipient whose id you already hold — the first argument is the recipient, the second is the event name. Choose \`this.changed\` for broadcasting to observers (the typical case); choose \`this.emit\` only when targeting a known recipient.
+
+# Answering ask and describe yourself
+
+Every object already answers \`ask\` (a question, answered by a model that reads your manifest, source and data) and \`describe\` (your manifest and a readable summary of it). A handler map may override either one to add its own behavior and call the system's version with \`super\`:
+
+\`\`\`js
+async ask(msg) {
+  const { question } = msg.payload;
+  if (this._isForMe(question)) {        // a question this object exists to answer
+    const line = this._answer(question); // from live state, no model call
+    await this._say(line);               // shown the object's own way (a bubble, a label)
+    return line;
+  }
+  return super.ask(msg);                 // everything else: the system's answer
+},
+async describe(msg) {
+  const base = await super.describe(msg);
+  return { description: base.description + '\\n\\nRight now: ' + this._statusLine() };
+},
+\`\`\`
+
+- Write them in method syntax, \`async ask(msg) { ... }\`. \`super\` works only there: inside \`ask: async function (msg) { ... }\` or an arrow function it does not parse.
+- Other objects and agents send \`ask\` to learn how to use you. Answer yourself only the questions the object is for (a conversation, a status) and hand the rest to \`super.ask(msg)\`, so a question about how to call you still gets a real answer. \`super.ask\` asks a model and costs an LLM call; an answer built from state costs none.
+- \`ask\` returns its answer as a string. If it throws, the caller gets the error as the answer.
+- \`describe\` returns a description string or an object of extra fields. The reply always carries your real manifest, so describe adds to what other objects learn about you but cannot change the methods you declare. Keep it quick and free of side effects; it is called often. If it throws or returns anything else, the system's description is used.
+- The other system handlers (\`getSource\`, \`getData\`, \`updateSource\`, \`persistSnapshot\`, \`probe\`, \`getRegistry\`, \`ping\`, \`addDependent\`, \`removeDependent\`, \`freeMemory\`) stay the system's: a member with one of those names never runs, so give such a method another name.
 
 # Architecture for objects with a UI
 

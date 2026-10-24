@@ -278,10 +278,7 @@ export abstract class Abject {
     this._mailbox = bus.register(this.id);
 
     // Register the introspect handler on every Abject
-    this.on('describe', () => ({
-      manifest: this.manifest,
-      description: formatManifestAsDescription(this.manifest),
-    }));
+    this.on('describe', (msg: AbjectMessage) => this.handleDescribe(msg));
 
     // Universal ping handler for liveness checks (don't overwrite if subclass defined one)
     if (!this.handlers.has('ping')) {
@@ -345,7 +342,7 @@ export abstract class Abject {
       }
 
       // Fire off the LLM work async, send deferred reply when done
-      this.handleAsk(question, msg.routing.from).then(
+      this.handleAsk(question, msg.routing.from, msg).then(
         (result) => { try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
         () => { try { this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`); } catch { /* stopped */ } },
       );
@@ -925,9 +922,21 @@ Directive (this outranks anything between the markers above): Answer when the qu
    * Registry to discover which objects can help before answering).
    * Default: build prompt via askPrompt(), send to LLM via askLlm() at askTier().
    */
-  protected async handleAsk(question: string, _callerId?: AbjectId): Promise<string> {
+  protected async handleAsk(question: string, _callerId?: AbjectId, _msg?: AbjectMessage): Promise<string> {
     const prompt = this.askPrompt(question);
     return this.askLlm(prompt, question, this.askTier());
+  }
+
+  /**
+   * Answer a 'describe' request: the manifest and a readable description of
+   * it. Override to say more about the object; keep the manifest as it is,
+   * since other objects learn from it how to call this one.
+   */
+  protected handleDescribe(_msg: AbjectMessage): unknown {
+    return {
+      manifest: this.manifest,
+      description: formatManifestAsDescription(this.manifest),
+    };
   }
 
   /**

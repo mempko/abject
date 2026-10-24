@@ -180,7 +180,20 @@ Abject messages.
   order, caches a live answer for an hour and a fallback for 30s, and dedupes
   concurrent requests; `peekCachedModels()` lets the synchronous
   `describe()` paint the cached list; `openRouterCatalog()` reads the public
-  OpenRouter catalog (no key needed).
+  OpenRouter catalog (no key needed), with each model's context window.
+- **`context-window.ts`**: context windows and the budgets they set.
+  `contextWindowOf()` / `windowField()` read a model-list row's window
+  (`context_length` from OpenRouter and xAI, `max_input_tokens` from
+  Anthropic, `inputTokenLimit` from Gemini, and the other spellings
+  OpenAI-compatible servers use); every provider's `listModels()` spreads it
+  into its `ModelInfo`. `publicContextWindow()` looks a hosted model up in the
+  public OpenRouter catalog (cached a day), which `LLMObject` uses when a
+  provider reports no window (never for Ollama, whose window is its local
+  setting). `conversationBudget()` turns a window into the soft and hard
+  character budgets; an unknown window gets the fixed 180k-character
+  fallback. Other abjects do not compute budgets themselves: they ask `LLM`
+  by message (`getContextBudget`), which answers with the window and these
+  budgets.
 - **`pty-session.ts`**: `PtySession` (one warm CLI in a pseudo-terminal from
   `@lydell/node-pty`, screen kept by `@xterm/headless`, both loaded by dynamic
   import on first use) and `PtySessionPool` (leases one session per request;

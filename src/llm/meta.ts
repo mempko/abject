@@ -12,6 +12,7 @@
 import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('META');
 
@@ -84,7 +85,7 @@ export class MetaProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as MetaModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id) }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id), ...windowField(m) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [

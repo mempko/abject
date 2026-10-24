@@ -1200,8 +1200,30 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
     }),
   };
 
-  /** Characters of preloaded skill instructions; load_skill returns the whole text. */
+  /**
+   * Characters of preloaded skill instructions, at least; a larger window
+   * takes a twentieth of its conversation budget (preloadLimit). load_skill
+   * returns the whole text.
+   */
   private static readonly PRELOAD_CHARS = 12000;
+  /** preloadLimit's last answer, re-asked of LLM after a minute. */
+  private preloadChars?: { chars: number; at: number };
+
+  /** How much of a skill's instructions to preload: a twentieth of the balanced tier's conversation budget, at least PRELOAD_CHARS. */
+  private async preloadLimit(): Promise<number> {
+    const now = Date.now();
+    if (this.preloadChars && now - this.preloadChars.at < 60_000) return this.preloadChars.chars;
+    let chars = SkillAgent.PRELOAD_CHARS;
+    try {
+      const llm = await this.discoverDep('LLM');
+      if (llm) {
+        const budget = await this.request<{ soft: number }>(request(this.id, llm, 'getContextBudget', { tier: 'balanced' }), 10000);
+        chars = Math.max(SkillAgent.PRELOAD_CHARS, Math.floor(budget.soft * 0.05));
+      }
+    } catch { /* keep the floor */ }
+    this.preloadChars = { chars, at: now };
+    return chars;
+  }
 
   private static readonly RESULT_QUESTIONS: Record<string, DecisionQuestion> = {
     last_result: {
@@ -1337,8 +1359,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       }
       if (skill && p >= 0.85) {
         const instructions = skill.instructions ?? '(no instructions)';
-        const shown = instructions.length > SkillAgent.PRELOAD_CHARS
-          ? `${instructions.slice(0, SkillAgent.PRELOAD_CHARS)}\n… [${instructions.length - SkillAgent.PRELOAD_CHARS} more chars; load_skill returns the whole text]`
+        const preload = await this.preloadLimit();
+        const shown = instructions.length > preload
+          ? `${instructions.slice(0, preload)}\n… [${instructions.length - preload} more chars; load_skill returns the whole text]`
           : instructions;
         return {
           note: `[Runtime skill check] The installed skill "${skill.name}" likely covers this task (p=${p.toFixed(2)}), so its instructions are loaded below. Before its first command, send load_skill for it (it can share a response with that command): the load registers the skill for this task's permission grants.\n\nSkill ${skill.name}: ${skill.description}\n${shown}`,

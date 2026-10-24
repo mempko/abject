@@ -79,7 +79,8 @@ object in `error` keeps sending, and the next successful handler clears it.
 `addDependent`, `removeDependent`, `getRegistry`, `getResultContract`, and
 `progress`. A subclass's own `ping` handler is kept, and its own `progress`
 handler runs after the built-in one; the others are overwritten, so customize
-`ask` through the hooks below.
+`ask` and `describe` through the hooks below (`handleAsk()`,
+`handleDescribe()`).
 
 **Messaging.**
 - `on(method, handler)` / `off(method)`; `'*'` is the catch-all. A request
@@ -120,7 +121,9 @@ so it cannot rewrite the instructions. `askBusyStatus()` returning a string
 answers at once from the manifest instead of queuing behind LLM work
 (`askAvailabilityContext()` adds non-LLM facts). Without an LLM the reply is
 `[No LLM available]` plus the manifest description; `isTemporaryAskResponse()`
-recognizes these stand-in answers.
+recognizes these stand-in answers. `handleAsk()` also receives the request
+message. `describe` answers through `handleDescribe(msg)`, by default the
+manifest and its prose description.
 
 **People.** `confirm()` and `prompt()` send `askPerson` to `DialogBroker`
 and wait (with a 10 minute stall timer that the broker's heartbeats keep
@@ -275,7 +278,9 @@ All but `file-edit.ts` and `tool-output.ts` import Node built-ins (`fs`,
   (`SandboxSourceError`). `compileBody` (JobManager), `compileExpression`
   (TriggerManager), `installHandlers` (ScriptableAbject), `checkHandlers`
   (compile checks, forge). The `owner` option names the abject whose code it
-  is, for memory attribution. Do not enable `async_hooks.createHook` in a
+  is, for memory attribution. The `inherited` option gives a handler map a
+  parent: `super.<name>(...)` in a method (method syntax only) calls the host
+  helper of that name, as ScriptableAbject does for `ask` and `describe`. Do not enable `async_hooks.createHook` in a
   process that runs sandboxes: Node aborts when a slice is stopped inside a
   promise continuation while a hook is enabled.
 - **sandbox-memory.ts**: what each sandbox in a thread holds. Every Sandbox

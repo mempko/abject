@@ -252,6 +252,47 @@ export class ScriptableAbject extends Abject {
     return prompt;
   }
 
+  /** The source's own `ask` answers when it has one; super.ask(msg) there is the answer above. */
+  protected override async handleAsk(question: string, callerId?: AbjectId, msg?: AbjectMessage): Promise<string> {
+    if (!this._handlerFunctions.has('ask')) return super.handleAsk(question, callerId, msg);
+    const call = msg ?? ({ payload: { question }, routing: { from: callerId, method: 'ask' } } as unknown as AbjectMessage);
+    try {
+      const answer = await this.invokeUserHandler('ask', call);
+      if (typeof answer === 'string') return answer;
+      if (answer === undefined || answer === null) return `(${this.manifest.name}'s ask returned no answer)`;
+      return JSON.stringify(answer);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.warn(`[${this.manifest.name}] its ask handler failed: ${reason}`);
+      return `${this.manifest.name}'s own ask handler failed: ${reason}`;
+    }
+  }
+
+  /**
+   * The source's own `describe` says what the object is, as a description
+   * string or an object of fields; the reply always carries the real
+   * manifest, since other objects learn from it how to call this one. A
+   * describe that fails gives the system's description instead.
+   */
+  protected override handleDescribe(msg: AbjectMessage): unknown {
+    const base = super.handleDescribe(msg) as { manifest: AbjectManifest; description: string };
+    if (!this._handlerFunctions.has('describe')) return base;
+    return (async () => {
+      try {
+        const own = await this.invokeUserHandler('describe', msg);
+        if (typeof own === 'string') return { ...base, description: own };
+        if (own !== null && typeof own === 'object' && !Array.isArray(own)) {
+          const fields = own as Record<string, unknown>;
+          return { ...fields, manifest: this.manifest, description: typeof fields.description === 'string' ? fields.description : base.description };
+        }
+        log.warn(`[${this.manifest.name}] its describe returned neither a string nor an object; using the system's description`);
+      } catch (err) {
+        log.warn(`[${this.manifest.name}] its describe failed (${err instanceof Error ? err.message : String(err)}); using the system's description`);
+      }
+      return base;
+    })();
+  }
+
   /**
    * Get a dependency ID by name via Registry discovery.
    * Results are cached so subsequent calls for the same name are instant.
@@ -773,9 +814,19 @@ export class ScriptableAbject extends Abject {
   // window (e.g. a manager's main window when an editor's X is clicked).
   static readonly PROTECTED_HANDLERS = new Set([
     'getSource', 'getData', 'updateSource', 'persistSnapshot', 'probe',
-    'describe', 'ask', 'getRegistry',
+    'getRegistry',
     'ping', 'addDependent', 'removeDependent', 'freeMemory',
   ]);
+
+  /**
+   * System handlers the source may override, calling the system's own with
+   * `super.<name>(msg)`: `ask` (answer a question) and `describe` (say what
+   * the object is). They reach the source through handleAsk and
+   * handleDescribe, so the system's handler stays in front of them: an ask
+   * still answers when the object is busy, and describe always carries the
+   * real manifest.
+   */
+  static readonly INHERITED_HANDLERS = new Set(['ask', 'describe']);
 
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
   private static readonly PROXY_BUILTINS = new Set([
@@ -799,6 +850,15 @@ export class ScriptableAbject extends Abject {
       contracts: true,
       data: true,
       reservedNames: [...ScriptableAbject.PROXY_BUILTINS],
+      inherited: {
+        ask: (msg: unknown) => {
+          // super.ask(msg) or super.ask('a question').
+          const m = msg as { payload?: { question?: unknown }; routing?: { from?: AbjectId } } | undefined;
+          const question = typeof msg === 'string' ? msg : m?.payload?.question;
+          return super.handleAsk(typeof question === 'string' ? question : '', m?.routing?.from);
+        },
+        describe: (msg: unknown) => super.handleDescribe(msg as AbjectMessage),
+      },
       asyncHelpers: {
         call: (to: unknown, method: unknown, payload?: unknown, options?: unknown) =>
           this.call(to as AbjectId, method as string, payload, options),
@@ -1077,7 +1137,7 @@ export class ScriptableAbject extends Abject {
   private registerHandlers(list: HandlerList): void {
     this._handlerFunctions = new Set(list.filter(h => h.kind === 'function').map(h => h.name));
     for (const name of this._handlerFunctions) {
-      if (name.startsWith('_') || ScriptableAbject.PROTECTED_HANDLERS.has(name)) continue;
+      if (name.startsWith('_') || ScriptableAbject.PROTECTED_HANDLERS.has(name) || ScriptableAbject.INHERITED_HANDLERS.has(name)) continue;
       this.on(name, msg => this.invokeUserHandler(name, msg));
       this._userMethods.add(name);
     }

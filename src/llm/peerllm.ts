@@ -16,6 +16,7 @@ import {
 } from './provider.js';
 import { OpenAIProvider, OpenAIReasoningProfile, OpenAIRequest } from './openai.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('PEERLLM');
 
@@ -107,6 +108,7 @@ export class PeerLLMProvider extends OpenAIProvider {
         name: model.id,
         vision: false,
         efforts: [],
+        ...windowField(model),
       }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);

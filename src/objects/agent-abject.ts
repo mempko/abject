@@ -35,6 +35,7 @@ import {
   finalDispositionQuestions, relevanceQuestions, delegationQuestions, FAILURE_GUIDANCE, type FailureKind,
   criterion, instruction,
 } from '../core/decision-questions.js';
+import { CHARS_PER_TOKEN, SOFT_BUDGET_FRACTION, HARD_BUDGET_FRACTION, FALLBACK_CONVERSATION_CHARS, conversationBudget } from '../llm/context-window.js';
 
 const log = new Log('AgentAbject');
 
@@ -449,6 +450,13 @@ interface LLMThinkResult {
 }
 
 interface TaskEntry {
+  /**
+   * The conversation budget of the model this task last thought on, from
+   * LLM's getContextBudget. What one step may show (a job result, an
+   * observation, a chunk) scales with it; until it is known the fixed
+   * floors apply.
+   */
+  contextBudget?: { soft: number; hard: number };
   knowledgeScopes?: string[];
   refreshKnowledgePrompt?: boolean;
   parentTaskId?: string;
@@ -877,7 +885,7 @@ function sanitizeInjectedFact(content: string): string {
  */
 const TRANSCRIPT_CHAR_CAP = 40000;
 
-function flattenTranscript(messages: AgentMessage[]): string {
+function flattenTranscript(messages: AgentMessage[], cap = TRANSCRIPT_CHAR_CAP): string {
   const lines = messages.map(m => {
     const text = typeof m.content === 'string'
       ? m.content
@@ -885,9 +893,9 @@ function flattenTranscript(messages: AgentMessage[]): string {
     return `[${m.role}] ${text}`;
   });
   let out = lines.join('\n\n');
-  if (out.length > TRANSCRIPT_CHAR_CAP) {
-    const head = out.slice(0, TRANSCRIPT_CHAR_CAP * 0.6);
-    const tail = out.slice(-TRANSCRIPT_CHAR_CAP * 0.35);
+  if (out.length > cap) {
+    const head = out.slice(0, cap * 0.6);
+    const tail = out.slice(-cap * 0.35);
     out = `${head}\n\n[... transcript middle elided ...]\n\n${tail}`;
   }
   return out;
@@ -999,7 +1007,7 @@ export class AgentAbject extends Abject {
   private static readonly SUBMIT_JOB_TIMEOUT_MS = 86_400_000;
   /** Keep-alive cadence to the caller while a submit_job runs (under every watchdog). */
   private static readonly JOB_KEEPALIVE_MS = 30_000;
-  /** Cap on a job result entering the conversation; jobs should aggregate. */
+  /** Cap on a job result entering the conversation (a floor; see jobResultLimit); jobs should aggregate. */
   private static readonly SUBMIT_JOB_RESULT_CAP = 20000;
 
   /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
@@ -2223,7 +2231,7 @@ The registered object must implement these handlers to participate in the agent 
         knowledgeScopes: entry.knowledgeScopes,
         injectedKnowledge: entry.injectedKnowledge ?? [],
         predictions: entry.predictions ?? [],
-        transcript: flattenTranscript(entry.state.llmMessages),
+        transcript: flattenTranscript(entry.state.llmMessages, this.transcriptLimit(entry)),
       };
     });
 
@@ -2799,6 +2807,9 @@ The registered object must implement these handlers to participate in the agent 
 
   private async runTaskAsync(entry: TaskEntry): Promise<void> {
     try {
+      // The first observation arrives before the first think picks a route;
+      // size it by the balanced tier until then.
+      entry.contextBudget ??= await this.resolveContextBudget({ tier: 'balanced' });
       await this.checkpointSession(entry);
       let completionCorrections = 0;
       for (;;) {
@@ -2931,7 +2942,7 @@ The registered object must implement these handlers to participate in the agent 
             goalId: evidenceGoal, result: entry.state.result, error: entry.state.error,
             knowledgeScope: entry.config.knowledgeScope, knowledgeScopes: entry.knowledgeScopes,
             injectedKnowledge: entry.injectedKnowledge ?? [], predictions: entry.predictions ?? [],
-            transcript: flattenTranscript(entry.state.llmMessages), evidence: entry.acceptanceEvidence },
+            transcript: flattenTranscript(entry.state.llmMessages, this.transcriptLimit(entry)), evidence: entry.acceptanceEvidence },
         }));
       } catch (err) {
         success = false; entry.state.phase = 'error';
@@ -3602,9 +3613,10 @@ The registered object must implement these handlers to participate in the agent 
                       let rendered = value === undefined || value === null
                         ? '(no result — return a value from the job code)'
                         : typeof value === 'string' ? value : JSON.stringify(value);
-                      if (rendered.length > AgentAbject.SUBMIT_JOB_RESULT_CAP) {
-                        rendered = rendered.slice(0, AgentAbject.SUBMIT_JOB_RESULT_CAP)
-                          + `\n[... job result truncated at ${AgentAbject.SUBMIT_JOB_RESULT_CAP} chars — aggregate inside the job next time ...]`;
+                      const resultLimit = this.jobResultLimit(entry);
+                      if (rendered.length > resultLimit) {
+                        rendered = rendered.slice(0, resultLimit)
+                          + `\n[... job result truncated at ${resultLimit} chars — aggregate inside the job next time ...]`;
                       }
                       log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" completed (${rendered.length} chars)`);
                       task.llmMessages.push({ role: 'user', content: `[Job Result] ${rendered}` });
@@ -3814,7 +3826,7 @@ The registered object must implement these handlers to participate in the agent 
     const data = result?.data;
     const value = data && typeof data === 'object' ? data as Record<string, unknown> : undefined;
     const page = action.action === 'read_chunk' && !action.grep && !action.outline
-      ? entry.payloads?.find(p => p.id === action.id)?.text.slice(Number(action.offset ?? 0), Number(action.offset ?? 0) + Math.min(Number(action.length ?? AgentAbject.MAX_CHUNK_CHARS), AgentAbject.MAX_CHUNK_CHARS)) : undefined;
+      ? entry.payloads?.find(p => p.id === action.id)?.text.slice(Number(action.offset ?? 0), Number(action.offset ?? 0) + Math.min(Number(action.length ?? this.chunkLimit(entry)), this.chunkLimit(entry))) : undefined;
     const evidence = page ?? held ?? result?.payload ?? value?.content ?? value?.body ?? value?.text
       ?? (typeof value?.stdout === 'string' ? `${value.stdout}\n${value.stderr ?? ''}` : undefined) ?? data ?? result?.error;
     const metadataOnly = !!value && !page && !held && !result?.payload && Object.keys(value).every(k =>
@@ -3997,7 +4009,8 @@ The registered object must implement these handlers to participate in the agent 
       });
 
       const finalRoute = await this.applyVisionTiering(entry, 'smart');
-      await this.trimConversation(entry, await this.resolveContextBudget(finalRoute));
+      entry.contextBudget = await this.resolveContextBudget(finalRoute);
+      await this.trimConversation(entry, entry.contextBudget);
       this.appendVocabularyReminder(entry);
 
       this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
@@ -4646,6 +4659,8 @@ The registered object must implement these handlers to participate in the agent 
 
   /** Cached per-tier capabilities from the LLM service. */
   private tierCapsCache?: { caps: TierCapabilities; at: number };
+  /** LLM's getContextBudget answers, by what was asked. */
+  private contextBudgets = new Map<string, { budget: { soft: number; hard: number; windowTokens?: number }; at: number }>();
   private static readonly TIER_CAPS_TTL_MS = 60_000;
 
   /**
@@ -4769,6 +4784,7 @@ The registered object must implement these handlers to participate in the agent 
     // Trim against the window of the model this step will actually run on,
     // which vision tiering may just have changed.
     const budget = await this.resolveContextBudget(route);
+    entry.contextBudget = budget;
     await this.trimConversation(entry, budget);
     this.appendVocabularyReminder(entry);
 
@@ -5393,7 +5409,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // screenshot came with it.
       const content = entry.lastObservationLlmContent.map((part, i) => {
         if (i === 0 && part.type === 'text') {
-          const body = entry.observationChunkable && part.text.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+          const body = entry.observationChunkable && part.text.length > this.payloadHandleThreshold(entry)
             ? this.renderPayloadHandle(
                 this.storePayload(entry, part.text, 'observation'), part.text, 'observation')
             : part.text;
@@ -5417,13 +5433,13 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     // composed briefing, which is long precisely because the agent needs all
     // of it — is delivered as it always was, with truncateText as backstop.
     const observation = entry.observationChunkable
-      && task.observation.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD
+      && task.observation.length > this.payloadHandleThreshold(entry)
       ? this.renderPayloadHandle(
           this.storePayload(entry, task.observation, 'observation'),
           task.observation,
           'observation',
         )
-      : truncateText(task.observation, AgentAbject.MAX_OBSERVATION_CHARS);
+      : truncateText(task.observation, this.observationLimit(entry));
 
     task.llmMessages.push({
       role: 'user',
@@ -5561,7 +5577,11 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   // Large payloads: held whole, read in chunks
   // ═══════════════════════════════════════════════════════════════════
 
-  /** Above this, a payload is stored and summarized instead of pasted in. */
+  /**
+   * Above this, a payload is stored and summarized instead of pasted in. This
+   * and the chunk and grep sizes below are floors: each grows with the
+   * model's conversation budget (stepLimit).
+   */
   private static readonly PAYLOAD_HANDLE_THRESHOLD = LARGE_PAYLOAD_CHARS;
   /** How much of a stored payload rides along with the handle for free. */
   private static readonly PAYLOAD_PREVIEW_CHARS = 2000;
@@ -5581,6 +5601,22 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private static readonly MAX_GREP_MATCHES = 100;
   private static readonly MAX_GREP_OUTPUT_CHARS = 30000;
   private static readonly GREP_CONTEXT_CHARS = 300;
+
+  /**
+   * What one step may show: the fixed floor, or this share of the task's
+   * conversation budget when that is larger. A small or unknown window keeps
+   * the floor; a large one stops clipping and paging what it has room for.
+   */
+  private stepLimit(entry: TaskEntry, floor: number, share: number): number {
+    return Math.max(floor, Math.floor((entry.contextBudget?.soft ?? 0) * share));
+  }
+  private payloadHandleThreshold(entry: TaskEntry): number { return this.stepLimit(entry, AgentAbject.PAYLOAD_HANDLE_THRESHOLD, 0.03); }
+  private chunkLimit(entry: TaskEntry): number { return this.stepLimit(entry, AgentAbject.MAX_CHUNK_CHARS, 0.10); }
+  private grepOutputLimit(entry: TaskEntry): number { return this.stepLimit(entry, AgentAbject.MAX_GREP_OUTPUT_CHARS, 0.10); }
+  private grepMatchLimit(entry: TaskEntry): number { return Math.max(AgentAbject.MAX_GREP_MATCHES, Math.floor(this.grepOutputLimit(entry) / AgentAbject.GREP_CONTEXT_CHARS)); }
+  private jobResultLimit(entry: TaskEntry): number { return this.stepLimit(entry, AgentAbject.SUBMIT_JOB_RESULT_CAP, 0.10); }
+  private observationLimit(entry: TaskEntry): number { return this.stepLimit(entry, AgentAbject.MAX_OBSERVATION_CHARS, 0.25); }
+  private transcriptLimit(entry: TaskEntry): number { return this.stepLimit(entry, TRANSCRIPT_CHAR_CAP, 0.25); }
 
   /** Keep a payload whole and return its id. */
   private storePayload(entry: TaskEntry, text: string, kind: string): string {
@@ -5732,7 +5768,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       return;
     }
 
-    if (text.length <= AgentAbject.PAYLOAD_HANDLE_THRESHOLD) {
+    if (text.length <= this.payloadHandleThreshold(entry)) {
       if (result.data === undefined) {
         result.data = text;
       } else if (typeof result.data === 'object' && result.data !== null && !Array.isArray(result.data)) {
@@ -5750,7 +5786,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     const stored = entry.payloads?.find(p => p.id === result.payloadId);
     if (!stored) return undefined;
     if (result.payloadMode !== 'page') return this.renderStoredHandle(entry, stored.id);
-    const shown = stored.text.slice(0, AgentAbject.MAX_CHUNK_CHARS);
+    const shown = stored.text.slice(0, this.chunkLimit(entry));
     const remainder = shown.length < stored.text.length
       ? `\n[Page exceeds the display limit; ${stored.text.length - shown.length} characters remain in ${stored.id}. Continue with read_chunk at offset ${shown.length}.]`
       : '\n[End of requested page. Use the output continuation for the next page, if present.]';
@@ -5887,9 +5923,9 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const e = await this.request<{ title?: string; type?: string; content?: string; knowledgeRef?: string; patternRef?: string } | null>(
         request(this.id, kbId, 'get', { id }), 10000);
       if (e?.patternRef) (entry.patternSelections ??= {})[id] = e.patternRef;
-      if (e) await this.recordKnowledgeSelection(entry, { ...e, id }, (e.content?.length ?? 0) <= AgentAbject.MAX_CHUNK_CHARS);
+      if (e) await this.recordKnowledgeSelection(entry, { ...e, id }, (e.content?.length ?? 0) <= this.chunkLimit(entry));
       rendered = e
-        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}; ${(e.content ?? '').length} chars): ${(e.content ?? '').slice(0, AgentAbject.MAX_CHUNK_CHARS)}${(e.content?.length ?? 0) > AgentAbject.MAX_CHUNK_CHARS ? '\n[Incomplete claim: content exceeds the recall display limit.]' : ''}`
+        ? `**${e.title}** (${e.type}; knowledgeRef=${e.knowledgeRef ?? 'unknown'}; ${(e.content ?? '').length} chars): ${(e.content ?? '').slice(0, this.chunkLimit(entry))}${(e.content?.length ?? 0) > this.chunkLimit(entry) ? '\n[Incomplete claim: content exceeds the recall display limit.]' : ''}`
         : `No entry with id "${id}".`;
     } else if (pattern) {
       const hits = await this.request<Array<{ id: string; title: string; type: string; content: string; knowledgeRef?: string; patternRef?: string }>>(
@@ -5940,11 +5976,12 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         re = new RegExp(grep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       }
       const hits: string[] = [];
-      let budget = AgentAbject.MAX_GREP_OUTPUT_CHARS;
+      let budget = this.grepOutputLimit(entry);
+      const matchLimit = this.grepMatchLimit(entry);
       let total = 0;
       for (const m of text.matchAll(re)) {
         total++;
-        if (hits.length >= AgentAbject.MAX_GREP_MATCHES || budget <= 0) continue;
+        if (hits.length >= matchLimit || budget <= 0) continue;
         const at = m.index ?? 0;
         const from = Math.max(0, at - AgentAbject.GREP_CONTEXT_CHARS);
         const to = Math.min(text.length, at + AgentAbject.GREP_CONTEXT_CHARS);
@@ -5965,8 +6002,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
 
     const offset = Math.max(0, typeof action.offset === 'number' ? action.offset : 0);
     const length = Math.max(1, Math.min(
-      typeof action.length === 'number' ? action.length : AgentAbject.MAX_CHUNK_CHARS,
-      AgentAbject.MAX_CHUNK_CHARS,
+      typeof action.length === 'number' ? action.length : this.chunkLimit(entry),
+      this.chunkLimit(entry),
     ));
     if (offset > text.length || (offset === text.length && text.length > 0)) {
       throw new Error(`Offset ${offset} is past the end of ${stored.id} (${text.length} chars).`);
@@ -6117,7 +6154,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
         : undefined;
       if (storedHandle) {
         resultStr = `Action "${action?.action}" succeeded: ${body}\n${storedHandle}`;
-      } else if (body.length > AgentAbject.PAYLOAD_HANDLE_THRESHOLD) {
+      } else if (body.length > this.payloadHandleThreshold(entry)) {
         // No dedicated payload, but `data` itself is oversized: hold that.
         resultStr = `Action "${action?.action}" succeeded.\n${this.renderPayloadHandle(
           this.storePayload(entry, body, 'result'), body, 'result')}`;
@@ -6164,26 +6201,14 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    *  200k-token model it compacts at a quarter of capacity, and to a 32k
    *  local model it never fires at all. When the window IS known,
    *  resolveContextBudget derives the real thresholds from it. */
-  private static readonly MAX_CONVERSATION_CHARS = 180000;
-  /** Characters per token. Deliberately below the usual ~4 so the estimate
-   *  errs toward under-using the window rather than overflowing it. */
-  private static readonly CHARS_PER_TOKEN = 3.5;
-  /** Tokens held back for the model's own response. The window covers input
-   *  and output together, and the harness sets no maxTokens (provider
-   *  per-tier sizing owns that), so reserve enough for a long reasoning
-   *  turn. Floored at half the window so a small local model still gets a
-   *  usable input budget instead of zero. */
-  private static readonly OUTPUT_RESERVE_TOKENS = 32000;
-  /** Fraction of the usable window at which cheap deterministic elision
-   *  starts. Below this the conversation is left verbatim. */
-  private static readonly SOFT_BUDGET_FRACTION = 0.60;
-  /** Fraction at which LLM summarization is allowed to run. Elision has
-   *  already had its chance between soft and hard. */
-  private static readonly HARD_BUDGET_FRACTION = 0.85;
+  private static readonly MAX_CONVERSATION_CHARS = FALLBACK_CONVERSATION_CHARS;
+  // The budget for a known window (characters per token, the reply reserve,
+  // and the soft and hard fractions) is conversationBudget in
+  // src/llm/context-window.ts, shared with ObjectCreator.
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
-  /** Per-observation cap applied at ingestion (head+tail slice). */
+  /** Per-observation cap applied at ingestion (head+tail slice); a floor, see observationLimit. */
   private static readonly MAX_OBSERVATION_CHARS = 60000;
   /** Below this an action result is not worth eliding — the stub and the
    *  retained head would cost nearly as much as the body. */
@@ -6286,39 +6311,29 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
   private async resolveContextBudget(
     route: { tier: 'smart' | 'balanced' | 'code'; provider?: string; model?: string },
   ): Promise<{ soft: number; hard: number; windowTokens?: number }> {
-    const fromChars = (hard: number) => ({
-      soft: Math.floor(hard * (AgentAbject.SOFT_BUDGET_FRACTION / AgentAbject.HARD_BUDGET_FRACTION)),
-      hard,
-    });
-
-    const caps = await this.tierCapabilities();
-    if (!caps) return fromChars(AgentAbject.MAX_CONVERSATION_CHARS);
-
     // A vision fallback overrides provider+model for this step, so its
-    // window is the one that binds — not the nominal tier's.
-    const tierCap = caps[route.tier];
-    const cap = route.model && caps.visionFallback?.model === route.model
-      ? caps.visionFallback
-      : tierCap;
-    const windowTokens = cap?.contextWindow ?? null;
-    if (!windowTokens || windowTokens <= 0) return fromChars(AgentAbject.MAX_CONVERSATION_CHARS);
-
-    const usableTokens = Math.max(
-      windowTokens - AgentAbject.OUTPUT_RESERVE_TOKENS,
-      windowTokens * 0.5,
-    );
-    const usableChars = usableTokens * AgentAbject.CHARS_PER_TOKEN;
-    return {
-      soft: Math.floor(usableChars * AgentAbject.SOFT_BUDGET_FRACTION),
-      hard: Math.floor(usableChars * AgentAbject.HARD_BUDGET_FRACTION),
-      windowTokens,
-    };
+    // window is the one that binds, not the nominal tier's.
+    const ask = route.provider && route.model ? { provider: route.provider, model: route.model } : { tier: route.tier };
+    const key = JSON.stringify(ask);
+    const now = Date.now();
+    const hit = this.contextBudgets.get(key);
+    if (hit && now - hit.at < AgentAbject.TIER_CAPS_TTL_MS) return hit.budget;
+    try {
+      this.llmId = await this.cachedDepOrThrow('LLM', this.llmId);
+      const answer = await this.request<{ windowTokens: number | null; soft: number; hard: number }>(
+        request(this.id, this.llmId!, 'getContextBudget', ask), 10000);
+      const budget = { soft: answer.soft, hard: answer.hard, ...(answer.windowTokens ? { windowTokens: answer.windowTokens } : {}) };
+      this.contextBudgets.set(key, { budget, at: now });
+      return budget;
+    } catch {
+      return hit?.budget ?? conversationBudget(null);
+    }
   }
 
   private async trimConversation(entry: TaskEntry, budget?: { soft: number; hard: number }): Promise<void> {
     const task = entry.state;
     const { soft: softBudget, hard: hardBudget } = budget ?? {
-      soft: Math.floor(AgentAbject.MAX_CONVERSATION_CHARS * (AgentAbject.SOFT_BUDGET_FRACTION / AgentAbject.HARD_BUDGET_FRACTION)),
+      soft: Math.floor(AgentAbject.MAX_CONVERSATION_CHARS * (SOFT_BUDGET_FRACTION / HARD_BUDGET_FRACTION)),
       hard: AgentAbject.MAX_CONVERSATION_CHARS,
     };
     const maxMsgs = entry.config.maxConversationMessages;
@@ -6352,7 +6367,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     // pinned to the current messages (see contextAnchor); characters alone
     // are only a proxy, and the model's tokenizer is the authority on how
     // much of the window this conversation actually occupies.
-    const measure = () => anchoredConversationChars(task.llmMessages, entry.contextAnchor, AgentAbject.CHARS_PER_TOKEN);
+    const measure = () => anchoredConversationChars(task.llmMessages, entry.contextAnchor, CHARS_PER_TOKEN);
 
     // 2. Soft threshold — cheap deterministic elision, no LLM call. Bulky
     //    action results in the middle region become stubs that say how much

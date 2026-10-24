@@ -45,6 +45,7 @@ import {
   ModelInfo,
   cliIsRetryable,
 } from './provider.js';
+import { windowField } from './context-window.js';
 
 /**
  * Sentinel value for the "Auto" model option - spawn with no `--model` flag
@@ -165,7 +166,7 @@ async function anthropicApiModels(): Promise<ModelInfo[]> {
     const display = typeof row.display_name === 'string' && row.display_name.length > 0
       ? row.display_name
       : id;
-    live.push({ id, name: display, vision: true });
+    live.push({ id, name: display, vision: true, ...windowField(row) });
   }
   return live.length > 0 ? withAliases(live) : [];
 }
@@ -189,7 +190,7 @@ async function openRouterClaudeModels(): Promise<ModelInfo[]> {
   for (const entry of entries) {
     const id = entry.id.replace(/\./g, '-');
     if (!isDrivableClaudeModel(id)) continue;
-    live.push({ id, name: entry.name, vision: true });
+    live.push({ id, name: entry.name, vision: true, ...windowField(entry) });
   }
   return live.length > 0 ? withAliases(live) : [];
 }

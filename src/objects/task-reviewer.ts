@@ -89,7 +89,11 @@ const MIN_TRANSCRIPT_CHARS = 600;
 const REVIEW_STUCK_MS = 5 * 60 * 1000;
 /** Most tasks folded into one goal review; oldest first when over. */
 const MAX_TASKS_PER_GOAL_REVIEW = 6;
-/** Combined transcript budget for a goal review's material. */
+/**
+ * Combined transcript budget for a goal review's material, at least; a
+ * larger window takes a quarter of its conversation budget
+ * (transcriptBudget), so a long run's middle is not cut out.
+ */
 const GOAL_TRANSCRIPT_BUDGET = 40000;
 /**
  * The execution record patterns are mined from, and the pattern language
@@ -605,6 +609,8 @@ function observedLine(p: PredictionRecord): string {
 
 export class TaskReviewer extends Abject {
   private agentAbjectId?: AbjectId;
+  /** transcriptBudget's last answer, re-asked of LLM after a minute. */
+  private transcriptChars?: { chars: number; at: number };
   private goalManagerId?: AbjectId;
   private knowledgeBaseId?: AbjectId;
   private skillRegistryId?: AbjectId;
@@ -2025,7 +2031,7 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     if ((worth || judgments) && this.inFlight) { this.queueGoalReview(review); return; }
 
     // Split the transcript budget across tasks, larger tasks trimmed first.
-    const perTask = Math.max(6000, Math.floor(GOAL_TRANSCRIPT_BUDGET / records.length));
+    const perTask = Math.max(6000, Math.floor(await this.transcriptBudget() / records.length));
     let material =
       `## Goal under review\n` +
       `Title: ${goal?.title ?? '(unknown)'}\n` +
@@ -2591,13 +2597,29 @@ My work is internal maintenance of this workspace's memory. When invited to cont
     );
   }
 
+  /** A goal review's transcript budget: a quarter of the balanced tier's conversation budget (the tier reviews think on), at least GOAL_TRANSCRIPT_BUDGET. */
+  private async transcriptBudget(): Promise<number> {
+    const now = Date.now();
+    if (this.transcriptChars && now - this.transcriptChars.at < 60_000) return this.transcriptChars.chars;
+    let chars = GOAL_TRANSCRIPT_BUDGET;
+    try {
+      const llm = await this.discoverDep('LLM');
+      if (llm) {
+        const budget = await this.request<{ soft: number }>(request(this.id, llm, 'getContextBudget', { tier: 'balanced' }), 10000);
+        chars = Math.max(GOAL_TRANSCRIPT_BUDGET, Math.floor(budget.soft * 0.25));
+      }
+    } catch { /* keep the floor */ }
+    this.transcriptChars = { chars, at: now };
+    return chars;
+  }
+
   /** Budget the whole dossier; full records remain addressable through this receiver. */
   private async buildLearningDossier(task: string, material: string, records: TranscriptResponse[], knowledgeRefs: Record<string, string> = {}, priors?: string,
     briefing: ReviewBriefing & { goalId?: string } = {}, recurrences: NonNullable<ReviewTaskExtra['recurrences']> = [],
     planRecorded: string[] = []): Promise<string> {
     const pieces: string[] = [];
     const executionRecord = briefing.executionRecord?.trim();
-    let remaining = GOAL_TRANSCRIPT_BUDGET;
+    let remaining = await this.transcriptBudget();
     const append = (text: string, cap: number): void => {
       const limit = Math.min(cap, remaining);
       if (limit <= 0) return;

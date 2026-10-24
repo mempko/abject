@@ -13,6 +13,7 @@ import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.
 import { Log } from '../core/timed-log.js';
 import type { DecisionOptions, DecisionProvider, DecisionRequest, DecisionResult } from './decision.js';
 import { callSystemOne } from './typesafe.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('OPENROUTER');
 
@@ -218,6 +219,7 @@ export class OpenRouterProvider extends OpenAIProvider implements DecisionProvid
             ? m.architecture.input_modalities.includes('image')
             : undefined,
           efforts: this.supportedEfforts(m.id),
+          ...windowField(m),
           ...(m.created !== undefined ? { created: m.created } : {}),
           ...(input !== undefined && output !== undefined ? { pricing: { inputPerMTok: input, outputPerMTok: output } } : {}),
         };

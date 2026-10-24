@@ -247,3 +247,12 @@ draws.
   a user object.
 - **`ask` shows source and data to the model.** Keep secrets and records in
   workspace Storage or settings, not in `this.data`.
+- **`ask` and `describe` can be your own.** Write them in method syntax and
+  call the system's answer with `super.ask(msg)` / `super.describe(msg)`:
+  answer the questions the abject is for and pass the rest to `super.ask`,
+  since other objects ask how to call you. `ask` returns a string; `describe`
+  returns a description string or extra fields, and the reply always carries
+  the real manifest. The other system handlers (`getSource`, `getData`,
+  `updateSource`, `persistSnapshot`, `probe`, `getRegistry`, `ping`,
+  `addDependent`, `removeDependent`, `freeMemory`) are the system's; a member
+  with one of those names never runs.

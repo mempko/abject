@@ -35,7 +35,7 @@ async startup() {
 |---|---|
 | `name` | Required. The provider id (rules below) |
 | `label` | Shown in the provider dropdown, at most 64 characters. Defaults to the name |
-| `models` | `[{ id, name, vision?, efforts?, contextWindow? }]`: the models offered in tier dropdowns, and the list used when `providerModels` fails |
+| `models` | `[{ id, name, vision?, efforts?, contextWindow? }]`: the models offered in tier dropdowns, and the list used when `providerModels` fails. Give `contextWindow` (tokens) for each model: agents size their conversation by it, and a model without one is looked up in the public OpenRouter catalog by id, which describes the hosted model, not a local server's setting |
 | `defaultTierModels` | Model per tier (`smart`, `balanced`, `fast`, `code`) when routing names none |
 | `streaming` | `true` when the abject answers `providerStream` |
 | `liveModels` | `true` when the abject answers `providerModels` |

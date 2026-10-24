@@ -36,6 +36,7 @@ import {
   ModelInfo,
   cliIsRetryable,
 } from './provider.js';
+import { windowField } from './context-window.js';
 
 /**
  * Sentinel value for the "Auto" model option - spawn with no `--model` flag
@@ -140,6 +141,7 @@ async function openAiApiModels(): Promise<ModelInfo[]> {
     id: row.id as string,
     name: row.id as string,
     vision: true,
+    ...windowField(row),
   }));
   return live.length > 0 ? withKnownModels(live) : [];
 }
@@ -158,7 +160,7 @@ async function openRouterCodexModels(): Promise<ModelInfo[]> {
   const live: ModelInfo[] = [];
   for (const entry of entries) {
     if (!isDrivableCodexModel(entry.id)) continue;
-    live.push({ id: entry.id, name: entry.name, vision: true });
+    live.push({ id: entry.id, name: entry.name, vision: true, ...windowField(entry) });
   }
   return live.length > 0 ? withKnownModels(live) : [];
 }

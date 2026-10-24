@@ -283,9 +283,12 @@ A built-in provider (compiled into the server):
 1. Create in `src/llm/`
 2. Implement `LLMProvider` interface (or extend `BaseLLMProvider`)
 3. Include both `complete()` and `stream()` methods
-4. Add configuration to `LLMObject.configure()` and an entry to `LLMObject.PROVIDER_DESCRIPTORS`
+4. Report each model's context window from `listModels()`: spread `windowField(row)`
+   (`src/llm/context-window.ts`) into each `ModelInfo`. A provider that reports none makes every
+   agent on its models trim at a small fixed budget, unless the public model catalog knows the model
+5. Add configuration to `LLMObject.configure()` and an entry to `LLMObject.PROVIDER_DESCRIPTORS`
    (which also reserves its name against abject-backed providers)
-5. Export from `src/index.ts`
+6. Export from `src/index.ts`
 
 ## Common Pitfalls
 

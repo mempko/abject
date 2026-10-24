@@ -26,6 +26,20 @@
  * Inside the methods `this` is typed as AbjectThis<State> plus the handler
  * map's own members (pass the map's type as the second parameter of
  * AbjectHandlers to check those calls too).
+ *
+ * `ask` and `describe` may be your own. Write them in method syntax and call
+ * the system's version with `super`:
+ *
+ *   async ask(msg: AbjectMessage<{ question: string }>) {
+ *     if (msg.payload.question.startsWith('count')) return `The count is ${this.data.count ?? 0}.`;
+ *     return super.ask(msg);   // other questions, such as how to call you
+ *   },
+ *
+ * `ask` returns a string; `describe` returns a description string or extra
+ * fields, and its reply always carries the real manifest. The other system
+ * handlers (getSource, getData, updateSource, persistSnapshot, probe,
+ * getRegistry, ping, addDependent, removeDependent, freeMemory) are the
+ * system's: a member with one of those names never runs.
  */
 
 /** An AbjectId: a UUID, or a well-known id such as 'abjects:registry'. */

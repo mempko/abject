@@ -142,6 +142,8 @@ export interface CatalogEntry {
   id: string;
   /** A display name with the redundant vendor prefix removed. */
   name: string;
+  /** The model's context window in tokens, when the catalog lists one. */
+  contextWindow?: number;
 }
 
 /**
@@ -166,7 +168,8 @@ export async function openRouterCatalog(vendorPrefix: string): Promise<CatalogEn
     if (bare.length === 0 || seen.has(bare)) continue;
     seen.add(bare);
     const raw = typeof row.name === 'string' && row.name.length > 0 ? row.name : bare;
-    out.push({ id: bare, name: stripVendorPrefix(raw) });
+    const window = row.context_length;
+    out.push({ id: bare, name: stripVendorPrefix(raw), ...(typeof window === 'number' && window > 0 ? { contextWindow: window } : {}) });
   }
   return out;
 }

@@ -323,6 +323,7 @@ export { DECISION_SITES, DEFAULT_DECISION_POLICY, resolveSiteMode } from './core
 export type { DecisionMode, DecisionGates, DecisionPolicy, DecisionSite } from './core/decision-sites.js';
 export type { ModelPricing, PricingEntry } from './llm/pricing.js';
 export { lookupPricing, estimateCostUsd } from './llm/pricing.js';
+export { contextWindowOf, windowField, publicContextWindow, conversationBudget } from './llm/context-window.js';
 
 // Export network
 export { Transport } from './network/transport.js';

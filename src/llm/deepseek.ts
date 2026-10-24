@@ -8,6 +8,7 @@
 import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions, EffortLevel, CacheProfile, TierRules } from './provider.js';
 import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('DEEPSEEK');
 
@@ -99,7 +100,7 @@ export class DeepSeekProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as DeepSeekModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id, vision: false, efforts: this.supportedEfforts(m.id) }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: false, efforts: this.supportedEfforts(m.id), ...windowField(m) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [

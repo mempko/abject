@@ -23,6 +23,7 @@ import {
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import { windowField } from './context-window.js';
 
 const log = new Log('OPENAI');
 
@@ -353,6 +354,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       const rows = parsed.data ?? [];
       if (rows.length === 0) return this.fallbackModels();
       const createdById = new Map(rows.map(r => [r.id, r.created]));
+      const rowById = new Map(rows.map(r => [r.id, r]));
       // Keep chat-capable text models; drop embeddings/audio/image/moderation/realtime.
       const excluded = /(embedding|whisper|tts|dall-e|moderation|audio|realtime|transcribe|davinci|babbage|ada|curie)/i;
       const filtered = rows
@@ -362,7 +364,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       const models = (filtered.length > 0 ? filtered : rows.map(r => r.id))
         .map(id => {
           const created = createdById.get(id);
-          return { id, name: id, vision: this.modelVision(id), efforts: this.supportedEfforts(id), ...(created !== undefined ? { created } : {}) };
+          return { id, name: id, vision: this.modelVision(id), efforts: this.supportedEfforts(id), ...windowField(rowById.get(id)), ...(created !== undefined ? { created } : {}) };
         });
       return models;
     } catch (err) {
