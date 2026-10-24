@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.15.17",
+    "date": "2026-10-24",
+    "title": "Room to Read the Whole Thing",
+    "summary": "Agents now size what they read and keep to the context window of the model they actually run on. Models with large windows stop clipping and paging work they have room for, and objects that save often stop rewriting storage that has not changed.",
+    "highlights": [
+      "Every provider (Anthropic, OpenAI, OpenRouter, Gemini, DeepSeek, Grok, Kimi, Meta, PeerLLM and the CLI agents) now reports each model's real context window. A hosted model whose provider gives no window is looked up in the public OpenRouter catalog. Before this, every OpenRouter model got a small fixed budget, even ones with a million-token window.",
+      "Agents scale what one step shows them (job results, observations, file pages, grep output, review transcripts) to the model they last thought on. Each has a floor, so small or unknown windows behave as before; large windows stop truncating and paging.",
+      "ObjectCreator shows a large object's source whole when the model has room for it, instead of paging through a few thousand lines at a time.",
+      "Attached text files in Chat, preloaded skill instructions and goal-review transcripts are sized to the tier that reads them, not to one fixed number.",
+      "A script abject can now answer ask and describe itself, and still reach the system's version through super.ask(msg) and super.describe(msg). The system keeps answering ask while the object is busy, and describe always carries the real manifest.",
+      "ObjectCreator can verify an object that draws straight into the desktop scene without a window: it uses a desktop capture as the visual check instead of refusing the work."
+    ],
+    "fixes": [
+      "Objects that save their state as they run no longer rewrite an unchanged source, manifest and index on every save. Only changed data is written, and nothing at all when the data is the same.",
+      "ObjectCreator now flags handler members whose names collide with a system handler, and explains that super works only in method syntax."
+    ]
+  },
+  {
     "version": "0.15.16",
     "date": "2026-10-23",
     "title": "Work in progress stays in progress",
