@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.15.18",
+    "date": "2026-10-24",
+    "title": "Windows Close Cleanly, Quiet Models Recover",
+    "summary": "This small stability release fixes windows that could be torn down twice when closed. It also stops agents from failing when an OpenAI-compatible model returns no text.",
+    "highlights": [
+      "Closing a window now tears it down exactly once: a second close request waits for the first instead of repeating it, and other objects hear only one \"window destroyed\" notice",
+      "When an OpenAI-compatible model (including OpenRouter) returns no text, for example because it spent its whole budget on reasoning or refused, the request is retried right away; if the retries also come back empty, the caller gets an empty answer it already knows how to handle instead of failing"
+    ],
+    "fixes": [
+      "Fixed a crash (\"Cannot read properties of null\") in LLM calls when a provider returned a completion with no text content; retries and provider fallbacks now treat it as an empty completion",
+      "Fixed windows that kept sending drawing updates after closing began, which produced \"no surface\" errors from the display server",
+      "A handler that stops only because its object was shut down is now logged as normal teardown, not as an error, which removes the \"Object stopped\" noise when widgets close in the middle of a render",
+      "Empty-completion errors now include the finish reason, token usage and any refusal text, so it is easier to see why a model returned nothing"
+    ]
+  },
+  {
     "version": "0.15.17",
     "date": "2026-10-24",
     "title": "Room to Read the Whole Thing",
