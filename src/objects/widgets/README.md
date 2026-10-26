@@ -163,18 +163,31 @@ which lists it in `listLayoutIssues`.
 - **`vbox-layout.ts`**: `VBoxLayout`, top to bottom.
 - **`hbox-layout.ts`**: `HBoxLayout`, left to right.
 - **`scrollable-vbox-layout.ts`**: `ScrollableVBoxLayout`. VBox with clipping,
-  an 8 px scrollbar, wheel and keyboard scrolling (`scrollKey`), optional
-  `autoScroll` (stick to the bottom), and viewport culling.
+  wheel and keyboard scrolling (`scrollKey`), optional `autoScroll` (stick to
+  the bottom), and viewport culling. Its scrollbar is not drawn at rest: a
+  thin thumb at the right edge shows while the pointer is over the layout or
+  just after a scroll, widening into an 8 px bar with its track under the
+  pointer. Hidden children take no scroll height.
 
 ### Input widgets
 
 - **`button-widget.ts`**: `ButtonWidget`. Flat print block with a hard offset
   shadow; `click` on mousedown or Enter/Space; optional `style.icon` from
   `src/ui/icons.ts`; with `style.caption` it draws as a tile (icon at the top,
-  bold text and a quieter caption line under it).
+  bold text and a quieter caption line under it). `style.accessory` adds a
+  small icon action at the right end (the dock's favorite star): shown while
+  the pointer is over the row, or always with `atRest`, and taking room from
+  the label only while shown; a press on it fires `accessory` instead of
+  `click`, and it has its own tooltip. A flat left-aligned row fades a label
+  too long for it into the row's fill (others end it with an ellipsis); a cut
+  label with no `style.tooltip` shows its full text as the tooltip. The focus
+  ring shows for keyboard focus only.
 - **`text-input-widget.ts`**: `TextInputWidget`. Single line (optionally
   wrapping), cursor, selection, clipboard, undo, masking, placeholder. Events
-  `change`, `submit`, `resize`, `attach`.
+  `change`, `submit`, `resize`, `attach`. A single-line input takes a leading
+  `style.icon` (a search glyph, say; sized and placed like a button's icon, so
+  a field among icon rows lines up with them), and `style.clearable` adds a clear mark
+  while there is text; it, and the first Escape, empty the field.
 - **`text-area-widget.ts`**: `TextAreaWidget`. Multi-line editor with scrolling,
   selection, paste, Tab indent, optional word wrap and monospace. Event
   `change`.

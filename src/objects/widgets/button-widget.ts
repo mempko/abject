@@ -6,16 +6,18 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { darkenColor, fontStacks, raisedBlock } from './widget-types.js';
+import { darkenColor, fontStacks, gradientRect, raisedBlock, withAlpha } from './widget-types.js';
 import {
   TOOLTIP_NODE_ID, TOOLTIP_DELAY_MS, TOOLTIP_AUTO_HIDE_MS, showTooltip, type PopoutSurface,
 } from './popout.js';
 import { shapeOf } from '../../core/theme-data.js';
-import { iconCommands, isIconName } from '../../ui/icons.js';
+import { iconCommands, isIconName, type IconName } from '../../ui/icons.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
   private pressed = false;
+  /** The pointer is over style.accessory (its tooltip shows, its press is its own). */
+  private overAccessory = false;
 
   // style.tooltip: a pop-out beside the button (popout.ts) after a hover
   // dwell, so it may cross the window edge. One per window: every tooltip
@@ -27,6 +29,11 @@ export class ButtonWidget extends WidgetAbject {
   private tipPointer?: { x: number; y: number };
   /** Where the button last drew, in window px. */
   private drawnAt?: { x: number; y: number };
+  /** The last draw cut the label short; with no style.tooltip, the full text is the tooltip. */
+  private labelCut = false;
+
+  /** Width of the accessory's hit area at the right end, when the row has one. */
+  private static readonly ACCESSORY_W = 26;
 
   constructor(config: WidgetConfig) {
     super(config);
@@ -115,7 +122,8 @@ export class ButtonWidget extends WidgetAbject {
       });
     }
 
-    if (this.focused && live) {
+    // The ring marks keyboard focus only; a click leaves no ring behind.
+    if (this.focusVisible && live) {
       const lw = 2;
       commands.push({
         type: 'rect', surfaceId,
@@ -127,13 +135,73 @@ export class ButtonWidget extends WidgetAbject {
       });
     }
 
+    // The accessory takes room from the label only while it shows.
+    const accessory = this.accessory();
+    const showAccessory = !!accessory && (hovered || pressed || !!accessory.atRest);
+    const labelArea = showAccessory
+      ? { ...face, width: Math.max(0, face.width - ButtonWidget.ACCESSORY_W + 6) }
+      : face;
+    // A flat left-aligned row fades a long label into its own fill instead of
+    // cutting it with an ellipsis.
+    const rowFill = style.flat ? (hovered || pressed ? theme.textPrimary : style.background) : undefined;
+    const fadeTo = style.flat && (style.align ?? 'center') === 'left' && rowFill?.startsWith('#') ? rowFill : undefined;
     commands.push(...(style.caption
-      ? await this.tileCommands(surfaceId, face, textColor, hovered)
-      : await this.labelCommands(surfaceId, face, font, textColor, style.align ?? 'center', hasMarker ? 4 : 0)));
+      ? await this.tileCommands(surfaceId, labelArea, textColor, hovered)
+      : await this.labelCommands(surfaceId, labelArea, font, textColor, style.align ?? 'center', hasMarker ? 4 : 0, fadeTo)));
+    if (accessory && showAccessory) {
+      commands.push(...this.accessoryCommands(surfaceId, face, accessory, hovered || pressed ? textColor : undefined));
+    }
 
     if (this.disabled) {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
+    return commands;
+  }
+
+  /** style.accessory, when it names a known icon. */
+  private accessory(): { icon: IconName; tooltip?: string; atRest?: boolean; color?: string } | undefined {
+    const a = this.style.accessory;
+    if (!a || typeof a.icon !== 'string' || !isIconName(a.icon)) return undefined;
+    return { ...a, icon: a.icon };
+  }
+
+  /** Whether a local x falls on the accessory's hit area. */
+  private onAccessory(localX: number | undefined): boolean {
+    return !!this.accessory() && typeof localX === 'number'
+      && localX >= this.rect.width - ButtonWidget.ACCESSORY_W;
+  }
+
+  /**
+   * The accessory icon at the right end. Over the row it takes the row's
+   * hover ink (`rowInk`), and the accent with a soft chip behind it while the
+   * pointer is on the accessory itself; at rest it wears its own color.
+   */
+  private accessoryCommands(
+    surfaceId: string,
+    face: { x: number; y: number; width: number; height: number },
+    accessory: { icon: IconName; color?: string },
+    rowInk: string | undefined,
+  ): unknown[] {
+    const commands: unknown[] = [];
+    const size = Math.max(10, Math.min(14, face.height - 12));
+    const slot = ButtonWidget.ACCESSORY_W;
+    const x = face.x + face.width - slot + (slot - size) / 2 - 2;
+    const y = face.y + (face.height - size) / 2;
+    const hot = this.overAccessory && !this.disabled;
+    if (hot) {
+      const pad = 4;
+      commands.push({
+        type: 'rect', surfaceId,
+        params: {
+          x: Math.round(x - pad), y: Math.round(y - pad), width: size + pad * 2, height: size + pad * 2,
+          fill: this.theme.windowBg, radius: this.theme.tokens.radius.sm,
+        },
+      });
+    }
+    const color = hot ? this.theme.accent : rowInk ?? accessory.color ?? this.theme.accent;
+    commands.push(...iconCommands(accessory.icon, {
+      surfaceId, x: Math.round(x), y: Math.round(y), size, color, caps: shapeOf(this.theme).iconCaps,
+    }));
     return commands;
   }
 
@@ -185,8 +253,9 @@ export class ButtonWidget extends WidgetAbject {
 
   /**
    * The button's label inside `area`: optional vector icon (style.icon) then
-   * the text, truncated with an ellipsis to fit. With no text the icon is
-   * centered. `leftPad` reserves room for a leading marker.
+   * the text, truncated with an ellipsis to fit, or faded into `fadeTo` (the
+   * row's fill) when given. With no text the icon is centered. `leftPad`
+   * reserves room for a leading marker.
    */
   private async labelCommands(
     surfaceId: string,
@@ -195,6 +264,7 @@ export class ButtonWidget extends WidgetAbject {
     color: string,
     align: 'left' | 'center' | 'right',
     leftPad: number,
+    fadeTo?: string,
   ): Promise<unknown[]> {
     const commands: unknown[] = [];
     const padding = 8;
@@ -205,9 +275,15 @@ export class ButtonWidget extends WidgetAbject {
     const iconSpan = iconSize + iconGap;
 
     const maxTextWidth = area.width - padding * 2 - leftPad - iconSpan;
-    const displayText = this.text
-      ? await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font)
-      : '';
+    const fullWidth = this.text && fadeTo && align === 'left'
+      ? await this.measureText(surfaceId, this.text, font)
+      : 0;
+    const fade = fullWidth > maxTextWidth;
+    // A measured label either fits as it is or fades; only the rest need truncating.
+    const displayText = !this.text ? ''
+      : fullWidth > 0 ? this.text
+      : await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font);
+    this.labelCut = fade || displayText !== this.text;
     const textW = icon && displayText && align !== 'left'
       ? await this.measureText(surfaceId, displayText, font)
       : 0;
@@ -230,21 +306,47 @@ export class ButtonWidget extends WidgetAbject {
         : align === 'center' ? area.x + area.width / 2 + leftPad / 2
         : align === 'right' ? area.x + area.width - padding
         : area.x + padding + leftPad;
-      commands.push({
+      const text = {
         type: 'text', surfaceId,
         params: {
           x: textX, y: cy, text: displayText, font, fill: color,
           align: icon ? 'left' : align, baseline: 'middle',
         },
-      });
+      };
+      if (fade && fadeTo) {
+        // Clip the text at the label's end and fade its last stretch into the row.
+        const end = textX + maxTextWidth;
+        const fadeW = Math.min(22, maxTextWidth);
+        commands.push(
+          { type: 'save', surfaceId, params: {} },
+          { type: 'clip', surfaceId, params: { x: area.x, y: area.y, width: Math.max(0, end - area.x), height: area.height } },
+          text,
+          { type: 'restore', surfaceId, params: {} },
+          ...gradientRect(surfaceId, {
+            x: end - fadeW, y: area.y, width: fadeW, height: area.height,
+            gradient: { x0: end - fadeW, y0: 0, x1: end, y1: 0, stops: [
+              { offset: 0, color: withAlpha(fadeTo, 0) }, { offset: 1, color: fadeTo },
+            ] },
+          }),
+        );
+      } else {
+        commands.push(text);
+      }
     }
     return commands;
   }
 
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     if (input.type === 'mousedown') {
-      this.pressed = true;
       this.hideTooltip();
+      // A press on the accessory is the accessory's own action, not the row's,
+      // when it can be seen: a touch with no hover first lands on the row.
+      if (this.onAccessory(input.x as number | undefined) && (this.hovered || this.accessory()?.atRest)) {
+        this.changed('accessory', this.text);
+        await this.requestRedraw();
+        return { consumed: true };
+      }
+      this.pressed = true;
       // Click fires immediately so call sites don't need to wait for mouseup;
       // the visible press animation runs in parallel and is cleared on
       // mouseup or mouseleave below.
@@ -263,8 +365,12 @@ export class ButtonWidget extends WidgetAbject {
       const gx = input.globalX as number | undefined;
       const gy = input.globalY as number | undefined;
       if (gx !== undefined && gy !== undefined) this.tipPointer = { x: gx, y: gy };
-      if (!this.hovered) {
+      const overAccessory = this.onAccessory(input.x as number | undefined);
+      if (!this.hovered || overAccessory !== this.overAccessory) {
+        // Entering the accessory swaps the tooltip for the accessory's own.
+        if (this.hovered) this.hideTooltip();
         this.hovered = true;
+        this.overAccessory = overAccessory;
         this.scheduleTooltip();
         await this.requestRedraw();
       }
@@ -274,6 +380,7 @@ export class ButtonWidget extends WidgetAbject {
       const wasInteracting = this.hovered || this.pressed;
       this.hovered = false;
       this.pressed = false;
+      this.overAccessory = false;
       this.hideTooltip();
       if (wasInteracting) await this.requestRedraw();
       return { consumed: true };
@@ -288,9 +395,22 @@ export class ButtonWidget extends WidgetAbject {
     return { consumed: false };
   }
 
-  /** Show style.tooltip after a hover dwell. */
+  /**
+   * The tooltip for where the pointer is: the accessory's on it, else
+   * style.tooltip, else the full label when the last draw cut it short.
+   */
+  private tooltipText(): string | undefined {
+    if (this.overAccessory) return this.accessory()?.tooltip;
+    return this.style.tooltip ?? (this.labelCut && this.text ? this.text : undefined);
+  }
+
+  /**
+   * Show the tooltip after a hover dwell. Whether a label is cut can change
+   * with the hover itself (the accessory takes room), so a button with text
+   * waits and asks again when the dwell ends.
+   */
   private scheduleTooltip(): void {
-    if (!this.style.tooltip || this.disabled) return;
+    if (this.disabled || (!this.tooltipText() && !this.text)) return;
     this.cancelTimer(this.tipTimer);
     this.tipTimer = this.setTimer(() => this.showTooltipNow(), TOOLTIP_DELAY_MS);
   }
@@ -302,7 +422,7 @@ export class ButtonWidget extends WidgetAbject {
    */
   private async showTooltipNow(): Promise<void> {
     this.tipTimer = undefined;
-    const text = this.style.tooltip;
+    const text = this.tooltipText();
     const at = this.drawnAt;
     if (!text || !at || !this.hovered || this.disabled) return;
     const tip = this.tip ??= this.createPopout(TOOLTIP_NODE_ID, { interactive: false });

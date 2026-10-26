@@ -1,9 +1,12 @@
 /**
  * ScrollableVBoxLayout — a VBoxLayout that clips overflow and supports scrolling.
  *
- * When content exceeds the visible area, a scrollbar is rendered and wheel
- * events adjust the scroll offset. Mouse events are offset by scrollTop
- * before being delegated to the parent VBoxLayout.
+ * When content exceeds the visible area, wheel events adjust the scroll
+ * offset and a scrollbar shows: a thin thumb at the right edge while the
+ * pointer is over the layout or it has just scrolled, widening to a grabbable
+ * bar with its track under the pointer. At rest it is not drawn, so it never
+ * sits on top of the rows. Mouse events are offset by scrollTop before being
+ * delegated to the parent VBoxLayout.
  */
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
@@ -12,7 +15,12 @@ import { Rect, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
+/** The scrollbar's hit strip at the right edge, and its width while grabbed or pointed at. */
 const SCROLLBAR_WIDTH = 8;
+/** The thumb's width while it only shows where the view is. */
+const THIN_SCROLLBAR = 3;
+/** How long the thumb stays after a scroll with the pointer elsewhere. */
+const SCROLLBAR_LINGER_MS = 900;
 const SCROLL_STEP = 30;
 
 export interface ScrollableVBoxConfig extends LayoutConfig {
@@ -27,6 +35,11 @@ export class ScrollableVBoxLayout extends VBoxLayout {
   private scrollbarDragOffset = 0;
   /** Children drawn in the last pass; one that scrolls out hears viewportCulled once. */
   private drawnChildren = new Set<AbjectId>();
+  /** The pointer is over this layout / over the scrollbar's strip. */
+  private pointerInside = false;
+  private pointerOnBar = false;
+  /** The thumb shows after a scroll until this timer fires. */
+  private lingerTimer?: ReturnType<typeof setTimeout>;
 
   constructor(config: ScrollableVBoxConfig) {
     super(config);
@@ -60,6 +73,8 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     let count = 0;
     for (const child of this.layoutChildren) {
       if (isSpacer(child)) continue;
+      // A hidden child takes no room (calculateChildRects skips it too).
+      if (this.hiddenChildren.has(child.widgetId)) continue;
       const vPolicy = child.sizePolicy?.vertical ?? 'preferred';
       if (vPolicy === 'fixed' || vPolicy === 'preferred') {
         total += child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT;
@@ -146,8 +161,34 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     } else {
       return false;
     }
-    if (changed) await this.requestRedraw();
+    if (changed) {
+      this.lingerScrollbar();
+      await this.requestRedraw();
+    }
     return true;
+  }
+
+  /**
+   * Follow the pointer for the scrollbar: x in local px while it moves over
+   * the layout, undefined when it leaves. Redraws only when what shows changes.
+   */
+  private async trackPointer(x: number | undefined): Promise<void> {
+    const inside = x !== undefined;
+    const sb = this.scrollbarMetrics();
+    const onBar = inside && sb.visible && x >= sb.trackX;
+    if (inside === this.pointerInside && onBar === this.pointerOnBar) return;
+    this.pointerInside = inside;
+    this.pointerOnBar = onBar;
+    if (sb.visible) await this.requestRedraw();
+  }
+
+  /** Keep the thumb showing for a moment after a scroll, then let it go. */
+  private lingerScrollbar(): void {
+    this.cancelTimer(this.lingerTimer);
+    this.lingerTimer = this.setTimer(async () => {
+      this.lingerTimer = undefined;
+      if (!this.pointerInside) await this.requestRedraw();
+    }, SCROLLBAR_LINGER_MS);
   }
 
   // ── Rendering ─────────────────────────────────────────────────────
@@ -264,36 +305,25 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     }
     this.drawnChildren = drawn;
 
-    // Draw scrollbar if content overflows
+    // The scrollbar, while the pointer is over the layout or it just scrolled.
     const sb = this.scrollbarMetrics();
-    if (sb.visible) {
+    if (sb.visible && (this.pointerInside || this.scrollbarDragging || this.lingerTimer)) {
       const trackX = ox + sb.trackX;
       const trackY = oy + sb.trackY;
-      const trackH = sb.trackH;
-
-      // Track
+      const wide = this.scrollbarDragging || this.pointerOnBar;
+      if (wide) {
+        commands.push({
+          type: 'rect', surfaceId,
+          params: { x: trackX, y: trackY, width: SCROLLBAR_WIDTH, height: sb.trackH, fill: this.theme.scrollbarTrack },
+        });
+      }
+      // Thumb: a flat slab, thin at the edge until grabbed or pointed at.
+      const thumbW = wide ? SCROLLBAR_WIDTH - 2 : THIN_SCROLLBAR;
       commands.push({
         type: 'rect',
         surfaceId,
         params: {
-          x: trackX,
-          y: trackY,
-          width: SCROLLBAR_WIDTH,
-          height: trackH,
-          fill: this.theme.scrollbarTrack,
-        },
-      });
-
-      // Thumb
-      const thumbHeight = sb.thumbHeight;
-      const thumbY = oy + sb.thumbY;
-
-      // Thumb: a flat square slab, highlighted while dragged.
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
+          x: trackX + SCROLLBAR_WIDTH - 1 - thumbW, y: oy + sb.thumbY, width: thumbW, height: sb.thumbHeight,
           fill: this.scrollbarDragging ? this.theme.scrollbarThumbHover : this.theme.scrollbarThumb,
         },
       });
@@ -310,6 +340,10 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     // Keyboard scrolling when this layout (or its content) holds focus.
     if (inputType === 'keydown') {
       return { consumed: await this.handleScrollKey(input.key as string) };
+    }
+
+    if (inputType === 'mousemove' || inputType === 'mouseleave') {
+      await this.trackPointer(inputType === 'mousemove' ? input.x as number : undefined);
     }
 
     // ── Scrollbar dragging ────────────────────────────────────────────
@@ -346,6 +380,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
 
     if (inputType === 'mouseup' && this.scrollbarDragging) {
       this.scrollbarDragging = false;
+      await this.requestRedraw();
       return { consumed: true };
     }
 
@@ -364,6 +399,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       if (this.scrollTop !== oldScroll) {
         // Disable auto-scroll when user scrolls up, re-enable at bottom
         this.autoScroll = this.scrollTop >= this.maxScroll;
+        this.lingerScrollbar();
         await this.requestRedraw();
         return { consumed: true };
       }

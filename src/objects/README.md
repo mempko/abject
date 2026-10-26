@@ -383,8 +383,8 @@ ChatBrowser, the roster window, is under Per-workspace UI.
 | `widget-manager.ts` | WidgetManager | global, desktop, worker | Spawns windows and widgets (their tree lives in its worker) and decides who may change a window (its owner, its widgets, objects the owner granted with `grantWindowAccess`, built-in objects; `admitsToWindow`); window effects, widget types, Exposé; presenter for confirm and prompt |
 | `window-manager.ts` | WindowManager | global, desktop, worker | Window policy: z-order, drag, resize; registers each workspace's Taskbar |
 | `scene-library.ts` | SceneLibrary | global, desktop, worker | Named 3D material and look presets, pushed to UIServer |
-| `sidebar.ts` | Sidebar | global, desktop, worker | The dock window and its three sections (System, Spaces, Abjects) |
-| `global-toolbar.ts` | GlobalToolbar | global, desktop, worker | The dock's System section: Settings, PeerNetwork, and abjects tagged `launcher` |
+| `sidebar.ts` | Sidebar | global, desktop, worker | The dock window and its three sections (System, Spaces, Abjects), and its compact (icon-only) mode (`toggleCompact`) |
+| `global-toolbar.ts` | GlobalToolbar | global, desktop, worker | The dock's System section: Settings, PeerNetwork, abjects tagged `launcher`, and the dock's collapse toggle in its header |
 | `workspace-switcher.ts` | WorkspaceSwitcher | global, desktop, worker | The dock's Spaces section; lives outside workspaces so a switch never hides it |
 | `object-browser.ts` | ObjectBrowser | global, desktop, worker | Four-pane object explorer: scope, kinds, methods, detail with send-message |
 | `method-inspector.ts` | MethodInspector | global, desktop, worker | Opens on a window's `?` button: the owner's methods, detail and a send form |
@@ -396,7 +396,7 @@ ChatBrowser, the roster window, is under Per-workspace UI.
 | File | Object | Runs | Role |
 |------|--------|------|------|
 | `settings.ts` | Settings | workspace UI, worker | Workspace settings: General, Access, Web and Appearance tabs |
-| `taskbar.ts` | Taskbar | workspace UI, worker | The dock's Abjects section: launch rows and minimized windows |
+| `taskbar.ts` | Taskbar | workspace UI, worker | The dock's Abjects section: a fixed header and search field over a scrolling body of every row: the built-in launch rows, favorite user objects (starred, kept in the workspace's Storage), the rest, and minimized windows |
 | `command-palette.ts` | CommandPalette (class `CommandPaletteAbject`) | workspace UI, worker | Ctrl-K launcher over objects that have `show` |
 | `window-switcher.ts` | WindowSwitcher (class `WindowSwitcherAbject`) | workspace UI, worker | Ctrl+backtick switcher over open windows |
 | `app-explorer.ts` | AppExplorer | workspace UI, worker | Three-pane explorer of object kinds and instances, local or remote. The person's kept objects show their folder and tags (searchable), sleeping ones are listed as asleep, and the detail pane moves, retags, switches loading, copies (AbjectStore) and wakes them |

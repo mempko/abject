@@ -47,7 +47,12 @@ export type IconName =
   | 'lock'
   | 'grid'
   | 'diamond'
-  | 'activity';
+  | 'activity'
+  // Favorite marker: outline to add, filled once favorited.
+  | 'star'
+  | 'starFilled'
+  // A window with a filled left pane: the dock's collapse / expand toggle.
+  | 'sidebar';
 
 export interface IconDrawOpts {
   surfaceId: string;
@@ -571,6 +576,37 @@ const activityIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
   return bars.map(([fx, fh]) => filledRect(surfaceId, x + size * fx, base - size * fh, w, size * fh, color));
 };
 
+/** The five-point star's outline, point up, inside the box. */
+function starPoints(x: number, y: number, size: number): Array<{ x: number; y: number }> {
+  const cx = x + size / 2;
+  const cy = y + size * 0.54;
+  const outer = size * 0.46;
+  const inner = outer * 0.42;
+  const points: Array<{ x: number; y: number }> = [];
+  for (let i = 0; i < 10; i++) {
+    const r = i % 2 === 0 ? outer : inner;
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    points.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+  }
+  return points;
+}
+
+const starIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) =>
+  [polyline(surfaceId, starPoints(x, y, size), color, lineWidth ?? defaultLineWidth(size), true)];
+
+const starFilledIcon: Renderer = ({ surfaceId, x, y, size, color }) =>
+  [polygon(surfaceId, starPoints(x, y, size), color)];
+
+const sidebarIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  const lw = lineWidth ?? defaultLineWidth(size);
+  const left = x + size * 0.12, top = y + size * 0.2;
+  const w = size * 0.76, h = size * 0.6;
+  return [
+    rect(surfaceId, left, top, w, h, color, lw),
+    filledRect(surfaceId, left, top, w * 0.34, h, color),
+  ];
+};
+
 const ICONS: Record<IconName, Renderer> = {
   close: closeIcon,
   minimize: minimizeIcon,
@@ -608,6 +644,9 @@ const ICONS: Record<IconName, Renderer> = {
   grid: gridIcon,
   diamond: diamondIcon,
   activity: activityIcon,
+  star: starIcon,
+  starFilled: starFilledIcon,
+  sidebar: sidebarIcon,
 };
 
 /** True when `name` is a built-in icon (for validating caller-supplied names). */

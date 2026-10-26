@@ -18,6 +18,22 @@ export const CANVAS_INTERFACE: InterfaceId = 'abjects:canvas' as InterfaceId;
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
+/**
+ * A button's trailing icon action (a row's favorite star, say). It shows
+ * while the pointer is over the row, or always with `atRest`; a press on it
+ * fires the 'accessory' aspect instead of 'click'.
+ */
+export interface ButtonAccessory {
+  /** A built-in vector icon name (ui/icons.ts IconName). */
+  icon: string;
+  /** Tooltip shown while the pointer is over the accessory. */
+  tooltip?: string;
+  /** Keep it visible when the pointer is elsewhere (a state worth seeing, like a set favorite). */
+  atRest?: boolean;
+  /** Ink at rest; defaults to the theme's accent. */
+  color?: string;
+}
+
 export interface WidgetStyle {
   color?: string;
   background?: string;
@@ -35,7 +51,9 @@ export interface WidgetStyle {
   syntaxHighlight?: boolean;  // textArea only: colorize JavaScript tokens
   flat?: boolean;  // buttons only: quiet row (sidebar/toolbar item) — no depth gradient, bevel, or border; hover/press feedback only
   tooltip?: string;  // buttons: hover tooltip text, shown after a dwell as a pop-out beside the button (popout.ts) that may cross the window edge
-  icon?: string;  // buttons only: a built-in vector icon name (ui/icons.ts IconName) drawn before the text; unknown names are ignored
+  icon?: string;  // buttons and single-line text inputs: a built-in vector icon name (ui/icons.ts IconName) drawn before the text; unknown names are ignored
+  accessory?: ButtonAccessory;  // buttons only: a small icon action at the row's right end; clicking it fires 'accessory' instead of 'click'
+  clearable?: boolean;  // single-line text inputs: a clear mark at the right end while there is text; it, and Escape, empty the field
   caption?: string;  // buttons only: a smaller second line under the text (a tile's subtitle); the text then sits on the first line
   enter?: 'rise';  // any widget: fade in and rise a few pixels the first time it is drawn
 }

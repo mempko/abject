@@ -62,6 +62,9 @@ export class GlobalToolbar extends Abject {
   private compact = false;
   private headerBtnId?: AbjectId;
   private settingsBtnId?: AbjectId;
+  /** Collapses the dock to icons (in the header) or expands it (the compact dock's first row). */
+  private dockToggleBtnId?: AbjectId;
+  private sidebarId?: AbjectId;
   private networkBtnId?: AbjectId;
   private explorerBtnId?: AbjectId;
   private processesBtnId?: AbjectId;
@@ -156,6 +159,9 @@ LLMMonitor (The Eye).
 - Each button lazily discovers its target object on first click.
 - Clicking a row sends \`show\` to the corresponding system panel.
 - Clicking the section header toggles the section collapsed (header only).
+- The sidebar icon beside the gear collapses the whole dock to icon-only rows
+  (Sidebar's \`toggleCompact\`); collapsed, it is the dock's first row and
+  expands it again.
 
 ### Interface ID
 \`abjects:global-toolbar\``;
@@ -298,6 +304,13 @@ LLMMonitor (The Eye).
         return;
       }
 
+      // Dock collapse / expand: the compact mode is the Sidebar's.
+      if (fromId === this.dockToggleBtnId) {
+        if (!this.sidebarId) this.sidebarId = await this.discoverDep('Sidebar') ?? undefined;
+        if (this.sidebarId) this.send(request(this.id, this.sidebarId, 'toggleCompact', {}));
+        return;
+      }
+
       // Settings button
       if (fromId === this.settingsBtnId) {
         if (!this.globalSettingsId) {
@@ -432,6 +445,7 @@ LLMMonitor (The Eye).
     await this.request(request(this.id, this.sectionLayoutId, 'clearLayoutChildren', {}));
     this.headerBtnId = undefined;
     this.settingsBtnId = undefined;
+    this.dockToggleBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
@@ -444,20 +458,6 @@ LLMMonitor (The Eye).
     const btnW = 120;
     const btnH = 30;
     const labelH = 20;
-
-    // Header row: collapse-toggle header button + gear (settings) button
-    const headerRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.sectionLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
-      })
-    );
-    await this.request(request(this.id, this.sectionLayoutId, 'updateLayoutChild', {
-      widgetId: headerRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: labelH },
-    }));
 
     // "Grimoire index" styling: flat, borderless, left-aligned rows (matches
     // the Abjects rail) rather than boxed pills. Constructivist themes get the
@@ -478,6 +478,12 @@ LLMMonitor (The Eye).
     if (!compact) {
       specs.push({ type: 'button', windowId: this.windowId, text: '', style: gearStyle });
     }
+    // The dock toggle: a small header action beside the gear, or, in the
+    // narrow icon-only dock, its own row at the very top.
+    const toggleIdx = specs.length;
+    specs.push(compact
+      ? { type: 'button', windowId: this.windowId, text: '', style: { ...dock.row, icon: 'sidebar', tooltip: 'Expand sidebar' } }
+      : { type: 'button', windowId: this.windowId, text: '', style: { ...gearStyle, icon: 'sidebar', tooltip: 'Collapse sidebar' } });
     const rowStartIdx = specs.length;
     if (!this.collapsed) {
       specs.push(
@@ -497,13 +503,39 @@ LLMMonitor (The Eye).
 
     this.headerBtnId = widgetIds[0];
     this.settingsBtnId = compact ? undefined : widgetIds[1];
+    this.dockToggleBtnId = widgetIds[toggleIdx];
+    if (compact) {
+      await this.request(request(this.id, this.sectionLayoutId, 'addLayoutChild', {
+        widgetId: this.dockToggleBtnId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: btnW, height: btnH },
+      }));
+    }
 
-    // Add header row children: header toggle (+ gear when expanded)
+    // Header row: collapse-toggle header button + gear (settings) button +
+    // dock toggle (made after the compact dock's toggle row, so it sits under it)
+    const headerRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.sectionLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.sectionLayoutId, 'updateLayoutChild', {
+      widgetId: headerRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    // Add header row children: header toggle (+ gear and dock toggle when expanded)
     const headerChildren: Array<Record<string, unknown>> = [
       { widgetId: this.headerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
     ];
     if (this.settingsBtnId) {
       headerChildren.push({ widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } });
+    }
+    if (!compact) {
+      headerChildren.push({ widgetId: this.dockToggleBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } });
     }
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', { children: headerChildren }));
 
@@ -553,6 +585,7 @@ LLMMonitor (The Eye).
     this.sectionLayoutId = undefined;
     this.headerBtnId = undefined;
     this.settingsBtnId = undefined;
+    this.dockToggleBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;

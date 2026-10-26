@@ -2,8 +2,16 @@
  * Taskbar -- persistent vertical bar with launch buttons for workspace apps.
  *
  * Uses the standard show/hide pattern: destroys and rebuilds the window on
- * each show(). On data changes (registry events, minimize/restore), rebuilds
- * the content by clearing the root layout and repopulating it.
+ * each show(). On data changes (minimize/restore, collapse), rebuilds the
+ * content by clearing the root layout and repopulating it.
+ *
+ * The section header and a search field stay put at the top; every row goes
+ * in a scrolling body under them. The search filters everything there: the
+ * built-in apps, then the favorite user objects (starred from the row's hover
+ * star, kept in this workspace's Storage), then every other user object, the
+ * three groups parted by hairline rules. Typing hides and shows the built-in
+ * rows in place and refills the two object lists, so the field keeps its
+ * focus and text, and the rows keep their busy lights and open markers.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
@@ -11,8 +19,10 @@ import { Abject } from '../core/abject.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { event, request } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
+import { require } from '../core/contracts.js';
 import { chromeCase } from '../core/theme-data.js';
 import { ActivityLatch, dockStyles, type DockLauncher } from './dock-style.js';
+import { withAlpha } from './widgets/widget-types.js';
 
 const log = new Log('Taskbar');
 
@@ -23,6 +33,38 @@ const BTN_H = 30;
 const LABEL_H = 20;
 /** Fallback glyph for user objects whose manifest declares no icon. */
 const DEFAULT_OBJECT_ICON = '◆';
+/** Height of the search field at the top of the section (a row's height, so it reads as one). */
+const SEARCH_H = BTN_H;
+/** Height of the hairline rule between the apps, the favorites and the rest. */
+const RULE_H = 1;
+/** Storage key (this workspace's Storage) for the favorited objects. */
+const FAVORITES_KEY = 'taskbar:favorites';
+
+/** A user object's durable favorite key: its typeId, which survives restarts, else its name. */
+function favoriteKey(obj: ObjectRegistration): string {
+  return obj.typeId ?? obj.manifest.name;
+}
+
+/**
+ * How well a row matches a search, lower is better, or null for no match:
+ * name prefix, then the start of a word in the name ('duck' finds
+ * DesktopDuck), then anywhere in the name, then the description.
+ */
+function matchRank(name: string, description: string, query: string): number | null {
+  const q = query.trim().toLowerCase();
+  if (!q) return 0;
+  const lower = name.toLowerCase();
+  if (lower.startsWith(q)) return 0;
+  const words = name.split(/(?<=[a-z0-9])(?=[A-Z])|[\s_\-.]+/).map((w) => w.toLowerCase());
+  if (words.some((w) => w.startsWith(q))) return 1;
+  if (lower.includes(q)) return 2;
+  if (description.toLowerCase().includes(q)) return 3;
+  return null;
+}
+
+function objectRank(obj: ObjectRegistration, query: string): number | null {
+  return matchRank(obj.manifest.name, obj.manifest.description ?? '', query);
+}
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -44,6 +86,8 @@ export class Taskbar extends Abject {
   /** Sidebar dock window + this rail's section layout (pushed via show()). */
   private windowId?: AbjectId;
   private sectionLayoutId?: AbjectId;
+  /** The scrolling body under the header and the search field, holding every row. */
+  private bodyLayoutId?: AbjectId;
   /** Single-flight guard for clear+repopulate of the section. */
   private buildingUI = false;
   /** Accordion state: collapsed sections show only their header row. */
@@ -69,6 +113,32 @@ export class Taskbar extends Abject {
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
   private restoreButtons: Map<AbjectId, string> = new Map();
+  /** User object row -> that object's favorite key (for its star). */
+  private rowKeys: Map<AbjectId, string> = new Map();
+  /** The built-in launcher rows in order, with the label the search matches. */
+  private launcherRows: Array<{ btnId: AbjectId; label: string }> = [];
+  /** Launcher rows and rules the search has hidden. */
+  private hiddenRows = new Set<AbjectId>();
+  /** The rule under the built-in apps, and the one between the favorites and the rest. */
+  private appsRuleId?: AbjectId;
+  private listsRuleId?: AbjectId;
+
+  /** Favorited user objects by favorite key, in the order they were starred. */
+  private favorites: string[] = [];
+  private storageId?: AbjectId;
+  /** What the search field holds; it filters every row under it. */
+  private filterQuery = '';
+  private searchInputId?: AbjectId;
+  /** The two object lists, refreshed in place (typing never rebuilds the field). */
+  private favoritesListId?: AbjectId;
+  private othersListId?: AbjectId;
+  private favoriteRowIds: AbjectId[] = [];
+  private otherRowIds: AbjectId[] = [];
+  /** Which of favorites / search / others the section was built with; a change needs a full rebuild. */
+  private builtShape = '';
+  private listTimer?: ReturnType<typeof setTimeout>;
+  private refreshingLists = false;
+  private listsStale = false;
 
   // Minimized window state (survives rebuilds)
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
@@ -109,6 +179,24 @@ export class Taskbar extends Abject {
                   visible: { kind: 'primitive', primitive: 'boolean' },
                 }},
               },
+              {
+                name: 'setFavorite',
+                description: 'Favorite or unfavorite a launchable user object, which moves its row up under the built-in apps or back into the searchable list',
+                parameters: [
+                  { name: 'object', type: { kind: 'primitive', primitive: 'string' }, description: 'The object\'s name, typeId or AbjectId' },
+                  { name: 'favorite', type: { kind: 'primitive', primitive: 'boolean' }, description: 'true to favorite (default), false to unfavorite' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getFavorites',
+                description: 'The favorited user objects, in the order they show',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                  name: { kind: 'primitive', primitive: 'string' },
+                  key: { kind: 'primitive', primitive: 'string' },
+                }}},
+              },
             ],
           },
         tags: ['system', 'ui'],
@@ -122,7 +210,8 @@ export class Taskbar extends Abject {
     return super.askPrompt(_question) + `\n\n## Taskbar Usage Guide
 
 ### Overview
-Provider of the Abjects section of the sidebar dock. Displays launch rows for
+Provider of the Abjects section of the sidebar dock. Under a fixed header and
+search field, a scrolling body displays launch rows for
 core workspace apps (Chat, Goals, Jobs, Web) and any user-created objects that
 expose show/hide methods. Also shows a "minimized windows" list so the user
 can restore windows from the sidebar.
@@ -133,6 +222,16 @@ can restore windows from the sidebar.
   place.
 - \`hide()\` -- Clear the section and all button state.
 - \`getState()\` -- Returns \`{ visible: boolean }\`.
+- \`setFavorite({ object, favorite? })\` -- Favorite (default) or unfavorite a
+  launchable user object by name, typeId or AbjectId.
+- \`getFavorites()\` -- The favorited objects as \`[{ name, key }]\`.
+
+### Favorites and search
+A search field at the top of the section filters every row by name (and a
+user object's description): the built-in apps, then the favorited user
+objects, then the rest. Enter opens the best match. The person stars or
+unstars a user object with the star that appears when the pointer is over its
+row; favorites list right under the built-in apps and are kept per workspace.
 
 ### Behavior
 - Subscribes to the Registry for objectRegistered/objectUnregistered events
@@ -162,6 +261,8 @@ can restore windows from the sidebar.
     this.registryId = await this.requireDep('Registry');
     this.workspaceManagerId = await this.requireDep('WorkspaceManager');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
+    await this.loadFavorites();
 
     if (this.registryId) {
       await this.request(request(this.id, this.registryId, 'subscribe', {}));
@@ -229,13 +330,30 @@ can restore windows from the sidebar.
         return;
       }
       if (aspect === 'visibility') {
-        // Update single button style in-place (no rebuild)
         const fromId = msg.routing.from;
+        // Our own rows report the search hiding them; that is not an app's window.
+        if (this.systemButtons.has(fromId) || this.userObjButtons.has(fromId)) return;
+        // Update single button style in-place (no rebuild)
         await this.updateButtonStyle(fromId, !!value);
         return;
       }
       if (aspect === 'workspaceAccessChanged') {
         this.scheduleRebuild();
+        return;
+      }
+      if (aspect === 'change' && msg.routing.from === this.searchInputId) {
+        this.filterQuery = typeof value === 'string' ? value : '';
+        this.scheduleListRefresh(40);
+        return;
+      }
+      if (aspect === 'submit' && msg.routing.from === this.searchInputId) {
+        await this.openBestMatch();
+        return;
+      }
+      if (aspect === 'accessory') {
+        // The hover star on a user object row.
+        const key = this.rowKeys.get(msg.routing.from);
+        if (key) await this.applyFavorite(key, !this.favorites.includes(key));
         return;
       }
       if (aspect !== 'click') return;
@@ -279,12 +397,28 @@ can restore windows from the sidebar.
       if (this.windowId) await this.rebuild();
     });
 
-    this.on('objectRegistered', async () => this.scheduleRebuild());
-    this.on('objectUnregistered', async () => this.scheduleRebuild());
+    this.on('objectRegistered', async () => this.scheduleListRefresh());
+    this.on('objectUnregistered', async () => this.scheduleListRefresh());
     // An object that gains show and hide through a source update becomes
     // launchable without ever re-registering; the Registry announces the
     // manifest swap and the list follows it.
-    this.on('manifestUpdated', async () => this.scheduleRebuild());
+    this.on('manifestUpdated', async () => this.scheduleListRefresh());
+
+    this.on('setFavorite', async (msg: AbjectMessage) => {
+      const { object, favorite } = msg.payload as { object: string; favorite?: boolean };
+      require(typeof object === 'string' && object.length > 0, 'setFavorite: object is required');
+      const objects = await this.discoverShowableObjects();
+      const target = objects.find((o) => o.id === object || o.typeId === object)
+        ?? objects.find((o) => o.manifest.name === object);
+      if (!target) throw new Error(`No launchable user object '${object}' (it needs show and hide methods)`);
+      await this.applyFavorite(favoriteKey(target), favorite !== false);
+      return true;
+    });
+
+    this.on('getFavorites', async () => {
+      const byKey = new Map((await this.discoverShowableObjects()).map((o) => [favoriteKey(o), o]));
+      return this.favorites.map((key) => ({ name: byKey.get(key)?.manifest.name ?? key, key }));
+    });
 
     // WidgetManager broadcasts these (with the owning app's id) whenever any
     // window opens or closes — the authoritative signal for the open highlight.
@@ -323,6 +457,7 @@ can restore windows from the sidebar.
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
+    this.forgetObjectLists();
     this.changed('visibility', false);
     return true;
   }
@@ -367,12 +502,30 @@ can restore windows from the sidebar.
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
+    this.forgetObjectLists();
     await this.populateContent();
+  }
+
+  /** Drop every handle on the rows, lists, rules and the search field (their widgets go with the section). */
+  private forgetObjectLists(): void {
+    this.rowKeys.clear();
+    this.launcherRows = [];
+    this.hiddenRows.clear();
+    this.appsRuleId = undefined;
+    this.listsRuleId = undefined;
+    this.searchInputId = undefined;
+    this.bodyLayoutId = undefined;
+    this.favoritesListId = undefined;
+    this.othersListId = undefined;
+    this.favoriteRowIds = [];
+    this.otherRowIds = [];
+    this.builtShape = '';
   }
 
   private async populateContent(): Promise<void> {
     const collapsed = this.collapsed;
-    const showableObjects = collapsed ? [] : await this.discoverShowableObjects();
+    const objects = this.partitionObjects(collapsed ? [] : await this.discoverShowableObjects());
+    const shape = this.listShape(objects);
     const activeWorkspace = await this.request<{
       accessMode: 'local' | 'shared' | 'public';
       joined?: boolean;
@@ -401,7 +554,7 @@ can restore windows from the sidebar.
     }));
 
     // ---- Batch create all widgets ----
-    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+    const specs: Array<{ type: string; windowId: AbjectId; text: string; placeholder?: string; style?: Record<string, unknown> }> = [];
 
     // "Grimoire index" styling: flat, borderless, left-aligned rows rather than
     // boxed pills. Apps render in primary ink; user objects are demoted to
@@ -428,55 +581,57 @@ can restore windows from the sidebar.
       // [1] Gear button (AppExplorer)
       specs.push({ type: 'button', windowId: this.windowId!, text: '', style: gearStyle });
     }
-    const sysRowStartIdx = specs.length;
-    if (!collapsed) {
-      // Chat (opens ChatBrowser overview). A rebuild creates fresh widgets;
-      // the busy light is re-applied once the rows are laid out (below).
-      specs.push({ type: 'button', windowId: this.windowId!, text: this.chatRowText(), style: { ...rowStyle('Chat'), ...this.chatRowStyle(this.chatBusy) } });
-      // Peers is meaningful only for shared/public (including joined) workspaces.
-      if (showPeers) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('peers', 'Peers'), style: rowStyle('Peers', 'peers') });
-      }
-      // Goals (optional)
-      if (this.goalBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('goals', 'Goals'), style: rowStyle('Goals', 'goals') });
-      }
-      // Jobs
-      specs.push({ type: 'button', windowId: this.windowId!, text: row('jobs', 'Jobs'), style: rowStyle('Jobs', 'jobs') });
-      // Knowledge (optional)
-      if (this.knowledgeBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('knowledge', 'Knowledge'), style: rowStyle('Knowledge', 'knowledge') });
-      }
-      // Agents (optional)
-      if (this.agentBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('agents', 'Agents'), style: rowStyle('Agents', 'agents') });
-      }
-      // Schedules (optional)
-      if (this.schedulerBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('schedules', 'Schedules'), style: rowStyle('Schedules', 'schedules') });
-      }
-      // Web (optional)
-      if (this.webBrowserViewerId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('web', 'Web'), style: rowStyle('Web', 'web') });
-      }
-      // Files (optional)
-      if (this.fileManagerId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('files', 'Files'), style: rowStyle('Files', 'files') });
-      }
-      // Projects — the on-disk counterpart to Files (optional)
-      if (this.externalProjectBrowserId) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: row('projects', 'Projects'), style: rowStyle('Projects', 'projects') });
-      }
+
+    // The search field heads the section, over every row below it.
+    const searchIdx = specs.length;
+    if (shape.search) {
+      specs.push({
+        type: 'textInput', windowId: this.windowId!, text: this.filterQuery,
+        placeholder: 'Search abjects',
+        style: {
+          fontSize: 13, icon: 'search', clearable: true, radius: this.theme.tokens.radius.sm,
+          // A quiet tint with no rule: it reads as the list's own field, not a box among rows.
+          background: withAlpha(this.theme.textPrimary, 0.06),
+          borderColor: withAlpha(this.theme.textPrimary, 0),
+        },
+      });
     }
 
-    // User object buttons. Use the manifest icon when present, else a neutral
-    // default so older objects (created before icons) still render an icon.
-    // (showableObjects is empty when collapsed.)
-    const userObjStartIdx = specs.length;
-    for (const obj of showableObjects) {
-      const icon = obj.manifest.icon?.trim() || DEFAULT_OBJECT_ICON;
-      specs.push({ type: 'button', windowId: this.windowId!, text: compact ? icon : `${icon}  ${obj.manifest.name}`, style: compact ? { ...objStyle, tooltip: obj.manifest.name } : objStyle });
+    // The built-in apps, in this order. Chat carries its own icon style (and
+    // the busy light, re-applied once the rows are laid out, below).
+    const launchers: Array<{ label: string; key?: DockLauncher; target: AbjectId }> = [];
+    if (!collapsed) {
+      launchers.push({ label: 'Chat', target: this.chatBrowserId! });
+      // Peers is meaningful only for shared/public (including joined) workspaces.
+      if (showPeers) launchers.push({ label: 'Peers', key: 'peers', target: this.peersViewerId! });
+      if (this.goalBrowserId) launchers.push({ label: 'Goals', key: 'goals', target: this.goalBrowserId });
+      launchers.push({ label: 'Jobs', key: 'jobs', target: this.jobBrowserId! });
+      if (this.knowledgeBrowserId) launchers.push({ label: 'Knowledge', key: 'knowledge', target: this.knowledgeBrowserId });
+      if (this.agentBrowserId) launchers.push({ label: 'Agents', key: 'agents', target: this.agentBrowserId });
+      if (this.schedulerBrowserId) launchers.push({ label: 'Schedules', key: 'schedules', target: this.schedulerBrowserId });
+      if (this.webBrowserViewerId) launchers.push({ label: 'Web', key: 'web', target: this.webBrowserViewerId });
+      if (this.fileManagerId) launchers.push({ label: 'Files', key: 'files', target: this.fileManagerId });
+      // Projects — the on-disk counterpart to Files
+      if (this.externalProjectBrowserId) launchers.push({ label: 'Projects', key: 'projects', target: this.externalProjectBrowserId });
     }
+    const query = this.activeQuery();
+    const sysRowStartIdx = specs.length;
+    for (const l of launchers) {
+      // Rows the search leaves out are born hidden.
+      const visible = matchRank(l.label, '', query) !== null;
+      const style = l.key ? rowStyle(l.label, l.key) : { ...rowStyle(l.label), ...this.chatRowStyle(this.chatBusy) };
+      specs.push({ type: 'button', windowId: this.windowId!, text: l.key ? row(l.key, l.label) : this.chatRowText(), style: { ...style, visible } });
+    }
+
+    // Hairline rules: under the apps when user objects follow, and between
+    // the favorites and the rest. The search shows and hides them.
+    const ruleStyle = (visible: boolean) => ({ color: this.theme.divider, visible });
+    const appsRuleIdx = specs.length;
+    const withAppsRule = launchers.length > 0 && (shape.favorites || shape.others);
+    if (withAppsRule) specs.push({ type: 'divider', windowId: this.windowId!, text: '', style: ruleStyle(false) });
+    const listsRuleIdx = specs.length;
+    const withListsRule = shape.favorites && shape.others;
+    if (withListsRule) specs.push({ type: 'divider', windowId: this.windowId!, text: '', style: ruleStyle(false) });
 
     // Minimized window section (hidden while collapsed)
     const minimizedStartIdx = specs.length;
@@ -499,26 +654,21 @@ can restore windows from the sidebar.
       this.systemButtons.set(gearBtnId, this.appExplorerId!);
     }
 
-    if (!collapsed) {
-      let idx = sysRowStartIdx;
-      const chatBtnId = widgetIds[idx++];
-      this.chatBtnId = chatBtnId;
-      this.systemButtons.set(chatBtnId, this.chatBrowserId!);
-      if (showPeers) this.systemButtons.set(widgetIds[idx++], this.peersViewerId!);
-      if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
-      this.jobsBtnId = widgetIds[idx++];
-      this.systemButtons.set(this.jobsBtnId, this.jobBrowserId!);
-      if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
-      if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
-      if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
-      if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
-      if (this.fileManagerId) this.systemButtons.set(widgetIds[idx++], this.fileManagerId);
-      if (this.externalProjectBrowserId) this.systemButtons.set(widgetIds[idx++], this.externalProjectBrowserId);
-    }
-
-    for (let i = 0; i < showableObjects.length; i++) {
-      this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
-    }
+    launchers.forEach((l, i) => {
+      const btnId = widgetIds[sysRowStartIdx + i];
+      this.systemButtons.set(btnId, l.target);
+      this.launcherRows.push({ btnId, label: l.label });
+      if (matchRank(l.label, '', query) === null) this.hiddenRows.add(btnId);
+      if (!l.key) this.chatBtnId = btnId;
+      if (l.key === 'jobs') this.jobsBtnId = btnId;
+    });
+    this.searchInputId = shape.search ? widgetIds[searchIdx] : undefined;
+    this.appsRuleId = withAppsRule ? widgetIds[appsRuleIdx] : undefined;
+    this.listsRuleId = withListsRule ? widgetIds[listsRuleIdx] : undefined;
+    // Rules are born hidden; applyRules shows the ones with rows on both sides.
+    if (this.appsRuleId) this.hiddenRows.add(this.appsRuleId);
+    if (this.listsRuleId) this.hiddenRows.add(this.listsRuleId);
+    this.builtShape = shape.key;
 
     // ---- Add header row children ----
     const headerChildren: Array<Record<string, unknown>> = [
@@ -533,15 +683,53 @@ can restore windows from the sidebar.
     // ---- Add section layout children ----
     const sectionChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
 
-    // System buttons in declaration order (skip the header-row widgets).
-    for (let i = sysRowStartIdx; i < userObjStartIdx; i++) {
-      sectionChildren.push({ widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    // The search field stays under the header; the body under it takes the
+    // rest of the section's height and scrolls on its own.
+    if (this.searchInputId) {
+      await this.request(request(this.id, this.sectionLayoutId!, 'addLayoutChild', {
+        widgetId: this.searchInputId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: BTN_W, height: SEARCH_H },
+      }));
+      this.send(request(this.id, this.searchInputId, 'addDependent', {}));
+    }
+    this.bodyLayoutId = await this.request<AbjectId>(request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+      parentLayoutId: this.sectionLayoutId!,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: this.theme.tokens.space.sm,
+    }));
+
+    // The built-in apps and their rule, then the lists. Nested lists append
+    // to the body as they are made, so everything goes in order.
+    for (const { btnId } of this.launcherRows) {
+      sectionChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    }
+    if (this.appsRuleId) {
+      sectionChildren.push({ widgetId: this.appsRuleId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: RULE_H } });
+    }
+    if (sectionChildren.length > 0) {
+      await this.request(request(this.id, this.bodyLayoutId, 'addLayoutChildren', { children: sectionChildren }));
+      sectionChildren.length = 0;
     }
 
-    // User object buttons
-    for (let i = 0; i < showableObjects.length; i++) {
-      sectionChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    // The favorites, their rule, and the rest.
+    const lists = this.filterLists(objects);
+    if (shape.favorites) {
+      this.favoritesListId = await this.createObjectList();
+      await this.fillObjectList('favorites', lists.favorites);
     }
+    if (this.listsRuleId) {
+      await this.request(request(this.id, this.bodyLayoutId, 'addLayoutChild', {
+        widgetId: this.listsRuleId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: BTN_W, height: RULE_H },
+      }));
+    }
+    if (shape.others) {
+      this.othersListId = await this.createObjectList();
+      await this.fillObjectList('others', lists.others, this.noMatchText(lists));
+    }
+    this.applyRules(lists);
 
     // Minimized window section
     if (minimizedCount > 0) {
@@ -557,7 +745,7 @@ can restore windows from the sidebar.
     }
 
     if (sectionChildren.length > 0) {
-      await this.request(request(this.id, this.sectionLayoutId!, 'addLayoutChildren', {
+      await this.request(request(this.id, this.bodyLayoutId, 'addLayoutChildren', {
         children: sectionChildren,
       }));
     }
@@ -569,9 +757,6 @@ can restore windows from the sidebar.
     // Register as dependent of all buttons (for click events)
     for (const [btnId] of this.systemButtons) {
       this.send(request(this.id, btnId, 'addDependent', {}));
-    }
-    for (let i = 0; i < showableObjects.length; i++) {
-      this.send(request(this.id, widgetIds[userObjStartIdx + i], 'addDependent', {}));
     }
     for (const [btnId] of this.restoreButtons) {
       this.send(request(this.id, btnId, 'addDependent', {}));
@@ -602,6 +787,279 @@ can restore windows from the sidebar.
     // Fire-and-forget: derive the open highlight from live window ownership.
     // This doesn't block rendering; buttons appear immediately, styles follow.
     void this.refreshOpenStates();
+  }
+
+  // ---- Favorites and search ----
+
+  /** Split launchable objects into favorites (in starred order) and the rest (in registry order). */
+  private partitionObjects(all: ObjectRegistration[]): { favorites: ObjectRegistration[]; others: ObjectRegistration[] } {
+    const starred = new Set(this.favorites);
+    const byKey = new Map<string, ObjectRegistration>();
+    const others: ObjectRegistration[] = [];
+    for (const obj of all) {
+      const key = favoriteKey(obj);
+      if (starred.has(key) && !byKey.has(key)) byKey.set(key, obj);
+      else others.push(obj);
+    }
+    const favorites = this.favorites.map((k) => byKey.get(k)).filter((o): o is ObjectRegistration => !!o);
+    return { favorites, others };
+  }
+
+  /**
+   * Which object lists the section carries. Compact docks have no room for a
+   * search field, and a collapsed section shows no rows to search. The shape
+   * follows the unfiltered lists; the others list also holds the "No matches"
+   * row, so it is there whenever the field is.
+   */
+  private listShape(objects: { favorites: ObjectRegistration[]; others: ObjectRegistration[] }): {
+    favorites: boolean; search: boolean; others: boolean; key: string;
+  } {
+    const favorites = objects.favorites.length > 0;
+    const search = !this.compact && !this.collapsed;
+    const others = search || objects.others.length > 0;
+    return { favorites, search, others, key: `${favorites}|${search}|${others}` };
+  }
+
+  /** The search that applies: none in a compact dock, which has no field. */
+  private activeQuery(): string {
+    return this.compact ? '' : this.filterQuery.trim();
+  }
+
+  /** The objects the search keeps, best matches first (stable within a rank). */
+  private filterObjects(objs: ObjectRegistration[]): ObjectRegistration[] {
+    const query = this.activeQuery();
+    if (!query) return objs;
+    return objs
+      .map((obj, i) => ({ obj, i, rank: objectRank(obj, query) }))
+      .filter((m): m is { obj: ObjectRegistration; i: number; rank: number } => m.rank !== null)
+      .sort((a, b) => a.rank - b.rank || a.i - b.i)
+      .map((m) => m.obj);
+  }
+
+  private filterLists(objects: { favorites: ObjectRegistration[]; others: ObjectRegistration[] }): {
+    favorites: ObjectRegistration[]; others: ObjectRegistration[];
+  } {
+    return { favorites: this.filterObjects(objects.favorites), others: this.filterObjects(objects.others) };
+  }
+
+  /** The launcher rows the search keeps showing. */
+  private visibleLaunchers(): number {
+    return this.launcherRows.filter(({ btnId }) => !this.hiddenRows.has(btnId)).length;
+  }
+
+  /** The "No matches" row's text, when a search left nothing at all to show. */
+  private noMatchText(lists: { favorites: ObjectRegistration[]; others: ObjectRegistration[] }): string | undefined {
+    const nothing = this.activeQuery().length > 0 && this.visibleLaunchers() === 0
+      && lists.favorites.length === 0 && lists.others.length === 0;
+    return nothing ? 'No matches' : undefined;
+  }
+
+  /** Show or hide one row or rule (one update, only when it changes). */
+  private setRowShown(widgetId: AbjectId, shown: boolean): void {
+    if (shown === !this.hiddenRows.has(widgetId)) return;
+    if (shown) this.hiddenRows.delete(widgetId); else this.hiddenRows.add(widgetId);
+    try {
+      this.send(event(this.id, widgetId, 'update', { visible: shown }));
+    } catch { /* widget gone with a dock rebuild */ }
+  }
+
+  /** Hide the built-in rows the search leaves out (in place: they keep their lights and markers). */
+  private applyLauncherFilter(): void {
+    const query = this.activeQuery();
+    for (const { btnId, label } of this.launcherRows) {
+      this.setRowShown(btnId, matchRank(label, '', query) !== null);
+    }
+  }
+
+  /** A rule shows only with rows on both sides of it. */
+  private applyRules(lists: { favorites: ObjectRegistration[]; others: ObjectRegistration[] }): void {
+    const apps = this.visibleLaunchers() > 0;
+    const favorites = lists.favorites.length > 0;
+    const others = lists.others.length > 0;
+    if (this.appsRuleId) this.setRowShown(this.appsRuleId, apps && (favorites || others));
+    if (this.listsRuleId) this.setRowShown(this.listsRuleId, favorites && others);
+  }
+
+  /**
+   * Enter in the search field: open the best match across every group (a
+   * better rank wins; on a tie, the row higher up), then clear the field so
+   * the section is whole again.
+   */
+  private async openBestMatch(): Promise<void> {
+    const query = this.activeQuery();
+    if (!query) return;
+    const objects = this.partitionObjects(await this.discoverShowableObjects());
+    const candidates: Array<{ rank: number | null; target: AbjectId | undefined }> = [
+      ...this.launcherRows.map(({ btnId, label }) => ({ rank: matchRank(label, '', query), target: this.systemButtons.get(btnId) })),
+      ...[...objects.favorites, ...objects.others].map((obj) => ({ rank: objectRank(obj, query), target: obj.id })),
+    ];
+    let best: { rank: number; target: AbjectId } | undefined;
+    for (const c of candidates) {
+      if (c.rank === null || !c.target) continue;
+      if (!best || c.rank < best.rank) best = { rank: c.rank, target: c.target };
+    }
+    if (!best) return;
+    this.send(event(this.id, best.target, 'show', {}));
+    this.filterQuery = '';
+    if (this.searchInputId) {
+      try {
+        this.send(event(this.id, this.searchInputId, 'update', { text: '' }));
+      } catch { /* field gone */ }
+    }
+    this.scheduleListRefresh(0);
+  }
+
+  private async createObjectList(): Promise<AbjectId> {
+    return this.request<AbjectId>(request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+      parentLayoutId: this.bodyLayoutId!,
+      autoSize: true,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: this.theme.tokens.space.sm,
+    }));
+  }
+
+  /**
+   * Fill one object list with rows. Each row carries a star at its right end
+   * that shows while the pointer is over the row: filled on favorites (press
+   * to unfavorite), an outline on the rest. Their place under the apps says
+   * which are favorites, so the stars stay out of sight otherwise. `noMatch`
+   * adds one quiet row saying the search found nothing.
+   */
+  private async fillObjectList(which: 'favorites' | 'others', objs: ObjectRegistration[], noMatch?: string): Promise<void> {
+    const listId = which === 'favorites' ? this.favoritesListId : this.othersListId;
+    if (!listId || !this.windowId) return;
+    const compact = this.compact;
+    const dock = dockStyles(this.theme, compact);
+    const favorite = which === 'favorites';
+    const accessory = favorite
+      ? { icon: 'starFilled', tooltip: 'Remove from favorites' }
+      : { icon: 'star', tooltip: 'Add to favorites' };
+    const specs: Array<Record<string, unknown>> = objs.map((obj) => {
+      // The manifest icon when present, else a neutral default so older
+      // objects (created before icons) still render an icon.
+      const icon = obj.manifest.icon?.trim() || DEFAULT_OBJECT_ICON;
+      const name = obj.manifest.name;
+      return {
+        type: 'button', windowId: this.windowId!,
+        text: compact ? icon : `${icon}  ${name}`,
+        style: compact ? { ...dock.row, tooltip: favorite ? `\u2605 ${name}` : name } : { ...dock.row, accessory },
+      };
+    });
+    if (noMatch && objs.length === 0) {
+      specs.push({
+        type: 'button', windowId: this.windowId!, text: noMatch,
+        style: { ...dock.row, color: this.theme.textSecondary, fontSize: 12, disabled: true },
+      });
+    }
+    if (specs.length === 0) return;
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs }),
+    );
+    const rowIds = widgetIds.slice(0, objs.length);
+    rowIds.forEach((btnId, i) => {
+      this.userObjButtons.set(btnId, objs[i].id);
+      this.rowKeys.set(btnId, favoriteKey(objs[i]));
+    });
+    if (favorite) this.favoriteRowIds = rowIds; else this.otherRowIds = rowIds;
+
+    await this.request(request(this.id, listId, 'addLayoutChildren', {
+      children: widgetIds.map((widgetId) => ({
+        widgetId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: BTN_W, height: BTN_H },
+      })),
+    }));
+    for (const btnId of rowIds) this.send(request(this.id, btnId, 'addDependent', {}));
+  }
+
+  /** Coalesce list refreshes (keystrokes, registry bursts) into one. */
+  private scheduleListRefresh(delayMs = 100): void {
+    if (this.listTimer) return;
+    this.listTimer = setTimeout(() => {
+      this.listTimer = undefined;
+      void this.refreshObjectLists();
+    }, delayMs);
+  }
+
+  /**
+   * Refresh the section for the search in place: hide or show the built-in
+   * rows, refill the favorites and the rest, set the rules. The search field
+   * is left alone. A change of shape (the first favorite, the last one gone)
+   * rebuilds the section instead. One refresh runs at
+   * a time; a request during it runs once more after.
+   */
+  private async refreshObjectLists(): Promise<void> {
+    if (!this.windowId || !this.sectionLayoutId) return;
+    if (this.refreshingLists || this.buildingUI) {
+      this.listsStale = true;
+      return;
+    }
+    this.refreshingLists = true;
+    try {
+      // Optional browsers are discovered once at init; one that registers
+      // later needs its row, which only a full rebuild adds.
+      const hadProjects = !!this.externalProjectBrowserId;
+      if (!hadProjects) {
+        this.externalProjectBrowserId = await this.discoverDep('ExternalProjectBrowser') ?? undefined;
+      }
+      const objects = this.partitionObjects(this.collapsed ? [] : await this.discoverShowableObjects());
+      const shape = this.listShape(objects);
+      if (shape.key !== this.builtShape || hadProjects !== !!this.externalProjectBrowserId) {
+        this.refreshingLists = false;
+        await this.rebuild();
+        return;
+      }
+      if (this.collapsed) return;
+      this.applyLauncherFilter();
+      const lists = this.filterLists(objects);
+      await this.clearObjectList('favorites');
+      await this.fillObjectList('favorites', lists.favorites);
+      await this.clearObjectList('others');
+      await this.fillObjectList('others', lists.others, this.noMatchText(lists));
+      this.applyRules(lists);
+      void this.refreshOpenStates();
+    } finally {
+      this.refreshingLists = false;
+      if (this.listsStale) {
+        this.listsStale = false;
+        this.scheduleListRefresh(0);
+      }
+    }
+  }
+
+  private async clearObjectList(which: 'favorites' | 'others'): Promise<void> {
+    const listId = which === 'favorites' ? this.favoritesListId : this.othersListId;
+    const rowIds = which === 'favorites' ? this.favoriteRowIds : this.otherRowIds;
+    for (const btnId of rowIds) {
+      this.userObjButtons.delete(btnId);
+      this.rowKeys.delete(btnId);
+    }
+    if (which === 'favorites') this.favoriteRowIds = []; else this.otherRowIds = [];
+    if (!listId) return;
+    try {
+      await this.request(request(this.id, listId, 'clearLayoutChildren', {}));
+    } catch { /* list gone with a dock rebuild */ }
+  }
+
+  /** Star or unstar an object by favorite key, keep it, and move its row. */
+  private async applyFavorite(key: string, favorite: boolean): Promise<void> {
+    const has = this.favorites.includes(key);
+    if (favorite === has) return;
+    this.favorites = favorite ? [...this.favorites, key] : this.favorites.filter((k) => k !== key);
+    if (this.storageId) {
+      this.send(request(this.id, this.storageId, 'set', { key: FAVORITES_KEY, value: this.favorites }));
+    }
+    this.changed('favorites', this.favorites);
+    await this.refreshObjectLists();
+  }
+
+  private async loadFavorites(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const stored = await this.request<unknown>(request(this.id, this.storageId, 'get', { key: FAVORITES_KEY }), 5000);
+      if (Array.isArray(stored)) this.favorites = stored.filter((k): k is string => typeof k === 'string');
+    } catch { /* no favorites yet, or Storage busy: start with none */ }
   }
 
   /**

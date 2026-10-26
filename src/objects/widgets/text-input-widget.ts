@@ -23,6 +23,12 @@ import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from 
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText, type RichTextLayout } from './rich-text-layout.js';
 import { renderRichTextCommands } from './markdown-render.js';
+import { iconCommands, isIconName, type IconName } from '../../ui/icons.js';
+
+/** Size of a single-line input's clear mark. */
+const SINGLE_LINE_ICON = 12;
+/** Width of the clear mark's hit area at the right end. */
+const CLEAR_HIT_W = 24;
 
 interface InputSnapshot {
   text: string;
@@ -302,6 +308,42 @@ export class TextInputWidget extends WidgetAbject {
     return { type: 'rect', surfaceId, params: { x: Math.round(x), y: top, width: 2, height: Math.max(0, bottom - top), fill: this.theme.cursor } };
   }
 
+  /** style.icon on a single-line input, when it names a known icon. */
+  private leadingIcon(): IconName | undefined {
+    const icon = this.style.icon;
+    return icon && !this.wordWrap && isIconName(icon) ? icon : undefined;
+  }
+
+  /**
+   * The leading icon's size: the same rule a button's icon follows, so a
+   * search field in a list of icon rows lines its icon and text up with theirs.
+   */
+  private leadingIconSize(): number {
+    return Math.max(10, Math.min(16, this.rect.height - 10));
+  }
+
+  /** Where single-line text starts: past the leading icon when there is one. */
+  private singleLineTextX(): number {
+    return this.leadingIcon() ? 8 + this.leadingIconSize() + 7 : 8;
+  }
+
+  /** Whether the clear mark shows: a clearable single-line input with text in it. */
+  private showsClear(): boolean {
+    return !!this.style.clearable && !this.wordWrap && !this.isMarkdown() && this.text.length > 0 && !this.disabled;
+  }
+
+  /** Empty the field (the clear mark, or Escape on a clearable input). */
+  private async clearText(): Promise<void> {
+    this.recordEdit('edit');
+    this.text = '';
+    this.cursorPos = 0;
+    this.selAnchor = null;
+    this.invalidateWrapCache();
+    this.changed('change', this.text);
+    await this.notifySelectionChanged();
+    await this.requestRedraw();
+  }
+
   private async buildSingleLineDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     this.lastSurfaceId = surfaceId;
     const commands: unknown[] = [];
@@ -321,18 +363,38 @@ export class TextInputWidget extends WidgetAbject {
     const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
     commands.push(...this.inputFrame(surfaceId, ox, oy, w, h, borderColor, style.radius ?? 0));
 
-    // Clip to prevent text overflow
+    // Leading icon (style.icon) in the placeholder's ink, the accent while focused.
+    const icon = this.leadingIcon();
+    if (icon) {
+      const size = this.leadingIconSize();
+      commands.push(...iconCommands(icon, {
+        surfaceId, x: Math.round(ox + 8), y: Math.round(oy + (h - size) / 2), size,
+        color: focused ? this.theme.accent : this.theme.textPlaceholder, caps: shapeOf(this.theme).iconCaps,
+      }));
+    }
+
+    // Clear mark (style.clearable) at the right end while there is text.
+    const clear = this.showsClear();
+    if (clear) {
+      commands.push(...iconCommands('close', {
+        surfaceId, x: Math.round(ox + w - CLEAR_HIT_W + (CLEAR_HIT_W - SINGLE_LINE_ICON) / 2 - 2),
+        y: Math.round(oy + (h - SINGLE_LINE_ICON) / 2), size: SINGLE_LINE_ICON,
+        color: this.theme.textSecondary, caps: shapeOf(this.theme).iconCaps,
+      }));
+    }
+
+    // Clip to prevent text overflow (short of the clear mark when it shows)
     commands.push({ type: 'save', surfaceId, params: {} });
     commands.push({
       type: 'clip',
       surfaceId,
-      params: { x: ox + 1, y: oy + 1, width: w - 2, height: h - 2 },
+      params: { x: ox + 1, y: oy + 1, width: w - 2 - (clear ? CLEAR_HIT_W : 0), height: h - 2 },
     });
 
     const displayText = this.text
       ? (this.masked ? '\u2022'.repeat(this.text.length) : this.text)
       : '';
-    const textPadding = 8;
+    const textPadding = this.singleLineTextX();
     const textFont = style.fontSize ? font : widgetFont(this.theme);
 
     // Selection highlight
@@ -926,7 +988,7 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     // Single-line
-    const clickOffset = clickX - textPadding;
+    const clickOffset = clickX - this.singleLineTextX();
     if (this.text.length > 0 && clickOffset > 0) {
       const displayText = this.masked ? '\u2022'.repeat(this.text.length) : this.text;
       if (surfaceId) {
@@ -956,6 +1018,10 @@ export class TextInputWidget extends WidgetAbject {
   private async handleMouseDown(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     const clickX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
     const clickY = (input.localY as number | undefined) ?? (input.y as number | undefined) ?? 0;
+    if (this.showsClear() && clickX >= this.rect.width - CLEAR_HIT_W) {
+      await this.clearText();
+      return { consumed: true };
+    }
     const modifiers = input.modifiers as { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean } | undefined;
     const surfaceId = (input.surfaceId as string | undefined) ?? this.lastSurfaceId;
 
@@ -1344,7 +1410,12 @@ export class TextInputWidget extends WidgetAbject {
 
     // Escape: let it bubble so the parent Window (e.g. command palette,
     // notification card) can handle it as "dismiss".
+    // A clearable input with text takes the first Escape to empty itself.
     if (key === 'Escape') {
+      if (this.showsClear()) {
+        await this.clearText();
+        return { consumed: true };
+      }
       return { consumed: false };
     }
 

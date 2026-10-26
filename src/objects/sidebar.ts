@@ -10,8 +10,12 @@
  *
  * The System and Spaces sections auto-size to their content (autoSize nested
  * VBoxes report their preferred height to the root), and the Abjects section
- * takes the remaining height with internal scrolling, so a long object list
- * never runs off-screen.
+ * takes the remaining height; its provider keeps its header in place and
+ * scrolls the rows under it, so a long object list never runs off-screen.
+ *
+ * The compact (icon-only) mode is the sidebar's state, but the toggle is a
+ * provider's widget (GlobalToolbar draws it in the System header), which
+ * sends `toggleCompact` here. The dock spends no row of its own on it.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -42,7 +46,6 @@ export class Sidebar extends Abject {
   private systemSectionId?: AbjectId;
   private spacesSectionId?: AbjectId;
   private abjectsSectionId?: AbjectId;
-  private toggleBtnId?: AbjectId;
 
   /** Horizontal collapse: compact docks show icon-only rows. */
   private compact = false;
@@ -71,6 +74,12 @@ export class Sidebar extends Abject {
             {
               name: 'hide',
               description: 'Destroy the dock window',
+              parameters: [],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'toggleCompact',
+              description: 'Collapse the dock to icon-only rows, or expand it back, and rebuild every section for the new width',
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -113,13 +122,14 @@ click handling.
   window ID plus the three section layout IDs. Providers build their widgets
   into the window and add them to their section layout.
 - \`hide()\` -- Destroy the dock window.
+- \`toggleCompact()\` -- Collapse the dock into a compact icon-only strip, or
+  expand it back. The System section's header carries the button for it.
 
 ### Behavior
 - The top two sections auto-size to their content; the bottom section takes the
-  remaining height and scrolls internally.
-- A toggle row at the top collapses the dock horizontally into a compact
-  icon-only strip; \`getSections()\` reports the mode via \`compact\` so
-  providers render icon-only rows.
+  remaining height, and its provider scrolls the rows under its header.
+- \`getSections()\` reports the mode via \`compact\` so providers render
+  icon-only rows.
 - Every \`show()\` invalidates previously returned section IDs -- callers must
   re-fetch sections after each show.
 
@@ -158,12 +168,9 @@ click handling.
 
     this.on('getState', async () => ({ visible: !!this.windowId, compact: this.compact }));
 
-    // The horizontal collapse toggle is the sidebar's only own widget. The
-    // flip needs every section repopulated for the new width, so it routes
+    // The flip needs every section repopulated for the new width, so it routes
     // through WorkspaceManager's refreshTaskbar like every other dock rebuild.
-    this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string };
-      if (aspect !== 'click' || msg.routing.from !== this.toggleBtnId) return;
+    this.on('toggleCompact', async () => {
       this.compact = !this.compact;
       if (!this.workspaceManagerId) {
         this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
@@ -171,6 +178,7 @@ click handling.
       if (this.workspaceManagerId) {
         this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
       }
+      return true;
     });
   }
 
@@ -191,7 +199,6 @@ click handling.
         this.systemSectionId = undefined;
         this.spacesSectionId = undefined;
         this.abjectsSectionId = undefined;
-        this.toggleBtnId = undefined;
       }
 
       const display = await this.request<{ width: number; height: number }>(
@@ -223,32 +230,8 @@ click handling.
         })
       );
 
-      // Horizontal collapse toggle — a quiet full-width row at the very top.
-      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', {
-          specs: [{
-            type: 'button',
-            windowId: this.windowId,
-            text: this.compact ? '»' : '«',
-            style: {
-              background: this.theme.windowBg, flat: true,
-              color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm,
-              align: this.compact ? 'center' : 'right', fontSize: 14,
-              tooltip: this.compact ? 'Expand sidebar' : 'Collapse sidebar',
-            },
-          }],
-        })
-      );
-      this.toggleBtnId = widgetIds[0];
-      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-        widgetId: this.toggleBtnId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 18 },
-      }));
-      this.send(request(this.id, this.toggleBtnId, 'addDependent', {}));
-
-      // System and Spaces auto-size to their rows; Abjects takes the rest and
-      // scrolls so a long object list never runs off-screen.
+      // System and Spaces auto-size to their rows; Abjects takes the rest (its
+      // provider keeps the header still and scrolls the rows under it).
       this.systemSectionId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedVBox', {
           parentLayoutId: this.rootLayoutId,
@@ -266,7 +249,7 @@ click handling.
         })
       );
       this.abjectsSectionId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        request(this.id, this.widgetManagerId!, 'createNestedVBox', {
           parentLayoutId: this.rootLayoutId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: space.sm,
@@ -291,7 +274,6 @@ click handling.
     this.systemSectionId = undefined;
     this.spacesSectionId = undefined;
     this.abjectsSectionId = undefined;
-    this.toggleBtnId = undefined;
     return true;
   }
 }
