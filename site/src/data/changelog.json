@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.15.19",
+    "date": "2026-10-26",
+    "title": "A dock you can search and keep favorites in",
+    "summary": "The dock's Abjects section now has a search field and a favorites list, and its rows scroll inside a fixed header. Finding and opening the objects you use most takes fewer clicks.",
+    "highlights": [
+      "Search the dock: a field at the top of the Abjects section filters the built-in apps and your own objects as you type, puts the best matches first, and opens the top match when you press Enter (Escape or the clear mark empties it)",
+      "Favorites: hover over an object's row and click the star to pin it to a favorites list above the rest; your favorites are saved between sessions",
+      "The dock's header and search field stay in place while only the rows below them scroll, so a long list of objects no longer pushes the controls out of view",
+      "The button that collapses or expands the dock has moved to a small icon at the right end of the System header, next to the gear, so the old toggle row at the top is gone",
+      "Scrollbars across the interface are hidden until you need them: a thin thumb shows while you hover or scroll, and it widens to a full bar when the pointer is over it",
+      "Labels too long for a dock row now fade out at the edge instead of ending in an ellipsis; hover to see the full name",
+      "Widgets that scripts and packages can use: buttons can carry a small action icon at their right end, text fields can have a leading icon and a clear mark, and there are new star and sidebar icons"
+    ],
+    "fixes": [
+      "Clicking a dock row no longer leaves a red focus box around it; the focus ring now appears only when you move focus with the keyboard",
+      "Hidden rows in a scrolling list no longer take up scroll height, so lists no longer end in empty space"
+    ]
+  },
+  {
     "version": "0.15.18",
     "date": "2026-10-24",
     "title": "Windows Close Cleanly, Quiet Models Recover",
