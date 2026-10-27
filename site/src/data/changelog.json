@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.16.0",
+    "date": "2026-10-27",
+    "title": "Every Change Can Be Taken Back",
+    "summary": "Almost anything you change in Abject can now be undone and redone with Ctrl+Z, from moving a dock item to deleting an object or a file. Deleting things no longer asks you to confirm first: it happens right away and shows a short notice you can undo from.",
+    "highlights": [
+      "Undo and redo work everywhere: Ctrl+Z undoes; Ctrl+Shift+Z or Ctrl+Y redoes. The window you are in sends the request to whatever owns the data, and a short notice tells you what was undone.",
+      "The desktop app's Edit menu now has working Undo and Redo items.",
+      "Deleted objects and folders go to a trash that lasts for the current session plus three days (up to 200 items or 64 MB), so they can come back. The old confirmation dialogs are replaced by an undo notice.",
+      "Files overwritten or deleted through the file system can be restored, and removed skills go to a trash of their own.",
+      "Undo covers the dock and taskbar, themes, the scheduler, workspace details, app and object browsers, agents and triggers, the pinboard, the object editor, chats and conversations, the knowledge browser, settings, and the AI section of global settings (keys and secrets are never kept in undo history).",
+      "Each person and object gets its own undo history, so your Ctrl+Z only undoes your own changes, never someone else's in a shared space. Some histories are saved to disk so they survive a restart.",
+      "Text fields keep their own typing undo. When a field has nothing left to undo, Ctrl+Z goes to the window around it.",
+      "Script packages can mark a saveData call as undoable and get notified when their data is restored, so undo works in your own abjects too."
+    ],
+    "fixes": []
+  },
+  {
     "version": "0.15.19",
     "date": "2026-10-26",
     "title": "A dock you can search and keep favorites in",
